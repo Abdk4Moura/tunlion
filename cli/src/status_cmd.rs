@@ -103,14 +103,25 @@ pub(crate) fn tour_cmd() -> Result<()> {
     Ok(())
 }
 
-/// The identity as `status --json` reports it: the owner fingerprint, the
-/// string "joined" on a joined device, or null when there is none yet.
-fn identity_summary() -> Value {
+/// The identity as `--json` reports it, as two fields that each mean one
+/// thing: `identity` is always the owner fingerprint (the same 8 hex `id`
+/// shows) or null with none yet, and `role` is "owner" (holds the signing
+/// key), "joined-device" (`id --json`'s spelling) or null. `identity` used to be
+/// a fingerprint on one device and the string "joined" on another.
+pub(crate) fn identity_fields() -> (Value, Value) {
     match identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-        Ok(Some(key)) => json!(key.fingerprint()),
-        _ if local_device_cert().is_some() => json!("joined"),
-        _ => Value::Null,
+        Ok(Some(key)) => (json!(key.fingerprint()), json!("owner")),
+        _ => match local_device_cert() {
+            Some(cert) => (json!(owner_fingerprint(&cert.user_pub)), json!("joined-device")),
+            None => (Value::Null, Value::Null),
+        },
     }
+}
+
+/// The fingerprint of an owner public key, as `UserKey::fingerprint` renders
+/// it. Pure.
+pub(crate) fn owner_fingerprint(user_pub: &[u8; 32]) -> String {
+    hex::encode(user_pub).chars().take(8).collect()
 }
 
 pub(crate) fn status_cmd(json: bool) -> Result<()> {
@@ -120,21 +131,24 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
             .iter()
             .map(|b| json!({ "port": b.port, "target": b.target, "peers": b.peers.clone().unwrap_or_default() }))
             .collect();
-        let mut recent: Vec<String> = std::fs::read_to_string(up_log())
-            .map(|log| log.lines().rev().take(8).map(str::to_string).collect())
-            .unwrap_or_default();
-        recent.reverse();
+        // Structured transfer records from both directions, newest last.
+        let recent = crate::transfer_history::recent(RECENT);
+        let (identity, role) = identity_fields();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "verb": "status",
                 "running": pid.is_some(),
                 "pid": pid,
                 "devices": devices_load().len(),
                 "exposed": exposed,
                 "recent": recent,
-                // The fingerprint, "joined" for a joined device, or null: a
-                // device with no identity yet. Read only; status never mints.
-                "identity": identity_summary(),
+                // Always the owner fingerprint or null; `role` says whether
+                // this device is the owner or a joined one. Read only; status
+                // never mints.
+                "identity": identity,
+                "role": role,
                 // The SOCKS proxy the daemon auto-starts without a TUN: its
                 // address and how to use it (the token's PATH, never the
                 // token), or null when none is running.
@@ -188,8 +202,15 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
             ui::say(&line);
         }
     }
-    if let Ok(log) = std::fs::read_to_string(up_log()) {
-        let recent: Vec<&str> = log.lines().rev().take(8).collect();
+    let recent = crate::transfer_history::recent(RECENT);
+    if !recent.is_empty() {
+        ui::say(&ui::paint(ui::Tone::Dim, "  recent transfers:"));
+        for r in &recent {
+            ui::say(&format!("    {}", crate::transfer_history::human_line(r)));
+        }
+    } else if let Ok(log) = std::fs::read_to_string(up_log()) {
+        // A daemon from before the structured history only has its log.
+        let recent: Vec<&str> = log.lines().rev().take(RECENT).collect();
         if !recent.is_empty() {
             ui::say(&ui::paint(ui::Tone::Dim, "  recent receives:"));
             for l in recent.iter().rev() {
@@ -199,6 +220,9 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
     }
     Ok(())
 }
+
+/// How many transfers `status` shows.
+const RECENT: usize = 8;
 
 /// Human state text for a DELEGATED device's row, quoting the binding clock
 /// from effective_principal_deadline (never restating a bound we do not compute).

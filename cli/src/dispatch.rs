@@ -170,6 +170,32 @@ pub(crate) fn validate_grant_spec(spec: &str) -> Result<()> {
     crate::capability::parse_grant_spec(spec, &[0u8; 32]).map(|_| ())
 }
 
+/// Which of `names` are online right now, for `devices --json`. A device
+/// counts only when the local daemon holds a link to it and the device answers
+/// a reach-ping on that link (bounded, all in parallel). This never
+/// establishes anything: a device with no held link is simply not online here.
+/// The link state alone is not enough: a peer stopped or killed -9 keeps its
+/// link "alive" locally until QUIC's idle timeout.
+async fn devices_online(names: Vec<String>) -> std::collections::HashSet<String> {
+    let warm = crate::warm_device_names(ctl::try_list_warm().await.as_ref());
+    let probes = names
+        .into_iter()
+        .filter(|n| warm.iter().any(|w| w.eq_ignore_ascii_case(n)))
+        .map(|n| async move { ctl::try_ping(&n).await.is_some().then_some(n) });
+    futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// A grant spec that does not parse (an unknown capability, `route` without a
+/// prefix, a resource on a self-scoped capability) is a usage error, exit 2:
+/// the command line is wrong, nothing was refused.
+pub(crate) fn grant_usage(e: anyhow::Error) -> anyhow::Error {
+    crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, e.to_string())
+}
+
 pub(crate) async fn async_main() -> Result<()> {
     // Pick ring explicitly before anything touches TLS. Kept UNCONDITIONAL on
     // purpose: skipping it for local-only commands was tried and measured at
@@ -542,6 +568,7 @@ pub(crate) async fn async_main() -> Result<()> {
             name,
             remember,
             auth_key,
+            timeout,
         } => {
             let json_out = ui_caps.json || cli.json;
             let peer = to.clone();
@@ -558,9 +585,12 @@ pub(crate) async fn async_main() -> Result<()> {
                     name,
                     relay,
                     remember,
+                    timeout,
                 )
                 .await
             };
+            // Both ends keep a structured history; this is the sender's half.
+            crate::send_report::persist_history(peer.as_deref());
             if json_out {
                 // One result object on stdout, success or failure.
                 return crate::send_report::emit(res, peer.as_deref());
@@ -677,6 +707,8 @@ pub(crate) async fn async_main() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "verb": "addr",
                             "name": name,
                             "channel": channel,
                             "caps": caps,
@@ -716,6 +748,8 @@ pub(crate) async fn async_main() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "verb": "addr",
                             "name": mesh_name,
                             "overlayV6": id.addr().to_string(),
                             "overlayV4": id.addr_v4().to_string(),
@@ -760,7 +794,10 @@ pub(crate) async fn async_main() -> Result<()> {
                                             println!(
                                                 "{}",
                                                 serde_json::to_string_pretty(&json!({
+                                                    "ok": true,
+                                                    "verb": "id",
                                                     "configured": true,
+                                                    "identity": fingerprint,
                                                     "fingerprint": fingerprint,
                                                     "role": "joined-device",
                                                     "holdsOwnerSigningKey": false,
@@ -798,7 +835,13 @@ pub(crate) async fn async_main() -> Result<()> {
                                 if ui_caps.json {
                                     println!(
                                         "{}",
-                                        serde_json::to_string_pretty(&json!({ "configured": false }))?
+                                        serde_json::to_string_pretty(&json!({
+                                            "ok": true,
+                                            "verb": "id",
+                                            "configured": false,
+                                            "identity": Value::Null,
+                                            "role": "joined-device",
+                                        }))?
                                     );
                                 } else {
                                     crate::ui::say(&format!(
@@ -826,7 +869,10 @@ pub(crate) async fn async_main() -> Result<()> {
                                 println!(
                                     "{}",
                                     serde_json::to_string_pretty(&json!({
+                                        "ok": true,
+                                        "verb": "id",
                                         "configured": true,
+                                        "identity": uk.fingerprint(),
                                         "fingerprint": uk.fingerprint(),
                                         "publicKey": uk.public_key_hex(),
                                         "role": "owner",
@@ -982,7 +1028,10 @@ pub(crate) async fn async_main() -> Result<()> {
             let for_ = match (who, for_) {
                 (Some(w), None) => Some(w),
                 (Some(w), Some(f)) => {
-                    bail!("you named the invitee twice: `add {w}` and `--for {f}`. Use one.")
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Usage,
+                        format!("you named the invitee twice: `add {w}` and `--for {f}`. Use one."),
+                    ));
                 }
                 (None, f) => f,
             };
@@ -1190,6 +1239,8 @@ pub(crate) async fn async_main() -> Result<()> {
                 None => {
                     let all = devices_load();
                     if json || ui_caps.json {
+                        let online =
+                            devices_online(all.iter().map(|(n, _)| n.clone()).collect()).await;
                         let arr: Vec<Value> = all
                             .iter()
                             .map(|(n, s)| {
@@ -1204,6 +1255,10 @@ pub(crate) async fn async_main() -> Result<()> {
                                     "lastSeen": last_seen,
                                     "address": addr,
                                     "mesh": mesh,
+                                    // Live, not remembered: the daemon holds a
+                                    // link to it AND the device answered a
+                                    // liveness ping on that link just now.
+                                    "online": online.contains(n),
                                 })
                             })
                             .collect();
@@ -1632,13 +1687,15 @@ pub(crate) async fn async_main() -> Result<()> {
             device,
             watch,
             repeat,
+            timeout,
             json,
         } => {
             crate::exit_codes::set_json_mode(json || ui_caps.json, Some("doctor"));
             if let Some(d) = &device {
                 require_known_device(d)?;
             }
-            doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay).await
+            doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay, timeout)
+                .await
         }
         Cmd::Grant {
             device,
@@ -1649,7 +1706,7 @@ pub(crate) async fn async_main() -> Result<()> {
             let (device, capability) = grant_operands(device, capability, tag.as_deref())?;
             // Valid on every device or on none: checked before the owner/joined
             // split, so no advice below can name a spec that would be refused.
-            validate_grant_spec(&capability)?;
+            validate_grant_spec(&capability).map_err(grant_usage)?;
             // The owner key resolves the RESOURCE, so it is needed before the
             // capability name is final: `route:10.0.0.0/24` names an owner-bound
             // resource, while `shell` names "self".
@@ -1664,7 +1721,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 // just the public half. Keep requiring a full identity here.
                 let user_key = crate::identity_flow::ensure_user_key(false)?;
                 let pk = user_key.public_key_bytes();
-                let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                 let (capability, resource) = (g.action.clone(), g.resource.clone());
                 let target_bytes = crate::capability::make_tag_target(&pk, t);
                 let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
@@ -1713,7 +1770,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 .map(|k| k.public_key_bytes());
             let (capability, cap_resource, cap_nonce) = match owner_pk {
                 Some(pk) => {
-                    let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                    let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                     (g.action, g.resource, g.nonce)
                 }
                 None => {
@@ -1733,11 +1790,11 @@ pub(crate) async fn async_main() -> Result<()> {
                         // U1: not joined and no key, so this is the first use;
                         // mint the identity and bind the resource to it.
                         let pk = crate::identity_flow::ensure_user_key(false)?.public_key_bytes();
-                        let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                        let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                         (g.action, g.resource, g.nonce)
                     } else {
                         (
-                            crate::capability::canonical_capability(&spec)?,
+                            crate::capability::canonical_capability(&spec).map_err(grant_usage)?,
                             "self".to_string(),
                             crate::capability::self_resource_nonce(),
                         )
@@ -2207,6 +2264,12 @@ pub(crate) async fn async_main() -> Result<()> {
                         "--options, --foreground, and --save-auto belong to the retired sshfs path and are not supported by mesh-native mount"
                     );
                 }
+                // A missing local prerequisite (no FUSE) is a problem with this
+                // machine's setup, not a failure of the mount: exit 2 (usage:
+                // bad input or environment), before anything connects.
+                crate::platform::mount_prerequisite().map_err(|m| {
+                    crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, m)
+                })?;
                 let plan = resolve_mount_plan(&ui_caps, peer, remote, local, read_write)?;
                 require_known_device(&plan.peer)?;
                 // Before any network work, and long before a "mounted." line:

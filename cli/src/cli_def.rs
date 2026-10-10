@@ -69,7 +69,7 @@ EXAMPLES
 EXIT CODES
   0    success
   1    any other error
-  2    usage: bad arguments or flags
+  2    usage: bad arguments or flags, or a missing local prerequisite (mount without FUSE)
   3    unknown device, or not paired with this one
   4    denied: refused by the peer, a capability, or the system
   5    reach --until-direct: the link is up but still on a relay
@@ -195,12 +195,18 @@ pub(crate) enum Cmd {
         /// Join an explicit room instead of the same-network auto room
         #[arg(long)]
         room: Option<String>,
-        /// Only connect to a peer whose display name contains this (C13)
+        /// Send to the known device with exactly this name (case-insensitive);
+        /// `tunlion devices` lists them
         #[arg(long)]
         to: Option<String>,
         /// Override the offered file name (for stdin '-', or a single file)
         #[arg(long)]
         name: Option<String>,
+        /// Seconds to wait for the peer to connect (default 60, or
+        /// FILAMENT_SEND_TIMEOUT; 0 waits without limit). A known device that
+        /// shows no presence at all fails sooner, with exit 6 (offline).
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
         /// Enroll as delegated principal using an auth key file before sending
         #[arg(long, hide = true)]
         auth_key: Option<PathBuf>,
@@ -617,6 +623,10 @@ pub(crate) enum Cmd {
         watch: bool,
         #[arg(long)]
         repeat: Option<u32>,
+        /// Seconds to wait for the device's probe (default 30). An offline
+        /// device exits 6, an unreachable tunlion server 7.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
         /// Machine-readable JSON output (for scripting)
         #[arg(long)]
         json: bool,

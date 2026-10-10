@@ -40,7 +40,9 @@ pub(crate) const DAEMON_CONFLICT: i32 = 10;
 pub(crate) enum ExitKind {
     /// Anything not classified below.
     Other,
-    /// Bad arguments, a missing value, flags that cannot go together.
+    /// Bad arguments, a missing value, flags that cannot go together, or a
+    /// missing local prerequisite the user has to set up first (`mount`
+    /// without FUSE): input or environment, never the peer.
     Usage,
     /// No such device, or it is not paired with this one.
     UnknownDevice,
@@ -366,6 +368,45 @@ mod tests {
         let wrapped = e.context("while doing a thing");
         assert_eq!(classify(&wrapped), ExitKind::Usage, "the kind survives context");
         assert_eq!(classify(&reported(ExitKind::Unreachable)), ExitKind::Unreachable);
+    }
+
+    /// The blind automation run: these were exit 1. Each is a usage error,
+    /// classified where it is raised rather than from its text.
+    #[test]
+    fn usage_errors_from_the_blind_run_exit_2() {
+        let unknown_cap = crate::capability::canonical_capability("port")
+            .map_err(crate::dispatch::grant_usage)
+            .unwrap_err();
+        assert_eq!(classify(&unknown_cap), ExitKind::Usage);
+        assert_eq!(classify(&unknown_cap).code(), 2);
+        let route = crate::capability::parse_grant_spec("route", &[0u8; 32])
+            .map_err(crate::dispatch::grant_usage)
+            .unwrap_err();
+        assert_eq!(classify(&route), ExitKind::Usage);
+        let missing = crate::send_cmd::missing_input(
+            "nope.txt",
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert_eq!(classify(&missing).code(), 2);
+    }
+
+    /// Offline and unconfirmed sends carry their kinds explicitly, so the
+    /// exit code does not depend on the wording.
+    #[test]
+    fn offline_is_6_and_unconfirmed_delivery_is_8() {
+        let off = err(ExitKind::Unreachable, crate::send_cmd::offline_message("laptop", std::time::Duration::from_secs(10)));
+        assert_eq!(classify(&off).code(), 6);
+        let unconfirmed = err(
+            ExitKind::Partial,
+            "delivery not confirmed: 1 file(s) sent but never delivery-acked by the receiver",
+        );
+        assert_eq!(classify(&unconfirmed).code(), 8);
+        // And with no explicit kind the old sentence would have been 1: the
+        // classification must come from the source, not the text.
+        assert_eq!(
+            classify_text("delivery not confirmed: 1 file(s) sent but never delivery-acked"),
+            ExitKind::Other
+        );
     }
 
     #[test]
