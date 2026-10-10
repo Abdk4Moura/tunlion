@@ -114,6 +114,9 @@ bounded_wait() {  # $1 = pid, $2 = seconds, $3 = label, rest = logs to show
     echo "  [${f##*/}]"
     tail -n 30 "$f" 2>/dev/null | sed 's/^/    /'
   done
+  # Say so when it was already on its way out: past the bound is still past the
+  # bound, but "exited while being captured" is a slow path, not a hang.
+  kill -0 "$p" 2>/dev/null || echo "  (it exited while the state above was being captured)"
   echo "===== END WEDGE"
   kill -9 "$p" 2>/dev/null
   wait "$p" 2>/dev/null
@@ -326,9 +329,11 @@ G2BSZ=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
 # death, and SIGTERM lets the receiver close cleanly.
 kill -9 $R1 2>/dev/null; wait $R1 2>/dev/null
 T0=$(date +%s)
-# 15s until the dead link is dropped, the 10s rejoin window, and the bounded
-# probes: well under a minute when the sender works. 90s is the wedge line.
-bounded_wait $SP 90 "dead-receiver sender" "$WORK/g2b-send.log"; RCS=$?
+# Two honest ways out, and the bound has to cover the slower one. Measured in
+# CI: the rejoin path (15s until the dead link is dropped, then the 10s window)
+# exits in 25-26s; the reconnect path (five attempts at the dead peer, then
+# "lost the receiving peer") took about 90s. 150s is the wedge line.
+bounded_wait $SP 150 "dead-receiver sender" "$WORK/g2b-send.log"; RCS=$?
 T1=$(date +%s)
 # With the exit-code taxonomy present, "the peer is gone" is 6 (unreachable);
 # a build without it can only promise nonzero.
@@ -337,7 +342,7 @@ WANT_RC=nonzero
 if [ "$G2BSZ" -eq 0 ]; then
   bad "dead receiver: the receiver wrote nothing before it was killed, so nothing was mid-transfer"
 elif [ $RCS -eq 124 ]; then
-  bad "dead receiver: sender still running 90s after its receiver was killed (wedged, state above)"
+  bad "dead receiver: sender still running 150s after its receiver was killed (wedged, state above)"
 elif [ $RCS -eq 0 ]; then
   bad "dead receiver: sender exited 0 though its receiver died at ${G2BSZ} of $((80 * 1024 * 1024)) bytes"
 elif [ "$WANT_RC" = 6 ] && [ $RCS -ne 6 ]; then
