@@ -367,6 +367,14 @@ pub(crate) fn ensure_inbox(dir: &Path) -> std::io::Result<bool> {
         return Ok(false);
     }
     crate::platform::create_private_dir_all(dir)?;
+    // Something other than a directory (a file) can sit at the path; creating
+    // "succeeds" around it without making a directory.
+    if !dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "something that is not a directory is in its place",
+        ));
+    }
     Ok(true)
 }
 
