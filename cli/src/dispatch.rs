@@ -834,6 +834,22 @@ pub(crate) async fn async_main() -> Result<()> {
             if userspace {
                 unsafe { std::env::set_var("FILAMENT_L3_USERSPACE", "1") };
             }
+            // The daemon flags given explicitly, before settings fold in: what
+            // `up` compares against an already-running daemon's report.
+            let launch = crate::up_logs::LaunchAsk {
+                server: (cli.server != DEFAULT_SERVER).then(|| server.clone()),
+                dir: dir.as_ref().map(|d| {
+                    let abs = std::path::absolute(d).unwrap_or_else(|_| d.clone());
+                    abs.to_string_lossy().into_owned()
+                }),
+                relay: cli.relay,
+                no_relay: cli.no_relay,
+                name_as: cli.name_as.clone(),
+                userspace,
+                shell_program: shell_program.clone(),
+                shell_user: shell_user.clone(),
+                no_proxy_fallback,
+            };
             // Flags win; otherwise fall back to persistent settings. Per-peer
             // `shell on` overrides fold into the shell-only allowlist so
             // `tunlion set shell on --peer laptop` unifies with --shell-only.
@@ -865,6 +881,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 i_know,
                 install_system,
                 no_proxy_fallback,
+                launch,
             )
             .await
         }

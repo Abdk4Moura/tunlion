@@ -434,6 +434,7 @@ pub(crate) async fn init_experience(
             false,
             false,
             false,
+            crate::up_logs::LaunchAsk::default(),
         )
         .await
         .context("install always-on receive service")?;

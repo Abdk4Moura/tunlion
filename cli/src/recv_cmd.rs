@@ -1807,6 +1807,16 @@ pub(crate) async fn recv_cmd(
                                 // revoked is still being handed out by the policy.
                                 "shell_policy": shell_policy.label(),
                                 "shell_auto": shell_policy.auto_names(),
+                                // Every other daemon flag, so `up` over this
+                                // daemon can tell whether the flags it was
+                                // given are already in effect.
+                                "launch": crate::up_logs::launch_report(
+                                    server,
+                                    &dir,
+                                    relay,
+                                    shell_user.as_deref(),
+                                    no_proxy_fallback,
+                                ),
                             })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ListWarm) {
                             handle_list_warm(&conn, req).await;
