@@ -461,6 +461,15 @@ pub(crate) async fn handle_auth_key_enroll_response(
                     candidate = format!("{base}-{n}");
                     n += 1;
                 }
+                // The suffix is the security rule (a new key never takes over
+                // another key's name). Say it out loud, with the way back, so a
+                // reset device does not sit beside its stale self forever.
+                if candidate != base {
+                    ui::say(&format!(
+                        "  {} a new device asked to be called {base}, a name another key holds, so it was stored as {candidate}. If {base} was reset and this is the same machine: `tunlion devices forget {base}` then `tunlion devices rename {candidate} {base}`.",
+                        ui::paint(ui::Tone::Warn, "!")
+                    ));
+                }
             }
             let requested_name = candidate;
             let secret = fresh_secret();

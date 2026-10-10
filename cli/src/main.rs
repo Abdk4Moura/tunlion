@@ -71,6 +71,8 @@ mod pake_ceremony;
 mod ping;
 mod roster;
 mod sdnotify;
+/// What to say when a paired device was reset and came back under a new key.
+mod reset_hints;
 // The wire vocabulary and its pure decisions now live in their own crate. Kept
 // under the `protocol::` name so every call site reads unchanged.
 use filament_proto as protocol;

@@ -732,7 +732,16 @@ pub(crate) async fn send_cmd(
         if let (Some((n, _)), Some(after)) = (&known_target, offline_after) {
             if !established && saw_known_peer.is_empty() && started.elapsed() >= after {
                 ui::clear_sticky();
-                return Err(exit_codes::err(ExitKind::Unreachable, offline_message(n, after)));
+                // A reset device runs `up` as a NEW key the old record can
+                // never find, so "is up running there?" alone was useless. Say
+                // so, and if it already re-paired under a suffixed name, name it.
+                let names: Vec<String> = devices_load().into_iter().map(|(name, _)| name).collect();
+                let successor =
+                    crate::reset_hints::successor_of(n, names.iter().map(String::as_str));
+                return Err(exit_codes::err(
+                    ExitKind::Unreachable,
+                    offline_message_with(n, after, successor.as_deref()),
+                ));
             }
         }
         // The wait-for-peer deadline only applies while we have no peer (F3).
@@ -2364,10 +2373,17 @@ pub(crate) fn offline_window(establish: Duration, env: Option<&str>) -> Option<D
 
 /// The answer for a known device that never appeared. Pure.
 pub(crate) fn offline_message(peer: &str, after: Duration) -> String {
+    offline_message_with(peer, after, None)
+}
+
+/// [`offline_message`], naming `successor` when a newer record looks like the
+/// same machine re-paired after a reset (see reset_hints). Pure.
+pub(crate) fn offline_message_with(peer: &str, after: Duration, successor: Option<&str>) -> String {
     format!(
         "{peer} is offline: it did not appear on the tunlion server within {}s. \
-         Is `tunlion up` running there? Nothing was sent.",
-        after.as_secs()
+         Is `tunlion up` running there? {} Nothing was sent.",
+        after.as_secs(),
+        crate::reset_hints::offline_hint(peer, successor)
     )
 }
 
