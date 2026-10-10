@@ -1030,6 +1030,88 @@ else
   tail -n 3 "$WORK/g22-send.err" "$WORK/g22-sendj.out" "$WORK/g22-init.log" "$WORK/g22-add.log" "$WORK/g22-grant.log" "$WORK/g22-off.err"
 fi
 
+# ---------------------------------------------------------------- gate T1 ----
+say "T1/T2: a source send cannot read is a fast local error (exit 2) and reaches no receiver; a FIFO or device never hangs"
+# The blind run: a mode-000 file printed "ok", then blamed the network (exit 6,
+# "re-run the same tunlion send to resume"), or stalled until killed, and left
+# unread, unread.part and unread.part.meta on the receiver; an EMPTY mode-000
+# file reported "ok unread 0 B" (exit 0); a FIFO and /dev/zero hung silently.
+# A receiver waits in a room the whole time: it must receive nothing at all.
+DT1="$WORK/gT1"; rm -rf "$DT1"; mkdir -p "$DT1/rx"
+RT1="gT1room$$"
+"$BIN" receive -y --dir "$DT1/rx" --room "$RT1" --server "$SERVER" >"$WORK/gT1-recv.log" 2>&1 &
+RT1P=$!; pids+=($RT1P); sleep 3
+echo secret >"$DT1/unread"; chmod 000 "$DT1/unread"
+: >"$DT1/unread-empty"; chmod 000 "$DT1/unread-empty"
+mkfifo "$DT1/fifo"
+t1_run() {  # $1 = label, $2 = path; prints "rc seconds"
+  local t0 rc
+  t0=$(date +%s)
+  timeout 30 "$BIN" send "$2" --room "$RT1" --server "$SERVER" >"$WORK/gT1-$1.out" 2>"$WORK/gT1-$1.err"; rc=$?
+  echo "$rc $(( $(date +%s) - t0 ))"
+}
+read -r T1U T1US <<<"$(t1_run unread "$DT1/unread")"
+read -r T1E T1ES <<<"$(t1_run empty "$DT1/unread-empty")"
+read -r T1F T1FS <<<"$(t1_run fifo "$DT1/fifo")"
+read -r T1Z T1ZS <<<"$(t1_run zero /dev/zero)"
+sleep 2
+T1RX=$(ls -A "$DT1/rx" | tr '\n' ' ')
+kill_tree $RT1P
+chmod 600 "$DT1/unread" "$DT1/unread-empty" 2>/dev/null
+echo "  unreadable: rc=$T1U ${T1US}s; empty unreadable: rc=$T1E ${T1ES}s; fifo: rc=$T1F ${T1FS}s; /dev/zero: rc=$T1Z ${T1ZS}s; receiver holds: [$T1RX]"
+if [ "$(id -u)" = 0 ]; then
+  bad "unreadable-source: running as root, which can read a mode-000 file, so this gate cannot test it"
+elif [ "$T1U" = 2 ] && [ "$T1E" = 2 ] && [ "$T1F" = 2 ] && [ "$T1Z" = 2 ] \
+   && [ "$T1US" -le 5 ] && [ "$T1ES" -le 5 ] && [ "$T1FS" -le 5 ] && [ "$T1ZS" -le 5 ] \
+   && grep -q "$DT1/unread'" "$WORK/gT1-unread.err" && grep -qi "permission denied" "$WORK/gT1-unread.err" \
+   && grep -q "not a regular file" "$WORK/gT1-fifo.err" && grep -q "tunlion send -" "$WORK/gT1-fifo.err" \
+   && grep -q "not a regular file" "$WORK/gT1-zero.err" \
+   && ! grep -qh "^ok \|lost the receiving peer\|  ok " "$WORK"/gT1-*.err "$WORK"/gT1-*.out \
+   && [ -z "$T1RX" ]; then
+  ok "unreadable-source: mode-000 (and empty), FIFO and /dev/zero refused in seconds with exit 2 and the reason; the receiver got nothing"
+else
+  bad "unreadable-source"
+  tail -n 2 "$WORK/gT1-unread.err" "$WORK/gT1-empty.err" "$WORK/gT1-fifo.err" "$WORK/gT1-zero.err" "$WORK/gT1-recv.log"
+fi
+
+# --------------------------------------------------------------- gate T1b ----
+say "T1b: a source that stops being readable mid-transfer cancels it on both ends, exit 2, nothing left behind"
+# The source is truncated while it is being sent (the read the sender does
+# next returns end-of-file early). The sender must stop as a local problem,
+# never retry or blame the peer, and the receiver must discard its partial.
+DT1B="$WORK/gT1b"; rm -rf "$DT1B"; mkdir -p "$DT1B/rx"
+cp "$BIG" "$DT1B/shrinks.bin"
+RT1B="gT1broom$$"
+"$BIN" receive -y --dir "$DT1B/rx" --room "$RT1B" --server "$SERVER" >"$WORK/gT1b-recv.log" 2>&1 &
+RT1BP=$!; pids+=($RT1BP); sleep 3
+FILAMENT_TEST_TRANSFER_STALL_MS=10 \
+  "$BIN" send "$DT1B/shrinks.bin" --room "$RT1B" --server "$SERVER" >"$WORK/gT1b-send.log" 2>&1 &
+ST1B=$!; pids+=($ST1B)
+for _ in $(seq 1 120); do
+  sz=$(stat -c %s "$DT1B/rx/shrinks.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((2 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+T1BSZ=$(stat -c %s "$DT1B/rx/shrinks.bin.part" 2>/dev/null || echo 0)
+truncate -s 1048576 "$DT1B/shrinks.bin"
+T0=$(date +%s)
+bounded_wait $ST1B 60 "shrinking-source sender" "$WORK/gT1b-send.log"; RT1BS=$?
+T1BT=$(( $(date +%s) - T0 ))
+bounded_wait $RT1BP 60 "shrinking-source receiver" "$WORK/gT1b-recv.log"; RT1BR=$?
+T1BRX=$(ls -A "$DT1B/rx" | tr '\n' ' ')
+echo "  part at truncation: $T1BSZ; sender rc=$RT1BS in ${T1BT}s; receiver rc=$RT1BR; receiver holds: [$T1BRX]"
+if [ "$T1BSZ" -eq 0 ]; then
+  bad "shrinking-source: nothing was received before the truncation, so nothing was mid-transfer"
+elif [ $RT1BS -eq 2 ] && [ "$T1BT" -le 20 ] && grep -q "shorter than offered" "$WORK/gT1b-send.log" \
+   && ! grep -q "lost the receiving peer" "$WORK/gT1b-send.log" \
+   && [ $RT1BR -ne 0 ] && [ $RT1BR -ne 124 ] && grep -q "the sender cancelled" "$WORK/gT1b-recv.log" \
+   && [ -z "$T1BRX" ]; then
+  ok "shrinking-source: sender stopped in ${T1BT}s with exit 2, the receiver discarded its partial and said why"
+else
+  bad "shrinking-source"
+  tail -n 3 "$WORK/gT1b-send.log" "$WORK/gT1b-recv.log"
+fi
+
 # --------------------------------------------------------- L2 tunnel gates ---
 # ssh / TCP over the data channel (docs/L2-tunnel-design.md). These run their
 # OWN fixture backend on port 8097 (NOT this suite's 8077) and are OPT-IN:

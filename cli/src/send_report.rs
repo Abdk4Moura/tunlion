@@ -71,11 +71,29 @@ pub(crate) fn delivered_as(offered: &str, stored: Option<&str>) -> Option<String
     (name != offered).then_some(name)
 }
 
+/// Above this many characters the offered name is described, not printed, in
+/// a status line. It is never cut with "...": a shortened name in "sent as
+/// xxx...xxx.txt" reads as the name the file was sent under, which it is not.
+const LONG_NAME_CHARS: usize = 80;
+
+/// How the line refers to the name that was offered, next to the stored one.
+fn sent_as(offered: &str, stored: &str) -> String {
+    let n = offered.chars().count();
+    if n <= LONG_NAME_CHARS {
+        return format!("sent as {offered}");
+    }
+    if stored.chars().count() < n {
+        format!("sent with a {n}-character name, shortened to fit there")
+    } else {
+        format!("sent with a {n}-character name")
+    }
+}
+
 /// The label of the per-file "ok" line: the stored name when it differs,
 /// followed by what was offered, so the line names a file that exists.
 pub(crate) fn summary_label(offered: &str, renamed: Option<&str>) -> String {
     match renamed {
-        Some(stored) => format!("{stored} (sent as {})", shorten(offered)),
+        Some(stored) => format!("{stored} ({})", sent_as(offered, stored)),
         None => offered.to_string(),
     }
 }
@@ -84,24 +102,11 @@ pub(crate) fn summary_label(offered: &str, renamed: Option<&str>) -> String {
 pub(crate) fn delivered_line(offered: &str, renamed: Option<&str>) -> String {
     match renamed {
         Some(stored) => format!(
-            "    {} delivered as {stored} + verified (whole-file sha256 matched)",
-            shorten(offered)
+            "    delivered as {stored} ({}) + verified (whole-file sha256 matched)",
+            sent_as(offered, stored)
         ),
         None => format!("    {offered} delivered + verified (whole-file sha256 matched)"),
     }
-}
-
-/// A long offered name, cut for a status line (the stored name is printed in full).
-fn shorten(name: &str) -> String {
-    if name.chars().count() <= 80 {
-        return name.to_string();
-    }
-    let head: String = name.chars().take(40).collect();
-    let tail: String = {
-        let v: Vec<char> = name.chars().collect();
-        v[v.len() - 20..].iter().collect()
-    };
-    format!("{head}...{tail}")
 }
 
 fn stored_for(id: &str) -> Option<String> {
@@ -251,7 +256,17 @@ mod tests {
         assert_eq!(r.len(), 240);
         let line = delivered_line(&long, Some(&r));
         assert!(line.contains(&format!("delivered as {r}")), "{line}");
-        assert!(line.len() < 400, "the offered name is shortened: {}", line.len());
+        assert!(line.len() < 400, "the offered name is described, not repeated: {}", line.len());
+        // The tester's case: a long name, shortened by the receiver. Neither
+        // line may print a cut-down "xxx...xxx" name, which reads as the name
+        // the file was sent under; the line says what happened instead.
+        let label = summary_label(&long, Some(&r));
+        for l in [&line, &label] {
+            assert!(!l.contains("..."), "no ellipsized name: {l}");
+            assert!(l.contains("300-character name, shortened to fit there"), "{l}");
+        }
+        // A short name that differs is printed in full, never cut.
+        assert_eq!(summary_label("a.txt", Some("a (1).txt")), "a (1).txt (sent as a.txt)");
         // A collision on the far side.
         assert_eq!(delivered_as("a.txt", Some("a (1).txt")).as_deref(), Some("a (1).txt"));
         // Same name, or an older receiver that does not say: unchanged lines.
