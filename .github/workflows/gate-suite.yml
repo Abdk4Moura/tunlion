@@ -173,7 +173,7 @@ jobs:
             [cli/tests/reenrol-advice-gates.sh]=3
             [cli/tests/daemon-stop-gates.sh]=4
             [cli/tests/signaling-freeze-gates.sh]=5
-            [cli/tests/config-scope-gates.sh]=3
+            [cli/tests/config-scope-gates.sh]=4
             [cli/tests/identity-relink-gates.sh]=3
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The

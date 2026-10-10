@@ -216,6 +216,9 @@ pub async fn reach_until_direct(
         }
     };
     let kind = until_direct_verdict(&last);
+    // The answer is the exit code whatever happens to the output: decide it
+    // first, so a reader that closed the pipe does not turn it into 0.
+    ui::exit_code_on_closed_pipe(kind.code());
     if !json_out {
         let verdict = match kind {
             ExitKind::StillRelayed => format!("still on relay after {timeout_s}s"),

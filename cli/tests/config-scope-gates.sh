@@ -15,8 +15,10 @@
 #   H  `env -u HOME tunlion init`: the inbox written to the config is absolute
 #      (it was `dir ./Tunlion`), and a relative --inbox is made absolute.
 #   E  output into a closed pipe (`status | true`, the reader gone before the
-#      write): exit 0 and no panic, for the human text and for --json (both
-#      exited 101 with "failed printing to stdout: Broken pipe").
+#      write): no panic, and the exit code the same command gives unpiped, for
+#      the human text and for --json (both exited 101 with "failed printing").
+#   P  the same with no daemon: `status 2>&1 | head -1` exits with status's own
+#      code (11 with the exit-code taxonomy), never 0.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
@@ -119,21 +121,46 @@ else
 fi
 
 # ===================================================================== GATE E ==
-say "E: output into a closed pipe exits 0 without a panic"
+say "E: output into a closed pipe ends quietly with the command's own exit code"
 # The reader (`true`) is gone before the first write, so every write is EPIPE.
+# The exit code must be the one the same command gives unpiped (the default
+# config's daemon is up here, so that is 0): a closed pipe changes nothing.
+dflt timeout 20 "$BIN" status >/dev/null 2>&1; rcU=$?
+dflt timeout 20 "$BIN" status --json >/dev/null 2>&1; rcUJ=$?
 { sleep 0.5; dflt timeout 20 "$BIN" status; echo $? >"$WORK/epipe-text.rc"; } 2>"$WORK/epipe-text.err" | true
 { sleep 0.5; dflt timeout 20 "$BIN" status 2>&1; echo $? >"$WORK/epipe-both.rc"; } | true
 { sleep 0.5; dflt timeout 20 "$BIN" status --json; echo $? >"$WORK/epipe-json.rc"; } 2>"$WORK/epipe-json.err" | true
 rcT=$(cat "$WORK/epipe-text.rc"); rcB=$(cat "$WORK/epipe-both.rc"); rcJ=$(cat "$WORK/epipe-json.rc")
-echo "## status | true: rc=$rcT; status 2>&1 | true: rc=$rcB; status --json | true: rc=$rcJ"
+echo "## unpiped: status rc=$rcU, --json rc=$rcUJ; status | true: rc=$rcT; status 2>&1 | true: rc=$rcB; status --json | true: rc=$rcJ"
 cat "$WORK/epipe-text.err" "$WORK/epipe-json.err" 2>/dev/null | head -4 | sed 's/^/    stderr: /'
-if [ "$rcT" = "0" ] && [ "$rcB" = "0" ] && [ "$rcJ" = "0" ] \
+if [ "$rcT" = "$rcU" ] && [ "$rcB" = "$rcU" ] && [ "$rcJ" = "$rcUJ" ] && [ "$rcU" = "0" ] \
    && ! grep -qi "panicked\|failed printing" "$WORK/epipe-text.err" "$WORK/epipe-json.err"; then
-  ok "gateE: a closed pipe ends the command quietly with exit 0"
+  ok "gateE: a closed pipe ends the command quietly with its own exit code ($rcU)"
 else
-  bad "gateE: closed pipe (rc text=$rcT both=$rcB json=$rcJ)"
+  bad "gateE: closed pipe (unpiped rc=$rcU/json $rcUJ; piped text=$rcT both=$rcB json=$rcJ)"
 fi
 
+# ===================================================================== GATE P ==
+say "P: a closed pipe keeps a nonzero answer: status with no daemon"
+# The tester's case: `tunlion status 2>&1 | head -1` with no daemon gave
+# PIPESTATUS 0 where plain `status` exits 11, so a script lost the answer. The
+# command decides its exit code before printing and a closed pipe exits with it.
+DP="$WORK/cfg-pipe"
+env FILAMENT_CONFIG_DIR="$DP" "$BIN" init --name piper --recovery-file "$WORK/piper-rec.txt" --yes >/dev/null 2>&1
+env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status >/dev/null 2>&1; rcPU=$?
+env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status --json >/dev/null 2>&1; rcPUJ=$?
+{ sleep 0.5; env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status 2>&1; echo $? >"$WORK/pipe-p.rc"; } | true
+{ sleep 0.5; env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status --json; echo $? >"$WORK/pipe-pj.rc"; } 2>"$WORK/pipe-pj.err" | true
+rcPP=$(cat "$WORK/pipe-p.rc"); rcPPJ=$(cat "$WORK/pipe-pj.rc")
+# And through `head -1`, exactly as reported.
+env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status 2>&1 | head -1 >/dev/null; rcPH=${PIPESTATUS[0]}
+echo "## no daemon: status rc=$rcPU (piped $rcPP, | head -1 $rcPH); --json rc=$rcPUJ (piped $rcPPJ)"
+if [ "$rcPP" = "$rcPU" ] && [ "$rcPH" = "$rcPU" ] && [ "$rcPPJ" = "$rcPUJ" ] \
+   && ! grep -qi "panicked\|failed printing" "$WORK/pipe-pj.err"; then
+  ok "gateP: with no daemon, a closed pipe keeps status's exit code ($rcPU)"
+else
+  bad "gateP: a closed pipe changed status's exit code (unpiped $rcPU, piped $rcPP, head -1 $rcPH; json $rcPUJ vs $rcPPJ)"
+fi
 # ===================================================================== GATE H ==
 say "H: with HOME unset, init never writes a relative inbox"
 DH="$WORK/cfg-nohome"
