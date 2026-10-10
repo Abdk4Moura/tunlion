@@ -330,8 +330,13 @@ pub(crate) async fn send_cmd(
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| p.clone())
                 });
+                // Read the whole source NOW, before anything is offered: a file
+                // that cannot be read (mode 000) used to be offered with no
+                // digest, and the send then blamed the network ("lost the
+                // receiving peer"), stalled, or reported a 0-byte "ok". A FIFO
+                // or a device never ends, so it hung here, silently.
+                let full = Some(crate::send_source::source_digest(p, &meta)?);
                 let head = head_hash(&path);
-                let full = full_hash(&path);
                 outgoing.push(Outgoing {
                     id,
                     sid,
@@ -562,6 +567,14 @@ pub(crate) async fn send_cmd(
     // displayed from our own local mint when pair-ok arrives.
     let mut send_words = String::new(); // the SPAKE2 password (only when use_code)
     let mut send_nameplate = String::new();
+    // A revoked device is refused before anything waits on it. It used to wait
+    // out the presence window and say "offline ... Is `tunlion up` running
+    // there?", sending the user to check a machine this one has cut off.
+    if let Some((n, _)) = &known_target {
+        if let Some(why) = revoked_send_refusal(n, &devices_records()) {
+            return Err(exit_codes::err(ExitKind::Denied, why));
+        }
+    }
     if let Some((n, sec)) = &known_target {
         ui::say(&format!(
             "  waiting for known device {}",
@@ -720,6 +733,11 @@ pub(crate) async fn send_cmd(
     // control message, on a healthy link it returns within a round-trip.
     let ack_reprobe = Duration::from_secs(5);
     let mut sent_all_at: Option<Instant> = None;
+    // Transfer id -> why its SOURCE could not be read mid-stream. Filled by the
+    // streaming task, read when its TransferFailed arrives: a local read
+    // failure ends the send (and cancels on the receiver), it is never treated
+    // as an interrupted link to resume.
+    let source_failed: Arc<std::sync::Mutex<HashMap<String, String>>> = Arc::new(Default::default());
     let mut ack_reprobed = false; // re-sent file-end once for the no-ack window?
     let mut reprobed_at: Option<Instant> = None;
     // Typed refusals from the receiver (disk full, a name its filesystem
@@ -1808,6 +1826,7 @@ pub(crate) async fn send_cmd(
                     // #28 test hook: the active peer's sid, so the streamer can
                     // synthesize a peer-left for it mid-flight (see stream_one).
                     let active_sid = conn.active.clone();
+                    let source_failed = source_failed.clone();
                     tokio::spawn(async move {
                         match stream_one(
                             out,
@@ -1825,7 +1844,13 @@ pub(crate) async fn send_cmd(
                             }
                             Err(e) => {
                                 // C10: surface through the loop; the transfer
-                                // stays pending and re-offers on reconnect.
+                                // stays pending and re-offers on reconnect,
+                                // unless the SOURCE failed (recorded here).
+                                if let Some(why) = crate::send_source::as_source_read(&e) {
+                                    if let Ok(mut m) = source_failed.lock() {
+                                        m.insert(id.clone(), why);
+                                    }
+                                }
                                 let _ = tx2.send(Ev::TransferFailed {
                                     id,
                                     err: e.to_string(),
@@ -1916,6 +1941,38 @@ pub(crate) async fn send_cmd(
                 _ => {}
             },
             Ev::TransferFailed { id, err } => {
+                let local = source_failed.lock().ok().and_then(|mut m| m.remove(&id));
+                if let Some(why) = local {
+                    // The source stopped being readable. Tell the receiver to
+                    // discard what it has (its partial can never be completed
+                    // from this source), then end as a local problem: exit 2,
+                    // never "lost the peer", never a resume that cannot work.
+                    let (sid, offered) = outgoing
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|o| o.id == id)
+                        .map(|o| (o.sid, o.name.clone()))
+                        .unwrap_or_default();
+                    if let Some(t) = conn.transport() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            t.send_control(&crate::send_source::cancel_msg(&id, sid, &offered, &why)),
+                        )
+                        .await;
+                        let _ = tokio::time::timeout(Duration::from_secs(2), t.flush()).await;
+                    }
+                    ui::clear_sticky();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                    return Err(exit_codes::err(
+                        ExitKind::Usage,
+                        format!(
+                            "{why}. The transfer was cancelled and the receiver told to discard \
+                             its partial (a local file problem; re-running cannot help until the \
+                             file is readable)"
+                        ),
+                    ));
+                }
                 let out = outgoing.lock().await;
                 let name = out
                     .iter()
@@ -2160,12 +2217,15 @@ pub(crate) async fn send_cmd(
                 // Do NOT claim success: the receiver may have gotten nothing. Fail
                 // honestly. The on-disk source is untouched and the outgoing entry
                 // is preserved for resume; a fresh `send`/reconnect re-offers it.
-                let names: Vec<String> = {
+                let (names, confirmed): (Vec<String>, usize) = {
                     let out = outgoing.lock().await;
-                    out.iter()
-                        .filter(|o| !o.done)
-                        .map(|o| o.name.clone())
-                        .collect()
+                    (
+                        out.iter()
+                            .filter(|o| !o.done)
+                            .map(|o| o.name.clone())
+                            .collect(),
+                        out.iter().filter(|o| o.done && !o.declined).count(),
+                    )
                 };
                 for name in &names {
                     ui::critical(&ui::paint(
@@ -2176,15 +2236,24 @@ pub(crate) async fn send_cmd(
                     ));
                 }
                 let _ = sio.disconnect().await;
-                // Bytes left and no whole-file ack came back: a partial outcome
-                // (exit 8), not a generic failure. The source is untouched.
-                return Err(exit_codes::err(
-                    ExitKind::Partial,
+                // No whole-file ack came back. With NOTHING confirmed this is the
+                // receiver gone or not answering (exit 6, unreachable): exit 8
+                // means "some moved, some did not", which a single unconfirmed
+                // file is not. Some confirmed and some not is that partial (8).
+                // The source is untouched either way.
+                let kind = crate::send_source::unconfirmed_kind(confirmed, names.len().max(1));
+                let msg = if kind == ExitKind::Partial {
                     format!(
-                        "delivery not confirmed: {} file(s) sent but never delivery-acked by the receiver (treating as unconfirmed, not delivered)",
+                        "delivery not confirmed: {confirmed} file(s) confirmed, {} sent but never delivery-acked by the receiver (treating those as not delivered)",
                         names.len().max(1)
-                    ),
-                ));
+                    )
+                } else {
+                    format!(
+                        "delivery not confirmed: the receiver is unreachable or stopped answering, and acknowledged none of the {} file(s) sent; nothing is confirmed delivered",
+                        names.len().max(1)
+                    )
+                };
+                return Err(exit_codes::err(kind, msg));
             }
         }
         // Exit when every transfer reached a terminal state (`done` = acked, or the
@@ -2409,8 +2478,16 @@ async fn stream_one(
         handles.push(tokio::spawn(async move {
             let trace =
                 cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
-            let mut f = tokio::fs::File::open(&path).await?;
-            f.seek(SeekFrom::Start(start)).await?;
+            // Every local file operation below maps its failure to a SourceRead:
+            // the source stopped being readable (a permission changed, a disk
+            // failed, the file was truncated), which no reconnect can repair.
+            use crate::send_source::source_read;
+            let mut f = tokio::fs::File::open(&path)
+                .await
+                .map_err(|e| source_read(&path, e))?;
+            f.seek(SeekFrom::Start(start))
+                .await
+                .map_err(|e| source_read(&path, e))?;
             let mut pos = start;
             // Double-buffer with tracing + batching
             let mut buf_a = vec![0u8; chunk];
@@ -2428,10 +2505,14 @@ async fn stream_one(
             } else {
                 None
             };
-            let mut cur_n = f.read(&mut buf_a[..first_want]).await?;
+            let mut cur_n = f
+                .read(&mut buf_a[..first_want])
+                .await
+                .map_err(|e| source_read(&path, e))?;
             let _first_read_us = t_first_read.map(|t| t.elapsed().as_micros()).unwrap_or(0);
             if cur_n == 0 {
-                return Ok(());
+                // End of file where the offer promised more bytes.
+                return Err(source_read(&path, format!("it ended at {pos} bytes, shorter than offered")));
             }
 
             while pos < end {
@@ -2446,16 +2527,24 @@ async fn stream_one(
                 // Fire the NEXT read (into the alternate buffer) BEFORE sending.
                 let next_want = std::cmp::min(chunk as u64, end - (pos + cur_n as u64)) as usize;
                 let next_read = if next_want > 0 {
-                    let mut f2 = tokio::fs::File::open(&path).await?;
-                    f2.seek(SeekFrom::Start(pos + cur_n as u64)).await?;
+                    let mut f2 = tokio::fs::File::open(&path)
+                        .await
+                        .map_err(|e| source_read(&path, e))?;
+                    f2.seek(SeekFrom::Start(pos + cur_n as u64))
+                        .await
+                        .map_err(|e| source_read(&path, e))?;
                     let alt_buf = if using_buf_a {
                         std::mem::replace(&mut buf_b, vec![0u8; chunk])
                     } else {
                         std::mem::replace(&mut buf_a, vec![0u8; chunk])
                     };
+                    let read_path = path.clone();
                     Some(tokio::spawn(async move {
                         let mut buf = alt_buf;
-                        let n = f2.read(&mut buf[..next_want]).await?;
+                        let n = f2
+                            .read(&mut buf[..next_want])
+                            .await
+                            .map_err(|e| source_read(&read_path, e))?;
                         Ok::<(Vec<u8>, usize), anyhow::Error>((buf, n))
                     }))
                 } else {
@@ -2522,7 +2611,13 @@ async fn stream_one(
                             using_buf_a = !using_buf_a;
                             cur_n = n;
                             if cur_n == 0 {
-                                break;
+                                // A read-ahead is only fired while bytes remain
+                                // in this range, so EOF here is a source that
+                                // got shorter than the size it was offered at.
+                                return Err(source_read(
+                                    &path,
+                                    format!("it ended at {pos} bytes, shorter than offered"),
+                                ));
                             }
                         }
                         Ok(Err(e)) => return Err(e.into()),
@@ -2713,3 +2808,52 @@ mod spool_tests {
     }
 }
 
+/// The raw device records (empty when there is no store). Read only.
+fn devices_records() -> Vec<serde_json::Value> {
+    std::fs::read_to_string(crate::devices_store::devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// The refusal for a send to a device this one has revoked, or None. A
+/// revoked device is denied (exit 4), not offline: the remedy is a decision
+/// here, not a check on the other machine. Pure over the records.
+pub(crate) fn revoked_send_refusal(name: &str, records: &[serde_json::Value]) -> Option<String> {
+    let record = records
+        .iter()
+        .find(|d| d["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))?;
+    let revoked = record["certRevoked"].as_bool() == Some(true)
+        || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED);
+    revoked.then(|| {
+        format!(
+            "'{name}' is revoked on this device, so nothing is sent to it. To let it back in: `tunlion devices restore {name}`; to drop it: `tunlion devices forget {name}`"
+        )
+    })
+}
+
+#[cfg(test)]
+mod revoked_send_tests {
+    use super::revoked_send_refusal;
+    use serde_json::json;
+
+    #[test]
+    fn a_send_to_a_revoked_device_is_refused_as_revoked() {
+        let records = vec![
+            json!({"name": "p9-b", "certRevoked": true}),
+            json!({"name": "laptop", "principalState": "revoked"}),
+            json!({"name": "desk", "certRevoked": false}),
+        ];
+        let r = revoked_send_refusal("p9-b", &records).expect("revoked is refused");
+        assert!(r.contains("revoked") && !r.contains("offline"), "{r}");
+        assert!(r.contains("tunlion devices restore p9-b"), "{r}");
+        assert!(revoked_send_refusal("LAPTOP", &records).is_some(), "durable revoke, any case");
+        assert_eq!(revoked_send_refusal("desk", &records), None);
+        assert_eq!(revoked_send_refusal("nobody", &records), None);
+        use clap::Parser;
+        for cmd in ["tunlion devices restore p9-b", "tunlion devices forget p9-b"] {
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{cmd}");
+        }
+    }
+}

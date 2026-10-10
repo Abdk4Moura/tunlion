@@ -877,6 +877,10 @@ pub(crate) async fn recv_cmd(
     };
 
     let mut paired = code.is_some();
+    // Set when the sender cancels a transfer because it could not read its own
+    // source (`file-cancel`). A one-shot receive then ends saying so, instead of
+    // holding the line for a sender that has already given up.
+    let mut sender_cancelled: Option<String> = None;
     // C24: at most one typed claim in flight, a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
@@ -1748,6 +1752,21 @@ pub(crate) async fn recv_cmd(
         // unless FILAMENT_TEST_WEDGE_LOOP is set (test-hooks builds only).
         if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
             std::future::pending::<()>().await;
+        }
+        if !daemon && !keep_open && st.by_sid.is_empty() {
+            if let Some(what) = sender_cancelled.take() {
+                ui::clear_sticky();
+                let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
+                bail!(
+                    "the sender cancelled the transfer because it could not read its file ({what}); \
+                     nothing of it was kept here{}",
+                    if st.completed > 0 {
+                        format!(" ({} other file(s) were received)", st.completed)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
         }
         let ev = tokio::select! {
             biased;
@@ -6748,6 +6767,61 @@ pub(crate) async fn recv_cmd(
                         },
                     );
                     t.send_control(&protocol::accept_msg(&id, offset)).await?;
+                }
+                // The sender could not read its own source part way through: the
+                // partial here can never be completed from it, so it is removed,
+                // never kept as junk (`unread`, `unread.part`, `unread.part.meta`
+                // were left behind before this message existed).
+                Some("file-cancel") => {
+                    let id = v["id"].as_str().unwrap_or_default().to_string();
+                    let reason: String = v["reason"]
+                        .as_str()
+                        .unwrap_or("the sender cancelled it")
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(300)
+                        .collect();
+                    let keys: Vec<(String, u32)> = st
+                        .by_sid
+                        .iter()
+                        .filter(|((p, _), inc)| *p == pid && inc.id == id)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    let remove_part = |part: &Path| {
+                        let _ = std::fs::remove_file(part);
+                        let mut meta = part.as_os_str().to_owned();
+                        meta.push(".meta");
+                        let _ = std::fs::remove_file(PathBuf::from(meta));
+                    };
+                    // The stream may already be parked (the sender's leave can
+                    // land first and flush it out of the table), so the partial
+                    // is also found by the name it was offered under.
+                    let mut names: Vec<String> = Vec::new();
+                    for k in keys {
+                        if let Some(inc) = st.by_sid.remove(&k) {
+                            if !to_stdout {
+                                remove_part(inc.part_path.as_path());
+                            }
+                            names.push(inc.name.clone());
+                        }
+                    }
+                    if names.is_empty() && !to_stdout {
+                        if let Some(raw) = v["name"].as_str() {
+                            let name = safe_incoming_name(raw);
+                            let part = dir.join(format!("{name}.part"));
+                            if part.is_file() {
+                                remove_part(part.as_path());
+                                names.push(name);
+                            }
+                        }
+                    }
+                    for name in names {
+                        ui::critical(&ui::paint(
+                            ui::Tone::Warn,
+                            &format!("  {name}: the sender cancelled it ({reason}); its partial was removed"),
+                        ));
+                        sender_cancelled = Some(format!("{name}: {reason}"));
+                    }
                 }
                 Some("file-end") => {
                     // Test hook (gate 18 standalone repro): drop the file-end

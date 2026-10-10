@@ -64,6 +64,8 @@ EXPECTED_GREEN=(
   "U1: created once|u1-implicit-init"
   "daemon waits for the network|daemon-network-wait"
   "exit codes: send missing file|exit-codes-blind-run"
+  "unreadable-source: mode-000|unreadable-source"
+  "shrinking-source: sender stopped|shrinking-source"
 )
 
 # A missing PASS line has three different causes and they want different

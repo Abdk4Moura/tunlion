@@ -36,7 +36,7 @@ pub(crate) fn offline_hint(peer: &str, successor: Option<&str>) -> String {
             "{s} is also paired here, under a newer key: if {peer} was reset and joined again, that is the same machine. Send to {s}, and replace the stale record with `tunlion devices forget {peer}` then `tunlion devices rename {s} {peer}`."
         ),
         None => format!(
-            "If {peer} was reset (its identity wiped), this key will never come back: pair it again (`tunlion add {peer}` here, `tunlion join` there), then drop the old record with `tunlion devices forget {peer}`."
+            "If {peer} was reset (its identity wiped), this key will never come back: drop the old record with `tunlion devices forget {peer}`, then pair it again under the same name (`tunlion add {peer}` here, `tunlion join` there)."
         ),
     }
 }
@@ -58,6 +58,18 @@ pub(crate) fn ago(secs: u64) -> String {
         3600..=86_399 => format!("{}h ago", secs / 3600),
         _ => format!("{}d ago", secs / 86_400),
     }
+}
+
+/// Every backticked command in a hint, in the order the hint gives them, so a
+/// test can parse and run the chain a person would.
+#[cfg(test)]
+pub(crate) fn hint_commands(text: &str) -> Vec<String> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|c| c.starts_with("tunlion "))
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -93,5 +105,28 @@ mod tests {
         let taken = name_taken_note("bravo", Some("3h ago"));
         assert!(taken.contains("last seen 3h ago") && taken.contains("bravo-2"), "{taken}");
         assert!(taken.contains("tunlion devices forget bravo"), "{taken}");
+    }
+
+    /// The re-link sentences are commands a person runs in order, so every one
+    /// must be a command the CLI accepts, not merely the right words. (That
+    /// each chain also SUCCEEDS against a store is asserted where the forget
+    /// and rename rules live, and end to end by identity-relink-gates.sh.)
+    #[test]
+    fn every_relink_hint_command_parses_in_order() {
+        use clap::Parser;
+        let hints = [
+            (offline_hint("p9-b", Some("p9-b-2")), vec!["tunlion devices forget p9-b", "tunlion devices rename p9-b-2 p9-b"]),
+            (offline_hint("p9-b", None), vec!["tunlion devices forget p9-b", "tunlion add p9-b", "tunlion join"]),
+            (name_taken_note("p9-b", None), vec!["tunlion devices forget p9-b"]),
+        ];
+        for (text, want) in hints {
+            let got = hint_commands(&text);
+            assert_eq!(got, want, "{text}");
+            for cmd in got.iter().filter(|c| c.split_whitespace().count() > 2) {
+                let argv: Vec<&str> = cmd.split_whitespace().collect();
+                crate::Cli::try_parse_from(&argv)
+                    .unwrap_or_else(|e| panic!("hint `{cmd}` does not parse: {e}"));
+            }
+        }
     }
 }
