@@ -128,7 +128,9 @@ fn marker_path() -> PathBuf {
 /// `down` is about to stop the daemon. Best effort: a read-only config dir
 /// only costs the startup message its hint.
 pub(crate) fn mark_down(pid: u32) {
-    let _ = std::fs::write(marker_path(), format!("{pid}\n"));
+    // Owner-only like everything else in the config dir: under umask 0000 a
+    // plain write left it 0666 (hostile-env gate U).
+    let _ = platform::SecretFile::write_str(&marker_path(), &format!("{pid}\n"));
 }
 
 /// Did a `tunlion down` run at or after `since`? An `up --detach` asks this
