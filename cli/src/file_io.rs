@@ -243,7 +243,6 @@ mod invitation_prefix_tests {
                 .collect();
             assert_eq!(got, digest, "frozen invitation prefix {name} changed");
         }
-        }
     }
 }
 
