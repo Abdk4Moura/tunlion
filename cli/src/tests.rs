@@ -4896,7 +4896,7 @@ fn a_relay_peer_that_went_silent_is_not_present() {
 fn a_roster_announcement_does_not_refresh_last_seen() {
     let src = include_str!("recv_cmd.rs");
     let at = src
-        .find("appeared, connecting\"")
+        .find("known device '{n}' appeared, connecting\"")
         .expect("the known-device announcement branch exists");
     let branch = &src[at..];
     let branch = &branch[..branch.find("} else {").expect("branch end")];
