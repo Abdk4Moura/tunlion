@@ -27,9 +27,15 @@
 #      any the log collapsed. The storm wrote ~150 a minute.
 #   4  A -> B send works after the resume, byte-exact.
 #
-# The backend runs with the server's production ping settings (10 s timeout,
-# 5 s interval) rather than the 120 s the other fixtures use: the server has to
-# actually drop the frozen socket for the freeze to mean anything.
+# WHICH SERVER SETTINGS, measured. Production runs FIL_PING_TIMEOUT=60 and
+# FIL_PING_INTERVAL=25 (deploy/docker-compose.yml), so a socket frozen for 80 s
+# is usually still OPEN at the server when the daemon resumes. That is the
+# case that seeds the storm: the old socket is alive, the silence watchdog
+# re-dials over it, and its close arrives after the new connection is up. With
+# the backend's own 10 s/5 s defaults the server has already dropped the frozen
+# socket, its close reaches the daemon first, and unfixed main recovered with
+# one clean reconnect (two baseline runs). So this backend keeps the socket
+# for the whole freeze (120 s timeout, 25 s interval, as the other fixtures).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
@@ -58,7 +64,7 @@ command -v ss >/dev/null || { echo "REFUSED: gate 2 counts connections with ss, 
 for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
 sleep 1
 ( cd "$CLI_DIR/../backend" && PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=10 FIL_PING_INTERVAL=5 \
+    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
     "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
 pids+=($!)
 for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
@@ -130,6 +136,41 @@ fi
 pre_ports="$(conn_ports "$BPID" | tr '\n' ' ')"
 echo "## B daemon pid $BPID, connections to the server before the freeze: [$pre_ports]"
 
+# THE PEER LINK IS PART OF THE REPRODUCTION. The finding was a daemon frozen
+# "while a peer is connected", and the link is what seeds the storm: on resume
+# its QUIC idle timer fires at once, so a link event reaches the loop between
+# the silence probe and the old socket's close, the watchdog re-dials first,
+# and the late close then tears down the fresh connection. Measured: with no
+# held link (the one-shot send above closes its own) the unfixed daemon made
+# one clean reconnect, so without this precondition the gate proves nothing.
+held=""
+for _ in $(seq 1 60); do
+  held=$("$PYV" - "$DB/control.sock" <<'PY'
+import json, socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(sys.argv[1])
+    s.sendall(b'{"op":"list-warm"}\n'); buf = b""
+    while not buf.endswith(b"\n"):
+        c = s.recv(65536)
+        if not c:
+            break
+        buf += c
+    links = json.loads(buf).get("links", [])
+    print(" ".join(sorted(l.get("name") or "?" for l in links)))
+except Exception:
+    print("")
+PY
+)
+  [ -n "$held" ] && break
+  sleep 1
+done
+if [ -z "$held" ]; then
+  echo "REFUSED: B never held a link to boxA within 60s, so the freeze would not reproduce the finding"
+  tail -20 "$WORK/B-up.log"; tail -20 "$WORK/A-up.log"
+  exit 2
+fi
+echo "## B holds a link to: $held"
+
 # ============================================================= GATE 1 ==
 say "1: SIGSTOP ${FREEZE_SECS}s, SIGCONT, and the link comes back"
 log_lines_before=$(wc -l <"$WORK/B-up.log")
@@ -188,7 +229,8 @@ fi
 # ============================================================= GATE 3 ==
 say "3: the log does not grow with every cycle"
 tail -n +"$((log_lines_before + 1))" "$WORK/B-up.log" >"$WORK/B-after.log"
-grep -i "reconnect" "$WORK/B-after.log" | head -12 | sed 's/^/    /'
+echo "## B's log from the resume (first 20 lines):"
+head -20 "$WORK/B-after.log" | sed 's/^/    /'
 lines=$(grep -ci "reconnecting\|reconnected" "$WORK/B-after.log" || true)
 collapsed=$(grep -oE "and [0-9]+ more like it" "$WORK/B-after.log" | awk '{s+=$2} END{print s+0}')
 total=$(( lines + ${collapsed:-0} ))
