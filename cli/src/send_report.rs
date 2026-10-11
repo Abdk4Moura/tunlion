@@ -193,6 +193,35 @@ pub(crate) fn persist_history(peer: Option<&str>) {
     crate::transfer_history::append(&history_records(&files, peer));
 }
 
+/// What the history calls each source a send was given: `-` is stdin (under
+/// `--name` when given), anything else its file name. Pure.
+pub(crate) fn source_labels(paths: &[String], name: Option<&str>) -> Vec<String> {
+    paths
+        .iter()
+        .map(|p| {
+            if p == "-" {
+                name.unwrap_or("stdin").to_string()
+            } else {
+                std::path::Path::new(p)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.clone())
+            }
+        })
+        .collect()
+}
+
+/// A send that failed before it offered any file (nothing reached
+/// `record`) still belongs in the history: one failed record per source,
+/// with the reason. Called after `persist_history`, only on failure.
+pub(crate) fn persist_unoffered(peer: Option<&str>, sources: &[String], err: &anyhow::Error) {
+    let offered = LAST.lock().map(|l| !l.is_empty()).unwrap_or(true);
+    if offered {
+        return;
+    }
+    crate::transfer_history::append_unoffered(peer, sources, &format!("{err:#}"));
+}
+
 /// History records for these files. Pure.
 pub(crate) fn history_records(
     files: &[FileReport],
@@ -325,6 +354,13 @@ pub(crate) fn emit(res: Result<()>, peer: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_sends_sources_are_named_for_the_history() {
+        let paths = vec!["-".to_string(), "/tmp/dir/a.txt".to_string()];
+        assert_eq!(source_labels(&paths, None), ["stdin", "a.txt"]);
+        assert_eq!(source_labels(&paths, Some("log.txt")), ["log.txt", "a.txt"]);
+    }
 
     fn one(name: &str, bytes: u64) -> FileReport {
         FileReport {

@@ -221,6 +221,12 @@ pub(crate) fn classify_text(s: &str) -> ExitKind {
     if any(&["no identity yet", "no identity. run"]) {
         return ExitKind::NoIdentity;
     }
+    // A confirmation a script did not pre-answer (UiCapability::confirm): the
+    // command line is missing -y/--yes, which is a usage error, not a failure
+    // of the work. It was 1, the catch-all.
+    if s.contains("without --yes") {
+        return ExitKind::Usage;
+    }
     if is_local_resource_text(&s) {
         return ExitKind::LocalResource;
     }
@@ -787,6 +793,20 @@ mod tests {
             "the receiver's disk is not this machine's"
         );
         assert_eq!(classify_text("permission denied (os error 13)"), ExitKind::Denied);
+    }
+
+    /// E2: `add --for beta --allow shell` from a script failed "refusing to
+    /// include deliberate remote authority ... without --yes" with exit 1. A
+    /// missing flag is usage: 2.
+    #[test]
+    fn a_missing_yes_is_a_usage_error() {
+        for c in [
+            "refusing to include deliberate remote authority in this invitation ceiling without --yes (non-interactive)",
+            "refusing to shut down the daemon without --yes (non-interactive)",
+        ] {
+            assert_eq!(classify_text(c), ExitKind::Usage, "{c}");
+            assert_eq!(classify_text(c).code(), 2, "{c}");
+        }
     }
 
     /// J6: every verb's --help lists what it can return. Cross-checked
