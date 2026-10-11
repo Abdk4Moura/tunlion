@@ -2701,7 +2701,7 @@ pub(crate) async fn recv_cmd(
                             &revoked_secrets,
                             &crate::revocation_live::key_listed,
                         ) {
-                            doomed.push((pid.clone(), l.label().to_string()));
+                            doomed.push((pid.clone(), l.shown().to_string()));
                         } else if crate::revocation_live::route_must_withdraw(
                             l.identity_device_pub.as_ref(),
                             &device_cert_revoked,
