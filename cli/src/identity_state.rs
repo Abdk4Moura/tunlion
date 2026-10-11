@@ -359,12 +359,14 @@ pub(crate) fn reenrol_steps(device: &str, owner: &str, capability: &str, ceiling
     let pad = " ".repeat(w);
     format!(
         "To give {device} {capability}, enrol it again with {capability} in its invitation:\n  \
-         {on_owner:<w$}  tunlion devices forget {device}\n  \
-         {pad}  tunlion add --for {device} --allow {caps} --out {invite}\n  \
-         {on_device:<w$}  tunlion down\n  \
+         {on_owner:<w$}  tunlion devices forget {device} -y\n  \
+         {pad}  tunlion add --for {device} --allow {caps} --out {invite} --yes\n  \
+         {pad}  (copy {invite} to {device})\n  \
+         {on_device:<w$}  tunlion down -y\n  \
          {pad}  tunlion reset -y\n  \
          {pad}  tunlion join --invite-file {invite} --name {device}\n  \
-         (reset clears {device}'s local tunlion state; it rejoins under the same name)"
+         {pad}  tunlion up --detach\n  \
+         (reset clears {device}'s local tunlion state; the forget freed its name, so it rejoins as {device})"
     )
 }
 
