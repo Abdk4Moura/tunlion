@@ -920,13 +920,13 @@ pub(crate) fn spawn_cleanup_on_signal(dir: std::path::PathBuf) -> tokio::task::J
                 _ = terminate.recv() => 143,
             };
             let _ = std::fs::remove_dir_all(&dir);
-            std::process::exit(code);
+            crate::exit_codes::interrupted_exit(code);
         }
         #[cfg(not(unix))]
         {
             if tokio::signal::ctrl_c().await.is_ok() {
                 let _ = std::fs::remove_dir_all(&dir);
-                std::process::exit(130);
+                crate::exit_codes::interrupted_exit(130);
             }
         }
     })

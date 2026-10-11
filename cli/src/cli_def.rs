@@ -80,9 +80,13 @@ EXIT CODES
   9    this device has no identity yet (init, or join an invitation)
   10   up: a daemon is already running with different settings (not applied)
   11   status: no daemon is running for this config directory
-  130  interrupted
-  exec passes the remote command's own exit status through.
-  With --json, a failure is one JSON object on stdout:
+  12   a resource on this machine ran out (disk full, quota, open files, memory)
+  130  interrupted (SIGINT); 143 terminated (SIGTERM)
+  exec passes the remote command's own exit status through; 127 when the
+  command is not on the remote PATH, 126 when it cannot be executed there,
+  141 when this side's output was closed before it finished (`| head`).
+  Every command's own --help lists the codes it can return.
+  With --json, a failure is one JSON object on stdout (an interrupt too):
   {\"ok\":false,\"error\":{\"code\":\"unknown_device\",\"exit\":3,\"message\":\"...\"}}";
 
 #[derive(Parser)]
@@ -444,8 +448,8 @@ pub(crate) enum Cmd {
         #[arg(short = 'f', long)]
         follow: bool,
         /// Show only the last N lines before following/stopping (default 20;
-        /// 0 = live only, never replay history).
-        #[arg(long, default_value_t = 20)]
+        /// 0 = live only, never replay history). The log goes to stdout.
+        #[arg(short = 'n', long, visible_alias = "lines", default_value_t = 20)]
         tail: usize,
     },
     ///
@@ -800,6 +804,10 @@ pub(crate) enum Cmd {
         /// Print the plan (what would move) and move nothing
         #[arg(long, short = 'n')]
         dry_run: bool,
+        /// Machine output as NDJSON: one record per file as it happens, then
+        /// the summary. (`--json` prints one document with the files listed.)
+        #[arg(long)]
+        json_lines: bool,
     },
     /// Open a shell on a device.
     ///

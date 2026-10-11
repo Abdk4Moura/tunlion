@@ -218,7 +218,12 @@ test holds to the help text.
 | 9 | `no_identity` | this device has no identity yet: `tunlion init`, or `tunlion join <invitation>` |
 | 10 | | `up`: a daemon is already running with different settings; nothing was applied, and the message names the restart (`DAEMON_CONFLICT`) |
 | 11 | | `status`: no daemon is running for this config directory (`STATUS_NOT_RUNNING`) |
-| 130 | | interrupted |
+| 12 | `local_resource` | a resource on THIS machine ran out: its disk or quota is full, it has no file descriptors or memory left (a full stdin spool, `add --out` onto a full disk). A receiver's full disk is 4, the peer refusing, with `error.reason: "no_space"` |
+| 126 | | `exec`: the remote command was found but cannot be executed there |
+| 127 | | `exec`: the remote command is not on the remote daemon's PATH |
+| 130 | `interrupted` | interrupted (SIGINT) |
+| 141 | | this side's output was closed before an ACTION finished (`send ... \| head -1`); see "A closed pipe" |
+| 143 | `interrupted` | terminated (SIGTERM) |
 
 Rules that go with them:
 
@@ -258,9 +263,62 @@ Rules that go with them:
   owner key or joined someone else's is a separate field, `role`: `"owner"`,
   `"joined-device"`, or null.
 - **Every `--json` success carries `"ok": true`** (and `verb`), the mirror of
-  the failure envelope. `devices --json` and `set --json` print an array and
-  stay arrays; each `devices` entry carries a live `online` (the daemon holds a
-  link to it and it answered a liveness ping just now).
+  the failure envelope, and `ok` is true exactly when the exit code is 0.
+  `set --json` prints an array and stays one.
+- **`devices --json` is the envelope, schema 2**:
+  `{"ok":true,"verb":"devices","schema":2,"data":{"devices":[...]}}`. The rows
+  are unchanged one level down. COMPATIBILITY: schema 1 (every release before
+  this) printed the bare array; a script reading `.[]` reads
+  `.data.devices[]` now, and one that must handle both can test
+  `type == "array"`. Each row's `online` comes from the same rule the human
+  list uses (the daemon holds a link to it and it answered a liveness ping just
+  now): `true`/`false`, or `null` when no daemon answers and nothing can know.
+  It used to be computed separately and said `false` beside a human row that
+  said online.
+- **Every verb's `--help` ends in EXIT CODES**, the codes that verb can
+  return, generated from one table in `exit_codes.rs`
+  (`verb_exit_codes`). A unit test cross-checks the table against every
+  `ExitKind` the verb's source names, so a new error path cannot add a code
+  its help does not list.
+- **An interrupt under `--json` is a failure object too.** SIGINT (130) and
+  SIGTERM (143), for every verb:
+  `{"ok":false,"verb":"send","error":{"code":"interrupted","exit":130,"signal":"SIGINT","message":"interrupted (SIGINT) before it finished"}}`.
+  It is printed once, and never after the verb already printed its answer.
+- **`reach --json` with no warm link** reports the cold probe as what it is:
+  `warm: false`, `link: "cold"`, `connect_ms` (the measured establish), and
+  `data` filled from the path the probe link took (`route`, `direct`, `addr`,
+  `connect_ms`). `data.rtt_ms` is null on a cold probe: an establish time is
+  not a round trip. A probe that did not connect has `link: "none"`.
+- **A refusal carries its typed reason in `--json`.** Each `send --json` file
+  has `refusal`: null when delivered, else `{"reason","message"}` with the
+  receiver's token (`no_space`, `name_too_long`, `read_only`, `permission`,
+  `io`, `inbox_missing`, ...) or `declined` for a plain no, and its sentence
+  ("receiver is out of disk space for a.bin (needs 2.9 MiB, has 980.0 KiB)").
+  `error.message` names the refusals, and `error.reason` is the token when one
+  kind of refusal failed the send. It said `"message": "failed (denied)"`.
+- **`exec` exit codes.** The remote command's own status passes through. 127
+  when the command is not on the remote daemon's PATH and 126 when it is there
+  but cannot be executed: the codes a shell uses, produced locally from the
+  remote daemon's refusal (it used to be 4, "denied"). 141 when this side's
+  stdout was closed before the remote command finished (`exec ... | head -2`;
+  it was 1 with "Error: Broken pipe"). Tunlion's own failures use the table, so
+  a remote status equal to one of them is ambiguous; the stderr line says
+  which.
+- **`sync --json` is one document** like every other verb:
+  `{"ok","verb":"sync","data":{"counts":{...},"bytes":{...},"files":[...],...}}`.
+  `--json-lines` is the explicit NDJSON mode: one `{"ok":true,"verb":"sync","data":{"file","state","bytes"}}`
+  record per file as it happens, then the summary (without `files`). The
+  counters: `counts.total` is every local entry (regular files plus entries
+  skipped while walking) and `sent + updated + same + skipped + failed`
+  (`+ would_send + would_update` on a dry run) equals it; `deleted` and
+  `would_delete` count REMOTE files and are outside `total`. `bytes.total` is
+  the tree's size, `bytes.moved` what was sent and acknowledged (0 on a dry
+  run, failed files excluded), `bytes.would_move` the dry run's answer. The
+  schema-1 `moved`/`total` keys stay, and are bytes; the per-state counts also
+  stay flat beside them.
+- **`logs` is data**: the log lines go to stdout (`logs | grep`, `logs -n 100`,
+  `logs -f`); "no log yet" and "detached" stay on stderr. `-n`/`--lines` is
+  `--tail`.
 - **`reach` confirms liveness.** A warm link is reported only after the peer
   answers a `reach-ping` on it (1.5 s, FILAMENT_REACH_PING_MS); a peer stopped
   or killed keeps its link "alive" locally until QUIC's idle timeout, so with

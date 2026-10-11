@@ -128,7 +128,7 @@ jobs:
           declare -A EXPECT=(
             [cli/tests/ssh-ca-gates.sh]=8
             [cli/tests/exec-gates.sh]=14
-            [cli/tests/sync-gates.sh]=17
+            [cli/tests/sync-gates.sh]=18
             # 23 gate slots (FORGET-REFUSED, from #385, is the 23rd). This was 24 while gateRECON existed, but RECON read
             # AUTH-A's own exec result and printed a second PASS for it, so one
             # observation counted twice; it was removed and its honest-vs-silent

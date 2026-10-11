@@ -7592,7 +7592,7 @@ pub(crate) async fn recv_cmd(
                 // The signal task already armed a force-exit; cap the disconnect so
                 // we exit cleanly on our own well inside that grace.
                 let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-                std::process::exit(130);
+                crate::exit_codes::interrupted_exit(130);
             }
             // P0 (GAP-1): the inbound transfer stalled (zero bytes, link alive).
             // The receiver participates in the SYMMETRIC direct-QUIC repair: it
