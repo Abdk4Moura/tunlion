@@ -546,6 +546,24 @@ stream kinds are refused, never misinterpreted.
   the session); only the exec-close frame ends the stream. The receiver
   serves each accepted open as a detached task, so one session's lifetime
   never blocks the daemon's event loop or another stream.
+- LIFETIME: a served command never outlives its initiator. The receiver
+  spawns it as the leader of a process group of its own and ends the WHOLE
+  group (SIGHUP, then SIGTERM, then SIGKILL, ~1.5 s apart; taskkill /T on
+  Windows) when the initiator closes the stream (`l2-close` for `sid`), when
+  the link carrying it dies, or when an initiator that announced heartbeats
+  stops sending them. The output read ends are closed first, so a command
+  still writing gets EPIPE/SIGPIPE at once, as under a closed local pipe.
+  After an initiator-requested close the receiver answers with
+  `exec-close { sid, status, ended: "initiator-closed" }`.
+- `exec-open` MAY carry `alive_ms` (the initiator sends 2000): a promise of
+  `{ type: "exec-alive", sid }` at that interval. Silence for six beats
+  (bounded to 10..60 s) ends the session as above. An open without it is
+  held to its link alone (older initiators).
+- `{ type: "exec-signal", sid, signal: "INT" | "TERM" | "HUP" | "KILL" }` --
+  the initiator was interrupted: the receiver delivers that signal to the
+  whole group at once. The initiator's `l2-close` follows and ends whatever
+  ignores it. Unknown signal names are ignored. Both frames are routed only
+  through the sending peer's own streams, by sid.
 - SHELL GATE: an exec stream is allowed exactly where a shell is allowed.
   The receiver enforces the same gate as `up --shell`, and `--shell-only
 a,b` scopes it to the listed peers/devices identically: a peer outside the

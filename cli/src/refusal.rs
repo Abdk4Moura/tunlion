@@ -164,10 +164,12 @@ impl Refusal {
 /// plumbing carries only the string).
 pub(crate) fn code_from_reason(reason: &str) -> Option<Code> {
     let r = reason.trim();
-    if r == crate::capability::SHELL_OFF_REASON {
+    // By prefix: older peers send the same cause with a different tail (the
+    // retired "run `tunlion up --shell`" advice), and it is the same cause.
+    if r.starts_with(crate::capability::SHELL_OFF_PREFIX) {
         return Some(Code::ShellOff);
     }
-    if r == crate::capability::TUNNEL_OFF_REASON {
+    if r.starts_with(crate::capability::TUNNEL_OFF_PREFIX) {
         return Some(Code::TunnelOff);
     }
     if r == crate::capability::CEILING_REASON {
@@ -302,6 +304,13 @@ pub(crate) fn remedy(code: Code, peer: &str, me: &str) -> (String, Option<String
 /// The re-enrolment that widens this device's ceiling, as `on X:  command`
 /// lines in the order they must run. `--allow` replaces the default ceiling,
 /// so the defaults (transfer, mount) are carried over.
+///
+/// Every command runs EXACTLY as printed from a script: the confirmations
+/// carry `-y`/`--yes` (a pipe has no terminal to answer them, and the old
+/// `add` and `down` lines failed there), and the last step starts the daemon
+/// again, without which the next `exec` waited 45 s for a device that was
+/// not listening. The one line that is not a command (moving the invitation)
+/// is in parentheses. cli/tests/reenrol-advice-gates.sh runs these lines.
 pub(crate) fn ceiling_steps(peer: &str, me: &str) -> Vec<String> {
     let invite = format!("{me}-invite.txt");
     let owner = format!("on '{peer}':");
@@ -309,25 +318,33 @@ pub(crate) fn ceiling_steps(peer: &str, me: &str) -> Vec<String> {
     let w = owner.len().max(here.len());
     let pad = " ".repeat(w);
     vec![
-        format!("{owner:<w$}  tunlion devices forget {me}"),
-        format!("{pad}  tunlion add --for {me} --allow transfer,mount,shell --out {invite}"),
-        format!("{here:<w$}  tunlion down"),
+        format!("{owner:<w$}  tunlion devices forget {me} -y"),
+        format!("{pad}  tunlion add --for {me} --allow transfer,mount,shell --out {invite} --yes"),
+        format!("{pad}  (copy {invite} to this device)"),
+        format!("{here:<w$}  tunlion down -y"),
         format!("{pad}  tunlion reset -y"),
         format!("{pad}  tunlion join --invite-file {invite} --name {me}"),
+        format!("{pad}  tunlion up --detach"),
     ]
 }
 
 /// One user-facing explanation: "<verb> refused by 'peer': reason" plus the
 /// matching remedy. `as_name` falls back to this device's display name.
 pub(crate) fn explain(verb: &str, peer: &str, reason: &str, code: Option<Code>, as_name: Option<&str>) -> String {
-    let head = format!("'{peer}' refused {verb}: {reason}");
     let Some(code) = code.or_else(|| code_from_reason(reason)) else {
-        return head;
+        return format!("'{peer}' refused {verb}: {reason}");
     };
+    // An older peer's "serving is off" carried its own (wrong) command, which
+    // would sit above the right one; say the cause in this build's words.
+    let reason = match code {
+        Code::ShellOff | Code::TunnelOff => Refusal::new(code, None).reason,
+        _ => reason.to_string(),
+    };
+    let head = format!("'{peer}' refused {verb}: {reason}");
     let fallback = crate::display_name();
     let me = as_name
         .map(str::to_string)
-        .or_else(|| name_from_reason(reason))
+        .or_else(|| name_from_reason(&reason))
         .unwrap_or(fallback);
     match remedy(code, peer, &me) {
         (text, Some(cmd)) => format!("{head}\n  {text}\n    {cmd}"),
@@ -412,6 +429,37 @@ mod tests {
         assert_eq!(from_frame(&old, "err").0, Some(Code::ShellOff));
     }
 
+    /// E3: "refused exec: shell serving is off there; run `tunlion up --shell`
+    /// on that device" followed by "grant this device: tunlion grant alpha
+    /// shell" was two contradictory fixes, and the first one refuses without
+    /// --i-know. Serving is off exactly when no device holds a grant, so the
+    /// grant is the one fix, and the reason says why rather than prescribing
+    /// a different command.
+    #[test]
+    fn serving_off_says_why_and_gives_only_the_grant() {
+        for (code, reason) in [
+            (Code::ShellOff, crate::capability::SHELL_OFF_REASON),
+            (Code::TunnelOff, crate::capability::TUNNEL_OFF_REASON),
+        ] {
+            assert!(!reason.contains("up --shell"), "{reason}");
+            assert!(!reason.contains("FILAMENT_L2"), "{reason}");
+            let msg = explain("exec", "beta", reason, Some(code), Some("alpha"));
+            assert!(!msg.contains("up --shell"), "{msg}");
+            assert_eq!(msg.matches("tunlion ").count(), 1, "{msg}");
+            assert!(msg.contains("tunlion grant alpha shell"), "{msg}");
+        }
+        // What older peers send is still the same cause.
+        for legacy in [
+            "shell serving is off there; run `tunlion up --shell` on that device",
+            "tunnelling is off there; run `tunlion up --shell` (or set FILAMENT_L2=1) on that device",
+        ] {
+            assert!(code_from_reason(legacy).is_some(), "{legacy}");
+            let msg = explain("exec", "beta", legacy, None, Some("alpha"));
+            assert!(msg.contains("tunlion grant alpha shell"), "{msg}");
+            assert!(!msg.contains("up --shell"), "{msg}");
+        }
+    }
+
     /// The ceiling remedy is a sequence, and every step in it is a command the
     /// CLI accepts, in the order that works: the old single step (`add --for
     /// <me> --allow shell`) produced an invitation the joined device refused.
@@ -421,23 +469,29 @@ mod tests {
         let steps = ceiling_steps("p1-a", "p1-b");
         let cmds: Vec<String> = steps
             .iter()
-            .map(|l| l[l.find("tunlion").unwrap()..].to_string())
+            .filter_map(|l| l.find("tunlion ").map(|i| l[i..].to_string()))
             .collect();
         assert_eq!(
             cmds,
             [
-                "tunlion devices forget p1-b",
-                "tunlion add --for p1-b --allow transfer,mount,shell --out p1-b-invite.txt",
-                "tunlion down",
+                "tunlion devices forget p1-b -y",
+                "tunlion add --for p1-b --allow transfer,mount,shell --out p1-b-invite.txt --yes",
+                "tunlion down -y",
                 "tunlion reset -y",
                 "tunlion join --invite-file p1-b-invite.txt --name p1-b",
+                "tunlion up --detach",
             ]
         );
+        // Every line is a command or a parenthesised instruction: nothing a
+        // script would run by mistake.
+        for l in &steps {
+            assert!(l.contains("tunlion ") || l.trim_start().starts_with('(') || l.contains("  ("), "{l}");
+        }
         for cmd in &cmds {
             let argv: Vec<&str> = cmd.split_whitespace().collect();
             assert!(crate::Cli::try_parse_from(&argv).is_ok(), "step does not parse: {cmd}");
         }
-        assert!(steps[0].contains("on 'p1-a':") && steps[2].contains("on this device:"));
+        assert!(steps[0].contains("on 'p1-a':") && steps[3].contains("on this device:"));
         let msg = explain("exec", "p1-a", crate::capability::CEILING_REASON, Some(Code::Ceiling), Some("p1-b"));
         for cmd in &cmds {
             assert!(msg.contains(cmd.as_str()), "{msg}");

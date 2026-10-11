@@ -162,6 +162,12 @@ pub struct Mux {
     /// be swallowed into a clean close. Entries for streams that never read them
     /// linger only until link death (`shutdown_all`), bounded and harmless.
     close_err: Mutex<HashMap<u32, String>>,
+    /// Acceptor only: per-sid control channel into a served exec session
+    /// (`exec-alive` heartbeats, `exec-signal` from the initiator). Keyed by
+    /// the sid on THIS peer's mux, so one peer can never reach another's
+    /// session. Bounded: a peer that floods heartbeats loses the extras, never
+    /// the daemon's memory. Dropped with the stream on every teardown path.
+    exec_ctl: Mutex<HashMap<u32, mpsc::Sender<crate::exec_recv::ExecCtl>>>,
 }
 
 impl Mux {
@@ -174,6 +180,7 @@ impl Mux {
             resizers: Mutex::new(HashMap::new()),
             open_ack_tx: Mutex::new(HashMap::new()),
             close_err: Mutex::new(HashMap::new()),
+            exec_ctl: Mutex::new(HashMap::new()),
         })
     }
 
@@ -262,6 +269,7 @@ impl Mux {
     pub(crate) async fn drop_stream(&self, sid: u32) {
         self.resizers.lock().await.remove(&sid);
         self.open_ack_tx.lock().await.remove(&sid);
+        self.exec_ctl.lock().await.remove(&sid);
         if let Some(s) = self.streams.lock().await.remove(&sid) {
             if let Some(h) = s.read_pump {
                 h.abort();
@@ -393,6 +401,26 @@ impl Mux {
         self.drop_stream(sid).await;
     }
 
+    /// Acceptor: open the control channel for the exec session on `sid`.
+    pub(crate) async fn register_exec_ctl(
+        &self,
+        sid: u32,
+    ) -> mpsc::Receiver<crate::exec_recv::ExecCtl> {
+        let (tx, rx) = mpsc::channel(16);
+        self.exec_ctl.lock().await.insert(sid, tx);
+        rx
+    }
+
+    /// Acceptor: deliver an initiator's `exec-alive`/`exec-signal` to the
+    /// session on `sid`. A frame for no live session is dropped, as is one
+    /// that finds the session's small queue full (heartbeats are idempotent,
+    /// and a signal is followed by the initiator's l2-close anyway).
+    pub(crate) async fn exec_control(&self, sid: u32, msg: crate::exec_recv::ExecCtl) {
+        if let Some(tx) = self.exec_ctl.lock().await.get(&sid) {
+            let _ = tx.try_send(msg);
+        }
+    }
+
     /// Take the mid-session close reason for a stream, if one was recorded, so the
     /// caller can distinguish "the peer revoked us" from "the shell exited".
     pub async fn take_close_err(&self, sid: u32) -> Option<String> {
@@ -404,6 +432,7 @@ impl Mux {
     pub async fn shutdown_all(&self) {
         self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
         self.open_ack_tx.lock().await.clear();
+        self.exec_ctl.lock().await.clear();
         self.close_err.lock().await.clear();
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {

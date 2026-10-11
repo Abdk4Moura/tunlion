@@ -330,6 +330,127 @@ pub async fn termination_signal() -> i32 {
     }
 }
 
+// ------------------------------------------------- remote process trees --
+
+/// Start a spawned command as the leader of a process group of its own, so the
+/// whole tree it forks (a shell's children, a pipeline) can be signalled as one
+/// and nothing it started survives the session that asked for it. Without this
+/// a remote `sh -c 'a | b'` could only be ended one pid at a time, and the
+/// grandchildren kept running as children of the daemon. A no-op where there
+/// are no process groups; there the leader alone is ended.
+pub fn own_process_group(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// The signals a served remote command can be sent as a whole tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeSignal {
+    /// The terminal went away (the initiator is gone).
+    Hangup,
+    /// The initiator's user pressed Ctrl-C.
+    Interrupt,
+    /// Asked to stop.
+    Terminate,
+    /// Ended now; cannot be caught.
+    Kill,
+}
+
+impl TreeSignal {
+    /// The wire name (`exec-signal`'s `signal`), shared by both ends.
+    pub fn wire(self) -> &'static str {
+        match self {
+            TreeSignal::Hangup => "HUP",
+            TreeSignal::Interrupt => "INT",
+            TreeSignal::Terminate => "TERM",
+            TreeSignal::Kill => "KILL",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<TreeSignal> {
+        Some(match s {
+            "HUP" => TreeSignal::Hangup,
+            "INT" => TreeSignal::Interrupt,
+            "TERM" => TreeSignal::Terminate,
+            "KILL" => TreeSignal::Kill,
+            _ => return None,
+        })
+    }
+}
+
+/// Signal every process in the group `pgid` leads (see [`own_process_group`]).
+/// Ok(false) when no process of that group exists any more. On Windows the
+/// tree is ended with taskkill /T (forcefully for `Kill`); the gentler signals
+/// have no console-less equivalent, so they ask without /F.
+pub fn signal_process_group(pgid: u32, sig: TreeSignal) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let s = match sig {
+            TreeSignal::Hangup => libc::SIGHUP,
+            TreeSignal::Interrupt => libc::SIGINT,
+            TreeSignal::Terminate => libc::SIGTERM,
+            TreeSignal::Kill => libc::SIGKILL,
+        };
+        if pgid == 0 || pgid > i32::MAX as u32 {
+            return Ok(false);
+        }
+        if unsafe { libc::kill(-(pgid as libc::pid_t), s) } == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(e)
+        }
+    }
+    #[cfg(windows)]
+    {
+        let pid = pgid.to_string();
+        let mut args = vec!["/T", "/PID", pid.as_str()];
+        if sig == TreeSignal::Kill {
+            args.insert(0, "/F");
+        }
+        let st = std::process::Command::new("taskkill")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        Ok(st.success())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pgid, sig);
+        Err(std::io::Error::other("cannot signal processes on this platform"))
+    }
+}
+
+/// Does any process of group `pgid` still exist? Unix asks the kernel (signal
+/// 0); elsewhere there is no group to ask about, so the answer is no and the
+/// caller relies on the leader's own exit. A zombie leader counts as present
+/// until it is reaped, so callers reap before asking.
+pub fn process_group_alive(pgid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pgid == 0 || pgid > i32::MAX as u32 {
+            return false;
+        }
+        unsafe { libc::kill(-(pgid as libc::pid_t), 0) == 0 }
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        false
+    }
+}
+
 // ------------------------------------------------------------ SecretFile --
 
 // The safe restricted-file writer now lives in the standalone `secret-write`
@@ -1256,6 +1377,56 @@ impl ShellHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_signal_wire_names_round_trip() {
+        for s in [
+            TreeSignal::Hangup,
+            TreeSignal::Interrupt,
+            TreeSignal::Terminate,
+            TreeSignal::Kill,
+        ] {
+            assert_eq!(TreeSignal::from_wire(s.wire()), Some(s), "{s:?}");
+        }
+        assert_eq!(TreeSignal::from_wire("STOP"), None);
+        assert_eq!(TreeSignal::from_wire(""), None);
+    }
+
+    /// The property E1 rests on: a command started in its own group can be
+    /// ended as a whole, its forked children included. Before, only the
+    /// leader was killed and a `sh -c 'sleep & ...'` child kept running as a
+    /// child of the daemon.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_group_ends_as_a_whole() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg("sleep 300 & sleep 300; wait");
+            own_process_group(&mut cmd);
+            let mut child = cmd.spawn().expect("spawn sh");
+            let pgid = child.id().expect("pid");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(process_group_alive(pgid), "the group exists while it runs");
+            assert!(signal_process_group(pgid, TreeSignal::Hangup).unwrap());
+            let _ = child.wait().await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while process_group_alive(pgid) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            // Backgrounded sleeps are reparented to init and reaped there, so
+            // a group that still answers after 5 s is a real survivor.
+            let survived = process_group_alive(pgid);
+            if survived {
+                let _ = signal_process_group(pgid, TreeSignal::Kill);
+            }
+            assert!(!survived, "a member of the group outlived the hangup");
+            assert!(!signal_process_group(pgid, TreeSignal::Kill).unwrap());
+        });
+    }
 
     #[test]
     fn detect_returns_a_valid_variant() {

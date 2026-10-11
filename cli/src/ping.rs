@@ -285,10 +285,24 @@ fn print_warm_verdict(peer: &str, v: &Value) {
     let route = v["route"].as_str().unwrap_or("?");
     if is_relay(route) {
         ui::say(&format!("  {}", ui::paint(Tone::Warn, "⚠ on relay, no direct path · still end-to-end encrypted")));
-        ui::say(&format!("  {}", ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} will be instant, over the relay"))));
-    } else {
-        ui::say(&format!("  {}", ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} will be instant (warm direct link)"))));
     }
+    ui::say(&format!("  {}", ui::paint(Tone::Dim, &warm_verdict_line(peer, is_relay(route)))));
+}
+
+/// What a warm link buys, without promising what this device may not do. A
+/// held link makes every verb start at once, but whether `shell`/`exec`/ssh
+/// are ALLOWED is the peer's grant, which this side does not hold: `reach`
+/// used to say "ssh/pty to beta will be instant" to a device beta then
+/// refused. So the shell verbs are named with their condition.
+fn warm_verdict_line(peer: &str, relayed: bool) -> String {
+    let how = if relayed {
+        "over the relay"
+    } else {
+        "warm direct link"
+    };
+    format!(
+        "─ {how}: transfers to {peer} start at once; so do shell, exec and ssh where {peer} has granted this device shell"
+    )
 }
 
 /// No live link held locally: measure what a fresh connect would cost (the honest
@@ -357,6 +371,18 @@ async fn ping_json(server: &str, peer: &str, relay: bool, warm: Option<Value>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E3: `reach` told a device with no shell grant on beta that "ssh/pty to
+    /// beta will be instant". It cannot know the grant, so it says the
+    /// condition instead of the promise.
+    #[test]
+    fn warm_verdict_never_promises_a_shell_it_was_not_granted() {
+        for relayed in [false, true] {
+            let line = warm_verdict_line("beta", relayed);
+            assert!(!line.contains("will be instant"), "{line}");
+            assert!(line.contains("where beta has granted this device shell"), "{line}");
+        }
+    }
 
     fn warm(relayed: bool, route: &str, addr: Option<&str>, rtt: Option<u64>) -> Probe {
         Probe::Warm { relayed, route: route.into(), addr: addr.map(str::to_string), rtt_ms: rtt }

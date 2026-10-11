@@ -260,6 +260,135 @@ else
   echo "SKIP gateI: no rsync on PATH"
 fi
 
+# ============================================================ LIFETIME GATES ==
+# A remote command never outlives its initiator. Before, `exec boxB -- sleep
+# 300` killed locally (kill -9 OR a plain SIGTERM from `timeout`) left the
+# sleep running as a child of boxB's daemon for the full five minutes, and a
+# `seq` behind `| head -2` was still producing 19 s after head exited. Unix
+# only: the gates find the remote processes with pgrep by their exact argv
+# (both ends share this host, so the patterns are anchored at the program path
+# and never match the initiator's own `tunlion exec ...` command line).
+gone_within() { # <seconds> <pgrep -f pattern>...: 0 once none of them match
+  local secs=$1; shift
+  local end=$(( $(date +%s) + secs ))
+  while :; do
+    local alive=0
+    for pat in "$@"; do pgrep -f -- "$pat" >/dev/null 2>&1 && alive=1; done
+    [ "$alive" = 0 ] && return 0
+    [ "$(date +%s)" -ge "$end" ] && return 1
+    sleep 0.25
+  done
+}
+started_within() { # <seconds> <pattern>: 0 once it matches
+  local secs=$1 pat=$2
+  local end=$(( $(date +%s) + secs ))
+  until pgrep -f -- "$pat" >/dev/null 2>&1; do
+    [ "$(date +%s)" -ge "$end" ] && return 1
+    sleep 0.25
+  done
+}
+
+# ===================================================================== GATE M ==
+# KILL -9 THE INITIATOR: the remote TREE (a shell, a backgrounded child and a
+# foreground child) is gone within 20 s. Nothing reaches the acceptor from a
+# SIGKILLed process, so this is the heartbeat bound, and the backgrounded
+# child proves the whole process group is ended, not only its leader.
+say M
+if [ "$PLATFORM" = "unix" ]; then
+  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sh -c '/bin/sleep 3011 & /bin/sleep 3012; wait' \
+    >/dev/null 2>"$WORK/M.err" </dev/null &
+  MPid=$!
+  if started_within 30 '^/bin/sleep 3012$'; then
+    kill -9 "$MPid" 2>/dev/null; wait "$MPid" 2>/dev/null
+    t0=$(date +%s)
+    if gone_within 20 '^/bin/sleep 3011$' '^/bin/sleep 3012$'; then
+      ok "gateM: kill -9 of the initiator ended the whole remote tree in $(( $(date +%s) - t0 ))s"
+    else
+      echo "-- M.err --"; cat "$WORK/M.err"; tail -15 "$WORK/up.log"
+      pkill -f '^/bin/sleep 301[12]$' 2>/dev/null
+      bad "gateM: the remote tree outlived a SIGKILLed initiator by 20s"
+    fi
+  else
+    kill -9 "$MPid" 2>/dev/null
+    echo "-- M.err --"; cat "$WORK/M.err"
+    bad "gateM: the remote command never started"
+  fi
+else
+  echo "SKIP gateM: the remote process check uses pgrep (unix)"
+fi
+
+# ===================================================================== GATE N ==
+# SIGTERM THE INITIATOR (`timeout 5`, the tester's exact shape): rc 124, and the
+# remote sleep is gone within 5 s, because the initiator forwards the signal
+# and closes the session before it exits rather than waiting on a heartbeat.
+say N
+if [ "$PLATFORM" = "unix" ]; then
+  timeout 5 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 3013 \
+    >/dev/null 2>"$WORK/N.err" </dev/null
+  rcN=$?
+  t0=$(date +%s)
+  if [ "$rcN" = "124" ] && gone_within 5 '^/bin/sleep 3013$'; then
+    ok "gateN: SIGTERM to the initiator ended the remote command in $(( $(date +%s) - t0 ))s (rc=$rcN)"
+  else
+    echo "-- N.err --"; cat "$WORK/N.err"; tail -15 "$WORK/up.log"
+    pkill -f '^/bin/sleep 3013$' 2>/dev/null
+    bad "gateN: the remote command outlived a SIGTERMed initiator (rc=$rcN)"
+  fi
+else
+  echo "SKIP gateN: the remote process check uses pgrep (unix)"
+fi
+
+# ===================================================================== GATE O ==
+# CTRL-C: SIGINT to the initiator reaches the remote command as SIGINT (a
+# trap there sees it), the initiator exits 130, and nothing is left running.
+say O
+if [ "$PLATFORM" = "unix" ]; then
+  MARK="$WORK/O.int"
+  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sh -c \
+    "trap 'echo INT > $MARK; exit 130' INT; /bin/sleep 3014 & wait" \
+    >/dev/null 2>"$WORK/O.err" </dev/null &
+  OPid=$!
+  if started_within 30 '^/bin/sleep 3014$'; then
+    sleep 1
+    kill -INT "$OPid" 2>/dev/null
+    wait "$OPid"; rcO=$?
+    gone_within 5 '^/bin/sleep 3014$'; goneO=$?
+    if [ "$rcO" = "130" ] && [ "$goneO" = "0" ] && [ -s "$MARK" ]; then
+      ok "gateO: Ctrl-C was forwarded as SIGINT, rc=130, remote tree gone"
+    else
+      echo "-- O.err --"; cat "$WORK/O.err"; tail -15 "$WORK/up.log"
+      pkill -f '^/bin/sleep 3014$' 2>/dev/null
+      bad "gateO: Ctrl-C not forwarded (rc=$rcO gone=$goneO trap=$( [ -s "$MARK" ] && echo yes || echo no))"
+    fi
+  else
+    kill -9 "$OPid" 2>/dev/null
+    echo "-- O.err --"; cat "$WORK/O.err"
+    bad "gateO: the remote command never started"
+  fi
+else
+  echo "SKIP gateO: the remote process check uses pgrep (unix)"
+fi
+
+# ===================================================================== GATE P ==
+# A CLOSED LOCAL STDOUT: `exec ... | head -2` prints two lines, and the remote
+# producer is gone within 5 s of head exiting (EPIPE semantics over the link),
+# not still counting toward ten million.
+say P
+if [ "$PLATFORM" = "unix" ] && command -v seq >/dev/null 2>&1; then
+  SEQ=$(command -v seq)
+  OUTP=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$SEQ" 1 99999917 2>"$WORK/P.err" </dev/null | head -2)
+  t0=$(date +%s)
+  if [ "$OUTP" = "$(printf '1\n2')" ] && gone_within 5 "^$SEQ 1 99999917\$"; then
+    ok "gateP: | head -2 printed two lines and the remote producer was gone in $(( $(date +%s) - t0 ))s"
+  else
+    echo "-- P.err --"; cat "$WORK/P.err"; tail -15 "$WORK/up.log"
+    pkill -f "^$SEQ 1 99999917\$" 2>/dev/null
+    bad "gateP: the remote producer outlived a closed local stdout (out='$OUTP')"
+  fi
+else
+  echo "SKIP gateP: needs unix and seq"
+fi
+
 # ===================================================================== GATE J ==
 # NEGATIVE revoked: same command refused again after revoke.
 say J
