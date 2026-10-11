@@ -4675,6 +4675,32 @@ pub(crate) async fn recv_cmd(
                         Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
                     }
                 }
+                // The peer cannot answer our identity challenge (it holds no
+                // certificate for its own key, or the challenge named its own
+                // key). Identity will not resolve on this link, so the offer
+                // hold that waits for it ends now and the offer goes to the
+                // normal gate, the same decision the hold reaches on expiry.
+                // Without this every code transfer from a device with no
+                // identity sat 20 s (RECV_IDENTITY_HOLD_DEADLINE) before its
+                // first byte. Only an answer to OUR outstanding nonce counts.
+                Some("identity-unavailable") => {
+                    let ours = identity_nonces
+                        .get(&pid)
+                        .map(|(n, _, _)| hex::encode(n))
+                        .is_some_and(|n| Some(n.as_str()) == v["nonce"].as_str());
+                    if ours {
+                        identity_nonces.remove(&pid);
+                        st.pending_proven.lock().unwrap().remove(&pid);
+                        if let Some(expired) =
+                            Instant::now().checked_sub(RECV_IDENTITY_HOLD_DEADLINE)
+                        {
+                            recv_identity_hold.insert(pid.clone(), expired);
+                        }
+                        ui::debug(&format!(
+                            "  {pid} cannot prove an identity; deciding its offers without waiting"
+                        ));
+                    }
+                }
                 // #30: respond to identity nonce challenge by producing a
                 // possession_sig (0x02) over the peer-provided nonce. The
                 // challenger verifies and upgrades our binding to Proven.

@@ -31,6 +31,14 @@
 # It is a candidate to add back once it is understood, not a gate to quietly
 # drop. Tracked in #249.
 #
+# UNDERSTOOD AND ADDED BACK (fix/known-red-gates). The resume half failed for
+# two reasons, neither environmental: two processes of one install fell back
+# from the post-PAKE direct promotion every time (the TCP-localhost path was
+# never finished) and a code transfer from a device with no identity waited out
+# a 20 s identity hold, so the replacement receiver often started against a
+# sender that was still stalled. With both fixed the transfer runs on QUIC, and
+# the sender is slowed 3ms per chunk so the kill lands mid-transfer.
+#
 # Matching is on a stable SUBSTRING of each gate's ok() text, deliberately not
 # the whole line: some carry a measured value ("22.8 MB/s") that varies per run,
 # and pinning those would make this fail for the wrong reason.
@@ -61,6 +69,17 @@ EXPECTED_GREEN=(
   "deferred drop: flowing link survives its peer-left|deferred-drop (#28 trigger)"
   "stepped-away sender: held|stepped-away wait"
   "U1: created once|u1-implicit-init"
+  # Known-red gates repaired by fix/known-red-gates, measured green on GitHub
+  # runners on main and on integration/launch-candidate before being listed.
+  "route detection: local on both ends|route detection"
+  "kill-resume: replacement receiver resumed|kill-resume"
+  "--to bob delivered to bob only|--to selection"
+  "relayed transfer via coturn|relay"
+  "same-uid supersede: sender swapped links|uid supersede"
+  "daemon: verified identity, room-less|daemon"
+  "pair ceremony: both exited clean|pair-ceremony"
+  "ceremony bailed in|pair fail-fast"
+  "lossy rendezvous converged|gate-L convergence"
 )
 
 # A missing PASS line has three different causes and they want different
