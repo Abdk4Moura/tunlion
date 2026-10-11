@@ -1602,6 +1602,34 @@ fn anything_unrecognised_keeps_the_multi_threaded_runtime() {
     }
 }
 
+/// E4: `reset -y` said "clean slate" and left up.inbox behind, which `status`
+/// and `doctor` then read as the inbox to judge.
+#[test]
+fn reset_leaves_no_inbox_marker() {
+    let _guard = lock_test_config();
+    let dir = std::env::temp_dir().join(format!(
+        "fil-reset-marker-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    let marker = crate::recv_files::daemon_inbox_marker();
+    assert!(marker.starts_with(&dir), "{}", marker.display());
+    std::fs::write(&marker, "/somewhere/Tunlion\n").unwrap();
+    let caps = UiCapability {
+        interactive: false,
+        json: false,
+        yes: true,
+        color: false,
+    };
+    crate::mount_cmd::reset_cmd(&caps).expect("reset -y with no daemon");
+    let left = marker.exists();
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!left, "reset kept {}", marker.display());
+}
+
 #[test]
 fn confirm_non_interactive_without_yes_fails() {
     let caps = UiCapability {
@@ -4039,4 +4067,67 @@ fn the_reenrolment_advice_is_complete_and_keeps_the_ceiling() {
     // A capability already in the ceiling is not listed twice.
     let again = crate::identity_state::reenrol_steps("d", "o", "mount", &["mount".to_string()]);
     assert!(again.contains("--allow mount --out"), "{again}");
+}
+
+/// E2: `join --name beta` that the owner filed as `beta-2` (the old record still
+/// held the name) printed "joined as 'beta-2'" and nothing else. It now warns,
+/// and the way back it prints parses.
+#[test]
+fn a_join_filed_under_another_name_says_so() {
+    use clap::Parser;
+    assert_eq!(crate::enrollment::renamed_note("beta", "beta"), None);
+    let note = crate::enrollment::renamed_note("beta", "beta-2").expect("a renamed join warns");
+    assert!(note.contains("'beta'") && note.contains("'beta-2'"), "{note}");
+    let tail = &note[note.find("tunlion ").unwrap()..];
+    for cmd in tail.split(" && ") {
+        let argv: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "`{cmd}` does not parse");
+    }
+}
+
+/// E2: the recipe is run from scripts, so each command must succeed exactly as
+/// printed with no terminal: every verb that asks for confirmation carries
+/// `-y`, and the daemon is started again at the end (without it the next exec
+/// waited 45 s and exited 6). The tester's run: `add` refused "without --yes",
+/// `down` refused, and nothing said to run `up`.
+#[test]
+fn every_reenrolment_command_runs_in_a_script_as_printed() {
+    use clap::Parser;
+    let s = crate::identity_state::reenrol_steps(
+        "delta",
+        "alpha",
+        "shell",
+        &["transfer".to_string(), "mount".to_string()],
+    );
+    // A command line is `[on <machine>:]  tunlion ...`; prose that happens to
+    // say "tunlion" (the closing note) is not one.
+    let cmds: Vec<&str> = s
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim_start();
+            let t = match t.strip_prefix("on ") {
+                Some(rest) => rest.split_once(':').map(|(_, r)| r.trim_start()).unwrap_or(t),
+                None => t,
+            };
+            t.starts_with("tunlion ").then_some(t)
+        })
+        .collect();
+    assert!(cmds.len() >= 6, "{s}");
+    for cmd in &cmds {
+        let argv: Vec<&str> = cmd.split_whitespace().collect();
+        let cli = crate::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("`{cmd}` does not parse: {e}"));
+        let asks = matches!(
+            cli.cmd,
+            Some(crate::Cmd::Down)
+                | Some(crate::Cmd::Reset)
+                | Some(crate::Cmd::Add { .. })
+                | Some(crate::Cmd::Devices {
+                    action: Some(crate::DevicesAction::Forget { .. }),
+                    ..
+                })
+        );
+        assert!(!asks || cli.yes, "`{cmd}` asks for confirmation and would fail in a script");
+    }
+    assert_eq!(cmds.last().copied(), Some("tunlion up --detach"), "{s}");
 }

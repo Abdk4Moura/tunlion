@@ -131,6 +131,14 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
     reset_remove(&cfg.join("peerconf"), "per-peer settings", &mut wiped);
     reset_remove(&cfg.join("config"), "global settings", &mut wiped);
     reset_remove(&cfg.join("diag.jsonl"), "diagnostics log", &mut wiped);
+    // The inbox the last daemon served. `status` and `doctor` read it to judge
+    // the inbox, so a "clean slate" that kept it went on reporting a folder
+    // from the state it had just wiped.
+    reset_remove(
+        &crate::recv_files::daemon_inbox_marker(),
+        "the last daemon's inbox marker (up.inbox)",
+        &mut wiped,
+    );
     reset_remove(
         &cfg.join("mount-profiles"),
         "saved mount profiles",

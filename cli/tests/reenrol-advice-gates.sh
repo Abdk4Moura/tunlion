@@ -14,7 +14,9 @@
 #   A  a device enrolled without shell is refused exec on its owner (nonzero)
 #   B  `grant <dev> shell` refuses and prints the re-enrolment steps, every one
 #      of them a real command: forget, add --for with shell, down, reset, join
-#   C  following those steps, the device runs `exec` on the owner (rc=0, exact)
+#   C  every printed command, run VERBATIM from a script (no terminal, no flag
+#      added by the gate), exits 0; then the device runs `exec` on the owner
+#      (rc=0, exact) under its own name
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
@@ -63,7 +65,8 @@ need=( "tunlion devices forget $DEV"
        "--out $DEV-invite.txt"
        "tunlion down"
        "tunlion reset -y"
-       "tunlion join --invite-file $DEV-invite.txt --name $DEV" )
+       "tunlion join --invite-file $DEV-invite.txt --name $DEV"
+       "tunlion up --detach" )
 missing=""
 for n in "${need[@]}"; do echo "$OUTB" | grep -qF -- "$n" || missing="$missing [$n]"; done
 ALLOW=$(echo "$OUTB" | grep -oE "add --for $DEV --allow [^ ]+" | head -1 | awk '{print $NF}')
@@ -74,41 +77,66 @@ else
 fi
 
 # ===================================================================== GATE C ==
-say "C: the printed steps work"
-cd "$WORK" || exit 2
-# On the owner, exactly as printed (plus --yes: no terminal to confirm on).
-"${A_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$DEV" >"$WORK/c-forget.log" 2>&1
-rcF=$?
-"${A_ENV[@]}" timeout 45 "$BIN" --server "$SERVER" add --for "$DEV" --allow "${ALLOW:-shell}" --out "$DEV-invite.txt" --yes >"$WORK/c-add.log" 2>&1
-# On the device, exactly as printed.
-"${D_ENV[@]}" timeout 20 "$BIN" down -y >"$WORK/c-down.log" 2>&1
-sleep 1
-"${D_ENV[@]}" "$BIN" reset -y >"$WORK/c-reset.log" 2>&1
-"${D_ENV[@]}" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$DEV-invite.txt" --name "$DEV" --no-interactive >"$WORK/c-join.log" 2>&1
-rcJ=$?
+say "C: the printed steps work, run EXACTLY as printed from a script"
+# Each command line of the advice is executed verbatim: no flag added here, no
+# terminal (stdin is /dev/null), each on the machine its `on X:` label names,
+# each from its own working directory so the invitation really has to be
+# carried across by the one non-command line, "(copy <file> to <dev>)". The
+# server comes from FILAMENT_SERVER, the environment a user's shell provides,
+# so not a word of a command is changed. This gate used to append --yes to
+# `add` and -y to `down` itself, which is exactly why it stayed green while a
+# tester running the printed text got "refusing ... without --yes".
+OWN_CWD="$WORK/c-owner"; DEV_CWD="$WORK/c-device"; DEV_HOME="$WORK/c-device-home"
+mkdir -p "$OWN_CWD" "$DEV_CWD" "$DEV_HOME"
+printf '%s\n' "$OUTB" > "$WORK/c-recipe.txt"
+: > "$WORK/c-steps.log"
+side=""; nsteps=0; failed_step=""
+while IFS= read -r line; do
+  case "$line" in
+    *"on alpha:"*) side=owner ;;
+    *"on $DEV:"*)  side=device ;;
+  esac
+  if [[ "$line" =~ \(copy[[:space:]]+([^[:space:]]+)[[:space:]]+to ]]; then
+    cp "$OWN_CWD/${BASH_REMATCH[1]}" "$DEV_CWD/" 2>>"$WORK/c-steps.log" \
+      || { failed_step="${failed_step:-copy ${BASH_REMATCH[1]}}"; }
+    continue
+  fi
+  [[ "$line" =~ ^[[:space:]]*(on[^:]*:)?[[:space:]]*tunlion[[:space:]](.*)$ ]] || continue
+  args="${BASH_REMATCH[2]}"
+  nsteps=$((nsteps+1))
+  if [ "$side" = owner ]; then
+    ( cd "$OWN_CWD" && env FILAMENT_CONFIG_DIR="$DA" FILAMENT_SERVER="$SERVER" \
+        timeout 60 "$BIN" $args </dev/null ) >"$WORK/c-step$nsteps.log" 2>&1
+  else
+    ( cd "$DEV_CWD" && env HOME="$DEV_HOME" FILAMENT_CONFIG_DIR="$DD" FILAMENT_SERVER="$SERVER" \
+        timeout 60 "$BIN" $args </dev/null ) >"$WORK/c-step$nsteps.log" 2>&1
+  fi
+  rc=$?
+  echo "[$side] tunlion $args -> rc=$rc" | tee -a "$WORK/c-steps.log"
+  [ "$rc" = "0" ] || { failed_step="${failed_step:-tunlion $args (rc=$rc)}"; tail -4 "$WORK/c-step$nsteps.log" | sed 's/^/      /'; }
+done < "$WORK/c-recipe.txt"
 # The owner indexes the re-enrolled device on its next tick.
 sleep 5
-OUTC=$(timeout 60 "${D_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo REENROL-OK 2>"$WORK/C.err" </dev/null)
+OUTC=$(timeout 60 "${D_ENV[@]}" HOME="$DEV_HOME" "$BIN" --server "$SERVER" exec alpha -- /bin/echo REENROL-OK 2>"$WORK/C.err" </dev/null)
 rcC=$?
-echo "## (join) rc=$rcJ (exec) rc=$rcC out='$OUTC'"
-# The first printed step must itself succeed, and the device must come back
-# under its own name. This gate used to ignore the forget's exit code, so it
-# stayed green while `forget` refused (a live certificate) and the re-enrolled
-# device was quietly filed as "$DEV-2" beside its stale record.
+echo "## steps run: $nsteps; first failure: ${failed_step:-none}; (exec) rc=$rcC out='$OUTC'"
+# The device must come back under its own name: the forget at the top of the
+# advice frees it, and a re-enrolled device filed as "$DEV-2" beside its stale
+# record is the advice not working.
 NAMES=$("${A_ENV[@]}" "$BIN" devices --json 2>/dev/null | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 if isinstance(d, dict):
     d = d.get("devices") or (d.get("data") or {}).get("devices") or []
 print(" ".join(sorted(x["name"] for x in d)))' 2>/dev/null)
-echo "## (forget) rc=$rcF; owner devices after re-enrolment: [$NAMES]"
-if [ "$rcF" = "0" ] && echo " $NAMES " | grep -q " $DEV " && ! echo " $NAMES " | grep -q " $DEV-2 " \
+echo "## owner devices after re-enrolment: [$NAMES]"
+if [ -z "$failed_step" ] && [ "$nsteps" -ge 6 ] \
+   && echo " $NAMES " | grep -q " $DEV " && ! echo " $NAMES " | grep -q " $DEV-2 " \
    && [ "$rcC" = "0" ] && [ "$OUTC" = "REENROL-OK" ]; then
-  ok "gateC: after the printed re-enrolment the device runs exec on its owner"
+  ok "gateC: every printed step ran as printed (rc=0 each, $nsteps steps) and the device runs exec on its owner"
 else
-  for f in c-forget c-add c-down c-reset c-join; do echo "-- $f --"; tail -4 "$WORK/$f.log"; done
   echo "-- C.err --"; tail -6 "$WORK/C.err"
-  bad "gateC: the printed re-enrolment did not work as printed (forget rc=$rcF devices=[$NAMES] join rc=$rcJ exec rc=$rcC)"
+  bad "gateC: the printed re-enrolment did not work as printed (first failure: ${failed_step:-none}, steps=$nsteps, devices=[$NAMES], exec rc=$rcC)"
 fi
 
 echo

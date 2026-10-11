@@ -38,6 +38,20 @@ const ESTABLISH_BUDGET: Duration = Duration::from_secs(45);
 /// identical but for a hoisted local: one took an AuthKey and one an Invitation,
 /// which made them look like different functions. Once the two credentials
 /// collapsed into one, the signatures became the same and so did the bodies.
+/// The warning for a join the owner filed under a different name than the one
+/// asked for (None when it kept the name). The owner only does that when the
+/// name is held by another key, which after a reset is this machine's own
+/// stale record, so the way back names both commands, run on the owner.
+pub(crate) fn renamed_note(asked: &str, stored: &str) -> Option<String> {
+    let asked = crate::sanitize_device_name(asked);
+    if asked.is_empty() || asked == stored {
+        return None;
+    }
+    Some(format!(
+        "! asked to join as '{asked}', but the owner already holds another key under that name, so it filed this device as '{stored}'. If '{asked}' is this machine's old record, on the owner run: tunlion devices forget {asked} -y && tunlion devices rename {stored} {asked}"
+    ))
+}
+
 fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<String> {
     if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
         bail!(
@@ -437,6 +451,15 @@ pub(crate) async fn enroll_cmd(
                             name,
                             hex::encode(device_pub)
                         ));
+                    }
+                    // The owner files a new key under a free name when the one
+                    // asked for is held by another key (a stale record of this
+                    // same machine, usually). That used to pass silently: `join
+                    // --name beta` printed "joined as 'beta-2'" and exited 0,
+                    // and the re-enrolment recipe's "rejoins under the same
+                    // name" was false. Say so, with the way back.
+                    if let Some(note) = proposed_name.and_then(|asked| renamed_note(asked, &name)) {
+                        ui::critical(&note);
                     }
                     return Ok(());
                 }
