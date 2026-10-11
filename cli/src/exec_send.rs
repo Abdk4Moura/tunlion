@@ -240,9 +240,13 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
     const ATTEMPTS: u32 = 12;
     let started = std::time::Instant::now();
     let mut attempt = 0;
+    // One signal listener for the whole invocation, retries included: tokio
+    // keeps a signal's handler installed once registered, so a listener per
+    // attempt would leave the gaps between attempts swallowing Ctrl-C.
+    let mut interrupted: Interrupted = Box::pin(interruption());
     loop {
         attempt += 1;
-        match exec_once(server, peer, relay, &opts).await {
+        match exec_once(server, peer, relay, &opts, &mut interrupted).await {
             Ok(code) => return Ok(code),
             Err(e)
                 if attempt < ATTEMPTS
@@ -256,24 +260,43 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
                 } else {
                     crate::ui::debug(&format!("tunlion: {e} -- retry {attempt}"));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+                    (_sig, code) = interrupted.as_mut() => return Ok(code),
+                }
             }
             Err(e) => return Err(e),
         }
     }
 }
 
-async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Result<i32> {
-    let (t, mut rx, guard, _diag) = match tokio::time::timeout(
+/// The invocation's signal listener (see `exec_cmd`).
+type Interrupted = std::pin::Pin<Box<dyn std::future::Future<Output = (TreeSignal, i32)> + Send>>;
+
+async fn exec_once(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    opts: &ExecOpts,
+    interrupted: &mut Interrupted,
+) -> Result<i32> {
+    // Signals are handled from the first moment, not only once the session
+    // runs: a SIGTERM during bring-up or the open used to take the default
+    // action, and a command the acceptor had already started then ran until
+    // its heartbeat deadline. Before the open nothing is remote; after it the
+    // session is hung up (forwarded signal, then close).
+    let bring_up = tokio::time::timeout(
         std::time::Duration::from_secs(45),
         l2::bring_up_to_known(server, peer, relay, "exec"),
-    )
-    .await
-    {
-        Ok(inner) => inner?,
-        Err(_) => {
-            bail!("connect timeout: couldn't reach '{peer}' in 45s");
-        }
+    );
+    let (t, mut rx, guard, _diag) = tokio::select! {
+        r = bring_up => match r {
+            Ok(inner) => inner?,
+            Err(_) => {
+                bail!("connect timeout: couldn't reach '{peer}' in 45s");
+            }
+        },
+        (_sig, code) = interrupted.as_mut() => return Ok(code),
     };
     guard.forget();
     let mux = l2::Mux::new(t.clone());
@@ -321,7 +344,7 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
     // Bounded ack wait with pty's four outcomes. A refusal surfaces the
     // RECEIVER's reason (dropping it here reported every refusal as a
     // confusing transport error); anything else names what actually happened.
-    let ack: std::result::Result<Value, String> = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let ack_wait = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let ev = match rx.recv().await {
                 Some(ev) => ev,
@@ -370,8 +393,15 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                 _ => {}
             }
         }
-    })
-    .await
+    });
+    let ack_wait = tokio::select! {
+        r = ack_wait => r,
+        (sig, code) = interrupted.as_mut() => {
+            hang_up_remote(&t, &mut rx, sid, Some(sig), "the initiator was interrupted").await;
+            return Ok(code);
+        }
+    };
+    let ack: std::result::Result<Value, String> = ack_wait
     .map_err(|_| {
         anyhow::anyhow!(
             "no answer from '{peer}' - it may be unresponsive or running a build without exec"
@@ -614,7 +644,7 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
     };
     let end = tokio::select! {
         r = session => SessionEnd::Done(r),
-        (sig, code) = interruption() => SessionEnd::Signalled(sig, code),
+        (sig, code) = interrupted.as_mut() => SessionEnd::Signalled(sig, code),
     };
     beats.abort();
     match end {

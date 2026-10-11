@@ -26,6 +26,10 @@
 #   K  REVOKED MID-SESSION -- a live exec ends when the grant is revoked.
 #   L  SHELL-USER -- a root acceptor with `--shell-user nobody` runs the exec
 #      as nobody (unix; needs root or passwordless sudo, as CI runners have).
+#   M  KILL -9 THE INITIATOR -- the remote process tree is gone within 20 s.
+#   N  SIGTERM THE INITIATOR (timeout 5) -- rc 124, remote gone within 5 s.
+#   O  CTRL-C -- forwarded as SIGINT, rc 130, remote tree gone.
+#   P  | head -2 -- the remote producer is gone within 5 s of head exiting.
 #
 # PLATFORM NOTE, stated honestly: executed here on Linux. The wire property
 # under test (array preserved, never re-parsed) is platform-independent code --
