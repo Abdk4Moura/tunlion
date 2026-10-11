@@ -217,7 +217,7 @@ pub(crate) async fn up_cmd(
         // Asked of the RUNNING daemon (like `revoke`'s #244 check): its shell
         // posture comes from launch flags that never touch the settings file,
         // so only the daemon can say what it is serving.
-        let running = crate::ctl::try_cap_status().await;
+        let running = running_daemon_status(pid).await;
         // Every other flag the daemon reports (its `launch` object) is compared
         // too: `--userspace`, `--no-relay`, `--name-as`, `--shell-program` and
         // the rest used to pass as "same settings" whenever the shell posture
@@ -526,6 +526,37 @@ pub(crate) fn launch_report(
         "shell_user": shell_user,
         "no_proxy_fallback": no_proxy_fallback,
     })
+}
+
+/// How long after writing its pidfile a daemon may still be opening its
+/// control socket. Measured in CI: five racing `up --detach` on one config dir.
+const DAEMON_START_GRACE: Duration = Duration::from_secs(10);
+
+/// What the running daemon `pid` reports via `cap-status`, waiting for one that
+/// is still starting.
+///
+/// A daemon writes its pidfile before it opens its control socket. A second
+/// `up` that asked once in that window got no answer and read it as "did not
+/// report its settings": exit 10, a settings conflict, for a start that merely
+/// raced the winner (hostile gateR, five concurrent `up --detach --dir ...`).
+/// So a daemon whose pidfile is younger than DAEMON_START_GRACE is asked again
+/// until it answers or the grace runs out; an old daemon that does not answer
+/// is still reported as not answering, at once.
+async fn running_daemon_status(pid: u32) -> Option<serde_json::Value> {
+    loop {
+        if let Some(st) = crate::ctl::try_cap_status().await {
+            return Some(st);
+        }
+        let starting = std::fs::metadata(crate::pidfile())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < DAEMON_START_GRACE);
+        if !starting || daemon_alive() != Some(pid) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Compare the asked-for posture with what the running daemon reports via
