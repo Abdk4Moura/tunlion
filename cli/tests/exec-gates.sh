@@ -23,6 +23,11 @@
 #      `boxB rsync --server ...`, which our trailing-argv shape takes directly --
 #      itself an argv-exactness proof under a real workload.
 #   J  NEGATIVE revoked -- grant revoked, same command refused again.
+#   K  REVOKED MID-SESSION -- a live exec ends when the grant is revoked.
+#   M  KILL -9 THE INITIATOR -- the remote process tree is gone within 20 s.
+#   N  SIGTERM THE INITIATOR (timeout 5) -- rc 124, remote gone within 5 s.
+#   O  CTRL-C -- forwarded as SIGINT, rc 130, remote tree gone.
+#   P  | head -2 -- the remote producer is gone within 5 s of head exiting.
 #
 # PLATFORM NOTE, stated honestly: executed here on Linux. The wire property
 # under test (array preserved, never re-parsed) is platform-independent code --

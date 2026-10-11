@@ -441,6 +441,8 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                             exit_status = v.get("status").and_then(|s| s.as_i64()).map(|s| s as i32);
                             want_out = v.get("out_bytes").and_then(|n| n.as_u64());
                             want_err = v.get("err_bytes").and_then(|n| n.as_u64());
+                            // The command over there has exited: nothing to hang up.
+                            remote_ended = true;
                             break;
                         }
                         if v.get("type").and_then(|t| t.as_str()) == Some("l2-close")
