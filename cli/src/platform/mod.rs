@@ -441,8 +441,8 @@ pub fn process_group_alive(pgid: u32) -> bool {
         if pgid == 0 || pgid > i32::MAX as u32 {
             return false;
         }
-        unsafe { libc::kill(-(pgid as libc::pid_t), 0) == 0 }
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let exists = unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0;
+        exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     {
