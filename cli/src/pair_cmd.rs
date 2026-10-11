@@ -1502,7 +1502,7 @@ pub(crate) fn external_pairing_notice(
     let steps = if asked_to_own {
         vec![
             format!("if '{peer}' is yours, on '{peer}' run: tunlion down --yes && tunlion reset"),
-            format!("then here: tunlion devices forget {peer_w} && tunlion add {peer_w} (and do what it prints on '{peer}')"),
+            format!("then here: tunlion devices forget {peer_w} -y && tunlion add {peer_w} (and do what it prints on '{peer}')"),
         ]
     } else {
         vec![

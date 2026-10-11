@@ -143,14 +143,17 @@ seed_vouched_record; grant_shell
 start_daemon shell --shell --i-know
 outA="$(revoke_shell_output)"; rcA=$?
 echo "## revoke under --shell (rc $rcA):"; printf '%s\n' "$outA" | sed 's/^/   /'
-remedy="$(printf '%s\n' "$outA" | grep -oE 'tunlion devices forget [^ ]+' | head -1)"
+# The whole printed command, flags included: `devices forget` confirms like
+# every destructive verb, so its remedy carries -y, and a pattern that stopped
+# at the name would run a different command than the one printed.
+remedy="$(printf '%s\n' "$outA" | grep -oE 'tunlion devices forget [^ ]+( -y)?' | head -1)"
 echo "## printed remedy: ${remedy:-<none>}"
 if ! revoke_succeeded "$rcA" "$outA"; then
   bad "gateA: the revoke itself did not succeed (rc $rcA), so the caution is not about a revoked grant"
 elif ! printf '%s\n' "$outA" | grep -q "$CAUTION"; then
   bad "gateA: revoke reported success and never said the policy still grants the shell (#244)"
-elif [ "$remedy" != "tunlion devices forget $DEV" ]; then
-  bad "gateA: the caution appears but its remedy is not 'tunlion devices forget $DEV' (got: ${remedy:-nothing})"
+elif [ "$remedy" != "tunlion devices forget $DEV -y" ]; then
+  bad "gateA: the caution appears but its remedy is not 'tunlion devices forget $DEV -y' (got: ${remedy:-nothing})"
 else
   # Run it as printed: drop the leading program name, keep every word after it.
   read -r -a remedy_args <<<"${remedy#tunlion }"

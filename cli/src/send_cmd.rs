@@ -2938,7 +2938,7 @@ pub(crate) fn revoked_send_refusal(name: &str, records: &[serde_json::Value]) ->
         || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED);
     revoked.then(|| {
         format!(
-            "'{name}' is revoked on this device, so nothing is sent to it. To let it back in: `tunlion devices restore {name}`; to drop it: `tunlion devices forget {name}`"
+            "'{name}' is revoked on this device, so nothing is sent to it. To let it back in: `tunlion devices restore {name}`; to drop it: `tunlion devices forget {name} -y`"
         )
     })
 }
@@ -2958,11 +2958,12 @@ mod revoked_send_tests {
         let r = revoked_send_refusal("p9-b", &records).expect("revoked is refused");
         assert!(r.contains("revoked") && !r.contains("offline"), "{r}");
         assert!(r.contains("tunlion devices restore p9-b"), "{r}");
+        assert!(r.contains("tunlion devices forget p9-b -y"), "{r}");
         assert!(revoked_send_refusal("LAPTOP", &records).is_some(), "durable revoke, any case");
         assert_eq!(revoked_send_refusal("desk", &records), None);
         assert_eq!(revoked_send_refusal("nobody", &records), None);
         use clap::Parser;
-        for cmd in ["tunlion devices restore p9-b", "tunlion devices forget p9-b"] {
+        for cmd in ["tunlion devices restore p9-b", "tunlion devices forget p9-b -y"] {
             let argv: Vec<&str> = cmd.split_whitespace().collect();
             assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{cmd}");
         }

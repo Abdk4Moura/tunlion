@@ -33,10 +33,10 @@ pub(crate) fn successor_of<'a>(peer: &str, names: impl IntoIterator<Item = &'a s
 pub(crate) fn offline_hint(peer: &str, successor: Option<&str>) -> String {
     match successor {
         Some(s) => format!(
-            "{s} is also paired here, under a newer key: if {peer} was reset and joined again, that is the same machine. Send to {s}, and replace the stale record with `tunlion devices forget {peer}` then `tunlion devices rename {s} {peer}`."
+            "{s} is also paired here, under a newer key: if {peer} was reset and joined again, that is the same machine. Send to {s}, and replace the stale record with `tunlion devices forget {peer} -y` then `tunlion devices rename {s} {peer}`."
         ),
         None => format!(
-            "If {peer} was reset (its identity wiped), this key will never come back: drop the old record with `tunlion devices forget {peer}`, then pair it again under the same name (`tunlion add {peer}` here, `tunlion join` there)."
+            "If {peer} was reset (its identity wiped), this key will never come back: drop the old record with `tunlion devices forget {peer} -y`, then pair it again under the same name (`tunlion add {peer}` here, `tunlion join` there)."
         ),
     }
 }
@@ -45,7 +45,7 @@ pub(crate) fn offline_hint(peer: &str, successor: Option<&str>) -> String {
 /// the invitation it mints cannot reuse the name for a new key. Pure.
 pub(crate) fn name_taken_note(name: &str, last_seen: Option<&str>) -> String {
     format!(
-        "{name} is already paired here{}. If this invitation is for the same machine after a reset, forget the old record first (`tunlion devices forget {name}`); otherwise the new device is stored as {name}-2.",
+        "{name} is already paired here{}. If this invitation is for the same machine after a reset, forget the old record first (`tunlion devices forget {name} -y`); otherwise the new device is stored as {name}-2.",
         last_seen.map(|s| format!(" (last seen {s})")).unwrap_or_default()
     )
 }
@@ -115,9 +115,9 @@ mod tests {
     fn every_relink_hint_command_parses_in_order() {
         use clap::Parser;
         let hints = [
-            (offline_hint("p9-b", Some("p9-b-2")), vec!["tunlion devices forget p9-b", "tunlion devices rename p9-b-2 p9-b"]),
-            (offline_hint("p9-b", None), vec!["tunlion devices forget p9-b", "tunlion add p9-b", "tunlion join"]),
-            (name_taken_note("p9-b", None), vec!["tunlion devices forget p9-b"]),
+            (offline_hint("p9-b", Some("p9-b-2")), vec!["tunlion devices forget p9-b -y", "tunlion devices rename p9-b-2 p9-b"]),
+            (offline_hint("p9-b", None), vec!["tunlion devices forget p9-b -y", "tunlion add p9-b", "tunlion join"]),
+            (name_taken_note("p9-b", None), vec!["tunlion devices forget p9-b -y"]),
         ];
         for (text, want) in hints {
             let got = hint_commands(&text);

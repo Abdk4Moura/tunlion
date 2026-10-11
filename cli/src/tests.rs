@@ -4108,7 +4108,7 @@ fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
     assert!(!device_cert_revoked(&old.device_pub));
 
     // The chain, exactly as the hints print it.
-    let chain = ["tunlion devices forget p9-b", "tunlion devices rename p9-b-2 p9-b"];
+    let chain = ["tunlion devices forget p9-b -y", "tunlion devices rename p9-b-2 p9-b"];
     for step in chain {
         let argv: Vec<&str> = step.split_whitespace().collect();
         let cli = crate::Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{step}` does not parse: {e}"));
@@ -5021,6 +5021,104 @@ fn every_printed_relink_chain_runs_against_a_store() {
     assert!(crate::device_view::device_cert_for("p9-b").is_none());
     unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// E2, both re-enrolment recipes as a script would run them. The exec/shell
+/// refusal prints `refusal::ceiling_steps` (#392) and `grant` prints
+/// `identity_state::reenrol_steps` (#398); a blind tester ran the first one
+/// and `add` failed "without --yes", `down` failed without -y, and nothing
+/// said to start the daemon again. Every command line is parsed, every verb
+/// that confirms must carry -y, the device's last step starts the daemon, and
+/// the forget each recipe opens with succeeds against a store holding a live
+/// certified record (the name it frees is the one the join asks for).
+#[test]
+fn every_reenrolment_recipe_runs_as_printed_in_a_script() {
+    use clap::Parser;
+    let _guard = lock_test_config();
+    // `[on <machine>:]  tunlion ...`; prose that says "tunlion" is not a step.
+    fn commands(text: &str) -> Vec<String> {
+        text.lines()
+            .filter_map(|l| {
+                let t = l.trim_start();
+                let t = match t.strip_prefix("on ") {
+                    Some(rest) => rest.split_once(':').map(|(_, r)| r.trim_start()).unwrap_or(t),
+                    None => t,
+                };
+                t.starts_with("tunlion ").then(|| t.to_string())
+            })
+            .collect()
+    }
+    let refusal = crate::refusal::explain(
+        "exec",
+        "alpha",
+        crate::capability::CEILING_REASON,
+        Some(crate::refusal::Code::Ceiling),
+        Some("p9-b"),
+    );
+    let grant = crate::identity_state::reenrol_steps(
+        "p9-b",
+        "alpha",
+        "shell",
+        &["transfer".to_string(), "mount".to_string()],
+    );
+    for (what, text) in [("exec refusal", &refusal), ("grant advice", &grant)] {
+        let cmds = commands(text);
+        assert!(cmds.len() >= 6, "{what}:\n{text}");
+        for cmd in &cmds {
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
+            let cli = crate::Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("{what}: `{cmd}` does not parse: {e}"));
+            let confirms = matches!(
+                cli.cmd,
+                Some(crate::Cmd::Down)
+                    | Some(crate::Cmd::Reset)
+                    | Some(crate::Cmd::Add { .. })
+                    | Some(crate::Cmd::Devices {
+                        action: Some(crate::DevicesAction::Forget { .. })
+                            | Some(crate::DevicesAction::Revoke { .. }),
+                        ..
+                    })
+            );
+            assert!(!confirms || cli.yes, "{what}: `{cmd}` confirms and would fail in a script");
+        }
+        assert_eq!(cmds.last().map(String::as_str), Some("tunlion up --detach"), "{what}:\n{text}");
+        assert!(
+            cmds.iter().any(|c| c == "tunlion join --invite-file p9-b-invite.txt --name p9-b"),
+            "{what}:\n{text}"
+        );
+
+        // The opening forget frees the name the join asks for.
+        let dir = std::env::temp_dir().join(format!(
+            "fil-recipe-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
+        let now = identity::now_secs();
+        let live = identity::DeviceCert::certify(&uk, [0x63u8; 32], now, 30 * 86_400).unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            serde_json::to_string(&serde_json::json!([
+                { "name": "p9-b", "secret": "c".repeat(64), "deviceCert": live.to_json() },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let forget = &cmds[0];
+        let argv: Vec<&str> = forget.split_whitespace().collect();
+        match crate::Cli::try_parse_from(&argv).unwrap().cmd {
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Forget { name }), .. }) => {
+                crate::fleet_support::forget_device(&name, now)
+                    .unwrap_or_else(|e| panic!("{what}: `{forget}` failed: {e}"));
+            }
+            _ => panic!("{what}: the recipe does not open with a forget: `{forget}`"),
+        }
+        assert!(crate::device_view::device_cert_for("p9-b").is_none(), "{what}: the name is still held");
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// E2: `join --name beta` that the owner filed as `beta-2` (the old record still

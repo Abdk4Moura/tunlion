@@ -516,7 +516,7 @@ pub(crate) async fn handle_auth_key_enroll_response(
                 // reset device does not sit beside its stale self forever.
                 if candidate != base {
                     ui::say(&format!(
-                        "  {} a new device asked to be called {base}, a name another key holds, so it was stored as {candidate}. If {base} was reset and this is the same machine: `tunlion devices forget {base}` then `tunlion devices rename {candidate} {base}`.",
+                        "  {} a new device asked to be called {base}, a name another key holds, so it was stored as {candidate}. If {base} was reset and this is the same machine: `tunlion devices forget {base} -y` then `tunlion devices rename {candidate} {base}`.",
                         ui::paint(ui::Tone::Warn, "!")
                     ));
                 }
