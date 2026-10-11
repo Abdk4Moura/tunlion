@@ -857,6 +857,15 @@ fi
 # a MID-transfer link (by_sid non-empty) is never dropped — gate 2 (kill-resume)
 # and gate 11c (deferred-drop) reconnect paths are untouched (unit-tested too).
 say "18b: recv exits on post-completion link churn — Mode B (RC=124 flake, #28)"
+# WebRTC for this gate, by construction. The Mode B flap is a WebRTC
+# phenomenon: the churn hook closes the link's PeerConnection and `on_stuck`
+# acts only on a link whose PeerConnection is down. Until fix/known-red-gates
+# these same-install transfers always fell back to WebRTC by accident (the
+# promotion to direct never worked); now they reach QUIC, where a direct link
+# has no PeerConnection to close, the baseline never flapped, and the A half
+# could not show the bug it exists to show. FILAMENT_DIRECT=0 restores the
+# premise explicitly instead of by accident.
+export FILAMENT_DIRECT=0
 H_DIR="$WORK/g18b"; mkdir -p "$H_DIR"
 # A) baseline: Mode-B drop disabled → the post-completion flap hangs to timeout.
 # -v on the receivers: the flap line ("connection stuck while connecting,
@@ -899,6 +908,7 @@ else
   bad "gate-18b Mode B"; echo "  base_ok=$base_ok RCA=$RCA RCB=$RCB fix_walltime=$((T1-T0))s"
   tail -n 6 "$WORK/g18bb-recv.log" "$WORK/g18ba-recv.log"
 fi
+unset FILAMENT_DIRECT
 
 # --------------------------------------------------------------- gate 19 ----
 say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"

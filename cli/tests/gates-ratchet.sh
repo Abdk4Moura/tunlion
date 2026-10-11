@@ -80,6 +80,7 @@ EXPECTED_GREEN=(
   "pair ceremony: both exited clean|pair-ceremony"
   "ceremony bailed in|pair fail-fast"
   "lossy rendezvous converged|gate-L convergence"
+  "quiet-exit fired (peer-left dropped)|quiet-exit (G-k)"
 )
 
 # A missing PASS line has three different causes and they want different
