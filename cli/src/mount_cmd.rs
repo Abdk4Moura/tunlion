@@ -153,6 +153,12 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ("roster.json", "fleet roster"),
     ("roster-state.json", "fleet roster state"),
     ("armed.json", "armed invitations"),
+    // Safe to remove only because reset also removes the owner key above: an
+    // invitation signed by the old key cannot verify against a new one.
+    (
+        crate::invite_burn::USED_INVITATIONS_FILE,
+        "used invitations (one-use counts)",
+    ),
     ("ssh_ca_issued.json", "ssh certificate issuance log"),
     ("ssh_ca_serial", "ssh certificate serial counter"),
     ("peerconf", "per-peer settings"),
@@ -537,6 +543,7 @@ mod reset_tests {
             "caps.json",
             "ssh",
             "revoked-keys.json",
+            "used-invitations.json",
         ] {
             assert!(names.contains(&must), "reset does not remove {must}");
         }

@@ -93,6 +93,10 @@ pub(crate) async fn handle_warm_req(
         // Wake is handled inline in the daemon loop (its whole purpose is to make
         // the loop iterate); answer defensively if it ever reaches here.
         ctl::ReqKind::Wake => req.reply(&json!({ "ok": true })).await,
+        // RevocationSync is handled inline in the daemon loop (it owns the
+        // device list and the links it must close). Never confirm it from here:
+        // `ok:false` makes the caller say the revocation is not yet confirmed.
+        ctl::ReqKind::RevocationSync => req.reply(&json!({ "ok": false })).await,
         // Mount/Unmount/ListMounts/MountHealth are handled inline in the daemon
         // loop (they need access to DaemonMounts); answer defensively if reached.
         ctl::ReqKind::Mount { .. } => req.reject("mount not handled here").await,

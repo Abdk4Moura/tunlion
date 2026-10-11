@@ -1551,7 +1551,18 @@ pub(crate) async fn recv_cmd(
     // Brokered meeting places we have joined: channel -> its one-time secret.
     // Kept so a peer arriving on one is proved by that secret, exactly as a
     // paired peer is proved by a pair secret.
-    let mut brokered: HashMap<String, String> = HashMap::new();
+    // The value also carries the device key of the sibling that brokered it,
+    // so revoking that key closes the meeting place it opened (revocation_live).
+    let mut brokered: HashMap<String, (String, Option<[u8; 32]>)> = HashMap::new();
+    // Forget / revoke, live (revocation_live.rs). `revocation_snap` is the store
+    // the last sweep acted on; a different one, or a `revocation-sync` request
+    // (`revocation_sweep_now`), runs the sweep on this iteration's scan.
+    // `revoked_secrets` collects held secrets the store dropped, wherever they
+    // were noticed, until the sweep closes the links that used them.
+    let mut revocation_snap = crate::revocation_live::store_snapshot();
+    let mut revocation_sweep_now = false;
+    let mut revoked_secrets: std::collections::HashSet<String> = Default::default();
+    let mut revocation_waiters: Vec<ctl::Req> = Vec::new();
     // How long an offer may wait for its sender to prove itself before we decide
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
     // would turn a clean decline into the 45s timeout it replaced.
@@ -1674,6 +1685,12 @@ pub(crate) async fn recv_cmd(
                                 l2_enabled, &mut sess, &sio, &my_uid,
                             ).await;
                             req.reply(&json!({ "ok": true, "live": live })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::RevocationSync) {
+                            // `devices forget` / `revoke`: apply the store NOW.
+                            // Parked, and answered by the sweep below on this
+                            // same iteration, so the reply means it is done.
+                            revocation_sweep_now = true;
+                            revocation_waiters.push(req);
                         } else if matches!(&req.kind, ctl::ReqKind::Wake) {
                             // Nothing to do here: receiving this event IS the point.
                             // The loop now runs its top-level arm gate this same
@@ -2638,8 +2655,90 @@ pub(crate) async fn recv_cmd(
         // them into `devices` so the KnownPeer handler recognizes them. We never
         // re-subscribe existing channels or touch live links. Daemon-only: a
         // one-shot `recv`/`send` has a fixed roster for its short lifetime.
-        if daemon && last_devices_scan.elapsed() >= Duration::from_secs(2) {
+        if daemon && (revocation_sweep_now || last_devices_scan.elapsed() >= Duration::from_secs(2)) {
             last_devices_scan = Instant::now();
+            // Forget / revoke, live. Runs FIRST so a forgotten secret is out of
+            // `devices` before anything below can re-add or dial it.
+            let snap = crate::revocation_live::store_snapshot();
+            if revocation_sweep_now || (snap.is_some() && snap != revocation_snap) {
+                revocation_sweep_now = false;
+                if snap.is_none() {
+                    // A store that cannot be read is never "everything was
+                    // forgotten"; the per-open gate fails closed on it anyway.
+                    for req in revocation_waiters.drain(..) {
+                        req.reply(&json!({ "ok": false, "error": "device store unreadable" })).await;
+                    }
+                } else {
+                    revocation_snap = snap;
+                    revoked_secrets.extend(crate::revocation_live::prune_to_store(&mut devices));
+                    // Meeting places a now-revoked sibling brokered.
+                    brokered.retain(|_, (sec, broker)| {
+                        let keep = !broker.as_ref().is_some_and(device_cert_revoked);
+                        if !keep {
+                            revoked_secrets.insert(sec.clone());
+                        }
+                        keep
+                    });
+                    if !revoked_secrets.is_empty() {
+                        let gone: std::collections::HashSet<String> =
+                            revoked_secrets.iter().map(|s| channel_of(s)).collect();
+                        known_channels.retain(|c| !gone.contains(c));
+                        let before = sess.channels.len();
+                        sess.channels.retain(|c| !gone.contains(c));
+                        if sess.channels.len() != before {
+                            sess.invalidate();
+                        }
+                    }
+                    let mut doomed: Vec<(String, String)> = Vec::new();
+                    let mut unrouted: Vec<String> = Vec::new();
+                    for (pid, l) in &conn.links {
+                        let facts = crate::revocation_live::LinkFacts {
+                            secret: l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
+                            device_pub: l.identity_device_pub,
+                        };
+                        if crate::revocation_live::link_must_close(
+                            &facts,
+                            &revoked_secrets,
+                            &crate::revocation_live::key_listed,
+                        ) {
+                            doomed.push((pid.clone(), l.label().to_string()));
+                        } else if crate::revocation_live::route_must_withdraw(
+                            l.identity_device_pub.as_ref(),
+                            &device_cert_revoked,
+                        ) {
+                            unrouted.push(pid.clone());
+                        }
+                    }
+                    revoked_secrets.clear();
+                    for (pid, label) in &doomed {
+                        conn.drop_link(pid);
+                        l2_muxes.remove(pid);
+                        fleet_pending.remove(pid);
+                        fleet_verified.remove(pid);
+                        fleet_greeted.remove(pid);
+                        fleet_deferred_offers.retain(|(p, _, _)| p != pid);
+                        unrouted.push(pid.clone());
+                        ui::say(&format!(
+                            "closed the link to '{label}': it was forgotten or revoked here"
+                        ));
+                    }
+                    // An overlay route is the one thing a revoked device keeps
+                    // without opening anything, so it goes with the revocation
+                    // (this is the explicit forget path `remove_by_pid` is for).
+                    #[cfg(l3)]
+                    for pid in &unrouted {
+                        l3_seen.remove(pid);
+                        if let Some(m) = l3.as_ref() {
+                            m.remove_by_pid(pid).await;
+                        }
+                    }
+                    let _ = &unrouted;
+                    let closed = doomed.len();
+                    for req in revocation_waiters.drain(..) {
+                        req.reply(&json!({ "ok": true, "closed": closed })).await;
+                    }
+                }
+            }
             let mut new_chans: Vec<String> = Vec::new();
             for (n, s) in devices_load() {
                 let ch = channel_of(&s);
@@ -3056,6 +3155,13 @@ pub(crate) async fn recv_cmd(
                     // Channel subscriptions are independent of room membership.
                     // Re-adopt missed known-peer pushes and reap known links that
                     // remain absent from two consecutive channel rosters.
+                    // Re-adopting dials on a held secret: check it against the
+                    // store first, as the known-peer arm does.
+                    let gone = crate::revocation_live::prune_to_store(&mut devices);
+                    if !gone.is_empty() {
+                        revoked_secrets.extend(gone);
+                        revocation_sweep_now = true;
+                    }
                     for p in &channel_peers {
                         if is_self_uid(&conn.my_uid, p["uid"].as_str()) {
                             continue;
@@ -3232,6 +3338,14 @@ pub(crate) async fn recv_cmd(
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own sender/daemon shares these channels
                 }
+                // Dialing on a held secret is admitting it (a direct link is born
+                // trusted on that MAC), so match against the store as it is NOW,
+                // not as it was at start: a forgotten device must not be dialed.
+                let gone = crate::revocation_live::prune_to_store(&mut devices);
+                if !gone.is_empty() {
+                    revoked_secrets.extend(gone);
+                    revocation_sweep_now = true;
+                }
                 if let Some((n, sec)) = devices
                     .iter()
                     .find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or(""))
@@ -3287,8 +3401,16 @@ pub(crate) async fn recv_cmd(
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
                     }
-                } else if let Some(sec) = brokered.get(v["channel"].as_str().unwrap_or("")).cloned()
+                } else if let Some((sec, broker)) =
+                    brokered.get(v["channel"].as_str().unwrap_or("")).cloned()
                 {
+                    // A meeting place opened by a sibling revoked since is closed,
+                    // not honoured (the sweep also drops it from `brokered`).
+                    if broker.as_ref().is_some_and(device_cert_revoked) {
+                        ui::debug("brokered meeting place refused: its broker is revoked");
+                        revocation_sweep_now = true;
+                        continue;
+                    }
                     // A peer arrived on a meeting place we were TOLD about over a
                     // certificate-verified link. Exactly one other party is
                     // expected here, and the brokered secret proves it the same
@@ -3834,6 +3956,12 @@ pub(crate) async fn recv_cmd(
                                     ui::debug(&format!(
                                         "  l3-announce from {pid} ignored: relayed link and peer does not advertise relay datagrams"
                                     ));
+                                } else if device_cert_revoked(&pending.pubkey) {
+                                    // The overlay key IS the device key: a
+                                    // revoked or forgotten device gets no route.
+                                    ui::debug(&format!(
+                                        "  l3-announce from {pid} ignored: its key is revoked here"
+                                    ));
                                 } else if l3.accept_seq(&pending.pubkey, pending.seq).await {
                                     let who =
                                         conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
@@ -4316,7 +4444,8 @@ pub(crate) async fn recv_cmd(
                                 let _ = sio
                                     .emit("subscribe", json!({ "channels": [ch.clone()] }))
                                     .await;
-                                brokered.insert(ch, sec.to_string());
+                                let broker = conn.link(&pid).and_then(|l| l.identity_device_pub);
+                                brokered.insert(ch, (sec.to_string(), broker));
                                 ui::debug(&format!(
                                     "fleet-rendezvous: joined a brokered channel for {pid}"
                                 ));
@@ -4353,6 +4482,14 @@ pub(crate) async fn recv_cmd(
                                 }) {
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
+                                            // The overlay key IS the device key: a
+                                            // revoked or forgotten device gets no route.
+                                            if device_cert_revoked(&ann.pubkey) {
+                                                ui::debug(&format!(
+                                                    "  l3-announce from {pid} ignored: its key is revoked here"
+                                                ));
+                                                continue;
+                                            }
                                             // Seq check AFTER verify, never before, so an
                                             // unauthenticated message cannot poison the
                                             // last-seen map. verify() proves address-is-key,
@@ -5658,6 +5795,14 @@ pub(crate) async fn recv_cmd(
                     }
                 }
                 Some("pair-proof") => {
+                    // The proof is matched against the store as it is NOW: a
+                    // secret `devices forget` removed must stop proving at once,
+                    // not at the next daemon start.
+                    let gone = crate::revocation_live::prune_to_store(&mut devices);
+                    if !gone.is_empty() {
+                        revoked_secrets.extend(gone);
+                        revocation_sweep_now = true;
+                    }
                     let mac = v["mac"].as_str().unwrap_or_default();
                     let peer_uid = conn
                         .link(&pid)

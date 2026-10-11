@@ -1144,9 +1144,16 @@ pub(crate) async fn async_main() -> Result<()> {
                     // (fleet_support::forget_device). The name is then free.
                     let report = crate::fleet_support::forget_device(&name, identity::now_secs())?;
                     println!("{report}");
-                    println!(
-                        "(their side still holds its half; it will hear \"never met you\" on the next proof)"
-                    );
+                    // The store is written; the RUNNING daemon must act on it too
+                    // (revocation_live.rs). Say only what it confirmed. The old
+                    // line here promised the forgotten device would hear "never
+                    // met you": it does not, because this machine stops answering
+                    // it at all, so from its side we look offline.
+                    let answer = crate::revocation_live::tell_daemon().await;
+                    match crate::revocation_live::daemon_line(&name, &answer, true) {
+                        Ok(line) => ui::say(&line),
+                        Err(e) => bail!(e),
+                    }
                 }
                 Some(DevicesAction::Rename { old, new }) => {
                     // Rename in place on the raw record so caps/v2 fields ride
@@ -1168,6 +1175,11 @@ pub(crate) async fn async_main() -> Result<()> {
                     println!(
                         "revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `tunlion devices restore {name}` can)"
                     );
+                    let answer = crate::revocation_live::tell_daemon().await;
+                    match crate::revocation_live::daemon_line(&name, &answer, false) {
+                        Ok(line) => ui::say(&line),
+                        Err(e) => bail!(e),
+                    }
                 }
                 Some(DevicesAction::Restore { name }) => {
                     if !device_record_exists(&name) {
@@ -1801,6 +1813,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 println!(
                     "revoked fleet certificate from '{device}'; the device is denied by the local capability gate"
                 );
+                let answer = crate::revocation_live::tell_daemon().await;
+                match crate::revocation_live::daemon_line(&device, &answer, false) {
+                    Ok(line) => ui::say(&line),
+                    Err(e) => bail!(e),
+                }
                 return Ok(());
             }
             let capability = capability

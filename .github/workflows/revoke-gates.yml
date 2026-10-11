@@ -29,6 +29,12 @@
 # tells you when the far side says no. There was no gate for it at all, which is
 # why #268 had to be found by hand across two machines.
 #
+# Also carries revocation-live-gates: a forget must end access in the daemon
+# that is ALREADY RUNNING (no restart between the forget and the check), and a
+# used invitation must stay used across a forget and an owner restart. Both were
+# found by hand on the launch candidate because every earlier forget gate
+# restarted a daemon in between, which is exactly what hid them.
+#
 # Linux only, deliberately. The mount arm needs FUSE, and the point here is to
 # run the guarantee somewhere real rather than to matrix it.
 
@@ -47,6 +53,7 @@ on:
       - 'cli/tests/fleet-cert-gates.sh'
       - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/forward-refusal-gates.sh'
+      - 'cli/tests/revocation-live-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -129,6 +136,10 @@ jobs:
             [cli/tests/l2-revoke-gates.sh]=3
             [cli/tests/shell-posture-gates.sh]=3
             [cli/tests/forward-refusal-gates.sh]=5
+            # 14 = 3 enrolment + 7 live-forget (S1: forget applied by the
+            # RUNNING daemon, no restart) + 4 invitation-burn (S2: a used
+            # invitation stays used across forget and restart, new key or same).
+            [cli/tests/revocation-live-gates.sh]=14
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
@@ -139,7 +150,8 @@ jobs:
                    cli/tests/mount-revoke-gates.sh \
                    cli/tests/l2-revoke-gates.sh \
                    cli/tests/shell-posture-gates.sh \
-                   cli/tests/forward-refusal-gates.sh; do
+                   cli/tests/forward-refusal-gates.sh \
+                   cli/tests/revocation-live-gates.sh; do
             echo "::group::$g"
             # Label the tree the gates actually run against: CI checks out
             # GitHub's MERGE ref (pull/N/merge) by default, so "CI ran sha X"
