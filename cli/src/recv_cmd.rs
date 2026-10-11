@@ -1668,7 +1668,12 @@ pub(crate) async fn recv_cmd(
     // paired peer is proved by a pair secret.
     // The value also carries the device key of the sibling that brokered it,
     // so revoking that key closes the meeting place it opened (revocation_live).
-    let mut brokered: HashMap<String, (String, Option<[u8; 32]>)> = HashMap::new();
+    let mut brokered: HashMap<String, (String, crate::revocation_live::BrokeredBy)> =
+        HashMap::new();
+    // Links dialed on a brokered meeting place, by pid -> who brokered it. Each
+    // adoption of such a link (first DirectReady and every repair) is re-bound
+    // to the broker's proven identity, never to the name the peer announced.
+    let mut brokered_pids: HashMap<String, crate::revocation_live::BrokeredBy> = HashMap::new();
     // Forget / revoke, live (revocation_live.rs). `revocation_snap` is the store
     // the last sweep acted on; a different one, or a `revocation-sync` request
     // (`revocation_sweep_now`), runs the sweep on this iteration's scan.
@@ -2914,7 +2919,7 @@ pub(crate) async fn recv_cmd(
                     revoked_secrets.extend(crate::revocation_live::prune_to_store(&mut devices));
                     // Meeting places a now-revoked sibling brokered.
                     brokered.retain(|_, (sec, broker)| {
-                        let keep = !broker.as_ref().is_some_and(device_cert_revoked);
+                        let keep = !device_cert_revoked(&broker.device_pub);
                         if !keep {
                             revoked_secrets.insert(sec.clone());
                         }
@@ -2951,6 +2956,10 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                     revoked_secrets.clear();
+                    brokered_pids.retain(|p, by| {
+                        (conn.links.contains_key(p) || conn.direct_pending.contains_key(p))
+                            && !device_cert_revoked(&by.device_pub)
+                    });
                     for (pid, label) in &doomed {
                         conn.drop_link(pid);
                         l2_muxes.remove(pid);
@@ -3668,7 +3677,7 @@ pub(crate) async fn recv_cmd(
                 {
                     // A meeting place opened by a sibling revoked since is closed,
                     // not honoured (the sweep also drops it from `brokered`).
-                    if broker.as_ref().is_some_and(device_cert_revoked) {
+                    if device_cert_revoked(&broker.device_pub) {
                         ui::debug("brokered meeting place refused: its broker is revoked");
                         revocation_sweep_now = true;
                         continue;
@@ -3686,11 +3695,19 @@ pub(crate) async fn recv_cmd(
                     if pid.is_empty() {
                         continue;
                     }
-                    let name = v["name"].as_str().unwrap_or("peer").to_string();
+                    // Dialed (and so filed) under the BROKER's proven name, never
+                    // the name this peer announces: a one-shot that called itself
+                    // after a device holding grants used to be filed as that
+                    // device (revocation_live::brokered_dial_name).
+                    let name = crate::revocation_live::brokered_dial_name(&broker);
+                    brokered_pids.insert(pid.clone(), broker.clone());
                     conn.start_direct(&pid, &name, &sec).await;
                     conn.maybe_adopt(&v, true).await?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((name, sec));
+                        if l.transport.is_some() {
+                            crate::revocation_live::bind_brokered_link(l, &broker);
+                        }
                     }
                 } else if fleet::is_fleet_channel(v["channel"].as_str().unwrap_or("")) {
                     // Fleet auto-mesh: a device is present on our fleet meeting
@@ -3981,6 +3998,14 @@ pub(crate) async fn recv_cmd(
                 conn.adopt_direct(&pid, t.clone(), route);
                 if let Some(k) = tkey {
                     conn.spawn_direct_workers(&pid, &t, k);
+                }
+                // A link on a brokered meeting place: adoption just copied the
+                // dial name into verified_name and marked it trusted. Re-bind it
+                // to the broker's proven identity, on every (re)adoption.
+                if let Some(by) = brokered_pids.get(&pid) {
+                    if let Some(l) = conn.link_mut(&pid) {
+                        crate::revocation_live::bind_brokered_link(l, by);
+                    }
                 }
                 // #30: Send nonce challenge at link adoption so Proven settles
                 // before any gated open. Under authoritative, HOLD ChannelReady
@@ -4665,16 +4690,32 @@ pub(crate) async fn recv_cmd(
                     match v["secret"].as_str() {
                         Some(sec) if hex::decode(sec).map(|b| b.len()).ok() == Some(32) => {
                             let ch = channel_of(sec);
-                            if !sess.channels.contains(&ch) {
-                                sess.channels.push(ch.clone());
-                                let _ = sio
-                                    .emit("subscribe", json!({ "channels": [ch.clone()] }))
-                                    .await;
-                                let broker = conn.link(&pid).and_then(|l| l.identity_device_pub);
-                                brokered.insert(ch, (sec.to_string(), broker));
-                                ui::debug(&format!(
-                                    "fleet-rendezvous: joined a brokered channel for {pid}"
-                                ));
+                            // Who brokered it, as PROVEN on this link by its
+                            // fleet-hello. A link verified but missing any of
+                            // these is not one to accept a meeting place from.
+                            let broker = conn.link(&pid).and_then(|l| {
+                                Some(crate::revocation_live::BrokeredBy {
+                                    device_pub: l.identity_device_pub?,
+                                    owner_pub: l.identity_user_pub?,
+                                    expires: l.identity_cert_expires?,
+                                    name: l.verified_name.clone(),
+                                })
+                            });
+                            match broker {
+                                None => ui::debug(&format!(
+                                    "fleet-rendezvous from {pid} ignored: no proven identity on the link"
+                                )),
+                                Some(broker) if !sess.channels.contains(&ch) => {
+                                    sess.channels.push(ch.clone());
+                                    let _ = sio
+                                        .emit("subscribe", json!({ "channels": [ch.clone()] }))
+                                        .await;
+                                    brokered.insert(ch, (sec.to_string(), broker));
+                                    ui::debug(&format!(
+                                        "fleet-rendezvous: joined a brokered channel for {pid}"
+                                    ));
+                                }
+                                Some(_) => {}
                             }
                         }
                         _ => ui::debug("fleet-rendezvous: ignored a malformed secret"),

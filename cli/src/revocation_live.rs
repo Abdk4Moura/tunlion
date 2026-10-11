@@ -135,6 +135,50 @@ pub(crate) fn key_listed(device_pub: &[u8; 32]) -> bool {
     crate::fleet_support::device_key_revoked(device_pub, crate::identity::now_secs())
 }
 
+/// Who brokered a meeting place: the PROVEN identity of the certificate
+/// verified fleet link the `fleet-rendezvous` arrived on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BrokeredBy {
+    pub device_pub: [u8; 32],
+    pub owner_pub: [u8; 32],
+    pub expires: u64,
+    /// The local petname for `device_pub`, if we hold a record for that key.
+    pub name: Option<String>,
+}
+
+/// The name a link on a brokered meeting place is dialed under, which every
+/// adoption path copies into `verified_name` (the capability-store key). Pure.
+///
+/// It comes from the BROKER's proven key, never from the name the arriving peer
+/// announces. The old code used the announced name, so a fleet sibling's
+/// one-shot calling itself after a device that holds grants was filed under
+/// that device: `verified_name` was the claimed name, `resolve_peer_identity`
+/// then resolved the CLAIMED device's certificate, and the link was born
+/// trusted as an owner device. With no record for the broker's key the link
+/// gets `BROKERED_NO_RECORD`, which no device record can be named (it holds a
+/// control character, which every stored name has stripped), so it keys no
+/// grant on any path that copies it.
+pub(crate) fn brokered_dial_name(broker: &BrokeredBy) -> String {
+    broker
+        .name
+        .clone()
+        .unwrap_or_else(|| BROKERED_NO_RECORD.to_string())
+}
+
+/// See `brokered_dial_name`. Not `FLEET_LINK_NAME`: that one is printable, so
+/// `devices rename x 'fleet: unverified'` could make it a record's name.
+pub(crate) const BROKERED_NO_RECORD: &str = "\u{7f}fleet: brokered, no record";
+
+/// Bind a link that arrived on a brokered meeting place to its broker: the
+/// same shape as a fleet-hello admission (proven key, fleet principal, not
+/// legacy-trusted), because the only thing the peer proved is possession of a
+/// one-time secret the broker handed over its own verified link.
+pub(crate) fn bind_brokered_link(link: &mut crate::conn::Link, broker: &BrokeredBy) {
+    link.trusted = false;
+    link.verified_name = broker.name.clone();
+    link.admit_fleet(broker.owner_pub, broker.device_pub, broker.expires);
+}
+
 /// What a running daemon said when asked to apply a revocation now.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DaemonAnswer {
@@ -258,6 +302,27 @@ mod tests {
         std::fs::write(&d, "[{\"name\":").unwrap();
         assert_eq!(snapshot_at(&d, &r), None, "a torn store must not read as every secret removed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_brokered_link_never_takes_the_name_its_peer_asserts() {
+        // The broker proved key [7;32], which we hold as "phone". Whatever the
+        // arriving one-shot calls itself ("laptop", the device with grants),
+        // the link is dialed, and so filed, as the broker.
+        let by = BrokeredBy {
+            device_pub: [7u8; 32],
+            owner_pub: [1u8; 32],
+            expires: 99,
+            name: Some("phone".into()),
+        };
+        assert_eq!(brokered_dial_name(&by), "phone");
+        // No record for the broker's key: the placeholder, which can never be
+        // a device record's name, so it keys no grant.
+        let unknown = BrokeredBy { name: None, ..by.clone() };
+        let n = brokered_dial_name(&unknown);
+        assert_eq!(n, BROKERED_NO_RECORD);
+        assert_ne!(crate::sanitize_device_name(&n), n, "the placeholder is not a storable device name");
+        assert_ne!(n, "laptop");
     }
 
     #[test]

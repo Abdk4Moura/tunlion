@@ -152,10 +152,10 @@ jobs:
             # record; the slot reports it (KNOWN-RED today, counted here).
             [cli/tests/shell-posture-gates.sh]=4
             [cli/tests/forward-refusal-gates.sh]=6
-            # 14 = 3 enrolment + 7 live-forget (S1: forget applied by the
+            # 15 = 3 enrolment + 8 live-forget (S1: forget applied by the
             # RUNNING daemon, no restart) + 4 invitation-burn (S2: a used
             # invitation stays used across forget and restart, new key or same).
-            [cli/tests/revocation-live-gates.sh]=14
+            [cli/tests/revocation-live-gates.sh]=15
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
