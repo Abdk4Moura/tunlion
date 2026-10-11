@@ -109,6 +109,26 @@ dying by SIGPIPE (exit 141): 141 says only "the reader left", which under
 the verdict. Only the print itself counts: a socket or child pipe that closes
 under a command is still that command's failure.
 
+**A closed pipe never turns undone work into success.** The rule above is
+for verbs that only LOOK (`status`, `devices`, `logs`, `reach`, `doctor`,
+`id`, `addr`, `requests`): when their reader stops, nothing is left undone.
+An ACTION (`send`, `sync`, `exec`, `receive`, `add`, `join`, `up`, every
+other verb) is different: `tunlion send f --to beta 2>&1 | head -1` exited 0
+after 0.6 s with nothing delivered, because its second human line hit the
+closed pipe and the hook above exited 0 in the middle of the transfer. The
+rule per class:
+
+- human lines (stderr, through `ui::`) never panic: a closed stderr is
+  dropped silently and the command keeps working, so an action finishes the
+  job and exits with its REAL result (0 delivered, 4 refused, 6 unreachable);
+- an action whose bare print to a closed STDOUT still hits the hook exits
+  141 (128 + SIGPIPE, what a shell reports for SIGPIPE) unless it already
+  decided its code, never 0: under `set -o pipefail` that fails the
+  pipeline, which is right, because the work was not confirmed done;
+- `exec` writes the remote command's output itself: a closed local stdout
+  ends it with 141, never "Error: Broken pipe" and 1;
+- `logs` and `logs -f` stop quietly with 0 when their reader goes away.
+
 Mixing them inside one screen is the specific bug to avoid. The invitation
 screen currently prints its body with `eprintln!` and its footer with
 `ui::say`, so under `-q` you get the footer and not the invitation.
