@@ -286,14 +286,21 @@ async fn end_session_tree(
     pgid: Option<u32>,
     readers: [&tokio::task::JoinHandle<u64>; 2],
     first: TreeSignal,
+    first_already_sent: bool,
     why: &str,
 ) -> Option<i32> {
     for r in readers {
         r.abort();
     }
     let mut gone = false;
-    for &sig in ladder(first) {
-        deliver_signal(child, pgid, sig);
+    for (step, &sig) in ladder(first).iter().enumerate() {
+        // A signal the initiator forwarded moments ago is not sent twice: the
+        // ladder only gives it its grace before the next, harder one. Sending
+        // SIGHUP straight after a forwarded SIGINT killed a shell before its
+        // INT trap could run.
+        if !(step == 0 && first_already_sent) {
+            deliver_signal(child, pgid, sig);
+        }
         let wait = if sig == TreeSignal::Kill {
             std::time::Duration::from_secs(5)
         } else {
@@ -591,6 +598,9 @@ pub(crate) async fn serve_exec(
     liveness.tick().await;
     let mut exec_ctl = exec_ctl;
     let mut exec_ctl_open = true;
+    // The last signal the initiator forwarded, so the close that follows it
+    // gives that signal its grace instead of sending SIGHUP on top of it.
+    let mut forwarded: Option<TreeSignal> = None;
     // stdin: chunks in, EOF shuts the child's write-half (it may still produce
     // output -- EOF is non-terminal, same rule as the pty pumps). Channel
     // death (link gone) kills the child: nobody is left to report to, and an
@@ -708,10 +718,14 @@ pub(crate) async fn serve_exec(
                         // A Ctrl-C the initiator forwarded just before its
                         // close may still be queued: it goes first, so the
                         // command sees the signal its user sent.
-                        let mut first = TreeSignal::Hangup;
+                        let (mut first, mut already_sent) = match forwarded {
+                            Some(sig) => (sig, true),
+                            None => (TreeSignal::Hangup, false),
+                        };
                         while let Ok(m) = exec_ctl.try_recv() {
                             if let ExecCtl::Signal(sig) = m {
                                 first = sig;
+                                already_sent = false;
                             }
                         }
                         let status = end_session_tree(
@@ -719,6 +733,7 @@ pub(crate) async fn serve_exec(
                             pgid,
                             [&out_task, &err_task],
                             first,
+                            already_sent,
                             "the initiator closed the session",
                         )
                         .await;
@@ -744,6 +759,7 @@ pub(crate) async fn serve_exec(
                     // l2-close follows and ends whatever ignores it.
                     last_heard = tokio::time::Instant::now();
                     deliver_signal(&mut child, pgid, sig);
+                    forwarded = Some(sig);
                 }
                 // The stream was dropped; the stdin arm sees it too and ends
                 // the session, so stop polling a closed channel.
@@ -763,6 +779,7 @@ pub(crate) async fn serve_exec(
                         pgid,
                         [&out_task, &err_task],
                         TreeSignal::Hangup,
+                        false,
                         why,
                     )
                     .await;
@@ -805,6 +822,7 @@ pub(crate) async fn serve_exec(
                         pgid,
                         [&out_task, &err_task],
                         TreeSignal::Kill,
+                        false,
                         "peer access revoked",
                     )
                     .await;
