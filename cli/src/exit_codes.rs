@@ -802,12 +802,15 @@ mod tests {
             ("NoIdentity", 9), ("LocalResource", 12),
         ];
         assert_eq!(kinds.len(), ExitKind::ALL.len(), "a new kind needs a row here");
-        let sources: [(&str, &str); 6] = [
+        // status_cmd.rs is not scanned: it also holds `up --detach`'s helpers
+        // (the network verdict for a daemon that died starting), which are
+        // up's codes. status's own codes are decided in one function,
+        // status_exit_code, and asserted below.
+        let sources: [(&str, &str); 5] = [
             ("send", concat!(include_str!("send_cmd.rs"), include_str!("send_report.rs"), include_str!("send_source.rs"))),
             ("sync", include_str!("sync_cmd.rs")),
             ("exec", include_str!("exec_send.rs")),
             ("reach", include_str!("ping.rs")),
-            ("status", include_str!("status_cmd.rs")),
             ("receive", include_str!("recv_cmd.rs")),
         ];
         for (verb, src) in sources {
@@ -834,6 +837,10 @@ mod tests {
                 }
             }
         }
+        for c in [0, STATUS_NOT_RUNNING, 6, 9] {
+            assert!(verb_exit_codes("status").contains(&c), "status returns {c}");
+        }
+        assert!(verb_exit_codes("up").contains(&7), "up --detach: the daemon said the network");
         // The reported case: send's help named 0/1/4/6 only.
         let help = exit_codes_help("send");
         for c in [0, 1, 2, 3, 4, 6, 7, 8, 130] {
