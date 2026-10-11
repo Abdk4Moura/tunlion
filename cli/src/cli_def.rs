@@ -125,7 +125,8 @@ pub(crate) struct Cli {
     /// TTY: a pipe still gets human text unless --json is set.
     #[arg(long, global = true)]
     pub(crate) json: bool,
-    /// Auto-confirm destructive actions (revoke, unmount, unexpose).
+    /// Auto-confirm destructive actions (revoke, devices forget, unmount,
+    /// unexpose, down, reset).
     /// Required from a non-TTY; a TTY prompts instead.
     #[arg(short = 'y', long = "yes", global = true)]
     pub(crate) yes: bool,

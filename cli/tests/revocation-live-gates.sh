@@ -110,7 +110,7 @@ fi
 # whole point. A restart anywhere from here to LF would hide S1.
 say "LB: forget while both daemons run; the running daemon confirms it"
 LOG_MARK=$(wc -l <"$WORK/up.log")
-"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$SPOKE" >"$WORK/forget.log" 2>&1
+"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$SPOKE" -y >"$WORK/forget.log" 2>&1
 rcLB=$?
 echo "## (forget) rc=$rcLB"; cat "$WORK/forget.log"
 if [ "$rcLB" = "0" ] \
@@ -191,7 +191,7 @@ rm -f "$WORK/$GAMMA-samekey/identity/device-cert.json" "$WORK/$GAMMA-samekey/dev
 
 # The owner forgets it and restarts, the order S2 was found in. The restart is
 # what used to clear the one-use marker.
-"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$GAMMA" >"$WORK/forget-gamma.log" 2>&1
+"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$GAMMA" -y >"$WORK/forget-gamma.log" 2>&1
 kill "$OWNER_PID" 2>/dev/null
 sleep 2
 cp "$WORK/up.log" "$WORK/up-before-restart.log"

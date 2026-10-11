@@ -445,7 +445,7 @@ pub(crate) fn handle_identity_expose(
                     "its certificate was not stored ({e}), so revoke has nothing to key on."
                 )),
                 &[format!(
-                    "remove it instead: tunlion devices forget {petname}"
+                    "remove it instead: tunlion devices forget {petname} -y"
                 )],
             ),
         }

@@ -1142,6 +1142,16 @@ pub(crate) async fn async_main() -> Result<()> {
                     // records its KEY as revoked before dropping the record, and
                     // a revoked record carries its revocation over the same way
                     // (fleet_support::forget_device). The name is then free.
+                    //
+                    // Destructive, so it asks like `down`, `reset` and `devices
+                    // revoke` do: a prompt at a terminal, `-y` from a script.
+                    // It was the one destructive verb that did neither.
+                    if !device_record_exists(&name) {
+                        bail!("no device named '{name}', see `tunlion devices`");
+                    }
+                    ui_caps.confirm(&format!(
+                        "forget {name} (delete its record; its key stays refused)"
+                    ))?;
                     let report = crate::fleet_support::forget_device(&name, identity::now_secs())?;
                     println!("{report}");
                     // The store is written; the RUNNING daemon must act on it too
@@ -1803,7 +1813,7 @@ pub(crate) async fn async_main() -> Result<()> {
                             // vouched device got an error and no route. A record with no
                             // certificate is removed by forgetting it, and nothing else
                             // said so.
-                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `tunlion devices`).\n  To remove its access: tunlion devices forget {device}"
+                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `tunlion devices`).\n  To remove its access: tunlion devices forget {device} -y"
                         ))?;
                 let owner = load_owner_key().ok_or_else(|| anyhow!("no local user identity"))?;
                 if cert.user_pub != owner.public_key_bytes() {
@@ -1977,7 +1987,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                     "restart the daemon without it, or scope it: tunlion up --shell-only <others>"
                                 ),
                                 format!(
-                                    "or remove the device entirely: tunlion devices forget {device}"
+                                    "or remove the device entirely: tunlion devices forget {device} -y"
                                 ),
                             ],
                         );
