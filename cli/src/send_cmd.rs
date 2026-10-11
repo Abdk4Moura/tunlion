@@ -1801,6 +1801,49 @@ pub(crate) async fn send_cmd(
                 ui::debug(&format!(
                     "{name}: interrupted ({err}), will resume on reconnect"
                 ));
+                drop(out);
+                // The reconnect may already have happened. A daemon receiver
+                // that was killed and restarted dials us again on its own, and
+                // its new link can come up while the old one is still timing
+                // out: that ChannelReady found the old link still active and
+                // stayed idle, so when the old one then died nothing was left
+                // to re-offer on, and its eventual file-accept was dropped
+                // (`conn.transport()` is the dead active link). Measured in CI
+                // (gate 14b at -vv, 3 of 3): a new QUIC link up within a second
+                // of the restart, then 60 s stalls, a relay escalation, and the
+                // sender still running at 120 s. When the active link is dead
+                // and another live link to the same known device exists, that
+                // link becomes the target and gets the full ChannelReady path
+                // (offers with resume, a fresh delivery-ack wait).
+                if let Some((_, secret)) = &known_target {
+                    let channel = channel_of(secret);
+                    let active_dead = conn
+                        .active
+                        .as_ref()
+                        .and_then(|a| conn.transport_of(a))
+                        .is_none_or(|t| t.is_dead());
+                    let successor = if active_dead {
+                        conn.links
+                            .iter()
+                            .filter(|(pid, _)| conn.active.as_deref() != Some(pid.as_str()))
+                            .find(|(_, l)| {
+                                l.expected_secret
+                                    .as_ref()
+                                    .is_some_and(|(_, s)| channel_of(s) == channel)
+                                    && l.transport.as_ref().is_some_and(|t| !t.is_dead())
+                            })
+                            .map(|(pid, l)| (pid.clone(), l.transport.clone()))
+                    } else {
+                        None
+                    };
+                    if let Some((next, Some(t))) = successor {
+                        ui::debug(&format!(
+                            "  {next} is a live link to the same device; resuming there"
+                        ));
+                        conn.active = Some(next.clone());
+                        let _ = tx.send(Ev::ChannelReady(next, t));
+                    }
+                }
             }
             // P0 (GAP-1): the bytes-moved watchdog declared this transfer stalled.
             // Drive the least-disruptive correction ladder, preserving the on-disk
