@@ -994,6 +994,19 @@ pub(crate) fn upgrade_principal(
     }
 }
 
+/// The TCP-localhost transport for two processes of ONE install (c6100a6d) is
+/// unfinished, so it stays off. Its offer advertised a listener that nothing
+/// ever `accept`s, and the offer's receiver returned before trying it because a
+/// local pending carries no QUIC endpoint (`on_transport_offer` takes one or
+/// returns). Every same-install promotion therefore dropped its working WebRTC
+/// link, waited out DIRECT_BUDGET with nothing dialled, and re-established
+/// WebRTC: measured in CI, a 5 MiB code transfer between two processes sharing
+/// a config dir took 31 s, 8 runs of 8, each with DIRECT-FALLBACK on both ends.
+/// Those peers now take the same authenticated QUIC race as any other pair
+/// (their session ids differ, so role election holds). It is also unencrypted
+/// and unauthenticated, which a finished version would have to answer first.
+const LOCAL_TCP_TRANSPORT: bool = false;
+
 impl Conn {
     /// Single constructor for the `pair`/`send`/`recv` command event loops, which
     /// built the identical ~17-field `Conn` literal three times (the only
@@ -1920,7 +1933,7 @@ impl Conn {
 
         // Check if target is same-machine peer (local transport).
         let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str());
-        let is_local = is_self_uid(&self.my_uid, peer_uid);
+        let is_local = LOCAL_TCP_TRANSPORT && is_self_uid(&self.my_uid, peer_uid);
 
         let (ep, port) = if is_local {
             // For local peers, we don't need a QUIC endpoint.
