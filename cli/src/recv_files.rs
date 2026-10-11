@@ -834,6 +834,190 @@ pub(crate) async fn finalize_incoming(
     Ok(true)
 }
 
+/// How long an interrupted transfer's partial (`<name>.part` plus its
+/// `<name>.part.meta`) waits in the inbox for its resume before the receiver
+/// removes it: 7 days, stated wherever `tunlion status` lists partials.
+/// Before this a partial of up to the chunk size stayed forever, and nothing
+/// mentioned it.
+pub(crate) const PARTIAL_TTL_SECS: u64 = 7 * 86_400;
+
+/// One resumable partial left in the inbox by an interrupted transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Partial {
+    /// The file it will become (`<name>` of `<name>.part`).
+    pub(crate) name: String,
+    pub(crate) bytes: u64,
+    pub(crate) age_secs: u64,
+}
+
+/// The resumable partials in `dir` (not recursive): a regular `<name>.part`
+/// WITH its `<name>.part.meta`. The meta is what makes it ours: a received
+/// file that merely ends in `.part` has none, so it is never listed and never
+/// expired. Sorted by name.
+pub(crate) fn resumable_partials(dir: &Path, now: std::time::SystemTime) -> Vec<Partial> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Partial> = entries
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let name = file.strip_suffix(".part")?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let md = std::fs::symlink_metadata(e.path()).ok()?;
+            if !md.is_file() || !dir.join(format!("{file}.meta")).is_file() {
+                return None;
+            }
+            let age_secs = md
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(Partial {
+                name,
+                bytes: md.len(),
+                age_secs,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Remove the partials in `dir` older than [`PARTIAL_TTL_SECS`] (the `.part`
+/// and its `.part.meta`). Returns what was removed.
+pub(crate) fn expire_partials(dir: &Path, now: std::time::SystemTime) -> Vec<Partial> {
+    let mut gone = Vec::new();
+    for p in resumable_partials(dir, now) {
+        if p.age_secs < PARTIAL_TTL_SECS {
+            continue;
+        }
+        let part = dir.join(format!("{}.part", p.name));
+        if std::fs::remove_file(&part).is_ok() {
+            let _ = std::fs::remove_file(dir.join(format!("{}.part.meta", p.name)));
+            gone.push(p);
+        }
+    }
+    gone
+}
+
+/// Expire old partials at receiver start and say what went.
+pub(crate) fn expire_partials_and_say(dir: &Path) {
+    for p in expire_partials(dir, std::time::SystemTime::now()) {
+        ui::say(&format!(
+            "  removed an interrupted transfer's partial of {} ({}), unresumed for {} days",
+            p.name,
+            human(p.bytes),
+            p.age_secs / 86_400
+        ));
+    }
+}
+
+/// `status --json`'s view of the partials: name, size, age, and when each
+/// will be removed if nobody resumes it.
+pub(crate) fn partials_json(dir: &Path) -> serde_json::Value {
+    let now = std::time::SystemTime::now();
+    serde_json::Value::Array(
+        resumable_partials(dir, now)
+            .into_iter()
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.name,
+                    "bytes": p.bytes,
+                    "ageSecs": p.age_secs,
+                    "expiresInSecs": PARTIAL_TTL_SECS.saturating_sub(p.age_secs),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// `status`'s human lines for the partials (none when there are none).
+pub(crate) fn partial_status_lines(dir: &Path) -> Vec<String> {
+    let parts = resumable_partials(dir, std::time::SystemTime::now());
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  interrupted transfers in {} (resume by sending again; removed after {} days):",
+        dir.display(),
+        PARTIAL_TTL_SECS / 86_400
+    )];
+    for p in parts {
+        lines.push(format!(
+            "    {}  {} so far, {} old",
+            p.name,
+            human(p.bytes),
+            age_words(p.age_secs)
+        ));
+    }
+    lines
+}
+
+fn age_words(secs: u64) -> String {
+    match secs {
+        s if s < 3_600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3_600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+
+    /// E4: an interrupted transfer left `<name>.part` and `.part.meta` in the
+    /// inbox forever, and `status` never mentioned them. They are listed with
+    /// size and age, expire after PARTIAL_TTL_SECS, and a received file that
+    /// merely ends in `.part` (no meta) is never touched.
+    #[test]
+    fn partials_are_listed_and_expire_and_a_plain_dot_part_file_is_left_alone() {
+        let d = std::env::temp_dir().join(format!(
+            "fil-partials-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("old.bin.part"), vec![0u8; 4096]).unwrap();
+        std::fs::write(d.join("old.bin.part.meta"), b"{}").unwrap();
+        std::fs::write(d.join("new.bin.part"), vec![0u8; 10]).unwrap();
+        std::fs::write(d.join("new.bin.part.meta"), b"{}").unwrap();
+        std::fs::write(d.join("notes.part"), b"a file the user received").unwrap();
+        let now = std::time::SystemTime::now();
+        let later = now + std::time::Duration::from_secs(PARTIAL_TTL_SECS - 3_600);
+        // Age `old` past the bound by moving "now", not the file clock.
+        std::fs::File::options()
+            .write(true)
+            .open(d.join("old.bin.part"))
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(2 * 3_600))
+            .unwrap();
+        let listed = resumable_partials(&d, now);
+        let names: Vec<&str> = listed.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["new.bin", "old.bin"]);
+        assert_eq!(listed[1].bytes, 4096);
+        assert!(listed[1].age_secs >= 2 * 3_600 - 5, "{:?}", listed[1]);
+        let lines = partial_status_lines(&d);
+        assert!(lines[0].contains("removed after 7 days"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("old.bin")), "{lines:?}");
+        let json = partials_json(&d);
+        assert_eq!(json.as_array().unwrap().len(), 2, "{json}");
+
+        let gone = expire_partials(&d, later);
+        assert_eq!(gone.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["old.bin"]);
+        assert!(!d.join("old.bin.part").exists() && !d.join("old.bin.part.meta").exists());
+        assert!(d.join("new.bin.part").exists() && d.join("new.bin.part.meta").exists());
+        assert!(d.join("notes.part").exists(), "a received file named *.part was removed");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};

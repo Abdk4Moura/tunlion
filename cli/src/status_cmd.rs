@@ -203,6 +203,11 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
                 // address and how to use it (the token's PATH, never the
                 // token), or null when none is running.
                 "proxy": crate::proxy_state::to_json(proxy.as_ref()),
+                // Interrupted transfers waiting in the inbox for a resume, with
+                // their size, age and when they expire.
+                "partials": crate::recv_files::partials_json(
+                    &crate::recv_files::inbox_to_check(pid.is_some()),
+                ),
             }))?
         );
         return match code {
@@ -288,6 +293,11 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         for line in crate::proxy_state::status_lines(p) {
             ui::say(&line);
         }
+    }
+    for line in crate::recv_files::partial_status_lines(
+        &crate::recv_files::inbox_to_check(pid_alive.is_some()),
+    ) {
+        ui::say(&line);
     }
     let recent = crate::transfer_history::recent(RECENT);
     if !recent.is_empty() {
