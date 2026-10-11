@@ -155,7 +155,7 @@ j3() {  # $1 signal name, $2 expected exit
       "$BIN" --server "$SERVER" send - --to boxB --json >"$out" 2>"$WORK/j3-$1.err"
   rc=${PIPESTATUS[1]}
   echo "## $1: rc=$rc stdout: $(cat "$out")"
-  "$PYV" - "$out" "$rc" "$2" "$1" <<'PY'
+  "$PYV" - "$out" "$rc" "$2" "SIG$1" <<'PY'
 import json, sys
 out, rc, want, sig = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 docs = [l for l in open(out) if l.strip()]
