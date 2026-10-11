@@ -28,6 +28,7 @@
 #   enrolment x3  the spoke is a certified fleet device (lib/fixture.sh)
 #   LA   POSITIVE send   -- before the forget, the spoke's file is delivered
 #   LA2  POSITIVE exec   -- and its exec runs
+#   LP   PREMISE: the owner's daemon holds a direct link to the spoke now
 #   LB   the forget says the RUNNING daemon applied it ("in effect now", at
 #        least one link closed) and does not promise "never met you"
 #   LC   the forgotten spoke's send is refused within seconds, nothing lands,
@@ -108,6 +109,23 @@ fi
 # ==================================================================== GATE LB ==
 # The spoke's daemon stays UP throughout, and so does the owner's: this is the
 # whole point. A restart anywhere from here to LF would hide S1.
+# ==================================================================== GATE LP ==
+# The premise LB stands on, made deterministic rather than assumed: the owner's
+# daemon HOLDS a live link to the spoke right now. `reach --until-direct` asks
+# that daemon about its own link (it never dials one of its own), so exit 0
+# means a held, direct link exists at the moment of the forget.
+say "LP: premise -- the owner's running daemon holds a link to the spoke"
+timeout 60 "${O_ENV[@]}" "$BIN" --server "$SERVER" reach "$SPOKE" --until-direct --timeout 40 \
+  >"$WORK/LP.out" 2>&1 </dev/null
+rcLP=$?
+echo "## (owner reach $SPOKE --until-direct) rc=$rcLP"
+if [ "$rcLP" = "0" ]; then
+  ok "gateLP: the owner's daemon holds a direct link to '$SPOKE' before the forget"
+else
+  cat "$WORK/LP.out"
+  bad "gateLP: the owner's daemon holds no direct link to '$SPOKE', so LB cannot show one being closed (rc=$rcLP)"
+fi
+
 say "LB: forget while both daemons run; the running daemon confirms it"
 LOG_MARK=$(wc -l <"$WORK/up.log")
 "${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$SPOKE" -y >"$WORK/forget.log" 2>&1
