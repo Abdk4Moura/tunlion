@@ -1055,7 +1055,8 @@ mod verbosity_tests {
     /// use the panicking print macros.
     #[test]
     fn human_lines_do_not_use_the_panicking_macros() {
-        let src = include_str!("ui.rs");
+        // A Windows checkout has CRLF line endings.
+        let src = include_str!("ui.rs").replace("\r\n", "\n");
         let body = |name: &str| {
             let start = src.find(&format!("fn {name}(")).expect(name);
             let end = src[start..].find("\n}\n").map(|e| start + e).unwrap();
