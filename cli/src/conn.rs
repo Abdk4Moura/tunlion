@@ -305,6 +305,10 @@ pub(crate) struct ResilienceState {
     /// signal, we re-probe IMMEDIATELY. Polled cheaply each tick (no platform
     /// netlink dependency); the portable best-effort trigger the plan asks for.
     pub(crate) iface_snapshot: Vec<String>,
+    /// When each peer's current inbound/outbound transfer became in flight, so
+    /// the bytes-moved watchdog measures silence since the transfer began, not
+    /// since the link was opened. See `detect_stall`.
+    pub(crate) in_flight_since: HashMap<String, Instant>,
 }
 
 /// ORCHESTRATION: peer-absence / rejoin-grace bookkeeping, split out of the Conn
@@ -1062,6 +1066,7 @@ impl Conn {
                 warm_cutover: std::collections::HashSet::new(),
                 upgrade_probe: HashMap::new(),
                 iface_snapshot: Vec::new(),
+                in_flight_since: HashMap::new(),
             },
             direct_ok,
             local_port: None,
@@ -2824,6 +2829,24 @@ impl Conn {
         let workers: Vec<Arc<dyn Transport>> = link.map(|l| l.workers.clone()).unwrap_or_default();
         let (transport_up, flowed, idle_ms) =
             Self::stall_observation(transport.map(|t| t.as_ref()), &workers);
+        // The stall clock starts when THIS transfer did. A link's idle time
+        // counts from when it opened (or last moved bytes), so a link that sat
+        // idle before a transfer was offered on it read as stalled the moment
+        // the transfer began: measured in CI (gate 14b at -vv), a restarted
+        // daemon's link idle 16.98 s accepted a resume and declared "inbound
+        // stall: 16983ms" in the same second, tearing down the link it had just
+        // accepted on, before one byte could move.
+        let idle_ms = if in_flight {
+            let since = *self
+                .resil
+                .in_flight_since
+                .entry(pid.to_string())
+                .or_insert_with(Instant::now);
+            idle_ms.min(u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX))
+        } else {
+            self.resil.in_flight_since.remove(pid);
+            idle_ms
+        };
         #[cfg(debug_assertions)]
         eprintln!(
             "[STALL] pid={pid} in_flight={in_flight} transport_up={transport_up} flowed={flowed} idle_ms={idle_ms} workers={} cluster={:?}",

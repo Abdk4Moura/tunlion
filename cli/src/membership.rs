@@ -251,6 +251,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
             warm_cutover: std::collections::HashSet::new(),
             upgrade_probe: HashMap::new(),
             iface_snapshot: Vec::new(),
+            in_flight_since: std::collections::HashMap::new(),
         },
         direct_ok: direct::direct_enabled(),
         local_port: None,
