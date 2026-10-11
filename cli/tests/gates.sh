@@ -464,7 +464,11 @@ if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1;
   TS=testsecret$RANDOM
   # --allow-loopback-peers: coturn 403s loopback peer addresses by default,
   # and in this hermetic setup BOTH peers are 127.0.0.1. Test-only flag.
-  CT=$(docker run -d --rm --network host coturn/coturn -n \
+  # PINNED. `coturn/coturn` (latest) dropped `--no-dtls`, so the container
+  # printed its usage and exited 255 within a second; -d --rm hid that, and the
+  # gate reported a relay failure that was really "no TURN server". 4.6.2
+  # accepts every flag below.
+  CT=$(docker run -d --rm --network host coturn/coturn:4.6.2 -n \
         --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 --listening-port=3478 \
         --static-auth-secret="$TS" --realm=tunlion.test --no-tls --no-dtls \
         --allow-loopback-peers --cli-password=x 2>/dev/null)
@@ -472,6 +476,10 @@ if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1;
   ( cd "$CLI_DIR/../backend" && PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS" \
       "$VENV_PY" app.py >"$WORK/g10-backend.log" 2>&1 ) &
   BK=$!; pids+=($BK); sleep 4
+  # A TURN server that is not running makes every relay assertion below
+  # meaningless, so say that instead of blaming the product.
+  [ -n "$CT" ] && [ "$(docker inspect -f '{{.State.Running}}' "$CT" 2>/dev/null)" = "true" ] \
+    || echo "  coturn is NOT running (container ${CT:-none}); the relay result below is not a product verdict"
   D="$WORK/g10"; mkdir -p "$D"
   "$BIN" -v send "$SMALL" --word "$CODE_WORD" --relay --server http://127.0.0.1:8078 >"$WORK/g10-send.log" 2>&1 &
   SP=$!; pids+=($SP)
