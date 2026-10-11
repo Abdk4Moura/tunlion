@@ -194,17 +194,26 @@ fi
 # ---------------------------------------------------------------- gate 1 ----
 say "1: one-time code transfer + code burn"
 D="$WORK/g1"; mkdir -p "$D"
-"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g1-send.log" 2>&1 &
+# -v on both ends: the `route:` line has been a DEBUG line since #66 (it is
+# shown under -v; the relay banner is the part every user sees), so without it
+# the route half of this gate had nothing to read and was red on every run.
+"$BIN" -v send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g1-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g1-send.log") || { bad "code transfer (no code minted)"; tail -n 3 "$WORK/g1-send.log"; }
-if [ -n "${W:-}" ] && timeout 90 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.log" 2>&1 \
+if [ -n "${W:-}" ] && timeout 90 "$BIN" -v receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.log" 2>&1 \
    && wait $SP && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ]; then
   ok "code transfer, hashes match, clean exits"
 else bad "code transfer"; tail -n 3 "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
 # C2: same-machine peers must BOTH report local (is_own_addr handles the
 # multi-homed case), and nothing may misreport relayed.
-if [ "$(grep -hc 'route: local' "$WORK/g1-send.log" "$WORK/g1-recv.log" | paste -sd+ | bc)" -ge 2 ] \
-   && ! grep -hq "route: relayed" "$WORK/g1-send.log" "$WORK/g1-recv.log"; then
+# The labels are the transport's (`Peer::route`, and a direct-QUIC link's own
+# route): a same-host path has been "direct over lo" since v0.4.1 and a relayed
+# one "relay". This gate still grepped "route: local" and "route: relayed", so
+# its first half could not pass and its second could not fail. Now it reads the
+# labels the code prints, and the "not relayed" half also requires that the
+# relay banner (what a user is actually shown) is absent.
+if [ "$(grep -hcE 'route: (local|direct over lo)' "$WORK/g1-send.log" "$WORK/g1-recv.log" | paste -sd+ | bc)" -ge 2 ] \
+   && ! grep -hqE "route: relay|on relay, via a TURN server" "$WORK/g1-send.log" "$WORK/g1-recv.log"; then
   ok "route detection: local on both ends, no false relayed"
 else bad "route detection"; grep -h "route:" "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
 if timeout 30 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-burn.log" 2>&1; then
@@ -332,17 +341,35 @@ fi
 
 # ---------------------------------------------------------------- gate 7 ----
 say "7: --to peer selection (C13)"
+# PREMISE CHANGED, PROPERTY KEPT. This gate used to run two room receivers
+# named by $USER and `send --to bob`, which picked a peer by DISPLAY NAME in
+# the auto room. #221 made `send --to` name a KNOWN device and refuse anything
+# else up front ("no known device by that name"), deliberately: a name
+# substring in a shared room is not an identity. So the old command was
+# refused before it connected and this gate had been red on every runner since.
+# The property is unchanged: with a bystander receiver present that accepts
+# anything (-y, same auto room), a targeted send lands at the named device and
+# nowhere else. "bob" is now a real paired device (code ceremony, no file)
+# serving its inbox with `up`.
 DA="$WORK/g7-alice"; DB="$WORK/g7-bob"; mkdir -p "$DA" "$DB"
-USER=alice "$BIN" receive -y --to charlie --dir "$DA" --server "$SERVER" >"$WORK/g7-alice.log" 2>&1 &
-RA=$!; pids+=($RA)
-USER=bob timeout 120 "$BIN" receive -y --dir "$DB" --server "$SERVER" >"$WORK/g7-bob.log" 2>&1 &
-RB=$!; pids+=($RB); sleep 3
+C7S="$WORK/g7-cfg-sender"; C7B="$WORK/g7-cfg-bob"; mkdir -p "$C7S" "$C7B"
 G7=0
-timeout 60 "$BIN" send "$SMALL" --to bob --server "$SERVER" >"$WORK/g7-send.log" 2>&1 || G7=1
-sleep 2; kill $RA 2>/dev/null; wait $RB 2>/dev/null
+FILAMENT_CONFIG_DIR="$C7S" timeout 90 "$BIN" add --name bob --word "$CODE_WORD" --server "$SERVER" >"$WORK/g7-add.log" 2>&1 &
+P7=$!; pids+=($P7)
+C7=$(wait_code "$WORK/g7-add.log") || { G7=1; echo "  no pairing code from add"; tail -n 3 "$WORK/g7-add.log"; }
+if [ -n "${C7:-}" ]; then
+  FILAMENT_CONFIG_DIR="$C7B" timeout 90 "$BIN" join "$C7" --name sender --server "$SERVER" >"$WORK/g7-join.log" 2>&1 || G7=1
+fi
+wait $P7 || G7=1
+USER=alice "$BIN" receive -y --dir "$DA" --server "$SERVER" >"$WORK/g7-alice.log" 2>&1 &
+RA=$!; pids+=($RA)
+FILAMENT_CONFIG_DIR="$C7B" timeout 120 "$BIN" up --dir "$DB" --server "$SERVER" >"$WORK/g7-bob.log" 2>&1 &
+RB=$!; pids+=($RB); sleep 3
+FILAMENT_CONFIG_DIR="$C7S" timeout 60 "$BIN" send "$SMALL" --to bob --server "$SERVER" >"$WORK/g7-send.log" 2>&1 || G7=1
+sleep 2; kill_tree $RA $RB
 if [ $G7 -eq 0 ] && [ "$(hashof "$DB/small.bin" 2>/dev/null)" = "$H_SMALL" ] && [ ! -e "$DA/small.bin" ]; then
   ok "--to bob delivered to bob only"
-else bad "--to selection"; tail -n 3 "$WORK/g7-send.log"; fi
+else bad "--to selection"; tail -n 3 "$WORK/g7-add.log" "$WORK/g7-join.log" "$WORK/g7-send.log" "$WORK/g7-bob.log"; fi
 
 # ---------------------------------------------------------------- gate 8 ----
 say "8: consent — no tty, no -y declines (C14)"
@@ -439,20 +466,25 @@ if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1;
       "$VENV_PY" app.py >"$WORK/g10-backend.log" 2>&1 ) &
   BK=$!; pids+=($BK); sleep 4
   D="$WORK/g10"; mkdir -p "$D"
-  "$BIN" send "$SMALL" --word "$CODE_WORD" --relay --server http://127.0.0.1:8078 >"$WORK/g10-send.log" 2>&1 &
+  "$BIN" -v send "$SMALL" --word "$CODE_WORD" --relay --server http://127.0.0.1:8078 >"$WORK/g10-send.log" 2>&1 &
   SP=$!; pids+=($SP)
   W=$(wait_code "$WORK/g10-send.log") || { bad "relay (no code minted)"; tail -n 3 "$WORK/g10-send.log"; }
   G10=0
-  timeout 120 "$BIN" receive "$W" -y --relay --dir "$D" --server http://127.0.0.1:8078 >"$WORK/g10-recv.log" 2>&1 || G10=1
+  timeout 120 "$BIN" -v receive "$W" -y --relay --dir "$D" --server http://127.0.0.1:8078 >"$WORK/g10-recv.log" 2>&1 || G10=1
   wait $SP || G10=1
+  [ -n "$CT" ] && docker logs "$CT" >"$WORK/g10-coturn.log" 2>&1
   kill $BK 2>/dev/null; kill_8078; docker stop "$CT" >/dev/null 2>&1
   # relay-only ICE policy guarantees the path; the route line is reporting.
   # Require it on at least one end (a very fast transfer can exit before the
-  # sender's detector fires).
+  # sender's detector fires). The transport labels a relayed path "relay"
+  # (`net::ROUTE_RELAY`); the CLI compared against "relayed", so the relay
+  # banner every user is promised on a relayed transfer never printed. Both
+  # are required now: the -v route line, and the banner at default verbosity.
   if [ $G10 -eq 0 ] && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ] \
-     && grep -hq "route: relayed" "$WORK/g10-send.log" "$WORK/g10-recv.log"; then
+     && grep -hqE "route: relay" "$WORK/g10-send.log" "$WORK/g10-recv.log" \
+     && grep -hq "on relay, via a TURN server" "$WORK/g10-send.log" "$WORK/g10-recv.log"; then
     ok "relayed transfer via coturn; route: relayed reported"
-  else bad "relay"; tail -n 3 "$WORK/g10-send.log" "$WORK/g10-recv.log"; fi
+  else bad "relay"; tail -n 3 "$WORK/g10-send.log" "$WORK/g10-recv.log"; grep -h "route:\|relay" "$WORK/g10-send.log" "$WORK/g10-recv.log" | head -5; tail -n 5 "$WORK/g10-coturn.log" 2>/dev/null; fi
 elif [ $WITH_RELAY -eq 1 ]; then
   # Was a FAILURE, not a skip. The gate launched its backend with a hardcoded
   # interpreter path from a job directory that no longer exists, so it reported
@@ -703,8 +735,12 @@ else
 fi
 
 say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
+# --word on every `add` below (and in 17b and 19): from a script, `add` with no
+# words refuses, because a code minted for a person to read out has nobody to
+# read it here (the non-TTY refusal says exactly this and names --word). These
+# gates ran `add --name X` bare and were refused before any ceremony started.
 DA17="$WORK/g17a"; DB17="$WORK/g17b"; mkdir -p "$DA17" "$DB17"
-FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
+FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --word "$CODE_WORD" --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
 P17=$!; pids+=($P17); sleep 4
 C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
@@ -723,7 +759,7 @@ say "17b: pair ceremony fails FAST when it can't complete (no 10-min orphan)"
 # the budget (shortened to 5s) must bail it with a clear message — NOT the
 # 600s code TTL, and well under the 90s timeout backstop.
 DC="$WORK/g17c"; mkdir -p "$DC/a" "$DC/b"
-FILAMENT_CONFIG_DIR="$DC/a" timeout 120 "$BIN" add --name gone --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
+FILAMENT_CONFIG_DIR="$DC/a" timeout 120 "$BIN" add --name gone --word "$CODE_WORD" --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
 CR=$!; pids+=($CR); sleep 4
 CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
 T0=$(date +%s)
@@ -854,7 +890,7 @@ say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 # bugs by hand before becoming a gate (a tick starved behind a blocking
 # 600s read; see C30 in the ledger).
 DA19="$WORK/g19a"; DB19="$WORK/g19b"; D19="$WORK/g19"; mkdir -p "$DA19" "$DB19" "$D19"
-FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
+FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --word "$CODE_WORD" --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
 P19=$!; pids+=($P19); sleep 4
 C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0

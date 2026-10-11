@@ -628,6 +628,9 @@ pub(crate) async fn send_cmd(
         None
     };
     let mut pake_peer: Option<String> = None;
+    // `--remember <name>` on the code path: the record this send stored for the
+    // ceremony peer, once it has been offered (see the `file-accept` arm).
+    let mut remembered_as: Option<String> = None;
     // The transfer is allowed to offer once auth is settled: immediately for
     // local / known-device sends; only after the ephemeral PAKE confirms for the
     // code path. The agreed secret is then DISCARDED (never stored).
@@ -1283,7 +1286,7 @@ pub(crate) async fn send_cmd(
                                     // actually the TURN relay, print the honest
                                     // one-line banner so the user is never unaware
                                     // they're on a middleman path. CRITICAL.
-                                    if r == "relayed" {
+                                    if r == filament_transport::net::ROUTE_RELAY {
                                         ui::critical(&format!("    {}", relay_banner()));
                                     }
                                     break;
@@ -1611,10 +1614,10 @@ pub(crate) async fn send_cmd(
                 }
                 // C27: the human on the other side answered our remember offer.
                 Some("pair-keep-ack") => {
-                    if let Some(name) = &remember {
+                    if let Some(name) = remembered_as.clone() {
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         if v["ok"].as_bool() == Some(false) {
-                            devices_remove(name)?;
+                            devices_remove(&name)?;
                             ui::say(&conn.roster(
                                 &pid,
                                 ui::glyph_err(),
@@ -1651,6 +1654,43 @@ pub(crate) async fn send_cmd(
                     }
                 }
                 Some("file-accept") => {
+                    // `--remember <name>`: hand the code's peer a FRESH long-lived
+                    // pair secret over this mutually authenticated link, and keep
+                    // our half under <name>. This is a separate, explicit trust
+                    // grant: the ephemeral PAKE secret is still discarded.
+                    //
+                    // It was deleted by accident in 583a11b9 (the direct-QUIC
+                    // rewrite of the PAKE-confirm arm), and `send --remember` then
+                    // stored nothing on either side and said nothing: gate 14 has
+                    // been red since, its later `send --to boxB` refused as an
+                    // unknown device. Offered on the peer's FIRST accept, not on
+                    // our own PAKE confirm: the receiver only accepts after ITS
+                    // ceremony confirmed, and it remembers a secret only from its
+                    // confirmed ceremony peer, so offering any earlier raced that
+                    // check. Only the ceremony peer is ever offered one.
+                    if let Some(name) = remember.as_deref() {
+                        if use_code
+                            && pake_done
+                            && remembered_as.is_none()
+                            && pake_peer.as_deref() == Some(pid.as_str())
+                        {
+                            let sec = crate::fresh_secret();
+                            let handed = match conn.transport_of(&pid) {
+                                Some(t) => t
+                                    .send_control(&json!({ "type": "pair-keep", "secret": sec }))
+                                    .await
+                                    .is_ok(),
+                                None => false,
+                            };
+                            if handed {
+                                crate::devices_store(name, &sec)?;
+                                ui::say(&format!(
+                                    "  remembered this device as '{name}' (it keeps its half only if it passed --remember too)"
+                                ));
+                                remembered_as = Some(name.to_string());
+                            }
+                        }
+                    }
                     let Some(t) = conn.transport() else { continue };
                     // Build transport list: primary + any parallel QUIC workers.
                     let workers = conn

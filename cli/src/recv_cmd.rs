@@ -3880,7 +3880,7 @@ pub(crate) async fn recv_cmd(
                                     // actually the TURN relay, print the honest
                                     // one-line banner so the user is never unaware
                                     // they're on a middleman path. CRITICAL.
-                                    if r == "relayed" {
+                                    if r == filament_transport::net::ROUTE_RELAY {
                                         ui::critical(&format!("    {}", relay_banner()));
                                     }
                                     break;
