@@ -293,6 +293,29 @@ pub(crate) fn human_message(e: &anyhow::Error) -> String {
     }
 }
 
+/// The message and its cause chain in the shape `{e:?}` prints, WITHOUT the
+/// stack backtrace `{e:?}` appends whenever RUST_BACKTRACE or
+/// RUST_LIB_BACKTRACE is set. A Rust developer usually has one of those
+/// exported, and every ordinary refusal (`send --to` an unknown device, a bad
+/// flag) then ended in a page of `<unknown>` frames that read as a crash; the
+/// gate logs, which tail the last lines, showed only the frames and never the
+/// reason. A real panic still prints its backtrace through the panic hook.
+pub(crate) fn error_with_causes(e: &anyhow::Error) -> String {
+    let mut out = e.to_string();
+    let causes: Vec<String> = e.chain().skip(1).map(|c| c.to_string()).collect();
+    match causes.as_slice() {
+        [] => {}
+        [only] => out.push_str(&format!("\n\nCaused by:\n    {only}")),
+        many => {
+            out.push_str("\n\nCaused by:");
+            for (i, c) in many.iter().enumerate() {
+                out.push_str(&format!("\n    {i}: {c}"));
+            }
+        }
+    }
+    out
+}
+
 /// `main`'s failure path: report the error once, in the form the caller asked
 /// for, and return the exit code.
 ///
@@ -316,7 +339,7 @@ pub(crate) fn report(e: &anyhow::Error) -> i32 {
         ui::critical(&format!("Error: {NETWORK_LINE}"));
         ui::debug(&format!("  cause: {raw}"));
     } else {
-        ui::critical(&format!("Error: {e:?}"));
+        ui::critical(&format!("Error: {}", error_with_causes(e)));
     }
     kind.code()
 }
@@ -324,6 +347,24 @@ pub(crate) fn report(e: &anyhow::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_report_carries_the_cause_chain_and_never_a_backtrace() {
+        let one = anyhow::anyhow!("root cause").context("what failed");
+        assert_eq!(error_with_causes(&one), "what failed\n\nCaused by:\n    root cause");
+        let two = anyhow::anyhow!("deepest").context("middle").context("top");
+        assert_eq!(
+            error_with_causes(&two),
+            "top\n\nCaused by:\n    0: middle\n    1: deepest"
+        );
+        assert_eq!(error_with_causes(&anyhow::anyhow!("alone")), "alone");
+        // The Debug form it replaces matches it exactly when no backtrace was
+        // captured, so the human output keeps its shape.
+        if one.backtrace().status() != std::backtrace::BacktraceStatus::Captured {
+            assert_eq!(format!("{one:?}"), error_with_causes(&one));
+            assert_eq!(format!("{two:?}"), error_with_causes(&two));
+        }
+    }
 
     #[test]
     fn codes_are_distinct_and_keep_the_existing_meanings() {
