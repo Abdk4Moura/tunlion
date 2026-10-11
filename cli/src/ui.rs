@@ -230,7 +230,7 @@ pub fn link(url: &str, text: &str) -> String {
 pub fn clipboard(s: &str) -> bool {
     use base64_mini::enc;
     if caps().tty {
-        eprint!("\x1b]52;c;{}\x07", enc(s.as_bytes()));
+        err_write(&format!("\x1b]52;c;{}\x07", enc(s.as_bytes())));
         return crate::platform::clipboard_reachable();
     }
     false
@@ -260,8 +260,18 @@ static LIVE: AtomicBool = AtomicBool::new(false);
 
 fn clear_live() {
     if LIVE.swap(false, Ordering::Relaxed) && caps().tty {
-        eprint!("\r\x1b[2K");
+        err_write("\r\x1b[2K");
     }
+}
+
+/// Write to stderr WITHOUT the print macros' panic on a closed pipe. Human
+/// output is a side channel of the work: a reader that stopped reading it
+/// (`send f --to b 2>&1 | head -1`) must not end the work. The write error is
+/// dropped; the command finishes and exits with its real result.
+fn err_write(s: &str) {
+    let mut e = std::io::stderr().lock();
+    let _ = e.write_all(s.as_bytes());
+    let _ = e.flush();
 }
 
 // Sticky status (C22): an open question or countdown survives interleaved
@@ -272,8 +282,7 @@ static STICKY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn paint_live(line: &str) {
     clear_live();
-    eprint!("{line}");
-    let _ = std::io::stderr().flush();
+    err_write(line);
     LIVE.store(true, Ordering::Relaxed);
 }
 
@@ -314,8 +323,42 @@ pub fn exit_quietly_on_broken_pipe() {
 }
 
 /// The exit code a closed pipe ends the command with: 0 unless the command
-/// has already decided its answer.
+/// has already decided its answer, or the command is an ACTION (below).
 static CLOSED_PIPE_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// 128 + SIGPIPE, what a shell reports for a process SIGPIPE killed.
+pub const CLOSED_PIPE_UNFINISHED: i32 = 141;
+
+/// Verbs that only LOOK: when their reader stops reading, nothing is left
+/// undone, so a closed pipe exits with the code they decided (0 by default),
+/// as `head` asked. Every other verb is an action (send, sync, exec, receive,
+/// add, ...): its work is not finished when its output stops being read.
+const READ_ONLY_VERBS: &[&str] = &[
+    "status", "devices", "logs", "reach", "doctor", "id", "addr", "requests", "completions", "man",
+    "help",
+];
+
+/// The closed-pipe exit for this verb before it decides anything. `None` is
+/// bare `tunlion` (the tour) or `--help`/`--version`: read-only.
+///
+/// An action whose reader went away must never exit 0 for work it did not do:
+/// `tunlion send f --to beta 2>&1 | head -1` exited 0 in 0.6 s with nothing
+/// delivered, because the second human line panicked into this hook. Human
+/// lines no longer panic (`err_write`), so an action keeps working silently
+/// and exits with its real result. This default covers what is left: a bare
+/// print to a closed STDOUT inside an action ends it with 141, never 0.
+pub fn closed_pipe_default(verb: Option<&str>) -> i32 {
+    match verb {
+        None => 0,
+        Some(v) if READ_ONLY_VERBS.contains(&v) => 0,
+        Some(_) => CLOSED_PIPE_UNFINISHED,
+    }
+}
+
+/// Record the verb on the command line, once, before anything prints.
+pub fn set_closed_pipe_verb(verb: Option<&str>) {
+    CLOSED_PIPE_EXIT.store(closed_pipe_default(verb), Ordering::Relaxed);
+}
 
 /// Record the exit code this command has decided on, BEFORE it prints, so a
 /// reader that closes the pipe early (`| head -1`) does not turn the answer
@@ -343,7 +386,7 @@ pub fn is_broken_pipe_print(msg: &str) -> bool {
 /// `debug`/`trace`) at call sites so the verbosity gate is applied.
 fn emit(line: &str) {
     clear_live();
-    eprintln!("{line}");
+    err_write(&format!("{line}\n"));
     if let Ok(s) = STICKY.lock() {
         if let Some(st) = s.as_ref() {
             if caps().tty {
@@ -463,7 +506,7 @@ pub fn status(line: &str) {
 /// bare eprint would land inside whatever transient line is on screen).
 pub fn answer_echo(c: char) {
     clear_live();
-    eprintln!("  {} {}", paint(Tone::Dim, "↳"), paint(Tone::Bold, &c.to_string()));
+    err_write(&format!("  {} {}\n", paint(Tone::Dim, "↳"), paint(Tone::Bold, &c.to_string())));
 }
 
 /// A status line that survives interleaved say()s until cleared, for open
@@ -573,7 +616,7 @@ impl Progress {
             paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
         ));
         if caps().tty && secs > 30.0 {
-            eprint!("\x07");
+            err_write("\x07");
         }
     }
 }
@@ -601,7 +644,7 @@ pub fn transfer_summary(label: &str, bytes: u64, secs: f64) {
         paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
     ));
     if caps().tty && secs > 30.0 {
-        eprint!("\x07");
+        err_write("\x07");
     }
 }
 
@@ -836,6 +879,38 @@ mod verbosity_tests {
         super::exit_code_on_closed_pipe(11);
         assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 11);
         super::exit_code_on_closed_pipe(0);
+    }
+
+    /// J1: `send f --to beta 2>&1 | head -1` exited 0 with nothing delivered.
+    /// A read-only verb's closed pipe is the success `head` asked for; an
+    /// action's is never 0 for work it did not finish.
+    #[test]
+    fn a_closed_pipe_never_turns_undone_work_into_success() {
+        for v in ["status", "devices", "logs", "reach", "doctor", "id"] {
+            assert_eq!(super::closed_pipe_default(Some(v)), 0, "{v} only looks");
+        }
+        assert_eq!(super::closed_pipe_default(None), 0, "bare tunlion, --help");
+        for v in ["send", "sync", "exec", "receive", "backup", "add", "join", "up", "mount", "something-new"] {
+            assert_eq!(super::closed_pipe_default(Some(v)), 141, "{v} is an action");
+        }
+        assert_ne!(super::CLOSED_PIPE_UNFINISHED, 0);
+    }
+
+    /// The other half of J1: human lines never panic into the hook, so an
+    /// action whose stderr reader left keeps working. The emitter must not
+    /// use the panicking print macros.
+    #[test]
+    fn human_lines_do_not_use_the_panicking_macros() {
+        let src = include_str!("ui.rs");
+        let body = |name: &str| {
+            let start = src.find(&format!("fn {name}(")).expect(name);
+            let end = src[start..].find("\n}\n").map(|e| start + e).unwrap();
+            src[start..end].to_string()
+        };
+        for f in ["emit", "paint_live", "clear_live", "answer_echo", "clipboard"] {
+            let b = body(f);
+            assert!(!b.contains("eprint"), "{f} uses a panicking print macro");
+        }
     }
 }
 
