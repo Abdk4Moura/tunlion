@@ -3593,7 +3593,21 @@ pub(crate) async fn recv_cmd(
                     .direct_pending
                     .get(&pid)
                     .map(|p| direct::transport_key(&p.secret.1));
+                let named_before = conn.link(&pid).and_then(|l| l.verified_name.clone());
                 conn.adopt_direct(&pid, t.clone(), route);
+                // A direct link to a REMEMBERED device was authenticated by its
+                // pair secret (the QUIC keying-material MAC), the proof a
+                // WebRTC link gets from `pair-proof`. Only the pair-proof path
+                // ever said so, so a daemon receiving from a known device over
+                // QUIC (the usual case) never confirmed whose identity it had
+                // verified. Said once, when the link first gains the name.
+                if named_before.is_none() {
+                    if let Some(n) = conn.link(&pid).and_then(|l| l.verified_name.clone()) {
+                        if crate::devices_load().iter().any(|(d, _)| *d == n) {
+                            ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
+                        }
+                    }
+                }
                 if let Some(k) = tkey {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }

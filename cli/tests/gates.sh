@@ -225,7 +225,14 @@ fi
 # ---------------------------------------------------------------- gate 2 ----
 say "2: chaos — receiver killed mid-transfer, replacement resumes (C4/C6/C7)"
 D="$WORK/g2"; mkdir -p "$D"
-"$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
+# FILAMENT_TEST_TRANSFER_STALL_MS: the kill below has to land MID-transfer.
+# Once two processes of one install stopped falling back to WebRTC after the
+# code ceremony, 80 MB moved over QUIC in about half a second, inside the first
+# 0.5s poll, and the receiver finished before it could be killed (measured:
+# "delivered" at 160 MB/s). 3ms per chunk stretches it to ~5s, the same remedy
+# and the same arithmetic as gate 11b.
+FILAMENT_TEST_TRANSFER_STALL_MS=${FILAMENT_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g2-send.log") || { bad "kill-resume (no code minted)"; tail -n 3 "$WORK/g2-send.log"; }
 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv1.log" 2>&1 &
@@ -505,7 +512,9 @@ D="$WORK/g11"; mkdir -p "$D"
 # idle threshold low and sleep past it after the freeze to keep that
 # deterministic regardless of how fast the replacement joins.
 # -v on the sender: "superseding old link" is a DEBUG (resilience-internal) line.
-FILAMENT_ADOPT_ACTIVE_MS=500 "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
+# The freeze must land mid-transfer; see gate 2 for the stall.
+FILAMENT_ADOPT_ACTIVE_MS=500 FILAMENT_TEST_TRANSFER_STALL_MS=${FILAMENT_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g11-send.log") || { bad "uid supersede (no code minted)"; tail -n 3 "$WORK/g11-send.log"; }
 FILAMENT_UID="samedevice$$" "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv1.log" 2>&1 &
@@ -664,10 +673,10 @@ fi
 # --------------------------------------------------------------- gate 14 ----
 say "14: daemon — pair, introduce-grade trust, room-less up receives (C19/C20/C12)"
 DA="$WORK/g14a"; DB="$WORK/g14b"; DD="$WORK/g14drop"; mkdir -p "$DA" "$DB" "$DD"
-FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$CODE_WORD" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
+FILAMENT_CONFIG_DIR="$DA" "$BIN" -v send "$SMALL" --word "$CODE_WORD" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g14-s1.log") || { bad "daemon (no code minted)"; tail -n 3 "$WORK/g14-s1.log"; }
-FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" receive "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
+FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" -v receive "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
 wait $SP
 FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" up --dir "$DD" --server "$SERVER" >"$WORK/g14-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
@@ -746,8 +755,10 @@ C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-
 G17=0
 FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" join "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
 wait $P17 || G17=1
-CHA=$(FILAMENT_CONFIG_DIR="$DA17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
-CHB=$(FILAMENT_CONFIG_DIR="$DB17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
+# The channel id is in `devices --json`; the table stopped printing it, so this
+# compared two empty strings and the gate could not pass.
+CHA=$(FILAMENT_CONFIG_DIR="$DA17" "$BIN" devices --json 2>/dev/null | grep -oE '"channel": *"[0-9a-f]+"' | head -1)
+CHB=$(FILAMENT_CONFIG_DIR="$DB17" "$BIN" devices --json 2>/dev/null | grep -oE '"channel": *"[0-9a-f]+"' | head -1)
 if [ $G17 -eq 0 ] && [ -n "$CHA" ] && [ "$CHA" = "$CHB" ]; then
   ok "pair ceremony: both exited clean; channel ids match (one mutual secret)"
 else bad "pair-ceremony"; tail -n 3 "$WORK/g17-a.log" "$WORK/g17-b.log"; fi
@@ -768,7 +779,7 @@ FILAMENT_TEST_PAIR_STALL=1 FILAMENT_PAIR_GRACE_SECS=5 FILAMENT_CONFIG_DIR="$DC/b
 RC=$?; T1=$(date +%s)
 kill $CR 2>/dev/null; wait $CR 2>/dev/null
 if [ $RC -ne 0 ] && [ $((T1 - T0)) -lt 30 ] \
-   && grep -q "could not connect before pairing finished" "$WORK/g17c-b.log"; then
+   && grep -q "before setup finished" "$WORK/g17c-b.log"; then
   ok "ceremony bailed in $((T1 - T0))s with a clear message (was: 600s orphan)"
 else bad "pair fail-fast"; echo "  rc=$RC walltime=$((T1-T0))s"; tail -n 3 "$WORK/g17c-b.log"; fi
 

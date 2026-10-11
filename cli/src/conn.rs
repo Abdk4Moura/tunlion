@@ -819,6 +819,11 @@ pub(crate) struct DirectPending {
     /// This dial used the FLEET rendezvous secret, so the link it produces must
     /// NOT be born trusted / owner-equivalent. See `DirectIntent::Fleet`.
     pub(crate) fleet: bool,
+    /// This dial is a post-PAKE PROMOTION on the one-time-code path, keyed by
+    /// the EPHEMERAL ceremony secret. Its MAC proves "the peer that typed this
+    /// code", not "a device we remember", so the link it produces must not be
+    /// born trusted either. See `adopt_direct`.
+    pub(crate) ephemeral: bool,
     /// budget deadline; on expiry with no DirectReady we fall back to WebRTC.
     pub(crate) deadline: Instant,
     /// set once the peer's transport-offer arrived and we spawned the racer, so
@@ -2095,6 +2100,7 @@ impl Conn {
             pid.to_string(),
             DirectPending {
                 fleet: intent == DirectIntent::Fleet,
+                ephemeral: intent == DirectIntent::Promote,
                 secret: (name.to_string(), secret.to_string()),
                 deadline,
                 racing: false,
@@ -2368,6 +2374,15 @@ impl Conn {
                 fleet::rv().is_some() && !paired
             }
         };
+        // A code-path promotion is authenticated by the one-time ceremony
+        // secret, which the transfer DISCARDS. On WebRTC that peer is an
+        // untrusted link that must be asked for consent; the direct link that
+        // replaces it was born `trusted: true` with a petname, so a
+        // `receive <code>` without -y took every offer unasked once QUIC won
+        // the race (gate 15 measured it the moment same-host promotion started
+        // working), and `trusted` is also what admits `pair-intro`, l2 and
+        // mount opens. It keeps the trust the WebRTC link had: none.
+        let ephemeral = pend.as_ref().is_some_and(|p| p.ephemeral);
         let (name, secret) = match pend {
             Some(p) => p.secret,
             None => ("peer".to_string(), String::new()),
@@ -2404,9 +2419,11 @@ impl Conn {
             existing.direct_route = route;
             existing.generation = generation;
             existing.attempts = 0;
-            existing.trusted = true;
-            if let Some((n, _)) = &expected_secret {
-                existing.verified_name = Some(n.clone());
+            if !ephemeral {
+                existing.trusted = true;
+                if let Some((n, _)) = &expected_secret {
+                    existing.verified_name = Some(n.clone());
+                }
             }
             resolve_peer_identity(existing);
             if expected_secret.is_some() {
@@ -2432,8 +2449,8 @@ impl Conn {
                     // that the peer is in the fleet. So it is born untrusted, with no
                     // petname and no owner-equivalence, until a verified fleet-hello
                     // names it.
-                    trusted: !fleet,
-                    verified_name: if fleet {
+                    trusted: !fleet && !ephemeral,
+                    verified_name: if fleet || ephemeral {
                         None
                     } else {
                         expected_secret.as_ref().map(|(n, _)| n.clone())
