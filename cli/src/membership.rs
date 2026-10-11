@@ -280,6 +280,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
             warm_cutover: std::collections::HashSet::new(),
             upgrade_probe: HashMap::new(),
             iface_snapshot: Vec::new(),
+            in_flight_since: std::collections::HashMap::new(),
         },
         // --relay: never direct (see `direct_permitted`).
         direct_ok: crate::conn::direct_permitted(relay, direct::direct_enabled()),

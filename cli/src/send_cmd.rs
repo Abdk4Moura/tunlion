@@ -2708,9 +2708,16 @@ async fn stream_one(
                 // when the reconnect lands. Zero in every build without test
                 // hooks, and the no-hook twin returns 0, so the shipped loop is
                 // unchanged.
+                //
+                // Per 64 KiB of the chunk, not per chunk: a direct-QUIC chunk is
+                // up to 1 MiB against WebRTC's ~60 KiB, so a per-chunk stall
+                // slowed QUIC sixteen times less, and 80 MB still crossed in
+                // under a second (gate 2 killed its receiver at 0 bytes). The
+                // same setting now means the same rate on either transport.
                 let stall = test_hooks::transfer_stall_ms();
                 if stall > 0 {
-                    tokio::time::sleep(Duration::from_millis(stall)).await;
+                    let units = (cur_n as u64).div_ceil(64 * 1024).max(1);
+                    tokio::time::sleep(Duration::from_millis(stall.saturating_mul(units))).await;
                 }
                 // Fire the NEXT read (into the alternate buffer) BEFORE sending.
                 let next_want = std::cmp::min(chunk as u64, end - (pos + cur_n as u64)) as usize;

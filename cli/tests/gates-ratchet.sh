@@ -88,6 +88,10 @@ EXPECTED_GREEN=(
   "pair ceremony: both exited clean|pair-ceremony"
   "ceremony bailed in|pair fail-fast"
   "lossy rendezvous converged|gate-L convergence"
+  # Integration-only gates (14b and 18b do not exist on main), green here once
+  # fix/known-red-gates landed: measured 31 PASS / 0 FAIL, and 14b 3 of 3 at -vv.
+  "daemon-restart: the sender picked up the restarted daemon|daemon-restart"
+  "Mode B: baseline hung|gate-18b Mode B"
 )
 
 # A missing PASS line has three different causes and they want different
