@@ -123,6 +123,9 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
                 // address and how to use it (the token's PATH, never the
                 // token), or null when none is running.
                 "proxy": crate::proxy_state::to_json(crate::proxy_state::current().as_ref()),
+                // Interrupted transfers waiting in the inbox for a resume, with
+                // their size, age and when they expire.
+                "partials": crate::recv_files::partials_json(&crate::drop_dir(None)),
             }))?
         );
         return Ok(());
@@ -164,6 +167,9 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
         for line in crate::proxy_state::status_lines(&p) {
             ui::say(&line);
         }
+    }
+    for line in crate::recv_files::partial_status_lines(&crate::drop_dir(None)) {
+        ui::say(&line);
     }
     if let Ok(log) = std::fs::read_to_string(up_log()) {
         let recent: Vec<&str> = log.lines().rev().take(8).collect();

@@ -833,6 +833,8 @@ pub(crate) async fn recv_cmd(
     // hint is obsolete); any well-formed code is a valid claim here.
     // Owner-only: peers write here (platform::create_inbox_dir).
     crate::platform::create_inbox_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Interrupted transfers' partials wait PARTIAL_TTL_SECS for a resume, then go.
+    crate::recv_files::expire_partials_and_say(&dir);
     let my_uid = mk_uid("r");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     // P2 (GAP-2): `mut` so the long-lived acceptor's outer reconnect loop can

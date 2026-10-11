@@ -205,7 +205,12 @@ pub(crate) async fn up_cmd(
         return detach_up(server, dir).await;
     }
     let dir = drop_dir(dir);
-    std::fs::create_dir_all(&dir)?;
+    // The daemon's first start creates the inbox when nothing else has, and
+    // this used to be a plain create_dir_all: 0755 under the usual umask, so a
+    // device that joined (rather than ran init, which creates it owner-only)
+    // got a world-readable inbox. Peers write here; owner-only, the same call
+    // init and receive use.
+    crate::platform::create_inbox_dir(&dir)?;
     write_pidfile()?;
     let granted_names = shell_grant_names();
     match &shell_policy {
