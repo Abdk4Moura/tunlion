@@ -441,7 +441,19 @@ run_impostor_variant() {
   sleep 2
   env FILAMENT_CONFIG_DIR="$DM" FILAMENT_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
   FIX_PIDS+=($!)
-  sleep 8
+  # Wait for the attempt to happen rather than a fixed 8s. The impostor's
+  # record was dropped from the owner's store, and since a running daemon
+  # applies that at once (revocation_live.rs) the impostor's stale pair secret
+  # no longer gets it a link: it reaches the owner only through fleet-hello,
+  # after its pair-path attempt fails, which can take longer than 8s. Bounded:
+  # a refusal that never comes still fails the verdicts below exactly as before.
+  for _ in $(seq 1 45); do
+    if [ "$(grep -c "reason=name-taken" "$WORK/up.log" || true)" -gt "$refused_before" ] \
+       && grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log"; then
+      break
+    fi
+    sleep 1
+  done
   local refused=0 intact=0 execref=0 attempted=0 victim_ok=0
   local refused_after=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   [ "$refused_after" -gt "$refused_before" ] && refused=1
