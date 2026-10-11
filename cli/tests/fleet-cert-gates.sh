@@ -378,7 +378,7 @@ start_spoke "$DFG" "$FORGOTTEN"
 sleep 4
 FG_PUB=$(python3 -c "import json,sys;print(next((d.get('deviceCert',{}).get('devicePub','') for d in json.load(open('$DA/devices.json')) if d.get('name')=='$FORGOTTEN'),''))" 2>/dev/null)
 say "FORGET-REVOKES: forgetting a live certificate holder revokes its key and frees the name"
-"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$FORGOTTEN" >"$WORK/forget.log" 2>&1
+"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$FORGOTTEN" -y >"$WORK/forget.log" 2>&1
 rcFG=$?
 pkill -f "up --dir $WORK/$FORGOTTEN-drop" 2>/dev/null || true
 sleep 2

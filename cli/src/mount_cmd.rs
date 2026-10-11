@@ -153,6 +153,12 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ("roster.json", "fleet roster"),
     ("roster-state.json", "fleet roster state"),
     ("armed.json", "armed invitations"),
+    // Safe to remove only because reset also removes the owner key above: an
+    // invitation signed by the old key cannot verify against a new one.
+    (
+        crate::invite_burn::USED_INVITATIONS_FILE,
+        "used invitations (one-use counts)",
+    ),
     ("ssh_ca_issued.json", "ssh certificate issuance log"),
     ("ssh_ca_serial", "ssh certificate serial counter"),
     ("peerconf", "per-peer settings"),
@@ -168,6 +174,9 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ("up.exe", "daemon executable record"),
     ("up.ready", "daemon readiness marker"),
     ("up.lock", "daemon single-instance lock"),
+    // The inbox the last daemon served (written by `up`; status and doctor
+    // read it). `reset -y` said "clean slate" and kept it.
+    ("up.inbox", "last daemon's inbox marker"),
     ("proxy.token", "local proxy token"),
     // What the local proxy and the transfer history record. `reset` called the
     // machine a clean slate while both survived it: proxy.json names the
@@ -525,6 +534,7 @@ mod reset_tests {
             "up.exe",
             "up.ready",
             "up.lock",
+            "up.inbox",
             "proxy.token",
             "proxy.json",
             "transfers.json",
@@ -534,6 +544,7 @@ mod reset_tests {
             "caps.json",
             "ssh",
             "revoked-keys.json",
+            "used-invitations.json",
         ] {
             assert!(names.contains(&must), "reset does not remove {must}");
         }

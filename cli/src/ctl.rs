@@ -48,15 +48,18 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, daemon_responds, forward_probe, send_reply, serve_at, try_approve_request, try_bootstrap,
-    try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping, try_pty_reason, try_reconfigure, try_reload,
-    try_reload_expose, try_resize, try_unmount, try_wake, Req, ReqKind,
+    daemon_present, daemon_responds, forward_probe, send_reply, serve_at, try_approve_request,
+    try_bootstrap, try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous,
+    try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
+    try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
+    try_revocation_sync, try_unmount, try_wake, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-    daemon_present, daemon_responds, forward_probe, try_approve_request, try_cap_status, try_deny_request,
-    try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping, try_reconfigure, try_wake,
+    daemon_present, daemon_responds, forward_probe, try_approve_request, try_cap_status,
+    try_deny_request, try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping,
+    try_reconfigure, try_revocation_sync, try_wake,
     Req,
 };
 
@@ -375,6 +378,25 @@ mod imp {
         serde_json::from_str(&reply).ok()
     }
 
+    /// Tell the running daemon the device store changed by a forget or a
+    /// revoke, and wait for it to apply that: re-read the store, close every
+    /// link the change ends, drop the forgotten channels. Replies
+    /// `{"ok":true,"closed":<n>}` once done; `None` when no daemon answered.
+    /// The daemon would notice the change on its own within a few seconds;
+    /// asking is what lets the command say "in effect now" and mean it.
+    pub async fn try_revocation_sync() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut line = serde_json::to_vec(&json!({ "op": "revocation-sync" })).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), read_line(&mut s, 1024))
+            .await
+            .ok()?
+            .ok()?;
+        serde_json::from_str(&reply).ok()
+    }
+
     /// Ask a running `up` daemon to RELOAD onto a freshly `tunlion update`d binary
     /// with no manual restart and no sudo. The daemon gracefully shuts down (the
     /// same path a `systemctl restart` / SIGTERM takes, which cleanly closes the
@@ -643,6 +665,10 @@ mod imp {
         /// carries no state, so a platform without a control socket loses nothing
         /// but the speed-up. Answered INLINE with `{"ok":true}`.
         Wake,
+        /// A forget or revoke changed the device store: re-read it now, close
+        /// the links it ends, and reply `{"ok":true,"closed":<n>}` once done
+        /// (see revocation_live.rs). Handled inline in the daemon loop.
+        RevocationSync,
         /// Gracefully restart to pick up an updated binary (`tunlion update`).
         /// Handled INLINE: if supervised (systemd), reply then self-SIGTERM so the
         /// supervisor restarts us cleanly; otherwise decline (don't exit into down).
@@ -804,6 +830,7 @@ mod imp {
                     }
                     Some("reload-expose") => ReqKind::ReloadExpose,
                     Some("wake") => ReqKind::Wake,
+                    Some("revocation-sync") => ReqKind::RevocationSync,
                     Some("reload") => ReqKind::Reload,
                     Some("mount") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
@@ -981,6 +1008,21 @@ mod stub {
     /// receives, and the fast paths (gated on `cfg(unix)`) never call `try_open`.
     /// Keeping the type lets the daemon loop and handler compile unchanged.
     pub enum Req {}
+
+    impl Req {
+        /// Uninhabited here, so this is never called; it exists so the daemon
+        /// loop's reply to a parked revocation-sync compiles on every target.
+        pub async fn reply(self, _v: &Value) {
+            match self {}
+        }
+    }
+
+    /// No control socket here, so no daemon can be asked to apply a
+    /// revocation now; `None` makes the command say it applies within a few
+    /// seconds (the daemon's own store scan) or at the next start.
+    pub async fn try_revocation_sync() -> Option<Value> {
+        None
+    }
 
     /// No control socket on this platform, so there is never a warm daemon link
     /// to ping. Callers (`ping`, `forward`) treat `None` as "no daemon" and fall

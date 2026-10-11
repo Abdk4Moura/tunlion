@@ -86,6 +86,17 @@
       ]
     },
     {
+      "path": "cli/tests/revocation-live-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/revocation-live-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/forward-refusal-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/forward-refusal-gates.sh",
@@ -256,6 +267,7 @@
         "cli/tests/mount-revoke-gates.sh",
         "cli/tests/pty-revoke-gates.sh",
         "cli/tests/reenrol-advice-gates.sh",
+        "cli/tests/revocation-live-gates.sh",
         "cli/tests/roster-gates.sh",
         "cli/tests/shell-posture-gates.sh",
         "cli/tests/warm-hold-idle-gates.sh"

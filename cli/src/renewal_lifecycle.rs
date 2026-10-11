@@ -407,6 +407,29 @@ pub(crate) async fn handle_auth_key_enroll_response(
                     .await;
                 return;
             }
+            // The in-memory burn above is process-local: a daemon restart
+            // cleared it, and a used invitation enrolled again (with the old
+            // device key or a brand-new one). The durable count is kept apart
+            // from every device record, so no forget/rename/revoke resets it;
+            // only the invitation's own expiry does (invite_burn.rs).
+            if let Err(refusal) = crate::invite_burn::record_use(
+                &hex::encode(enroll_pub),
+                &ak.reuse,
+                ak.expires,
+                identity::now_secs(),
+            ) {
+                ui::debug(&format!(
+                    "enroll response refused: invitation {:?} (durable use count)",
+                    refusal
+                ));
+                let _ = t
+                    .send_control(&json!({
+                        "type": "identity-auth-key-enroll-error",
+                        "reason": refusal.wire_reason()
+                    }))
+                    .await;
+                return;
+            }
             // #155: the enrollment side READS the signed `ephemeral` flag. An
             // ephemeral key admits in-memory only: nothing durable is written,
             // so the device is gone at daemon restart by construction (Q2). A
@@ -439,9 +462,9 @@ pub(crate) async fn handle_auth_key_enroll_response(
             // A key revoked and then forgotten has no record left to refuse
             // it, so a fresh invitation would have re-admitted the very key
             // the owner cut off. The key list keeps that decision.
-            if prior.is_none()
-                && crate::fleet_support::device_key_revoked(&device_pub, identity::now_secs())
-            {
+            // Whatever record does or does not exist: a key on the revocation
+            // list never enrols again, by any invitation.
+            if crate::fleet_support::device_key_revoked(&device_pub, identity::now_secs()) {
                 ui::debug(&format!("enroll response refused: device {pid} holds a revoked key"));
                 let _ = t
                     .send_control(&json!({

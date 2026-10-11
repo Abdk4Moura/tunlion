@@ -143,6 +143,10 @@ pub(crate) use mount_cmd::{reset_cmd, resolve_mount_plan};
 pub(crate) use mount_cmd::mount_fuse_cmd;
 /// Fleet helpers and mesh housekeeping.
 mod fleet_support;
+/// Forget and revoke, in effect in the running daemon.
+mod revocation_live;
+/// Used invitations, kept on disk apart from any device record.
+mod invite_burn;
 pub(crate) use fleet_support::{apply_reconfigure, ensure_self_genesis_header, fleet_certificate_warning, fleet_identity_pending, fleet_indexed_name, fleet_route_ok, fleet_shaped_link, fleet_share_root, sweep_completed_streams, sweep_lapsed};
 #[cfg(test)]
 pub(crate) use fleet_support::fleet_certificate_warning_for;

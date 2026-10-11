@@ -146,9 +146,10 @@ pub(crate) struct Cli {
     /// Independent of TTY: a pipe still gets human text unless --json is set.
     #[arg(long, global = true)]
     pub(crate) json: bool,
-    /// Auto-confirm prompts: down, reset, revoke, devices revoke, unmount,
-    /// unexpose, set --reset, add --for with remote authority, and init.
-    /// Required for these from a non-TTY; a TTY prompts instead.
+    /// Auto-confirm prompts: down, reset, revoke, devices revoke, devices
+    /// forget, unmount, unexpose, set --reset, add --for with remote
+    /// authority, and init. Required for these from a non-TTY; a TTY
+    /// prompts instead.
     #[arg(short = 'y', long = "yes", global = true)]
     pub(crate) yes: bool,
     #[command(subcommand)]
