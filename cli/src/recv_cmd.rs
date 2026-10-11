@@ -3641,7 +3641,7 @@ pub(crate) async fn recv_cmd(
                         .map(|t| t.is_dead())
                         .unwrap_or(false);
                     if fresh || link_dead {
-                        ui::say(&format!("known device '{n}' appeared, connecting"));
+                        ui::say_folded(&format!("known device '{n}' appeared, connecting"));
                         // NOT a sighting. This is the server's roster, which it
                         // re-pushes on every (re)subscribe and sync tick, and
                         // which can still carry a session the device no longer
@@ -4817,7 +4817,7 @@ pub(crate) async fn recv_cmd(
                                                 t.clone(),
                                             )
                                             .await;
-                                            ui::say(&format!(
+                                            ui::say_folded(&format!(
                                                 "  {} L3 peer {who}.mesh ({ip} / {v4})",
                                                 ui::paint(ui::Tone::Ok, ui::glyph_ok())
                                             ));
@@ -7784,7 +7784,7 @@ pub(crate) async fn recv_cmd(
                 // The signal task already armed a force-exit; cap the disconnect so
                 // we exit cleanly on our own well inside that grace.
                 let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-                std::process::exit(130);
+                crate::exit_codes::interrupted_exit(130);
             }
             // P0 (GAP-1): the inbound transfer stalled (zero bytes, link alive).
             // The receiver participates in the SYMMETRIC direct-QUIC repair: it

@@ -97,7 +97,10 @@ say C
 JSON=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices --json 2>/dev/null)
 echo "$JSON" | python3 -c "
 import sys, json
-rows = {d['name']: d['caps'] for d in json.loads(sys.stdin.read())}
+doc = json.loads(sys.stdin.read())
+if doc.get('ok') is not True or doc.get('verb') != 'devices':
+    print('## devices --json is not the ok envelope:', doc); sys.exit(1)
+rows = {d['name']: d['caps'] for d in doc['data']['devices']}
 foxtrot = rows.get('foxtrot', [])
 if 'shell' in foxtrot:
     print('## foxtrot caps include shell (WRONG):', foxtrot); sys.exit(1)

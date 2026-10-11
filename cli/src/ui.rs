@@ -112,13 +112,166 @@ pub fn caps() -> &'static Caps {
             && std::env::var("COLORTERM")
                 .map(|v| v.contains("truecolor") || v.contains("24bit"))
                 .unwrap_or(false);
-        let unicode = std::env::var("LC_ALL")
-            .or_else(|_| std::env::var("LC_CTYPE"))
-            .or_else(|_| std::env::var("LANG"))
-            .map(|v| v.to_uppercase().contains("UTF"))
-            .unwrap_or(cfg!(windows)); // Windows Terminal is UTF-16 native
+        let var = |k: &str| std::env::var(k).ok();
+        let unicode = unicode_from(var("LC_ALL"), var("LC_CTYPE"), var("LANG"), &term);
         Caps { tty, color, truecolor, unicode }
     })
+}
+
+/// Whether to print Unicode glyphs, from the locale and the terminal. Pure.
+///
+/// POSIX order: the first of LC_ALL, LC_CTYPE, LANG that is set AND non-empty
+/// decides (an empty LC_ALL is unset, not "C"). `TERM=dumb` is ASCII whatever
+/// the locale: a dumb terminal promises nothing beyond it. With no locale at
+/// all, Windows (UTF-16 native consoles) says yes and everything else no.
+pub fn unicode_from(lc_all: Option<String>, lc_ctype: Option<String>, lang: Option<String>, term: &str) -> bool {
+    if term == "dumb" {
+        return false;
+    }
+    [lc_all, lc_ctype, lang]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(|v| v.to_uppercase().contains("UTF"))
+        .unwrap_or(cfg!(windows))
+}
+
+/// The glyphs human lines use, and their ASCII stand-ins. Applied to every
+/// line `emit` prints when the terminal or locale is not Unicode (`LANG=C`,
+/// `TERM=dumb`), so a glyph written inline at a call site (`✓`, `⚡ warm`,
+/// `○ cold`, `→`, `●`) cannot reach an ASCII terminal as mojibake. Only these
+/// characters are mapped: a file name with other non-ASCII letters is the
+/// user's data and passes through.
+const ASCII_GLYPHS: &[(char, &str)] = &[
+    ('✓', "ok"),
+    ('✗', "x"),
+    ('⚡', "*"),
+    ('→', "->"),
+    ('←', "<-"),
+    ('↳', "->"),
+    ('●', "*"),
+    ('○', "o"),
+    ('◐', "o"),
+    ('◇', "<>"),
+    ('⚠', "!"),
+    ('•', "*"),
+    ('·', "-"),
+    ('─', "-"),
+    ('━', "="),
+    ('╸', "-"),
+    ('…', "..."),
+];
+
+/// `line` with every known glyph replaced by its ASCII stand-in. Pure.
+pub fn ascii_glyphs(line: &str) -> String {
+    if line.is_ascii() {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        match ASCII_GLYPHS.iter().find(|(g, _)| *g == c) {
+            Some((_, a)) => out.push_str(a),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------ daemon log --
+//
+// A detached daemon's stderr IS daemon.log. Its lines had no time on them,
+// and status lines repeated without bound ("ok L3 peer ..." twice per
+// reconnect, "known device 'beta' appeared" 14 times in 150 lines).
+//
+// - In daemon-log mode (the daemon's stderr is not a terminal) every line
+//   starts with an ISO-8601 UTC timestamp.
+// - A repeating STATUS line goes through `say_folded`: a copy within
+//   DEDUP_WINDOW of its last printing is folded into a count that rides on
+//   its next printing. Folding is opt-in per call site on purpose: refusals,
+//   errors and anything a person or a gate counts stay one line per event.
+
+static DAEMON_LOG: AtomicBool = AtomicBool::new(false);
+const DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounds the memory the fold uses; a daemon prints far fewer distinct lines.
+const DEDUP_MAX: usize = 512;
+
+type FoldMap = std::collections::HashMap<String, (Instant, u64)>;
+/// line -> (when it was last PRINTED, how many copies were folded since)
+static FOLD: std::sync::Mutex<Option<FoldMap>> = std::sync::Mutex::new(None);
+
+/// Turn daemon-log mode on (the daemon calls this when its stderr is a file).
+pub fn set_daemon_log(on: bool) {
+    DAEMON_LOG.store(on, Ordering::Relaxed);
+}
+
+/// What the fold does with `line` seen at `now`. Pure over the map.
+/// `None`: fold it (a copy within the window). `Some(n)`: print it, noting
+/// `n` folded copies since it last printed.
+fn fold_decision(seen: &mut FoldMap, line: &str, now: Instant) -> Option<u64> {
+    if seen.len() >= DEDUP_MAX && !seen.contains_key(line) {
+        seen.retain(|_, (t, _)| now.duration_since(*t) < DEDUP_WINDOW);
+        if seen.len() >= DEDUP_MAX {
+            seen.clear();
+        }
+    }
+    match seen.get_mut(line) {
+        Some((t, n)) if now.duration_since(*t) < DEDUP_WINDOW => {
+            *n += 1;
+            None
+        }
+        Some((t, n)) => {
+            let folded = *n;
+            *t = now;
+            *n = 0;
+            Some(folded)
+        }
+        None => {
+            seen.insert(line.to_string(), (now, 0));
+            Some(0)
+        }
+    }
+}
+
+/// A folded line's text: the count of copies folded since it last printed. Pure.
+pub fn folded_line(line: &str, folded: u64) -> String {
+    match folded {
+        0 => line.to_string(),
+        n => format!("{line}  (and {n} more like it in the last {}s)", DEDUP_WINDOW.as_secs()),
+    }
+}
+
+/// A daemon-log line: the ISO timestamp first. Pure.
+pub fn stamped_line(stamp: &str, line: &str) -> String {
+    format!("{stamp} {line}")
+}
+
+/// INFO level, for a status line a daemon repeats (a peer appearing, a route
+/// coming up): printed at most once per DEDUP_WINDOW per distinct text, with
+/// the number of copies it stood for.
+pub fn say_folded(line: &str) {
+    if !enabled(Level::Info) {
+        return;
+    }
+    let folded = match FOLD.lock() {
+        Ok(mut g) => match fold_decision(g.get_or_insert_with(FoldMap::new), line, Instant::now()) {
+            Some(n) => n,
+            None => return,
+        },
+        // A poisoned fold never costs a line: print it unfolded.
+        Err(_) => 0,
+    };
+    emit(&folded_line(line, folded));
+}
+
+/// The line as it is written: ASCII glyphs on an ASCII terminal, and the
+/// timestamp in daemon-log mode.
+fn decorate(line: &str) -> String {
+    let line = if caps().unicode { line.to_string() } else { ascii_glyphs(line) };
+    if !DAEMON_LOG.load(Ordering::Relaxed) {
+        return line;
+    }
+    let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    stamped_line(&stamp, &line)
 }
 
 // ------------------------------------------------------------------ paint --
@@ -230,7 +383,7 @@ pub fn link(url: &str, text: &str) -> String {
 pub fn clipboard(s: &str) -> bool {
     use base64_mini::enc;
     if caps().tty {
-        eprint!("\x1b]52;c;{}\x07", enc(s.as_bytes()));
+        err_write(&format!("\x1b]52;c;{}\x07", enc(s.as_bytes())));
         return crate::platform::clipboard_reachable();
     }
     false
@@ -260,8 +413,18 @@ static LIVE: AtomicBool = AtomicBool::new(false);
 
 fn clear_live() {
     if LIVE.swap(false, Ordering::Relaxed) && caps().tty {
-        eprint!("\r\x1b[2K");
+        err_write("\r\x1b[2K");
     }
+}
+
+/// Write to stderr WITHOUT the print macros' panic on a closed pipe. Human
+/// output is a side channel of the work: a reader that stopped reading it
+/// (`send f --to b 2>&1 | head -1`) must not end the work. The write error is
+/// dropped; the command finishes and exits with its real result.
+fn err_write(s: &str) {
+    let mut e = std::io::stderr().lock();
+    let _ = e.write_all(s.as_bytes());
+    let _ = e.flush();
 }
 
 // Sticky status (C22): an open question or countdown survives interleaved
@@ -272,8 +435,7 @@ static STICKY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn paint_live(line: &str) {
     clear_live();
-    eprint!("{line}");
-    let _ = std::io::stderr().flush();
+    err_write(line);
     LIVE.store(true, Ordering::Relaxed);
 }
 
@@ -314,8 +476,42 @@ pub fn exit_quietly_on_broken_pipe() {
 }
 
 /// The exit code a closed pipe ends the command with: 0 unless the command
-/// has already decided its answer.
+/// has already decided its answer, or the command is an ACTION (below).
 static CLOSED_PIPE_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// 128 + SIGPIPE, what a shell reports for a process SIGPIPE killed.
+pub const CLOSED_PIPE_UNFINISHED: i32 = 141;
+
+/// Verbs that only LOOK: when their reader stops reading, nothing is left
+/// undone, so a closed pipe exits with the code they decided (0 by default),
+/// as `head` asked. Every other verb is an action (send, sync, exec, receive,
+/// add, ...): its work is not finished when its output stops being read.
+const READ_ONLY_VERBS: &[&str] = &[
+    "status", "devices", "logs", "reach", "doctor", "id", "addr", "requests", "completions", "man",
+    "help",
+];
+
+/// The closed-pipe exit for this verb before it decides anything. `None` is
+/// bare `tunlion` (the tour) or `--help`/`--version`: read-only.
+///
+/// An action whose reader went away must never exit 0 for work it did not do:
+/// `tunlion send f --to beta 2>&1 | head -1` exited 0 in 0.6 s with nothing
+/// delivered, because the second human line panicked into this hook. Human
+/// lines no longer panic (`err_write`), so an action keeps working silently
+/// and exits with its real result. This default covers what is left: a bare
+/// print to a closed STDOUT inside an action ends it with 141, never 0.
+pub fn closed_pipe_default(verb: Option<&str>) -> i32 {
+    match verb {
+        None => 0,
+        Some(v) if READ_ONLY_VERBS.contains(&v) => 0,
+        Some(_) => CLOSED_PIPE_UNFINISHED,
+    }
+}
+
+/// Record the verb on the command line, once, before anything prints.
+pub fn set_closed_pipe_verb(verb: Option<&str>) {
+    CLOSED_PIPE_EXIT.store(closed_pipe_default(verb), Ordering::Relaxed);
+}
 
 /// Record the exit code this command has decided on, BEFORE it prints, so a
 /// reader that closes the pipe early (`| head -1`) does not turn the answer
@@ -342,8 +538,9 @@ pub fn is_broken_pipe_print(msg: &str) -> bool {
 /// decided the line is in-budget. Use the leveled helpers (`critical`/`say`/
 /// `debug`/`trace`) at call sites so the verbosity gate is applied.
 fn emit(line: &str) {
+    let line = decorate(line);
     clear_live();
-    eprintln!("{line}");
+    err_write(&format!("{line}\n"));
     if let Ok(s) = STICKY.lock() {
         if let Some(st) = s.as_ref() {
             if caps().tty {
@@ -367,6 +564,9 @@ pub fn say(line: &str) {
 /// print so stdout carries exactly what a script parses and nothing else; it
 /// is never verbosity-gated, because a `-q` script still needs its answer.
 pub fn json_out(v: &serde_json::Value) {
+    // This command's answer is on stdout now; an interrupt after this must
+    // not add a second document (exit_codes::report_interrupted).
+    crate::exit_codes::note_json_answered();
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{v}");
     let _ = out.flush();
@@ -460,7 +660,7 @@ pub fn status(line: &str) {
 /// bare eprint would land inside whatever transient line is on screen).
 pub fn answer_echo(c: char) {
     clear_live();
-    eprintln!("  {} {}", paint(Tone::Dim, "↳"), paint(Tone::Bold, &c.to_string()));
+    err_write(&format!("  {} {}\n", paint(Tone::Dim, "↳"), paint(Tone::Bold, &c.to_string())));
 }
 
 /// A status line that survives interleaved say()s until cleared, for open
@@ -570,7 +770,7 @@ impl Progress {
             paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
         ));
         if caps().tty && secs > 30.0 {
-            eprint!("\x07");
+            err_write("\x07");
         }
     }
 }
@@ -598,7 +798,7 @@ pub fn transfer_summary(label: &str, bytes: u64, secs: f64) {
         paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
     ));
     if caps().tty && secs > 30.0 {
-        eprint!("\x07");
+        err_write("\x07");
     }
 }
 
@@ -834,6 +1034,38 @@ mod verbosity_tests {
         assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 11);
         super::exit_code_on_closed_pipe(0);
     }
+
+    /// J1: `send f --to beta 2>&1 | head -1` exited 0 with nothing delivered.
+    /// A read-only verb's closed pipe is the success `head` asked for; an
+    /// action's is never 0 for work it did not finish.
+    #[test]
+    fn a_closed_pipe_never_turns_undone_work_into_success() {
+        for v in ["status", "devices", "logs", "reach", "doctor", "id"] {
+            assert_eq!(super::closed_pipe_default(Some(v)), 0, "{v} only looks");
+        }
+        assert_eq!(super::closed_pipe_default(None), 0, "bare tunlion, --help");
+        for v in ["send", "sync", "exec", "receive", "backup", "add", "join", "up", "mount", "something-new"] {
+            assert_eq!(super::closed_pipe_default(Some(v)), 141, "{v} is an action");
+        }
+        assert_ne!(super::CLOSED_PIPE_UNFINISHED, 0);
+    }
+
+    /// The other half of J1: human lines never panic into the hook, so an
+    /// action whose stderr reader left keeps working. The emitter must not
+    /// use the panicking print macros.
+    #[test]
+    fn human_lines_do_not_use_the_panicking_macros() {
+        let src = include_str!("ui.rs");
+        let body = |name: &str| {
+            let start = src.find(&format!("fn {name}(")).expect(name);
+            let end = src[start..].find("\n}\n").map(|e| start + e).unwrap();
+            src[start..end].to_string()
+        };
+        for f in ["emit", "paint_live", "clear_live", "answer_echo", "clipboard"] {
+            let b = body(f);
+            assert!(!b.contains("eprint"), "{f} uses a panicking print macro");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -849,5 +1081,54 @@ mod transfer_units {
         assert_eq!(crate::human(1024 * 1024), "1.0 MiB");
         assert_eq!(crate::human(5 * 1024 * 1024 * 1024), "5.0 GiB");
         assert_eq!(crate::human(2 * 1024u64.pow(4)), "2.0 TiB");
+    }
+}
+
+#[cfg(test)]
+mod scripting_output_tests {
+    use super::*;
+
+    /// J7: with LANG=C or TERM=dumb the output carried ✓ ⚡ → ●.
+    #[test]
+    fn ascii_terminals_get_ascii_glyphs() {
+        let s = |v: &str| Some(v.to_string());
+        assert!(!unicode_from(None, None, s("C"), "xterm"), "LANG=C");
+        assert!(!unicode_from(None, None, s("en_US.UTF-8"), "dumb"), "TERM=dumb");
+        assert!(unicode_from(None, None, s("en_US.UTF-8"), "xterm-256color"));
+        assert!(!unicode_from(s("C"), None, s("en_US.UTF-8"), "xterm"), "LC_ALL wins");
+        assert!(unicode_from(s(""), None, s("en_US.UTF-8"), "xterm"), "an empty LC_ALL is unset");
+        assert_eq!(ascii_glyphs("  ✓ up (pid 7)"), "  ok up (pid 7)");
+        assert_eq!(ascii_glyphs("  ⚡ warm  ○ cold → ●"), "  * warm  o cold -> *");
+        assert_eq!(ascii_glyphs("café.txt delivered"), "café.txt delivered", "user data passes through");
+        for (g, a) in ASCII_GLYPHS {
+            assert!(a.is_ascii(), "{g} maps to non-ASCII");
+        }
+    }
+
+    /// J7: "known device 'beta' appeared" 14 times in 150 lines, and no
+    /// timestamps. Copies within the window fold into a count on the next
+    /// printing; every printed line starts with an ISO timestamp.
+    #[test]
+    fn daemon_log_lines_are_stamped_and_repeats_fold() {
+        let mut seen = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let l = "known device 'beta' appeared, connecting";
+        assert_eq!(fold_decision(&mut seen, l, t0), Some(0), "first time prints");
+        for i in 1..14 {
+            assert_eq!(fold_decision(&mut seen, l, t0 + std::time::Duration::from_secs(i)), None);
+        }
+        assert_eq!(fold_decision(&mut seen, "other", t0), Some(0), "a different line is not folded");
+        let later = t0 + DEDUP_WINDOW + std::time::Duration::from_secs(1);
+        assert_eq!(fold_decision(&mut seen, l, later), Some(13), "the next printing carries the count");
+        assert_eq!(fold_decision(&mut seen, l, later), None, "and the window restarts");
+        let line = stamped_line("2026-10-11T01:02:03Z", &folded_line(l, 13));
+        assert!(line.starts_with("2026-10-11T01:02:03Z known device"), "{line}");
+        assert!(line.ends_with("(and 13 more like it in the last 60s)"), "{line}");
+        assert_eq!(folded_line("x", 0), "x");
+        // Bounded: a flood of distinct lines cannot grow the map without limit.
+        for i in 0..(DEDUP_MAX * 2) {
+            fold_decision(&mut seen, &format!("line {i}"), t0);
+        }
+        assert!(seen.len() <= DEDUP_MAX);
     }
 }

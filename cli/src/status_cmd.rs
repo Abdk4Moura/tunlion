@@ -150,7 +150,10 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
     // JSON and the exit code are three renderings of ONE answer. `--json` used
     // to say `"ok": true` with exit 0 for a daemon that was down or frozen,
     // while the same question without `--json` exited 11 or 6.
-    let code = status_exit_code(pid_alive.is_some(), responding);
+    let code = status_identity_code(
+        status_exit_code(pid_alive.is_some(), responding),
+        crate::identity_flow::has_identity(),
+    );
     // ...and a reader that closes the pipe early (`status | head -1`) must not
     // turn that answer into 0: the closed-pipe exit is this code (ui.rs).
     crate::ui::exit_code_on_closed_pipe(code);
@@ -333,6 +336,11 @@ pub(crate) fn proxy_if_serving<T>(responding: Option<bool>, proxy: Option<T>) ->
 pub(crate) fn status_error(code: i32, pid: Option<u32>) -> Value {
     match code {
         0 => Value::Null,
+        9 => json!({
+            "code": "no_identity",
+            "exit": code,
+            "message": crate::identity_flow::NO_IDENTITY_MSG,
+        }),
         STATUS_NOT_RUNNING => json!({
             "code": "not_running",
             "exit": code,
@@ -372,6 +380,19 @@ pub(crate) fn status_exit_code(running: bool, responding: Option<bool>) -> i32 {
     }
 }
 
+/// A daemon that answers on a device with no identity is not "ok, up": it can
+/// receive by code and nothing else, and every verb that names a device fails
+/// with 9. status said "up" and exited 0 there, so a script gating on it went
+/// ahead and hit 9 on its next command. The daemon's own trouble (11, 6) is
+/// the more urgent answer and wins. Pure.
+pub(crate) fn status_identity_code(code: i32, has_identity: bool) -> i32 {
+    if code == 0 && !has_identity {
+        crate::exit_codes::ExitKind::NoIdentity.code()
+    } else {
+        code
+    }
+}
+
 /// No daemon serves this config dir. A status-only code (like `up`'s 10),
 /// listed under EXIT CODES in `tunlion --help`.
 pub(crate) const STATUS_NOT_RUNNING: i32 = crate::exit_codes::STATUS_NOT_RUNNING;
@@ -382,6 +403,19 @@ pub(crate) const STATUS_NOT_RESPONDING: i32 = 6;
 #[cfg(test)]
 mod status_exit_tests {
     use super::status_exit_code;
+
+    /// J6: status with no identity but a daemon running said "ok up", exit 0.
+    #[test]
+    fn a_daemon_with_no_identity_is_status_9() {
+        use super::status_identity_code as id;
+        assert_eq!(id(0, true), 0);
+        assert_eq!(id(0, false), 9, "answers, but no identity: the taxonomy's 9");
+        assert_eq!(id(11, false), 11, "no daemon is the more urgent answer");
+        assert_eq!(id(6, false), 6, "a frozen daemon is the more urgent answer");
+        let e = super::status_error(9, Some(1));
+        assert_eq!(e["code"], serde_json::json!("no_identity"));
+        assert_eq!(e["exit"], serde_json::json!(9));
+    }
 
     #[test]
     fn status_exits_nonzero_unless_a_daemon_serves_and_answers() {

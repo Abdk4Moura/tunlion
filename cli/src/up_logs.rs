@@ -528,6 +528,10 @@ pub(crate) async fn up_cmd(
             }
         }
     }
+    // From here this process IS the daemon. When its stderr is not a terminal
+    // (daemon.log, the journal, a gate's redirect) every line carries an ISO
+    // timestamp: a log with no times cannot be read against anything else.
+    ui::set_daemon_log(!std::io::IsTerminal::is_terminal(&std::io::stderr()));
     let res = recv_cmd(
         server,
         None,
@@ -558,6 +562,16 @@ pub(crate) async fn up_cmd(
 /// because this branch predates exit_codes.rs; once both have merged, switch
 /// it to `exit_codes::DAEMON_CONFLICT`.
 pub(crate) const ALREADY_UP_DIFFERENT_EXIT: i32 = 10;
+
+/// One log line on STDOUT. The log is the data `logs` was asked for, so it
+/// goes where a pipe reads it (`logs | grep`; `logs 2>/dev/null | wc -l` was
+/// 0); the human asides (no log yet, detached) stay on stderr through `ui::`.
+/// False when stdout is closed (`| head`): the caller stops, it never panics.
+fn log_line_out(line: &str) -> bool {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{line}").and_then(|()| out.flush()).is_ok()
+}
 
 /// What `up` should do about a daemon that is already running.
 #[derive(Debug, PartialEq, Eq)]
@@ -1034,24 +1048,28 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     } else {
         crate::platform::Paths::config_path("diag.jsonl")
     };
-    let read_tail = |count: usize| -> Result<()> {
+    let read_tail = |count: usize| -> Result<bool> {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             // Say what is true now, not what will happen later: nothing has
             // been written yet. Whether it WILL appear depends on the daemon
             // actually running (and, on some platforms, having a place to
             // write), which this process cannot establish.
             ui::say("  no log yet (nothing written so far)");
-            return Ok(());
+            return Ok(true);
         };
         let lines: Vec<&str> = raw.lines().collect();
         let start = lines.len().saturating_sub(count);
         for line in &lines[start..] {
-            eprintln!("{line}");
+            if !log_line_out(line) {
+                return Ok(false);
+            }
         }
-        Ok(())
+        Ok(true)
     };
-    if tail > 0 {
-        read_tail(tail)?;
+    if tail > 0 && !read_tail(tail)? {
+        // The reader stopped reading (`logs | head`): read-only data, nothing
+        // left undone, so this is the success `head` asked for.
+        return Ok(());
     }
     if !follow {
         return Ok(());
@@ -1114,7 +1132,12 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                                 }
                                 continue;
                             }
-                            eprintln!("{}", line.trim_end());
+                            if !log_line_out(line.trim_end()) {
+                                // `logs -f | head`: the reader is gone, and a
+                                // follow has no other end. Exit as `head`
+                                // asked, leaving the daemon running.
+                                return Ok(());
+                            }
                             line.clear();
                         }
                     }
@@ -1367,7 +1390,7 @@ pub(crate) async fn connect_signaling_patiently(
                     _ = tokio::time::sleep(wait) => {}
                     _ = tokio::signal::ctrl_c() => {
                         crate::file_io::remove_pidfile();
-                        std::process::exit(130);
+                        crate::exit_codes::interrupted_exit(130);
                     }
                 }
             }

@@ -257,6 +257,9 @@ pub(crate) struct SyncOpts {
     pub delete: bool,
     pub dry_run: bool,
     pub json: bool,
+    /// `--json-lines`: one record per file as it happens, then the summary
+    /// (NDJSON). Plain `--json` is one document, like every other verb.
+    pub json_lines: bool,
 }
 
 /// Exit codes per docs/agent-output-audit.md: 3 unknown device, 4 denied,
@@ -278,10 +281,92 @@ fn fail(exit: i32, code: &'static str, msg: impl Into<String>) -> anyhow::Error 
     Fail(exit, code, msg.into()).into()
 }
 
+/// What a sync did, counted one way for every output. Pure, unit-tested.
+///
+/// The counters a script reads, and what each one means:
+///
+///   counts.total      local entries considered: every regular file in the
+///                     manifest plus every entry skipped while walking
+///   counts.<state>    entries that ended in that state; the states partition
+///                     `total`, so sent + updated + same + skipped + failed
+///                     (+ would_send + would_update on a dry run) == total.
+///                     `deleted`/`would_delete` are REMOTE files and are not
+///                     part of `total`.
+///   bytes.total       size of every local regular file (the tree)
+///   bytes.moved       bytes actually transferred and acknowledged (sent and
+///                     updated only; 0 on a dry run, failed files excluded)
+///   bytes.would_move  on a dry run, what `moved` would have been
+///
+/// The old summary had `moved` (bytes, including failed and dry-run bytes)
+/// beside `sent` (a file count) and `total` (bytes), which read as
+/// "moved 4 of total 4, sent 2" for two files. `moved` and `total` are kept
+/// with their byte meaning for existing scripts; `counts` and `bytes` are the
+/// labelled form.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct Tally {
+    pub(crate) files_total: u64,
+    pub(crate) bytes_total: u64,
+    pub(crate) bytes_moved: u64,
+    pub(crate) bytes_would_move: u64,
+    pub(crate) counts: BTreeMap<&'static str, u64>,
+}
+
+impl Tally {
+    pub(crate) fn record(&mut self, state: &'static str, bytes: u64) {
+        *self.counts.entry(state).or_insert(0) += 1;
+        match state {
+            "sent" | "updated" => self.bytes_moved += bytes,
+            "would send" | "would update" => self.bytes_would_move += bytes,
+            _ => {}
+        }
+    }
+
+    pub(crate) fn count(&self, state: &str) -> u64 {
+        self.counts.get(state).copied().unwrap_or(0)
+    }
+
+    /// Local entries that reached a state: must equal `files_total`.
+    pub(crate) fn accounted(&self) -> u64 {
+        ["sent", "updated", "same", "skipped", "failed", "would send", "would update"]
+            .iter()
+            .map(|s| self.count(s))
+            .sum()
+    }
+
+    /// The summary `data` object (without the per-file list).
+    pub(crate) fn summary(&self, dry_run: bool, exit: i32) -> Value {
+        let mut counts = json!({ "total": self.files_total });
+        for s in [
+            "sent", "updated", "same", "skipped", "failed", "deleted",
+            "would send", "would update", "would delete",
+        ] {
+            counts[s.replace(' ', "_")] = json!(self.count(s));
+        }
+        let mut d = json!({
+            "counts": counts,
+            "bytes": {
+                "total": self.bytes_total,
+                "moved": self.bytes_moved,
+                "would_move": self.bytes_would_move,
+            },
+            "dry_run": dry_run,
+            "exit": exit,
+            // Schema-1 names, kept for existing scripts: both are BYTES.
+            "moved": self.bytes_moved,
+            "total": self.bytes_total,
+        });
+        for (k, v) in &self.counts {
+            d[*k] = json!(v);
+        }
+        d
+    }
+}
+
 struct Report {
     json: bool,
-    moved: u64,
-    counts: BTreeMap<&'static str, u64>,
+    json_lines: bool,
+    tally: Tally,
+    files: Vec<Value>,
     /// Where the files landed on the peer, as the peer reported it in its
     /// ack (absolute). `None` from an older peer that does not say.
     dest: Option<String>,
@@ -293,14 +378,17 @@ struct Report {
 }
 impl Report {
     fn line(&mut self, state: &'static str, p: &str, bytes: u64, reason: Option<&str>) {
-        *self.counts.entry(state).or_insert(0) += 1;
-        self.moved += bytes;
-        if self.json {
+        self.tally.record(state, bytes);
+        if self.json || self.json_lines {
             let mut d = json!({ "file": p, "state": state, "bytes": bytes });
             if let Some(r) = reason {
                 d["reason"] = json!(r);
             }
-            println!("{}", json!({ "ok": true, "verb": "sync", "data": d }));
+            if self.json_lines {
+                println!("{}", json!({ "ok": true, "verb": "sync", "data": d }));
+            } else {
+                self.files.push(d);
+            }
         } else {
             let tail = match (reason, bytes) {
                 (Some(r), _) => format!(": {r}  {p}"),
@@ -323,28 +411,38 @@ pub(crate) async fn run(
     relay: bool,
     opts: SyncOpts,
 ) -> i32 {
-    let mut rep = Report { json: opts.json, moved: 0, counts: BTreeMap::new(), dest: None, kept_on_peer: 0 };
+    let mut rep = Report {
+        json: opts.json,
+        json_lines: opts.json_lines,
+        tally: Tally::default(),
+        files: Vec::new(),
+        dest: None,
+        kept_on_peer: 0,
+    };
     match sync_inner(server, local, peer, remote_dir, relay, &opts, &mut rep).await {
         Ok(total) => {
-            let partial = rep.counts.get("failed").copied().unwrap_or(0) > 0;
+            let partial = rep.tally.count("failed") > 0;
             let exit = if partial { 8 } else { 0 };
-            if opts.json {
-                let mut d = json!({ "moved": rep.moved, "total": total, "dry_run": opts.dry_run, "exit": exit });
+            if opts.json || opts.json_lines {
+                let mut d = rep.tally.summary(opts.dry_run, exit);
                 if let Some(dest) = &rep.dest {
                     d["dest"] = json!(dest);
                 }
-                for (k, v) in &rep.counts {
-                    d[k] = json!(v);
-                }
                 d["only_on_peer"] = json!(rep.kept_on_peer);
-                println!("{}", json!({ "ok": !partial, "verb": "sync", "data": d }));
+                if !opts.json_lines {
+                    d["files"] = Value::Array(std::mem::take(&mut rep.files));
+                }
+                crate::ui::json_out(&json!({ "ok": !partial, "verb": "sync", "data": d }));
             } else {
-                let c = |k: &str| rep.counts.get(k).copied().unwrap_or(0);
+                let c = |k: &str| rep.tally.count(k);
+                // On a dry run nothing moved: say what WOULD, in bytes.
+                let moved = if opts.dry_run { rep.tally.bytes_would_move } else { rep.tally.bytes_moved };
                 ui::say(&format!(
-                    "  {} {} of {} moved{}: {} sent, {} updated, {} same, {} skipped{}{}",
+                    "  {} {} of {} {}{}: {} sent, {} updated, {} same, {} skipped{}{}",
                     if partial { ui::glyph_warn() } else { ui::glyph_ok() },
-                    crate::human(rep.moved),
+                    crate::human(moved),
                     crate::human(total),
+                    if opts.dry_run { "would move" } else { "moved" },
                     if opts.dry_run { " (dry run, nothing moved)" } else { "" },
                     c("sent") + c("would send"),
                     c("updated") + c("would update"),
@@ -375,10 +473,9 @@ pub(crate) async fn run(
                 Some(Fail(x, c, _)) => (*x, *c),
                 None => (1, "error"),
             };
-            if opts.json {
-                println!(
-                    "{}",
-                    json!({ "ok": false, "verb": "sync", "error": { "code": code, "exit": exit, "message": e.to_string() } })
+            if opts.json || opts.json_lines {
+                crate::ui::json_out(
+                    &json!({ "ok": false, "verb": "sync", "error": { "code": code, "exit": exit, "message": e.to_string() } }),
                 );
             } else {
                 ui::problem("sync failed", &e.to_string(), &[]);
@@ -420,6 +517,8 @@ async fn sync_inner(
         .map_err(|e| fail(3, "unknown_device", e.to_string()))?;
     let (files, skipped) = walk_manifest(&local)?;
     let total: u64 = files.iter().map(|e| e.size).sum();
+    rep.tally.files_total = (files.len() + skipped.len()) as u64;
+    rep.tally.bytes_total = total;
 
     let (t, mut rx, guard, _diag) = match tokio::time::timeout(
         Duration::from_secs(45),
@@ -925,6 +1024,57 @@ async fn receive_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// J4: two files gave `"moved":4,"sent":2,"total":4` and three gave
+    /// `"moved":2,"sent":1,"same":2,"total":6`: bytes and file counts side by
+    /// side with no labels, and failed or dry-run bytes counted as moved. The
+    /// labelled counters partition the files and the bytes add up.
+    #[test]
+    fn sync_counters_add_up() {
+        // The reported run: three files of 2 bytes each, 1 sent and 2 same.
+        let mut t = Tally { files_total: 3, bytes_total: 6, ..Default::default() };
+        t.record("sent", 2);
+        t.record("same", 0);
+        t.record("same", 0);
+        assert_eq!(t.accounted(), t.files_total);
+        let s = t.summary(false, 0);
+        assert_eq!(s["counts"]["total"], json!(3));
+        assert_eq!(s["counts"]["sent"], json!(1));
+        assert_eq!(s["counts"]["same"], json!(2));
+        assert_eq!(s["counts"]["updated"], json!(0));
+        assert_eq!(s["bytes"]["total"], json!(6));
+        assert_eq!(s["bytes"]["moved"], json!(2));
+        assert_eq!(s["moved"], s["bytes"]["moved"], "the schema-1 name is bytes");
+        assert_eq!(s["total"], s["bytes"]["total"], "the schema-1 name is bytes");
+
+        // A failed file's bytes did not move; a skipped entry is counted.
+        let mut f = Tally { files_total: 4, bytes_total: 30, ..Default::default() };
+        f.record("sent", 10);
+        f.record("updated", 4);
+        f.record("failed", 9);
+        f.record("skipped", 0);
+        f.record("deleted", 0);
+        assert_eq!(f.accounted(), 4, "deleted is a remote file, not part of total");
+        assert_eq!(f.bytes_moved, 14);
+        let s = f.summary(false, 8);
+        assert_eq!(s["counts"]["failed"], json!(1));
+        assert_eq!(s["counts"]["deleted"], json!(1));
+        let parts: u64 = ["sent", "updated", "same", "skipped", "failed", "would_send", "would_update"]
+            .iter()
+            .map(|k| s["counts"][*k].as_u64().unwrap())
+            .sum();
+        assert_eq!(parts, s["counts"]["total"].as_u64().unwrap());
+
+        // A dry run moves nothing and says what would have.
+        let mut d = Tally { files_total: 2, bytes_total: 7, ..Default::default() };
+        d.record("would send", 5);
+        d.record("would update", 2);
+        let s = d.summary(true, 0);
+        assert_eq!(s["bytes"]["moved"], json!(0));
+        assert_eq!(s["bytes"]["would_move"], json!(7));
+        assert_eq!(s["counts"]["would_send"], json!(1));
+        assert_eq!(d.accounted(), 2);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("fil-sync-{}-{name}", std::process::id()));

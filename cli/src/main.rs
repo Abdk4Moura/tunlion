@@ -1846,11 +1846,25 @@ fn install_transport_hooks() {
 }
 
 
+/// The subcommand named on the command line (aliases resolved), for the
+/// closed-pipe rule: the first argument that names one, as the --json
+/// envelope's verb is found. None for bare `tunlion`, `--help`, `--version`.
+fn verb_on_command_line() -> Option<String> {
+    use clap::CommandFactory;
+    let c = Cli::command();
+    std::env::args().skip(1).find_map(|t| {
+        c.get_subcommands()
+            .find(|sc| sc.get_name() == t || sc.get_all_aliases().any(|a| a == t))
+            .map(|sc| sc.get_name().to_string())
+    })
+}
+
 fn main() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
     ui::exit_quietly_on_broken_pipe();
+    ui::set_closed_pipe_verb(verb_on_command_line().as_deref());
     let first = std::env::args().nth(1);
     let rt = if is_light_command(first.as_deref()) {
         tokio::runtime::Builder::new_current_thread().enable_all().build()

@@ -795,7 +795,14 @@ pub(crate) async fn send_cmd(
                         ));
                         let _ = sio.disconnect().await;
                         // Said above; exit as "did not answer in time".
-                        return Err(exit_codes::reported(ExitKind::Unreachable));
+                        return Err(exit_codes::reported_because(
+                            ExitKind::Unreachable,
+                            format!(
+                                "the receiver neither accepted nor refused {} in {}s; it may be unable to save it",
+                                waiting.join(", "),
+                                answer_wait.as_secs()
+                            ),
+                        ));
                     }
                     answer_clock = None;
                 }
@@ -1931,11 +1938,17 @@ pub(crate) async fn send_cmd(
                                     ui::Tone::Err,
                                     &format!("  {} not delivered: {why}", o.name),
                                 ));
+                                // The typed reason and the sentence, for
+                                // `send --json` (files[].refusal, error.reason).
+                                crate::send_report::note_refused(id, v["reason"].as_str(), &why);
                                 if !o.done {
                                     refused.push(format!("{}: {why}", o.name));
                                 }
                             }
-                            None => ui::say(&format!("declined: {}", o.name)),
+                            None => {
+                                crate::send_report::note_refused(id, None, "the receiver declined it");
+                                ui::say(&format!("declined: {}", o.name))
+                            }
                         }
                         o.declined = true;
                         o.done = true;
@@ -2123,7 +2136,7 @@ pub(crate) async fn send_cmd(
                     ui::paint(ui::Tone::Warn, "!")
                 ));
                 let _ = sio.disconnect().await;
-                std::process::exit(130);
+                crate::exit_codes::interrupted_exit(130);
             }
             Ev::Stuck(pid, generation) => {
                 // Bug 5: if we keep getting stuck BEFORE a channel ever came up,
@@ -2368,8 +2381,12 @@ pub(crate) async fn send_cmd(
                         refused.len(),
                         refused.join("\n  ")
                     ));
-                    // Said above; the receiver refused it, so exit as denied.
-                    return Err(exit_codes::reported(ExitKind::Denied));
+                    // Said above; the receiver refused it, so exit as denied,
+                    // carrying the sentences for a --json result.
+                    return Err(exit_codes::reported_because(
+                        ExitKind::Denied,
+                        format!("the receiver could not store {}", refused.join("; ")),
+                    ));
                 }
                 match send_outcome(completed, declined) {
                     SendOutcome::Complete { .. } => return Ok(()),

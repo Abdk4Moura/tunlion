@@ -94,7 +94,6 @@ use crate::ui;
 use crate::up_logs::{logs_cmd, up_cmd};
 use crate::update_cmd;
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser};
 use serde_json::{Value, json};
 use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -170,23 +169,9 @@ pub(crate) fn validate_grant_spec(spec: &str) -> Result<()> {
     crate::capability::parse_grant_spec(spec, &[0u8; 32]).map(|_| ())
 }
 
-/// Which of `names` are online right now, for `devices --json`. A device
-/// counts only when the local daemon holds a link to it and the device answers
-/// a reach-ping on that link (bounded, all in parallel). This never
-/// establishes anything: a device with no held link is simply not online here.
-/// The link state alone is not enough: a peer stopped or killed -9 keeps its
-/// link "alive" locally until QUIC's idle timeout.
-async fn devices_online(names: Vec<String>) -> std::collections::HashSet<String> {
-    let warm = crate::warm_device_names(ctl::try_list_warm().await.as_ref());
-    let probes = names
-        .into_iter()
-        .filter(|n| warm.iter().any(|w| w.eq_ignore_ascii_case(n)))
-        .map(|n| async move { ctl::try_ping(&n).await.is_some().then_some(n) });
-    futures_util::future::join_all(probes)
-        .await
-        .into_iter()
-        .flatten()
-        .collect()
+/// `devices --json`: the rows in the shared `--json` envelope. Pure.
+pub(crate) fn devices_json_envelope(rows: Vec<Value>) -> Value {
+    json!({ "ok": true, "verb": "devices", "schema": 2, "data": { "devices": rows } })
 }
 
 /// The daemon's warm-link reply with only the links whose device answered a
@@ -480,7 +465,13 @@ pub(crate) async fn async_main() -> Result<()> {
                 .map(|sc| sc.get_name().to_string())
         })
     };
-    let cli = Cli::parse_from(argv);
+    // Parsed through the same derive, with every subcommand's --help ending in
+    // the exit codes that verb can return (exit_codes::with_exit_code_help).
+    let cli = {
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = crate::exit_codes::with_exit_code_help(Cli::command()).get_matches_from(argv);
+        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+    };
     // From here every failure under --json is reported as the JSON envelope on
     // stdout (exit_codes::report). Subcommands with their own `json` flag
     // (reach, doctor) shadow the global one and set it again in their arm.
@@ -597,6 +588,7 @@ pub(crate) async fn async_main() -> Result<()> {
         } => {
             let json_out = ui_caps.json || cli.json;
             let peer = to.clone();
+            let sources = crate::send_report::source_labels(&paths, name.as_deref());
             let res = if let Some(ak_path) = auth_key {
                 enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
             } else {
@@ -616,6 +608,9 @@ pub(crate) async fn async_main() -> Result<()> {
             };
             // Both ends keep a structured history; this is the sender's half.
             crate::send_report::persist_history(peer.as_deref());
+            if let Err(e) = &res {
+                crate::send_report::persist_unoffered(peer.as_deref(), &sources, e);
+            }
             if json_out {
                 // One result object on stdout, success or failure.
                 return crate::send_report::emit(res, peer.as_deref());
@@ -1274,8 +1269,19 @@ pub(crate) async fn async_main() -> Result<()> {
                         return Err(crate::identity_flow::no_identity(true));
                     }
                     if json || ui_caps.json {
-                        let online =
-                            devices_online(all.iter().map(|(n, _)| n.clone()).collect()).await;
+                        // ONE source of truth for "online": the same answering
+                        // links and the same per-row rule the human list uses
+                        // (device_entries). The JSON computed its own set by
+                        // pinging the stored names, and said false for a
+                        // device the human list showed online and a send
+                        // reached. null when no daemon answers: then nothing
+                        // here can know, as the human row omits it (#217).
+                        let warm = answering_links(ctl::try_list_warm().await).await;
+                        let online: std::collections::HashMap<String, Option<bool>> =
+                            device_entries(warm.as_ref())
+                                .into_iter()
+                                .map(|e| (e.name, e.online))
+                                .collect();
                         let arr: Vec<Value> = all
                             .iter()
                             .map(|(n, s)| {
@@ -1293,11 +1299,15 @@ pub(crate) async fn async_main() -> Result<()> {
                                     // Live, not remembered: the daemon holds a
                                     // link to it AND the device answered a
                                     // liveness ping on that link just now.
-                                    "online": online.contains(n),
+                                    "online": online.get(n).copied().flatten(),
                                 })
                             })
                             .collect();
-                        println!("{}", serde_json::to_string_pretty(&arr)?);
+                        // The envelope every other --json verb uses
+                        // (docs/agent-output-audit.md section 4): the array
+                        // is `data.devices`, unchanged one level down.
+                        // `schema: 2`; schema 1 was the bare array.
+                        ui::json_out(&devices_json_envelope(arr));
                     } else {
                         // "online" on this screen means what it means in
                         // --json: the device answered a liveness ping on the
@@ -1571,7 +1581,13 @@ pub(crate) async fn async_main() -> Result<()> {
             dest,
             delete,
             dry_run,
+            json_lines,
         } => {
+            if json_lines {
+                // NDJSON is still machine output: failures and interrupts
+                // answer in JSON too.
+                crate::exit_codes::set_json_mode(true, Some("sync"));
+            }
             // `<device>:<remote-dir>`; the remote dir may be empty (the drop root).
             let Some((peer, remote_dir)) = dest.split_once(':') else {
                 ui::problem(
@@ -1584,7 +1600,8 @@ pub(crate) async fn async_main() -> Result<()> {
             let opts = crate::sync_cmd::SyncOpts {
                 delete,
                 dry_run,
-                json: cli.json,
+                json: cli.json && !json_lines,
+                json_lines,
             };
             match crate::sync_cmd::run(&server, &local, peer, remote_dir, relay, opts).await {
                 0 => Ok(()),
