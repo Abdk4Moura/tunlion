@@ -20,16 +20,24 @@
 
 pub use filament_cap::capability::*;
 
-/// Shell serving is OFF on the acceptor entirely. Not a capability problem, so a
-/// grant does not help and must never be suggested for it.
+/// Shell serving is OFF on the acceptor: it was started without `--shell` and
+/// no device holds a shell grant there. The fix is the grant (serving turns on
+/// live when the first one lands); the old wording sent people to
+/// `tunlion up --shell`, which refuses without `--i-know` and was never needed.
+/// Older peers still send that wording, so recognise the stable prefix
+/// ([`SHELL_OFF_PREFIX`]), never the whole sentence.
 pub const SHELL_OFF_REASON: &str =
-    "shell serving is off there; run `tunlion up --shell` on that device";
+    "shell serving is off there (no device holds a shell grant on it)";
+/// The part of [`SHELL_OFF_REASON`] every build has sent.
+pub const SHELL_OFF_PREFIX: &str = "shell serving is off there";
 
 /// The L2 tunnel acceptor is OFF on the peer entirely, so `forward`, `netcat`
 /// and the ssh bootstrap have nothing to open against. Like SHELL_OFF_REASON
 /// this is not a capability problem and a grant does not help.
 pub const TUNNEL_OFF_REASON: &str =
-    "tunnelling is off there; run `tunlion up --shell` (or set FILAMENT_L2=1) on that device";
+    "tunnelling is off there (no device holds a shell grant on it, and forwarding rides that grant)";
+/// The part of [`TUNNEL_OFF_REASON`] every build has sent.
+pub const TUNNEL_OFF_PREFIX: &str = "tunnelling is off there";
 
 /// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
 /// ceiling, so any hint built on this reason must not prescribe one: the fix is a

@@ -191,6 +191,30 @@ async fn deny_unsettled(
 /// arrived and a frame that arrived and was ignored are indistinguishable from
 /// the outside; this is the line that tells them apart, and its absence is what
 /// made "the peer ignores our challenge" take hours to disprove.
+/// A link this daemon dropped (dead, or a zombie) takes its streams with it:
+/// every stream on its mux is ended, so a served exec sees its pipe close and
+/// ends its command tree, and its PTY sessions are DETACHED (not killed) so
+/// the detached-idle reaper bounds how long a shell nobody returns to lives.
+/// Dropping the mux from the map alone ended nothing: each session task holds
+/// its own reference.
+async fn retire_link_streams(
+    pid: &str,
+    l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    pty_bindings: &mut HashMap<String, HashMap<u32, String>>,
+    pty_sessions: &l2::PtySessions,
+) {
+    if let Some(mux) = l2_muxes.remove(pid) {
+        mux.shutdown_all().await;
+    }
+    if let Some(sid_map) = pty_bindings.remove(pid) {
+        for session_id in sid_map.values() {
+            if let Some(sess) = pty_sessions.get_live(session_id).await {
+                sess.detach();
+            }
+        }
+    }
+}
+
 fn log_ctl_rx<'a>(pid: &str, ty: Option<&'a str>) -> Option<&'a str> {
     crate::ui::debug(&format!("ctl rx {} <- {pid}", ty.unwrap_or("?")));
     ty
@@ -2649,7 +2673,13 @@ pub(crate) async fn recv_cmd(
                     "tunlion: link to '{pid}' died, dropping so it can re-connect"
                 ));
                 conn.drop_link(&pid);
-                l2_muxes.remove(&pid);
+                // Removing the mux is not ending its streams: every served
+                // session holds its own Arc, so a bare remove left a remote
+                // exec's stdin pipe open and its command running for as long
+                // as the command liked (observed: five minutes of `sleep`
+                // after the initiator was gone). End them, and detach the
+                // shells this link carried so their idle reaper runs.
+                retire_link_streams(&pid, &mut l2_muxes, &mut pty_bindings, &pty_sessions).await;
             }
         }
 
@@ -3210,7 +3240,8 @@ pub(crate) async fn recv_cmd(
                         "tunlion: dropping zombie warm link to '{pid}' (black-holed a stream)"
                     ));
                     conn.drop_link(&pid);
-                    l2_muxes.remove(&pid);
+                    retire_link_streams(&pid, &mut l2_muxes, &mut pty_bindings, &pty_sessions)
+                        .await;
                     // CONTINUITY: do NOT retract the L3 route here. A dropped link
                     // is almost always followed by a repair (a fresh transport for
                     // the same peer), whose add_peer atomically swaps the route. If
@@ -5470,6 +5501,20 @@ pub(crate) async fn recv_cmd(
                 // Remote command execution: parse, shell-gate, direct-spawn
                 // and serve. The module sends its own ack/close/refusal
                 // replies; the arm only resolves the transport and the mux.
+                // The initiator of a served exec: still there (`exec-alive`),
+                // or forwarding its user's Ctrl-C (`exec-signal`). Routed only
+                // through THIS peer's mux, by sid, so it can reach nothing but
+                // a session this same peer opened.
+                Some("exec-alive") | Some("exec-signal") => {
+                    if let (Some(mux), Some(sid), Some(msg)) = (
+                        l2_muxes.get(&pid),
+                        l2::wire_sid(&v),
+                        exec_recv::ExecCtl::from_frame(&v),
+                    ) {
+                        mux.exec_control(sid, msg).await;
+                    }
+                    continue;
+                }
                 Some("exec-open") => {
                     let Some(t) = conn.transport_of(&pid) else {
                         continue;

@@ -18,6 +18,7 @@
 
 use crate::identity_lifecycle::respond_to_identity_challenge;
 use crate::l2;
+use crate::platform::TreeSignal;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -92,6 +93,75 @@ pub(crate) fn parse_env_pair(s: &str) -> Result<(String, String)> {
         bail!("--env key must be [A-Za-z0-9_], got {k:?}");
     }
     Ok((k.to_string(), v.to_string()))
+}
+
+/// How one exec session ended on this side.
+enum SessionEnd {
+    Done(Result<i32>),
+    Signalled(TreeSignal, i32),
+}
+
+/// The local signal that interrupted this exec, as the signal to forward and
+/// the exit status to end with (128 + n). Ctrl-C everywhere; SIGTERM, SIGHUP
+/// and SIGQUIT where they exist.
+async fn interruption() -> (TreeSignal, i32) {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = ctrl_c => (TreeSignal::Interrupt, 130),
+        code = crate::platform::termination_signal() => {
+            let sig = if code == 129 { TreeSignal::Hangup } else { TreeSignal::Terminate };
+            (sig, code)
+        }
+    }
+}
+
+/// How long an interrupted initiator waits for the acceptor to confirm the
+/// remote tree is gone before exiting anyway.
+const HANG_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Tell the acceptor this side is going: forward `sig` when there is one, then
+/// close the session, which ends the remote process tree. Waits briefly for
+/// the acceptor's word that it is gone, so the frames leave before this
+/// process (and its link) does; a link already dead gets nothing.
+async fn hang_up_remote(
+    t: &std::sync::Arc<dyn crate::net::Transport>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::net::Ev>,
+    sid: u32,
+    sig: Option<TreeSignal>,
+    why: &str,
+) {
+    if t.is_dead() {
+        return;
+    }
+    if let Some(sig) = sig {
+        let _ = t
+            .send_control(&json!({ "type": "exec-signal", "sid": sid, "signal": sig.wire() }))
+            .await;
+    }
+    if t
+        .send_control(&json!({ "type": "l2-close", "sid": sid, "err": why }))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = tokio::time::timeout(HANG_UP_WAIT, async {
+        while let Some(ev) = rx.recv().await {
+            if let crate::net::Ev::Control(_pid, v) = ev {
+                let ty = v.get("type").and_then(|t| t.as_str());
+                if matches!(ty, Some("exec-close") | Some("l2-close"))
+                    && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
 }
 
 /// Run a command on a peer and return its remote exit status. Local failures
@@ -177,6 +247,8 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
             "sid": sid,
             "err_sid": err_sid,
             "argv": opts.argv.clone(),
+            // Heartbeat promise: the acceptor ends the command if these stop.
+            "alive_ms": crate::exec_recv::EXEC_ALIVE_INTERVAL.as_millis() as u64,
         });
         if let Some(cwd) = &opts.cwd {
             f["cwd"] = json!(cwd.to_string_lossy());
@@ -255,172 +327,223 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
     })?
     .map_err(|reason: String| anyhow::anyhow!(reason))?;
     let _ = ack;
-    // Pumps: bounded fd0 reader (one consumer for the whole invocation,
-    // same singleton discipline as pty's shared reader), stdout/stderr to
-    // local stdio, close status out. No reconnect: link death below fails
-    // loudly by design.
-    let mut stdin_rx = spawn_bounded_stdin_reader();
-    let mut stdin_done = false;
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
-    let exit_status: Option<i32>;
-    // Bytes consumed per stream: the close announces both counts, and the
-    // drain below collects stragglers until the counts are met (or bounded
-    // time passes). Incremented everywhere a pipe item is consumed.
-    let mut out_recv: u64 = 0;
-    let mut err_recv: u64 = 0;
-    let want_out: Option<u64>;
-    let want_err: Option<u64>;
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            item = out_pipe.recv() => match item {
-                Some(Some(bytes)) => {
-                    out_recv += bytes.len() as u64;
-                    stdout.write_all(&bytes).await?;
-                    stdout.flush().await?;
+    // Heartbeats, on their own task so a pump blocked on a slow local
+    // consumer never looks like a dead initiator: the acceptor ends the
+    // remote command when they stop (kill -9 of this process, a vanished
+    // host), instead of letting it run on with nobody to report to.
+    let beats = {
+        let t = t.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::exec_recv::EXEC_ALIVE_INTERVAL);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if t
+                    .send_control(&json!({ "type": "exec-alive", "sid": sid }))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
-                _ => {
-                    // Pipe closed without a close payload: transport-level liveness
-                    // decides whether this was a clean end we misread or a drop.
+            }
+        })
+    };
+    // Set when the ACCEPTOR ended the session (its l2-close): nothing is left
+    // over there to hang up, so an error exit does not wait on it.
+    let mut remote_ended = false;
+    let session = async {
+        // Pumps: bounded fd0 reader (one consumer for the whole invocation,
+        // same singleton discipline as pty's shared reader), stdout/stderr to
+        // local stdio, close status out. No reconnect: link death below fails
+        // loudly by design.
+        let mut stdin_rx = spawn_bounded_stdin_reader();
+        let mut stdin_done = false;
+        let mut stdout = tokio::io::stdout();
+        let mut stderr = tokio::io::stderr();
+        let exit_status: Option<i32>;
+        // Bytes consumed per stream: the close announces both counts, and the
+        // drain below collects stragglers until the counts are met (or bounded
+        // time passes). Incremented everywhere a pipe item is consumed.
+        let mut out_recv: u64 = 0;
+        let mut err_recv: u64 = 0;
+        let want_out: Option<u64>;
+        let want_err: Option<u64>;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                item = out_pipe.recv() => match item {
+                    Some(Some(bytes)) => {
+                        out_recv += bytes.len() as u64;
+                        stdout.write_all(&bytes).await?;
+                        stdout.flush().await?;
+                    }
+                    _ => {
+                        // Pipe closed without a close payload: transport-level liveness
+                        // decides whether this was a clean end we misread or a drop.
+                        // The STRICT question, asked here because only this caller wants it: for the exec select,
+                        // a peer that can never send again means waiting is pointless, even though the
+                        // connection is otherwise usable.
+                        if mux.transport().is_dead() {
+                            bail!("link to '{peer}' died during exec");
+                        }
+                        // TERMINAL AND NAMED, with no timeout involved: the session's stream ended
+                        // and no `exec-close` carrying a status will follow, so waiting longer can
+                        // only wait on a link that is working and a frame that is not coming.
+                        remote_ended = true;
+                        bail!(
+                            "exec stream ended without an exit status; the peer's close frame did not arrive ('{peer}')"
+                        );
+                    }
+                },
+                item = err_pipe.recv() => match item {
+                    Some(Some(bytes)) => {
+                        err_recv += bytes.len() as u64;
+                        stderr.write_all(&bytes).await?;
+                        stderr.flush().await?;
+                    }
+                    _ => {}
+                },
+                chunk = stdin_rx.recv(), if !stdin_done => match chunk {
+                    Some(c) if c.is_empty() => {
+                        let _ = t.send_frame(sid, 0, &[]).await;
+                        stdin_done = true;
+                    }
+                    Some(c) => {
+                        let cap = t.max_payload().max(1);
+                        let mut failed = false;
+                        for chunk in c.chunks(cap) {
+                            if t.send_frame(sid, 0, chunk).await.is_err() {
+                                failed = true;
+                                break;
+                            }
+                        }
+                        if failed {
+                            bail!("link to '{peer}' died mid-send");
+                        }
+                    }
+                    None => { stdin_done = true; }
+                },
+                ev = rx.recv() => match ev {
+                    Some(crate::net::Ev::Control(_pid, v)) => {
+                        // #309: the owner re-challenges while an open is parked (and
+                        // after any re-adopt), so the same answer is owed here, in
+                        // the long-lived pump, not only during the ack wait. Same
+                        // shared helper: one possession-signing path, not two.
+                        if v.get("type").and_then(|t| t.as_str())
+                            == Some("identity-nonce-challenge")
+                        {
+                            respond_to_identity_challenge(&t, &v).await;
+                        }
+                        if v.get("type").and_then(|t| t.as_str()) == Some("exec-close")
+                            && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
+                        {
+                            exit_status = v.get("status").and_then(|s| s.as_i64()).map(|s| s as i32);
+                            want_out = v.get("out_bytes").and_then(|n| n.as_u64());
+                            want_err = v.get("err_bytes").and_then(|n| n.as_u64());
+                            break;
+                        }
+                        if v.get("type").and_then(|t| t.as_str()) == Some("l2-close")
+                            && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
+                        {
+                            let err = v.get("err").and_then(|e| e.as_str()).unwrap_or("closed");
+                            remote_ended = true;
+                            bail!("'{peer}' closed the exec stream: {err}");
+                        }
+                    }
+                    Some(crate::net::Ev::Chunk(_pid, got, _offset, data)) => {
+                        mux.on_frame(got, data).await;
+                    }
+                    // Bring-up's LOSER keeps emitting on this shared channel after
+                    // it returns (a late ChannelReady/DirectReady, Stuck, PcState
+                    // ...): pty's pump never polls rx at all, and polling it here
+                    // must not mistake those for death -- a late winner-arrival
+                    // killed every session living past ~2s with a bogus "link
+                    // died". Only a CLOSED channel means the link is really gone;
+                    // anything else is ignored, with the 2s ticker as backstop.
+                    Some(_) => {}
+                    None => {
+                        bail!("link to '{peer}' died during exec");
+                    }
+                },
+                _ = ticker.tick() => {
                     // The STRICT question, asked here because only this caller wants it: for the exec select,
                     // a peer that can never send again means waiting is pointless, even though the
                     // connection is otherwise usable.
                     if mux.transport().is_dead() {
                         bail!("link to '{peer}' died during exec");
                     }
-                    // TERMINAL AND NAMED, with no timeout involved: the session's stream ended
-                    // and no `exec-close` carrying a status will follow, so waiting longer can
-                    // only wait on a link that is working and a frame that is not coming.
-                    bail!(
-                        "exec stream ended without an exit status; the peer's close frame did not arrive ('{peer}')"
-                    );
                 }
-            },
-            item = err_pipe.recv() => match item {
-                Some(Some(bytes)) => {
+            }
+        }
+        // Bounded drain: exec-close travels control while bytes travel frames,
+        // so a fast-exiting child can beat its own tail (observed live: a missing
+        // 8 KiB tail with rc=0). The close announces both byte counts, so the
+        // drain is DETERMINISTIC on a healthy link -- collect until the counts
+        // are met -- with a 3s cap for a dying one. Skipped when the close
+        // carried no status (abnormal end: nothing to collect for).
+        if exit_status.is_some() {
+            let drain_end = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let met = match (want_out, want_err) {
+                    (Some(o), Some(e)) => out_recv >= o && err_recv >= e,
+                    _ => false,
+                };
+                if met || tokio::time::Instant::now() >= drain_end {
+                    break;
+                }
+                tokio::select! {
+                    ev = rx.recv() => match ev {
+                        Some(crate::net::Ev::Chunk(_pid, got, _offset, data)) => {
+                            mux.on_frame(got, data).await;
+                        }
+                        _ => {}
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
+                while let Ok(Some(bytes)) = out_pipe.try_recv() {
+                    out_recv += bytes.len() as u64;
+                    stdout.write_all(&bytes).await?;
+                }
+                while let Ok(Some(bytes)) = err_pipe.try_recv() {
                     err_recv += bytes.len() as u64;
                     stderr.write_all(&bytes).await?;
-                    stderr.flush().await?;
                 }
-                _ => {}
-            },
-            chunk = stdin_rx.recv(), if !stdin_done => match chunk {
-                Some(c) if c.is_empty() => {
-                    let _ = t.send_frame(sid, 0, &[]).await;
-                    stdin_done = true;
-                }
-                Some(c) => {
-                    let cap = t.max_payload().max(1);
-                    let mut failed = false;
-                    for chunk in c.chunks(cap) {
-                        if t.send_frame(sid, 0, chunk).await.is_err() {
-                            failed = true;
-                            break;
-                        }
-                    }
-                    if failed {
-                        bail!("link to '{peer}' died mid-send");
-                    }
-                }
-                None => { stdin_done = true; }
-            },
-            ev = rx.recv() => match ev {
-                Some(crate::net::Ev::Control(_pid, v)) => {
-                    // #309: the owner re-challenges while an open is parked (and
-                    // after any re-adopt), so the same answer is owed here, in
-                    // the long-lived pump, not only during the ack wait. Same
-                    // shared helper: one possession-signing path, not two.
-                    if v.get("type").and_then(|t| t.as_str())
-                        == Some("identity-nonce-challenge")
-                    {
-                        respond_to_identity_challenge(&t, &v).await;
-                    }
-                    if v.get("type").and_then(|t| t.as_str()) == Some("exec-close")
-                        && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
-                    {
-                        exit_status = v.get("status").and_then(|s| s.as_i64()).map(|s| s as i32);
-                        want_out = v.get("out_bytes").and_then(|n| n.as_u64());
-                        want_err = v.get("err_bytes").and_then(|n| n.as_u64());
-                        break;
-                    }
-                    if v.get("type").and_then(|t| t.as_str()) == Some("l2-close")
-                        && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
-                    {
-                        let err = v.get("err").and_then(|e| e.as_str()).unwrap_or("closed");
-                        bail!("'{peer}' closed the exec stream: {err}");
-                    }
-                }
-                Some(crate::net::Ev::Chunk(_pid, got, _offset, data)) => {
-                    mux.on_frame(got, data).await;
-                }
-                // Bring-up's LOSER keeps emitting on this shared channel after
-                // it returns (a late ChannelReady/DirectReady, Stuck, PcState
-                // ...): pty's pump never polls rx at all, and polling it here
-                // must not mistake those for death -- a late winner-arrival
-                // killed every session living past ~2s with a bogus "link
-                // died". Only a CLOSED channel means the link is really gone;
-                // anything else is ignored, with the 2s ticker as backstop.
-                Some(_) => {}
-                None => {
-                    bail!("link to '{peer}' died during exec");
-                }
-            },
-            _ = ticker.tick() => {
-                // The STRICT question, asked here because only this caller wants it: for the exec select,
-                // a peer that can never send again means waiting is pointless, even though the
-                // connection is otherwise usable.
-                if mux.transport().is_dead() {
-                    bail!("link to '{peer}' died during exec");
-                }
+                stdout.flush().await?;
+                stderr.flush().await?;
             }
         }
-    }
-    // Bounded drain: exec-close travels control while bytes travel frames,
-    // so a fast-exiting child can beat its own tail (observed live: a missing
-    // 8 KiB tail with rc=0). The close announces both byte counts, so the
-    // drain is DETERMINISTIC on a healthy link -- collect until the counts
-    // are met -- with a 3s cap for a dying one. Skipped when the close
-    // carried no status (abnormal end: nothing to collect for).
-    if exit_status.is_some() {
-        let drain_end = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            let met = match (want_out, want_err) {
-                (Some(o), Some(e)) => out_recv >= o && err_recv >= e,
-                _ => false,
-            };
-            if met || tokio::time::Instant::now() >= drain_end {
-                break;
-            }
-            tokio::select! {
-                ev = rx.recv() => match ev {
-                    Some(crate::net::Ev::Chunk(_pid, got, _offset, data)) => {
-                        mux.on_frame(got, data).await;
-                    }
-                    _ => {}
-                },
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
-            }
-            while let Ok(Some(bytes)) = out_pipe.try_recv() {
-                out_recv += bytes.len() as u64;
-                stdout.write_all(&bytes).await?;
-            }
-            while let Ok(Some(bytes)) = err_pipe.try_recv() {
-                err_recv += bytes.len() as u64;
-                stderr.write_all(&bytes).await?;
-            }
-            stdout.flush().await?;
-            stderr.flush().await?;
+        mux.drop_stream(sid).await;
+        mux.drop_stream(err_sid).await;
+        // No exit-status payload means the process did not exit cleanly: never
+        // render that as success (contract). A clean remote 0 falls through to Ok.
+        match exit_status {
+            Some(code) => Ok::<i32, anyhow::Error>(code),
+            None => bail!("'{peer}' closed the exec stream without an exit status"),
         }
-    }
-    mux.drop_stream(sid).await;
-    mux.drop_stream(err_sid).await;
-    // No exit-status payload means the process did not exit cleanly: never
-    // render that as success (contract). A clean remote 0 falls through to Ok.
-    match exit_status {
-        Some(code) => Ok(code),
-        None => bail!("'{peer}' closed the exec stream without an exit status"),
+    };
+    let end = tokio::select! {
+        r = session => SessionEnd::Done(r),
+        (sig, code) = interruption() => SessionEnd::Signalled(sig, code),
+    };
+    beats.abort();
+    match end {
+        SessionEnd::Done(Ok(code)) => Ok(code),
+        SessionEnd::Done(Err(e)) => {
+            // Whatever ended this side (its stdout closed under `| head`, the
+            // peer refused mid-session, a local error), the remote command must
+            // not outlive it. A session already closed remotely ignores this.
+            if !remote_ended {
+                hang_up_remote(&t, &mut rx, sid, None, "the initiator ended the session").await;
+            }
+            Err(e)
+        }
+        SessionEnd::Signalled(sig, code) => {
+            // Ctrl-C or SIGTERM here is Ctrl-C or SIGTERM there, then the
+            // close that ends whatever ignores it. Exit as the signal would.
+            hang_up_remote(&t, &mut rx, sid, Some(sig), "the initiator was interrupted").await;
+            Ok(code)
+        }
     }
 }
 
