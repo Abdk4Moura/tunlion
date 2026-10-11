@@ -3272,7 +3272,7 @@ pub(crate) async fn recv_cmd(
                         .map(|t| t.is_dead())
                         .unwrap_or(false);
                     if fresh || link_dead {
-                        ui::say(&format!("known device '{n}' appeared, connecting"));
+                        ui::say_folded(&format!("known device '{n}' appeared, connecting"));
                         devices_touch(n, None, None); // track last_seen; addresses filled on ChannelReady
                     } else {
                         ui::trace(&format!(
@@ -4451,7 +4451,7 @@ pub(crate) async fn recv_cmd(
                                                 t.clone(),
                                             )
                                             .await;
-                                            ui::say(&format!(
+                                            ui::say_folded(&format!(
                                                 "  {} L3 peer {who}.mesh ({ip} / {v4})",
                                                 ui::paint(ui::Tone::Ok, ui::glyph_ok())
                                             ));
