@@ -3267,10 +3267,17 @@ pub(crate) async fn recv_cmd(
         // lost contact with stops blocking. FILAMENT_TEST_DISABLE_MODEB_DROP
         // restores the old links-gated behaviour so gate 18b proves the A/B
         // (baseline hangs, fix exits) with one binary.
-        let no_healthy_link = conn
-            .links
-            .values()
-            .all(|l| !matches!(l.presence, Presence::Ready));
+        // A link whose transport is DEAD is not healthy whatever its presence
+        // says. A direct QUIC link stays `Ready` after its peer is gone: the
+        // sender ends its send half once the file is acked (the primary is then
+        // `is_dead`), and nothing moves presence off `Ready` for a link that
+        // simply stops. Gated on presence alone, a receiver whose sender vanished
+        // over QUIC with its peer-left lost never quiet-exited (gate 18, RC=124
+        // at 120 s, once same-host transfers stopped falling back to WebRTC).
+        let no_healthy_link = conn.links.values().all(|l| {
+            !matches!(l.presence, Presence::Ready)
+                || l.transport.as_ref().is_none_or(|t| t.is_dead())
+        });
         let links_clear = if !test_hooks::disable_modeb_drop() {
             no_healthy_link
         } else {
@@ -3995,7 +4002,21 @@ pub(crate) async fn recv_cmd(
                     .direct_pending
                     .get(&pid)
                     .map(|p| direct::transport_key(&p.secret.1));
+                let named_before = conn.link(&pid).and_then(|l| l.verified_name.clone());
                 conn.adopt_direct(&pid, t.clone(), route);
+                // A direct link to a REMEMBERED device was authenticated by its
+                // pair secret (the QUIC keying-material MAC), the proof a
+                // WebRTC link gets from `pair-proof`. Only the pair-proof path
+                // ever said so, so a daemon receiving from a known device over
+                // QUIC (the usual case) never confirmed whose identity it had
+                // verified. Said once, when the link first gains the name.
+                if named_before.is_none() {
+                    if let Some(n) = conn.link(&pid).and_then(|l| l.verified_name.clone()) {
+                        if crate::devices_load().iter().any(|(d, _)| *d == n) {
+                            ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
+                        }
+                    }
+                }
                 if let Some(k) = tkey {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }
@@ -4298,7 +4319,7 @@ pub(crate) async fn recv_cmd(
                                     // actually the TURN relay, print the honest
                                     // one-line banner so the user is never unaware
                                     // they're on a middleman path. CRITICAL.
-                                    if r == "relayed" {
+                                    if r == filament_transport::net::ROUTE_RELAY {
                                         ui::critical(&format!("    {}", relay_banner()));
                                     }
                                     break;
@@ -5059,6 +5080,32 @@ pub(crate) async fn recv_cmd(
                             }
                         }
                         Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
+                    }
+                }
+                // The peer cannot answer our identity challenge (it holds no
+                // certificate for its own key, or the challenge named its own
+                // key). Identity will not resolve on this link, so the offer
+                // hold that waits for it ends now and the offer goes to the
+                // normal gate, the same decision the hold reaches on expiry.
+                // Without this every code transfer from a device with no
+                // identity sat 20 s (RECV_IDENTITY_HOLD_DEADLINE) before its
+                // first byte. Only an answer to OUR outstanding nonce counts.
+                Some("identity-unavailable") => {
+                    let ours = identity_nonces
+                        .get(&pid)
+                        .map(|(n, _, _)| hex::encode(n))
+                        .is_some_and(|n| Some(n.as_str()) == v["nonce"].as_str());
+                    if ours {
+                        identity_nonces.remove(&pid);
+                        st.pending_proven.lock().unwrap().remove(&pid);
+                        if let Some(expired) =
+                            Instant::now().checked_sub(RECV_IDENTITY_HOLD_DEADLINE)
+                        {
+                            recv_identity_hold.insert(pid.clone(), expired);
+                        }
+                        ui::debug(&format!(
+                            "  {pid} cannot prove an identity; deciding its offers without waiting"
+                        ));
                     }
                 }
                 // #30: respond to identity nonce challenge by producing a

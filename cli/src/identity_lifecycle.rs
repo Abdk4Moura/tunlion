@@ -457,6 +457,16 @@ pub(crate) fn handle_identity_expose(
     true
 }
 
+/// Tell a challenger that this link will not produce an identity, so it can
+/// stop waiting for one. Carries only the challenger's own nonce back. A peer
+/// that ignores the message (an older build) simply waits out its hold, as it
+/// did before.
+async fn say_identity_unavailable(t: &Arc<dyn Transport>, nonce_hex: &str) {
+    let _ = t
+        .send_control(&serde_json::json!({ "type": "identity-unavailable", "nonce": nonce_hex }))
+        .await;
+}
+
 /// #30 shared responder: on receiving an identity-nonce-challenge, prove
 /// device-key possession by signing possession_sig(0x02) over the peer-provided
 /// nonce and replying with an identity-expose. The challenger's identity-expose
@@ -498,6 +508,7 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
     if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
         if recv_dpub_arr == own_dpub {
             crate::ui::debug("identity challenge ignored: it names my own device key");
+            say_identity_unavailable(t, nonce_hex).await;
             return;
         }
     }
@@ -509,6 +520,7 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
         crate::ui::say(
             "identity challenge NOT answered: this device holds no certificate for its own key",
         );
+        say_identity_unavailable(t, nonce_hex).await;
         return;
     };
     // Self-binding, made explicit rather than inherited: the certificate we are

@@ -79,6 +79,12 @@ pub const DC_FLUSH_STALL: std::time::Duration = std::time::Duration::from_secs(1
 /// never cut off. 15 s with zero acknowledged bytes is well past the 6 s stall
 /// threshold the transfer ladder already acts on.
 pub const DC_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(15);
+/// The label `Peer::route` gives a path through a TURN relay. Callers that
+/// must react to a relayed path (the relay-honesty banner) compare against
+/// THIS, not a literal of their own: the CLI compared against "relayed" while
+/// this returned "relay", so the banner it promises on every relayed transfer
+/// never printed once.
+pub const ROUTE_RELAY: &str = "relay";
 
 /// P0 (GAP-1): default no-progress threshold (ms) for the bytes-moved stall
 /// watchdog. An in-flight transfer whose link's `idle_ms()` exceeds this, while
@@ -1777,7 +1783,7 @@ impl Peer {
         if pair.local.typ == RTCIceCandidateType::Relay
             || pair.remote.typ == RTCIceCandidateType::Relay
         {
-            return Some("relay".into());
+            return Some(ROUTE_RELAY.into());
         }
         let same_host =
             pair.local.address == pair.remote.address || is_own_addr(&pair.remote.address);
