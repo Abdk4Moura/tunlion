@@ -912,6 +912,22 @@ pub fn add_firewall_rule(exe: &Path) {
         .output();
 }
 
+/// Resolves when this process is asked to terminate (SIGTERM on unix). Never
+/// resolves where there is no such request to wait for (Windows has no
+/// SIGTERM; a console close arrives as Ctrl-C/Ctrl-Break there). Installing
+/// the handler replaces SIGTERM's default action, so the caller must exit.
+pub async fn terminate_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            term.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
 /// Spawn `exe` with `args` detached from this process's terminal, its stdout
 /// and stderr appended to `log`. One portable operation with two arms, written
 /// together: the unix arm detaches with `setsid`, the Windows arm with

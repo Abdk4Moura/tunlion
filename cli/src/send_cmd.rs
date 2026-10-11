@@ -1946,7 +1946,7 @@ pub(crate) async fn send_cmd(
                     ui::paint(ui::Tone::Warn, "!")
                 ));
                 let _ = sio.disconnect().await;
-                std::process::exit(130);
+                crate::exit_codes::interrupted_exit(130);
             }
             Ev::Stuck(pid, generation) => {
                 // Bug 5: if we keep getting stuck BEFORE a channel ever came up,

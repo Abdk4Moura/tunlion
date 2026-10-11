@@ -212,7 +212,7 @@ pub async fn reach_until_direct(
         // line and no orphaned probe.
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            _ = tokio::signal::ctrl_c() => std::process::exit(130),
+            _ = tokio::signal::ctrl_c() => crate::exit_codes::interrupted_exit(130),
         }
     };
     let kind = until_direct_verdict(&last);
@@ -399,6 +399,7 @@ async fn ping_json(
                         o.failed_phase.map(|p| p.label()),
                         o.error.as_deref(),
                         kind,
+                        o.path.as_ref().map(|p| p.to_json()).as_ref(),
                     ),
                     kind,
                 )
@@ -406,7 +407,7 @@ async fn ping_json(
             Err(e) => {
                 let kind = exit_codes::classify(&e);
                 let message = exit_codes::human_message(&e);
-                (reach_json_cold(false, 0, None, Some(&message), Some(kind)), Some(kind))
+                (reach_json_cold(false, 0, None, Some(&message), Some(kind), None), Some(kind))
             }
         },
     };
@@ -428,22 +429,65 @@ pub(crate) fn reach_json_warm(mut v: Value) -> Value {
 }
 
 /// A cold probe's result in the reach envelope. Pure.
+///
+/// No warm link means the probe established a fresh link and dropped it (the
+/// human line: "cold, would connect in ~N ms"). The JSON says the same thing:
+/// `warm: false`, `link: "cold"`, `connect_ms` the measured establish time, and
+/// `data` filled from the path the probe link actually took. It used to carry
+/// `data: {route: null, direct: false, addr: null}` next to `established:
+/// true`, which read as "connected, but over nothing, and not directly".
+/// `rtt_ms` stays null: a cold probe measures an establish, not a round trip,
+/// and inventing one from the establish time would be a different number under
+/// the same name. `path` is `PathInfo::to_json` of the probe's link.
 pub(crate) fn reach_json_cold(
     established: bool,
     total_ms: u64,
     failed_phase: Option<&str>,
     error: Option<&str>,
     kind: Option<ExitKind>,
+    path: Option<&Value>,
 ) -> Value {
+    let data = match path.filter(|_| established) {
+        Some(p) => {
+            let relayed = p["relay"].as_bool().unwrap_or(false);
+            let route = if relayed {
+                "relay".to_string()
+            } else {
+                p["class"]
+                    .as_str()
+                    .map(|c| format!("direct ({})", short_class(c)))
+                    .unwrap_or_else(|| "direct".to_string())
+            };
+            json!({
+                "route": route,
+                "direct": !relayed,
+                "rtt_ms": Value::Null,
+                "addr": p["remote"].clone(),
+                "connect_ms": total_ms,
+            })
+        }
+        None => json!({
+            "route": Value::Null,
+            "direct": false,
+            "rtt_ms": Value::Null,
+            "addr": Value::Null,
+            "connect_ms": if established { json!(total_ms) } else { Value::Null },
+        }),
+    };
     let mut v = json!({
         "ok": established,
         "verb": "reach",
         "warm": false,
+        "link": if established { "cold" } else { "none" },
         "established": established,
+        "connect_ms": if established { json!(total_ms) } else { Value::Null },
         "total_ms": total_ms,
         "failed_phase": failed_phase,
-        "data": { "route": Value::Null, "direct": false, "rtt_ms": Value::Null, "addr": Value::Null },
+        "data": data,
     });
+    if established {
+        v["path"] = path.cloned().unwrap_or(Value::Null);
+    }
     if let Some(k) = kind.filter(|_| !established) {
         let message = if k == ExitKind::Network {
             exit_codes::NETWORK_LINE.to_string()
@@ -493,14 +537,14 @@ mod tests {
     fn an_offline_peer_is_not_ok_in_reach_json() {
         let kind = cold_failure_kind(Some("presence: peer never appeared"));
         assert_eq!(kind, ExitKind::Unreachable);
-        let v = reach_json_cold(false, 30_000, Some("presence"), Some("peer never appeared"), Some(kind));
+        let v = reach_json_cold(false, 30_000, Some("presence"), Some("peer never appeared"), Some(kind), None);
         assert_eq!(v["ok"], json!(false), "offline is not ok");
         assert_eq!(v["established"], json!(false));
         assert_eq!(v["failed_phase"], json!("presence"));
         assert_eq!(v["verb"], json!("reach"));
         assert_eq!(v["data"]["direct"], json!(false));
         assert_eq!(v["error"]["exit"], json!(6));
-        let up = reach_json_cold(true, 900, None, None, None);
+        let up = reach_json_cold(true, 900, None, None, None, None);
         assert_eq!(up["ok"], json!(true));
         assert!(up.get("error").is_none());
     }
@@ -509,7 +553,7 @@ mod tests {
     fn a_dead_server_is_a_network_failure_not_an_offline_peer() {
         let raw = "signaling connect to https://x: failed to lookup address information: Try again";
         assert_eq!(cold_failure_kind(Some(raw)), ExitKind::Network);
-        let v = reach_json_cold(false, 0, None, Some(raw), Some(ExitKind::Network));
+        let v = reach_json_cold(false, 0, None, Some(raw), Some(ExitKind::Network), None);
         assert_eq!(v["error"]["message"], json!(exit_codes::NETWORK_LINE));
     }
 
@@ -519,7 +563,7 @@ mod tests {
             "ok": true, "warm": true, "route": "direct-quic", "rtt_ms": 9,
             "path": { "remote": "203.0.113.7:41641", "relay": false },
         }));
-        let c = reach_json_cold(true, 900, None, None, None);
+        let c = reach_json_cold(true, 900, None, None, None, None);
         for v in [&w, &c] {
             assert_eq!(v["verb"], json!("reach"));
             assert!(v["ok"].is_boolean());
@@ -559,5 +603,38 @@ mod tests {
         assert!(!p.is_direct());
         assert_eq!(probe_line(&p), "pong via relay(198.51.100.4:3478) 41 ms");
         assert_eq!(probe_envelope(&p)["data"]["direct"], json!(false));
+    }
+
+    /// J2: with no daemon the cold probe established in ~858 ms and the JSON
+    /// said `established: true` with `data` all null and `direct: false`,
+    /// while the human line said "cold, would connect in ~858ms". The JSON
+    /// must say what the human line says: a cold link, its connect time, and
+    /// the path the probe actually took.
+    #[test]
+    fn a_cold_probe_reports_the_path_it_took_and_its_connect_time() {
+        let path = json!({ "class": "private (RFC1918)", "remote": "192.168.1.9:41641", "relay": false });
+        let v = reach_json_cold(true, 858, None, None, None, Some(&path));
+        assert_eq!(v["ok"], json!(true), "it connected: ok, exit 0");
+        assert_eq!(v["warm"], json!(false));
+        assert_eq!(v["link"], json!("cold"));
+        assert_eq!(v["connect_ms"], json!(858));
+        assert_eq!(v["data"]["connect_ms"], json!(858));
+        assert_eq!(v["data"]["direct"], json!(true));
+        assert_eq!(v["data"]["route"], json!("direct (private)"));
+        assert_eq!(v["data"]["addr"], json!("192.168.1.9:41641"));
+        assert_eq!(v["data"]["rtt_ms"], Value::Null, "an establish time is not an RTT");
+        let relayed = json!({ "remote": "198.51.100.4:3478", "relay": true });
+        let r = reach_json_cold(true, 1200, None, None, None, Some(&relayed));
+        assert_eq!(r["data"]["direct"], json!(false));
+        assert_eq!(r["data"]["route"], json!("relay"));
+        // A failed probe has no link and no connect time.
+        let f = reach_json_cold(false, 30_000, Some("presence"), None, Some(ExitKind::Unreachable), Some(&path));
+        assert_eq!(f["link"], json!("none"));
+        assert_eq!(f["connect_ms"], Value::Null);
+        assert_eq!(f["data"]["addr"], Value::Null, "a path from a failed probe is not reported");
+        // ok is exactly "exit code is 0".
+        for x in [&v, &r, &f] {
+            assert_eq!(x["ok"].as_bool().unwrap(), x.get("error").is_none());
+        }
     }
 }

@@ -140,12 +140,19 @@ fn devices_json_includes_new_fields() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Should be valid JSON
-    assert!(
-        stdout.trim().starts_with('['),
-        "Expected JSON array, got: {}",
-        &stdout[..stdout.len().min(200)]
-    );
+    // One JSON document in the shared envelope (schema 2; schema 1 was the
+    // bare array, now `data.devices` unchanged one level down).
+    let doc: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("devices --json is not one JSON document ({e}): {stdout}"));
+    assert_eq!(doc["ok"], serde_json::json!(true), "{stdout}");
+    assert_eq!(doc["verb"], serde_json::json!("devices"), "{stdout}");
+    assert_eq!(doc["schema"], serde_json::json!(2), "{stdout}");
+    let rows = doc["data"]["devices"].as_array().expect("data.devices is the array");
+    assert_eq!(rows.len(), 1, "{stdout}");
+    assert_eq!(rows[0]["name"], serde_json::json!("test-device"));
+    // No daemon here: nothing can know whether it is online, so it says null,
+    // the same as the human row omitting it, never a confident false.
+    assert!(rows[0]["online"].is_null(), "{stdout}");
 
     // Should contain the new fields
     assert!(

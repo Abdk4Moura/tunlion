@@ -124,7 +124,9 @@ for line in open(sys.argv[1]):
     line=line.strip()
     if not line: continue
     d=json.loads(line).get("data",{})
+    # --json-lines: one record per file. --json: one document, files listed.
     if "file" in d: rows.append((d["file"],d["state"],d["bytes"]))
+    for r in d.get("files") or []: rows.append((r["file"],r["state"],r["bytes"]))
 for f,s,b in sorted(rows): print(f"{s}\t{f}\t{b}")
 PY
 }
@@ -159,13 +161,42 @@ with open(p,"r+b") as f:
     f.seek(chunk+100); f.write(b"\xff\xfe\xfd")
 PY
 head -c 1000 /dev/urandom > "$TREE/d"
-"${SYNC[@]}" --json sync "$TREE" boxB:inbox >"$WORK/B.jsonl" 2>"$WORK/B.err"; rcB=$?
+"${SYNC[@]}" sync --json-lines "$TREE" boxB:inbox >"$WORK/B.jsonl" 2>"$WORK/B.err"; rcB=$?
 echo "## rc=$rcB"; cat "$WORK/B.jsonl"
 if [ "$rcB" = 0 ] && [ "$(jstates "$WORK/B.jsonl")" = "$(printf 'same\ta\t0\nupdated\tbig\t%s\nsent\td\t1000\nskipped\tlink\t0\nsame\tsub/c\t0' "$CHUNK")" ]; then
   ok "gateB: exactly two files moved: one chunk of big, all of d"
 else cat "$WORK/B.err"; jstates "$WORK/B.jsonl"; bad "gateB: delta records wrong (rc=$rcB)"; fi
 [ "$(jfinal "$WORK/B.jsonl" moved)" = "$((CHUNK + 1000))" ] && ok "gateB: bytes moved == one chunk + d ($((CHUNK+1000)))" || bad "gateB: moved=$(jfinal "$WORK/B.jsonl" moved)"
 if same_bytes big && same_bytes d && same_bytes a; then ok "gateB: landed bytes identical after the delta"; else bad "gateB: landed tree differs after the delta"; fi
+
+# ===================================================================== GATE K ==
+# J4: `--json` is ONE document like every other verb (A), `--json-lines` is the
+# NDJSON stream (B), and in both the labelled counters partition the entries and
+# the bytes add up: `counts.total` is every local entry, the states sum to it,
+# `bytes.moved` is what was sent and acknowledged.
+say K
+python3 - "$WORK/A.jsonl" "$WORK/B.jsonl" "$TOTAL" "$CHUNK" <<'PY' && ok "gateK: --json is one document, --json-lines a stream, and the counters add up" || bad "gateK: sync JSON shape or counters"
+import json, sys
+a_path, b_path, total, chunk = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+def parts(c):
+    return sum(c[k] for k in ("sent", "updated", "same", "skipped", "failed", "would_send", "would_update"))
+a = [l for l in open(a_path) if l.strip()]
+assert len(a) == 1, f"--json printed {len(a)} documents"
+d = json.loads(a[0]); data = d["data"]; c = data["counts"]
+assert d["ok"] is True and d["verb"] == "sync", d
+assert len(data["files"]) == 4 and c["total"] == 4 == parts(c), c
+assert (c["sent"], c["skipped"], c["same"]) == (3, 1, 0), c
+assert data["bytes"]["moved"] == data["bytes"]["total"] == total == data["moved"] == data["total"], data
+b = [json.loads(l) for l in open(b_path) if l.strip()]
+recs, summary = b[:-1], b[-1]["data"]
+assert len(recs) == 5 and all("file" in r["data"] for r in recs), recs
+assert "files" not in summary, "the stream does not repeat the files in its summary"
+c = summary["counts"]
+assert c["total"] == 5 == parts(c) == len(recs), c
+assert (c["same"], c["updated"], c["sent"], c["skipped"]) == (2, 1, 1, 1), c
+assert summary["bytes"]["moved"] == chunk + 1000 == sum(r["data"]["bytes"] for r in recs), summary
+print("## A counts", json.dumps(data["counts"]), "B counts", json.dumps(c))
+PY
 
 # ===================================================================== GATE C ==
 say C

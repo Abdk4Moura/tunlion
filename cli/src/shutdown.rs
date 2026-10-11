@@ -54,7 +54,11 @@ pub fn arm_force_exit(code: i32, grace: Duration) {
         tokio::time::sleep(grace).await;
         // The graceful path did not finish in time. A dropped link is already an
         // ordinary disconnect to the peer's resilience layer, so exiting now
-        // corrupts nothing a normal disconnect wouldn't.
+        // corrupts nothing a normal disconnect wouldn't. An interrupt still
+        // answers a `--json` caller with its failure object first.
+        if code == crate::exit_codes::INTERRUPTED || code == crate::exit_codes::TERMINATED {
+            crate::exit_codes::interrupted_exit(code);
+        }
         std::process::exit(code);
     });
 }

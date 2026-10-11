@@ -302,6 +302,9 @@ pub fn say(line: &str) {
 /// print so stdout carries exactly what a script parses and nothing else; it
 /// is never verbosity-gated, because a `-q` script still needs its answer.
 pub fn json_out(v: &serde_json::Value) {
+    // This command's answer is on stdout now; an interrupt after this must
+    // not add a second document (exit_codes::report_interrupted).
+    crate::exit_codes::note_json_answered();
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{v}");
     let _ = out.flush();

@@ -21,6 +21,14 @@
 //! `stored_name` is the name the receiver stored the file under, carried by
 //! its delivery-ack (an additive field: an older receiver omits it, and then
 //! `stored_name` is null).
+//!
+//! `refusal` is why a file was not delivered, null for one that was:
+//! `{"reason": <token>, "message": <the receiver's sentence>}`. The token is
+//! the receiver's typed reason (`no_space`, `name_too_long`, `read_only`,
+//! `permission`, `io`, `inbox_missing`, ...; see filament-proto `refuse_msg`)
+//! or `declined` when a person (or an older receiver) said no without one.
+//! When the send failed because of refusals, `error.message` carries their
+//! sentences too, so a script reading only the top level still learns why.
 
 use crate::exit_codes::{self, ExitKind};
 use crate::ui;
@@ -39,11 +47,48 @@ pub(crate) struct FileReport {
     pub(crate) declined: bool,
     /// The receiver's final name for it, when its ack said so.
     pub(crate) stored_name: Option<String>,
+    /// Why it was not delivered: (reason token, sentence). Set for a declined
+    /// file; `None` for a delivered one.
+    pub(crate) refusal: Option<(String, String)>,
 }
 
 static LAST: Mutex<Vec<FileReport>> = Mutex::new(Vec::new());
 /// Transfer id -> the name the receiver stored it under.
 static STORED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+/// Transfer id -> (reason token, sentence) of the receiver's refusal.
+static REFUSED: Mutex<Option<HashMap<String, (String, String)>>> = Mutex::new(None);
+
+/// The reason token a script matches, from a peer-supplied string: lowercase
+/// ASCII letters, digits, `_` and `-` only, bounded. Anything else (an empty
+/// or hostile token) becomes `io`, the generic "could not store it".
+pub(crate) fn reason_token(raw: &str) -> String {
+    let t: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .take(40)
+        .collect();
+    if t.is_empty() || !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        "io".to_string()
+    } else {
+        t
+    }
+}
+
+/// The receiver refused transfer `id`: remember its reason for the result.
+/// `reason` is the wire token (None for a plain decline, which becomes
+/// `declined`); `message` the sentence shown to the person.
+pub(crate) fn note_refused(id: &str, reason: Option<&str>, message: &str) {
+    let token = reason.map(reason_token).unwrap_or_else(|| "declined".to_string());
+    if let Ok(mut m) = REFUSED.lock() {
+        m.get_or_insert_with(HashMap::new)
+            .insert(id.to_string(), (token, message.to_string()));
+    }
+}
+
+fn refused_for(id: &str) -> Option<(String, String)> {
+    REFUSED.lock().ok()?.as_ref()?.get(id).cloned()
+}
 
 /// The receiver reported the name it stored transfer `id` under. Only the
 /// final path component is kept: a name, never a path on the other machine.
@@ -124,6 +169,11 @@ pub(crate) fn record(out: &[Outgoing]) {
             delivered: o.done && !o.declined,
             declined: o.declined,
             stored_name: stored_for(&o.id),
+            refusal: o.declined.then(|| {
+                refused_for(&o.id).unwrap_or_else(|| {
+                    ("declined".to_string(), "the receiver declined it".to_string())
+                })
+            }),
         })
         .collect();
     if let Ok(mut last) = LAST.lock() {
@@ -190,22 +240,68 @@ pub(crate) fn result_object(files: &[FileReport], peer: Option<&str>, res: &Resu
             "delivered": f.delivered,
             "declined": f.declined,
             "stored_name": f.stored_name,
+            "refusal": refusal_json(f),
         })).collect::<Vec<_>>(),
     });
     if let [only] = files {
         v["file"] = json!(only.file);
         v["sha256"] = json!(only.sha256);
         v["stored_name"] = json!(only.stored_name);
+        v["refusal"] = refusal_json(only);
     }
     if let Err(e) = res {
         let kind = exit_codes::classify(e);
-        v["error"] = json!({
+        let mut error = json!({
             "code": kind.token(),
             "exit": kind.code(),
-            "message": exit_codes::human_message(e),
+            "message": error_message(files, e),
         });
+        // The typed reason at the top level too, when exactly one kind of
+        // refusal is why the send failed: `error.reason == "no_space"` is the
+        // one-field check a script wants.
+        let mut reasons: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f.refusal.as_ref().map(|(r, _)| r.as_str()))
+            .collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        if let [one] = reasons.as_slice() {
+            error["reason"] = json!(one);
+        }
+        v["error"] = error;
     }
     v
+}
+
+fn refusal_json(f: &FileReport) -> Value {
+    match &f.refusal {
+        Some((reason, message)) => json!({ "reason": reason, "message": message }),
+        None => Value::Null,
+    }
+}
+
+/// The top-level failure sentence. A send that failed because the receiver
+/// refused files names each refusal in the receiver's words; it used to say
+/// "failed (denied)" while the human block said "receiver is out of disk
+/// space ... needs 2.9 MiB, has 980.0 KiB".
+fn error_message(files: &[FileReport], e: &anyhow::Error) -> String {
+    let message = exit_codes::human_message(e);
+    let refusals: Vec<String> = files
+        .iter()
+        .filter_map(|f| {
+            let (reason, why) = f.refusal.as_ref()?;
+            (reason != "declined").then(|| why.clone())
+        })
+        .collect();
+    if refusals.is_empty() || refusals.iter().all(|r| message.contains(r.as_str())) {
+        return message;
+    }
+    let generic = message.starts_with("failed (") || message.starts_with("send incomplete");
+    if generic {
+        refusals.join("; ")
+    } else {
+        format!("{message}: {}", refusals.join("; "))
+    }
 }
 
 /// Print the result object for a finished `send --json` and turn the outcome
@@ -238,7 +334,63 @@ mod tests {
             delivered: true,
             declined: false,
             stored_name: None,
+            refusal: None,
         }
+    }
+
+    /// J5: on a full disk the human text named the reason and both sizes and
+    /// the JSON said `{"code":"denied","message":"failed (denied)"}` with
+    /// `declined: true` and no reason. Each file carries its typed reason and
+    /// sentence, and the top-level error names them.
+    #[test]
+    fn a_refused_file_carries_its_typed_reason_into_json() {
+        let why = "receiver is out of disk space for big.bin (needs 2.9 MiB, has 980.0 KiB)";
+        note_refused("t-refused-1", Some("no_space"), why);
+        let mut f = one("big.bin", 3_000_000);
+        f.delivered = false;
+        f.declined = true;
+        f.refusal = refused_for("t-refused-1");
+        let res: Result<()> = Err(exit_codes::reported(ExitKind::Denied));
+        let v = result_object(&[f.clone()], Some("beta"), &res);
+        assert_eq!(v["files"][0]["refusal"]["reason"], json!("no_space"));
+        assert_eq!(v["files"][0]["refusal"]["message"], json!(why));
+        assert_eq!(v["refusal"]["reason"], json!("no_space"), "single file: at the top too");
+        assert_eq!(v["error"]["code"], json!("denied"));
+        assert_eq!(v["error"]["exit"], json!(4));
+        assert_eq!(v["error"]["reason"], json!("no_space"));
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("out of disk space") && msg.contains("needs 2.9 MiB"), "{msg}");
+        assert!(!msg.contains("failed (denied)"), "{msg}");
+        // A reported sentence that already names it is not repeated.
+        let res: Result<()> = Err(exit_codes::reported_because(ExitKind::Denied, why));
+        let v = result_object(&[f], Some("beta"), &res);
+        assert_eq!(v["error"]["message"], json!(why));
+    }
+
+    #[test]
+    fn a_plain_decline_and_a_hostile_token_have_safe_reasons() {
+        note_refused("t-refused-2", None, "the receiver declined it");
+        assert_eq!(refused_for("t-refused-2").unwrap().0, "declined");
+        assert_eq!(reason_token("NAME_TOO_LONG"), "name_too_long");
+        assert_eq!(reason_token("inbox_missing"), "inbox_missing");
+        assert_eq!(reason_token("\u{1b}[31mx"), "io");
+        assert_eq!(reason_token(""), "io");
+        // Two different reasons: per file, and no single top-level reason.
+        let mut a = one("a", 1);
+        a.declined = true;
+        a.delivered = false;
+        a.refusal = Some(("no_space".into(), "no room for a".into()));
+        let mut b = one("b", 1);
+        b.declined = true;
+        b.delivered = false;
+        b.refusal = Some(("name_too_long".into(), "bad name b".into()));
+        let v = result_object(&[a, b], None, &Err(incomplete(0, 2)));
+        assert!(v["error"].get("reason").is_none());
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("no room for a") && msg.contains("bad name b"), "{msg}");
+        // A delivered file has no refusal.
+        let v = result_object(&[one("c", 1)], None, &Ok(()));
+        assert_eq!(v["files"][0]["refusal"], Value::Null);
     }
 
     #[test]
