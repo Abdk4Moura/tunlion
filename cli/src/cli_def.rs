@@ -186,11 +186,11 @@ pub(crate) enum Cmd {
     // ── Share ───────────────────────────────────────────────────────
     /// Send files or directories to a peer (browser or CLI).
     ///
-    /// Exit status: 0 when every file was delivered and verified; 4 when the
-    /// receiver refused a file it cannot store (out of disk space, a name its
-    /// filesystem refuses, no permission), with its reason printed; 6 when the
-    /// receiver neither accepted nor refused an offer within 60s
-    /// (FILAMENT_SEND_STALL_SECS changes the bound, 0 disables it); 1 otherwise.
+    /// A receiver that refuses a file it cannot store (out of disk space, a
+    /// name its filesystem refuses, no permission) says why, and the send
+    /// exits 4; one that neither accepts nor refuses an offer within 60s
+    /// exits 6 (FILAMENT_SEND_STALL_SECS changes the bound, 0 disables it).
+    /// Every code send can return is listed under EXIT CODES below.
     #[command(next_help_heading = "Share")]
     Send {
         /// Files or directories to send; '-' reads stdin
@@ -430,8 +430,9 @@ pub(crate) enum Cmd {
     /// Show whether the daemon runs and what it received recently.
     ///
     /// Exits 0 when the daemon serving this config dir answers, 11 when no
-    /// daemon serves it, and 6 when one runs but does not answer in time.
-    /// `--json` always exits 0 and reports both in `running`/`responding`.
+    /// daemon serves it, 6 when one runs but does not answer in time, and 9
+    /// when it answers but this device has no identity yet. `--json` exits
+    /// with the same code, `ok` true exactly when it is 0.
     Status {
         /// Machine-readable JSON (for scripts): {running, pid, devices, exposed, recent}.
         #[arg(long)]

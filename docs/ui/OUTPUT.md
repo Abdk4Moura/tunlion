@@ -277,7 +277,10 @@ Rules that go with them:
   data fields (`running`, `responding`, `suspended`, `proxy`, ...) are all
   still there. It used to say `"ok": true` with exit 0 for a down or frozen
   daemon. A closed pipe keeps the code (`status | head -1` exits 11 with no
-  daemon), and `proxy` is reported only while the daemon answers.
+  daemon), and `proxy` is reported only while the daemon answers. A daemon
+  that answers on a device with no identity is 9 (`no_identity`), not 0: it
+  can receive by code and nothing else, and every verb naming a device fails
+  with 9 there. 11 and 6 win over 9.
 - **`exec` passes the remote command's own status through.** A remote `exit 3`
   is a local 3; tunlion's own failures use the table, so for `exec` alone a
   low code is ambiguous. `1` is still the catch-all for anything unclassified,
