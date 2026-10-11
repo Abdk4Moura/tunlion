@@ -107,6 +107,58 @@ fn settle_retryable(err: &anyhow::Error) -> bool {
     m.contains("retry") && (m.contains("identity not proven") || m.contains("identity settling"))
 }
 
+/// Exit codes `exec` produces itself, beside the remote command's own status
+/// (docs/ui/OUTPUT.md, Exit codes). 127 and 126 are what a shell returns for
+/// a command it cannot find or cannot execute; the remote daemon refuses
+/// those before spawning, so they are produced here from its refusal. They
+/// were 4, "denied", which sent people to check permissions for a typo.
+const EXEC_NOT_FOUND: i32 = 127;
+const EXEC_CANNOT_RUN: i32 = 126;
+/// 128 + SIGPIPE: this side's stdout (or stderr) was closed before the remote
+/// command finished (`exec box -- seq 1 100000 | head -2`). It was 1 with
+/// "Error: Broken pipe".
+const EXEC_OUTPUT_CLOSED: i32 = 141;
+
+/// The shell exit code for a remote refusal that means "could not start the
+/// command", or None for any other refusal. Matched on the remote daemon's
+/// own reason text (exec_recv.rs). Pure.
+pub(crate) fn spawn_refusal_code(reason: &str) -> Option<i32> {
+    let r = reason.to_lowercase();
+    if r.contains("not found on daemon path") {
+        return Some(EXEC_NOT_FOUND);
+    }
+    if r.contains("spawn failed")
+        && (r.contains("permission denied")
+            || r.contains("os error 13)")
+            || r.contains("exec format error")
+            || r.contains("os error 8)"))
+    {
+        return Some(EXEC_CANNOT_RUN);
+    }
+    None
+}
+
+/// Say why the remote command could not start, and return its shell code.
+fn spawn_refused(peer: &str, argv0: &str, reason: &str, code: i32) -> i32 {
+    let what = if code == EXEC_NOT_FOUND {
+        format!("'{argv0}' is not on {peer}'s PATH")
+    } else {
+        format!("'{argv0}' cannot be executed on {peer}")
+    };
+    crate::ui::critical(&format!("tunlion exec: {what} ({reason}); exit {code}"));
+    code
+}
+
+/// A write to this side's stdout/stderr failed: a closed reader is 141
+/// (quietly, as SIGPIPE would end a local command), anything else is an error.
+fn local_output_failed(e: std::io::Error) -> Result<i32> {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        Ok(EXEC_OUTPUT_CLOSED)
+    } else {
+        Err(e.into())
+    }
+}
+
 pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOpts) -> Result<i32> {
     // Bounded by BOTH count and wall clock. Measured: the window in which a
     // challenge is unanswered is the peer's own reconnect churn (a daemon
@@ -197,7 +249,7 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
     // Bounded ack wait with pty's four outcomes. A refusal surfaces the
     // RECEIVER's reason (dropping it here reported every refusal as a
     // confusing transport error); anything else names what actually happened.
-    let ack: Value = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let ack: std::result::Result<Value, String> = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let ev = match rx.recv().await {
                 Some(ev) => ev,
@@ -252,8 +304,14 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
         anyhow::anyhow!(
             "no answer from '{peer}' - it may be unresponsive or running a build without exec"
         )
-    })?
-    .map_err(|reason: String| anyhow::anyhow!(reason))?;
+    })?;
+    let ack = match ack {
+        Ok(v) => v,
+        Err(reason) => match spawn_refusal_code(&reason) {
+            Some(code) => return Ok(spawn_refused(peer, opts.argv.first().map(String::as_str).unwrap_or("?"), &reason, code)),
+            None => bail!("{reason}"),
+        },
+    };
     let _ = ack;
     // Pumps: bounded fd0 reader (one consumer for the whole invocation,
     // same singleton discipline as pty's shared reader), stdout/stderr to
@@ -278,8 +336,12 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
             item = out_pipe.recv() => match item {
                 Some(Some(bytes)) => {
                     out_recv += bytes.len() as u64;
-                    stdout.write_all(&bytes).await?;
-                    stdout.flush().await?;
+                    if let Err(e) = stdout.write_all(&bytes).await {
+                        return local_output_failed(e);
+                    }
+                    if let Err(e) = stdout.flush().await {
+                        return local_output_failed(e);
+                    }
                 }
                 _ => {
                     // Pipe closed without a close payload: transport-level liveness
@@ -301,8 +363,12 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
             item = err_pipe.recv() => match item {
                 Some(Some(bytes)) => {
                     err_recv += bytes.len() as u64;
-                    stderr.write_all(&bytes).await?;
-                    stderr.flush().await?;
+                    if let Err(e) = stderr.write_all(&bytes).await {
+                        return local_output_failed(e);
+                    }
+                    if let Err(e) = stderr.flush().await {
+                        return local_output_failed(e);
+                    }
                 }
                 _ => {}
             },
@@ -349,6 +415,9 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
                         let err = v.get("err").and_then(|e| e.as_str()).unwrap_or("closed");
+                        if let Some(code) = spawn_refusal_code(err) {
+                            return Ok(spawn_refused(peer, opts.argv.first().map(String::as_str).unwrap_or("?"), err, code));
+                        }
                         bail!("'{peer}' closed the exec stream: {err}");
                     }
                 }
@@ -404,14 +473,22 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
             }
             while let Ok(Some(bytes)) = out_pipe.try_recv() {
                 out_recv += bytes.len() as u64;
-                stdout.write_all(&bytes).await?;
+                if let Err(e) = stdout.write_all(&bytes).await {
+                    return local_output_failed(e);
+                }
             }
             while let Ok(Some(bytes)) = err_pipe.try_recv() {
                 err_recv += bytes.len() as u64;
-                stderr.write_all(&bytes).await?;
+                if let Err(e) = stderr.write_all(&bytes).await {
+                    return local_output_failed(e);
+                }
             }
-            stdout.flush().await?;
-            stderr.flush().await?;
+            if let Err(e) = stdout.flush().await {
+                return local_output_failed(e);
+            }
+            if let Err(e) = stderr.flush().await {
+                return local_output_failed(e);
+            }
         }
     }
     mux.drop_stream(sid).await;
@@ -427,6 +504,35 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// J6: a remote "command not found" exited 4 ("denied"); exec passes 42
+    /// and 137 through, so the codes a shell uses for "cannot start it" are
+    /// the honest ones: 127 not found, 126 found but not executable.
+    #[test]
+    fn a_command_that_cannot_start_exits_like_a_shell() {
+        assert_eq!(spawn_refusal_code("argv[0] not found on daemon PATH"), Some(127));
+        assert_eq!(
+            spawn_refusal_code("'box' refused exec: argv[0] not found on daemon PATH"),
+            Some(127)
+        );
+        assert_eq!(spawn_refusal_code("spawn failed: Permission denied (os error 13)"), Some(126));
+        assert_eq!(spawn_refusal_code("spawn failed: Exec format error (os error 8)"), Some(126));
+        // Refusals that are not about starting the command keep their kinds.
+        assert_eq!(spawn_refusal_code("shell not granted"), None);
+        assert_eq!(spawn_refusal_code("cwd does not exist"), None);
+        assert_eq!(spawn_refusal_code("spawn failed: Resource temporarily unavailable"), None);
+    }
+
+    /// J1/J6: `exec ... | head -2` exited 1 with "Error: Broken pipe". A
+    /// closed local reader ends exec as SIGPIPE ends a local command, 141;
+    /// any other write failure is still an error.
+    #[test]
+    fn a_closed_local_output_is_141_not_an_error() {
+        let closed = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(local_output_failed(closed).unwrap(), 141);
+        let full = std::io::Error::other("No space left on device (os error 28)");
+        assert!(local_output_failed(full).is_err());
+    }
 
     #[test]
     fn build_argv_direct_passthrough() {

@@ -3494,7 +3494,7 @@ pub(crate) async fn recv_cmd(
                         .map(|t| t.is_dead())
                         .unwrap_or(false);
                     if fresh || link_dead {
-                        ui::say(&format!("known device '{n}' appeared, connecting"));
+                        ui::say_folded(&format!("known device '{n}' appeared, connecting"));
                         // NOT a sighting. This is the server's roster, which it
                         // re-pushes on every (re)subscribe and sync tick, and
                         // which can still carry a session the device no longer
@@ -4647,7 +4647,7 @@ pub(crate) async fn recv_cmd(
                                                 t.clone(),
                                             )
                                             .await;
-                                            ui::say(&format!(
+                                            ui::say_folded(&format!(
                                                 "  {} L3 peer {who}.mesh ({ip} / {v4})",
                                                 ui::paint(ui::Tone::Ok, ui::glyph_ok())
                                             ));

@@ -164,6 +164,23 @@ Style goes *inside* a `ui::` call, never around a bare print. `ui::paint` inside
 `eprintln!` gets the colour and loses the verbosity gate, which is the trap: it
 looks like it went through the UI layer.
 
+**ASCII terminals get ASCII.** The terminal is Unicode only when the first
+non-empty of LC_ALL, LC_CTYPE, LANG names UTF-8 AND `TERM` is not `dumb`. On
+any other terminal every human line is passed through `ui::ascii_glyphs`
+before it is written, so a glyph hardcoded at a call site anyway (`✓`, `⚡`,
+`○`, `→`, `●`, `•`, `─`) still reaches it as ASCII (`ok`, `*`, `o`, `->`).
+Only those glyphs are mapped: a file name's own non-ASCII letters are data.
+
+**The daemon log has times and does not repeat itself.** From the moment
+`up` starts serving, if its stderr is not a terminal (daemon.log, the
+journal, a redirect), every line starts with an ISO-8601 UTC timestamp. A
+status line the daemon repeats on every reconnect ("known device 'x'
+appeared", "L3 peer ...") goes through `ui::say_folded`: a copy within 60 s
+of its last printing is folded into a count carried by its next printing,
+`(and N more like it in the last 60s)`. Folding is per call site on
+purpose: a refusal, an error, or anything a person or a gate counts is one
+line per event.
+
 ## Prose
 
 Plain sentences that stop when they are done. No em dashes. Do not tell the user

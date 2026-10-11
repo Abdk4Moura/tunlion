@@ -112,13 +112,166 @@ pub fn caps() -> &'static Caps {
             && std::env::var("COLORTERM")
                 .map(|v| v.contains("truecolor") || v.contains("24bit"))
                 .unwrap_or(false);
-        let unicode = std::env::var("LC_ALL")
-            .or_else(|_| std::env::var("LC_CTYPE"))
-            .or_else(|_| std::env::var("LANG"))
-            .map(|v| v.to_uppercase().contains("UTF"))
-            .unwrap_or(cfg!(windows)); // Windows Terminal is UTF-16 native
+        let var = |k: &str| std::env::var(k).ok();
+        let unicode = unicode_from(var("LC_ALL"), var("LC_CTYPE"), var("LANG"), &term);
         Caps { tty, color, truecolor, unicode }
     })
+}
+
+/// Whether to print Unicode glyphs, from the locale and the terminal. Pure.
+///
+/// POSIX order: the first of LC_ALL, LC_CTYPE, LANG that is set AND non-empty
+/// decides (an empty LC_ALL is unset, not "C"). `TERM=dumb` is ASCII whatever
+/// the locale: a dumb terminal promises nothing beyond it. With no locale at
+/// all, Windows (UTF-16 native consoles) says yes and everything else no.
+pub fn unicode_from(lc_all: Option<String>, lc_ctype: Option<String>, lang: Option<String>, term: &str) -> bool {
+    if term == "dumb" {
+        return false;
+    }
+    [lc_all, lc_ctype, lang]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(|v| v.to_uppercase().contains("UTF"))
+        .unwrap_or(cfg!(windows))
+}
+
+/// The glyphs human lines use, and their ASCII stand-ins. Applied to every
+/// line `emit` prints when the terminal or locale is not Unicode (`LANG=C`,
+/// `TERM=dumb`), so a glyph written inline at a call site (`✓`, `⚡ warm`,
+/// `○ cold`, `→`, `●`) cannot reach an ASCII terminal as mojibake. Only these
+/// characters are mapped: a file name with other non-ASCII letters is the
+/// user's data and passes through.
+const ASCII_GLYPHS: &[(char, &str)] = &[
+    ('✓', "ok"),
+    ('✗', "x"),
+    ('⚡', "*"),
+    ('→', "->"),
+    ('←', "<-"),
+    ('↳', "->"),
+    ('●', "*"),
+    ('○', "o"),
+    ('◐', "o"),
+    ('◇', "<>"),
+    ('⚠', "!"),
+    ('•', "*"),
+    ('·', "-"),
+    ('─', "-"),
+    ('━', "="),
+    ('╸', "-"),
+    ('…', "..."),
+];
+
+/// `line` with every known glyph replaced by its ASCII stand-in. Pure.
+pub fn ascii_glyphs(line: &str) -> String {
+    if line.is_ascii() {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        match ASCII_GLYPHS.iter().find(|(g, _)| *g == c) {
+            Some((_, a)) => out.push_str(a),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------ daemon log --
+//
+// A detached daemon's stderr IS daemon.log. Its lines had no time on them,
+// and status lines repeated without bound ("ok L3 peer ..." twice per
+// reconnect, "known device 'beta' appeared" 14 times in 150 lines).
+//
+// - In daemon-log mode (the daemon's stderr is not a terminal) every line
+//   starts with an ISO-8601 UTC timestamp.
+// - A repeating STATUS line goes through `say_folded`: a copy within
+//   DEDUP_WINDOW of its last printing is folded into a count that rides on
+//   its next printing. Folding is opt-in per call site on purpose: refusals,
+//   errors and anything a person or a gate counts stay one line per event.
+
+static DAEMON_LOG: AtomicBool = AtomicBool::new(false);
+const DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounds the memory the fold uses; a daemon prints far fewer distinct lines.
+const DEDUP_MAX: usize = 512;
+
+type FoldMap = std::collections::HashMap<String, (Instant, u64)>;
+/// line -> (when it was last PRINTED, how many copies were folded since)
+static FOLD: std::sync::Mutex<Option<FoldMap>> = std::sync::Mutex::new(None);
+
+/// Turn daemon-log mode on (the daemon calls this when its stderr is a file).
+pub fn set_daemon_log(on: bool) {
+    DAEMON_LOG.store(on, Ordering::Relaxed);
+}
+
+/// What the fold does with `line` seen at `now`. Pure over the map.
+/// `None`: fold it (a copy within the window). `Some(n)`: print it, noting
+/// `n` folded copies since it last printed.
+fn fold_decision(seen: &mut FoldMap, line: &str, now: Instant) -> Option<u64> {
+    if seen.len() >= DEDUP_MAX && !seen.contains_key(line) {
+        seen.retain(|_, (t, _)| now.duration_since(*t) < DEDUP_WINDOW);
+        if seen.len() >= DEDUP_MAX {
+            seen.clear();
+        }
+    }
+    match seen.get_mut(line) {
+        Some((t, n)) if now.duration_since(*t) < DEDUP_WINDOW => {
+            *n += 1;
+            None
+        }
+        Some((t, n)) => {
+            let folded = *n;
+            *t = now;
+            *n = 0;
+            Some(folded)
+        }
+        None => {
+            seen.insert(line.to_string(), (now, 0));
+            Some(0)
+        }
+    }
+}
+
+/// A folded line's text: the count of copies folded since it last printed. Pure.
+pub fn folded_line(line: &str, folded: u64) -> String {
+    match folded {
+        0 => line.to_string(),
+        n => format!("{line}  (and {n} more like it in the last {}s)", DEDUP_WINDOW.as_secs()),
+    }
+}
+
+/// A daemon-log line: the ISO timestamp first. Pure.
+pub fn stamped_line(stamp: &str, line: &str) -> String {
+    format!("{stamp} {line}")
+}
+
+/// INFO level, for a status line a daemon repeats (a peer appearing, a route
+/// coming up): printed at most once per DEDUP_WINDOW per distinct text, with
+/// the number of copies it stood for.
+pub fn say_folded(line: &str) {
+    if !enabled(Level::Info) {
+        return;
+    }
+    let folded = match FOLD.lock() {
+        Ok(mut g) => match fold_decision(g.get_or_insert_with(FoldMap::new), line, Instant::now()) {
+            Some(n) => n,
+            None => return,
+        },
+        // A poisoned fold never costs a line: print it unfolded.
+        Err(_) => 0,
+    };
+    emit(&folded_line(line, folded));
+}
+
+/// The line as it is written: ASCII glyphs on an ASCII terminal, and the
+/// timestamp in daemon-log mode.
+fn decorate(line: &str) -> String {
+    let line = if caps().unicode { line.to_string() } else { ascii_glyphs(line) };
+    if !DAEMON_LOG.load(Ordering::Relaxed) {
+        return line;
+    }
+    let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    stamped_line(&stamp, &line)
 }
 
 // ------------------------------------------------------------------ paint --
@@ -385,6 +538,7 @@ pub fn is_broken_pipe_print(msg: &str) -> bool {
 /// decided the line is in-budget. Use the leveled helpers (`critical`/`say`/
 /// `debug`/`trace`) at call sites so the verbosity gate is applied.
 fn emit(line: &str) {
+    let line = decorate(line);
     clear_live();
     err_write(&format!("{line}\n"));
     if let Ok(s) = STICKY.lock() {
@@ -927,5 +1081,54 @@ mod transfer_units {
         assert_eq!(crate::human(1024 * 1024), "1.0 MiB");
         assert_eq!(crate::human(5 * 1024 * 1024 * 1024), "5.0 GiB");
         assert_eq!(crate::human(2 * 1024u64.pow(4)), "2.0 TiB");
+    }
+}
+
+#[cfg(test)]
+mod scripting_output_tests {
+    use super::*;
+
+    /// J7: with LANG=C or TERM=dumb the output carried ✓ ⚡ → ●.
+    #[test]
+    fn ascii_terminals_get_ascii_glyphs() {
+        let s = |v: &str| Some(v.to_string());
+        assert!(!unicode_from(None, None, s("C"), "xterm"), "LANG=C");
+        assert!(!unicode_from(None, None, s("en_US.UTF-8"), "dumb"), "TERM=dumb");
+        assert!(unicode_from(None, None, s("en_US.UTF-8"), "xterm-256color"));
+        assert!(!unicode_from(s("C"), None, s("en_US.UTF-8"), "xterm"), "LC_ALL wins");
+        assert!(unicode_from(s(""), None, s("en_US.UTF-8"), "xterm"), "an empty LC_ALL is unset");
+        assert_eq!(ascii_glyphs("  ✓ up (pid 7)"), "  ok up (pid 7)");
+        assert_eq!(ascii_glyphs("  ⚡ warm  ○ cold → ●"), "  * warm  o cold -> *");
+        assert_eq!(ascii_glyphs("café.txt delivered"), "café.txt delivered", "user data passes through");
+        for (g, a) in ASCII_GLYPHS {
+            assert!(a.is_ascii(), "{g} maps to non-ASCII");
+        }
+    }
+
+    /// J7: "known device 'beta' appeared" 14 times in 150 lines, and no
+    /// timestamps. Copies within the window fold into a count on the next
+    /// printing; every printed line starts with an ISO timestamp.
+    #[test]
+    fn daemon_log_lines_are_stamped_and_repeats_fold() {
+        let mut seen = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let l = "known device 'beta' appeared, connecting";
+        assert_eq!(fold_decision(&mut seen, l, t0), Some(0), "first time prints");
+        for i in 1..14 {
+            assert_eq!(fold_decision(&mut seen, l, t0 + std::time::Duration::from_secs(i)), None);
+        }
+        assert_eq!(fold_decision(&mut seen, "other", t0), Some(0), "a different line is not folded");
+        let later = t0 + DEDUP_WINDOW + std::time::Duration::from_secs(1);
+        assert_eq!(fold_decision(&mut seen, l, later), Some(13), "the next printing carries the count");
+        assert_eq!(fold_decision(&mut seen, l, later), None, "and the window restarts");
+        let line = stamped_line("2026-10-11T01:02:03Z", &folded_line(l, 13));
+        assert!(line.starts_with("2026-10-11T01:02:03Z known device"), "{line}");
+        assert!(line.ends_with("(and 13 more like it in the last 60s)"), "{line}");
+        assert_eq!(folded_line("x", 0), "x");
+        // Bounded: a flood of distinct lines cannot grow the map without limit.
+        for i in 0..(DEDUP_MAX * 2) {
+            fold_decision(&mut seen, &format!("line {i}"), t0);
+        }
+        assert!(seen.len() <= DEDUP_MAX);
     }
 }

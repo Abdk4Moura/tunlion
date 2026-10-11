@@ -523,6 +523,10 @@ pub(crate) async fn up_cmd(
             }
         }
     }
+    // From here this process IS the daemon. When its stderr is not a terminal
+    // (daemon.log, the journal, a gate's redirect) every line carries an ISO
+    // timestamp: a log with no times cannot be read against anything else.
+    ui::set_daemon_log(!std::io::IsTerminal::is_terminal(&std::io::stderr()));
     let res = recv_cmd(
         server,
         None,
