@@ -2917,10 +2917,17 @@ pub(crate) async fn recv_cmd(
         // lost contact with stops blocking. FILAMENT_TEST_DISABLE_MODEB_DROP
         // restores the old links-gated behaviour so gate 18b proves the A/B
         // (baseline hangs, fix exits) with one binary.
-        let no_healthy_link = conn
-            .links
-            .values()
-            .all(|l| !matches!(l.presence, Presence::Ready));
+        // A link whose transport is DEAD is not healthy whatever its presence
+        // says. A direct QUIC link stays `Ready` after its peer is gone: the
+        // sender ends its send half once the file is acked (the primary is then
+        // `is_dead`), and nothing moves presence off `Ready` for a link that
+        // simply stops. Gated on presence alone, a receiver whose sender vanished
+        // over QUIC with its peer-left lost never quiet-exited (gate 18, RC=124
+        // at 120 s, once same-host transfers stopped falling back to WebRTC).
+        let no_healthy_link = conn.links.values().all(|l| {
+            !matches!(l.presence, Presence::Ready)
+                || l.transport.as_ref().is_none_or(|t| t.is_dead())
+        });
         let links_clear = if !test_hooks::disable_modeb_drop() {
             no_healthy_link
         } else {
