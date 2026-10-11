@@ -529,6 +529,7 @@ pub(crate) async fn async_main() -> Result<()> {
         } => {
             let json_out = ui_caps.json || cli.json;
             let peer = to.clone();
+            let sources = crate::send_report::source_labels(&paths, name.as_deref());
             let res = if let Some(ak_path) = auth_key {
                 enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
             } else {
@@ -548,6 +549,9 @@ pub(crate) async fn async_main() -> Result<()> {
             };
             // Both ends keep a structured history; this is the sender's half.
             crate::send_report::persist_history(peer.as_deref());
+            if let Err(e) = &res {
+                crate::send_report::persist_unoffered(peer.as_deref(), &sources, e);
+            }
             if json_out {
                 // One result object on stdout, success or failure.
                 return crate::send_report::emit(res, peer.as_deref());

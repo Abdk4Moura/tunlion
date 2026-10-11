@@ -98,6 +98,55 @@ pub(crate) fn append(records: &[Record]) {
     }
 }
 
+/// Append already-shaped records, keeping the newest [`MAX_RECORDS`].
+fn append_values(values: Vec<Value>) {
+    if values.is_empty() {
+        return;
+    }
+    let _g = LOCK.lock();
+    let p = path();
+    let mut all = load_from(&p);
+    all.extend(values);
+    if all.len() > MAX_RECORDS {
+        let drop = all.len() - MAX_RECORDS;
+        all.drain(..drop);
+    }
+    if let Ok(body) = serde_json::to_string(&Value::Array(all)) {
+        let _ = crate::platform::SecretFile::write_str(&p, &body);
+    }
+}
+
+/// Records for a send that failed before any file was offered (its source
+/// could not be read, or `send -` ran out of spool space): one `ok: false`
+/// record per named source, carrying the reason as `error`. Pure. Such a send
+/// used to leave no trace in the history at all.
+pub(crate) fn unoffered_records(peer: Option<&str>, sources: &[String], reason: &str, now: u64) -> Vec<Value> {
+    sources
+        .iter()
+        .map(|s| {
+            let mut v = Record {
+                time: now,
+                direction: "out",
+                peer: peer.map(str::to_string),
+                file: s.clone(),
+                stored: None,
+                bytes: 0,
+                sha256: None,
+                ok: false,
+            }
+            .to_json();
+            v["error"] = json!(reason);
+            v
+        })
+        .collect()
+}
+
+/// Record a send that failed before any file was offered (see
+/// [`unoffered_records`]).
+pub(crate) fn append_unoffered(peer: Option<&str>, sources: &[String], reason: &str) {
+    append_values(unoffered_records(peer, sources, reason, now_secs()));
+}
+
 /// The newest `n` records, oldest first, as `status --json` reports them.
 pub(crate) fn recent(n: usize) -> Vec<Value> {
     let all = load();
@@ -112,7 +161,11 @@ pub(crate) fn human_line(v: &Value) -> String {
     let peer = v["peer"].as_str().unwrap_or("?");
     let file = v["file"].as_str().unwrap_or("?");
     let bytes = crate::human(v["bytes"].as_u64().unwrap_or(0));
-    let state = if v["ok"].as_bool() == Some(true) { "" } else { "  (not delivered)" };
+    let state = match (v["ok"].as_bool(), v["error"].as_str()) {
+        (Some(true), _) => String::new(),
+        (_, Some(why)) => format!("  (failed: {why})"),
+        _ => "  (not delivered)".to_string(),
+    };
     let stored = match v["stored"].as_str() {
         Some(s) if v["direction"] == "in" || s != file => format!(" -> {s}"),
         _ => String::new(),
@@ -171,5 +224,27 @@ mod tests {
         let line = human_line(&r.to_json());
         assert!(line.starts_with("received a.txt"), "{line}");
         assert!(line.contains("from laptop") && line.contains("not delivered"), "{line}");
+    }
+
+    /// E4: `send -` that ran out of spool space failed before offering
+    /// anything, and the history had no trace of it. A failed send is
+    /// recorded too, `ok: false`, with its reason.
+    #[test]
+    fn a_send_that_failed_before_offering_is_recorded_with_its_reason() {
+        let recs = unoffered_records(
+            Some("laptop"),
+            &["stdin".to_string()],
+            "no space left for the stdin spool in /tmp",
+            42,
+        );
+        assert_eq!(recs.len(), 1);
+        let v = &recs[0];
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["direction"], json!("out"));
+        assert_eq!(v["file"], json!("stdin"));
+        assert_eq!(v["time"], json!(42));
+        assert!(v["error"].as_str().unwrap().contains("no space"), "{v}");
+        let line = human_line(v);
+        assert!(line.contains("failed: no space left"), "{line}");
     }
 }
