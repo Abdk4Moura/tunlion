@@ -134,7 +134,9 @@ jobs:
           # that a machine cannot see is the thing #249 exists to catch.
           declare -A EXPECT=(
             [cli/tests/ssh-ca-gates.sh]=8
-            [cli/tests/exec-gates.sh]=18
+            # 21: Q1/Q2 (a SIGKILLed serving daemon leaves nothing running) and R
+            # (a forgotten device is refused as unrecognized) joined the 18.
+            [cli/tests/exec-gates.sh]=21
             [cli/tests/sync-gates.sh]=18
             # 23 gate slots (FORGET-REFUSED, from #385, is the 23rd). This was 24 while gateRECON existed, but RECON read
             # AUTH-A's own exec result and printed a second PASS for it, so one

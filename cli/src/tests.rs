@@ -4600,6 +4600,46 @@ fn revoking_one_fleet_device_leaves_its_sibling_granted() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `devices forget` takes the forgotten key's grants with it. They live in
+/// caps.json keyed by the device KEY, so removing the record alone left that
+/// key holding shell. A sibling's grant is untouched, and the old grant op
+/// cannot be replayed back in over the tombstone the forget left.
+#[test]
+fn forget_revokes_the_forgotten_keys_grants_and_only_those() {
+    let _guard = lock_test_config();
+    let (dir, _uk, laptop, desktop) = fleet_pair_fixture("forget-grants");
+    let expires = crate::capability::now_secs() + 3600;
+    assert!(crate::device_caps::issue_signed_bounded_grant("laptop", "shell", expires).unwrap());
+    assert!(crate::device_caps::issue_signed_bounded_grant("desktop", "shell", expires).unwrap());
+    assert!(explicit_shell(&dir, &laptop) && explicit_shell(&dir, &desktop));
+    let old_grant = crate::capability::load_cap_store(&dir)
+        .into_iter()
+        .find(|e| {
+            e["type"].as_str() == Some("cap_grant")
+                && e["target"].as_str() == Some(hex::encode(laptop.device_pub).as_str())
+        })
+        .expect("laptop's grant is stored");
+
+    crate::fleet_support::forget_device("laptop", crate::identity::now_secs()).unwrap();
+
+    assert!(!explicit_shell(&dir, &laptop), "a forgotten key keeps no grant");
+    assert!(explicit_shell(&dir, &desktop), "forgetting laptop leaves desktop's grant");
+    // Replaying the grant op it held is refused by the tombstone's version.
+    let mut store = crate::capability::load_cap_store(&dir);
+    let hdr = store
+        .iter()
+        .find(|e| e["type"].as_str() == Some("cap_header") && e["resource"].as_str() == Some("self"))
+        .and_then(crate::capability::CapHeader::from_json)
+        .expect("self header");
+    let replay = crate::capability::CapOp::from_json(&old_grant).expect("the stored grant parses as an op");
+    assert!(
+        crate::capability::apply_cap_op(&mut store, &hdr, &replay, crate::capability::now_secs()).is_err(),
+        "the forgotten key's old grant must not apply again"
+    );
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn user_wide_grant_is_explicit_and_a_device_revoke_takes_it() {
     let _guard = lock_test_config();

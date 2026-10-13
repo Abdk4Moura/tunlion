@@ -38,6 +38,11 @@ pub(crate) enum Code {
     /// The acceptor is configured to drop shells to another account
     /// (`--shell-user`) and cannot do so (it is not running as root).
     UserDropUnavailable,
+    /// The acceptor does not know this device at all: it claimed a pairing
+    /// the acceptor no longer holds (forgotten there) or never held. Decided
+    /// before any capability question, so it is never reported as a missing
+    /// grant or as serving being off.
+    Unrecognized,
 }
 
 impl Code {
@@ -50,6 +55,7 @@ impl Code {
             Code::CertRevoked => "cert-revoked",
             Code::Ceiling => "ceiling",
             Code::UserDropUnavailable => "user-drop-unavailable",
+            Code::Unrecognized => "not-recognized",
         }
     }
 
@@ -62,6 +68,7 @@ impl Code {
             "cert-revoked" => Code::CertRevoked,
             "ceiling" => Code::Ceiling,
             "user-drop-unavailable" => Code::UserDropUnavailable,
+            "not-recognized" => Code::Unrecognized,
             _ => return None,
         })
     }
@@ -84,6 +91,10 @@ pub(crate) fn revoked_reason(as_name: Option<&str>) -> String {
         None => "shell revoked for this device here".to_string(),
     }
 }
+
+/// Canonical human reason for a device the acceptor does not recognize.
+pub(crate) const UNRECOGNIZED_REASON: &str =
+    "this device is not recognized here: it was forgotten, or was never paired";
 
 /// Canonical human reason for a user drop the acceptor cannot perform.
 pub(crate) const USER_DROP_REASON: &str =
@@ -108,6 +119,7 @@ impl Refusal {
             Code::CertRevoked => "device revoked".to_string(),
             Code::Ceiling => crate::capability::CEILING_REASON.to_string(),
             Code::UserDropUnavailable => USER_DROP_REASON.to_string(),
+            Code::Unrecognized => UNRECOGNIZED_REASON.to_string(),
         };
         Refusal {
             code,
@@ -186,6 +198,9 @@ pub(crate) fn code_from_reason(reason: &str) -> Option<Code> {
     }
     if r == USER_DROP_REASON {
         return Some(Code::UserDropUnavailable);
+    }
+    if r == UNRECOGNIZED_REASON {
+        return Some(Code::Unrecognized);
     }
     if r.starts_with("shell not granted to")
         || r.starts_with("shell capability not granted")
@@ -298,6 +313,15 @@ pub(crate) fn remedy(code: Code, peer: &str, me: &str) -> (String, Option<String
             ),
             None,
         ),
+        // No grant can fix this and no command run here can either: the
+        // acceptor holds no record of this device, so only its owner can let
+        // it back in, by pairing or enrolling it again.
+        Code::Unrecognized => (
+            format!(
+                "'{peer}' holds no record of this device (it was forgotten there), so no grant applies. Only the owner of '{peer}' can let it back in, by pairing or enrolling it again."
+            ),
+            None,
+        ),
     }
 }
 
@@ -356,7 +380,7 @@ pub(crate) fn explain(verb: &str, peer: &str, reason: &str, code: Option<Code>, 
 mod tests {
     use super::*;
 
-    const ALL: [Code; 7] = [
+    const ALL: [Code; 8] = [
         Code::ShellOff,
         Code::TunnelOff,
         Code::NotGranted,
@@ -364,6 +388,7 @@ mod tests {
         Code::CertRevoked,
         Code::Ceiling,
         Code::UserDropUnavailable,
+        Code::Unrecognized,
     ];
 
     #[test]

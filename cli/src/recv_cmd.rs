@@ -518,6 +518,21 @@ async fn handle_forward_open(
     // the mux now, so it can't leak past the stream).
 }
 
+/// The refusal for a shell-class open while serving is OFF here (`off` is
+/// ShellOff or TunnelOff). Its remedy is a grant, which is wrong for a
+/// delegated device whose invitation ceiling excludes shell: `grant` refuses
+/// exactly that, so the device was handed a command that would fail. Such a
+/// device gets the ceiling refusal instead, whose remedy is the re-enrolment.
+fn serving_off_refusal(conn: &Conn, pid: &str, off: crate::refusal::Code) -> crate::refusal::Refusal {
+    let who = conn.link(pid).and_then(|l| l.verified_name.clone());
+    let outside = who.as_deref().and_then(crate::principal_ceiling_for).is_some_and(|c| {
+        crate::pair_cmd::grant_vs_ceiling(Some(c.as_slice()), crate::capability::CAP_SHELL, false)
+            == crate::pair_cmd::GrantVsCeiling::OutsideCeiling
+    });
+    let code = if outside { crate::refusal::Code::Ceiling } else { off };
+    crate::refusal::Refusal::new(code, who)
+}
+
 /// Accept one `pty-open` frame: validate, shell-gate, attach or spawn,
 /// acknowledge. Extracted verbatim from the recv loop arm so unsettled opens
 /// can be parked and re-driven through this same function.
@@ -542,8 +557,7 @@ async fn handle_pty_open(
     // no output. Say so, so the initiator errors instead of waiting.
     if !l2_enabled {
         let sid = l2::wire_sid(&v).unwrap_or(0);
-        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
-        let refusal = crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+        let refusal = serving_off_refusal(conn, &pid, crate::refusal::Code::ShellOff);
         let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
@@ -1682,6 +1696,12 @@ pub(crate) async fn recv_cmd(
     let mut revocation_snap = crate::revocation_live::store_snapshot();
     let mut revocation_sweep_now = false;
     let mut revoked_secrets: std::collections::HashSet<String> = Default::default();
+    // Links whose peer claimed a pairing this store does not hold (its
+    // pair-proof failed: forgotten here, or never paired). Every shell-class
+    // open on such a link is refused as unrecognized before any handler runs,
+    // so a forgotten device hears who refused it and why, not "serving is off"
+    // or "no grant", which named fixes that cannot apply.
+    let mut unrecognized_pids: std::collections::HashSet<String> = Default::default();
     let mut revocation_waiters: Vec<ctl::Req> = Vec::new();
     // How long an offer may wait for its sender to prove itself before we decide
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
@@ -5362,6 +5382,37 @@ pub(crate) async fn recv_cmd(
                     }
                 }
                 _ if !conn.links.contains_key(&pid) => {}
+                // A peer whose pair-proof FAILED here (forgotten, or never
+                // paired) and that has proven no other identity since: refuse
+                // every shell-class open with that fact, ahead of the serving
+                // and capability arms below. Those would answer "serving is off"
+                // or "no grant", and either sends the user to a fix that cannot
+                // apply to a device this machine does not know.
+                Some(
+                    ty @ ("exec-open" | "pty-open" | "l2-open" | "mount-open"
+                    | "ssh-sign-request" | "shell-bootstrap"),
+                ) if unrecognized_pids.contains(&pid)
+                    && conn.link(&pid).is_some_and(|l| l.verified_name.is_none()) =>
+                {
+                    ui::say(&format!("l2: {ty} refused: the peer is not a device recognized here"));
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let refusal =
+                            crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None);
+                        if ty == "shell-bootstrap" {
+                            let mut f = json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": refusal.reason,
+                            });
+                            refusal.annotate(&mut f);
+                            let _ = t.send_control(&f).await;
+                        } else if let Some(sid) = v["sid"].as_u64() {
+                            let mut f = json!({ "type": "l2-close", "sid": sid, "err": refusal.reason });
+                            refusal.annotate(&mut f);
+                            let _ = t.send_control(&f).await;
+                        }
+                    }
+                    continue;
+                }
                 // Warm-reuse liveness: the acceptor confirmed a stream WE initiated
                 // (a warm `open`) is connected end to end. Route it to the mux so
                 // verify_first_frame passes even for a client-speaks-first service
@@ -5469,9 +5520,8 @@ pub(crate) async fn recv_cmd(
                 // instead of a hang.
                 Some("l2-open") if !l2_enabled => {
                     if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
-                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
                         let refusal =
-                            crate::refusal::Refusal::new(crate::refusal::Code::TunnelOff, who);
+                            serving_off_refusal(&conn, &pid, crate::refusal::Code::TunnelOff);
                         let _ = t.send_control(&refusal.close_frame(sid)).await;
                     }
                     continue;
@@ -5480,9 +5530,8 @@ pub(crate) async fn recv_cmd(
                 // the caller errors instead of hanging on a silent drop.
                 Some("exec-open") if !l2_enabled => {
                     if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
-                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
                         let refusal =
-                            crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+                            serving_off_refusal(&conn, &pid, crate::refusal::Code::ShellOff);
                         let _ = t.send_control(&refusal.close_frame(sid)).await;
                     }
                     continue;
@@ -5504,9 +5553,8 @@ pub(crate) async fn recv_cmd(
                 #[cfg(unix)]
                 Some("shell-bootstrap") if !l2_enabled => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
                         let refusal =
-                            crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+                            serving_off_refusal(&conn, &pid, crate::refusal::Code::ShellOff);
                         let mut f = json!({
                             "type": "shell-bootstrap-deny",
                             "reason": refusal.reason,
@@ -6245,8 +6293,13 @@ pub(crate) async fn recv_cmd(
                             }
                         }
                         ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
+                        unrecognized_pids.remove(&pid);
                         true
                     } else {
+                        // Remembered for the open guard above; links gone since
+                        // are dropped from the set here so it cannot grow.
+                        unrecognized_pids.retain(|p| conn.links.contains_key(p));
+                        unrecognized_pids.insert(pid.clone());
                         // CRITICAL, a security verdict the user must see (-q too).
                         ui::critical(&ui::paint(
                             ui::Tone::Warn,

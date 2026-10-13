@@ -1984,8 +1984,12 @@ pub(crate) async fn bring_up_to_known(
                 // Hand sio + peer to the caller via a guard: a long-lived tunnel
                 // `forget()`s it (keep alive); the bootstrap `close().await`s it
                 // (tear down before the second link).
+                // DEBUG, like the direct-QUIC arm above: a transport being up
+                // says nothing about whether the peer will serve this device.
+                // At INFO it read as a promise, and a forgotten device saw
+                // "tunnel up to 'alpha'" right before alpha refused it.
                 if !role.starts_with("reconnect") && role != "bootstrap" {
-                    crate::ui::say(&format!("tunlion: tunnel up to '{peer_name}'"));
+                    crate::ui::debug(&format!("tunlion: tunnel up to '{peer_name}'"));
                 }
                 // Transport is up via WebRTC: Establishing race won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.

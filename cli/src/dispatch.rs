@@ -1908,19 +1908,32 @@ pub(crate) async fn async_main() -> Result<()> {
                     &capability,
                     resource_scoped,
                 ) {
-                    crate::pair_cmd::GrantVsCeiling::AlreadyCovered => bail!(
-                        "'{capability}' is already granted to '{device}' by its invitation ceiling; no grant is needed"
-                    ),
-                    _ => bail!(
-                        "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
-                        ceiling.join(", "),
-                        crate::identity_state::reenrol_steps(
-                            &device,
-                            &crate::display_name(),
-                            &capability,
-                            &ceiling
-                        )
-                    ),
+                    // The state asked for already holds: success, not an
+                    // error. It exited 1, so a provisioning script that
+                    // grants idempotently failed on its second run.
+                    crate::pair_cmd::GrantVsCeiling::AlreadyCovered => {
+                        ui::say(&format!(
+                            "'{capability}' is already granted to '{device}' by its invitation ceiling; nothing to do"
+                        ));
+                        return Ok(());
+                    }
+                    // A decision against the request: the documented
+                    // "denied" exit (4), not the catch-all 1.
+                    _ => {
+                        return Err(crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::Denied,
+                            format!(
+                                "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
+                                ceiling.join(", "),
+                                crate::identity_state::reenrol_steps(
+                                    &device,
+                                    &crate::display_name(),
+                                    &capability,
+                                    &ceiling
+                                )
+                            ),
+                        ));
+                    }
                 }
             }
             if user && owner_pk.is_none() {
