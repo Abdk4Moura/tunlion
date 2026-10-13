@@ -846,17 +846,33 @@ fi
 # --------------------------------------------------------------- gate 15 ----
 say "15: paired recv holds the line when the sender vanishes (C21)"
 D="$WORK/g15"; mkdir -p "$D"
-"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g15-send.log" 2>&1 &
+# The sender really vanishes: SIGKILLed mid-transfer, no clean leave. This gate
+# used to make the sender leave by having the receiver DECLINE (no -y, no
+# tty), and asserted that the receiver then held the line and blamed the
+# sender. That was the launch-blocker lie: a receiver that refused the offer
+# itself now ends at once with its own reason (exit 2, `no_tty`; asserted by
+# scripting-contract-gates K2). C21 is about a sender that goes away, so the
+# sender goes away. FILAMENT_TEST_TRANSFER_STALL_MS keeps the kill mid-transfer
+# (the same remedy as gates 2 and 11b).
+FILAMENT_TEST_TRANSFER_STALL_MS=${FILAMENT_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g15-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g15-send.log") || { bad "stepped-away wait (no code minted)"; tail -n 3 "$WORK/g15-send.log"; }
+FILAMENT_REJOIN_SECS=8 timeout 90 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" </dev/null >"$WORK/g15-recv.log" 2>&1 &
+RP=$!; pids+=($RP)
+for _ in $(seq 1 60); do
+  sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((2 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null
 T0=$(date +%s)
-# no -y and no tty -> the offer is declined -> sender exits -> peer-left with
-# nothing received; the OLD behavior bailed instantly, C21 holds the line.
-FILAMENT_REJOIN_SECS=8 timeout 60 "$BIN" receive "$W" --dir "$D" --server "$SERVER" </dev/null >"$WORK/g15-recv.log" 2>&1
-RC=$?
+wait $RP; RC=$?
 T1=$(date +%s)
-wait $SP 2>/dev/null
-if [ $RC -ne 0 ] && grep -q "holding the line" "$WORK/g15-recv.log" \
+# A sender lost mid-transfer is announced as "sender disconnected mid-transfer,
+# waiting up to 8s" (before any transfer it was "stepped away, holding the
+# line up to 8s"): either way the receiver must say it holds, and for how long.
+if [ $RC -ne 0 ] && grep -qE "(holding the line|waiting) up to 8s" "$WORK/g15-recv.log" \
    && grep -q "did not come back within 8s" "$WORK/g15-recv.log" \
    && [ $((T1 - T0)) -ge 8 ]; then
   ok "stepped-away sender: held ${FILAMENT_REJOIN_SECS:-8}s window, then failed honestly"

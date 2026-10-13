@@ -255,7 +255,7 @@ test holds to the help text.
 | 9 | `no_identity` | this device has no identity yet: `tunlion init`, or `tunlion join <invitation>` |
 | 10 | | `up`: a daemon is already running with different settings; nothing was applied, and the message names the restart (`DAEMON_CONFLICT`) |
 | 11 | | `status`: no daemon is running for this config directory (`STATUS_NOT_RUNNING`) |
-| 12 | `local_resource` | a resource on THIS machine ran out: its disk or quota is full, it has no file descriptors or memory left (a full stdin spool, `add --out` onto a full disk). A receiver's full disk is 4, the peer refusing, with `error.reason: "no_space"` |
+| 12 | `local_resource` | a resource on THIS machine ran out: its disk or quota is full, it has no file descriptors or memory left (a full stdin spool, `add --out` onto a full disk). A receiver's full disk is 4 for the sender, the peer refusing, with `error.reason: "no_space"`, and 12 for `receive` itself |
 | 126 | | `exec`: the remote command was found but cannot be executed there |
 | 127 | | `exec`: the remote command is not on the remote daemon's PATH |
 | 130 | `interrupted` | interrupted (SIGINT) |
@@ -388,6 +388,41 @@ Rules that go with them:
   is the name the receiver stored it under, from an additive field on its
   delivery-ack; null from an older receiver. A send whose files were all
   declined exits 4; some delivered and some declined exits 8.
+- **`send --json` with a code is two lines on stdout**: first an event,
+  `{"event":"code","verb":"send","code":"<words-NNNN>","expires_in_secs":600,"receive":"tunlion receive <code>"}`,
+  printed the moment the code exists, then the result object when the send
+  ends. A script reads the first line to hand the code on and the last line
+  for the outcome; only the last has `ok`. A send to a device (`--to`) prints
+  the result object alone. A code send waits as long as it advertises: the
+  code's lifetime (10 min), or `--timeout` when given, and "expires in" says
+  that bound. It gave up after 60 s while saying 10 min.
+- **An interrupted `send --json`** prints the same result object as every
+  other send failure (`peer`, `bytes`, `files`), with `error.code`
+  `interrupted`, `error.exit` 130 or 143 and `error.signal`.
+- **`receive` ends with the receiver's own reason.** A one-shot receive that
+  refused or declined every file ends as soon as nothing is in flight (it
+  used to hold the line for the sender, then say "the sender is unreachable",
+  exit 6): this machine's disk is full is 12 (`local_resource`, reason
+  `no_space`); no tty to ask on and no `-y` is 2 (`usage`, reason `no_tty`);
+  a person saying no, or a capability refusing the sender, is 4 (`denied`);
+  another local storage failure (read-only folder, a name the filesystem
+  refuses) is 2. Some files stored and some refused is 8.
+- **`receive --json`** prints one result object, the `send` contract: `ok`
+  (true exactly when the exit is 0), `verb: "receive"`, `dir`, `bytes` (what
+  was stored), `files` (each with `file`, `bytes`, `sha256`, `received`,
+  `stored_name`, `refusal`: null or `{"reason","message"}`), and `error`
+  `{code, exit, reason, message}` on failure. `--json` with `-o -` is refused
+  (both write to stdout).
+- **A corrupt state file is an error, never an empty store.** When
+  `devices.json`, `revoked-keys.json`, `used-invitations.json`, `peerconf` or
+  `config` does not parse, every command (except `reset`, `down`, `logs`,
+  `config`, `completions`, `man`, `update`) exits 2 naming the file and the
+  parse error, and no write replaces it. Every write first keeps the previous
+  good file as `<name>.bak`, and the error names that copy when it exists. A
+  corrupt `devices.json` used to list no devices with exit 0.
+- **`devices --json` rows carry `status`**, the human row's word for the same
+  value: `"online"` (`online: true`), `"idle"` (`online: false`: no answering
+  link right now), or null.
 - **`up --detach` waits up to 10 s** for the daemon to report it is serving
   (the ready marker it writes beside systemd's READY=1, or its control
   socket). A daemon that exits during startup is reported with its last lines

@@ -44,8 +44,12 @@ pub(crate) fn write_pidfile() -> Result<()> {
     let exe = std::env::current_exe()?;
     let _ = std::fs::remove_file(ready_marker());
     // Owner-only, like the rest of the config dir (#388).
-    crate::platform::SecretFile::write_str(&pidfile_exe(), &format!("{}\n", exe.display()))?;
-    crate::platform::SecretFile::write_str(&pidfile(), &format!("{pid}\n"))?;
+    // Name the file: a config directory this user cannot write (chmod 500)
+    // said only "Permission denied (os error 13)".
+    let named = |p: PathBuf| move |e: std::io::Error| anyhow::anyhow!("cannot write {}: {e}", p.display());
+    crate::platform::SecretFile::write_str(&pidfile_exe(), &format!("{}\n", exe.display()))
+        .map_err(named(pidfile_exe()))?;
+    crate::platform::SecretFile::write_str(&pidfile(), &format!("{pid}\n")).map_err(named(pidfile()))?;
     Ok(())
 }
 

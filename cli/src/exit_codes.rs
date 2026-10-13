@@ -317,7 +317,7 @@ const RECEIVE_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 130, 141, 143];
 const SYNC_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 130, 141, 143];
 const EXEC_CODES: &[i32] = &[1, 2, 3, 4, 6, 7, 9, 126, 127, 130, 141, 143];
 const REACH_CODES: &[i32] = &[0, 1, 2, 3, 5, 6, 7, 9, 130, 143];
-const STATUS_CODES: &[i32] = &[0, 1, 6, 9, 11, 130, 143];
+const STATUS_CODES: &[i32] = &[0, 1, 2, 6, 9, 11, 130, 143];
 const DEVICES_CODES: &[i32] = &[0, 1, 2, 3, 9, 12];
 const DOCTOR_CODES: &[i32] = &[0, 1, 2, 3, 6, 7, 9, 130, 143];
 const UP_CODES: &[i32] = &[0, 1, 2, 4, 7, 9, 10, 12, 130, 143];
@@ -481,6 +481,9 @@ pub(crate) fn interrupted_envelope(code: i32) -> Value {
     }
     let mut v = json!({ "ok": false, "error": error });
     if let Some(verb) = verb() {
+        if verb == "send" {
+            return crate::send_report::interrupted_object(v);
+        }
         v["verb"] = json!(verb);
     }
     v

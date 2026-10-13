@@ -572,6 +572,16 @@ pub fn json_out(v: &serde_json::Value) {
     let _ = out.flush();
 }
 
+/// An EVENT line on STDOUT under `--json`, ahead of the command's one result
+/// object (`send --json` with a code prints `{"event":"code",...}` first).
+/// Unlike [`json_out`] it does not count as the answer: the result object,
+/// or the interrupt failure object, still follows.
+pub fn json_event(v: &serde_json::Value) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{v}");
+    let _ = out.flush();
+}
+
 /// CRITICAL level: the value-prop + must-see lines, the route label, the relay
 /// banner, P1's fall-to-relay, P5's upgrade/relay-released, and fatal errors.
 /// ALWAYS printed, even under `-q` (critical is level 0).

@@ -39,9 +39,51 @@ pub(crate) fn receiver_gone_message(secs: u64, by_code: bool) -> String {
     format!("the receiver is unreachable: it disconnected and did not come back within {secs}s. {way_on}")
 }
 
+/// How often a send that is waiting says so. `exec` uses the same 7 s.
+pub(crate) const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(7);
+
+/// The progress line for a send that is waiting on its peer, or None when
+/// there is nothing to say. A peer frozen or killed mid-send used to mean a
+/// minute of silence before the error. `heard_ms` is how long since the peer
+/// last sent anything (None when the link does not track it). Pure.
+pub(crate) fn still_waiting_line(
+    peer: &str,
+    established: bool,
+    elapsed: std::time::Duration,
+    heard_ms: Option<u64>,
+    unfinished: bool,
+) -> Option<String> {
+    if !unfinished {
+        return None;
+    }
+    if !established {
+        return Some(format!("  still waiting for {peer} to connect ({}s)", elapsed.as_secs()));
+    }
+    match heard_ms? {
+        h if h < HEARTBEAT.as_millis() as u64 => None,
+        u64::MAX => Some(format!(
+            "  still waiting for {peer}: the link is down, trying to reconnect ({}s)",
+            elapsed.as_secs()
+        )),
+        h => Some(format!("  still waiting for {peer}: no answer for {}s", h / 1000)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_waiting_send_says_so_and_a_flowing_one_does_not() {
+        let s = std::time::Duration::from_secs(21);
+        let l = still_waiting_line("bravo", false, s, None, true).unwrap();
+        assert!(l.contains("still waiting for bravo") && l.contains("21s"), "{l}");
+        let l = still_waiting_line("bravo", true, s, Some(14_200), true).unwrap();
+        assert!(l.contains("no answer for 14s"), "{l}");
+        assert!(still_waiting_line("bravo", true, s, Some(800), true).is_none());
+        assert!(still_waiting_line("bravo", true, s, Some(14_200), false).is_none());
+        assert!(still_waiting_line("bravo", true, s, None, true).is_none());
+    }
 
     /// The window printed is the window passed in (the one enforced), and an
     /// empty name is never printed as a name.
