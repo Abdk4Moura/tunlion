@@ -71,11 +71,12 @@ def need(n):
             raise EOFError("closed after %d bytes" % len(b))
         b += c
     return b
+got = None
 try:
     s.sendall(b"\x05\x01\x02"); assert need(2) == b"\x05\x02"
     s.sendall(b"\x01" + bytes([7]) + b"tunlion" + bytes([len(pw)]) + pw); assert need(2) == b"\x01\x00"
     s.sendall(b"\x05\x01\x00\x03" + bytes([len(dst)]) + dst + dport.to_bytes(2, "big"))
-    r = need(10)
+    r = need(10); got = r[1]
     out = "rep=%d secs=%.1f" % (r[1], time.time() - t)
     if r[1] == 0:
         s.sendall(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n")
@@ -83,7 +84,10 @@ try:
         out += " http=%s" % (line.split(" ")[1] if " " in line else "none")
     print(out)
 except socket.timeout:
-    print("rep=none secs=%.1f (no reply: hung)" % (time.time() - t))
+    if got is None:
+        print("rep=none secs=%.1f (no reply: hung)" % (time.time() - t))
+    else:
+        print("rep=%d secs=%.1f http=none (granted, then held: no data and no close)" % (got, time.time() - t))
 except Exception as e:
     print("rep=none secs=%.1f (%s)" % (time.time() - t, e))
 PY

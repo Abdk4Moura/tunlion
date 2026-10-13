@@ -726,6 +726,17 @@ async fn poll_loop(
                 }
             }
 
+            // The peer's FIN, with every byte before it delivered to the pipe:
+            // the reader sees EOF now. A half-closed socket (CLOSE-WAIT) is
+            // still active, so the reap below never fired for it and the
+            // reader of a stream the peer had closed waited forever.
+            if rec.established && !s.may_recv() {
+                let open = !rec.inp.st.lock().unwrap().closed;
+                if open {
+                    mark_closed(&rec.inp);
+                }
+            }
+
             // Lifecycle: a closed/reset socket EOFs the app pipes and is reaped.
             if !s.is_active() && rec.established {
                 mark_closed(&rec.inp);

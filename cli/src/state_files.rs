@@ -60,7 +60,7 @@ pub(crate) fn parse_problem(raw: &[u8], shape: Shape) -> Option<String> {
         Err(e) => return Some(format!("not UTF-8 text ({e})")),
     };
     if text.trim().is_empty() {
-        return Some("the file is empty; tunlion never writes an empty one, so it was truncated".to_string());
+        return Some("the file is empty, and no command writes an empty one, so it was truncated".to_string());
     }
     match shape {
         Shape::JsonArray => match serde_json::from_str::<serde_json::Value>(text) {
