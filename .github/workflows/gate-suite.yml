@@ -45,7 +45,11 @@
 #                              when delivered), a cold reach --json says cold
 #                              with its path, an interrupted --json verb prints
 #                              its failure object (SIGINT 130, SIGTERM 143), and
-#                              a full receiver's typed reason reaches --json
+#                              a full receiver's typed reason reaches --json;
+#                              receive exits with its own reason (12 disk full,
+#                              2 no tty) at once, a corrupt devices.json is an
+#                              error naming it, and a code send --json puts the
+#                              code on stdout first
 #                              (mounts a small tmpfs, so it uses sudo)
 #
 # mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
@@ -182,7 +186,7 @@ jobs:
             [cli/tests/signaling-freeze-gates.sh]=5
             [cli/tests/config-scope-gates.sh]=4
             [cli/tests/identity-relink-gates.sh]=3
-            [cli/tests/scripting-contract-gates.sh]=6
+            [cli/tests/scripting-contract-gates.sh]=10
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
