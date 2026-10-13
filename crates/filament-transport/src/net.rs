@@ -2090,7 +2090,11 @@ async fn wire_channel(
             }
 
             // Our read loop: text -> Control, binary -> [u32 sid][payload].
-            {
+            //
+            // BUILT here, SPAWNED last (after ChannelReady is queued, below). A
+            // future does nothing until it is spawned, so this only fixes WHEN
+            // reading starts. See `announce_then_read` for why that matters.
+            let reader = {
                 let raw = raw.clone();
                 let tx = tx.clone();
                 let closed = closed.clone();
@@ -2100,7 +2104,7 @@ async fn wire_channel(
                 let last_heard = last_heard.clone();
                 let first_data = first_data.clone();
                 let peer_id = peer_id.clone();
-                tokio::spawn(async move {
+                async move {
                     let mut buf = vec![0u8; READ_BUF];
                     loop {
                         let read = raw.read_data_channel(&mut buf).await;
@@ -2157,9 +2161,10 @@ async fn wire_channel(
                             }
                         }
                     }
-                });
-            }
+                }
+            };
 
+            let mut ready = None;
             if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                 // Relay/DataChannel links have NO QUIC keepalive, so an idle one
                 // on a container/DERP path is silently evicted in ~10s, after which
@@ -2222,15 +2227,119 @@ async fn wire_channel(
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
                     });
-                let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
+                ready = Some(Ev::ChannelReady(peer_id.clone(), transport));
             }
+            announce_then_read(&tx, ready, reader);
         })
     }));
+}
+
+/// Queue the channel's `ChannelReady`, THEN start the task that reads it.
+///
+/// Both go into the same unbounded FIFO, so this order is what guarantees a
+/// consumer sees `ChannelReady` for a peer before any `Control` from it. The
+/// reader used to be spawned first. A peer that writes the moment ITS side
+/// opens (the joiner sends `identity-auth-key-enroll-request` from its own
+/// ChannelReady) has that frame buffered by the time ours opens, so the reader
+/// could queue it before ChannelReady was sent. The daemon then handled the
+/// request on a link with no transport attached yet, `transport_of` was None,
+/// and the request was dropped without a word: `tunlion join` printed "sent
+/// enrollment request" and waited out its 60s deadline. That is the shape of
+/// both CI wedges seen (`join --name delta` in revocation-live, `join --name
+/// bravo` in forward-refusal): owner shows the link up, no challenge ever sent.
+///
+/// Reading later loses nothing: unread frames stay buffered in the SCTP
+/// stream until the reader takes them. `ready` is None when the link was
+/// closed while opening; the reader still runs so the channel is drained and
+/// marked dead, and it forwards nothing for a closed link.
+fn announce_then_read<F>(tx: &mpsc::UnboundedSender<Ev>, ready: Option<Ev>, reader: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Some(ev) = ready {
+        let _ = tx.send(ev);
+    }
+    tokio::spawn(reader);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubTransport;
+
+    #[async_trait]
+    impl Transport for StubTransport {
+        async fn send_control(&self, _msg: &Value) -> Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The join hang: a frame the peer wrote the instant ITS side opened is
+    /// already buffered when ours opens, so our reader forwards it at once. The
+    /// consumer must still see ChannelReady first, or it handles the frame on a
+    /// link with no transport and drops it (the enrolment request, lost without
+    /// a word, left `tunlion join` waiting out its deadline). The reader here
+    /// does exactly that, forwarding on its first poll from another worker
+    /// thread, and the check runs many times because the old order lost only
+    /// a race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn channel_ready_is_queued_before_any_control_from_the_peer() {
+        for round in 0..200 {
+            let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+            let reader_tx = tx.clone();
+            let reader = async move {
+                let _ = reader_tx.send(Ev::Control(
+                    "peer".into(),
+                    json!({ "type": "identity-auth-key-enroll-request" }),
+                ));
+            };
+            let transport: Arc<dyn Transport> = Arc::new(StubTransport);
+            announce_then_read(
+                &tx,
+                Some(Ev::ChannelReady("peer".into(), transport)),
+                reader,
+            );
+            let first = rx.recv().await.expect("an event");
+            assert!(
+                matches!(first, Ev::ChannelReady(ref p, _) if p == "peer"),
+                "round {round}: a Control from the peer was queued before its ChannelReady"
+            );
+            let second = rx.recv().await.expect("the reader's frame");
+            assert!(
+                matches!(second, Ev::Control(ref p, _) if p == "peer"),
+                "round {round}: the buffered frame must still be delivered, after ChannelReady"
+            );
+        }
+    }
+
+    /// A link closed while opening announces nothing, but its reader still runs
+    /// (it drains the channel and marks it dead), so nothing is leaked or stuck.
+    #[tokio::test]
+    async fn a_closed_channel_announces_nothing_but_still_reads() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let (ran_tx, ran_rx) = tokio::sync::oneshot::channel::<()>();
+        announce_then_read(&tx, None, async move {
+            let _ = ran_tx.send(());
+        });
+        tokio::time::timeout(Duration::from_secs(5), ran_rx)
+            .await
+            .expect("the reader must run even when nothing is announced")
+            .expect("reader signalled");
+        assert!(rx.try_recv().is_err(), "a closed channel must not announce ChannelReady");
+    }
 
     #[test]
     fn c3_defers_once_for_ice_to_pc_handoff_only() {

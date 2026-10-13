@@ -449,6 +449,7 @@ async fn handle_forward_open(
     // Attempt through the whole loop. The initiator path (l2.rs) is
     // fully instrumented and is the side that exhibits the stall.
     let Some(t) = conn.transport_of(&pid) else {
+        crate::conn::dropped_no_transport(&pid, "forward open");
         return;
     };
     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
@@ -658,6 +659,7 @@ async fn handle_pty_open(
     parked: &mut Vec<ParkedOpen>,
 ) {
     let Some(t) = conn.transport_of(&pid) else {
+        crate::conn::dropped_no_transport(&pid, "pty open");
         return;
     };
     // #219: the acceptor is OFF (plain `up`, no --shell/--shell-only,
@@ -2540,6 +2542,7 @@ pub(crate) async fn recv_cmd(
             for p in fire {
                 crate::ui::say(&format!("l2: {:?} open proven; re-driving", p.kind));
                 let Some(t) = conn.transport_of(&p.pid) else {
+                    crate::conn::dropped_no_transport(&p.pid, &format!("parked {:?} open", p.kind));
                     continue;
                 };
                 match p.kind {
@@ -5878,6 +5881,7 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "shell-bootstrap");
                         continue;
                     };
                     // #30 GAP 2 (shell): honor the pending_proven hold. If a
@@ -6139,6 +6143,7 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("exec-open") => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "exec-open");
                         continue;
                     };
                     let mux = l2_muxes
@@ -6164,6 +6169,7 @@ pub(crate) async fn recv_cmd(
                 // parked on an unproven-identity deny like the shell-class opens.
                 Some("sync-open") => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "sync-open");
                         continue;
                     };
                     let mux = l2_muxes
@@ -6199,6 +6205,7 @@ pub(crate) async fn recv_cmd(
                 // the handler sends its own cert/refusal replies.
                 Some("ssh-sign-request") => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "ssh-sign-request");
                         continue;
                     };
                     crate::ssh_ca::handle_ssh_sign(
@@ -6214,6 +6221,7 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("mount-open") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "mount-open");
                         continue;
                     };
                     // wire_sid rejects a missing OR out-of-range sid instead of
@@ -6899,6 +6907,7 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("file-offer") => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "file-offer");
                         continue;
                     };
                     // L1-a (shared-room hardened): on the code path, accept bytes

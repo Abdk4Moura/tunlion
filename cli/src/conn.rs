@@ -350,6 +350,19 @@ pub(crate) fn looks_like_session_id(label: &str) -> bool {
         && count(char::is_ascii_lowercase) >= 3
 }
 
+/// A peer's message needs a reply, but its link has no transport attached, so
+/// it is dropped. Say so. The sender cannot tell a dropped message from a slow
+/// one and waits out its own deadline: that is how the join hang looked from
+/// the joiner's side, and one line here would have named it on the owner's.
+/// Since the transports announce a link before reading it (net.rs
+/// `announce_then_read`, direct.rs `UnreadTransport`), this is reachable only
+/// for a link that went away between the frame being queued and handled.
+pub(crate) fn dropped_no_transport(pid: &str, what: &str) {
+    ui::say(&format!(
+        "tunlion: {what} from {pid} dropped: its link has no transport attached, so nothing was sent back"
+    ));
+}
+
 /// Is a dropped link's departure worth a line? Not when another link to a
 /// peer of the same name is still up: that was a stale duplicate, and "alpha
 /// left" beside "ok alpha" is a contradiction on one line. An unnamed link
@@ -2838,7 +2851,7 @@ impl Conn {
             )
             .await
             {
-                let _ = tx.send(mk(pid_s, t, "direct-quic"));
+                t.announce(&tx, |t| mk(pid_s, t, "direct-quic"));
                 return;
             }
             // rung-2: UDP hole-punch, then rung-1's QUIC race over the punched
@@ -2869,7 +2882,7 @@ impl Conn {
                     )
                     .await
                     {
-                        let _ = tx.send(mk(pid_s, t, "holepunched"));
+                        t.announce(&tx, |t| mk(pid_s, t, "holepunched"));
                         return;
                     }
                 }
