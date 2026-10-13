@@ -4710,7 +4710,8 @@ pub(crate) enum MeshFail {
     Unreachable,
     /// The peer answered and nothing listens on the port there (SOCKS 0x05).
     Refused,
-    /// A link was up but the peer never answered the open (SOCKS 0x06).
+    /// The peer's answer did not arrive in time: the overlay dial timed out
+    /// while the peer was still answering on its link (SOCKS 0x06).
     TimedOut,
 }
 
@@ -4921,7 +4922,11 @@ async fn serve_mesh_connect(
             serve_stream(mux, sid, sock, pipe, true, Some(first), None).await;
         }
         WarmOpen::Refused(reason) => proto.fail(&mut sock, mesh_fail_for_refusal(&reason)).await?,
-        WarmOpen::Dead(_) => proto.fail(&mut sock, MeshFail::TimedOut).await?,
+        // No answer at all on a link we held: a zombie to a peer that is gone
+        // (killed, cut off), the same verdict the daemon's warm path and
+        // `forward` reach. An offline peer is "host unreachable", not a
+        // timeout of a peer that is there.
+        WarmOpen::Dead(_) => proto.fail(&mut sock, MeshFail::Unreachable).await?,
     }
     Ok(())
 }
