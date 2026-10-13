@@ -911,7 +911,8 @@ pub(crate) enum DevicesAction {
     /// Durable revoke: the device stops being recognized NOW and forever (the
     /// record survives as evidence; the gate refuses it on reconnect).
     Revoke { name: String },
-    /// Undo a durable revoke. The device returns to its prior state.
+    /// Undo a revoke (the device returns to its prior record), or lift the
+    /// key block a `forget` left behind (then re-add it with `tunlion add`).
     Restore { name: String },
 }
 

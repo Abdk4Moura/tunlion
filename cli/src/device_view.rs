@@ -128,6 +128,16 @@ pub(crate) fn record_is_revoked(record: &Value) -> bool {
         || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED)
 }
 
+/// Is the stored record named `name` revoked? False when there is no record.
+pub(crate) fn device_record_revoked(name: &str) -> bool {
+    std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .unwrap_or_default()
+        .iter()
+        .any(|d| d["name"].as_str() == Some(name) && record_is_revoked(d))
+}
+
 pub(crate) fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     // A revocation kept by KEY, apart from any record: what `devices forget`
     // leaves behind for a certificate that is still valid. Checked first, so a

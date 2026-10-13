@@ -610,6 +610,21 @@ pub(crate) async fn async_main() -> Result<()> {
             timeout,
         } => {
             let json_out = ui_caps.json || cli.json;
+            // Eval item 5: `--remember` was silently a no-op wherever it could
+            // not apply. It names the device met over a CODE; without one there
+            // is nobody to remember, so refuse rather than ignore it.
+            if let Some(r) = remember.as_deref() {
+                if auth_key.is_none() && !code && word.is_none() {
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Usage,
+                        format!(
+                            "--remember {r} names the device you pair with over a code, and this send has none. \
+                             Add --code (the receiver passes --remember too), or pair for good with:  tunlion add {r}"
+                        ),
+                    ));
+                }
+            }
+            let remember_name = remember.clone();
             let peer = to.clone();
             crate::send_report::set_peer(peer.as_deref());
             let sources = crate::send_report::source_labels(&paths, name.as_deref());
@@ -630,6 +645,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 )
                 .await
             };
+            if let (Ok(()), Some(r)) = (&res, remember_name.as_deref()) {
+                if !crate::shared_defs::REMEMBER_STORED.load(std::sync::atomic::Ordering::Relaxed) {
+                    ui::caution(&crate::shared_defs::remember_not_stored_msg(r, true), None, &[]);
+                }
+            }
             // Both ends keep a structured history; this is the sender's half.
             crate::send_report::persist_history(peer.as_deref());
             if let Err(e) = &res {
@@ -669,6 +689,20 @@ pub(crate) async fn async_main() -> Result<()> {
                     ));
                 }
                 let shown_dir = dir.display().to_string();
+                // Eval item 5: never a silent no-op. With no code and no
+                // terminal to type one into, there is no sender to remember.
+                if let Some(r) = remember.as_deref() {
+                    if code.is_none() && !crate::interactive_allowed() {
+                        return Err(crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::Usage,
+                            format!(
+                                "--remember {r} names the sender of a CODE transfer, and no code was given: \
+                                 tunlion receive <code> --remember {r}"
+                            ),
+                        ));
+                    }
+                }
+                let remember_name = remember.clone();
                 let res = recv_cmd(
                     &server,
                     code,
@@ -689,6 +723,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 // Refused files decide the outcome: all refused is the
                 // refusal's own code, some refused is partial.
                 let res = crate::recv_report::finish(res);
+                if let (Ok(()), Some(r)) = (&res, remember_name.as_deref()) {
+                    if !crate::shared_defs::REMEMBER_STORED.load(std::sync::atomic::Ordering::Relaxed) {
+                        ui::caution(&crate::shared_defs::remember_not_stored_msg(r, false), None, &[]);
+                    }
+                }
                 if json_out {
                     return crate::recv_report::emit(res, &shown_dir);
                 }
@@ -1120,6 +1159,18 @@ pub(crate) async fn async_main() -> Result<()> {
                 // form --help leads with, and still met both prompts.
                 let for_given = for_.is_some();
                 let (kind, named) = resolve_for_kind(&ui_caps, for_)?;
+                // Eval item 3: `add --for person --name u2-a` on a device that
+                // is already one of yours silently re-enrolled it as fleet, and
+                // the two sides were told opposite things. A device holding
+                // your identity's certificate cannot be filed as someone
+                // else's, so refuse before any code is minted, with the reason.
+                if kind == "person" {
+                    if let Some(who) = name.as_deref().or(named.as_deref()) {
+                        if let Some(msg) = crate::pair_cmd::person_names_own_device(who) {
+                            return Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, msg));
+                        }
+                    }
+                }
                 let who_given = named.is_some() || for_given;
                 // ASK "how", not only "who". The comment above names three
                 // orthogonal axes and the guided flow asked exactly one of them,
@@ -1206,6 +1257,8 @@ pub(crate) async fn async_main() -> Result<()> {
                     return add_for_cmd(&ui_caps, Some(kind), invitee, allow, expires, Some(path)).await;
                 }
                 let internal = kind == "device";
+                crate::pair_cmd::FOR_PERSON
+                    .store(kind == "person", std::sync::atomic::Ordering::Relaxed);
                 if internal && load_owner_key().is_none() {
                     bail!(
                         "`add --for device` enrols the other side into your mesh, which \
@@ -1465,11 +1518,29 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 }
                 Some(DevicesAction::Restore { name }) => {
-                    if !device_record_exists(&name) {
-                        bail!("no device named '{name}', see `tunlion devices`");
+                    // Eval item 2: restore did nothing for a FORGOTTEN device,
+                    // whose record is gone but whose key stays refused. It now
+                    // undoes both: a revoke (record kept) and the key block a
+                    // forget leaves behind.
+                    let record = device_record_exists(&name);
+                    let revoked = record && crate::device_view::device_record_revoked(&name);
+                    if revoked {
+                        set_device_revoked(&name, false)?;
                     }
-                    set_device_revoked(&name, false)?;
-                    println!("restored '{name}'; it is recognized again under its prior record");
+                    let lifted = crate::fleet_support::lift_key_revocations_named(&name)?;
+                    println!(
+                        "{}",
+                        crate::fleet_support::restore_report(&name, record, revoked, &lifted)
+                    );
+                    if !record && lifted.is_empty() {
+                        return Err(crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::UnknownDevice,
+                            format!("no device named '{name}', and no forgotten device by that name; see `tunlion devices`"),
+                        ));
+                    }
+                    if revoked || !lifted.is_empty() {
+                        let _ = crate::revocation_live::tell_daemon().await;
+                    }
                 }
             }
             Ok(())

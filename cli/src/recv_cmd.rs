@@ -6376,6 +6376,8 @@ pub(crate) async fn recv_cmd(
                         let kept = match (&remember, ceremony_peer) {
                             (Some(name), true) => match devices_store(name, &sec) {
                                 Ok(stored) => {
+                                    crate::shared_defs::REMEMBER_STORED
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
                                     ui::say(&format!(
                                         "remembered this device as '{stored}', future sends auto-accept after proof"
                                     ));

@@ -68,6 +68,12 @@
 #                              exec and refuses a send as "not recognized"
 #                              (exit 4) instead of "link died" / 60 s of waiting
 #                              (iptables + a small tmpfs, so it uses sudo)
+#   state-ux-gates.sh          --remember is refused where it cannot apply, a
+#                              runner key has one claim verb, a forgotten device
+#                              added again is re-admitted and told so, restore
+#                              lifts a forget's block, --for person cannot name
+#                              your own device, and a person pairing warns
+#                              neither side "EXTERNAL"
 #
 # mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
 # 6 PASS / 2 FAIL -- every mutation through the mount (create/write, mkdir,
@@ -118,6 +124,7 @@ on:
       - 'cli/tests/scripting-contract-gates.sh'
       - 'cli/tests/net-blockers-gates.sh'
       - 'cli/tests/daemon-path-gates.sh'
+      - 'cli/tests/state-ux-gates.sh'
       - 'backend/**'
       - '.github/workflows/gate-suite.yml'
   workflow_dispatch: {}
@@ -210,6 +217,8 @@ jobs:
             [cli/tests/scripting-contract-gates.sh]=11
             [cli/tests/net-blockers-gates.sh]=14
             [cli/tests/daemon-path-gates.sh]=7
+            # 7: R1 R2 K F1 P F2 X (fix/state-ux-blockers).
+            [cli/tests/state-ux-gates.sh]=7
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
@@ -243,7 +252,8 @@ jobs:
                    cli/tests/identity-relink-gates.sh \
                    cli/tests/scripting-contract-gates.sh \
                    cli/tests/net-blockers-gates.sh \
-                   cli/tests/daemon-path-gates.sh; do
+                   cli/tests/daemon-path-gates.sh \
+                   cli/tests/state-ux-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare
