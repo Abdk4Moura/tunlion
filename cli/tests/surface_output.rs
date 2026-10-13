@@ -37,6 +37,10 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // (per-file JSONL, the final summary, the error envelope). Human
         // lines go through ui::. Machine output is what println! is for.
         ("sync_cmd.rs", 3),
+        // skill.rs: two println! sites, each printing one path the command
+        // wrote or removed (`installed|updated <path>`, `removed <path>`) to
+        // stdout for a script; the asides go through ui::.
+        ("skill.rs", 2),
         ("conn.rs", 4),
         ("up_logs.rs", 3),
         ("runtime_support.rs", 3),

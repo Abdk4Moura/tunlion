@@ -301,10 +301,13 @@ pub(crate) fn skill_cmd(action: SkillAction, json_out: bool) -> Result<()> {
                     println!("removed {}", p.display());
                 }
                 for p in &skipped {
-                    println!("left {} alone: it has no {MARKER} marker, so this CLI did not install it", p.display());
+                    crate::ui::say(&format!(
+                        "left {} alone: it has no {MARKER} marker, so this CLI did not install it",
+                        p.display()
+                    ));
                 }
                 if removed.is_empty() {
-                    println!("nothing to remove: this CLI found no skill it had installed");
+                    crate::ui::say("nothing to remove: this CLI found no skill it had installed");
                 }
             }
         }
