@@ -1527,39 +1527,32 @@ pub(crate) async fn recv_cmd(
     #[cfg(l3)]
     let exposer: Option<std::sync::Arc<expose::Exposer>> = match l3.as_ref() {
         Some(m) => {
-            // POSTURE (user decision): a node that SILENTLY fell back to userspace
-            // (Auto, no explicit opt-in) must NOT auto-honor expose.json, because
-            // userspace bypasses host firewall/nftables on filament0 - an operator
-            // who assumed kernel-mode scoping would silently lose it. Only honor
-            // expose in userspace when the user opted in (`--userspace` / the env /
-            // `l3-mode=userspace`). Kernel mode always honors it.
-            let userspace_opt_in = std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1")
-                || settings::get_str("l3-mode", None).as_deref() == Some("userspace");
-            if m.is_userspace() && !userspace_opt_in {
-                if !expose::load().is_empty() {
+            // Honored in EVERY mode, userspace included, exactly as a live
+            // `tunlion expose` (ReloadExpose) already was. Startup used to refuse
+            // expose.json after a userspace fallback while the live apply bound
+            // the same ports, so a restart silently dropped what `expose` had just
+            // applied, and `status` went on listing ports nothing served. The
+            // ports bind on the overlay address only (a ULA reached over
+            // filament0 by paired peers); in userspace the host firewall does not
+            // see that traffic, which is said here rather than used as a reason
+            // to disagree with the live path.
+            let ex = expose::Exposer::new(m.clone());
+            let n = ex.reconcile().await;
+            if n > 0 {
+                ui::say(&format!(
+                    "  {} exposing {} port{} on the overlay",
+                    ui::paint(ui::Tone::Brand, "●"),
+                    n,
+                    if n == 1 { "" } else { "s" }
+                ));
+                if m.is_userspace() {
                     ui::say(&ui::paint(
-                        ui::Tone::Warn,
-                        "  expose.json NOT honored: L3 fell back to userspace (host firewall is bypassed there).",
-                    ));
-                    ui::say(
-                        "    opt in with `tunlion up --userspace` or `tunlion set l3-mode userspace` to expose in userspace mode",
-                    );
-                }
-                let ex = expose::Exposer::new(m.clone());
-                Some(ex) // held so a later live opt-in via ReloadExpose can still bind
-            } else {
-                let ex = expose::Exposer::new(m.clone());
-                let n = ex.reconcile().await;
-                if n > 0 {
-                    ui::say(&format!(
-                        "  {} exposing {} port{} on the overlay",
-                        ui::paint(ui::Tone::Brand, "●"),
-                        n,
-                        if n == 1 { "" } else { "s" }
+                        ui::Tone::Dim,
+                        "    (userspace overlay: paired peers reach these directly; the host firewall does not filter them)",
                     ));
                 }
-                Some(ex)
             }
+            Some(ex)
         }
         None => None,
     };
@@ -1921,12 +1914,16 @@ pub(crate) async fn recv_cmd(
                                                 req.reject("unknown overlay peer").await;
                                                 return;
                                             };
-                                            match m.dial(addr, port).await {
-                                                Ok(mut stream) => {
+                                            // BOUNDED. A port the peer did not expose can
+                                            // black-hole the SYN, and an unbounded dial held
+                                            // the proxy's client with no reply at all.
+                                            match tokio::time::timeout(l2::OVERLAY_DIAL_BOUND, m.dial(addr, port)).await {
+                                                Ok(Ok(mut stream)) => {
                                                     let mut sock = req.accept().await;
                                                     let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
                                                 }
-                                                Err(e) => req.reject(&format!("overlay dial failed: {e}")).await,
+                                                Ok(Err(e)) => req.reject(&format!("overlay dial failed: {e}")).await,
+                                                Err(_) => req.reject(l2::OVERLAY_DIAL_TIMED_OUT).await,
                                             }
                                         });
                                     }

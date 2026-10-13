@@ -2441,6 +2441,14 @@ pub(crate) fn forward_denied_line(peer: &str, rport: u16, reason: &str) -> Strin
     )
 }
 
+/// What a forward prints when a connection waited the whole bound for a peer
+/// that never answered.
+pub(crate) fn forward_unreachable_line(peer: &str, secs: u64) -> String {
+    format!(
+        "tunlion: cannot reach {peer} (no answer within {secs}s); closed the connection, and new ones are closed at once until {peer} is back (check with `tunlion reach {peer}`)"
+    )
+}
+
 /// The remedy lines for a policy refusal, when the reason carries a known code.
 fn forward_refusal_fix(peer: &str, reason: &str) -> Option<(String, Option<String>)> {
     let code = crate::refusal::code_from_reason(reason)?;
@@ -3726,6 +3734,9 @@ struct ForwardActivity {
     /// supervisor sees the forward stop instead of a listener that resets every
     /// client forever while the reason goes only to the log.
     denied: tokio::sync::mpsc::UnboundedSender<String>,
+    /// The peer could not be reached within `cold_link_bound` and no live link
+    /// has appeared since: new connections are closed at once rather than held.
+    unreachable: std::sync::Arc<std::sync::atomic::AtomicBool>,
     peer: String,
     rport: u16,
 }
@@ -3739,6 +3750,7 @@ impl ForwardActivity {
             first: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             denied,
+            unreachable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             peer: peer.to_string(),
             rport,
         };
@@ -3762,6 +3774,7 @@ impl ForwardActivity {
             first: self.first.clone(),
             refused: self.refused.clone(),
             denied: self.denied.clone(),
+            unreachable: self.unreachable.clone(),
             peer: self.peer.clone(),
             rport: self.rport,
         }
@@ -3804,6 +3817,31 @@ impl ForwardActivity {
         if policy {
             let _ = self.denied.send(reason.trim().to_string());
         }
+    }
+
+    /// A connection waited `cold_link_bound` for the peer and was closed. Said
+    /// once per outage on stderr (a browser retrying would otherwise print a
+    /// line per attempt); from here new connections are closed at once.
+    fn unreachable(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.unreachable.swap(true, Relaxed) {
+            crate::ui::critical(&forward_unreachable_line(&self.peer, cold_link_bound().as_secs()));
+        }
+    }
+
+    /// The peer answered again: accept connections normally.
+    fn reachable(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.unreachable.swap(false, Relaxed) {
+            crate::ui::critical(&format!(
+                "tunlion: {} is reachable again; forwarding connections",
+                self.peer
+            ));
+        }
+    }
+
+    fn is_unreachable(&self) -> bool {
+        self.unreachable.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a newly accepted connection; the returned guard decrements on drop.
@@ -3949,6 +3987,7 @@ pub async fn forward_cmd(
     // network blip is never silent (the old code held one link and never noticed).
     // Published via a watch channel the accept loop reads. Not started on the warm
     // path (that would create the extra presence we are avoiding).
+    let (activity, mut denied_rx) = ForwardActivity::new(peer, rport);
     let mut cold_rx = if via_daemon {
         // Report the ACTUAL peer link state, not a blanket "ready". The daemon may
         // hold a live warm link (then connections really are instant) or none yet
@@ -3984,28 +4023,47 @@ pub async fn forward_cmd(
             let (server, peer_s) = (server.to_string(), peer.to_string());
             tokio::spawn(async move { manage_cold_link(server, peer_s, relay, tx).await });
         }
-        // Wait for the first link so "ready" is honest.
-        while rx.borrow().is_none() {
-            if rx.changed().await.is_err() {
-                bail!(
-                    "tunlion: could not establish the link to {peer}; is it online? check with `tunlion reach {peer}` (or `tunlion devices`)"
-                );
+        // Wait for the first link so "ready" is honest, but BOUNDED: the
+        // listener is already bound, so while this waited the kernel completed
+        // every client's handshake and nothing ever served or closed them.
+        let first_link = tokio::time::timeout(cold_link_bound(), async {
+            while rx.borrow().is_none() {
+                if rx.changed().await.is_err() {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+        match first_link {
+            Ok(true) => {
+                // ...and ask the peer once, so "ready" also means "it will forward".
+                let first = rx.borrow().clone();
+                let target = match first {
+                    Some(m) => forward_probe_verdict(peer, rport, probe_forward(&m, rport).await)?,
+                    None => ForwardTarget::Open,
+                };
+                crate::ui::say(&format!(
+                    "tunlion: {}, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `tunlion up` here to avoid a separate presence on {peer})",
+                    forward_ready_word(rport, target)
+                ));
+            }
+            Ok(false) => bail!(
+                "tunlion: could not establish the link to {peer}; is it online? check with `tunlion reach {peer}` (or `tunlion devices`)"
+            ),
+            Err(_) => {
+                // Not reachable yet. Keep listening (it may come up), but close
+                // each connection at once until it does, and say so.
+                activity.unreachable.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::ui::critical(&format!(
+                    "tunlion: cannot reach {peer} yet (no link within {}s); listening on 127.0.0.1:{lport} -> {peer}:{rport} anyway, closing connections at once until {peer} is back",
+                    cold_link_bound().as_secs()
+                ));
             }
         }
-        // ...and ask the peer once, so "ready" also means "it will forward".
-        let first = rx.borrow().clone();
-        let target = match first {
-            Some(m) => forward_probe_verdict(peer, rport, probe_forward(&m, rport).await)?,
-            None => ForwardTarget::Open,
-        };
-        crate::ui::say(&format!(
-            "tunlion: {}, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `tunlion up` here to avoid a separate presence on {peer})",
-            forward_ready_word(rport, target)
-        ));
         Some(rx)
     };
 
-    let (activity, mut denied_rx) = ForwardActivity::new(peer, rport);
     loop {
         // A transient accept error (e.g. EMFILE/ENFILE under fd pressure) must NOT
         // tear down the listener; back off briefly and keep serving.
@@ -4029,12 +4087,18 @@ pub async fn forward_cmd(
             }
         };
         let _ = sock.set_nodelay(true);
+        // The whole connection, warm attempt included, gets one bound from here.
+        let deadline = tokio::time::Instant::now() + cold_link_bound();
         // Warm path: bridge this connection straight to the daemon's link. Retried
         // per connection so it is used whenever the daemon holds a warm link.
         #[cfg(unix)]
         if warm {
-            match crate::ctl::try_open_reason(peer, rport).await {
+            match tokio::time::timeout_at(deadline, crate::ctl::try_open_reason(peer, rport))
+                .await
+                .unwrap_or(Err(None))
+            {
                 Ok(usock) => {
+                    activity.reachable();
                     let guard = activity.begin();
                     tokio::spawn(async move {
                         let _guard = guard; // decrements + refreshes the activity line on close
@@ -4045,6 +4109,7 @@ pub async fn forward_cmd(
                 // The PEER said no: say so on this terminal, for this connection,
                 // and drop it. A cold retry would only be refused again.
                 Err(Some(reason)) if reason.starts_with("refused:") => {
+                    activity.reachable();
                     activity.refused_once(reason.trim_start_matches("refused:").trim());
                     drop(sock);
                     continue;
@@ -4067,19 +4132,29 @@ pub async fn forward_cmd(
             cold_rx = Some(rx);
         }
         let rx = cold_rx.clone().unwrap();
+        // The peer is known unreachable and no link has come back since: close
+        // this connection now instead of making the client wait out the bound
+        // again. The outage was announced once on stderr when it began.
+        if activity.is_unreachable() && !cold_link_live(&rx) {
+            crate::ui::status(&format!(
+                "tunlion: {peer} unreachable; closed a connection at once"
+            ));
+            drop(sock);
+            continue;
+        }
         let guard = activity.begin();
         // #232/#268: a handle sharing the same counters, so the spawned task can
         // report a refusal against this forward's once-only flag.
         let act = activity.handle();
-        let peer_c = peer.to_string();
         // Serve this connection, retrying across a reconnect: a link that died in
-        // the poll window is skipped (is_alive) and open_stream failures re-wait
-        // for the manager's fresh link. On give-up the socket is dropped (closed),
-        // but the ACCEPT LOOP ALWAYS SURVIVES -- one connection is never allowed to
-        // kill the whole forward (the beta.28/29 regression class).
+        // the poll window is skipped (is_alive) and open failures re-wait for the
+        // manager's fresh link, all inside `deadline`. On give-up the socket is
+        // dropped (closed), but the ACCEPT LOOP ALWAYS SURVIVES -- one connection
+        // is never allowed to kill the whole forward (the beta.28/29 regression
+        // class).
         tokio::spawn(async move {
             let _guard = guard; // decrements + refreshes the activity line on close
-            serve_cold_connection(rx, sock, rport, peer_c, Some(act)).await;
+            serve_cold_connection(rx, sock, rport, act, deadline).await;
         });
     }
 }
@@ -4427,43 +4502,7 @@ async fn handle_socks(
 
     match host.strip_suffix(".mesh") {
         Some(peer) => {
-            let peer = peer.to_string();
-            // Warm path: ride the local daemon's live mesh link (instant, no extra
-            // presence on the peer).
-            #[cfg(unix)]
-            if crate::ctl::daemon_present().await {
-                // PRIMARY: the L2 loopback open reaches the peer's 127.0.0.1:dport
-                // over its opt-in acceptor (unchanged semantics).
-                if let Some(usock) = crate::ctl::try_open(&peer, dport).await {
-                    socks_reply(&mut sock, 0x00).await?;
-                    return bridge_streams(sock, usock).await.map_err(Into::into);
-                }
-                // FALLBACK: reach a service the peer EXPOSED on its OVERLAY address
-                // (which the loopback open can't), and the only path on a userspace
-                // node. Tried only after the L2 open misses, so nothing that worked
-                // before changes; this only adds reachability to expose'd ports.
-                if let Some(usock) = crate::ctl::try_dial(&peer, dport).await {
-                    socks_reply(&mut sock, 0x00).await?;
-                    return bridge_streams(sock, usock).await.map_err(Into::into);
-                }
-            }
-            // Cold fallback (no daemon, or a warm miss): a per-peer self-healing
-            // link, reused across connections.
-            let rx = {
-                let mut map = cold.lock().await;
-                if let Some(rx) = map.get(&peer) {
-                    rx.clone()
-                } else {
-                    let (tx, rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
-                    let (s, pr) = (server.to_string(), peer.clone());
-                    tokio::spawn(async move { manage_cold_link(s, pr, relay, tx).await });
-                    map.insert(peer.clone(), rx.clone());
-                    rx
-                }
-            };
-            socks_reply(&mut sock, 0x00).await?;
-            serve_cold_connection(rx, sock, dport, peer, None).await;
-            Ok(())
+            serve_mesh_connect(sock, ProxyProto::Socks, peer, dport, server, relay, cold).await
         }
         None => {
             // Not a mesh name: behave like a plain SOCKS5 proxy (dial directly), so
@@ -4544,41 +4583,7 @@ async fn handle_http(
 
         match host.strip_suffix(".mesh") {
             Some(peer) => {
-                let peer = peer.to_string();
-                // Warm path: ride the local daemon's live mesh link.
-                #[cfg(unix)]
-                if crate::ctl::daemon_present().await {
-                    if let Some(usock) = crate::ctl::try_open(&peer, dport).await {
-                        let _ = sock
-                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                            .await;
-                        return bridge_streams(sock, usock).await.map_err(Into::into);
-                    }
-                    if let Some(usock) = crate::ctl::try_dial(&peer, dport).await {
-                        let _ = sock
-                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                            .await;
-                        return bridge_streams(sock, usock).await.map_err(Into::into);
-                    }
-                }
-                // Cold fallback.
-                let rx = {
-                    let mut map = cold.lock().await;
-                    if let Some(rx) = map.get(&peer) {
-                        rx.clone()
-                    } else {
-                        let (tx, rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
-                        let (s, pr) = (server.to_string(), peer.clone());
-                        tokio::spawn(async move { manage_cold_link(s, pr, relay, tx).await });
-                        map.insert(peer.clone(), rx.clone());
-                        rx
-                    }
-                };
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await;
-                serve_cold_connection(rx, sock, dport, peer, None).await;
-                Ok(())
+                serve_mesh_connect(sock, ProxyProto::Http, peer, dport, server, relay, cold).await
             }
             None => {
                 // Not a mesh name: dial directly.
@@ -4660,61 +4665,322 @@ fn http_proxy_auth_ok(request: &str, token: &str) -> bool {
     false
 }
 
+/// How long the daemon lets one overlay dial (the proxy's `.mesh` fallback to an
+/// `expose`d port) run before it answers "timed out". A port the peer did not
+/// expose can swallow the SYN, and the dial used to have no bound at all.
+pub(crate) const OVERLAY_DIAL_BOUND: Duration = Duration::from_secs(3);
+/// The daemon's reject reason when `OVERLAY_DIAL_BOUND` runs out.
+pub(crate) const OVERLAY_DIAL_TIMED_OUT: &str = "overlay dial timed out";
+
+/// The budget for the WARM half of a proxy `.mesh` CONNECT: the daemon's L2 open
+/// plus its overlay dial must have answered by then: the dial's own bound plus
+/// a second for the open, inside the 5 s a client can reasonably wait for a
+/// SOCKS reply. Override with FILAMENT_PROXY_WARM_MS.
+fn proxy_warm_budget() -> Duration {
+    std::env::var("FILAMENT_PROXY_WARM_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(OVERLAY_DIAL_BOUND + Duration::from_secs(1))
+}
+
+/// How long a connection accepted by `forward` (or a proxy CONNECT on the cold
+/// path) may wait for the peer before it is closed. A forward to a dead peer
+/// used to hold every client open with no data and no close for as long as the
+/// client cared to wait. Override with FILAMENT_FORWARD_CONNECT_SECS.
+pub(crate) fn cold_link_bound() -> Duration {
+    let secs = std::env::var("FILAMENT_FORWARD_CONNECT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(10);
+    Duration::from_secs(secs)
+}
+
+/// Why a proxy `.mesh` CONNECT was not carried, as the client is told it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeshFail {
+    /// Something else went wrong (SOCKS 0x01).
+    General,
+    /// The peer's policy refuses this port: not exposed, tunnels off, no grant
+    /// (SOCKS 0x02, connection not allowed by ruleset).
+    NotAllowed,
+    /// The peer is unknown, offline, or no link came up in time (SOCKS 0x04).
+    Unreachable,
+    /// The peer answered and nothing listens on the port there (SOCKS 0x05).
+    Refused,
+    /// A link was up but the peer never answered the open (SOCKS 0x06).
+    TimedOut,
+}
+
+impl MeshFail {
+    pub(crate) fn socks_rep(self) -> u8 {
+        match self {
+            MeshFail::General => 0x01,
+            MeshFail::NotAllowed => 0x02,
+            MeshFail::Unreachable => 0x04,
+            MeshFail::Refused => 0x05,
+            MeshFail::TimedOut => 0x06,
+        }
+    }
+
+    fn http_status(self) -> &'static str {
+        match self {
+            MeshFail::NotAllowed => "403 Forbidden",
+            MeshFail::TimedOut => "504 Gateway Timeout",
+            MeshFail::General | MeshFail::Unreachable | MeshFail::Refused => "502 Bad Gateway",
+        }
+    }
+}
+
+/// The reply for a peer's own refusal of an L2 open (its `l2-close{err}`).
+pub(crate) fn mesh_fail_for_refusal(reason: &str) -> MeshFail {
+    match classify_forward_refusal(reason) {
+        ForwardRefusal::Policy => MeshFail::NotAllowed,
+        ForwardRefusal::NothingListening => MeshFail::Refused,
+        ForwardRefusal::Transient => MeshFail::General,
+    }
+}
+
+/// Decide the reply for a `.mesh` CONNECT that neither warm path carried.
+/// `l2` is the peer's refusal of the loopback open (None: no warm link to ask
+/// through, so nothing was learned). `l3` is the daemon's answer to the overlay
+/// dial (None: there was no daemon to ask). `None` means "nothing definitive,
+/// try a cold link"; the peer only gets a verdict when it answered.
+pub(crate) fn mesh_verdict(l2: Option<&str>, l3: Option<&str>) -> Option<MeshFail> {
+    let refusal = mesh_fail_for_refusal(l2?);
+    if refusal != MeshFail::General {
+        return Some(refusal);
+    }
+    let dial = l3.map(str::to_ascii_lowercase).unwrap_or_default();
+    Some(if dial == OVERLAY_DIAL_TIMED_OUT {
+        MeshFail::TimedOut
+    } else if dial.contains("refused") || dial.contains("reset") {
+        MeshFail::Refused
+    } else {
+        MeshFail::General
+    })
+}
+
+/// True when `peer` names a paired device, by name or by the `.mesh` spelling
+/// of it (lowercase, anything but letters, digits, '-' and '.' as '-').
+fn mesh_peer_known(peer: &str) -> bool {
+    let norm = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c.to_ascii_lowercase() } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    };
+    let want = norm(peer);
+    crate::devices_load()
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(peer) || norm(n.as_str()) == want)
+}
+
+/// Which proxy protocol is waiting for the CONNECT answer.
+#[derive(Clone, Copy)]
+enum ProxyProto {
+    Socks,
+    Http,
+}
+
+impl ProxyProto {
+    async fn ok(self, sock: &mut TcpStream) -> std::io::Result<()> {
+        match self {
+            ProxyProto::Socks => socks_reply(sock, 0x00).await,
+            ProxyProto::Http => sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await,
+        }
+    }
+
+    async fn fail(self, sock: &mut TcpStream, f: MeshFail) -> std::io::Result<()> {
+        match self {
+            ProxyProto::Socks => socks_reply(sock, f.socks_rep()).await,
+            ProxyProto::Http => {
+                let head = format!(
+                    "HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    f.http_status()
+                );
+                sock.write_all(head.as_bytes()).await
+            }
+        }
+    }
+}
+
+/// Wait for a LIVE mux on a cold-link channel (a dead one may stay parked until
+/// the manager's ~1 s poll republishes; `is_alive` skips it so nothing opens on
+/// a corpse). `None` when the manager is gone.
+async fn wait_live_mux(rx: &mut tokio::sync::watch::Receiver<Option<Arc<Mux>>>) -> Option<Arc<Mux>> {
+    loop {
+        let cur = rx.borrow_and_update().clone();
+        match cur {
+            Some(m) if m.transport().is_alive() => return Some(m),
+            _ => {
+                if rx.changed().await.is_err() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// True when the cold-link channel holds a live link right now.
+fn cold_link_live(rx: &tokio::sync::watch::Receiver<Option<Arc<Mux>>>) -> bool {
+    rx.borrow().as_ref().is_some_and(|m| m.transport().is_alive())
+}
+
+/// Route one proxy CONNECT to `<peer>.mesh:<dport>` and answer the client only
+/// once the outcome is KNOWN. The proxy used to reply "succeeded" before asking
+/// the peer anything, then hold the client open forever when the peer refused
+/// (an unexposed port) or never answered (an offline peer). Every path below is
+/// bounded and ends in either a bridged stream or a specific failure reply.
+async fn serve_mesh_connect(
+    mut sock: TcpStream,
+    proto: ProxyProto,
+    peer: &str,
+    dport: u16,
+    server: &str,
+    relay: bool,
+    cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
+) -> Result<()> {
+    let started = tokio::time::Instant::now();
+    // Read only by the warm (daemon) path, which exists on unix alone.
+    let _warm_deadline = started + proxy_warm_budget();
+    let peer = peer.to_string();
+    if !mesh_peer_known(&peer) {
+        crate::ui::debug(&format!("tunlion: proxy: '{peer}.mesh' is not a paired device"));
+        proto.fail(&mut sock, MeshFail::Unreachable).await?;
+        return Ok(());
+    }
+    // Warm path: ride the local daemon's live mesh link (instant, no extra
+    // presence on the peer). PRIMARY is the L2 loopback open of the peer's
+    // 127.0.0.1:dport; FALLBACK is the overlay dial of a port the peer EXPOSED
+    // (which the loopback open cannot reach). Both answers are kept: when the
+    // peer refused, that refusal IS the reply, and a cold retry would only turn
+    // it into a hang.
+    #[cfg(unix)]
+    if crate::ctl::daemon_present().await {
+        let deadline = _warm_deadline;
+        let mut l2_refusal: Option<String> = None;
+        match tokio::time::timeout_at(deadline, crate::ctl::try_open_reason(&peer, dport)).await {
+            Ok(Ok(usock)) => {
+                proto.ok(&mut sock).await?;
+                return bridge_streams(sock, usock).await.map_err(Into::into);
+            }
+            Ok(Err(Some(r))) if r.starts_with("refused:") => {
+                l2_refusal = Some(r.trim_start_matches("refused:").trim().to_string());
+            }
+            _ => {}
+        }
+        let l3 = match tokio::time::timeout_at(deadline, crate::ctl::try_dial_reason(&peer, dport)).await {
+            Ok(Ok(usock)) => {
+                proto.ok(&mut sock).await?;
+                return bridge_streams(sock, usock).await.map_err(Into::into);
+            }
+            Ok(Err(r)) => r,
+            Err(_) => Some(OVERLAY_DIAL_TIMED_OUT.to_string()),
+        };
+        if let Some(f) = mesh_verdict(l2_refusal.as_deref(), l3.as_deref()) {
+            crate::ui::debug(&format!(
+                "tunlion: proxy: {peer}.mesh:{dport} not carried ({f:?}; peer said {:?}, overlay said {:?})",
+                l2_refusal, l3
+            ));
+            proto.fail(&mut sock, f).await?;
+            return Ok(());
+        }
+    }
+    // Cold fallback (no daemon, or no warm link): a per-peer self-healing link,
+    // reused across connections, waited for within the bound.
+    let mut rx = {
+        let mut map = cold.lock().await;
+        if let Some(rx) = map.get(&peer) {
+            rx.clone()
+        } else {
+            let (tx, rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
+            let (s, pr) = (server.to_string(), peer.clone());
+            tokio::spawn(async move { manage_cold_link(s, pr, relay, tx).await });
+            map.insert(peer.clone(), rx.clone());
+            rx
+        }
+    };
+    let deadline = started + cold_link_bound();
+    let mux = match tokio::time::timeout_at(deadline, wait_live_mux(&mut rx)).await {
+        Ok(Some(m)) => m,
+        _ => {
+            proto.fail(&mut sock, MeshFail::Unreachable).await?;
+            return Ok(());
+        }
+    };
+    let left = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .max(Duration::from_secs(2));
+    match open_stream_verified_reason(&mux, dport, left).await {
+        WarmOpen::Opened(sid, first, pipe) => {
+            proto.ok(&mut sock).await?;
+            serve_stream(mux, sid, sock, pipe, true, Some(first), None).await;
+        }
+        WarmOpen::Refused(reason) => proto.fail(&mut sock, mesh_fail_for_refusal(&reason)).await?,
+        WarmOpen::Dead(_) => proto.fail(&mut sock, MeshFail::TimedOut).await?,
+    }
+    Ok(())
+}
+
 /// Serve one accepted forward connection over the managed cold link, tolerant of
-/// a link blip: wait for a LIVE mux (skipping a stale dead one still parked in the
-/// channel), open a stream, and on a transient open failure re-wait for the
-/// manager's reconnected link (bounded). Never propagates errors to the accept
-/// loop; on give-up it just drops `sock`.
+/// a link blip: wait for a LIVE mux, open a stream and wait for the peer's
+/// answer, and on a transient open failure re-wait for the manager's
+/// reconnected link. ALL of it within `deadline`: when the peer cannot be
+/// reached by then the connection is closed (dropping `sock` sends the FIN) and
+/// the forward says so, instead of holding the client open indefinitely.
+/// Never propagates errors to the accept loop.
 async fn serve_cold_connection(
     mut rx: tokio::sync::watch::Receiver<Option<Arc<Mux>>>,
     sock: TcpStream,
     rport: u16,
-    peer: String,
-    // #232/#268: Some for `forward`, whose user is watching a terminal and needs
-    // to know the peer refused. None for the proxy paths, which serve many
-    // callers and have no single console to narrate to.
-    activity: Option<ForwardActivity>,
+    // #232/#268: `forward`'s user is watching a terminal and needs to know the
+    // peer refused, or cannot be reached.
+    activity: ForwardActivity,
+    deadline: tokio::time::Instant,
 ) {
     let mut tries = 0u32;
     loop {
-        // Wait for a live link (a dead mux may still be parked until the manager's
-        // ~1s poll republishes; is_alive() skips it so we never open on a corpse).
-        let mux = loop {
-            let cur = rx.borrow_and_update().clone();
-            match cur {
-                Some(m) if m.transport().is_alive() => break m,
-                _ => {
-                    if rx.changed().await.is_err() {
-                        return; // manager gone; drop this socket (listener lives on)
-                    }
-                }
+        let mux = match tokio::time::timeout_at(deadline, wait_live_mux(&mut rx)).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return, // manager gone; drop this socket (listener lives on)
+            Err(_) => {
+                activity.unreachable();
+                return;
             }
         };
-        match open_stream(&mux, rport).await {
-            Ok((sid, rx_pipe)) => {
-                serve_stream(mux.clone(), sid, sock, rx_pipe, true, None, None).await;
+        let left = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .max(Duration::from_secs(1));
+        match open_stream_verified_reason(&mux, rport, left).await {
+            WarmOpen::Opened(sid, first, rx_pipe) => {
+                activity.reachable();
+                serve_stream(mux.clone(), sid, sock, rx_pipe, true, Some(first), None).await;
                 // The acceptor's `l2-close{err}` landed in `close_err` before the
                 // pipe was dropped (on_close orders it that way deliberately), so
                 // by the time serve_stream returns the reason is already there if
                 // there is one. A clean end leaves None and prints nothing.
-                if let (Some(a), Some(reason)) = (&activity, mux.take_close_err(sid).await) {
-                    a.refused_once(&reason);
+                if let Some(reason) = mux.take_close_err(sid).await {
+                    activity.refused_once(&reason);
                 }
                 return;
             }
-            Err(_) => {
+            WarmOpen::Refused(reason) => {
+                // The peer answered, so it is reachable; it said no.
+                activity.reachable();
+                activity.refused_once(&reason);
+                return;
+            }
+            WarmOpen::Dead(_) => {
                 tries += 1;
-                if tries >= 3 {
-                    // #232: the client is staring at an empty reply, so this is
-                    // not a debug detail. It was invisible at the default level,
-                    // which is why the only thing the user saw was the premature
-                    // success line above.
-                    crate::ui::critical(&format!(
-                        "tunlion: could not open a stream to {peer} after 3 tries; this connection was dropped (the forward stays up)"
-                    ));
+                if tries >= 3 || tokio::time::Instant::now() >= deadline {
+                    activity.unreachable();
                     return; // drop sock; accept loop keeps running
                 }
-                // The link died between the liveness check and open_stream; loop
+                // The link died between the liveness check and the open; loop
                 // back to wait for the manager to publish a fresh one.
             }
         }
@@ -6691,6 +6957,68 @@ mod forward_refusal_tests {
         .to_string();
         assert!(e.contains("refused the connection"), "{e}");
         assert!(e.contains("tunnelling is off"), "{e}");
+    }
+
+    /// The proxy answers a `.mesh` CONNECT with the RFC 1928 code that names
+    /// what the peer said. It used to answer 0x00 before asking, then hang.
+    #[test]
+    fn mesh_verdict_maps_the_peers_answer_to_a_socks_reply() {
+        let off = crate::capability::TUNNEL_OFF_REASON;
+        // Policy refusal (tunnels off, no grant): not allowed by ruleset,
+        // whatever the overlay dial said.
+        for l3 in [None, Some(OVERLAY_DIAL_TIMED_OUT), Some("overlay dial failed: Connection refused")] {
+            assert_eq!(mesh_verdict(Some(off), l3), Some(MeshFail::NotAllowed), "{l3:?}");
+        }
+        assert_eq!(mesh_verdict(Some("denied"), None), Some(MeshFail::NotAllowed));
+        // Nothing listening on the peer's port.
+        assert_eq!(
+            mesh_verdict(Some("Connection refused (os error 111)"), Some(OVERLAY_DIAL_TIMED_OUT)),
+            Some(MeshFail::Refused)
+        );
+        // A transient refusal defers to the overlay dial's answer.
+        assert_eq!(mesh_verdict(Some("stream cap"), Some(OVERLAY_DIAL_TIMED_OUT)), Some(MeshFail::TimedOut));
+        assert_eq!(mesh_verdict(Some("stream cap"), Some("overlay dial failed: connection reset")), Some(MeshFail::Refused));
+        assert_eq!(mesh_verdict(Some("stream cap"), None), Some(MeshFail::General));
+        // No warm link to ask through: nothing definitive, try a cold link.
+        assert_eq!(mesh_verdict(None, Some(OVERLAY_DIAL_TIMED_OUT)), None);
+        assert_eq!(mesh_verdict(None, None), None);
+    }
+
+    #[test]
+    fn mesh_fail_codes_are_rfc1928() {
+        assert_eq!(MeshFail::General.socks_rep(), 0x01);
+        assert_eq!(MeshFail::NotAllowed.socks_rep(), 0x02);
+        assert_eq!(MeshFail::Unreachable.socks_rep(), 0x04);
+        assert_eq!(MeshFail::Refused.socks_rep(), 0x05);
+        assert_eq!(MeshFail::TimedOut.socks_rep(), 0x06);
+        assert!(MeshFail::NotAllowed.http_status().starts_with("403"));
+        assert!(MeshFail::TimedOut.http_status().starts_with("504"));
+    }
+
+    /// A proxy client gets its answer on the wire: the success reply is never
+    /// written before the outcome is known, and a failure is a full SOCKS reply.
+    #[tokio::test]
+    async fn proxy_failure_reply_is_a_complete_socks_reply() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            let mut buf = [0u8; 10];
+            c.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+        let (mut s, _) = l.accept().await.unwrap();
+        ProxyProto::Socks.fail(&mut s, MeshFail::NotAllowed).await.unwrap();
+        let got = client.await.unwrap();
+        assert_eq!(got, [0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn unreachable_line_names_the_peer_and_the_bound() {
+        let l = forward_unreachable_line("alpha", 10);
+        assert!(l.contains("cannot reach alpha"), "{l}");
+        assert!(l.contains("10s"), "{l}");
+        assert!(l.contains("closed"), "{l}");
     }
 
     #[test]

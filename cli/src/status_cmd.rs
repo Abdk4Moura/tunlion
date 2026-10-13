@@ -124,6 +124,12 @@ pub(crate) fn owner_fingerprint(user_pub: &[u8; 32]) -> String {
     hex::encode(user_pub).chars().take(8).collect()
 }
 
+/// The daemon pid whose bound-port record counts: only a daemon that answers
+/// serves anything. A frozen or wedged one binds nothing a peer can use.
+fn serving_pid(pid: Option<u32>, responding: Option<bool>) -> Option<u32> {
+    pid.filter(|_| responding != Some(false))
+}
+
 /// How long `status` waits for the daemon to answer on its control socket.
 const STATUS_PROBE: Duration = Duration::from_millis(1500);
 
@@ -163,9 +169,20 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
     let proxy = proxy_if_serving(responding, crate::proxy_state::current());
     if json {
         let pid = pid_alive;
+        // `bound` is what the daemon actually serves, read from its own record;
+        // `exposed` alone used to list configured ports that the daemon had
+        // refused to bind.
+        let bound = expose::bound_ports(serving_pid(pid_alive, responding));
         let exposed: Vec<Value> = expose::load()
             .iter()
-            .map(|b| json!({ "port": b.port, "target": b.target, "peers": b.peers.clone().unwrap_or_default() }))
+            .map(|b| {
+                json!({
+                    "port": b.port,
+                    "target": b.target,
+                    "peers": b.peers.clone().unwrap_or_default(),
+                    "bound": bound.contains(&b.port),
+                })
+            })
             .collect();
         // Structured transfer records from both directions, newest last.
         let recent = crate::transfer_history::recent(RECENT);
@@ -277,14 +294,20 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
     }
     let exposed = expose::load();
     if !exposed.is_empty() {
+        let bound = expose::bound_ports(serving_pid(pid_alive, responding));
         ui::say(&ui::paint(ui::Tone::Dim, "  exposed on .mesh:"));
         for b in exposed {
             let scope = match &b.peers {
                 Some(p) if !p.is_empty() => p.join(","),
                 _ => "any".into(),
             };
+            let state = if bound.contains(&b.port) {
+                String::new()
+            } else {
+                ui::paint(ui::Tone::Warn, "  NOT bound (configured only)")
+            };
             ui::say(&format!(
-                "    :{} {} {}  ({})",
+                "    :{} {} {}  ({}){state}",
                 b.port,
                 ui::glyph_arrow(),
                 b.target,

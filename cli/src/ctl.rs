@@ -49,7 +49,7 @@ pub fn reuse_disabled() -> bool {
 #[cfg(unix)]
 pub use imp::{
     daemon_present, daemon_responds, forward_probe, send_reply, serve_at, try_approve_request,
-    try_bootstrap, try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous,
+    try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
     try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
     try_revocation_sync, try_unmount, try_wake, Req, ReqKind,
@@ -117,18 +117,32 @@ mod imp {
     /// asserted). Returns the bridged socket, or `None` if there is no daemon / the
     /// peer is unknown / L3 is down, so the caller can report a clean failure.
     pub async fn try_dial(peer: &str, port: u16) -> Option<UnixStream> {
+        try_dial_reason(peer, port).await.ok()
+    }
+
+    /// Like `try_dial`, but reports WHY the daemon said no: `Err(Some(reason))`
+    /// is the daemon's answer (unknown peer, the dial refused or timed out),
+    /// `Err(None)` means there was no daemon to ask. The proxy needs the
+    /// difference to pick the right SOCKS reply instead of hanging.
+    pub async fn try_dial_reason(
+        peer: &str,
+        port: u16,
+    ) -> std::result::Result<UnixStream, Option<String>> {
         if reuse_disabled() {
-            return None;
+            return Err(None);
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
         let req = json!({ "op": "dial", "peer": peer, "port": port });
-        let mut line = serde_json::to_vec(&req).ok()?;
+        let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
         line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = read_line(&mut s, 4096).await.ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(s)
+        s.write_all(&line).await.map_err(|_| None)?;
+        s.flush().await.map_err(|_| None)?;
+        let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
+        let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
+        if v["ok"].as_bool() == Some(true) {
+            return Ok(s);
+        }
+        Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
     }
 
     /// Try to open an L2 stream to `peer:rport` THROUGH a local daemon's warm

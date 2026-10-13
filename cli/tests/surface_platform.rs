@@ -68,7 +68,9 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("mount_proto.rs", 39),
         // 39 -> 40 for the warm-pty verdict enum sharing its fn's gate.
         // 40 -> 39 measured on the integration of #378..#394.
-        ("l2.rs", 39),
+        // 39 -> 38: the SOCKS and HTTP CONNECT paths share one mesh-connect
+        // helper, so their two warm-path gates became one.
+        ("l2.rs", 38),
         // Should approach zero as the armed set stops needing IPC at all.
         ("ctl.rs", 6),
         ("tun/mod.rs", 6),
