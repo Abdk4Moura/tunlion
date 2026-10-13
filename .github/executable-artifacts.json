@@ -130,6 +130,17 @@
       ]
     },
     {
+      "path": "cli/tests/invite-expiry-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/invite-expiry-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/forward-refusal-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/forward-refusal-gates.sh",
@@ -296,6 +307,7 @@
         "cli/tests/devices-write-race-gates.sh",
         "cli/tests/fleet-cert-gates.sh",
         "cli/tests/forward-refusal-gates.sh",
+        "cli/tests/invite-expiry-gates.sh",
         "cli/tests/l2-revoke-gates.sh",
         "cli/tests/mount-revoke-gates.sh",
         "cli/tests/net-blockers-gates.sh",

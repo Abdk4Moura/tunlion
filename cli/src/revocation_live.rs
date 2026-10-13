@@ -182,8 +182,11 @@ pub(crate) fn bind_brokered_link(link: &mut crate::conn::Link, broker: &Brokered
 /// What a running daemon said when asked to apply a revocation now.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DaemonAnswer {
-    /// It swept: `closed` links ended, and it refuses the device from here on.
-    Applied { closed: u64 },
+    /// It swept: `closed` links ended, `refused` live links stay up to a device
+    /// revoked IN PLACE (every open on them is refused with the reason, and
+    /// their open sessions are cut by the live re-check), and it refuses the
+    /// device from here on.
+    Applied { closed: u64, refused: u64 },
     /// No daemon answered and none is running here (or this platform has no
     /// control socket to ask with).
     NoDaemon,
@@ -197,6 +200,7 @@ pub(crate) async fn tell_daemon() -> DaemonAnswer {
     match crate::ctl::try_revocation_sync().await {
         Some(v) if v["ok"].as_bool() == Some(true) => DaemonAnswer::Applied {
             closed: v["closed"].as_u64().unwrap_or(0),
+            refused: v["refused"].as_u64().unwrap_or(0),
         },
         _ if crate::ctl::daemon_present().await => DaemonAnswer::Unconfirmed,
         _ => DaemonAnswer::NoDaemon,
@@ -220,7 +224,14 @@ pub(crate) fn daemon_line(
         String::new()
     };
     match answer {
-        DaemonAnswer::Applied { closed } => Ok(format!(
+        // A revoke in place closes nothing on purpose (the refusal reaching
+        // the device is worth keeping), so "closed 0 link(s)" was true and
+        // misleading while live links existed. Say what happened to them.
+        DaemonAnswer::Applied { closed, refused } if !forgotten && *refused > 0 => Ok(format!(
+            "in effect now: the running daemon refuses '{name}' from here on. It holds {refused} live link(s) to it, kept up only to carry that refusal: every new open on them is refused, and any session or stream already open ends within a few seconds.{}",
+            if *closed > 0 { format!(" It also closed {closed} link(s).") } else { String::new() }
+        )),
+        DaemonAnswer::Applied { closed, .. } => Ok(format!(
             "in effect now: the running daemon closed {closed} link(s) to '{name}' and refuses it from here on.{untold}"
         )),
         DaemonAnswer::NoDaemon => Ok(format!(
@@ -327,15 +338,20 @@ mod tests {
 
     #[test]
     fn the_daemon_line_never_claims_what_it_cannot_know() {
-        let applied = daemon_line("beta", &DaemonAnswer::Applied { closed: 2 }, true).unwrap();
+        let applied = daemon_line("beta", &DaemonAnswer::Applied { closed: 2, refused: 0 }, true).unwrap();
         assert!(applied.contains("in effect now") && applied.contains("closed 2 link(s)"));
         assert!(applied.contains("looks offline"), "a forget says what the device sees: {applied}");
         let none = daemon_line("beta", &DaemonAnswer::NoDaemon, true).unwrap();
         assert!(!none.contains("in effect now"), "{none}");
         assert!(none.contains("next start"), "{none}");
         assert!(!none.contains("never met you"), "the forgotten side is not told: {none}");
-        let in_place = daemon_line("beta", &DaemonAnswer::Applied { closed: 0 }, false).unwrap();
+        let in_place = daemon_line("beta", &DaemonAnswer::Applied { closed: 0, refused: 0 }, false).unwrap();
         assert!(!in_place.contains("offline"), "a revoked device is refused with a reason: {in_place}");
+        // Live links kept up for the refusal are counted, never reported as
+        // "closed 0 link(s)".
+        let live = daemon_line("beta", &DaemonAnswer::Applied { closed: 0, refused: 2 }, false).unwrap();
+        assert!(live.contains("2 live link(s)") && !live.contains("closed 0"), "{live}");
+        assert!(!live.contains("offline"), "{live}");
         let unconfirmed = daemon_line("beta", &DaemonAnswer::Unconfirmed, true).unwrap_err();
         assert!(unconfirmed.contains("tunlion down -y && tunlion up --detach"), "{unconfirmed}");
     }

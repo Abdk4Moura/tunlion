@@ -257,6 +257,46 @@ fn log_ctl_rx<'a>(pid: &str, ty: Option<&'a str>) -> Option<&'a str> {
     ty
 }
 
+/// May this overlay key hold a route here? Not when its device was revoked,
+/// and not once the invitation that admitted it ended: a route is access too,
+/// the one a device keeps without opening anything.
+pub(crate) fn overlay_key_refused(pubkey: &[u8; 32]) -> bool {
+    device_cert_revoked(pubkey)
+        || crate::identity_state::delegated_access_for(pubkey)
+            .is_some_and(|a| a.expired(crate::identity::now_secs()))
+}
+
+/// The decline for an offer the gate refused. A refusal with a known cause
+/// (access expired, device revoked, outside the ceiling) travels as a TYPED
+/// refusal carrying the reason, so the sender prints why ("access expired at
+/// ...") instead of a bare "declined" that reads as a person saying no. A
+/// plain no stays a plain decline. Pure.
+pub(crate) fn policy_decline_msg(id: &str, reason: Option<&str>) -> Value {
+    match reason.and_then(|r| crate::refusal::code_from_reason(r).map(|c| (c, r))) {
+        Some((code, r)) => protocol::refuse_msg(id, code.as_wire(), r),
+        None => protocol::decline_msg(id),
+    }
+}
+
+/// May a parked open's re-drive overturn this deny once the peer proves its
+/// key? Only when the deny could be ABOUT the missing proof. Expiry, the
+/// enrolment ceiling, revocation (of the device or of a grant), an explicit
+/// owner deny and an unrecognized device are decisions no proof changes, so
+/// their verdict is final at once. Pure, so the rule is unit-testable.
+pub(crate) fn deny_is_proof_attributable(reason: &str) -> bool {
+    let r = reason.trim();
+    let final_prefixes = [
+        crate::capability::EXPIRED_PREFIX,
+        crate::capability::CEILING_REASON,
+        crate::capability::REVOKED_REASON,
+        "device revoked",
+        "shell revoked for",
+        "explicitly denied",
+        crate::refusal::UNRECOGNIZED_REASON,
+    ];
+    !final_prefixes.iter().any(|p| r.starts_with(p))
+}
+
 /// Settle-then-evaluate, called with an ALREADY-DENIED verdict: decide
 /// first, park only when the deny is attributable to the unproven binding.
 /// Allows proceed untouched (this fn never runs for them), so legacy
@@ -291,6 +331,14 @@ pub(crate) async fn park_on_deny(
     if binding_proven {
         return false;
     }
+    // A proof can only ever supply PROOF. A deny whose reason is something a
+    // proof cannot change (the access expired, the ceiling excludes it, the
+    // device was revoked or explicitly denied) is final: parking it handed the
+    // verdict to the re-drive, and the re-drive overturned an expiry it had
+    // no business touching (the exec ran ~2.5 min past the invitation end).
+    if !deny_is_proof_attributable(gate_reason) {
+        return false;
+    }
     // No resolved key: there is nothing for a hold to bind to, so the LIVE
     // verdict stands -- the caller sends its own reason and raises the
     // access request. Answering here would replace a real denial ("no shell
@@ -305,6 +353,13 @@ pub(crate) async fn park_on_deny(
         return false;
     }
     if crate::identity_state::cert_revoked_for(Some(&device_pub)) {
+        return false;
+    }
+    // And independently of how the reason was worded: an ended delegated
+    // device never parks.
+    if crate::identity_state::delegated_access_for(&device_pub)
+        .is_some_and(|a| a.expired(crate::identity::now_secs()))
+    {
         return false;
     }
     if let Some(n) = name.as_deref() {
@@ -495,8 +550,25 @@ async fn handle_forward_open(
             .unwrap_or("device not granted shell");
         ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
         let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
-        let mut close = json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" });
-        crate::refusal::Refusal::new(crate::refusal::Code::NotGranted, who).annotate(&mut close);
+        // The gate's own cause when it is final (expired, revoked): a revoked
+        // device used to be told "device lacks shell grant", which sent it to
+        // ask for a grant that could not help.
+        let close = match crate::refusal::Refusal::final_cause(l2_deny_reason.as_deref(), who.clone()) {
+            Some(mut r) => {
+                if r.code == crate::refusal::Code::Expired {
+                    r.reinvite = conn
+                        .link(&pid)
+                        .and_then(|l| l.identity_device_pub)
+                        .and_then(|d| crate::identity_state::reinvite_for(&d));
+                }
+                r.close_frame(sid)
+            }
+            None => {
+                let mut close = json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" });
+                crate::refusal::Refusal::new(crate::refusal::Code::NotGranted, who).annotate(&mut close);
+                close
+            }
+        };
         let _ = t.send_control(&close).await;
     } else {
         // Opt-in gateway: if the target is non-loopback, allow it
@@ -650,7 +722,8 @@ async fn handle_pty_open(
             gate_inputs.denied,
             cap_reason.as_deref(),
             dev.clone(),
-        );
+        )
+        .with_reinvite_for(gate_inputs.idev.as_ref());
         let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
@@ -1725,6 +1798,8 @@ pub(crate) async fn recv_cmd(
     // were noticed, until the sweep closes the links that used them.
     let mut revocation_snap = crate::revocation_live::store_snapshot();
     let mut revocation_sweep_now = false;
+    // Links whose device's invitation ended, already withdrawn (said once).
+    let mut expired_unrouted: std::collections::HashSet<String> = Default::default();
     let mut revoked_secrets: std::collections::HashSet<String> = Default::default();
     // Meeting places of devices forgotten while this daemon ran. The server keeps
     // us listed on them, so the forgotten device still finds us there; a dial on
@@ -3135,10 +3210,55 @@ pub(crate) async fn recv_cmd(
                     }
                     let _ = &unrouted;
                     let closed = doomed.len();
+                    // Links to a device revoked IN PLACE stay up to carry the
+                    // refusal; count them so `devices revoke` can say so.
+                    let refused = conn
+                        .links
+                        .values()
+                        .filter(|l| {
+                            crate::revocation_live::route_must_withdraw(
+                                l.identity_device_pub.as_ref(),
+                                &device_cert_revoked,
+                            )
+                        })
+                        .count();
                     for req in revocation_waiters.drain(..) {
-                        req.reply(&json!({ "ok": true, "closed": closed })).await;
+                        req.reply(&json!({ "ok": true, "closed": closed, "refused": refused })).await;
                     }
                 }
+            }
+            // Invitation ends are TIME, not store changes, so they are checked on
+            // every scan rather than on a snapshot change: a link whose device's
+            // invitation has ended loses its overlay route here (opens on it are
+            // refused by the gate, and its open sessions are cut by the live
+            // re-check in each serving loop).
+            {
+                let now = identity::now_secs();
+                let ended: Vec<(String, String)> = conn
+                    .links
+                    .iter()
+                    .filter(|(pid, _)| !expired_unrouted.contains(*pid))
+                    .filter_map(|(pid, l)| {
+                        let d = l.identity_device_pub?;
+                        crate::identity_state::delegated_access_for(&d)
+                            .filter(|a| a.expired(now))
+                            .map(|_| (pid.clone(), l.shown().to_string()))
+                    })
+                    .collect();
+                for (pid, label) in ended {
+                    expired_unrouted.insert(pid.clone());
+                    ui::say(&format!(
+                        "access for '{label}' ended (its invitation expired): refusing it from here on"
+                    ));
+                    #[cfg(l3)]
+                    {
+                        l3_seen.remove(&pid);
+                        if let Some(m) = l3.as_ref() {
+                            m.remove_by_pid(&pid).await;
+                        }
+                    }
+                }
+                expired_unrouted.retain(|p| conn.links.contains_key(p));
             }
             let mut new_chans: Vec<String> = Vec::new();
             for (n, s) in devices_load() {
@@ -4459,7 +4579,7 @@ pub(crate) async fn recv_cmd(
                                     ui::debug(&format!(
                                         "  l3-announce from {pid} ignored: relayed link and peer does not advertise relay datagrams"
                                     ));
-                                } else if device_cert_revoked(&pending.pubkey) {
+                                } else if overlay_key_refused(&pending.pubkey) {
                                     // The overlay key IS the device key: a
                                     // revoked or forgotten device gets no route.
                                     ui::debug(&format!(
@@ -4967,7 +5087,7 @@ pub(crate) async fn recv_cmd(
                                         Ok(ip) => {
                                             // The overlay key IS the device key: a
                                             // revoked or forgotten device gets no route.
-                                            if device_cert_revoked(&ann.pubkey) {
+                                            if overlay_key_refused(&ann.pubkey) {
                                                 ui::debug(&format!(
                                                     "  l3-announce from {pid} ignored: its key is revoked here"
                                                 ));
@@ -6185,7 +6305,17 @@ pub(crate) async fn recv_cmd(
                             authorized.deny_reason("not authorized (mount capability required)")
                         ));
                         enqueue_if_requestable(&who, "mount");
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
+                        // An expiry or revocation says so; anything else stays
+                        // the coarse category that leaks no authz internals.
+                        let deny = authorized.deny_reason("");
+                        let close = match crate::refusal::Refusal::final_cause(
+                            (!deny.is_empty()).then_some(deny),
+                            verified.clone(),
+                        ) {
+                            Some(r) => r.close_frame(sid),
+                            None => json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" }),
+                        };
+                        let _ = t.send_control(&close).await;
                         continue;
                     }
                     let Some(root_path) = confined_root else {
@@ -7052,7 +7182,7 @@ pub(crate) async fn recv_cmd(
                             &format!("declined {name} from {sender_name} ({reason})"),
                             crate::exit_codes::ExitKind::Denied,
                         );
-                        let r = t.send_control(&protocol::decline_msg(&id)).await;
+                        let r = t.send_control(&policy_decline_msg(&id, Some(reason.as_str()))).await;
                         peer_step(daemon, &pid, "decline", r)?;
                         continue;
                     }
@@ -7117,7 +7247,9 @@ pub(crate) async fn recv_cmd(
                                 crate::exit_codes::ExitKind::Usage,
                             ),
                         }
-                        let r = t.send_control(&protocol::decline_msg(&id)).await;
+                        let r = t
+                            .send_control(&policy_decline_msg(&id, xfer_deny_reason.as_deref()))
+                            .await;
                         peer_step(daemon, &pid, "decline", r)?;
                         continue;
                     }
@@ -8640,5 +8772,59 @@ fn note_refusal(
 ) {
     if !daemon {
         crate::recv_report::note_refused(name, size, token, msg, kind);
+    }
+}
+
+#[cfg(test)]
+mod expiry_redrive_tests {
+    use super::{deny_is_proof_attributable, policy_decline_msg};
+
+    /// The lab defect: an exec denied because the guest's invitation had ended
+    /// was parked "for identity proof", then RE-DRIVEN and run once the peer
+    /// proved its key. A proof can only supply proof; a decision it cannot
+    /// change must keep its verdict.
+    #[test]
+    fn the_redrive_never_overturns_a_final_deny() {
+        for reason in [
+            crate::capability::expired_reason(1_760_000_000),
+            crate::capability::CEILING_REASON.to_string(),
+            crate::capability::REVOKED_REASON.to_string(),
+            "device revoked".to_string(),
+            "shell revoked for 'b' here".to_string(),
+            "explicitly denied by owner (deniedCaps)".to_string(),
+            crate::refusal::UNRECOGNIZED_REASON.to_string(),
+        ] {
+            assert!(!deny_is_proof_attributable(&reason), "parked a final deny: {reason}");
+        }
+    }
+
+    /// The settle path still exists for what it was built for: a deny that is
+    /// about the binding not being proven yet.
+    #[test]
+    fn a_deny_about_missing_proof_still_parks() {
+        for reason in [
+            "identity not proven",
+            "fleet device: action needs an explicit grant (deliberate tier or out of scope)",
+            "device not granted shell",
+            "no shell cap / untrusted",
+        ] {
+            assert!(deny_is_proof_attributable(reason), "refused to park: {reason}");
+        }
+    }
+
+    /// A send refused for a known cause carries it, so the sender can say
+    /// "access expired at ..." instead of a bare "declined".
+    #[test]
+    fn a_policy_decline_carries_its_reason() {
+        let r = crate::capability::expired_reason(1_760_000_000);
+        let m = policy_decline_msg("x", Some(&r));
+        assert_eq!(m["type"], "file-decline");
+        assert_eq!(m["reason"], "expired");
+        assert!(m["error"].as_str().unwrap().starts_with("access expired at"));
+        let rv = policy_decline_msg("x", Some("device revoked"));
+        assert_eq!(rv["reason"], "cert-revoked");
+        // A person's plain no (or an unknown reason) stays a plain decline.
+        assert!(policy_decline_msg("x", None).get("reason").is_none());
+        assert!(policy_decline_msg("x", Some("unverified peer")).get("reason").is_none());
     }
 }

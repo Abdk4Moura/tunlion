@@ -1328,6 +1328,11 @@ pub(crate) async fn async_main() -> Result<()> {
                                 .into_iter()
                                 .map(|e| (e.name, e.online))
                                 .collect();
+                        let records: Vec<Value> = std::fs::read_to_string(crate::devices_store::devices_path())
+                            .ok()
+                            .and_then(|raw| serde_json::from_str(&raw).ok())
+                            .unwrap_or_default();
+                        let now = identity::now_secs();
                         let arr: Vec<Value> = all
                             .iter()
                             .map(|(n, s)| {
@@ -1335,10 +1340,25 @@ pub(crate) async fn async_main() -> Result<()> {
                                     devices_info(n).unwrap_or((0, None, None));
                                 let addr = v6.clone().or_else(|| v4.clone()).unwrap_or_default();
                                 let mesh = format!("{n}.mesh");
+                                // What the gate enforces now: state, effective
+                                // caps, cert expiry and the access deadline.
+                                let access = records
+                                    .iter()
+                                    .find(|r| r["name"].as_str() == Some(n.as_str()))
+                                    .map(|r| crate::device_caps::device_access_json(r, now))
+                                    .unwrap_or_else(|| json!({ "state": "active", "effectiveCaps": effective_device_caps(n) }));
+                                // `caps` IS the effective set: empty once the
+                                // device expired, lapsed or was revoked.
+                                let caps = access["effectiveCaps"].clone();
                                 json!({
                                     "name": n,
                                     "channel": channel_of(s),
-                                    "caps": effective_device_caps(n),
+                                    "caps": caps,
+                                    "grantedCaps": access["grantedCaps"].clone(),
+                                    "state": access["state"].clone(),
+                                    "certExpires": access["certExpires"].clone(),
+                                    "accessUntil": access["accessUntil"].clone(),
+                                    "invitationEnds": access["invitationEnds"].clone(),
                                     "lastSeen": last_seen,
                                     "address": addr,
                                     "mesh": mesh,

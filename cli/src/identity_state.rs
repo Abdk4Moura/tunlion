@@ -443,6 +443,131 @@ pub(crate) fn ceiling_covers_action(idev: Option<&[u8; 32]>, action: &str) -> bo
     idev.is_some() && covered
 }
 
+/// What a delegated (invitation-admitted) device may still do, read fresh from
+/// its record: the ceiling it was admitted with and the single moment its access
+/// ends. Every gate and every live-session re-check asks THIS, so the deadline a
+/// gate enforces and the one a running stream is cut at cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DelegatedAccess {
+    pub ceiling: Vec<String>,
+    /// When access ends: `min(cert expiry, invitation end, offline budget)`, and
+    /// the moment the record was marked lapsed when it was.
+    pub deadline: u64,
+    pub clock: DeadlineClock,
+}
+
+impl DelegatedAccess {
+    pub(crate) fn expired(&self, now: u64) -> bool {
+        now >= self.deadline
+    }
+}
+
+/// Pure: the delegated access a device record grants, or None when the record
+/// is not a delegated principal (an owner device, a plain pair, a fleet sibling
+/// enrolled without an end). A delegated record with no readable certificate
+/// has already ended: fail closed.
+pub(crate) fn delegated_access_from_record(record: &Value) -> Option<DelegatedAccess> {
+    if record["principalKind"].as_str() != Some("delegated") {
+        return None;
+    }
+    let ceiling: Vec<String> = record["principalCeiling"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let cert_expires = identity::DeviceCert::from_json(&record["deviceCert"])
+        .map(|c| c.expires)
+        .unwrap_or(0);
+    let (mut deadline, mut clock) = effective_principal_deadline(
+        cert_expires,
+        // A delegated record ALWAYS carries its invitation end. Absent means a
+        // half-written record, and that ends now rather than never.
+        Some(record["principalExpires"].as_u64().unwrap_or(0)),
+        record["lastSeen"].as_u64(),
+        record["principalMaxOffline"].as_u64(),
+    );
+    if record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED) {
+        let at = record["lapsedAt"].as_u64().unwrap_or(0);
+        if at < deadline {
+            deadline = at;
+            clock = DeadlineClock::AbsoluteStop;
+        }
+    }
+    Some(DelegatedAccess { ceiling, deadline, clock })
+}
+
+/// The delegated access of the device with this key, read fresh from the store.
+pub(crate) fn delegated_access_for(device_pub: &[u8; 32]) -> Option<DelegatedAccess> {
+    let hex = hex::encode(device_pub);
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let record = arr
+        .iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))?;
+    delegated_access_from_record(record)
+}
+
+/// What to re-invite an expired delegated device with: the ceiling it was
+/// admitted with and the lifetime its invitation granted (`principalIssued`,
+/// stamped at enrolment, to `principalExpires`). Pure.
+pub(crate) fn reinvite_from_record(record: &Value) -> Option<crate::refusal::Reinvite> {
+    let access = delegated_access_from_record(record)?;
+    let end = record["principalExpires"].as_u64()?;
+    let start = record["principalIssued"]
+        .as_u64()
+        .or_else(|| record["addedAt"].as_u64())
+        .unwrap_or(end);
+    let ceiling: Vec<String> = access.ceiling.into_iter().filter(|c| !c.starts_with("route:")).collect();
+    (!ceiling.is_empty()).then(|| crate::refusal::Reinvite {
+        ceiling,
+        lifetime: end.saturating_sub(start).max(1),
+    })
+}
+
+/// [`reinvite_from_record`] for the device with this key.
+pub(crate) fn reinvite_for(device_pub: &[u8; 32]) -> Option<crate::refusal::Reinvite> {
+    let hex = hex::encode(device_pub);
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let record = arr
+        .iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))?;
+    reinvite_from_record(record)
+}
+
+/// Why a LIVE session (exec, pty, forward, mount) must end now, if it must.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveCut {
+    /// The device was revoked here.
+    Revoked,
+    /// The invitation that admitted it ended at this time (UTC seconds).
+    Expired(u64),
+}
+
+impl LiveCut {
+    /// The reason the acceptor sends with the close, which the initiator maps
+    /// to its exit code and remedy (`refusal::code_from_reason`).
+    pub(crate) fn reason(self) -> String {
+        match self {
+            LiveCut::Revoked => crate::capability::REVOKED_REASON.to_string(),
+            LiveCut::Expired(at) => crate::capability::expired_reason(at),
+        }
+    }
+}
+
+/// The one live re-check every serving loop asks. Revocation first (it is the
+/// decision a person made), then the delegated deadline. An unidentified peer
+/// has no opinion here: its opens were judged by the gate.
+pub(crate) fn live_session_cut(idev: Option<&[u8; 32]>) -> Option<LiveCut> {
+    let idev = idev?;
+    if cert_revoked_for(Some(idev)) {
+        return Some(LiveCut::Revoked);
+    }
+    match delegated_access_for(idev) {
+        Some(a) if a.expired(crate::identity::now_secs()) => Some(LiveCut::Expired(a.deadline)),
+        _ => None,
+    }
+}
+
 /// Liveness re-check for live sessions: recompose the delegated deadline
 /// (cert expiry, absolute stop, offline budget) for the peer's STORED cert
 /// and report whether it is still ahead. None means unresolvable (no
@@ -567,5 +692,67 @@ mod tests {
             !cert_revoked_for(Some(&unknown)),
             "an unknown device (no record) is not revoked"
         );
+    }
+}
+
+#[cfg(test)]
+mod delegated_access_tests {
+    use super::{delegated_access_from_record, reinvite_from_record};
+    use serde_json::json;
+
+    fn record(cert_expires: u64, principal_expires: u64) -> serde_json::Value {
+        json!({
+            "name": "guest-b",
+            "principalKind": "delegated",
+            "principalCeiling": ["transfer", "shell"],
+            "principalExpires": principal_expires,
+            "principalIssued": principal_expires - 240,
+            "deviceCert": {
+                "devicePub": hex::encode([7u8; 32]),
+                "userPub": hex::encode([9u8; 32]),
+                "issued": 0,
+                "expires": cert_expires,
+                "sig": hex::encode([0u8; 64]),
+            },
+        })
+    }
+
+    /// A renewed certificate does not move the end: the invitation end binds.
+    #[test]
+    fn the_invitation_end_binds_even_past_a_renewed_cert() {
+        let r = record(1_000 + 394, 1_000 + 240);
+        if crate::identity::DeviceCert::from_json(&r["deviceCert"]).is_none() {
+            // The fixture must parse, or the test proves nothing.
+            panic!("fixture certificate does not parse");
+        }
+        let a = delegated_access_from_record(&r).expect("delegated");
+        assert_eq!(a.deadline, 1_240);
+        assert!(!a.expired(1_239));
+        assert!(a.expired(1_240));
+    }
+
+    #[test]
+    fn a_lapsed_record_ends_when_it_lapsed() {
+        let mut r = record(5_000, 5_000);
+        r["principalState"] = json!("lapsed");
+        r["lapsedAt"] = json!(1_500);
+        assert_eq!(delegated_access_from_record(&r).unwrap().deadline, 1_500);
+    }
+
+    #[test]
+    fn a_non_delegated_record_has_no_invitation_end() {
+        let mut r = record(5_000, 5_000);
+        r["principalKind"] = serde_json::Value::Null;
+        assert!(delegated_access_from_record(&r).is_none());
+    }
+
+    /// The re-invite preserves exactly the ceiling and the lifetime.
+    #[test]
+    fn the_reinvite_keeps_caps_and_lifetime() {
+        let r = record(1_240, 1_240);
+        let inv = reinvite_from_record(&r).unwrap();
+        assert_eq!(inv.ceiling, vec!["transfer".to_string(), "shell".to_string()]);
+        assert_eq!(inv.lifetime, 240);
+        assert_eq!(crate::refusal::expires_text(inv.lifetime), "4m");
     }
 }
