@@ -326,6 +326,13 @@ pub fn cap_shadow_counts() -> ShadowCounts {
 /// volume already lives in the counters. The dedup set is CAPPED, because a key
 /// space like distinct device_pubs is unbounded; past the cap, new keys stop logging
 /// (their count is still counted), bounding memory.
+/// The WIDENING shadow line ("... was REFUSED by legacy but cap AUTHORIZES;
+/// a flip will NEWLY PERMIT this open") printed on every `receive`, to people
+/// who cannot act on it: it is input to the flip review, not something the
+/// user did wrong. It is still counted (`ld_authorized`) and still logged,
+/// at -v (ui::debug) only. The CRITICAL line stays loud.
+const WIDENING_VERBOSE_ONLY: bool = true;
+
 fn log_once(key: String, msg: &str, verbose: bool) {
     const LOG_ONCE_CAP: usize = 4096;
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -846,7 +853,7 @@ pub fn cap_gate_effective(
                     hex::encode(dev),
                     hex::encode(usr),
                 ),
-                false, // #231: a WIDENING is a real disagreement; stays loud
+                WIDENING_VERBOSE_ONLY,
             ),
             _ => {}
         }
@@ -1837,6 +1844,12 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// C: the WIDENING line is debug-only; it leaked on every `receive`.
+    #[test]
+    fn the_widening_shadow_line_is_debug_only() {
+        assert!(std::hint::black_box(WIDENING_VERBOSE_ONLY), "WIDENING must print at -v only");
     }
 
     #[test]
