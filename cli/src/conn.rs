@@ -1759,6 +1759,25 @@ impl Conn {
         }
     }
 
+    /// Exit path: close every link's QUIC connection NOW, so each peer learns
+    /// this instance is gone. Without it a peer kept its direct link to the
+    /// departed instance alive until QUIC's 30s idle timeout, and when the
+    /// device came back on a new instance the peer held two live-looking links
+    /// to it and routed warm opens to the dead one, waiting out the 2.5s
+    /// verify window on every such open (net-blockers P1). Returns how many
+    /// transports were closed. The caller gives the close a moment to leave
+    /// before exiting; there is no flush-on-close in QUIC.
+    pub(crate) fn close_links_for_exit(&self) -> usize {
+        let mut n = 0;
+        for l in self.links.values() {
+            for t in l.transport.iter().chain(l.workers.iter()) {
+                t.force_close();
+                n += 1;
+            }
+        }
+        n
+    }
+
     // --- WARM-HOLD: proactive connection management ---
 
     /// Record that a peer was just used (transfer, ssh, ping). This updates the
@@ -5067,6 +5086,23 @@ mod warm_identity_tests {
         tokio::time::sleep(DROP_CLOSE_GRACE + Duration::from_millis(300)).await;
         assert_eq!(t.closes.load(Ordering::Relaxed), 1, "primary QUIC left open: split-brain");
         assert_eq!(w.closes.load(Ordering::Relaxed), 1, "worker QUIC left open");
+    }
+
+    #[tokio::test]
+    async fn exit_closes_every_direct_connection_at_once() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let a = FakeQuic::live();
+        let aw = FakeQuic::live();
+        let b = FakeQuic::live();
+        let mut la = direct_link("sid-a", "a", "user@a", a.clone());
+        la.workers = vec![aw.clone()];
+        conn.links.insert("sid-a".into(), la);
+        conn.links.insert("sid-b".into(), direct_link("sid-b", "b", "user@b", b.clone()));
+        assert_eq!(conn.close_links_for_exit(), 3);
+        // At once, not after a grace: the process is about to exit.
+        assert_eq!(a.closes.load(Ordering::Relaxed), 1, "primary left open at exit");
+        assert_eq!(aw.closes.load(Ordering::Relaxed), 1, "worker left open at exit");
+        assert_eq!(b.closes.load(Ordering::Relaxed), 1, "second link left open at exit");
     }
 
     #[tokio::test]
