@@ -130,6 +130,20 @@ impl AsyncWrite for NetstackStream {
     }
 }
 
+/// Dropping a stream closes it, as dropping a kernel `TcpStream` does. Without
+/// this a dropped stream left its socket ESTABLISHED forever and the far end
+/// never saw a FIN: `expose` drops the overlay connection when nothing listens
+/// behind the port, so a SOCKS client through the proxy was told "granted" and
+/// then held with 0 bytes until its own timeout.
+impl Drop for NetstackStream {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.out.st.lock() {
+            st.closed = true;
+        }
+        self.wake.notify_one();
+    }
+}
+
 /// The overlay source address of an accepted connection, which may be IPv4 or IPv6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OverlayAddr {
@@ -999,6 +1013,34 @@ mod tests {
             }
         }
         assert_eq!(&got, b"HELLO-OVERLAY", "byte stream must round-trip through both stacks");
+        server.await.unwrap();
+    }
+
+    /// B: a stream DROPPED without a shutdown (what `expose` does when nothing
+    /// listens behind the port) closes, so the dialer reads EOF promptly. It
+    /// used to stay established forever.
+    #[tokio::test]
+    async fn a_dropped_stream_closes_and_the_dialer_reads_eof() {
+        let a_addr: Ipv6Addr = "fdf1:1af7:c30d:aab::1".parse().unwrap();
+        let b_addr: Ipv6Addr = "fdf1:1af7:c30d:bbc::1".parse().unwrap();
+        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        cross_wire(a.clone(), b.clone(), 0);
+        let listener = b.listen(9100).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (s, _src) = listener.accept_v6().await.unwrap();
+            drop(s);
+        });
+        let mut client = tokio::time::timeout(Duration::from_secs(3), a.dial(b_addr, 9100))
+            .await
+            .expect("dial timed out")
+            .expect("dial failed");
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+            .await
+            .expect("a dropped peer stream never closed: the dialer is held open")
+            .unwrap();
+        assert_eq!(n, 0, "EOF, not data");
         server.await.unwrap();
     }
 

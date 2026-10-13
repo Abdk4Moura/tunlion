@@ -23,8 +23,13 @@
 #       at once
 #   F4  the forward says so on its stderr
 #   P5  SOCKS CONNECT to the offline peer gets REP 0x04 within the bound
+#   P6  SOCKS CONNECT to a port the peer EXPOSED with nothing listening gets
+#       REP 0x05 within 5 s. It got 0x00 and then 0 bytes until the client
+#       gave up (the overlay listener took the handshake, and a dropped
+#       userspace stream never sent its FIN)
+#   P7  (control) the same exposed port with a listener carries HTTP
 #
-# P3/F1 are the controls: P1/P2/P4/F2/F3 could all pass on a build that
+# P3/F1/P7 are the controls: P1/P2/P4/P6/F2/F3 could all pass on a build that
 # refuses everything.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -217,6 +222,26 @@ if [ "$(rep_of "$r")" = "4" ] && le "$(secs_of "$r")" 2; then
   ok "P2: an unknown peer got REP 0x04 in $(secs_of "$r")s"
 else
   bad "P2: unknown peer answered '$r' (want rep=4 within 2s)"
+fi
+
+say "P6/P7: an EXPOSED port, nothing listening and then something (L2 off: only the overlay carries it)"
+env FILAMENT_CONFIG_DIR="$BDIR" timeout 20 "$BIN" expose 39557 >"$WORK/expose-p6.out" 2>&1
+sed 's/^/   /' "$WORK/expose-p6.out"
+sleep 3
+r=$(socks bravo.mesh 39557); echo "## P6 bravo.mesh:39557 (exposed, nothing listening) -> $r"
+if [ "$(rep_of "$r")" = "5" ] && le "$(secs_of "$r")" 5; then
+  ok "P6: an exposed port with nothing listening got REP 0x05 in $(secs_of "$r")s, not 'granted' and then held"
+else
+  bad "P6: exposed port with nothing listening answered '$r' (want rep=5 within 5s)"
+fi
+( cd "$WORK" && $PYV -m http.server 39557 --bind 127.0.0.1 >/dev/null 2>&1 & echo $! >"$WORK/http-p7.pid" )
+FIX_PIDS+=($(cat "$WORK/http-p7.pid"))
+sleep 2
+r=$(socks bravo.mesh 39557); echo "## P7 bravo.mesh:39557 (exposed, live) -> $r"
+if [ "$(rep_of "$r")" = "0" ] && [ "$(http_of "$r")" = "200" ]; then
+  ok "P7: the same exposed port, now live, is carried (HTTP 200)"
+else
+  bad "P7: the control failed ('$r'); P6 proves nothing if the exposed port is never carried"
 fi
 
 say "P3/P4: L2 on, a live port and a closed one"

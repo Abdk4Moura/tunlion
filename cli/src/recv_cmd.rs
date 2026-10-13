@@ -1978,9 +1978,29 @@ pub(crate) async fn recv_cmd(
                                             // BOUNDED. A port the peer did not expose can
                                             // black-hole the SYN, and an unbounded dial held
                                             // the proxy's client with no reply at all.
+                                            let t0 = std::time::Instant::now();
                                             match tokio::time::timeout(l2::OVERLAY_DIAL_BOUND, m.dial(addr, port)).await {
                                                 Ok(Ok(mut stream)) => {
+                                                    // An exposed port's overlay listener completes
+                                                    // the handshake before `expose` dials what is
+                                                    // behind it, so a connect is not an answer.
+                                                    // Settle first: the peer closing at once means
+                                                    // nothing listens there (SOCKS 0x05), and the
+                                                    // proxy must not say "granted" and then hold.
+                                                    let window = l2::overlay_settle_window(t0.elapsed());
+                                                    let mut first = vec![0u8; 16 * 1024];
+                                                    let got = match tokio::time::timeout(window, tokio::io::AsyncReadExt::read(&mut stream, &mut first)).await {
+                                                        Ok(Ok(0)) | Ok(Err(_)) => {
+                                                            req.reject(l2::OVERLAY_TARGET_CLOSED).await;
+                                                            return;
+                                                        }
+                                                        Ok(Ok(n)) => n,
+                                                        Err(_) => 0,
+                                                    };
                                                     let mut sock = req.accept().await;
+                                                    if got > 0 && tokio::io::AsyncWriteExt::write_all(&mut sock, &first[..got]).await.is_err() {
+                                                        return;
+                                                    }
                                                     let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
                                                 }
                                                 Ok(Err(e)) => req.reject(&format!("overlay dial failed: {e}")).await,

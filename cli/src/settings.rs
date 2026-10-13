@@ -477,10 +477,13 @@ fn global_remove(store: &str) -> Result<bool> {
     let removed = kept.len() != raw.lines().count();
     if removed {
         crate::state_files::before_write(&p)?;
-        crate::platform::SecretFile::write_str(
-            &p,
-            &(kept.join("\n") + if kept.is_empty() { "" } else { "\n" }),
-        )?;
+        if kept.iter().all(|l| l.trim().is_empty()) {
+            // An empty `config` reads as a truncation (state_files), so the
+            // last key going removes the file instead of leaving it empty.
+            std::fs::remove_file(&p)?;
+        } else {
+            crate::platform::SecretFile::write_str(&p, &(kept.join("\n") + "\n"))?;
+        }
     }
     Ok(removed)
 }

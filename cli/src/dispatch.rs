@@ -1113,7 +1113,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // everywhere and `--internal` is gone.
             if out.is_some() {
                 // Delivering as a file is the invitation ceremony, unchanged.
-                add_for_cmd(&ui_caps, for_, allow, expires, out).await
+                add_for_cmd(&ui_caps, for_, name, allow, expires, out).await
             } else if for_.is_some() {
                 // Same question, spoken-code transport. Resolving here (rather
                 // than inside the ceremony) means a script that omits the answer
@@ -1202,8 +1202,12 @@ pub(crate) async fn async_main() -> Result<()> {
                 // what `ephemeral mint` was a separate verb for. Same two
                 // questions, third answer to the first one.
                 if via.as_deref() == Some("file") {
-                    let path = out.unwrap_or_else(|| invite_path_for(named.as_deref(), &kind));
-                    return add_for_cmd(&ui_caps, Some(kind), allow, expires, Some(path)).await;
+                    let invitee = crate::add_for::invitee_name(named, name)?;
+                    let path = out.unwrap_or_else(|| invite_path_for(invitee.as_deref(), &kind));
+                    // The kind is settled; the name rides along. --name used to
+                    // be dropped here, so `add --for device --name b` made a
+                    // device named after the joiner's hostname.
+                    return add_for_cmd(&ui_caps, Some(kind), invitee, allow, expires, Some(path)).await;
                 }
                 let internal = kind == "device";
                 if internal && load_owner_key().is_none() {

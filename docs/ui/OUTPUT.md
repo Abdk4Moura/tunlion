@@ -383,7 +383,8 @@ Rules that go with them:
   shown under `-v`.
 - **`send --json`** prints one result object: `ok`, `verb`, `peer`, `bytes`
   (total), `files` (each with `file`, `bytes`, `sha256`, `delivered`,
-  `declined`), `file` and `sha256` at the top when exactly one file was sent,
+  `declined` (a person said no), `refused` (the receiver refused it for a
+  reason of its own: disk full, bad name, ...)), `file` and `sha256` at the top when exactly one file was sent,
   and `error` on failure. `stored_name` (top level for one file, and per file)
   is the name the receiver stored it under, from an additive field on its
   delivery-ack; null from an older receiver. A send whose files were all
@@ -414,12 +415,14 @@ Rules that go with them:
   `{code, exit, reason, message}` on failure. `--json` with `-o -` is refused
   (both write to stdout).
 - **A corrupt state file is an error, never an empty store.** When
-  `devices.json`, `revoked-keys.json`, `used-invitations.json`, `peerconf` or
-  `config` does not parse, every command (except `reset`, `down`, `logs`,
+  `devices.json`, `revoked-keys.json`, `used-invitations.json`, `caps.json`,
+  `peerconf` or `config` does not parse, or exists but is empty (tunlion never
+  writes an empty one, so an empty file is a truncation), every command (except `reset`, `down`, `logs`,
   `config`, `completions`, `man`, `update`) exits 2 naming the file and the
   parse error, and no write replaces it. Every write first keeps the previous
   good file as `<name>.bak`, and the error names that copy when it exists. A
-  corrupt `devices.json` used to list no devices with exit 0.
+  corrupt or empty `devices.json` used to list no devices with exit 0. In
+  `--json` the error's `code` is `corrupt_state` (exit 2).
 - **`devices --json` rows carry `status`**, the human row's word for the same
   value: `"online"` (`online: true`), `"idle"` (`online: false`: no answering
   link right now), or null.

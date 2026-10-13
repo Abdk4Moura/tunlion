@@ -2480,6 +2480,28 @@ fn forward_refusal_fix(peer: &str, reason: &str) -> Option<(String, Option<Strin
     Some(crate::refusal::remedy(code, peer, &me))
 }
 
+/// G: `forward` rides the shell grant, so a device without one was refused
+/// with the shell remedy (a grant, or a re-enrolment for a ceiling) even for a
+/// port the peer had EXPOSED, which needs no shell at all. For a refusal about
+/// shell, also name the route that works for an exposed port: `<peer>.mesh`,
+/// directly with a kernel TUN or through the daemon's SOCKS5 proxy. Pure.
+pub(crate) fn forward_exposed_note(peer: &str, rport: u16, reason: &str) -> Option<String> {
+    use crate::refusal::Code;
+    let code = crate::refusal::code_from_reason(reason)?;
+    matches!(
+        code,
+        Code::ShellOff | Code::TunnelOff | Code::NotGranted | Code::Revoked | Code::Ceiling
+    )
+    .then(|| {
+        let host = format!("{}.mesh", peer.to_ascii_lowercase());
+        format!(
+            "If '{peer}' exposed port {rport} (`tunlion expose {rport}` there), no shell is needed: \
+             open {host}:{rport} directly, or through the SOCKS5 proxy `tunlion up` runs here \
+             (`tunlion status` shows its curl line), e.g. curl -x socks5h://... http://{host}:{rport}/"
+        )
+    })
+}
+
 /// Act on a probe verdict: a POLICY refusal (the peer will refuse every
 /// connection: tunnels off, no grant, revoked) ends the forward now with the
 /// reason and its remedy; a refusal of the target port itself (nothing
@@ -2489,11 +2511,14 @@ fn forward_probe_verdict(peer: &str, rport: u16, probe: ForwardProbe) -> Result<
         ForwardProbe::Accepted | ForwardProbe::Silent => Ok(ForwardTarget::Open),
         ForwardProbe::Refused(reason) => match classify_forward_refusal(&reason) {
             ForwardRefusal::Policy => {
-                let fix = match forward_refusal_fix(peer, &reason) {
+                let mut fix = match forward_refusal_fix(peer, &reason) {
                     Some((text, Some(c))) => format!("\n  {text}\n    {c}"),
                     Some((text, None)) => format!("\n  {text}"),
                     None => String::new(),
                 };
+                if let Some(note) = forward_exposed_note(peer, rport, &reason) {
+                    fix.push_str(&format!("\n  {note}"));
+                }
                 bail!("tunlion: {peer}:{rport} refused the connection: {reason}{fix}");
             }
             ForwardRefusal::NothingListening => {
@@ -3838,6 +3863,9 @@ impl ForwardActivity {
                 crate::ui::critical(&format!("    {c}"));
             }
         }
+        if let Some(note) = forward_exposed_note(&self.peer, self.rport, reason) {
+            crate::ui::critical(&format!("  {note}"));
+        }
         if policy {
             let _ = self.denied.send(reason.trim().to_string());
         }
@@ -4696,17 +4724,36 @@ pub(crate) const OVERLAY_DIAL_BOUND: Duration = Duration::from_secs(3);
 /// The daemon's reject reason when `OVERLAY_DIAL_BOUND` runs out.
 pub(crate) const OVERLAY_DIAL_TIMED_OUT: &str = "overlay dial timed out";
 
+/// The longest an overlay dial waits after its handshake (see below).
+pub(crate) const OVERLAY_SETTLE_MAX: Duration = Duration::from_millis(1500);
+
+/// The daemon's overlay-dial answer when the peer's exposed port accepted the
+/// connection and closed it at once: `expose` found nothing listening behind
+/// it. The proxy answers SOCKS 0x05 (connection refused).
+pub(crate) const OVERLAY_TARGET_CLOSED: &str =
+    "overlay dial refused: nothing is listening behind the exposed port there";
+
+/// How long an overlay dial waits, after the handshake, for the peer to close
+/// before the connection counts as carried. The close comes about one round
+/// trip after the handshake (the peer's `expose` fails its local connect at
+/// once), and the handshake itself took about one, so twice it plus a margin,
+/// bounded. Pure.
+#[cfg_attr(not(l3), allow(dead_code))]
+pub(crate) fn overlay_settle_window(handshake: Duration) -> Duration {
+    (handshake * 2 + Duration::from_millis(150)).clamp(Duration::from_millis(250), OVERLAY_SETTLE_MAX)
+}
+
 /// The budget for the WARM half of a proxy `.mesh` CONNECT: the daemon's L2 open
-/// plus its overlay dial must have answered by then: the dial's own bound plus
-/// a second for the open, inside the 5 s a client can reasonably wait for a
-/// SOCKS reply. Override with FILAMENT_PROXY_WARM_MS.
+/// plus its overlay dial must have answered by then: the dial's own bound, its
+/// settle wait, and a second for the open. Override with FILAMENT_PROXY_WARM_MS.
 fn proxy_warm_budget() -> Duration {
     std::env::var("FILAMENT_PROXY_WARM_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
         .map(Duration::from_millis)
-        .unwrap_or(OVERLAY_DIAL_BOUND + Duration::from_secs(1))
+        // The dial, then its settle wait (`overlay_settle_window`), then slack.
+        .unwrap_or(OVERLAY_DIAL_BOUND + OVERLAY_SETTLE_MAX + Duration::from_secs(1))
 }
 
 /// How long a connection accepted by `forward` (or a proxy CONNECT on the cold
@@ -4774,6 +4821,12 @@ pub(crate) fn mesh_fail_for_refusal(reason: &str) -> MeshFail {
 /// dial (None: there was no daemon to ask). `None` means "nothing definitive,
 /// try a cold link"; the peer only gets a verdict when it answered.
 pub(crate) fn mesh_verdict(l2: Option<&str>, l3: Option<&str>) -> Option<MeshFail> {
+    // The peer's exposed port took the connection and closed it: that port IS
+    // exposed and nothing listens behind it, whatever the loopback open said
+    // (a device without shell is refused there by policy).
+    if l3 == Some(OVERLAY_TARGET_CLOSED) {
+        return Some(MeshFail::Refused);
+    }
     let refusal = mesh_fail_for_refusal(l2?);
     if refusal != MeshFail::General {
         return Some(refusal);
@@ -5902,6 +5955,27 @@ async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
 }
 
 #[cfg(test)]
+mod forward_exposed_note_tests {
+    use super::forward_exposed_note;
+
+    /// G: a forward refused for want of shell names the route for an exposed
+    /// port; a refusal that has nothing to do with shell does not.
+    #[test]
+    fn a_shell_refusal_points_to_the_mesh_route_for_exposed_ports() {
+        for reason in [
+            crate::capability::CEILING_REASON,
+            crate::capability::TUNNEL_OFF_REASON,
+            crate::capability::SHELL_OFF_REASON,
+            "shell not granted to 'b' here",
+        ] {
+            let n = forward_exposed_note("Alpha", 7777, reason).unwrap_or_else(|| panic!("{reason}"));
+            assert!(n.contains("alpha.mesh:7777") && n.contains("expose 7777") && n.contains("SOCKS5"), "{n}");
+        }
+        assert!(forward_exposed_note("alpha", 7777, "connection refused").is_none());
+    }
+}
+
+#[cfg(test)]
 mod term_tests {
     use super::effective_term;
 
@@ -7008,6 +7082,17 @@ mod forward_refusal_tests {
         assert_eq!(mesh_verdict(Some("stream cap"), Some(OVERLAY_DIAL_TIMED_OUT)), Some(MeshFail::TimedOut));
         assert_eq!(mesh_verdict(Some("stream cap"), Some("overlay dial failed: connection reset")), Some(MeshFail::Refused));
         assert_eq!(mesh_verdict(Some("stream cap"), None), Some(MeshFail::General));
+        // B: an EXPOSED port that took the connection and closed it at once
+        // (nothing listening behind it) is "connection refused", even when
+        // the loopback open was refused by policy (no shell) or never asked.
+        for l2 in [Some(off), Some("stream cap"), None] {
+            assert_eq!(mesh_verdict(l2, Some(OVERLAY_TARGET_CLOSED)), Some(MeshFail::Refused), "{l2:?}");
+        }
+        assert_eq!(MeshFail::Refused.socks_rep(), 0x05);
+        // The settle wait is bounded both ways.
+        assert_eq!(overlay_settle_window(Duration::ZERO), Duration::from_millis(250));
+        assert_eq!(overlay_settle_window(Duration::from_millis(100)), Duration::from_millis(350));
+        assert_eq!(overlay_settle_window(Duration::from_secs(5)), Duration::from_millis(1500));
         // No warm link to ask through: nothing definitive, try a cold link.
         assert_eq!(mesh_verdict(None, Some(OVERLAY_DIAL_TIMED_OUT)), None);
         assert_eq!(mesh_verdict(None, None), None);
