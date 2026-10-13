@@ -92,6 +92,8 @@ EXPECTED_GREEN=(
   # fix/known-red-gates landed: measured 31 PASS / 0 FAIL, and 14b 3 of 3 at -vv.
   "daemon-restart: the sender picked up the restarted daemon|daemon-restart"
   "Mode B: baseline hung|gate-18b Mode B"
+  # A per-peer failure in the serving loop must never end `up` (fix/launch-final).
+  "daemon-survives-peer-failure: the daemon logged|daemon-survives-peer-failure"
 )
 
 # A missing PASS line has three different causes and they want different

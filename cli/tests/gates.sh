@@ -843,6 +843,48 @@ else
   bad "daemon-restart"; tail -n 5 "$WORK/g14b-send.log" "$WORK/g14b-up2.log"
 fi
 
+# --------------------------------------------------------------- gate 14c ---
+say "14c: one peer's failed adoption never ends the daemon: logged, still serving, the next transfer lands"
+# The blind run: a real two-machine `up` EXITED 9 s after a restart with
+# "direct fallback adoption failed for peer ... ICE config: no answer within
+# 3s". Every per-peer step in the serving loop ended the process with `?`.
+# FILAMENT_TEST_FAIL_ADOPT=1 fails the daemon's first adoption the same way
+# (the known-device adoption when boxA's sender appears). A build without the
+# fix dies right there, so the alive and status checks below fail on it.
+# Reuses gate 14's pairing (DA sends to boxB, whose daemon runs on DB).
+DD3="$WORK/g14cdrop"; mkdir -p "$DD3"
+G14C="$WORK/g14c.bin"; head -c $((2 * 1024 * 1024)) /dev/urandom > "$G14C"; H_G14C=$(hashof "$G14C")
+# No timeout wrapper: $! is the daemon itself, so `status` must name this pid.
+FILAMENT_TEST_FAIL_ADOPT=1 FILAMENT_CONFIG_DIR="$DB" "$BIN" -v up --dir "$DD3" --server "$SERVER" >"$WORK/g14c-up.log" 2>&1 &
+UPC=$!; pids+=($UPC); sleep 3
+# The attempt that meets the injected failure. Its own outcome is not the
+# claim (the direct dial may still win); the daemon outliving it is.
+RC1=0
+FILAMENT_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$SMALL" --to boxB --server "$SERVER" >"$WORK/g14c-s1.log" 2>&1 || RC1=$?
+FIRED=""
+for _ in $(seq 1 20); do
+  grep -q "PEER-STEP-FAILED.*FILAMENT_TEST_FAIL_ADOPT" "$WORK/g14c-up.log" && { FIRED=yes; break; }
+  sleep 0.5
+done
+ALIVE=""; kill -0 $UPC 2>/dev/null && ALIVE=yes
+ST14C=$(FILAMENT_CONFIG_DIR="$DB" timeout 20 "$BIN" status 2>&1)
+RC2=0
+FILAMENT_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$G14C" --to boxB --server "$SERVER" >"$WORK/g14c-s2.log" 2>&1 || RC2=$?
+ALIVE2=""; kill -0 $UPC 2>/dev/null && ALIVE2=yes
+kill_tree $UPC
+echo "  hook fired: ${FIRED:-no}; alive after it: ${ALIVE:-no}, after the next send: ${ALIVE2:-no}; first send exit $RC1, next send exit $RC2"
+echo "  status: $(echo "$ST14C" | head -1)"
+if [ "$FIRED" != "yes" ]; then
+  bad "daemon-survives-peer-failure: the injected adoption failure never reached the daemon, so nothing was tested"
+  tail -n 5 "$WORK/g14c-up.log"
+elif [ "$ALIVE" = "yes" ] && [ "$ALIVE2" = "yes" ] \
+   && echo "$ST14C" | grep -q "up (pid $UPC)" \
+   && [ $RC2 -eq 0 ] && [ "$(hashof "$DD3/g14c.bin" 2>/dev/null)" = "$H_G14C" ]; then
+  ok "daemon-survives-peer-failure: the daemon logged the failed adoption, stayed up, and the next transfer delivered, hash matches"
+else
+  bad "daemon-survives-peer-failure"; tail -n 8 "$WORK/g14c-up.log" "$WORK/g14c-s2.log"
+fi
+
 # --------------------------------------------------------------- gate 15 ----
 say "15: paired recv holds the line when the sender vanishes (C21)"
 D="$WORK/g15"; mkdir -p "$D"

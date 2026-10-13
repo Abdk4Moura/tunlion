@@ -447,6 +447,27 @@ mod test_hooks {
     pub fn corrupt_recv_target() -> Option<String> {
         std::env::var("FILAMENT_TEST_CORRUPT_RECV").ok()
     }
+
+    /// daemon-survival gate (14c): `FILAMENT_TEST_FAIL_ADOPT=<n>` makes the
+    /// first n peer adoptions fail the way an ICE-config timeout does, so the
+    /// gate can prove a per-peer failure never ends the `up` daemon and that
+    /// the next attempt still connects. The count is a process-global latch.
+    static FAIL_ADOPT_USED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    pub fn fail_adopt() -> bool {
+        let Some(n) = std::env::var("FILAMENT_TEST_FAIL_ADOPT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        FAIL_ADOPT_USED
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |used| (used < n).then_some(used + 1),
+            )
+            .is_ok()
+    }
     pub fn corrupt_recv_once() -> bool {
         std::env::var("FILAMENT_TEST_CORRUPT_ONCE").map(|v| v == "1").unwrap_or(false)
     }
@@ -480,6 +501,7 @@ mod test_hooks {
     #[inline] pub fn premature_already_fired() -> bool { false }
     #[inline] pub fn premature_mark_fired() {}
     #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
+    #[inline] pub fn fail_adopt() -> bool { false }
 }
 
 

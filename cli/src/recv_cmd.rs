@@ -199,6 +199,31 @@ async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str) {
     ui::debug(&format!("refused a dial from {pid}: a device forgotten here"));
 }
 
+/// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
+/// serving loop.
+///
+/// The daemon (`up`) serves every peer from this one loop, so a bare `?` on a
+/// per-peer step ended the process for all of them. A two-machine run lost
+/// its daemon 9 s after a restart to one peer's ICE-config timeout ("direct
+/// fallback adoption failed ... no answer within 3s"). In the daemon the
+/// failure is logged and the step is skipped (`Ok(None)`): the steps routed
+/// here leave the peer's existing state intact on error (an establish builds
+/// before it destroys), and the next roster push, warm-hold tick or retry
+/// rung drives that peer again. A one-shot `receive` has exactly one sender,
+/// so there the error still ends the run, unchanged, with its exit code.
+fn peer_step<T>(daemon: bool, pid: &str, what: &str, r: Result<T>) -> Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if daemon => {
+            ui::debug(&format!(
+                "tunlion: PEER-STEP-FAILED peer={pid} step={what}: {e:#}; the daemon keeps serving"
+            ));
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Every inbound control frame, one line, at debug level. A frame that never
 /// arrived and a frame that arrived and was ignored are indistinguishable from
 /// the outside; this is the line that tells them apart, and its absence is what
@@ -2180,7 +2205,19 @@ pub(crate) async fn recv_cmd(
                 },
                 next_ev(&mut rx, &conn, !st.pending.is_empty()),
             ) => match res {
-                Ok(res) => res?,
+                Ok(Ok(ev)) => ev,
+                // A daemon is not one sender's receiver: a peer that left
+                // mid-transfer and outlived its rejoin window closes that
+                // window, and the daemon keeps serving everyone else (its
+                // .part stays for a later resume). A one-shot ends here.
+                Ok(Err(e)) if daemon && conn.rejoin.waiting_rejoin.is_some() => {
+                    ui::debug(&format!(
+                        "tunlion: rejoin window closed ({e:#}); the daemon keeps serving"
+                    ));
+                    conn.rejoin.waiting_rejoin = None;
+                    None
+                }
+                Ok(Err(e)) => return Err(e),
                 Err(_) => None, // tick: run the settle sweep + quiet-check below
             },
         };
@@ -3156,9 +3193,10 @@ pub(crate) async fn recv_cmd(
         // ADOPT for the same peer; that sequence is not sound if peers recover
         // concurrently, so caller attribution alone is insufficient here.
         for (pid, info, (n, sec)) in conn.expired_direct() {
-            conn.maybe_adopt(&info, true).await.with_context(|| {
+            let adopted = conn.maybe_adopt(&info, true).await.with_context(|| {
                 format!("direct fallback adoption failed for peer {pid} on receive path")
-            })?;
+            });
+            peer_step(daemon, &pid, "direct fallback adoption", adopted)?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
@@ -3551,7 +3589,8 @@ pub(crate) async fn recv_cmd(
                             conn.start_direct(&pid, &name, &secret).await;
                             // Channel-digest recovery remains intentionally outside
                             // the room give-up suppression scope.
-                            conn.maybe_adopt(p, true).await?;
+                            let r = conn.maybe_adopt(p, true).await;
+                            peer_step(daemon, &pid, "channel-digest adoption", r)?;
                             if let Some(l) = conn.link_mut(&pid) {
                                 l.expected_secret = Some((name, secret));
                             }
@@ -3561,7 +3600,9 @@ pub(crate) async fn recv_cmd(
                             let enroll_channel =
                                 crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                             if p["channel"].as_str() == Some(enroll_channel.as_str()) {
-                                conn.maybe_adopt(p, true).await?;
+                                let r = conn.maybe_adopt(p, true).await;
+                                let pid = p["id"].as_str().unwrap_or_default();
+                                peer_step(daemon, pid, "enrollment-digest adoption", r)?;
                             }
                         }
                     }
@@ -3612,7 +3653,8 @@ pub(crate) async fn recv_cmd(
                                 ui::Tone::Dim,
                                 "  (digest: adopting a peer we never heard join)",
                             ));
-                            conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
+                            let r = conn.maybe_adopt_from(p, true, AdoptSource::Digest).await;
+                            peer_step(daemon, id, "digest adoption", r)?;
                         }
                     }
                     // known room-sourced link absent ×2 → a peer-left we
@@ -3710,7 +3752,9 @@ pub(crate) async fn recv_cmd(
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
-                        conn.maybe_adopt(p, true).await?;
+                        let r = conn.maybe_adopt(p, true).await;
+                        let pid = p["id"].as_str().unwrap_or_default();
+                        peer_step(daemon, pid, "welcome adoption", r)?;
                     }
                 }
                 // C30 (dissolves the C28 belt): a welcome means a fresh sid,
@@ -3789,7 +3833,8 @@ pub(crate) async fn recv_cmd(
                     // rung-1: known device = both CLIs; try direct QUIC first.
                     let (n, sec) = (n.clone(), sec.clone());
                     conn.start_direct(&pid, &n, &sec).await;
-                    conn.maybe_adopt(&v, true).await?;
+                    let r = conn.maybe_adopt(&v, true).await;
+                    peer_step(daemon, &pid, "known-device adoption", r)?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
                     }
@@ -3834,7 +3879,8 @@ pub(crate) async fn recv_cmd(
                     let name = crate::revocation_live::brokered_dial_name(&broker);
                     brokered_pids.insert(pid.clone(), broker.clone());
                     conn.start_direct(&pid, &name, &sec).await;
-                    conn.maybe_adopt(&v, true).await?;
+                    let r = conn.maybe_adopt(&v, true).await;
+                    peer_step(daemon, &pid, "brokered adoption", r)?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((name, sec));
                         if l.transport.is_some() {
@@ -3871,7 +3917,8 @@ pub(crate) async fn recv_cmd(
                             conn.start_direct_fleet(&pid, &rv).await;
                         }
                     }
-                    conn.maybe_adopt(&v, true).await?;
+                    let r = conn.maybe_adopt(&v, true).await;
+                    peer_step(daemon, &pid, "fleet adoption", r)?;
                 } else if let Ok(Some(uk)) =
                     crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
                 {
@@ -3885,13 +3932,17 @@ pub(crate) async fn recv_cmd(
                         {
                             ui::debug("enrollment peer appeared on channel, dialing");
                         }
-                        conn.maybe_adopt(&v, true).await?;
+                        let r = conn.maybe_adopt(&v, true).await;
+                        peer_step(daemon, &pid, "enrollment adoption", r)?;
                     }
                 }
             }
             Ev::PeerJoined(v) => {
                 let had_partials = !st.by_sid.is_empty();
-                if conn.maybe_adopt(&v, true).await? && had_partials {
+                let r = conn.maybe_adopt(&v, true).await;
+                let pid = v["id"].as_str().unwrap_or_default();
+                let now_active = peer_step(daemon, pid, "peer-joined adoption", r)?;
+                if now_active.unwrap_or(false) && had_partials {
                     // Stale per-link sid routing dies with the old link; the
                     // .part files live on and the sender's resume re-offers.
                     flush_inflight(&mut st.by_sid).await;
@@ -4129,7 +4180,12 @@ pub(crate) async fn recv_cmd(
                 }
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
-                conn.ensure_responder(&from, &data).await?;
+                // A responder that could not be built (or a peer announcing a
+                // malformed uid) gets no signal applied; the daemon carries on.
+                let r = conn.ensure_responder(&from, &data).await;
+                if peer_step(daemon, &from, "responder", r)?.is_none() {
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             // rung-1: authenticated direct-QUIC won the race, adopt as a
@@ -6649,7 +6705,8 @@ pub(crate) async fn recv_cmd(
                         if !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
                             ui::debug(&format!("enrollment peer appeared on channel, dialing"));
                         }
-                        conn.maybe_adopt(&v, true).await?;
+                        let r = conn.maybe_adopt(&v, true).await;
+                        peer_step(daemon, &pid, "enrollment adoption", r)?;
                     }
                 }
                                                                 }
@@ -6995,7 +7052,8 @@ pub(crate) async fn recv_cmd(
                             &format!("declined {name} from {sender_name} ({reason})"),
                             crate::exit_codes::ExitKind::Denied,
                         );
-                        t.send_control(&protocol::decline_msg(&id)).await?;
+                        let r = t.send_control(&protocol::decline_msg(&id)).await;
+                        peer_step(daemon, &pid, "decline", r)?;
                         continue;
                     }
                     if !ok {
@@ -7059,7 +7117,8 @@ pub(crate) async fn recv_cmd(
                                 crate::exit_codes::ExitKind::Usage,
                             ),
                         }
-                        t.send_control(&protocol::decline_msg(&id)).await?;
+                        let r = t.send_control(&protocol::decline_msg(&id)).await;
+                        peer_step(daemon, &pid, "decline", r)?;
                         continue;
                     }
 
@@ -7191,7 +7250,8 @@ pub(crate) async fn recv_cmd(
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
                             note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
-                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                            let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
+                            peer_step(daemon, &pid, "refusal", r)?;
                             continue;
                         }
                     }
@@ -7216,7 +7276,8 @@ pub(crate) async fn recv_cmd(
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
                             note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
-                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                            let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
+                            peer_step(daemon, &pid, "refusal", r)?;
                             continue;
                         }
                     }
@@ -7254,7 +7315,8 @@ pub(crate) async fn recv_cmd(
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
                                 note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
-                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                                let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
+                                peer_step(daemon, &pid, "refusal", r)?;
                                 continue;
                             }
                         }
@@ -7298,7 +7360,8 @@ pub(crate) async fn recv_cmd(
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
                                 note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
-                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                                let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
+                                peer_step(daemon, &pid, "refusal", r)?;
                                 continue;
                             }
                         }
@@ -7332,7 +7395,13 @@ pub(crate) async fn recv_cmd(
                             stdout: None,
                         },
                     );
-                    t.send_control(&protocol::accept_msg(&id, offset)).await?;
+                    // The accept could not be sent (the link died under us): drop
+                    // the stream just registered. Its .part stays for the
+                    // sender's resume on the next link.
+                    let r = t.send_control(&protocol::accept_msg(&id, offset)).await;
+                    if peer_step(daemon, &pid, "accept", r)?.is_none() {
+                        st.by_sid.remove(&(pid.clone(), sid));
+                    }
                 }
                 // The sender could not read its own source part way through: the
                 // partial here can never be completed from it, so it is removed,
@@ -7973,10 +8042,12 @@ pub(crate) async fn recv_cmd(
                             ),
                         ));
                         if let Some(t) = conn.transport_of(&qpid) {
-                            t.send_control(&protocol::decline_msg(
-                                qv["id"].as_str().unwrap_or_default(),
-                            ))
-                            .await?;
+                            let r = t
+                                .send_control(&protocol::decline_msg(
+                                    qv["id"].as_str().unwrap_or_default(),
+                                ))
+                                .await;
+                            peer_step(daemon, &qpid, "decline", r)?;
                         }
                     }
                     // show the next queued question (or re-show on gibberish)
@@ -8018,12 +8089,22 @@ pub(crate) async fn recv_cmd(
                 } else if let Some(n) = ans.strip_prefix("forget ") {
                     let n = n.trim();
                     if devices.iter().any(|(dn, _)| dn == n) {
-                        devices_remove(n)?;
-                        devices.retain(|(dn, _)| dn != n);
-                        ui::say(&format!(
-                            "  {} forgot '{n}', it can no longer find this machine",
-                            ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                        ));
+                        // A typed command that fails is answered, never a
+                        // reason to stop serving everyone else.
+                        match devices_remove(n) {
+                            Ok(()) => {
+                                devices.retain(|(dn, _)| dn != n);
+                                ui::say(&format!(
+                                    "  {} forgot '{n}', it can no longer find this machine",
+                                    ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                ));
+                            }
+                            Err(e) if daemon => ui::say(&format!(
+                                "  {} could not forget '{n}': {e:#}; still listening",
+                                ui::paint(ui::Tone::Err, ui::glyph_err())
+                            )),
+                            Err(e) => return Err(e),
+                        }
                     } else {
                         ui::say(&ui::paint(
                             ui::Tone::Dim,
@@ -8376,6 +8457,38 @@ async fn stdout_delivered(inc: &IncomingFile, conn: &Conn, pid: &str, sid: u32) 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod peer_step_tests {
+    use super::*;
+
+    /// The daemon survives a peer's failure: the step is skipped, not the loop.
+    #[test]
+    fn daemon_skips_a_failed_peer_step() {
+        let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"));
+        assert!(matches!(peer_step(true, "p1", "adoption", r), Ok(None)));
+    }
+
+    /// A one-shot receive still fails, with the very error it met (no added
+    /// context: the exit-code taxonomy classifies on that text).
+    #[test]
+    fn one_shot_keeps_the_error_unchanged() {
+        let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"))
+            .context("direct fallback adoption failed for peer p1 on receive path");
+        let e = peer_step(false, "p1", "adoption", r).unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "direct fallback adoption failed for peer p1 on receive path: ICE config: no answer within 3s"
+        );
+    }
+
+    /// Success passes the value through in both modes.
+    #[test]
+    fn success_passes_through() {
+        assert!(matches!(peer_step(true, "p1", "adoption", Ok(true)), Ok(Some(true))));
+        assert!(matches!(peer_step(false, "p1", "adoption", Ok(false)), Ok(Some(false))));
+    }
 }
 
 #[cfg(test)]

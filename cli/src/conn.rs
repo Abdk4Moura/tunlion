@@ -1517,6 +1517,9 @@ impl Conn {
         if !self.adoption_allowed(&peer_id, source) {
             return Ok(false);
         }
+        if test_hooks::fail_adopt() {
+            anyhow::bail!("ICE config: injected adoption failure (FILAMENT_TEST_FAIL_ADOPT)");
+        }
         // NOTE: same-install peers (our own daemon) are filtered at the
         // KnownPeer call sites, NOT here, room discovery must keep working
         // between two processes of one machine (loopback self-send is the
