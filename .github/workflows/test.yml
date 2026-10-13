@@ -7,6 +7,14 @@
 # proofs and need NO kernel TUN, so they run on a stock runner. The cross-build job
 # confirms the smoltcp netstack still compiles on every shipped target (musl,
 # macOS, Windows), not just at release time.
+#
+# PROFILE. The CLI's tests build in the `ci` profile (cli/Cargo.toml), not
+# --release: `cargo test --release` compiled every test binary with fat LTO and
+# one codegen unit, which is most of this workflow's wall-clock and changes no
+# behaviour a test asserts. `ci` inherits release, so debug assertions and
+# overflow checks are off exactly as in what ships. The local crates under
+# crates/ keep --release: they have no profile of their own, and plain release
+# there is already the fast no-LTO default.
 
 name: Test
 
@@ -56,7 +64,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
       - name: Test
         working-directory: cli
-        run: cargo test --release
+        run: cargo test --profile ci
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -72,7 +80,7 @@ jobs:
         working-directory: cli
         run: |
           set -euo pipefail
-          exe=$(cargo test --release --bin tunlion --no-run --message-format=json \
+          exe=$(cargo test --profile ci --bin tunlion --no-run --message-format=json \
                 | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true and .executable!=null) | .executable' \
                 | tail -1)
           echo "test binary: $exe"
@@ -161,7 +169,7 @@ jobs:
       - name: Test
         working-directory: cli
         shell: bash
-        run: cargo test --release
+        run: cargo test --profile ci
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -170,6 +178,14 @@ jobs:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      # The `ci` profile (cli/Cargo.toml: release without fat LTO, 16 codegen
+      # units) proves the code compiles and links on every shipped target in a
+      # fraction of the time. The shipping fat-LTO build runs in the release
+      # workflow and in Capability CI's release smoke job. A manual dispatch
+      # still builds --release, because what it publishes (below) has to be the
+      # exact shipping bytes.
+      BUILD_PROFILE: ${{ github.event_name == 'workflow_dispatch' && '--release' || '--profile ci' }}
     strategy:
       fail-fast: false
       matrix:
@@ -218,7 +234,7 @@ jobs:
         if: matrix.use_sccache_c
         working-directory: cli
         shell: bash
-        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+        run: cargo build $BUILD_PROFILE --target ${{ matrix.target }} ${{ matrix.features }}
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -232,7 +248,7 @@ jobs:
           if [[ "${{ matrix.target }}" == *windows-msvc* ]]; then
             export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
           fi
-          cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+          cargo build $BUILD_PROFILE --target ${{ matrix.target }} ${{ matrix.features }}
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -295,4 +311,4 @@ jobs:
       - name: Interactive cells
         working-directory: cli
         shell: bash
-        run: cargo test --release --test pty_flows -- --ignored --nocapture --test-threads=1
+        run: cargo test --profile ci --test pty_flows -- --ignored --nocapture --test-threads=1

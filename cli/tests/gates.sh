@@ -24,6 +24,40 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
+
+# SHARDING (CI runs this suite split across runners, see .github/workflows/gates.yml).
+#
+#   ./gates.sh --list-gates                       print every gate id, one per line
+#   FILAMENT_GATE_SHARD="1 2 2b" ./gates.sh ...   run only those gates
+#   FILAMENT_GATE_BIN=/path/to/tunlion ./gates.sh use a prebuilt test-hooks binary
+#                                                 instead of building one here
+#
+# Unset FILAMENT_GATE_SHARD means every gate, exactly as before. Each gate is one
+# `if gate_on <id>; then ... fi` block below, and --list-gates reads those blocks
+# out of this file, so the list cannot drift from what the file runs. An id that
+# is not a gate here is refused (exit 2) rather than silently running nothing,
+# and a sharded run ends with a `gates shard ran:` line that the CI aggregator
+# checks against --list-gates: every gate has to have run in some shard.
+_all_gate_ids() { grep -oE '^if gate_on [A-Za-z0-9]+; then' "$HERE/gates.sh" | awk '{print $3}' | tr -d ';'; }
+if [ "${1:-}" = "--list-gates" ]; then _all_gate_ids; exit 0; fi
+GATE_SHARD="${FILAMENT_GATE_SHARD:-}"
+GATES_RAN=""
+if [ -n "$GATE_SHARD" ]; then
+  _known=" $(_all_gate_ids | tr '\n' ' ') "
+  for _g in $GATE_SHARD; do
+    case "$_known" in *" $_g "*) ;; *) echo "FILAMENT_GATE_SHARD names '$_g', which is not a gate in this file (see --list-gates)"; exit 2 ;; esac
+  done
+  # 14b reuses gate 14's pairing (DA sends to boxB, whose daemon runs on DB), so
+  # it cannot run in a shard without 14 ahead of it.
+  case " $GATE_SHARD " in *" 14b "*) case " $GATE_SHARD " in *" 14 "*) ;; *) echo "FILAMENT_GATE_SHARD: gate 14b needs gate 14 in the same shard"; exit 2 ;; esac ;; esac
+fi
+gate_on() {
+  if [ -n "$GATE_SHARD" ]; then
+    case " $GATE_SHARD " in *" $1 "*) ;; *) return 1 ;; esac
+  fi
+  GATES_RAN="$GATES_RAN $1"
+  return 0
+}
 # Correctness gates build DEBUG by default (~20s incremental) instead of the LTO
 # release build (~4min) -- these gates verify BEHAVIOUR via the FILAMENT_TEST_*
 # hooks, not throughput, so they don't need release codegen. Set
@@ -44,8 +78,18 @@ _target_dir() {
       | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
       || echo "$CLI_DIR/target"
 }
-GATE_TARGET_DIR="${CARGO_TARGET_DIR:-$(_target_dir)}"
-BIN="$GATE_TARGET_DIR/$GATE_PROFILE_DIR/tunlion"
+if [ -n "${FILAMENT_GATE_BIN:-}" ]; then
+  # A prebuilt binary (CI builds it once, with --features test-hooks, and hands
+  # it to every shard). Resolved to an absolute path because gates cd around.
+  case "$FILAMENT_GATE_BIN" in /*) BIN="$FILAMENT_GATE_BIN" ;; *) BIN="$(pwd)/$FILAMENT_GATE_BIN" ;; esac
+else
+  GATE_TARGET_DIR="${CARGO_TARGET_DIR:-$(_target_dir)}"
+  BIN="$GATE_TARGET_DIR/$GATE_PROFILE_DIR/tunlion"
+fi
+# Gate 0 runs `cargo test` and never execs the binary, so a shard of gate 0 alone
+# (CI runs it on a runner of its own, beside the binary build) needs none.
+NEEDS_BIN=1
+[ -n "$GATE_SHARD" ] && [ "$(echo $GATE_SHARD)" = "0" ] && NEEDS_BIN=0
 SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
 WORK="${FILAMENT_TEST_WORK:-$(mktemp -d /tmp/filament-gates.XXXXXX)}"
 WITH_RELAY=0
@@ -137,6 +181,23 @@ wait_code() {
   done
   return 1
 }
+# Bounded polling for an EVENT, in place of a fixed sleep that only waited for
+# that event. Each keeps the bound of the sleep it replaced and, like the sleep,
+# carries on when the bound runs out (whatever the gate asserts next is what
+# fails), so the worst case is unchanged and the usual case stops waiting as soon
+# as the event has happened. Sleeps that ARE the premise (a restart 4s later, a
+# freeze longer than an idle threshold, a negative "nothing arrived" window) are
+# left as sleeps.
+wait_grep() {  # $1 = seconds, $2 = ERE, $3 = file
+  local i
+  for i in $(seq 1 $(( $1 * 5 ))); do grep -qE -- "$2" "$3" 2>/dev/null && return 0; sleep 0.2; done
+  return 1
+}
+port_released() {  # $1 = TCP port, $2 = seconds: no listener left on it
+  local i
+  for i in $(seq 1 $(( $2 * 10 ))); do ss -tln 2>/dev/null | grep -q ":$1 " || return 0; sleep 0.1; done
+  return 1
+}
 pids=()
 cleanup() { for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done; [ -n "${OWN_BACKEND:-}" ] && kill "$OWN_BACKEND" 2>/dev/null; }
 trap cleanup EXIT
@@ -166,7 +227,7 @@ PYV0="$(_pick_python)"
 OWN_BACKEND=""
 if [ -z "${FILAMENT_TEST_SERVER:-}" ] && [ -x "$PYV0" ]; then
   for pid in $(ss -tlnp 2>/dev/null | grep ":8077 " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
-  sleep 1
+  port_released 8077 1
   # FIL_PING_TIMEOUT high: a CPU-starved headless browser stays connected
   # instead of dropping → reconnecting → triggering the stale-answer glare.
   ( cd "$CLI_DIR/../backend" && PORT=8077 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 FIL_CLAIM_LIMIT=1000000 \
@@ -183,11 +244,15 @@ curl -fsS "$SERVER/api/health" >/dev/null || {
 }
 # These gates drive env-gated test hooks (FILAMENT_TEST_*), which now ship ONLY
 # in a `--features test-hooks` build (stripped from default/release).
-( cd "$CLI_DIR" && cargo build $GATE_BUILD_FLAG --features test-hooks -q ) || { echo "build failed"; exit 2; }
+if [ -n "${FILAMENT_GATE_BIN:-}" ]; then
+  echo "gates: prebuilt binary from FILAMENT_GATE_BIN, not building"
+elif [ "$NEEDS_BIN" = 1 ]; then
+  ( cd "$CLI_DIR" && cargo build $GATE_BUILD_FLAG --features test-hooks -q ) || { echo "build failed"; exit 2; }
+fi
 # Assert the binary the gates will EXEC exists, rather than discovering it 31
 # failures later. A build that succeeded says nothing about where this script
 # then looks.
-[ -x "$BIN" ] || {
+[ "$NEEDS_BIN" = 0 ] || [ -x "$BIN" ] || {
   echo "built, but no executable at the path the gates use:"
   echo "  BIN=$BIN"
   echo "  target dir resolved to: $GATE_TARGET_DIR"
@@ -213,6 +278,7 @@ head -c $((5 * 1024 * 1024))  /dev/urandom > "$SMALL"
 head -c $((80 * 1024 * 1024)) /dev/urandom > "$BIG"
 H_SMALL=$(hashof "$SMALL"); H_BIG=$(hashof "$BIG")
 
+if gate_on 0; then
 # ---------------------------------------------------------------- gate 0 ----
 say "0: unit tests"
 if ( cd "$CLI_DIR" && cargo test -q ) >"$WORK/g0.log" 2>&1; then ok "unit tests"; else bad "unit tests"; tail -n 5 "$WORK/g0.log"; fi
@@ -223,6 +289,9 @@ if [ -x "$PYV" ]; then
   else bad "pair-code tests"; tail -n 5 "$WORK/g0b.log"; fi
 fi
 
+fi  # gate 0
+
+if gate_on 1; then
 # ---------------------------------------------------------------- gate 1 ----
 say "1: one-time code transfer + code burn"
 D="$WORK/g1"; mkdir -p "$D"
@@ -254,6 +323,9 @@ else
   grep -q "code rejected" "$WORK/g1-burn.log" && ok "code burns on first use" || { bad "code burn (wrong error)"; tail -n 2 "$WORK/g1-burn.log"; }
 fi
 
+fi  # gate 1
+
+if gate_on 2; then
 # ---------------------------------------------------------------- gate 2 ----
 say "2: chaos — receiver killed mid-transfer, replacement resumes (C4/C6/C7)"
 D="$WORK/g2"; mkdir -p "$D"
@@ -314,6 +386,9 @@ elif [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ]
   ok "kill-resume: replacement receiver resumed, hash matches"
 else bad "kill-resume"; tail -n 4 "$WORK/g2-send.log" "$WORK/g2-recv2.log"; fi
 
+fi  # gate 2
+
+if gate_on 2b; then
 # --------------------------------------------------------------- gate 2b ----
 # The half of gate 2 that was never asserted: the receiver is killed mid-transfer
 # and NOTHING replaces it. The sender must notice within a bounded time and exit
@@ -378,6 +453,9 @@ else
   ok "dead receiver: sender gave up in $((T1 - T0))s, exit $RCS, said the peer is gone"
 fi
 
+fi  # gate 2b
+
+if gate_on 3; then
 # ---------------------------------------------------------------- gate 3 ----
 say "3: corruption guard — same name+size, different content restarts (C7)"
 D="$WORK/g3"; mkdir -p "$D"
@@ -393,6 +471,9 @@ if [ -n "${W:-}" ] && timeout 90 "$BIN" -v receive "$W" -y --dir "$D" --server "
   ok "head mismatch detected, restarted from 0, hash matches"
 else bad "corruption guard"; tail -n 3 "$WORK/g3-recv.log"; fi
 
+fi  # gate 3
+
+if gate_on 4; then
 # ---------------------------------------------------------------- gate 4 ----
 say "4: directory tar + stdin pipe"
 D="$WORK/g4"; mkdir -p "$D" "$WORK/srcdir/sub"
@@ -411,6 +492,9 @@ wait_for_exit $R 30
 [ "$(cat "$D/note.txt" 2>/dev/null)" = "pipe payload" ] || G4=1
 [ $G4 -eq 0 ] && ok "dir tar + stdin round-trip" || bad "dir/stdin"
 
+fi  # gate 4
+
+if gate_on 5; then
 # ---------------------------------------------------------------- gate 5 ----
 say "5: CLI -> browser (playwright)"
 if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
@@ -427,6 +511,9 @@ else
   echo "SKIP (run: cd $HERE && npm i playwright && npx playwright install chromium)"
 fi
 
+fi  # gate 5
+
+if gate_on 6; then
 # ---------------------------------------------------------------- gate 6 ----
 say "6: browser -> CLI, two human-paced sends (C1 + C9, playwright)"
 if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
@@ -449,6 +536,9 @@ else
   echo "SKIP (playwright not installed)"
 fi
 
+fi  # gate 6
+
+if gate_on 7; then
 # ---------------------------------------------------------------- gate 7 ----
 say "7: --to peer selection (C13)"
 # PREMISE CHANGED, PROPERTY KEPT. This gate used to run two room receivers
@@ -481,6 +571,9 @@ if [ $G7 -eq 0 ] && [ "$(hashof "$DB/small.bin" 2>/dev/null)" = "$H_SMALL" ] && 
   ok "--to bob delivered to bob only"
 else bad "--to selection"; tail -n 3 "$WORK/g7-add.log" "$WORK/g7-join.log" "$WORK/g7-send.log" "$WORK/g7-bob.log"; fi
 
+fi  # gate 7
+
+if gate_on 8; then
 # ---------------------------------------------------------------- gate 8 ----
 say "8: consent — no tty, no -y declines (C14)"
 D="$WORK/g8"; mkdir -p "$D"
@@ -503,6 +596,9 @@ if [ $G8 -eq 4 ] && grep -q "declined" "$WORK/g8-send.log" \
   ok "offer declined without consent; sender reported the decline and exited 4 (denied)"
 else bad "consent decline"; tail -n 3 "$WORK/g8-send.log" "$WORK/g8-recv.log"; fi
 
+fi  # gate 8
+
+if gate_on 9; then
 # ---------------------------------------------------------------- gate 9 ----
 say "9: bulk transfer completes (C8a backpressure regression guard)"
 # An absolute MB/s floor IS non-determinism — it encodes machine/load speed.
@@ -525,6 +621,8 @@ if [ $RC -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ]; then
   ok "80 MB transferred + hash match within ceiling (${RATE} MB/s)"
 else bad "bulk transfer (rc=$RC, ${RATE} MB/s — a hang/backpressure break, not slowness)"; fi
 
+fi  # gate 9
+
 # --------------------------------------------------------------- gate 10 ----
 kill_port() { # fixture backends (werkzeug reloader forks; kill by port)
   for pid in $(ss -tlnp 2>/dev/null | grep ":$1 " | grep -oP 'pid=\K[0-9]+' | sort -u); do
@@ -534,6 +632,7 @@ kill_port() { # fixture backends (werkzeug reloader forks; kill by port)
 kill_8078() { kill_port 8078; }
 VENV_PY="$PYV0"
 
+if gate_on 12; then
 # --------------------------------------------------------------- gate 12 ----
 # C1 against PRODUCTION's config: a backend serving chunkSize 65536 makes the
 # browser frame 64 KiB + 4 = 65540-byte messages. The CLI must advertise
@@ -564,9 +663,12 @@ else
   echo "SKIP (needs playwright + backend venv)"
 fi
 
+fi  # gate 12
+
+if gate_on 10; then
 if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1; then
   say "10: TURN relay path + route detection (C2/C17, docker coturn)"
-  kill_8078; sleep 1
+  kill_8078; port_released 8078 1
   TS=testsecret$RANDOM
   # --allow-loopback-peers: coturn 403s loopback peer addresses by default,
   # and in this hermetic setup BOTH peers are 127.0.0.1. Test-only flag.
@@ -581,7 +683,13 @@ if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1;
   VENV_PY="$PYV0"
   ( cd "$CLI_DIR/../backend" && PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS" \
       "$VENV_PY" app.py >"$WORK/g10-backend.log" 2>&1 ) &
-  BK=$!; pids+=($BK); sleep 4
+  BK=$!; pids+=($BK)
+  # Was `sleep 4`: wait (same bound) for what it waited for, the relay backend
+  # answering and coturn listening on 3478.
+  for _ in $(seq 1 20); do
+    curl -fsS http://127.0.0.1:8078/api/health >/dev/null 2>&1 && ss -uln 2>/dev/null | grep -q ':3478 ' && break
+    sleep 0.2
+  done
   # A TURN server that is not running makes every relay assertion below
   # meaningless, so say that instead of blaming the product.
   [ -n "$CT" ] && [ "$(docker inspect -f '{{.State.Running}}' "$CT" 2>/dev/null)" = "true" ] \
@@ -617,6 +725,9 @@ elif [ $WITH_RELAY -eq 1 ]; then
   echo "SKIP (needs a usable python and docker; set FILAMENT_TEST_VENV to point at one)"
 fi
 
+fi  # gate 10
+
+if gate_on 11; then
 # --------------------------------------------------------------- gate 11 ----
 say "11: same-uid rejoin supersede (C6) — frozen receiver replaced by same device"
 D="$WORK/g11"; mkdir -p "$D"
@@ -657,6 +768,9 @@ if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
   ok "same-uid supersede: sender swapped links, transfer resumed, hash matches"
 else bad "uid supersede"; tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"; fi
 
+fi  # gate 11
+
+if gate_on 11b; then
 # -------------------------------------------------------------- gate 11b ----
 # The inverse of gate 11 (#28): when the same device reconnects its signaling
 # socket (same uid, new sid) WHILE the original link is actively transferring,
@@ -713,6 +827,9 @@ if [ $RCS -eq 0 ] && [ "$(hashof "$D1B/big.bin")" = "$H_BIG" ] \
   ok "active link preserved across same-uid reconnect (kept deliberately, no supersede)"
 else bad "flow-preserve (#28)"; tail -n 4 "$WORK/g11b-send.log" "$WORK/g11b-recv1.log"; fi
 
+fi  # gate 11b
+
+if gate_on 11c; then
 # -------------------------------------------------------------- gate 11c ----
 # #28 second half (the socket-reconnect TRIGGER): when the server fires a
 # peer-left for the ACTIVE link's old sid while its data channel is still
@@ -768,6 +885,9 @@ if [ "$base_ok" = "1" ] && [ $RCB -eq 0 ] && [ $RCSB -eq 0 ] && [ "$HCB" = "$H_B
   ok "deferred drop: flowing link survives its peer-left, transfer completes (A/B proven)"
 else bad "deferred-drop (#28 trigger)"; tail -n 4 "$WORK/g11c-send.log" "$WORK/g11ca-send.log"; fi
 
+fi  # gate 11c
+
+if gate_on 13; then
 # --------------------------------------------------------------- gate 13 ----
 say "13: multi-link — CLI + two browsers, nobody wedges (C18)"
 if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
@@ -784,6 +904,9 @@ else
   echo "SKIP (playwright not installed)"
 fi
 
+fi  # gate 13
+
+if gate_on 14; then
 # --------------------------------------------------------------- gate 14 ----
 say "14: daemon — pair, introduce-grade trust, room-less up receives (C19/C20/C12)"
 DA="$WORK/g14a"; DB="$WORK/g14b"; DD="$WORK/g14drop"; mkdir -p "$DA" "$DB" "$DD"
@@ -803,6 +926,9 @@ if [ $G14 -eq 0 ] && [ "$(hashof "$DD/big.bin")" = "$H_BIG" ] \
   ok "daemon: verified identity, room-less, received + hash match"
 else bad "daemon"; tail -n 3 "$WORK/g14-up.log" "$WORK/g14-s2.log"; fi
 
+fi  # gate 14
+
+if gate_on 14b; then
 # --------------------------------------------------------------- gate 14b ---
 say "14b: a daemon receiver SIGKILLed mid-transfer and restarted 4s later: the sender picks it up and finishes"
 # The blind run: the sender ignored the replacement daemon and failed with exit 8
@@ -843,6 +969,9 @@ else
   bad "daemon-restart"; tail -n 5 "$WORK/g14b-send.log" "$WORK/g14b-up2.log"
 fi
 
+fi  # gate 14b
+
+if gate_on 15; then
 # --------------------------------------------------------------- gate 15 ----
 say "15: paired recv holds the line when the sender vanishes (C21)"
 D="$WORK/g15"; mkdir -p "$D"
@@ -878,6 +1007,9 @@ if [ $RC -ne 0 ] && grep -qE "(holding the line|waiting) up to 8s" "$WORK/g15-re
   ok "stepped-away sender: held ${FILAMENT_REJOIN_SECS:-8}s window, then failed honestly"
 else bad "stepped-away wait"; tail -n 3 "$WORK/g15-recv.log"; fi
 
+fi  # gate 15
+
+if gate_on 16; then
 say "16: known-device rendezvous + remember consent (C12/C20/C27 web)"
 if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
   G16=0
@@ -913,6 +1045,9 @@ else
   echo "SKIP (run: cd $HERE && npm i playwright && npx playwright install chromium)"
 fi
 
+fi  # gate 16
+
+if gate_on 17; then
 say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
 # --word on every `add` below (and in 17b and 19): from a script, `add` with no
 # words refuses, because a code minted for a person to read out has nobody to
@@ -920,7 +1055,7 @@ say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
 # gates ran `add --name X` bare and were refused before any ceremony started.
 DA17="$WORK/g17a"; DB17="$WORK/g17b"; mkdir -p "$DA17" "$DB17"
 FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --word "$CODE_WORD" --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
-P17=$!; pids+=($P17); sleep 4
+P17=$!; pids+=($P17); wait_grep 4 '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log"
 C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
 FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" join "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
@@ -933,6 +1068,9 @@ if [ $G17 -eq 0 ] && [ -n "$CHA" ] && [ "$CHA" = "$CHB" ]; then
   ok "pair ceremony: both exited clean; channel ids match (one mutual secret)"
 else bad "pair-ceremony"; tail -n 3 "$WORK/g17-a.log" "$WORK/g17-b.log"; fi
 
+fi  # gate 17
+
+if gate_on 17b; then
 say "17b: pair ceremony fails FAST when it can't complete (no 10-min orphan)"
 # The D3/D5 divergence the monitor kept catching: a claimer whose creator
 # vanishes (or never connects) used to sit in the room for the full 600s TTL.
@@ -941,7 +1079,7 @@ say "17b: pair ceremony fails FAST when it can't complete (no 10-min orphan)"
 # 600s code TTL, and well under the 90s timeout backstop.
 DC="$WORK/g17c"; mkdir -p "$DC/a" "$DC/b"
 FILAMENT_CONFIG_DIR="$DC/a" timeout 120 "$BIN" add --name gone --word "$CODE_WORD" --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
-CR=$!; pids+=($CR); sleep 4
+CR=$!; pids+=($CR); wait_grep 4 '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log"
 CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
 T0=$(date +%s)
 FILAMENT_TEST_PAIR_STALL=1 FILAMENT_PAIR_GRACE_SECS=5 FILAMENT_CONFIG_DIR="$DC/b" \
@@ -953,6 +1091,9 @@ if [ $RC -ne 0 ] && [ $((T1 - T0)) -lt 30 ] \
   ok "ceremony bailed in $((T1 - T0))s with a clear message (was: 600s orphan)"
 else bad "pair fail-fast"; echo "  rc=$RC walltime=$((T1-T0))s"; tail -n 3 "$WORK/g17c-b.log"; fi
 
+fi  # gate 17b
+
+if gate_on 18; then
 # --------------------------------------------------------------- gate 18 ----
 say "18: recv quiet-exit when peer-left never arrives (G-k)"
 # The quiet-exit fallback: a transfer completes but the peer-left event is
@@ -996,6 +1137,9 @@ else
   bad "quiet-exit (G-k)"; echo "  RC=$RC walltime=$((T1 - T0))s"; tail -n 6 "$WORK/g18-recv.log"
 fi
 
+fi  # gate 18
+
+if gate_on 18b; then
 # -------------------------------------------------------------- gate 18b ----
 # Gate 18 Mode B (the contention flake #28 could not previously reproduce): a
 # transfer COMPLETES, the sender's peer-left is LOST (as in gate 18), but the
@@ -1072,6 +1216,9 @@ else
 fi
 unset FILAMENT_DIRECT
 
+fi  # gate 18b
+
+if gate_on 19; then
 # --------------------------------------------------------------- gate 19 ----
 say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 # Seed 16's drop pattern is 'DD....': BOTH processes lose their first two
@@ -1082,7 +1229,7 @@ say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 # 600s read; see C30 in the ledger).
 DA19="$WORK/g19a"; DB19="$WORK/g19b"; D19="$WORK/g19"; mkdir -p "$DA19" "$DB19" "$D19"
 FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --word "$CODE_WORD" --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
-P19=$!; pids+=($P19); sleep 4
+P19=$!; pids+=($P19); wait_grep 4 '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log"
 C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0
 FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" join "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
@@ -1098,6 +1245,8 @@ kill $U19 2>/dev/null; wait $U19 2>/dev/null
 if [ $G19 -eq 0 ] && [ "$(hashof "$D19/small.bin")" = "$H_SMALL" ] && [ $((T1 - T0)) -lt 60 ]; then
   ok "lossy rendezvous converged in $((T1 - T0))s (both sides dropped join+subscribe)"
 else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"; fi
+
+fi  # gate 19
 
 # ============================================================================
 # L1-a — PAKE first-pairing gates (spec docs/L1-pake-protocol.md §10)
@@ -1130,6 +1279,7 @@ else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"
 # SPAKE2 crate: `cargo test` in pake/ (10 unit tests incl. reflection-rejected).
 # ============================================================================
 
+if gate_on 20; then
 say "20: U1 implicit identity: minted once by a verb that signs, never by one that only looks"
 # The config dir is NOT pre-created: the accessor makes it (0700) and the key
 # (0600). `id` used to be the minting verb here; it no longer mints (a fresh
@@ -1182,6 +1332,9 @@ else
   tail -n 3 "$WORK/g20-0.err" "$WORK/g20-j.out" "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
 fi
 
+fi  # gate 20
+
+if gate_on 21; then
 say "21: up waits for the network instead of exiting; up --detach reports a dead daemon"
 # Item 7: a daemon whose server is unreachable (127.0.0.1:9, nothing listens)
 # must stay up, say it is waiting, and keep retrying; it used to exit at once.
@@ -1218,6 +1371,9 @@ else
   tail -n 5 "$WORK/g21-up.log" "$WORK/g21-detach.log" "$WORK/g21-detach-wait.log"
 fi
 
+fi  # gate 21
+
+if gate_on 22; then
 say "22: exit codes from the blind automation run: usage is 2, an offline known device is 6, fast"
 # Each of these exited 1 before. Usage (2): a missing local file for `send`
 # (and its --json names the local file, not the peer), non-interactive `init`
@@ -1254,6 +1410,9 @@ else
   tail -n 3 "$WORK/g22-send.err" "$WORK/g22-sendj.out" "$WORK/g22-init.log" "$WORK/g22-add.log" "$WORK/g22-grant.log" "$WORK/g22-off.err"
 fi
 
+fi  # gate 22
+
+if gate_on T1; then
 # ---------------------------------------------------------------- gate T1 ----
 say "T1/T2: a source send cannot read is a fast local error (exit 2) and reaches no receiver; a FIFO or device never hangs"
 # The blind run: a mode-000 file printed "ok", then blamed the network (exit 6,
@@ -1298,6 +1457,9 @@ else
   tail -n 2 "$WORK/gT1-unread.err" "$WORK/gT1-empty.err" "$WORK/gT1-fifo.err" "$WORK/gT1-zero.err" "$WORK/gT1-recv.log"
 fi
 
+fi  # gate T1
+
+if gate_on T1b; then
 # --------------------------------------------------------------- gate T1b ----
 say "T1b: a source that stops being readable mid-transfer cancels it on both ends, exit 2, nothing left behind"
 # The source is truncated while it is being sent (the read the sender does
@@ -1336,6 +1498,9 @@ else
   tail -n 3 "$WORK/gT1b-send.log" "$WORK/gT1b-recv.log"
 fi
 
+fi  # gate T1b
+
+if gate_on T3; then
 # ---------------------------------------------------------------- gate T3 ---
 say "T3: receive -o - into a slow pipe streams in order, verified (no seek on a pipe)"
 # Every `receive <code> -o - | reader` failed "Invalid seek (os error 29)": the
@@ -1369,6 +1534,9 @@ while True:
   fi
 fi
 
+fi  # gate T3
+
+if gate_on T4; then
 # ---------------------------------------------------------------- gate T4 ---
 say "T4: one-shot receiver whose sender is SIGKILLed mid-transfer gives up honestly and in bounded time"
 # Was: ~96 s, then "lost the sender after 5 attempts; the partial is kept,
@@ -1416,6 +1584,9 @@ if [ -n "${W:-}" ]; then
   fi
 fi
 
+fi  # gate T4
+
+if gate_on L2; then
 # --------------------------------------------------------- L2 tunnel gates ---
 # ssh / TCP over the data channel (docs/L2-tunnel-design.md). These run their
 # OWN fixture backend on port 8097 (NOT this suite's 8077) and are OPT-IN:
@@ -1431,7 +1602,12 @@ if [ "${L2_GATES:-0}" = "1" ]; then
   fi
 fi
 
+fi  # gate L2
+
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"
+# Read by the CI aggregator: every id from --list-gates must appear in the
+# `ran` line of some shard. Printed for unsharded runs too (it is then all of them).
+echo "gates shard ran:$GATES_RAN"
 echo "artifacts: $WORK"
 [ $FAIL -eq 0 ]
