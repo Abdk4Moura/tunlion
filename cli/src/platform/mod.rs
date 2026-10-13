@@ -851,6 +851,156 @@ pub fn contain_with_daemon(child: &tokio::process::Child) {
     }
 }
 
+/// Spawn `cmd` so that `record` runs with the child's pid BEFORE the child can
+/// run a single instruction of the program, and return what it produced.
+///
+/// Why: the daemon records each served process group (`exec.groups`) so the
+/// next daemon can end what a SIGKILLed one left behind. Recorded after
+/// `spawn()` returned, the child was already running user code while the
+/// record did not name it yet: a `kill -9` of the daemon inside that window
+/// left a group no later daemon could find (and exec-gates gateQ1, which reads
+/// the record as soon as the child shows in `ps`, once saw too few groups).
+///
+/// Unix: the child, last thing before exec (after the process group and the
+/// parent-death signal are set up, so register this after
+/// [`die_with_daemon`]), writes its pid to a pipe and blocks on a second one.
+/// A helper thread reads the pid, runs `record` (which writes and fsyncs the
+/// record), and only then releases the child. std's `spawn` blocks until the
+/// child has exec'd, which is why the release cannot come from the spawning
+/// thread; the fork itself stays on the calling thread, which is the thread
+/// the parent-death signal follows. A child that is not released (the record
+/// panicked, the pipe broke) refuses to exec, so nothing unrecorded ever runs.
+/// Elsewhere the record follows the spawn; Windows ties the tree to the
+/// daemon with a job object instead ([`contain_with_daemon`]).
+pub fn spawn_recorded<R: Send>(
+    cmd: &mut tokio::process::Command,
+    record: impl FnOnce(u32) -> R + Send,
+) -> std::io::Result<(tokio::process::Child, Option<R>)> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        const GO: u8 = b'g';
+        let (report_r, report_w) = cloexec_pipe()?;
+        let (release_r, release_w) = cloexec_pipe()?;
+        let (rr, rw) = (report_r.as_raw_fd(), report_w.as_raw_fd());
+        let (lr, lw) = (release_r.as_raw_fd(), release_w.as_raw_fd());
+        // SAFETY: only async-signal-safe calls (close, getpid, write, read)
+        // run between fork and exec, and nothing is allocated.
+        unsafe {
+            cmd.pre_exec(move || {
+                // The parent's ends: holding them would keep this child from
+                // ever seeing the pipe close.
+                libc::close(rr);
+                libc::close(lw);
+                let pid = (libc::getpid() as u32).to_ne_bytes();
+                if !fd_write_all(rw, &pid) {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
+                }
+                let mut go = [0u8; 1];
+                if !fd_read_exact(lr, &mut go) || go[0] != GO {
+                    // Not released: the record does not name us, so do not run.
+                    return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                }
+                Ok(())
+            });
+        }
+        std::thread::scope(|s| {
+            let recorder = s.spawn(|| {
+                let mut pid = [0u8; 4];
+                if !fd_read_exact(report_r.as_raw_fd(), &mut pid) {
+                    return None;
+                }
+                let pid = u32::from_ne_bytes(pid);
+                if pid == 0 {
+                    // The spawn ended without reaching the gate.
+                    return None;
+                }
+                let r = record(pid);
+                fd_write_all(release_w.as_raw_fd(), &[GO]);
+                Some(r)
+            });
+            let spawned = cmd.spawn();
+            // Wake the recorder if no child ever reached the gate (spawn failed
+            // before it). Harmless otherwise: it has already read the real pid,
+            // and the read end stays open until this function returns.
+            fd_write_all(report_w.as_raw_fd(), &0u32.to_ne_bytes());
+            let recorded = recorder.join().unwrap_or(None);
+            drop(release_r);
+            spawned.map(|child| (child, recorded))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let child = cmd.spawn()?;
+        let recorded = child.id().map(record);
+        Ok((child, recorded))
+    }
+}
+
+/// A pipe whose ends close on exec, so no other spawned program inherits them.
+#[cfg(unix)]
+fn cloexec_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    let rc = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == 0 {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        rc
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe just returned these two fresh descriptors, owned by no one.
+    Ok(unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    })
+}
+
+/// Write all of `buf` to `fd`, retrying on EINTR. Async-signal-safe (no
+/// allocation), so the spawn gate can call it between fork and exec.
+#[cfg(unix)]
+fn fd_write_all(fd: libc::c_int, buf: &[u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe { libc::write(fd, buf[off..].as_ptr().cast(), buf.len() - off) };
+        if n > 0 {
+            off += n as usize;
+        } else if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fill `buf` from `fd`, retrying on EINTR; false on EOF or error.
+/// Async-signal-safe, like [`fd_write_all`].
+#[cfg(unix)]
+fn fd_read_exact(fd: libc::c_int, buf: &mut [u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe { libc::read(fd, buf[off..].as_mut_ptr().cast(), buf.len() - off) };
+        if n > 0 {
+            off += n as usize;
+        } else if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 /// Names this boot, so a process group recorded before a reboot is never
 /// mistaken for one that is still ours (after a reboot its number belongs to
 /// whatever happens to hold it now). None where the platform cannot say,
@@ -2231,6 +2381,55 @@ impl ShellHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The record is in place before the child runs any of the program: the
+    // child itself checks for what `record` wrote, so a record that landed
+    // after the program started would fail the run. Repeated, because the
+    // ungated version lost this race only sometimes.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_recorded_records_before_the_program_runs() {
+        let dir = mode_tmp("spawn-recorded");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _rt = rt.enter();
+        for i in 0..20 {
+            let marker = dir.join(format!("rec-{i}"));
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(r#"test "$(cat "$1")" = "$$""#).arg("sh").arg(&marker);
+            own_process_group(&mut cmd);
+            die_with_daemon(&mut cmd);
+            let m = marker.clone();
+            let (mut child, recorded) = spawn_recorded(&mut cmd, move |pid| {
+                // A slow record must still win: the child waits for it.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::fs::write(&m, pid.to_string()).unwrap();
+                pid
+            })
+            .expect("spawn");
+            assert_eq!(recorded, child.id(), "recorded pid is the child's");
+            let st = rt.block_on(child.wait()).unwrap();
+            assert!(st.success(), "run {i}: the program ran before its record existed");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A spawn whose exec fails returns the error (whatever was recorded is
+    // handed back to be dropped with it) instead of hanging the recorder.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_recorded_failed_spawn_returns_the_error() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _rt = rt.enter();
+        let mut cmd = tokio::process::Command::new("/definitely/not/a/tunlion/program");
+        let r = spawn_recorded(&mut cmd, |pid| pid);
+        assert!(r.is_err());
+    }
 
     fn mode_tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("tunlion-mode-{}-{name}", std::process::id()));

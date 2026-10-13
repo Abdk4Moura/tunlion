@@ -677,8 +677,13 @@ pub(crate) async fn serve_exec(
     // Backstop for a task that ends abnormally (panic, abort): the leader
     // dies with it rather than outliving the daemon's record of it.
     cmd.kill_on_drop(true);
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
+    // The leader's pid is its group id (own_process_group). Recorded before
+    // the child can run any of the program and kept until this function
+    // returns, so a daemon that dies at any point after the fork has its
+    // leftovers ended by the next one (kill_leftover_groups).
+    let spawned = crate::platform::spawn_recorded(&mut cmd, ServedGroup::record);
+    let (mut child, _served) = match spawned {
+        Ok(spawned) => spawned,
         Err(e) => {
             let _ = t
                 .send_control(
@@ -689,11 +694,7 @@ pub(crate) async fn serve_exec(
         }
     };
     crate::platform::contain_with_daemon(&child);
-    // The leader's pid is its group id (own_process_group).
     let pgid = child.id();
-    // Recorded until this function returns, so a daemon that dies before then
-    // has its leftovers ended by the next one (kill_leftover_groups).
-    let _served = pgid.map(ServedGroup::record);
     let _ = t
         .send_control(&json!({ "type": "exec-open-ack", "sid": sid, "out": sid, "err": err_sid }))
         .await;
