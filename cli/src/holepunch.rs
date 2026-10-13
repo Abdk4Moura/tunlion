@@ -25,7 +25,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::direct;
-use crate::net::Transport;
 
 /// Opt-in gate. Rung-2 is dead unless this is set; rung-1 + WebRTC are unaffected.
 pub fn holepunch_enabled() -> bool {
@@ -345,7 +344,8 @@ pub fn endpoint_from_socket(sock: UdpSocket) -> Result<Endpoint> {
 /// Rung-2 entry point: given a freshly-bound-and-STUN'd punch socket, the peer's
 /// advertised srflx, and the pair secret, punch the NAT then run rung-1's
 /// authenticated QUIC race over the punched socket. Returns an authenticated
-/// `Arc<dyn Transport>` (route `holepunched`) or None (caller steps to WebRTC).
+/// link (route `holepunched`) whose reader starts when the caller announces it
+/// (`UnreadTransport::announce`), or None (caller steps to WebRTC).
 ///
 /// `punch_sock` ownership is moved in: on success it lives inside the quinn
 /// endpoint; on failure it is dropped (mapping released).
@@ -361,7 +361,7 @@ pub async fn connect(
     exchange: bool,
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
-) -> Option<Arc<dyn Transport>> {
+) -> Option<direct::UnreadTransport> {
     // Punch on a blocking thread (blocking UDP I/O), reclaim the socket.
     let punch_result = tokio::task::spawn_blocking(move || {
         let r = punch(&punch_sock, peer_srflx);

@@ -1883,7 +1883,8 @@ pub(crate) async fn bring_up_to_known(
                             )
                             .await
                             {
-                                let _ = tx.send(Ev::DirectReady(pid, t, "direct-quic"));
+                                // Announce, THEN read (direct.rs UnreadTransport).
+                                t.announce(&tx, |t| Ev::DirectReady(pid, t, "direct-quic"));
                             }
                             // On None the WebRTC path (Ev::ChannelReady) continues.
                         });
