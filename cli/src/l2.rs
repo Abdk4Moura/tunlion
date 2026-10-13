@@ -4704,17 +4704,36 @@ pub(crate) const OVERLAY_DIAL_BOUND: Duration = Duration::from_secs(3);
 /// The daemon's reject reason when `OVERLAY_DIAL_BOUND` runs out.
 pub(crate) const OVERLAY_DIAL_TIMED_OUT: &str = "overlay dial timed out";
 
+/// The longest an overlay dial waits after its handshake (see below).
+pub(crate) const OVERLAY_SETTLE_MAX: Duration = Duration::from_millis(1500);
+
+/// The daemon's overlay-dial answer when the peer's exposed port accepted the
+/// connection and closed it at once: `expose` found nothing listening behind
+/// it. The proxy answers SOCKS 0x05 (connection refused).
+pub(crate) const OVERLAY_TARGET_CLOSED: &str =
+    "overlay dial refused: nothing is listening behind the exposed port there";
+
+/// How long an overlay dial waits, after the handshake, for the peer to close
+/// before the connection counts as carried. The close comes about one round
+/// trip after the handshake (the peer's `expose` fails its local connect at
+/// once), and the handshake itself took about one, so twice it plus a margin,
+/// bounded. Pure.
+#[cfg_attr(not(l3), allow(dead_code))]
+pub(crate) fn overlay_settle_window(handshake: Duration) -> Duration {
+    (handshake * 2 + Duration::from_millis(150)).clamp(Duration::from_millis(250), OVERLAY_SETTLE_MAX)
+}
+
 /// The budget for the WARM half of a proxy `.mesh` CONNECT: the daemon's L2 open
-/// plus its overlay dial must have answered by then: the dial's own bound plus
-/// a second for the open, inside the 5 s a client can reasonably wait for a
-/// SOCKS reply. Override with FILAMENT_PROXY_WARM_MS.
+/// plus its overlay dial must have answered by then: the dial's own bound, its
+/// settle wait, and a second for the open. Override with FILAMENT_PROXY_WARM_MS.
 fn proxy_warm_budget() -> Duration {
     std::env::var("FILAMENT_PROXY_WARM_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
         .map(Duration::from_millis)
-        .unwrap_or(OVERLAY_DIAL_BOUND + Duration::from_secs(1))
+        // The dial, then its settle wait (`overlay_settle_window`), then slack.
+        .unwrap_or(OVERLAY_DIAL_BOUND + OVERLAY_SETTLE_MAX + Duration::from_secs(1))
 }
 
 /// How long a connection accepted by `forward` (or a proxy CONNECT on the cold
@@ -4782,6 +4801,12 @@ pub(crate) fn mesh_fail_for_refusal(reason: &str) -> MeshFail {
 /// dial (None: there was no daemon to ask). `None` means "nothing definitive,
 /// try a cold link"; the peer only gets a verdict when it answered.
 pub(crate) fn mesh_verdict(l2: Option<&str>, l3: Option<&str>) -> Option<MeshFail> {
+    // The peer's exposed port took the connection and closed it: that port IS
+    // exposed and nothing listens behind it, whatever the loopback open said
+    // (a device without shell is refused there by policy).
+    if l3 == Some(OVERLAY_TARGET_CLOSED) {
+        return Some(MeshFail::Refused);
+    }
     let refusal = mesh_fail_for_refusal(l2?);
     if refusal != MeshFail::General {
         return Some(refusal);
@@ -7037,6 +7062,17 @@ mod forward_refusal_tests {
         assert_eq!(mesh_verdict(Some("stream cap"), Some(OVERLAY_DIAL_TIMED_OUT)), Some(MeshFail::TimedOut));
         assert_eq!(mesh_verdict(Some("stream cap"), Some("overlay dial failed: connection reset")), Some(MeshFail::Refused));
         assert_eq!(mesh_verdict(Some("stream cap"), None), Some(MeshFail::General));
+        // B: an EXPOSED port that took the connection and closed it at once
+        // (nothing listening behind it) is "connection refused", even when
+        // the loopback open was refused by policy (no shell) or never asked.
+        for l2 in [Some(off), Some("stream cap"), None] {
+            assert_eq!(mesh_verdict(l2, Some(OVERLAY_TARGET_CLOSED)), Some(MeshFail::Refused), "{l2:?}");
+        }
+        assert_eq!(MeshFail::Refused.socks_rep(), 0x05);
+        // The settle wait is bounded both ways.
+        assert_eq!(overlay_settle_window(Duration::ZERO), Duration::from_millis(250));
+        assert_eq!(overlay_settle_window(Duration::from_millis(100)), Duration::from_millis(350));
+        assert_eq!(overlay_settle_window(Duration::from_secs(5)), Duration::from_millis(1500));
         // No warm link to ask through: nothing definitive, try a cold link.
         assert_eq!(mesh_verdict(None, Some(OVERLAY_DIAL_TIMED_OUT)), None);
         assert_eq!(mesh_verdict(None, None), None);
