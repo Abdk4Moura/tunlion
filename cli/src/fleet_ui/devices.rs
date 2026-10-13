@@ -101,13 +101,21 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_h
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Warn, ui::glyph_review()),
-            ui::paint(Tone::Warn, "NEEDS REVIEW  /  paired without a certified identity, so trusted in full")
+            ui::paint(Tone::Warn, "NEEDS REVIEW  /  paired, but not certified by your owner key")
         ));
         for d in &review {
             lines.push(render_device_row(d));
             // #240: was `↳ tunlion devices promote <name>`, a verb that does
             // not exist, rendered as the prescribed next step.
-            lines.push(ui::paint(Tone::Dim, "       ↳ its identity was never certified; re-pair to scope it"));
+            // Eval item 7: "re-pair to scope it" named no command, and
+            // re-pairing the same way produces the same row. Name both
+            // resolutions exactly, one per answer to "whose is it".
+            lines.push(ui::paint(Tone::Dim, &format!(
+                "       ↳ yours: run `tunlion add {n}` on the device you ran `tunlion init` on, then `tunlion join <code>` on {n}",
+                n = d.name
+            )));
+            lines.push(ui::paint(Tone::Dim,
+                "       ↳ someone else's: leave it as a pairing, or `tunlion devices forget <name>` to remove it"));
         }
         lines.push(String::new());
     }
@@ -271,7 +279,7 @@ mod tests {
                 name: "old-laptop".into(),
                 tier: DeviceTier::NeedsReview,
                 online: Some(false),
-                caps_summary: "uncertified \u{b7} trusted in full".into(),
+                caps_summary: "uncertified \u{b7} transfer".into(),
                 countdown: "no certificate".into(),
                 last_seen: None,
             },
@@ -286,7 +294,10 @@ mod tests {
         // condition and prescribe no action it cannot deliver.
         assert!(!s.contains("promote"), "must not prescribe a verb that does not exist: {s}");
         assert!(!s.contains("legacy trust"), "must not leak internal jargon: {s}");
-        assert!(s.contains("re-pair to scope it"), "must say what the user can actually do");
+        // Eval item 7: the hint names the exact command that resolves it.
+        assert!(s.contains("tunlion add old-laptop"), "must give the exact command: {s}");
+        assert!(!s.contains("trusted in full"), "must not claim full trust: {s}");
+        assert!(!s.contains("re-pair to scope it"), "a hint with no command: {s}");
     }
 
     #[test]

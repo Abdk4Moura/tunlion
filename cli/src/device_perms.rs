@@ -51,6 +51,9 @@ pub(crate) struct DevicePerms {
     pub caveats: Vec<String>,
     pub caps: Vec<CapRow>,
     pub denies: Vec<String>,
+    /// The certificate's clock, rendered by `device_view::cert_expiry_text`,
+    /// the one sentence `devices` prints for the same device. Text view only.
+    pub cert_expires: Option<u64>,
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -162,7 +165,9 @@ pub(crate) fn perms_for(
     let state = record["principalState"].as_str();
     let mut caveats = Vec::new();
     match cert.as_ref() {
-        None => caveats.push("uncertified, trusted in full".to_string()),
+        None => caveats.push(format!(
+            "uncertified: pairing permissions only, not scoped by an owner key. If it is yours, run `tunlion add {name}` on the device you ran `tunlion init` on, and `tunlion join <code>` on {name}"
+        )),
         Some(c) if c.expires <= now => caveats.push(format!("cert expired {}", when(c.expires, now))),
         Some(_) => {}
     }
@@ -203,7 +208,10 @@ pub(crate) fn perms_for(
             continue; // the ceiling row above is the one enforcement reads
         }
         let until = record["capExpires"][&cap].as_u64();
-        let source = if v1 { "pair-secret legacy (v1 default)" } else { "pair-secret legacy" };
+        // v2 `caps` is what `add` and `join` write TODAY; calling a pairing
+        // made a minute ago "legacy" was jargon leaking from the gate's
+        // internal fold. Only a v1 record (no `caps`) is legacy.
+        let source = if v1 { "pair-secret legacy (v1 default)" } else { "pairing" };
         rows.push(row(&cap, "self", source, until));
     }
     // 3. Owner-signed ops in the cap store that name this device's keys (user
@@ -261,7 +269,7 @@ pub(crate) fn perms_for(
             }
             Err(None) => {
                 r.effective = Some(false);
-                r.reason = "refused: legacy trust does not allow it".to_string();
+                r.reason = "refused: not among this pairing's permissions".to_string();
             }
         }
     }
@@ -278,6 +286,7 @@ pub(crate) fn perms_for(
         caveats,
         caps: rows,
         denies: strings(&record["deniedCaps"]),
+        cert_expires: cert.as_ref().map(|c| c.expires),
     }
 }
 
@@ -351,11 +360,17 @@ pub(crate) fn render(devices: &[&DevicePerms], now: u64) -> String {
         let fp = d.fingerprint.as_deref().unwrap_or("no certificate");
         let addr = d.addr.as_deref().unwrap_or("");
         out.push(format!(
-            "  {}  {}  {}  {}",
+            "  {}  {}  {}  {}  {}",
             ui::paint(ui::Tone::Bold, &d.name),
             ui::paint(ui::Tone::Brand, d.tier),
             ui::paint(ui::Tone::Dim, fp),
-            ui::paint(ui::Tone::Dim, addr)
+            ui::paint(ui::Tone::Dim, addr),
+            ui::paint(
+                ui::Tone::Dim,
+                &d.cert_expires
+                    .map(|e| crate::device_view::cert_expiry_text(Some(e), now))
+                    .unwrap_or_default()
+            )
         ));
         for c in &d.caveats {
             out.push(format!("     {} {}", ui::paint(ui::Tone::Warn, ui::glyph_warn()), c));
@@ -371,7 +386,10 @@ pub(crate) fn render(devices: &[&DevicePerms], now: u64) -> String {
                         r.action.clone(),
                         r.resource.clone(),
                         r.source.clone(),
-                        r.valid_until.map_or("no expiry".to_string(), |t| when(t, now)),
+                        // A row without its own clock: say whose clock is
+                        // missing. The DEVICE's expiry (its certificate) is on
+                        // the header line, in the words `devices` uses.
+                        r.valid_until.map_or("no grant expiry".to_string(), |t| when(t, now)),
                         match r.effective {
                             Some(true) => "yes".to_string(),
                             Some(false) => "no".to_string(),
@@ -546,12 +564,12 @@ mod tests {
         let signed = find(laptop, "shell", "grant by 11111111 v5");
         assert_eq!(signed.valid_until, Some(now + 3600));
         assert_eq!(signed.effective, Some(true), "{}", signed.reason);
-        assert_eq!(find(laptop, "shell", "pair-secret legacy").effective, Some(true));
-        assert_eq!(find(laptop, "transfer", "pair-secret legacy").effective, Some(true));
+        assert_eq!(find(laptop, "shell", "pairing").effective, Some(true));
+        assert_eq!(find(laptop, "transfer", "pairing").effective, Some(true));
 
         // An expired grant is listed, not effective, and says when it lapsed.
         let oldbox = by("oldbox");
-        let legacy = find(oldbox, "mount", "pair-secret legacy");
+        let legacy = find(oldbox, "mount", "pairing");
         assert_eq!(legacy.valid_until, Some(now - 10));
         assert!(legacy.effective == Some(false) && legacy.reason.starts_with("expired"), "{}", legacy.reason);
         let sig = find(oldbox, "mount", "grant by 11111111 v9");
@@ -579,7 +597,7 @@ mod tests {
         let locked = by("locked");
         assert_eq!(locked.denies, vec!["shell".to_string()]);
         assert!(locked.caveats.iter().any(|c| c == "cert revoked"));
-        let xfer = find(locked, "transfer", "pair-secret legacy");
+        let xfer = find(locked, "transfer", "pairing");
         assert!(xfer.effective == Some(false) && xfer.reason.contains("revoked"), "{}", xfer.reason);
 
         // An expired cert keeps the tier `devices` gives it and gains the caveat.
@@ -595,8 +613,22 @@ mod tests {
         assert_eq!(base.effective, None);
         assert!(base.reason.starts_with("not evaluated"), "{}", base.reason);
 
+        // Eval item 7: a fresh v2 pairing is never called "legacy", and the
+        // header carries the same expiry sentence `devices` prints.
+        for d in &all {
+            if d.name != "plain" {
+                assert!(d.caps.iter().all(|r| !r.source.contains("legacy")), "{}: {:?}", d.name, d.caps.iter().map(|r| &r.source).collect::<Vec<_>>());
+            }
+        }
         // Read-only: the view wrote nothing.
         let rendered = render(&all.iter().collect::<Vec<_>>(), now);
+        assert!(!rendered.contains("no expiry"), "{rendered}");
+        let laptop_cert = laptop.cert_expires.expect("laptop has a certificate");
+        let laptop_line = rendered.lines().find(|l| l.contains("laptop")).unwrap();
+        assert!(
+            laptop_line.contains(&crate::device_view::cert_expiry_text(Some(laptop_cert), now)),
+            "the caps view must state the device expiry the device list states: {laptop_line}"
+        );
         assert!(rendered.contains("grant by 11111111 v5"));
         let after = (
             std::fs::read(dir.join("devices.json")).unwrap(),

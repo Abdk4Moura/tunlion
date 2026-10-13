@@ -57,12 +57,22 @@ pub(crate) fn gather_shell_gate_inputs(
     shell_policy: &crate::ShellPolicy,
     action: &str,
 ) -> (Option<String>, ShellGateInputs) {
-    let trusted = conn.link(pid).map(|l| l.trusted).unwrap_or(false);
+    // Eval item 4: a fleet sibling (met by fleet-hello, no pair secret) is
+    // born `trusted: false` and stays so, so `grant <sibling> shell` on a
+    // member recorded a grant the fold could never honour while the caps
+    // view (which assumes an authenticated link) said EFFECTIVE yes. A
+    // proven fleet link satisfies the record-grant term; the blanket
+    // `--shell` policy still speaks for PAIRED devices only.
+    let (pair_trusted, fleet_proven) = conn
+        .link(pid)
+        .map(|l| (l.trusted, l.fleet_proven()))
+        .unwrap_or((false, false));
+    let trusted = pair_trusted || fleet_proven;
     let dev = conn.link(pid).and_then(|l| l.verified_name.clone());
     let (denied, policy_allows, store_allows) = match dev.as_deref() {
         Some(n) => (
             crate::device_capability_denied(n, action),
-            shell_policy.auto_allows(n),
+            pair_trusted && shell_policy.auto_allows(n),
             crate::device_allows(n, action),
         ),
         None => (false, false, false),
@@ -105,6 +115,20 @@ pub(crate) fn gather_shell_gate_inputs(
         action: action.to_string(),
     };
     (dev, inputs)
+}
+
+/// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
+/// identity is Proven and whose local name came from that proven key.
+pub(crate) fn fleet_link_proven(
+    kind: &crate::capability::PrincipalKind,
+    binding: BindingStrength,
+    has_device_pub: bool,
+    has_verified_name: bool,
+) -> bool {
+    matches!(kind, crate::capability::PrincipalKind::FleetDevice)
+        && binding == BindingStrength::Proven
+        && has_device_pub
+        && has_verified_name
 }
 
 /// Shared verdict core: legacy folds trust the same way for both paths, then
@@ -427,4 +451,63 @@ mod tests {
     // cannot pass as a revocation. Keep that gate and this matrix together:
     // the matrix pins the decision, the gate pins that the decision is reached
     // with the real input.
+
+    /// Eval item 4: on a member, `grant u1-b shell` for a fleet sibling was
+    /// recorded, the caps view said EFFECTIVE yes, and every exec was refused
+    /// "shell not granted to 'u1-b' here", because the fold read the link's
+    /// pair `trusted` flag, which a fleet link never has. A proven fleet link
+    /// now satisfies the record-grant term (shadow, the default mode), and
+    /// the explicit deny and revocation still win.
+    #[test]
+    fn a_proven_fleet_sibling_with_a_record_grant_is_admitted() {
+        use crate::capability::PrincipalKind;
+        let _guard = crate::tests::lock_test_config();
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
+        unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "0") };
+
+        let fp = fleet_link_proven(&PrincipalKind::FleetDevice, BindingStrength::Proven, true, true);
+        assert!(fp, "what admit_fleet leaves on a verified fleet-hello link");
+        assert!(!fleet_link_proven(&PrincipalKind::FleetDevice, BindingStrength::Inferred, true, true));
+        assert!(!fleet_link_proven(&PrincipalKind::FleetDevice, BindingStrength::Proven, true, false));
+        assert!(!fleet_link_proven(&PrincipalKind::FleetDevice, BindingStrength::Proven, false, true));
+        assert!(!fleet_link_proven(&PrincipalKind::OwnerDevice, BindingStrength::Proven, true, true));
+
+        let owner = [0x11u8; 32];
+        let cell = |trusted: bool, store_allows: bool, denied: bool, cert_revoked: bool| ShellGateInputs {
+            trusted,
+            denied,
+            policy_allows: false,
+            store_allows,
+            outcome: CapOutcome::Denied("no header grant".into()),
+            idev: Some([0x42u8; 32]),
+            iusr: Some(owner),
+            binding: BindingStrength::Proven,
+            expires: Some(9_999_999_999u64),
+            ak_caps: None,
+            own_user: Some(owner),
+            has_grant: false,
+            cert_revoked,
+            ceiling_covers: false,
+            scoped_default: false,
+            action: CAP_SHELL.to_string(),
+        };
+        let pair_trusted = false; // a fleet link is born untrusted
+        // The grant the member recorded is honoured over the proven link.
+        assert!(exec_gate_decision(&cell(pair_trusted || fp, true, false, false)).is_ok());
+        assert!(pty_gate_decision(&cell(pair_trusted || fp, true, false, false)).is_ok());
+        // Before the fix the fold saw pair trust alone: this is the refusal
+        // the evaluator met.
+        assert!(exec_gate_decision(&cell(pair_trusted, true, false, false)).is_err());
+        // No grant, an explicit deny, or a revoked certificate still refuse.
+        assert!(exec_gate_decision(&cell(fp, false, false, false)).is_err());
+        assert!(exec_gate_decision(&cell(fp, true, true, false)).is_err());
+        assert!(exec_gate_decision(&cell(fp, true, false, true)).is_err());
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v),
+                None => std::env::remove_var("TUNLION_CAP_AUTHORITATIVE"),
+            }
+        }
+    }
 }
