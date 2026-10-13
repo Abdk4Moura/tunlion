@@ -1465,7 +1465,11 @@ fn note_reader_exit(peer_id: &str, primary: bool, reason: &str, frames: u64, dea
     }
 }
 
-fn spawn_reader(
+/// The link's read loop, as a future that does nothing until it is spawned.
+/// `make_transport` spawns it at once; `make_transport_unread` hands it back so
+/// the caller can announce the link first (see `UnreadTransport`).
+#[allow(clippy::too_many_arguments)]
+fn reader_task(
     peer_id: String,
     mut recv: RecvStream,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
@@ -1474,8 +1478,8 @@ fn spawn_reader(
     answerer: bool,
     rx_ended: Arc<std::sync::atomic::AtomicBool>,
     primary: bool,
-) {
-    tokio::spawn(async move {
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async move {
         let mut frames: u64 = 0;
         let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
         let mut last_chunk_time = if trace { Some(std::time::Instant::now()) } else { None };
@@ -1609,11 +1613,64 @@ fn spawn_reader(
                 _ => {}
             }
         }
-    });
+    }
+}
+
+/// An authenticated direct link whose read loop has NOT started yet.
+///
+/// The primary link is announced to the event loop with `Ev::DirectReady` (or
+/// `DirectUpgradeReady`), and the consumer attaches the transport to its link
+/// while handling that event. Its reader feeds the same FIFO. When the reader
+/// started inside `make_transport`, a frame the peer sent the moment ITS side
+/// was up could be queued as `Ev::Control` before the caller had sent
+/// DirectReady, and the consumer then handled it for a link that had no
+/// transport yet: `transport_of(pid)` was None and the handler returned
+/// without a word. The same ordering hung `tunlion join` on the WebRTC path
+/// (net.rs `announce_then_read`).
+///
+/// `announce` sends the ready event and THEN starts reading, so every frame is
+/// queued after it. Unread frames wait in the QUIC stream, so nothing is lost.
+/// Dropping this without announcing still starts the reader (a link that never
+/// reads would be a silent hang of its own), it just announces nothing.
+pub struct UnreadTransport {
+    transport: Arc<dyn Transport>,
+    reader: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>>,
+}
+
+impl UnreadTransport {
+    /// The transport, for callers that must inspect it before announcing.
+    pub fn transport(&self) -> &Arc<dyn Transport> {
+        &self.transport
+    }
+
+    /// Queue `ready(transport)` on `tx`, then start the read loop.
+    pub fn announce(
+        mut self,
+        tx: &tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+        ready: impl FnOnce(Arc<dyn Transport>) -> crate::net::Ev,
+    ) {
+        let _ = tx.send(ready(self.transport.clone()));
+        if let Some(reader) = self.reader.take() {
+            tokio::spawn(reader);
+        }
+    }
+}
+
+impl Drop for UnreadTransport {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(reader);
+            }
+        }
+    }
 }
 
 /// Build a `DirectTransport` from an authenticated connection + its auth stream
-/// (reused as the control/data stream), wiring the reader into `tx`.
+/// (reused as the control/data stream), wiring the reader into `tx` and
+/// starting it at once. Used for worker streams, which are never announced
+/// one at a time; the PRIMARY link goes through `make_transport_unread`.
+#[allow(clippy::too_many_arguments)]
 pub fn make_transport(
     peer_id: String,
     conn: quinn::Connection,
@@ -1624,10 +1681,29 @@ pub fn make_transport(
     ep: Option<quinn::Endpoint>,
     primary: bool,
 ) -> Arc<dyn Transport> {
+    let mut unread = make_transport_unread(peer_id, conn, send, recv, tx, answerer, ep, primary);
+    if let Some(reader) = unread.reader.take() {
+        tokio::spawn(reader);
+    }
+    unread.transport.clone()
+}
+
+/// `make_transport` without starting the reader: see `UnreadTransport`.
+#[allow(clippy::too_many_arguments)]
+pub fn make_transport_unread(
+    peer_id: String,
+    conn: quinn::Connection,
+    send: SendStream,
+    recv: RecvStream,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    answerer: bool,
+    ep: Option<quinn::Endpoint>,
+    primary: bool,
+) -> UnreadTransport {
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rx_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_reader(
+    let reader = reader_task(
         peer_id,
         recv,
         tx,
@@ -1637,7 +1713,7 @@ pub fn make_transport(
         rx_ended.clone(),
         primary,
     );
-    Arc::new(DirectTransport {
+    let transport: Arc<dyn Transport> = Arc::new(DirectTransport {
         conn,
         send: Arc::new(Mutex::new(send)),
         last_activity,
@@ -1652,7 +1728,10 @@ pub fn make_transport(
         frozen: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "test-hooks")]
         born_ms: now_ms(),
-    })
+    });
+    let reader: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> =
+        Box::pin(reader);
+    UnreadTransport { transport, reader: Some(reader) }
 }
 
 /// Mesh reuse: spawn a background task that accepts new incoming QUIC streams
@@ -1839,7 +1918,7 @@ pub async fn race_connect(
     exchange: bool,
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
-) -> Option<Arc<dyn Transport>> {
+) -> Option<UnreadTransport> {
     race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed).await
 }
 
@@ -1872,7 +1951,7 @@ pub async fn race_connect_labeled(
     exchange: bool,
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
-) -> Option<Arc<dyn Transport>> {
+) -> Option<UnreadTransport> {
     let answerer = match answerer_for(&my_uid, &peer_uid, &my_id, &peer_id) {
         Ok(value) => value,
         Err(error) => {
@@ -2099,7 +2178,9 @@ pub async fn race_connect_labeled(
     let conn_id = conn.stable_id();
     #[cfg(debug_assertions)]
     eprintln!("[PRIMARY-MADE] conn_stable={conn_id} answerer={answerer}");
-    Some(make_transport(
+    // Unread: the caller announces it (DirectReady) and only then does the
+    // reader start, so no frame from the peer can be queued ahead of it.
+    Some(make_transport_unread(
         peer_id,
         conn,
         send,
@@ -2227,6 +2308,78 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         f()
+    }
+
+    /// The join hang's direct twin: the peer writes the moment its side is up,
+    /// so the frame is already waiting when we build our primary. The consumer
+    /// must see DirectReady (which attaches the transport to the link) before
+    /// that frame, or a handler finds `transport_of(pid)` empty and drops it.
+    /// The frame is made to arrive BEFORE we announce, which is exactly the
+    /// case the old order lost: with the reader started inside
+    /// `make_transport`, the Control was queued first.
+    #[tokio::test]
+    async fn direct_ready_is_queued_before_a_frame_the_peer_already_sent() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let ((conn_d, send_d, recv_d), (conn_a, send_a, recv_a)) = connected_pair().await;
+            let (peer_tx, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
+            let peer = make_transport(
+                "us".to_string(), conn_d, send_d, recv_d, peer_tx, false, None, true,
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let ours = make_transport_unread(
+                "peer".to_string(), conn_a, send_a, recv_a, tx.clone(), true, None, true,
+            );
+            peer.send_control(&serde_json::json!({ "type": "identity-auth-key-enroll-request" }))
+                .await
+                .expect("peer sends its first frame");
+            // Let the frame land in our stream before we announce.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may be queued before the link is announced"
+            );
+            ours.announce(&tx, |t| crate::net::Ev::DirectReady("peer".to_string(), t, "direct-quic"));
+            let first = rx.recv().await.expect("an event");
+            assert!(
+                matches!(first, crate::net::Ev::DirectReady(ref p, _, _) if p == "peer"),
+                "a Control from the peer was queued before its DirectReady"
+            );
+            let second = rx.recv().await.expect("the peer's frame");
+            assert!(
+                matches!(second, crate::net::Ev::Control(ref p, ref v)
+                    if p == "peer" && v["type"] == "identity-auth-key-enroll-request"),
+                "the buffered frame must still be delivered, after DirectReady"
+            );
+        })
+        .await
+        .expect("announce-order test did not finish within 20s (a stall must FAIL here)");
+    }
+
+    /// Dropping an unannounced link must still start its reader: a link that
+    /// never reads would be a silent hang of its own.
+    #[tokio::test]
+    async fn an_unannounced_link_still_reads_when_dropped() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let ((conn_d, send_d, recv_d), (conn_a, send_a, recv_a)) = connected_pair().await;
+            let (peer_tx, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
+            let peer = make_transport(
+                "us".to_string(), conn_d, send_d, recv_d, peer_tx, false, None, true,
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let ours = make_transport_unread(
+                "peer".to_string(), conn_a, send_a, recv_a, tx, true, None, true,
+            );
+            let t = ours.transport().clone();
+            drop(ours);
+            peer.send_control(&serde_json::json!({ "type": "ping" }))
+                .await
+                .expect("peer sends");
+            let ev = rx.recv().await.expect("the reader runs after a drop");
+            assert!(matches!(ev, crate::net::Ev::Control(ref p, _) if p == "peer"));
+            drop(t);
+        })
+        .await
+        .expect("drop test did not finish within 20s (a stall must FAIL here)");
     }
 
     /// #312 T2: a PRIMARY link whose peer ends its send half must report DEAD

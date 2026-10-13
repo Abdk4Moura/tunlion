@@ -257,6 +257,9 @@ pub(crate) async fn respond_to_auth_key_enroll_request(
     v: serde_json::Value,
 ) {
     let Some(t) = conn.transport_of(&pid) else {
+        // Never silent: the joiner cannot tell a dropped request from a slow
+        // one, so it waits out its whole deadline (the join hang).
+        crate::conn::dropped_no_transport(&pid, "enrolment request");
         return;
     };
 
@@ -382,6 +385,7 @@ pub(crate) async fn handle_auth_key_enroll_response(
     v: serde_json::Value,
 ) {
     let Some(t) = conn.transport_of(&pid) else {
+        crate::conn::dropped_no_transport(&pid, "enrolment response");
         return;
     };
     let payload = match crate::ephemeral::EnrollmentPayload::from_json(&v) {
