@@ -266,6 +266,22 @@ impl Link {
         self.principal_kind = crate::capability::PrincipalKind::FleetDevice;
     }
 
+    /// Identity bound by a verified fleet-hello: Proven possession of a cert
+    /// chaining to our owner key, with `verified_name` resolved from that
+    /// cert's device key (never a claimed name). That answers the question the
+    /// shell fold's `trusted` term asks, "is this the device whose record
+    /// grants it", as strongly as a pair MAC does. Deliberately NOT written
+    /// into `trusted`, which also drives transfer auto-accept, vouching and the
+    /// blanket `--shell` policy.
+    pub(crate) fn fleet_proven(&self) -> bool {
+        crate::shell_gate::fleet_link_proven(
+            &self.principal_kind,
+            self.identity_binding,
+            self.identity_device_pub.is_some(),
+            self.verified_name.is_some(),
+        )
+    }
+
     pub(crate) fn admit_delegated(
         &mut self,
         owner_pub: [u8; 32],

@@ -1,8 +1,7 @@
 //! The clap command surface: the version and help text and the whole CLI shape.
 //!
 //! `const VERSION`, `const EXAMPLES`, `struct Cli`, `enum Cmd` and the four
-//! subcommand enums `Cmd`'s variants are built from (`EphemeralAction`,
-//! `IdAction`, `RequestsAction`, `DevicesAction`) -- moved as one group, verbatim
+//! subcommand enums `Cmd`'s variants are built from (`IdAction`, `RequestsAction`, `DevicesAction`) -- moved as one group, verbatim
 //! and in order, so every `#[command(...)]` attribute, every derive and every doc
 //! comment that clap turns into help text travelled with the item it belongs to.
 //!
@@ -45,8 +44,7 @@ COMMANDS
     devices                list your known devices
     requests               approve or deny access others asked for
     grant / revoke         give or take a capability on a device
-    add --for runner       a temporary key someone can enrol with (CI, borrowed box)
-    ephemeral enroll       use such a key to enrol (run on the CI / borrowed box)
+    add --for runner       a temporary key for a CI or borrowed box; it runs `tunlion join <file>`
     status                 what the daemon is doing / recently received
   Mesh
     addr                   show your overlay address (or a device's)
@@ -843,16 +841,6 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: Option<RequestsAction>,
     },
-    /// Mint auth keys or enroll as an ephemeral delegated device.
-    ///
-    /// Unhidden 2026-08-29. It was hidden while the banner did not mention it,
-    /// so the only way to find a working verb was to already know it existed.
-    /// `help_banner_agrees_with_clap_visibility` states the rule this now
-    /// satisfies: a command that works is discoverable, or it is removed.
-    Ephemeral {
-        #[command(subcommand)]
-        action: EphemeralAction,
-    },
     /// Wipe this machine's tunlion state (clean slate). DESTRUCTIVE.
     ///
     /// Removes the local identity + overlay keys, the paired-device store, the
@@ -920,20 +908,6 @@ pub(crate) struct SkillTargets {
     pub(crate) dir: Option<PathBuf>,
 }
 
-/// Ephemeral device commands: mint auth keys, enroll as delegated.
-#[derive(Subcommand)]
-pub(crate) enum EphemeralAction {
-    /// Enroll as an ephemeral delegated device using an auth key.
-    Enroll {
-        /// Owner-only file containing the auth key bundle.
-        #[arg(long, value_name = "PATH")]
-        auth_key_file: PathBuf,
-        /// Target peer display name or channel (the owner device to enroll at)
-        #[arg(long)]
-        to: Option<String>,
-    },
-}
-
 /// User identity management: generate the identity key, show the fingerprint,
 /// certify a known device so peers can verify it belongs to the same person.
 #[derive(Subcommand)]
@@ -992,7 +966,8 @@ pub(crate) enum DevicesAction {
     /// Durable revoke: the device stops being recognized NOW and forever (the
     /// record survives as evidence; the gate refuses it on reconnect).
     Revoke { name: String },
-    /// Undo a durable revoke. The device returns to its prior state.
+    /// Undo a revoke (the device returns to its prior record), or lift the
+    /// key block a `forget` left behind (then re-add it with `tunlion add`).
     Restore { name: String },
 }
 
@@ -1214,5 +1189,27 @@ mod tests {
         let src = include_str!("pair_cmd.rs");
         assert!(!src.contains("make sure both run `tunlion add`"));
         assert!(src.contains("while the other runs `tunlion join <code>`"));
+    }
+
+    /// Eval item 8: --help said a runner key is claimed with `ephemeral
+    /// enroll` while `add --for runner` printed `tunlion join <file>`. One
+    /// claim verb: the help, the add output and the parser all name `join`,
+    /// and the second spelling no longer parses.
+    #[test]
+    fn runner_keys_are_claimed_with_join_everywhere() {
+        use clap::Parser;
+        let runner_row = EXAMPLES
+            .lines()
+            .find(|l| l.trim_start().starts_with("add --for runner"))
+            .expect("the banner lists add --for runner");
+        assert!(runner_row.contains("tunlion join <file>"), "{runner_row}");
+        assert!(!EXAMPLES.contains("ephemeral enroll"), "the banner still names ephemeral enroll");
+        let step = crate::add_for::join_next_step("runner-invite.txt", None);
+        assert!(step.ends_with("tunlion join runner-invite.txt"), "{step}");
+        assert!(Cli::try_parse_from(["tunlion", "join", "runner-invite.txt"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["tunlion", "ephemeral", "enroll", "--auth-key-file", "k"]).is_err(),
+            "a second claim verb for the same file must not exist"
+        );
     }
 }

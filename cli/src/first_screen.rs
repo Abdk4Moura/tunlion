@@ -10,6 +10,13 @@ use crate::regex_lite_code;
 
 /// `add` was handed an invitation instead of a pairing code. One source for the
 /// sentence so the test and the error cannot drift apart.
+/// The ONE way in for someone holding something they were given. There used to
+/// be two entries, "Pair with a code I was given" (which ran `add`, the OFFERING
+/// side, so a typed code minted a second code) and "Join with an invitation"
+/// (which refused a code as "unknown format"). `join` with nothing on the line
+/// asks once and tells a code from an invitation from a file itself.
+pub(crate) const ACCEPT_ENTRY: (&str, &str) = ("I have a code or an invitation", "join");
+
 /// What the bare `tunlion` screen offers, given what this machine actually has.
 ///
 /// Extracted so #194 can be pinned without driving a terminal: the bug was a
@@ -62,8 +69,7 @@ pub(crate) fn first_screen_actions(
             // the OWNER side presents first as "Connect a device with me now",
             // had no entry here and had to know to type it. #198's shape: two
             // mint paths, and the claim surface grew only one of them.
-            ("Pair with a code I was given", "add"),
-            ("Join with an invitation", "join"),
+            ACCEPT_ENTRY,
             ("Receive a one-time transfer", "receive"),
         ]
     } else {
@@ -81,8 +87,7 @@ pub(crate) fn first_screen_actions(
             ("Receive something", "receive"),
             ("See every device", "devices"),
             ("Create an identity for this device", "init"),
-            ("Pair with a code I was given", "add"), // #209, as above
-            ("Join with an invitation", "join"),
+            ACCEPT_ENTRY, // #209, as above
         ]
     }
 }

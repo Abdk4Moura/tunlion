@@ -44,6 +44,21 @@ pub(crate) const MAX_ATTEMPTS: u32 = 5;
 pub(crate) static NO_RELAY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Set when `--remember <name>` actually stored a record this run (send or
+/// receive), cleared when the other side declined it. Read once the transfer
+/// is over so `--remember` is never silently a no-op.
+pub(crate) static REMEMBER_STORED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What to say when `--remember` stored nothing. Pure.
+pub(crate) fn remember_not_stored_msg(name: &str, sending: bool) -> String {
+    let other = if sending { "receiver" } else { "sender" };
+    format!(
+        "--remember {name}: nothing was remembered. Both sides must pass --remember on the same code transfer, \
+         and the {other} did not. To pair this device for good:  tunlion add {name}  (and `tunlion join <code>` on the other side)"
+    )
+}
+
 /// Set once in `run`, before any worker spawns, from the global `--no-interactive`
 /// flag (mirrors NO_RELAY). The guided code entry NEVER opens when this is set.
 pub(crate) static NO_INTERACTIVE: std::sync::atomic::AtomicBool =

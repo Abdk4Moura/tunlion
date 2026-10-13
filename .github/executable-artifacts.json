@@ -31,6 +31,17 @@
       ]
     },
     {
+      "path": "cli/tests/state-ux-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/state-ux-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/devices-write-race-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/devices-write-race-gates.sh",

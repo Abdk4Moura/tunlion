@@ -2285,16 +2285,33 @@ fn a_device_with_no_identity_is_offered_both_ways_in() {
     // deleting it left the suite green. That is the same shape as #227, which
     // this same PR exists to correct, so leaving it untested would have been
     // the defect reappearing inside its own fix.
+    //
+    // Eval item 1 tightened this: the pairing-code entry ran `add`, which is
+    // the OFFERING side, so a typed code minted a second code and both sides
+    // waited on different codes. Both ways in are now ONE entry that runs
+    // `join`, which accepts a code, an invitation or a file. So: the accept
+    // entry is present, it runs `join`, there is exactly one, and nothing on
+    // this menu that promises to take a code runs `add`.
     for (owner, joined, count) in [(false, false, 0usize), (false, false, 2usize)] {
         let actions = first_screen_actions(owner, joined, count);
         let verbs: Vec<&str> = actions.iter().map(|(_, verb)| *verb).collect();
-        assert!(
-            verbs.contains(&"add"),
-            "a device with no identity must be offered the pairing-code claim (device_count={count}): {verbs:?}"
+        let accept: Vec<_> = actions
+            .iter()
+            .filter(|(label, _)| label.contains("code") && label.contains("invitation"))
+            .collect();
+        assert_eq!(
+            accept.len(),
+            1,
+            "exactly one accept entry that names both a code and an invitation (device_count={count}): {actions:?}"
         );
+        assert_eq!(accept[0].1, "join", "the accept entry must run join, never add: {actions:?}");
         assert!(
             verbs.contains(&"join"),
-            "and the invitation claim as well (device_count={count}): {verbs:?}"
+            "a device with no identity must be offered a way in (device_count={count}): {verbs:?}"
+        );
+        assert!(
+            !actions.iter().any(|(label, verb)| label.contains("code I was given") && *verb == "add"),
+            "an entry for a code you were given must not run the offering verb: {actions:?}"
         );
     }
     // An owner already has an identity; neither claim belongs on that menu.

@@ -1931,6 +1931,8 @@ pub(crate) async fn send_cmd(
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         if v["ok"].as_bool() == Some(false) {
                             devices_remove(&name)?;
+                            crate::shared_defs::REMEMBER_STORED
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             ui::say(&conn.roster(
                                 &pid,
                                 ui::glyph_err(),
@@ -2033,6 +2035,8 @@ pub(crate) async fn send_cmd(
                                     "  remembered this device as '{stored}' (it keeps its half only if it passed --remember too)"
                                 ));
                                 remembered_as = Some(stored);
+                                crate::shared_defs::REMEMBER_STORED
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }
