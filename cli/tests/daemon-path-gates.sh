@@ -12,10 +12,14 @@
 # session the server listed first; when that was the ghost, the real daemon's
 # link came up as a mere responder: b verified a, and nothing was ever offered.
 #
-#   P1  ghost + disk full: the sender exits 4 with reason no_space within 10 s.
-#   P2  ghost + a send that fits: delivered within 10 s.
-#       Both first PROVE the ghost was there (the sender saw two sessions for
-#       b), so a run where the network did not leave one cannot pass silently.
+#   P1  ghost + disk full: the sender exits 4 with reason no_space within 10 s
+#       of the receiver's daemon being back.
+#   P2  ghost + a send that fits: delivered within 10 s of the same.
+#       The ghost is made deterministically (signaling socket blackholed, then
+#       kill -9, so the server never sees the close) and the sender starts
+#       against it alone; on the unfixed build both wait 60 s and exit 6. Both
+#       first PROVE the ghost was there (the sender saw two sessions for b), so
+#       a run that did not reproduce it cannot pass silently.
 #   E1  exec b -> a works (positive control for E2-F1).
 #   E2  exec running when a's daemon is kill -9'd: exits 6 within 16 s.
 #   E3  exec to a's dead daemon: exits 6 within 20 s (was 45 s).
@@ -101,8 +105,12 @@ sleep 8
 head -c 200000 /dev/urandom >"$WORK/small.bin"
 head -c 3000000 /dev/urandom >"$WORK/three.bin"
 
-# Blackhole B daemon's signaling socket WITHOUT closing it: the server keeps
-# listing that session (the ghost) while B reconnects on a fresh one.
+# A GHOST of B's daemon, deterministically: blackhole its signaling socket,
+# then kill -9 it. The close never reaches the server (the FIN is dropped too),
+# so the server keeps listing that session until its ping timeout while it can
+# never answer. The sender starts against the ghost alone, and B's daemon comes
+# back (a new session) two seconds later: the order the blind run met, where
+# the ghost was listed first and took the sender's active slot.
 blackhole_b() {
   local p
   for p in $(ss -tnp 2>/dev/null | grep "pid=$BDAEMON," | awk -v s="127.0.0.1:$PORT" '$5==s {print $4}' | grep -oE '[0-9]+$' | sort -u); do
@@ -113,26 +121,37 @@ blackhole_b() {
     echo "## blackholed B's signaling socket (local port $p)"
   done
 }
-reconnects() { grep -c "signaling reconnected" "$WORK/B-up.log"; }
-# Did this sender see more than one session for boxB? (the instrument check)
+start_b() {
+  env FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$TINY" >>"$WORK/B-up.log" 2>&1 &
+  BDAEMON=$!; pids+=($BDAEMON)
+}
+ghost_b() {
+  blackhole_b
+  kill -9 "$BDAEMON"; wait "$BDAEMON" 2>/dev/null
+  sleep 1
+}
+# Did this sender see more than one session for boxB? (the instrument check:
+# without the ghost there is nothing to measure)
 saw_ghost() { [ "$(grep -oE 'ADOPT peer=[^ ]+' "$1" | sort -u | wc -l)" -ge 2 ]; }
-
-say "ghost: B's signaling socket goes silent, B reconnects, the old session stays listed"
-n0=$(reconnects)
-blackhole_b
-for _ in $(seq 1 75); do [ "$(reconnects)" -gt "$n0" ] && break; sleep 1; done
-[ "$(reconnects)" -gt "$n0" ] && echo "## B reconnected its signaling" || echo "## B did NOT reconnect"
-sleep 2
+# $1 label, $2 file: a send started against the ghost alone; B returns 2 s in.
+# Sets rc and took (seconds from B's return to the sender's exit).
+send_behind_ghost() {
+  ghost_b
+  env FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$2" --to boxB --json >"$WORK/$1.json" 2>"$WORK/$1.err" &
+  local sp=$!
+  sleep 2
+  start_b; local t0; t0=$(ts)
+  wait "$sp"; rc=$?; took=$(since "$t0")
+  echo "## rc=$rc ${took}s after B returned"
+}
 
 # ===================================================================== P1 ======
 say "P1: disk full behind a ghost: exit 4, no_space, within 10 s"
-t0=$(ts)
-env FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$WORK/three.bin" --to boxB --json >"$WORK/p1.json" 2>"$WORK/p1.err"
-rc=$?; took=$(since "$t0")
-echo "## rc=$rc in ${took}s"; cat "$WORK/p1.json"
+send_behind_ghost p1 "$WORK/three.bin"
+cat "$WORK/p1.json"
 if ! saw_ghost "$WORK/p1.err"; then
   bad "P1: the ghost was not reproduced (the sender saw one session for boxB), so nothing was measured"
-  grep -E "ADOPT|reconnect" "$WORK/p1.err" | head
+  grep -E "ADOPT|found" "$WORK/p1.err" | head
 elif [ "$rc" = 4 ] && [ "$took" -le 10 ] && "$PYV" - "$WORK/p1.json" <<'PY'
 import json, sys
 docs = [l for l in open(sys.argv[1]) if l.strip()]
@@ -143,28 +162,28 @@ assert d["error"].get("reason") == "no_space", d["error"]
 assert d["files"][0]["refusal"]["reason"] == "no_space", d["files"][0]
 PY
 then
-  ok "P1: behind a ghost session the full receiver's refusal reached the sender in ${took}s (exit 4, no_space)"
+  ok "P1: behind a ghost session the full receiver's refusal reached the sender ${took}s after it came back (exit 4, no_space)"
 else
-  bad "P1: disk-full refusal behind a ghost (rc=$rc in ${took}s)"
+  bad "P1: disk-full refusal behind a ghost (rc=$rc, ${took}s after B came back)"
   grep -v "still waiting" "$WORK/p1.err" | tail -25
 fi
 
 # ===================================================================== P2 ======
-say "P2: a send that fits, behind the same ghost: delivered within 10 s"
-t0=$(ts)
-env FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxB >"$WORK/p2.out" 2>"$WORK/p2.err"
-rc=$?; took=$(since "$t0")
-echo "## rc=$rc in ${took}s"
+say "P2: a send that fits, behind a ghost: delivered within 10 s"
+sleep 4
+send_behind_ghost p2 "$WORK/small.bin"
 if ! saw_ghost "$WORK/p2.err"; then
   bad "P2: the ghost was not reproduced (the sender saw one session for boxB), so nothing was measured"
+  grep -E "ADOPT|found" "$WORK/p2.err" | head
 elif [ "$rc" = 0 ] && [ "$took" -le 10 ] && cmp -s "$WORK/small.bin" "$TINY/small.bin"; then
-  ok "P2: behind a ghost session the send was delivered in ${took}s"
+  ok "P2: behind a ghost session the send was delivered ${took}s after the receiver came back"
 else
-  bad "P2: send behind a ghost (rc=$rc in ${took}s)"
+  bad "P2: send behind a ghost (rc=$rc, ${took}s after B came back)"
   grep -v "still waiting" "$WORK/p2.err" | tail -25
 fi
 for r in "${RULES[@]:-}"; do [ -n "$r" ] && sudo -n iptables -D INPUT $r 2>/dev/null; done
 RULES=()
+sleep 4
 
 # ===================================================================== E1 ======
 say "E1: exec b -> a works (positive control)"
