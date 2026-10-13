@@ -170,14 +170,16 @@ jobs:
         run: |
           set -uo pipefail
           declare -A EXPECT=(
-            [cli/tests/cap-verbs-gates.sh]=3
+            # 4: D (an already-covered grant exits 0) joined A/B/C.
+            [cli/tests/cap-verbs-gates.sh]=4
             [cli/tests/devices-write-race-gates.sh]=2
             [cli/tests/roster-gates.sh]=8
             [cli/tests/shell-gates.sh]=12
             [cli/tests/whoami-candidate-gates.sh]=8
             [cli/tests/warm-hold-idle-gates.sh]=9
             [cli/tests/hostile-env-gates.sh]=17
-            [cli/tests/reenrol-advice-gates.sh]=3
+            # 4: A2 (serving off still advises the re-enrolment) joined A/B/C.
+            [cli/tests/reenrol-advice-gates.sh]=4
             [cli/tests/daemon-stop-gates.sh]=4
             [cli/tests/signaling-freeze-gates.sh]=5
             [cli/tests/config-scope-gates.sh]=4

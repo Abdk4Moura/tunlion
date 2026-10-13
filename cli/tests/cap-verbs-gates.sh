@@ -16,6 +16,8 @@
 #      refusal names `revoke <device> --certificate`.
 #   C  devices shows the ceiling — the row and the --json caps field list the
 #      ceiling, never a shell the verb claimed to grant.
+#   D  an already-covered grant is an idempotent success (exit 0), and A's
+#      refusal is exit 4 (denied), not the catch-all 1.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -69,11 +71,13 @@ OUTA=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant foxtrot she
 rcA=$?
 echo "## (grant shell) rc=$rcA"
 echo "$OUTA" | sed 's/^/    /'
-if [ "$rcA" != "0" ] && echo "$OUTA" | grep -q "outside foxtrot's invitation ceiling" \
+# Exit 4, the documented "denied": the request was decided against, which the
+# catch-all 1 did not say.
+if [ "$rcA" = "4" ] && echo "$OUTA" | grep -q "outside foxtrot's invitation ceiling" \
    && echo "$OUTA" | grep -q "cannot widen"; then
-  ok "gateA: grant outside the ceiling REFUSED (names ceiling + cannot widen)"
+  ok "gateA: grant outside the ceiling REFUSED with exit 4 (names ceiling + cannot widen)"
 else
-  bad "gateA: grant outside the ceiling NOT refused (rc=$rcA)"
+  bad "gateA: grant outside the ceiling NOT refused as denied (rc=$rcA, want 4)"
 fi
 
 # ===================================================================== GATE B ==
@@ -113,6 +117,21 @@ if [ "$rcC" = "0" ]; then
   ok "gateC: devices --json shows the ceiling (transfer, mount), no inert shell"
 else
   bad "gateC: devices --json does NOT show the enforcement-honoured ceiling"
+fi
+
+# ===================================================================== GATE D ==
+# A grant the ceiling already holds is the state asked for: exit 0, said so,
+# and nothing else changes. It exited 1 ("no grant is needed"), so a script
+# that grants idempotently failed on its second run.
+say D
+OUTD=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant golf mount 2>&1)
+rcD=$?
+echo "## (grant mount, inside golf's ceiling) rc=$rcD"
+echo "$OUTD" | sed 's/^/    /'
+if [ "$rcD" = "0" ] && echo "$OUTD" | grep -q "already granted to 'golf'"; then
+  ok "gateD: a grant the ceiling already holds is an idempotent success (rc 0, says so)"
+else
+  bad "gateD: an already-covered grant did not succeed idempotently (rc=$rcD)"
 fi
 
 # ========================================================================= sum =

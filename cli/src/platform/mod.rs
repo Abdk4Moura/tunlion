@@ -759,6 +759,151 @@ pub fn process_group_alive(pgid: u32) -> bool {
     }
 }
 
+/// Tie a served command to the life of this daemon, so it cannot outlive a
+/// daemon that crashed or was killed with SIGKILL (nothing runs in the daemon
+/// then, so its own cleanup never fires). Observed on the launch candidate: a
+/// remote `sleep 304` kept running with PPID 1 after `kill -9` of the serving
+/// daemon, and survived a fresh `up --detach`.
+///
+/// Linux: the child asks for SIGKILL when its parent dies (PR_SET_PDEATHSIG),
+/// set after the process group is made (std applies `process_group` before
+/// `pre_exec` callbacks), then re-checks that the parent is still the daemon:
+/// a daemon that died between fork and prctl would otherwise never deliver the
+/// signal. Only the leader carries it (the kernel clears it for children it
+/// forks, and for a setuid exec or a credential change such as runuser's), so
+/// the recorded groups swept at the next start are the backstop for the rest
+/// of the tree. Elsewhere this is a no-op; Windows gets
+/// [`contain_with_daemon`] after the spawn instead, macOS only the sweep.
+///
+/// The signal follows the THREAD that forked, not the process: served
+/// commands are spawned from runtime worker threads, which live as long as
+/// the runtime (the tree uses no `block_in_place`, which could retire one).
+pub fn die_with_daemon(cmd: &mut tokio::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        let daemon = unsafe { libc::getpid() };
+        // SAFETY: only async-signal-safe calls (prctl, getppid) run between
+        // fork and exec, and nothing is allocated.
+        unsafe {
+            cmd.pre_exec(move || {
+                let zero: libc::c_ulong = 0;
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, zero, zero, zero) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != daemon {
+                    // The daemon is already gone: do not start an orphan.
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Windows half of [`die_with_daemon`]: put the served child in one job object
+/// that kills every process in it when its last handle closes. The daemon
+/// holds that handle for its whole life and never closes it, so the kernel
+/// closes it when the daemon exits by any means, crash included, and the tree
+/// goes with it. Best effort: a grandchild started before the assignment
+/// stays outside the job. A no-op elsewhere.
+pub fn contain_with_daemon(child: &tokio::process::Child) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        static JOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let job = *JOB.get_or_init(|| unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return 0;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if set == 0 {
+                return 0;
+            }
+            h as usize
+        });
+        if job != 0 {
+            if let Some(h) = child.raw_handle() {
+                unsafe {
+                    AssignProcessToJobObject(job as _, h as _);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+    }
+}
+
+/// Names this boot, so a process group recorded before a reboot is never
+/// mistaken for one that is still ours (after a reboot its number belongs to
+/// whatever happens to hold it now). None where the platform cannot say,
+/// which makes the startup sweep a no-op there.
+pub fn boot_token() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::timeval>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"kern.boottime".as_ptr(),
+                &mut tv as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && tv.tv_sec > 0).then(|| format!("{}.{}", tv.tv_sec, tv.tv_usec))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// When process `pid` started, in the kernel's own units, so a recorded leader
+/// can be told from an unrelated process that later got the same pid. None
+/// when the process does not exist or the platform cannot say.
+pub fn process_start_token(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name sits in parentheses and may hold spaces; the fields
+        // after its closing paren are fixed. starttime is field 22 overall, the
+        // 20th after the paren (state is the 1st).
+        let rest = &stat[stat.rfind(')')? + 1..];
+        rest.split_whitespace().nth(19).map(str::to_string)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 // ------------------------------------------------------------ SecretFile --
 
 // The safe restricted-file writer now lives in the standalone `secret-write`
@@ -2341,6 +2486,51 @@ mod tests {
             assert!(!survived, "a member of the group outlived the hangup");
             assert!(!signal_process_group(pgid, TreeSignal::Kill).unwrap());
         });
+    }
+
+    /// die_with_daemon's mechanism, observed: the parent-death signal follows
+    /// the thread that forked, so a child spawned from a thread that then
+    /// exits must be SIGKILLed, the same thing a `kill -9` of the daemon does
+    /// to a served command. Without the prctl the sleep runs for 300 s.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_served_child_dies_with_its_spawner() {
+        let pid = std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut cmd = tokio::process::Command::new("/bin/sleep");
+                cmd.arg("300");
+                own_process_group(&mut cmd);
+                die_with_daemon(&mut cmd);
+                let child = cmd.spawn().expect("spawn sleep");
+                let pid = child.id().expect("pid");
+                assert!(process_start_token(pid).is_some(), "the leader's start is readable");
+                std::mem::forget(child);
+                pid
+            })
+        })
+        .join()
+        .unwrap();
+        // Gone, or a zombie nobody has reaped yet: either way, not running.
+        let running = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rfind(')').map(|i| s[i + 1..].trim_start().starts_with('Z')).map(|z| !z))
+                .unwrap_or(false)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let survived = running(pid);
+        if survived {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(!survived, "the child outlived the thread that spawned it");
+        assert!(boot_token().is_some(), "Linux names its boot");
     }
 
     #[test]

@@ -26,6 +26,113 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+/// Where the daemon records the process groups it is serving for `exec`,
+/// beside its pidfile. A daemon killed with SIGKILL (or one that crashed) runs
+/// none of its own cleanup, so whatever a served command forked would live on
+/// under init; the next daemon reads this at startup and ends what is left.
+/// One line per group: `<pgid> <boot token> <leader start token or ->`.
+pub(crate) const SERVED_GROUPS_FILE: &str = "exec.groups";
+
+fn served_groups_path() -> PathBuf {
+    crate::settings::config_dir().join(SERVED_GROUPS_FILE)
+}
+
+/// The live record, keyed by group id. Rewritten whole (atomically) on every
+/// change, so the file never holds a half line.
+static SERVED_GROUPS: std::sync::Mutex<std::collections::BTreeMap<u32, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn persist_served_groups(groups: &std::collections::BTreeMap<u32, String>) {
+    let path = served_groups_path();
+    if groups.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let body: String = groups.values().map(|l| format!("{l}\n")).collect();
+    if let Err(e) = crate::platform::SecretFile::write_str(&path, &body) {
+        crate::ui::trace(&format!(
+            "exec: could not record served process groups in {}: {e}",
+            path.display()
+        ));
+    }
+}
+
+/// One served group's entry in the record, removed when the session ends by
+/// any path (the guard drops with `serve_exec`'s frame).
+struct ServedGroup(u32);
+
+impl ServedGroup {
+    fn record(pgid: u32) -> ServedGroup {
+        // Without a boot token a recorded number could not be trusted at the
+        // next start, so the sweep ignores it; recording it anyway is harmless.
+        let boot = crate::platform::boot_token().unwrap_or_else(|| "-".into());
+        let start = crate::platform::process_start_token(pgid).unwrap_or_else(|| "-".into());
+        if let Ok(mut g) = SERVED_GROUPS.lock() {
+            g.insert(pgid, format!("{pgid} {boot} {start}"));
+            persist_served_groups(&g);
+        }
+        ServedGroup(pgid)
+    }
+}
+
+impl Drop for ServedGroup {
+    fn drop(&mut self) {
+        if let Ok(mut g) = SERVED_GROUPS.lock() {
+            g.remove(&self.0);
+            persist_served_groups(&g);
+        }
+    }
+}
+
+/// Should a recorded line be killed now? Only a group from THIS boot, and
+/// only when its number cannot have been handed to someone else: a live
+/// process holding the leader's pid with a different start time proves the
+/// pid was reused, and a pid is reused only once its old group is empty.
+fn leftover_group(
+    line: &str,
+    boot: &str,
+    start_now: impl Fn(u32) -> Option<String>,
+) -> Option<u32> {
+    let mut f = line.split_whitespace();
+    let pgid: u32 = f.next()?.parse().ok()?;
+    let rec_boot = f.next()?;
+    let rec_start = f.next()?;
+    if pgid <= 1 || rec_boot == "-" || rec_boot != boot {
+        return None;
+    }
+    match start_now(pgid) {
+        Some(now) if rec_start != "-" && now != rec_start => None,
+        _ => Some(pgid),
+    }
+}
+
+/// End every served group a previous daemon left behind, then clear the
+/// record. Called once at startup, after the single-instance lock is held and
+/// before anything is served, so nothing in the file can be a live session of
+/// this daemon. Returns how many groups were still alive and were killed.
+pub(crate) fn kill_leftover_groups() -> usize {
+    let path = served_groups_path();
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut killed = 0;
+    if let Some(boot) = crate::platform::boot_token() {
+        for line in body.lines() {
+            let Some(pgid) = leftover_group(line, &boot, crate::platform::process_start_token)
+            else {
+                continue;
+            };
+            if crate::platform::process_group_alive(pgid)
+                && crate::platform::signal_process_group(pgid, TreeSignal::Kill).unwrap_or(false)
+            {
+                killed += 1;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    killed
+}
+
 /// Bounds that keep a hostile or buggy initiator from turning an open frame
 /// into unbounded allocation. Generous on purpose: real commands (long rsync
 /// lines, big --env blobs) must fit comfortably; only absurd frames refuse.
@@ -563,6 +670,10 @@ pub(crate) async fn serve_exec(
     // A group of its own, so ending the session ends everything the command
     // started (`sh -c 'a | b'`, a script's children), not only its leader.
     crate::platform::own_process_group(&mut cmd);
+    // And not one that outlives the daemon: a daemon killed with SIGKILL runs
+    // none of the session cleanup below, which left a remote `sleep` running
+    // under init across a fresh `up` (the launch candidate's acceptance run).
+    crate::platform::die_with_daemon(&mut cmd);
     // Backstop for a task that ends abnormally (panic, abort): the leader
     // dies with it rather than outliving the daemon's record of it.
     cmd.kill_on_drop(true);
@@ -577,8 +688,12 @@ pub(crate) async fn serve_exec(
             return;
         }
     };
+    crate::platform::contain_with_daemon(&child);
     // The leader's pid is its group id (own_process_group).
     let pgid = child.id();
+    // Recorded until this function returns, so a daemon that dies before then
+    // has its leftovers ended by the next one (kill_leftover_groups).
+    let _served = pgid.map(ServedGroup::record);
     let _ = t
         .send_control(&json!({ "type": "exec-open-ack", "sid": sid, "out": sid, "err": err_sid }))
         .await;
@@ -1174,6 +1289,31 @@ mod tests {
         );
         assert_eq!(ExecCtl::from_frame(&json!({"type": "exec-signal", "sid": 1})), None);
         assert_eq!(ExecCtl::from_frame(&json!({"type": "exec-open", "sid": 1})), None);
+    }
+
+    /// The startup sweep kills only a group it can still vouch for: this boot,
+    /// and a leader pid that was not handed to someone else since.
+    #[test]
+    fn leftover_sweep_kills_only_what_is_still_ours() {
+        let gone = |_: u32| None;
+        let same = |_: u32| Some("777".to_string());
+        let reused = |_: u32| Some("999".to_string());
+        // Leader dead (PDEATHSIG), group survivors remain: kill.
+        assert_eq!(leftover_group("4242 boot-a 777", "boot-a", gone), Some(4242));
+        // Leader still running (no PDEATHSIG, e.g. macOS): kill.
+        assert_eq!(leftover_group("4242 boot-a 777", "boot-a", same), Some(4242));
+        // Pid reused by an unrelated process: its old group is empty, skip.
+        assert_eq!(leftover_group("4242 boot-a 777", "boot-a", reused), None);
+        // Another boot, or no boot token at all: never trusted.
+        assert_eq!(leftover_group("4242 boot-a 777", "boot-b", gone), None);
+        assert_eq!(leftover_group("4242 - 777", "-", gone), None);
+        // init and malformed lines are never targets.
+        assert_eq!(leftover_group("1 boot-a 777", "boot-a", gone), None);
+        assert_eq!(leftover_group("0 boot-a -", "boot-a", gone), None);
+        assert_eq!(leftover_group("x boot-a 777", "boot-a", gone), None);
+        assert_eq!(leftover_group("4242 boot-a", "boot-a", gone), None);
+        // No recorded start time: the boot match is all there is.
+        assert_eq!(leftover_group("4242 boot-a -", "boot-a", reused), Some(4242));
     }
 
     /// Every way a session is ended finishes on SIGKILL: a command that
