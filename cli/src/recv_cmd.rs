@@ -8171,13 +8171,15 @@ pub(crate) async fn recv_cmd(
                     g.restore(); // process::exit skips Drop
                 }
                 // Tell every peer this instance is gone: close each link's QUIC
-                // connection, then give the close frames a moment to leave
-                // (process::exit would drop them). A peer that is not told keeps
-                // a live-looking link to this dead instance for QUIC's 30s idle
-                // timeout and routes warm opens into it.
-                if conn.close_links_for_exit() > 0 {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
+                // connection. A peer that is not told keeps a live-looking link
+                // to this dead instance for QUIC's 30s idle timeout and routes
+                // warm opens into it. The close frames go out from the endpoint
+                // task while the signaling disconnect below is awaited, so this
+                // adds no wait of its own: a fixed sleep here delayed the exit
+                // enough that a daemon restarted right after `kill` on the same
+                // config found the old one still running (gates 14 then 14b).
+                conn.close_links_for_exit();
+                tokio::task::yield_now().await;
                 // Best-effort, BOUNDED: a wedged signaling socket must not turn the
                 // graceful exit into the very hang the watchdog exists to catch.
                 // The signal task already armed a force-exit; cap the disconnect so
