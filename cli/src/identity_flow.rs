@@ -199,6 +199,52 @@ pub(crate) fn implicit_init_disabled() -> bool {
 pub(crate) const NO_IDENTITY_MSG: &str =
     "no identity yet; run `tunlion init` or `tunlion join <invitation>`";
 
+/// `add` on a device with no identity. `add` offers THIS device's identity to
+/// another, so it needs one, and the one it used to mint on the spot ("created
+/// your identity at ...") came with no recovery phrase, while `init` insists on
+/// one. So `add` refuses (exit 9) and names the ceremony that does it right.
+pub(crate) const ADD_NEEDS_INIT_MSG: &str =
+    "no identity yet: `tunlion add` offers this device's identity, and it has none. \
+     Run `tunlion init` first (it creates the identity and shows its recovery phrase), then add again. \
+     To accept a code or an invitation you were given instead, run `tunlion join <code-or-file>`";
+
+/// [`ADD_NEEDS_INIT_MSG`] as the exit-9 error, or None when there is an identity.
+pub(crate) fn add_needs_init() -> Option<anyhow::Error> {
+    (!has_identity()).then(|| {
+        crate::exit_codes::err(crate::exit_codes::ExitKind::NoIdentity, ADD_NEEDS_INIT_MSG)
+    })
+}
+
+/// `up` on a device with no identity AND nothing paired: such a daemon serves
+/// no one, and `up --detach` used to exit 0 and run while `--help` says 9 is
+/// "no identity". A device with no identity that HAS code-paired devices is
+/// the legitimate receive-only daemon (gates 7/14, C12 live pairing, and every
+/// gate that pairs by secret), so that one still runs.
+pub(crate) const UP_NEEDS_IDENTITY_MSG: &str =
+    "no identity yet, and no paired devices: a daemon here would serve no one. \
+     Run `tunlion init` (makes this your first device) or `tunlion join <code-or-invitation>` first, then `tunlion up`";
+
+/// Pure: may `up` start? `devices_json` is the device store's text, if any.
+pub(crate) fn up_refused_for_identity(has_identity: bool, devices_json: Option<&str>) -> bool {
+    if has_identity {
+        return false;
+    }
+    match devices_json {
+        None => true,
+        // An unreadable store is not "nothing paired": leave it to the
+        // corrupt-state handling that names the file.
+        Some(raw) => serde_json::from_str::<Vec<Value>>(raw).is_ok_and(|a| a.is_empty()),
+    }
+}
+
+/// [`UP_NEEDS_IDENTITY_MSG`] as the exit-9 error when `up` would serve no one.
+pub(crate) fn up_needs_identity() -> Option<anyhow::Error> {
+    let raw = std::fs::read_to_string(crate::devices_store::devices_path()).ok();
+    up_refused_for_identity(has_identity(), raw.as_deref()).then(|| {
+        crate::exit_codes::err(crate::exit_codes::ExitKind::NoIdentity, UP_NEEDS_IDENTITY_MSG)
+    })
+}
+
 /// Does this device have an identity: an owner key, or a joined certificate?
 /// Reads only. `join` refuses a device for which this is true, which is why
 /// nothing that merely LOOKS at the identity may make it true.
@@ -1315,5 +1361,37 @@ mod init_refusal_tests {
         assert!(nothing(false, 0), "keyless and empty answers like `id` (exit 9)");
         assert!(!nothing(false, 2), "a keyless device that paired by code lists them");
         assert!(!nothing(true, 0), "an identity with no devices is an empty list, exit 0");
+    }
+}
+
+#[cfg(test)]
+mod rc_identity_gate_tests {
+    use super::{up_refused_for_identity, ADD_NEEDS_INIT_MSG, UP_NEEDS_IDENTITY_MSG};
+
+    /// RC lab item 5: `up` with no identity and nothing paired is refused;
+    /// the receive-only daemon of a code-paired device still runs.
+    #[test]
+    fn up_is_refused_only_when_it_would_serve_no_one() {
+        assert!(up_refused_for_identity(false, None));
+        assert!(up_refused_for_identity(false, Some("[]")));
+        assert!(!up_refused_for_identity(false, Some(r#"[{"name":"boxA","secret":"ab"}]"#)));
+        assert!(!up_refused_for_identity(true, None));
+        assert!(!up_refused_for_identity(false, Some("not json")), "a corrupt store is reported elsewhere");
+        assert!(UP_NEEDS_IDENTITY_MSG.contains("tunlion init"));
+    }
+
+    /// RC lab item 6: the refusal names init (the ceremony with the recovery
+    /// phrase), and classifies as exit 9 by its text too.
+    #[test]
+    fn add_without_identity_names_init_and_is_exit_9() {
+        assert!(ADD_NEEDS_INIT_MSG.contains("tunlion init"));
+        assert_eq!(
+            crate::exit_codes::classify_text(ADD_NEEDS_INIT_MSG),
+            crate::exit_codes::ExitKind::NoIdentity
+        );
+        assert_eq!(
+            crate::exit_codes::classify_text(UP_NEEDS_IDENTITY_MSG),
+            crate::exit_codes::ExitKind::NoIdentity
+        );
     }
 }

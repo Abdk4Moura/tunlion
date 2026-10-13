@@ -535,9 +535,15 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
         // all, and a silent one is exactly how a link that cannot prove itself
         // reads as a link that was refused. Same class as the capsule's other
         // refusals, which are visible at the default level.
-        crate::ui::say(
-            "identity challenge NOT answered: this device holds no certificate for its own key",
-        );
+        // EXPECTED on a device with no identity (a code transfer from a fresh
+        // machine): there is nothing to prove, the code is the trust, and the
+        // line read as a fault on every such send. Only -v shows it there.
+        let msg = "identity challenge NOT answered: this device holds no certificate for its own key";
+        if crate::identity_flow::has_identity() {
+            crate::ui::say(msg);
+        } else {
+            crate::ui::debug(msg);
+        }
         say_identity_unavailable(t, nonce_hex).await;
         return;
     };

@@ -42,6 +42,23 @@ pub fn grace_from(raw: Option<&str>) -> Duration {
     Duration::from_millis(ms)
 }
 
+static LAST_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Record which termination signal arrived (as its exit code: 130 SIGINT,
+/// 143 SIGTERM) so a graceful path that only sees "interrupted" exits with the
+/// code of the signal that was actually sent.
+pub fn note_signal(code: i32) {
+    LAST_SIGNAL.store(code, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The exit code for the recorded signal; SIGINT's 130 when none was noted.
+pub fn signal_code() -> i32 {
+    match LAST_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => crate::exit_codes::INTERRUPTED,
+        c => c,
+    }
+}
+
 /// Arm a detached watchdog that force-exits the process with `code` after
 /// `grace`, independent of the event loop. Call this the instant a termination
 /// signal is observed: even if the graceful shutdown (flush + signaling
@@ -66,6 +83,15 @@ pub fn arm_force_exit(code: i32, grace: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_code_reports_the_signal_that_arrived() {
+        assert_eq!(signal_code(), crate::exit_codes::INTERRUPTED);
+        note_signal(crate::exit_codes::TERMINATED);
+        assert_eq!(signal_code(), 143);
+        note_signal(crate::exit_codes::INTERRUPTED);
+        assert_eq!(signal_code(), 130);
+    }
 
     #[test]
     fn grace_defaults_when_unset() {

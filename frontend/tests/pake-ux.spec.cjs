@@ -133,7 +133,7 @@ function startHarnessServer(bundlePath) {
   // Guard the documented red herring: a prod-pointing dist times out every nav.
   const bundleJs = fs.readdirSync(path.join(DIST, 'assets')).filter((f) => f.endsWith('.js'));
   for (const f of bundleJs) {
-    if (fs.readFileSync(path.join(DIST, 'assets', f), 'utf8').includes('api.filament.autumated.com'))
+    if (fs.readFileSync(path.join(DIST, 'assets', f), 'utf8').includes('api.tunlion.autumated.com'))
       fail('dist is prod-pointing — rebuild SAME-ORIGIN: `VITE_TUNLION_API= npm run build`');
   }
   ok('dist present and same-origin');

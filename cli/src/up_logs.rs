@@ -180,6 +180,11 @@ pub(crate) async fn up_cmd(
         host.install_system(&exe, &daemon_argv)?;
         return Ok(());
     }
+    // Before anything is installed or spawned: a daemon with no identity and
+    // nothing paired serves no one (exit 9). `up --detach` used to exit 0.
+    if let Some(e) = crate::identity_flow::up_needs_identity() {
+        return Err(e);
+    }
     // --shell-program -- persist it so the daemon picks it up (shell_argv reads
     // this from config). The env var TUNLION_SHELL is also checked independently.
     if let Some(ref prog) = shell_program {

@@ -2325,8 +2325,8 @@ mod tests {
     #[test]
     fn host_port_parses_scheme_defaults_and_explicit() {
         assert_eq!(
-            host_port_from_url("https://api.filament.autumated.com"),
-            Some(("api.filament.autumated.com".to_string(), 443))
+            host_port_from_url("https://api.tunlion.autumated.com"),
+            Some(("api.tunlion.autumated.com".to_string(), 443))
         );
         assert_eq!(
             host_port_from_url("http://example.com/api/config?x=1"),
@@ -2362,10 +2362,10 @@ mod tests {
     #[test]
     fn cached_addrs_select_host_and_apply_port() {
         let doc = json!({
-            "api.filament.autumated.com": ["104.21.73.85", "172.67.142.8"],
+            "api.tunlion.autumated.com": ["104.21.73.85", "172.67.142.8"],
             "other.example": ["10.0.0.1"]
         });
-        let mut got = cached_addrs_from_doc(&doc, "api.filament.autumated.com", 443);
+        let mut got = cached_addrs_from_doc(&doc, "api.tunlion.autumated.com", 443);
         got.sort();
         assert_eq!(got.len(), 2);
         assert!(got.contains(&"104.21.73.85:443".parse::<SocketAddr>().unwrap()));

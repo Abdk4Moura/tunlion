@@ -29,7 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from filament_runner import FileRunnerBox, Job  # noqa: E402
 
-DEFAULT_SERVER = "https://api.filament.autumated.com"
+DEFAULT_SERVER = "https://api.tunlion.autumated.com"
 
 
 def main():

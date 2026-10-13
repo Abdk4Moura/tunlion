@@ -5240,3 +5240,26 @@ fn every_reenrolment_command_runs_in_a_script_as_printed() {
     }
     assert_eq!(cmds.last().copied(), Some("tunlion up --detach"), "{s}");
 }
+
+/// RC lab item 2: a revoked, forgotten or expired device can neither file an
+/// access request nor have one approved, and the refusal names the command
+/// that actually restores it.
+#[test]
+fn a_barred_device_is_named_for_why_and_live_devices_are_not_barred() {
+    let now = 1_000_000;
+    let store = vec![
+        json!({ "name": "rev", "certRevoked": true }),
+        json!({ "name": "gone-by", "principalKind": "delegated", "principalExpires": 10, "principalCeiling": ["transfer"] }),
+        json!({ "name": "fine" }),
+    ];
+    assert_eq!(request_bar_in(&store, "rev", now), Some(RequestBar::Revoked));
+    assert!(matches!(request_bar_in(&store, "gone-by", now), Some(RequestBar::Expired(_))));
+    assert_eq!(request_bar_in(&store, "forgotten", now), Some(RequestBar::Forgotten));
+    assert_eq!(request_bar_in(&store, "fine", now), None);
+
+    let r = request_bar_refusal(2, "guest2", RequestBar::Revoked);
+    assert!(r.contains("revoked") && r.contains("tunlion devices restore guest2"), "{r}");
+    let e = request_bar_refusal(2, "guest2", RequestBar::Expired(10));
+    assert!(e.contains("expired") && e.contains("tunlion add --for guest2"), "{e}");
+    assert!(!e.contains("approve"), "an expired device is never told to approve: {e}");
+}

@@ -1351,14 +1351,110 @@ fn save_requests(reqs: &[PendingRequest]) {
 fn expire_requests(requests: &mut Vec<PendingRequest>) {
     let now = crate::capability::now_secs();
     let mut changed = false;
+    let store = devices_store_snapshot();
     for r in requests.iter_mut().filter(|r| r.status == "pending") {
         if now.saturating_sub(r.timestamp) > REQUEST_TTL_SECS {
             r.status = "expired".to_string();
+            changed = true;
+        } else if store
+            .as_deref()
+            .and_then(|arr| request_bar_in(arr, &r.peer, now))
+            .is_some()
+        {
+            // The device was revoked, forgotten or ran out of access after it
+            // asked. Approving it now could not let it in, so the request is
+            // not waiting on anyone: withdraw it rather than list it.
+            r.status = REQUEST_WITHDRAWN.to_string();
             changed = true;
         }
     }
     if changed {
         save_requests(requests);
+    }
+}
+
+/// Status of a request withdrawn because its device can no longer be let in.
+pub(crate) const REQUEST_WITHDRAWN: &str = "withdrawn";
+
+/// Why a device can neither file an access request nor have one approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestBar {
+    /// Revoked here (`devices revoke`), or its key is refused (forgotten).
+    Revoked,
+    /// The invitation that admitted it ended at this time.
+    Expired(u64),
+    /// No record of it any more (`devices forget`).
+    Forgotten,
+}
+
+/// The device store as parsed records, or None when it is absent or
+/// unreadable (no opinion: nothing is withdrawn on a store we cannot read).
+fn devices_store_snapshot() -> Option<Vec<Value>> {
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    serde_json::from_str::<Vec<Value>>(&raw).ok()
+}
+
+/// Pure but for the key-revocation file: why `peer` (a device name) is barred
+/// from requests, judged against the device records `arr` at `now`.
+pub(crate) fn request_bar_in(arr: &[Value], peer: &str, now: u64) -> Option<RequestBar> {
+    let Some(record) = arr.iter().find(|d| d["name"].as_str() == Some(peer)) else {
+        return Some(RequestBar::Forgotten);
+    };
+    if record["certRevoked"].as_bool().unwrap_or(false) {
+        return Some(RequestBar::Revoked);
+    }
+    if let Some(key) = record["deviceCert"]["devicePub"]
+        .as_str()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+    {
+        if crate::fleet_support::device_key_revoked(&key, now) {
+            return Some(RequestBar::Revoked);
+        }
+    }
+    match crate::identity_state::delegated_access_from_record(record) {
+        Some(a) if a.expired(now) => Some(RequestBar::Expired(a.deadline)),
+        _ => None,
+    }
+}
+
+/// [`request_bar_in`] against this device's store. None when the store
+/// cannot be read.
+pub(crate) fn request_bar(peer: &str) -> Option<RequestBar> {
+    request_bar_in(&devices_store_snapshot()?, peer, crate::capability::now_secs())
+}
+
+/// Why `requests approve` refuses a barred device, with the one command that
+/// actually restores its access. Pure.
+pub(crate) fn request_bar_refusal(id: u64, peer: &str, bar: RequestBar) -> String {
+    let w = crate::refusal::word(peer);
+    match bar {
+        RequestBar::Revoked => format!(
+            "request {id} is from '{peer}', which is revoked here; approving cannot let it in. \
+             To restore it, run:  tunlion devices restore {w}"
+        ),
+        RequestBar::Expired(at) => format!(
+            "request {id} is from '{peer}', whose access expired {}; approving cannot extend it. \
+             Only a fresh invitation admits it again:  tunlion add --for {w}",
+            format_approval_expiry(at)
+        ),
+        RequestBar::Forgotten => format!(
+            "request {id} is from '{peer}', which is no longer paired here (forgotten); approving cannot let it in. \
+             Pair it again with `tunlion add`"
+        ),
+    }
+}
+
+/// Withdraw every pending request from `peer` (it was revoked or forgotten).
+pub(crate) fn withdraw_requests_for(peer: &str) {
+    let mut requests = load_requests();
+    let mut changed = false;
+    for r in requests.iter_mut().filter(|r| r.status == "pending" && r.peer == peer) {
+        r.status = REQUEST_WITHDRAWN.to_string();
+        changed = true;
+    }
+    if changed {
+        save_requests(&requests);
     }
 }
 
@@ -1374,6 +1470,12 @@ fn enqueue_if_requestable(dev_petname: &str, cap: &str) {
     match cap {
         "shell" | "mount" | "transfer" => {}
         _ => return,
+    }
+    // A revoked, forgotten or expired device's refusals are final: no grant
+    // can let it in, so a request from it only invites an approval that does
+    // nothing (and lets a barred device spam the owner's queue).
+    if request_bar(name).is_some() {
+        return;
     }
     let mut requests = load_requests();
     expire_requests(&mut requests);
@@ -1896,7 +1998,18 @@ fn main() -> std::process::ExitCode {
         tokio::runtime::Builder::new_multi_thread().enable_all().build()
     };
     let result = match rt {
-        Ok(rt) => rt.block_on(async_main()),
+        Ok(rt) => {
+            let r = rt.block_on(async_main());
+            // Never let the runtime's drop hold the exit. Dropping a runtime
+            // waits for EVERY blocking-pool task, including an uncancellable
+            // stdin read that nobody will ever satisfy, and by then the
+            // signal tasks are gone, so Ctrl-C and SIGTERM are caught and
+            // ignored. A finished command was observed parked here until
+            // Enter was pressed. Bounded: real blocking work (a final fsync)
+            // still gets its moment.
+            rt.shutdown_timeout(std::time::Duration::from_millis(500));
+            r
+        }
         Err(e) => Err(e.into()),
     };
     // Every failure leaves through here: one report, in the form the caller

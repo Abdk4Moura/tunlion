@@ -38,6 +38,11 @@
 #   X7  the owner's devices --json says expired, effective caps [], and the
 #       certificate was never renewed past the invitation end
 #   X8  the owner never re-drove a parked open after the end
+#   X9  the expired guest's refused exec filed no access request, and
+#       approving a request from it exits 4 naming the expiry (RC lab item 2)
+#   X10 owner and guest device lists say the access expired, no capability
+#       badge, no "EXTERNAL" relabel of the owner (RC lab item 8)
+#   X11 exec and forward give the same remedy for the expiry (RC lab item 9)
 #
 # The invitation lives EXP seconds. That is longer than the ~20 s the defect
 # needs, because the positive controls must all finish inside it on a shared CI
@@ -303,6 +308,83 @@ if [ "$REDRIVE" = "0" ] && kill -0 "$OWNER_PID" 2>/dev/null; then
 else
   tail -n +"$((LOG_MARK + 1))" "$WORK/up.log" | grep -E "parked|re-driving" | tail -10
   bad "gateX8: the owner re-drove $REDRIVE parked open(s) after the end, or restarted"
+fi
+
+# ==================================================================== GATE X9 ==
+# RC lab item 2: the refused exec of an expired device filed "[extern] guest
+# wants to OWNER-EQUIVALENT shell", and approving it exited 0 with "ok guest can
+# act as you" while the gate still refused it.
+say "X9: an expired device files no request, and approving one is refused"
+NOW=$(now)
+FILED=$(python3 - "$DA/requests.json" "$GUEST" <<'PY'
+import json,sys
+try: reqs=json.load(open(sys.argv[1]))
+except Exception: reqs=[]
+print(sum(1 for r in reqs if r.get('peer')==sys.argv[2] and r.get('status')=='pending'))
+PY
+)
+# A request filed BEFORE the end (seeded here: the daemon no longer files one
+# after it) must not be approvable once the device has expired.
+python3 - "$DA/requests.json" "$GUEST" "$NOW" <<'PY'
+import json,sys
+p,peer,now=sys.argv[1],sys.argv[2],int(sys.argv[3])
+try: reqs=json.load(open(p))
+except Exception: reqs=[]
+reqs.append({"id":977,"peer":peer,"capability":"shell","timestamp":now,"status":"pending","granted_at":None})
+json.dump(reqs,open(p,"w"))
+PY
+"${O_ENV[@]}" "$BIN" requests approve 977 --allow shell --for 1h >"$WORK/X9.out" 2>&1
+rcX9=$?
+STATUS977=$(python3 -c "
+import json,sys
+r=[x for x in json.load(open(sys.argv[1])) if x.get('id')==977]
+print(r[0]['status'] if r else 'gone')" "$DA/requests.json" 2>/dev/null)
+"${O_ENV[@]}" "$BIN" requests >"$WORK/X9-list.out" 2>&1
+echo "## pending from $GUEST after the refused exec: $FILED; approve rc=$rcX9; request status: $STATUS977"; cat "$WORK/X9.out"
+if [ "$FILED" = "0" ] && [ "$rcX9" = "4" ] && grep -qi "expired" "$WORK/X9.out" \
+   && grep -q "tunlion add --for $GUEST" "$WORK/X9.out" && ! grep -q "can act as you" "$WORK/X9.out" \
+   && [ "$STATUS977" != "pending" ] && [ "$STATUS977" != "approved" ] && ! grep -q "wants to" "$WORK/X9-list.out"; then
+  ok "gateX9: no request filed for the expired guest; approving one exits 4 naming the expiry and the re-invite, and withdraws it"
+else
+  cat "$WORK/X9-list.out"
+  bad "gateX9: an expired device's request was filed or approvable (filed=$FILED rc=$rcX9 status=$STATUS977)"
+fi
+
+# =================================================================== GATE X10 ==
+# RC lab item 8: the owner listed the expired guest under FLEET with an
+# "OWNER-EQUIVALENT shell" badge beside "lapsed"; the guest relabelled its
+# owner "EXTERNAL / other people".
+say "X10: both device lists say the access expired, with no capability badge"
+"${O_ENV[@]}" "$BIN" devices >"$WORK/X10-owner.out" 2>&1
+"${G_ENV[@]}" "$BIN" devices >"$WORK/X10-guest.out" 2>&1
+GROW=$(grep -E "^\s+\S+ $GUEST\b" "$WORK/X10-owner.out" | head -1)
+AROW=$(grep -E "^\s+\S+ alpha\b" "$WORK/X10-guest.out" | head -1)
+echo "## owner row: $GROW"; echo "## guest row: $AROW"
+if [ -n "$GROW" ] && echo "$GROW" | grep -q "expired" && ! echo "$GROW" | grep -q "OWNER-EQUIVALENT" \
+   && ! echo "$GROW" | grep -q "lapsed" \
+   && [ -n "$AROW" ] && echo "$AROW" | grep -q "your access expired" && ! grep -q "EXTERNAL" "$WORK/X10-guest.out"; then
+  ok "gateX10: the owner shows the guest as expired with no capability badge; the guest shows its owner with 'your access expired'"
+else
+  cat "$WORK/X10-owner.out" "$WORK/X10-guest.out"
+  bad "gateX10: a device list misstates the expiry"
+fi
+
+# =================================================================== GATE X11 ==
+# RC lab item 9: for the same expiry, exec printed forget + add + reset and
+# forward said "with a fresh invitation". One cause, one remedy.
+say "X11: exec and forward give the same remedy for the expiry"
+same_steps=1
+for f in "$WORK/X3.err" "$WORK/X5.err"; do
+  for step in "tunlion devices forget " "tunlion add --for " "tunlion reset -y" "tunlion join --invite-file " "tunlion up --detach"; do
+    grep -qF "$step" "$f" || { same_steps=0; echo "## $(basename "$f") lacks: $step"; }
+  done
+  grep -q "with a fresh invitation" "$f" && { same_steps=0; echo "## $(basename "$f") still says: with a fresh invitation"; }
+done
+if [ "$same_steps" = "1" ]; then
+  ok "gateX11: exec and forward refusals for the expiry carry the same re-admission steps"
+else
+  cat "$WORK/X3.err" "$WORK/X5.err"
+  bad "gateX11: exec and forward remedy the same expiry differently"
 fi
 
 declare_known_red_summary

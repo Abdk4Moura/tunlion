@@ -71,6 +71,14 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
     // Hermetic config dir: the pidfile lands here, nowhere near production.
     let cfg = scratch.join("cfg");
     std::fs::create_dir_all(&cfg).unwrap();
+    // One code-paired device, so this is the receive-only daemon `up` still
+    // starts without an identity. With nothing paired and no identity, `up`
+    // now refuses with exit 9 (it would serve no one), before any pidfile.
+    std::fs::write(
+        cfg.join("devices.json"),
+        format!(r#"[{{"name":"peer","secret":"{}"}}]"#, "ab".repeat(32)),
+    )
+    .unwrap();
 
     // Spawn the real daemon under the renamed binary.
     let mut child = Command::new(&renamed)

@@ -57,7 +57,7 @@ package public first, step 4, or `docker login ghcr.io` once.) Check:
 New Pages project from the repo:
 - Build command: `cd frontend && npm install && npm run build`
 - Output directory: `backend/dist`
-- Env var: `VITE_TUNLION_API = https://api.filament.autumated.com`
+- Env var: `VITE_TUNLION_API = https://api.tunlion.autumated.com`
 - After first deploy, add custom domain `tunlion.autumated.com`.
 Pages rebuilds on every push; `_redirects` handles SPA deep links.
 

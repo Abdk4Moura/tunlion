@@ -780,6 +780,7 @@ pub(crate) async fn send_cmd(
     let mut offered_to: Option<String> = None;
     // Progress while waiting on the peer (send_liveness::still_waiting_line).
     let mut last_heartbeat = Instant::now();
+    let mut remedy_said = false;
     let peer_label = known_target
         .as_ref()
         .map(|(n, _)| format!("'{n}'"))
@@ -1929,10 +1930,15 @@ pub(crate) async fn send_cmd(
                 Some("pair-keep-ack") => {
                     if let Some(name) = remembered_as.clone() {
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        crate::shared_defs::REMEMBER_ANSWERED
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         if v["ok"].as_bool() == Some(false) {
                             devices_remove(&name)?;
                             crate::shared_defs::REMEMBER_STORED
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
+                            // The one outcome line: nothing said "remembered"
+                            // before this (see file-accept), so it cannot be
+                            // contradicted.
                             ui::say(&conn.roster(
                                 &pid,
                                 ui::glyph_err(),
@@ -1945,7 +1951,7 @@ pub(crate) async fn send_cmd(
                                 &pid,
                                 ui::glyph_ok(),
                                 ui::Tone::Ok,
-                                "mutually remembered, you'll reconnect automatically",
+                                &format!("mutually remembered as '{name}', you'll reconnect automatically"),
                                 &n,
                             ));
                         }
@@ -2031,9 +2037,13 @@ pub(crate) async fn send_cmd(
                                 // A NEW record, suffixed when <name> is taken: a
                                 // remember never re-keys an existing device (C1).
                                 let stored = crate::devices_store(name, &sec)?;
-                                ui::say(&format!(
-                                    "  remembered this device as '{stored}' (it keeps its half only if it passed --remember too)"
-                                ));
+                                // Not said yet: the receiver's answer decides
+                                // what is true (pair-keep-ack), and the summary
+                                // after the transfer says it if none comes.
+                                ui::debug(&format!("stored our half of the remember as '{stored}'"));
+                                if let Ok(mut g) = crate::shared_defs::REMEMBER_STORED_AS.lock() {
+                                    *g = Some(stored.clone());
+                                }
                                 remembered_as = Some(stored);
                                 crate::shared_defs::REMEMBER_STORED
                                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2126,6 +2136,16 @@ pub(crate) async fn send_cmd(
                                 crate::send_report::note_refused(id, v["reason"].as_str(), &why);
                                 if !o.done {
                                     refused.push(format!("{}: {why}", o.name));
+                                }
+                                // The same remedy exec, forward and mount give
+                                // for this cause, once per send.
+                                if !remedy_said {
+                                    if let Some(peer) = known_target.as_ref().map(|(n, _)| n.clone()) {
+                                        if let Some(text) = final_refusal_remedy(&peer, &why) {
+                                            ui::critical(&text);
+                                            remedy_said = true;
+                                        }
+                                    }
                                 }
                             }
                             None => {
@@ -3104,6 +3124,22 @@ pub(crate) fn refusal_text(v: &Value) -> Option<String> {
     // Bounded: the text is peer-supplied and goes to a terminal.
     let clean: String = error.chars().filter(|c| !c.is_control()).take(300).collect();
     Some(clean)
+}
+
+/// The remedy for a refusal no retry changes (an expiry or a revoked
+/// device), worded exactly as exec, forward and mount word it. None for every
+/// other refusal. Pure but for this device's display name.
+pub(crate) fn final_refusal_remedy(peer: &str, reason: &str) -> Option<String> {
+    use crate::refusal::Code;
+    let code = crate::refusal::code_from_reason(reason)?;
+    if !matches!(code, Code::Expired | Code::CertRevoked) {
+        return None;
+    }
+    let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
+    Some(match crate::refusal::remedy(code, peer, &me) {
+        (text, Some(cmd)) => format!("  {text}\n    {cmd}"),
+        (text, None) => format!("  {text}"),
+    })
 }
 
 /// The refusal a send reports when the target device no longer recognizes

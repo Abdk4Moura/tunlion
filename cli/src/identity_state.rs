@@ -534,6 +534,9 @@ pub(crate) fn reinvite_for(device_pub: &[u8; 32]) -> Option<crate::refusal::Rein
     reinvite_from_record(record)
 }
 
+/// The one wording for a device revoked here, at open and mid-session.
+pub(crate) const DEVICE_REVOKED_REASON: &str = "device revoked";
+
 /// Why a LIVE session (exec, pty, forward, mount) must end now, if it must.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveCut {
@@ -548,7 +551,10 @@ impl LiveCut {
     /// to its exit code and remedy (`refusal::code_from_reason`).
     pub(crate) fn reason(self) -> String {
         match self {
-            LiveCut::Revoked => crate::capability::REVOKED_REASON.to_string(),
+            // The words the gate refuses a revoked device with at open
+            // ("device revoked"): one cause, one wording, mid-session or not.
+            // It said "access revoked" here, so a revoke read two ways.
+            LiveCut::Revoked => DEVICE_REVOKED_REASON.to_string(),
             LiveCut::Expired(at) => crate::capability::expired_reason(at),
         }
     }
@@ -754,5 +760,19 @@ mod delegated_access_tests {
         assert_eq!(inv.ceiling, vec!["transfer".to_string(), "shell".to_string()]);
         assert_eq!(inv.lifetime, 240);
         assert_eq!(crate::refusal::expires_text(inv.lifetime), "4m");
+    }
+}
+
+#[cfg(test)]
+mod live_cut_wording_tests {
+    /// RC lab item 9: a revoke read "device revoked" at open and "access
+    /// revoked" when it cut a live session. One cause, one wording.
+    #[test]
+    fn a_revoked_live_cut_reads_like_the_refusal_at_open() {
+        assert_eq!(super::LiveCut::Revoked.reason(), "device revoked");
+        assert_eq!(
+            crate::refusal::Refusal::new(crate::refusal::Code::CertRevoked, None).reason,
+            super::LiveCut::Revoked.reason()
+        );
     }
 }

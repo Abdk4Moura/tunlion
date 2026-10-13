@@ -21,7 +21,7 @@ concurrently — two suites share the auto-room and contaminate each other).
 Last full run: **18/18, 2026-06-07** (incl. gate 13 multi-link and gate 14
 daemon). Earlier milestone runs:
 **15/15, 2026-06-06**, plus live-production runs through
-`api.filament.autumated.com`: CLI↔CLI direct, CLI↔CLI forced-relay
+`api.tunlion.autumated.com`: CLI↔CLI direct, CLI↔CLI forced-relay
 (`route: relayed` both ends), and the real `tunlion.autumated.com` site
 sending 64 KiB-framed files to `tunlion recv`.
 
@@ -64,7 +64,7 @@ the same way, but is no longer required for correctness).
 chunkSize 65536 — the exact production config — browser sends two 65,540-byte-
 framed files, hashes match), and a LIVE run against the real production site:
 headless Chromium on `https://tunlion.autumated.com` sent 4 MB to
-`tunlion recv` through `api.filament.autumated.com`, hash identical,
+`tunlion recv` through `api.tunlion.autumated.com`, hash identical,
 10.3 MB/s (2026-06-06). The failure mode no longer occurs in the live system.
 
 ### C2. Route label disagreement — **VERIFIED** (with documented residual)
@@ -244,7 +244,7 @@ end-to-end against the LIVE release:
 ### C17. Never run against production — **VERIFIED (2026-06-06)**
 - Hermetic relay: gate 10 — local coturn, relay-only ICE policy, transfer
   completes, `route: relayed` reported.
-- Live production: CLI↔CLI through `api.filament.autumated.com` — direct
+- Live production: CLI↔CLI through `api.tunlion.autumated.com` — direct
   (8.3 MB/s, `route: local`/`direct`) and forced `--relay` through the
   droplet's coturn (5–7 MB/s, **`route: relayed` on both ends**, sha256
   verified). TURN ephemeral credentials, the Cloudflare tunnel, and the :3478

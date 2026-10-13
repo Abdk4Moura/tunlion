@@ -121,7 +121,7 @@ mkdir -p /etc/netns/srr && echo "nameserver 1.1.1.1" > /etc/netns/srr/resolv.con
 iptables -t nat -A POSTROUTING -s 10.77.0.0/24 ! -o srr-h -j MASQUERADE
 iptables -I FORWARD 1 -i srr-h -j ACCEPT
 iptables -I FORWARD 1 -o srr-h -j ACCEPT
-ip netns exec srr getent hosts api.filament.autumated.com >/dev/null 2>&1 \
+ip netns exec srr getent hosts api.tunlion.autumated.com >/dev/null 2>&1 \
   && ok "receiver namespace has internet" || { echo "SETUP: no internet in receiver ns"; exit 2; }
 
 say "2. router namespace on the remote machine"
@@ -137,7 +137,7 @@ rsh "sysctl -qw net.ipv4.ip_forward=1
      iptables -I FORWARD 1 -i srp-h -j ACCEPT
      iptables -I FORWARD 1 -o srp-h -j ACCEPT
      mkdir -p $RDIR" 180 >/dev/null
-RNET=$(rsh "ip netns exec srp getent hosts api.filament.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
+RNET=$(rsh "ip netns exec srp getent hosts api.tunlion.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$RNET" = "OK" ] && ok "router namespace has internet" || { echo "SETUP: no internet in router ns"; exit 2; }
 
 # The address each side presents to the world. This is the whole measurement.

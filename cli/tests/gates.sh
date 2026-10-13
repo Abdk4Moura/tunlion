@@ -1233,7 +1233,11 @@ say "21: up waits for the network instead of exiting; up --detach reports a dead
 # is a regular FILE, so creating it fails): --detach must exit nonzero and
 # quote the daemon's own last output. And for the waiting daemon, --detach
 # must not claim it is serving.
-D21="$WORK/g21-cfg"; rm -rf "$D21"; mkdir -p "$D21"
+# Each config dir gets an identity first: `up` with no identity AND nothing
+# paired now refuses with exit 9 (it would serve no one), which is not what
+# this gate measures. A device that has either still runs `up`.
+g21_init() { TUNLION_CONFIG_DIR="$1" "$BIN" init --name "$2" --recovery-file "$1/rec.txt" --no-background --yes >/dev/null 2>&1; }
+D21="$WORK/g21-cfg"; rm -rf "$D21"; mkdir -p "$D21"; g21_init "$D21" g21a
 TUNLION_CONFIG_DIR="$D21" "$BIN" --server http://127.0.0.1:9 up --dir "$WORK/g21-drop" >"$WORK/g21-up.log" 2>&1 &
 P21=$!; pids+=($P21)
 sleep 6
@@ -1242,10 +1246,10 @@ W21=$(grep -c "waiting for network" "$WORK/g21-up.log")
 PIDLINES=$(wc -l < "$D21/up.pid" 2>/dev/null | tr -d ' ')
 PIDVAL=$(cat "$D21/up.pid" 2>/dev/null)
 kill "$P21" 2>/dev/null; wait "$P21" 2>/dev/null
-D21B="$WORK/g21-cfg-b"; rm -rf "$D21B"; mkdir -p "$D21B"
+D21B="$WORK/g21-cfg-b"; rm -rf "$D21B"; mkdir -p "$D21B"; g21_init "$D21B" g21b
 : > "$WORK/g21-notadir"
 TUNLION_CONFIG_DIR="$D21B" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/g21-notadir" >"$WORK/g21-detach.log" 2>&1; R21D=$?
-D21C="$WORK/g21-cfg-c"; rm -rf "$D21C"; mkdir -p "$D21C"
+D21C="$WORK/g21-cfg-c"; rm -rf "$D21C"; mkdir -p "$D21C"; g21_init "$D21C" g21c
 TUNLION_CONFIG_DIR="$D21C" timeout 30 "$BIN" --server http://127.0.0.1:9 up --detach --dir "$WORK/g21-drop-c" >"$WORK/g21-detach-wait.log" 2>&1; R21W=$?
 P21C=$(cat "$D21C/up.pid" 2>/dev/null)
 [ -n "$P21C" ] && kill "$P21C" 2>/dev/null

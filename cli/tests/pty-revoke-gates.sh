@@ -11,7 +11,9 @@
 # Gates:
 #   A  the live shell streams before the revoke          (positive control)
 #   A2 a healthy shell survives its own recheck           (no-revoke control)
-#   B  after the revoke the shell exits nonzero with "access revoked" on stderr
+#   B  after the revoke the shell exits nonzero with "device revoked" on stderr (the
+#      wording the gate refuses a revoked device with at open; it read
+#      "access revoked" here, two words for one cause)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
@@ -91,8 +93,8 @@ elif [ "$wedged" = "1" ]; then
   bad "gateB: shell did NOT exit (wedged) within ${GRACE}s of the revoke"
 elif [ "$rc" = "0" ]; then
   bad "gateB: the revoked shell exited 0 (false success)"
-elif grep -q "access revoked" "$WORK/pty.err"; then
-  ok "gateB: revoked shell exited nonzero with 'access revoked' on stderr within ${GRACE}s"
+elif grep -q "device revoked" "$WORK/pty.err"; then
+  ok "gateB: revoked shell exited nonzero with 'device revoked' on stderr within ${GRACE}s"
 else
   bad "gateB: shell exited nonzero but no reason reached the initiator"
 fi

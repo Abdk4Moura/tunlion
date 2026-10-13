@@ -8,7 +8,7 @@
 
 ## Current role of the global rendezvous
 
-`DEFAULT_SERVER = "https://api.filament.autumated.com"`
+`DEFAULT_SERVER = "https://api.tunlion.autumated.com"`
 (`cli/src/main.rs:94`) does exactly three things, all control-plane:
 
 - **Blind signaling.** Socket.IO exchange of SDP / ICE candidates so two peers

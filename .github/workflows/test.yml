@@ -54,6 +54,16 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
+      # The receive cells in tests/pty_flows.rs drive a real `receive` in a
+      # real terminal against the signaling backend, so its deps are needed
+      # here (the same pinned set as gate-suite.yml). Under CI those cells
+      # fail, not skip, when the backend cannot start.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install backend deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
       - name: Test
         working-directory: cli
         run: cargo test --release

@@ -60,7 +60,7 @@ say "binary: $("$BIN" --version)"
 say "1. two namespaces, each with internet"
 ns_setup wga wga-h 1; ns_setup wgb wgb-h 2
 for n in wga wgb; do
-  ip netns exec $n getent hosts api.filament.autumated.com >/dev/null 2>&1 \
+  ip netns exec $n getent hosts api.tunlion.autumated.com >/dev/null 2>&1 \
     || { echo "SETUP: $n has no internet"; exit 2; }
 done
 ok "both namespaces resolve and route"

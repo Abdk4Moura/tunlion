@@ -368,21 +368,18 @@ pub(crate) fn remedy_with(
         // Not a grant (nothing to grant to an ended principal) and not the
         // ceiling re-enrolment (the ceiling was fine): the same invitation
         // again, with the same capabilities and the same lifetime.
-        Code::Expired => match reinvite {
-            Some(r) => (
-                format!(
-                    "the invitation that admitted this device has ended, so '{peer}' refuses everything from it. Only its owner can admit it again, with the same capabilities and lifetime:\n    {}",
-                    reinvite_steps(peer, &me_w, r).join("\n    ")
-                ),
-                None,
+        // ONE remedy for an expiry, whichever verb met it: exec knew the
+        // re-invite (ceiling + lifetime) and printed the steps, forward only
+        // had the reason string and said "with a fresh invitation". The steps
+        // are the same either way; only the add line's --allow/--expires need
+        // the acceptor's record, and are left at their defaults without it.
+        Code::Expired => (
+            format!(
+                "the invitation that admitted this device has ended, so '{peer}' refuses everything from it. Only its owner can admit it again:\n    {}",
+                reinvite_steps(peer, &me_w, reinvite).join("\n    ")
             ),
-            None => (
-                format!(
-                    "the invitation that admitted this device has ended, so '{peer}' refuses everything from it. Only the owner of '{peer}' can admit it again, with a fresh invitation."
-                ),
-                None,
-            ),
-        },
+            None,
+        ),
         Code::ShellOff => {
             let cmd = format!("tunlion grant {me_w} shell");
             (
@@ -489,19 +486,22 @@ pub(crate) fn ceiling_steps(peer: &str, me: &str) -> Vec<String> {
 /// runs it, preserving its capabilities and its lifetime. The forget frees the
 /// name; the device must reset, because a joined device refuses a second
 /// invitation while it holds the first.
-pub(crate) fn reinvite_steps(peer: &str, me: &str, r: &Reinvite) -> Vec<String> {
+/// Why the reset: `join` refuses on a device that still holds a device
+/// certificate (identity_flow::join_cmd), and an expired guest still holds
+/// its old one. Without the acceptor's record of the invitation (`r` None)
+/// the add line keeps its defaults rather than guessing the capabilities.
+pub(crate) fn reinvite_steps(peer: &str, me: &str, r: Option<&Reinvite>) -> Vec<String> {
     let invite = format!("{me}-invite.txt");
     let owner = format!("on '{peer}':");
     let here = "on this device:".to_string();
     let w = owner.len().max(here.len());
     let pad = " ".repeat(w);
+    let same = r
+        .map(|r| format!(" --allow {} --expires {}", r.ceiling.join(","), expires_text(r.lifetime)))
+        .unwrap_or_default();
     vec![
         format!("{owner:<w$}  tunlion devices forget {me} -y"),
-        format!(
-            "{pad}  tunlion add --for {me} --allow {} --expires {} --out {invite} --yes",
-            r.ceiling.join(","),
-            expires_text(r.lifetime)
-        ),
+        format!("{pad}  tunlion add --for {me}{same} --out {invite} --yes"),
         format!("{pad}  (copy {invite} to this device)"),
         format!("{here:<w$}  tunlion down -y"),
         format!("{pad}  tunlion reset -y"),
@@ -733,6 +733,35 @@ mod tests {
         // A hostile ceiling never reaches the printed command.
         f["ceiling"] = serde_json::json!(["shell; rm -rf /"]);
         assert_eq!(reinvite_from_frame(&f), None);
+    }
+
+    /// RC lab item 9: the same expiry read "forget + add + reset" from exec and
+    /// "with a fresh invitation" from forward (which carries no re-invite).
+    /// Both now give the same steps; only the add line's flags differ.
+    #[test]
+    fn an_expiry_has_one_remedy_with_or_without_the_reinvite() {
+        use clap::Parser;
+        let reason = crate::capability::expired_reason(1_760_384_363);
+        let with = explain_with("exec", "owner-a", &reason, None, Some("guest-b"),
+            Some(&Reinvite { ceiling: vec!["transfer".into()], lifetime: 240 }));
+        let without = explain("forward", "owner-a", &reason, None, Some("guest-b"));
+        let cmds = |m: &str| -> Vec<String> {
+            m.lines().filter_map(|l| l.find("tunlion ").map(|i| l[i..].to_string())).collect()
+        };
+        let (a, b) = (cmds(&with), cmds(&without));
+        assert_eq!(a.len(), 6, "{with}");
+        assert_eq!(b.len(), 6, "{without}");
+        for (x, y) in a.iter().zip(&b) {
+            if x.starts_with("tunlion add ") {
+                assert!(x.contains("--allow transfer --expires 4m"), "{x}");
+                assert_eq!(y, "tunlion add --for guest-b --out guest-b-invite.txt --yes");
+            } else {
+                assert_eq!(x, y);
+            }
+            let argv: Vec<&str> = y.split_whitespace().collect();
+            assert!(crate::Cli::try_parse_from(&argv).is_ok(), "step does not parse: {y}");
+        }
+        assert!(!without.contains("fresh invitation."), "{without}");
     }
 
     #[test]

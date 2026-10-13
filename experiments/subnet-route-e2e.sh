@@ -113,7 +113,7 @@ mkdir -p /etc/netns/srr && echo "nameserver 1.1.1.1" > /etc/netns/srr/resolv.con
 iptables -t nat -A POSTROUTING -s 10.77.0.0/24 ! -o srr-h -j MASQUERADE
 iptables -I FORWARD 1 -i srr-h -j ACCEPT
 iptables -I FORWARD 1 -o srr-h -j ACCEPT
-ip netns exec srr getent hosts api.filament.autumated.com >/dev/null 2>&1 \
+ip netns exec srr getent hosts api.tunlion.autumated.com >/dev/null 2>&1 \
   && ok "receiver namespace has DNS + internet" || { echo "SETUP: receiver ns has no internet"; exit 2; }
 
 say "2. router namespace on the remote machine, with a LAN behind it"
@@ -139,7 +139,7 @@ rsh "sysctl -qw net.ipv4.ip_forward=1
 RLAN=$(rsh "ip netns exec srp ping -c1 -W2 $LANHOST >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$RLAN" = "OK" ] && ok "router reaches $LANHOST on its own LAN" \
                    || { echo "SETUP: router cannot reach its LAN"; exit 2; }
-RNET=$(rsh "ip netns exec srp getent hosts api.filament.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
+RNET=$(rsh "ip netns exec srp getent hosts api.tunlion.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$RNET" = "OK" ] && ok "router namespace has internet" || { echo "SETUP: router ns has no internet"; exit 2; }
 
 say "3. NEGATIVE CONTROL: can the receiver reach that LAN today?"

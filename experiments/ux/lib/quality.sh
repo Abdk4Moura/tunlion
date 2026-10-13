@@ -102,7 +102,7 @@ pipe_gpu_offload() {
   cp "$in" "$indir/input.webm"
   echo "[quality] offloading NVENC encode to gpu-node $node (submit-deadline ${FILJOB_SUBMIT_DEADLINE:-30}s)" >&2
   "$PIPE_PY" "$rc" \
-    --server "${FILJOB_SERVER:-https://api.filament.autumated.com}" \
+    --server "${FILJOB_SERVER:-https://api.tunlion.autumated.com}" \
     --host-cfg "$FILJOB_HOST_CFG" --dout-cfg "$FILJOB_HOST_DOUT_CFG" \
     --in "$indir" --out "$outdir" --input input.webm --output out.mp4 \
     --timeout 120 --submit-deadline "${FILJOB_SUBMIT_DEADLINE:-30}" \

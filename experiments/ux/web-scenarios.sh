@@ -30,7 +30,7 @@ IDLE_EFF="$(_psv "SCENARIO_IDLE_$ID")";       [ -n "$IDLE_EFF" ]      || IDLE_EF
 
 # ensure the frontend dist exists + is same-origin
 DIST="$REPO/frontend/dist/index.html"
-if [ ! -f "$DIST" ] || grep -ql "api.filament.autumated.com" "$REPO"/frontend/dist/assets/*.js 2>/dev/null; then
+if [ ! -f "$DIST" ] || grep -ql "api.tunlion.autumated.com" "$REPO"/frontend/dist/assets/*.js 2>/dev/null; then
   echo "[web] (re)building frontend same-origin…"
   ( cd "$REPO/frontend" && VITE_TUNLION_API= npm run build >"$UX_WORK/frontbuild.log" 2>&1 ) || { echo "RESULT $ID FAIL frontend-build-failed" | tee "$RES"; exit 1; }
 fi

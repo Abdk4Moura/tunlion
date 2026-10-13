@@ -121,7 +121,7 @@ if kill -0 "$FWD_PID" 2>/dev/null; then
 else
   wait "$FWD_PID"; FWD_RC=$?
   fwdlog=$(tr -d '\r' <"$WORK/fwd.log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
-  if [ "$FWD_RC" -eq 4 ] && printf '%s\n' "$fwdlog" | grep -q 'access revoked' \
+  if [ "$FWD_RC" -eq 4 ] && printf '%s\n' "$fwdlog" | grep -q 'device revoked' \
      && printf '%s\n' "$fwdlog" | grep -q 'stopped'; then
     ok "gateC: the revoked forward exited 4 and said why"
   else

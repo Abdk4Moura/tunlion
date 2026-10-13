@@ -520,7 +520,22 @@ pub(crate) fn delegated_device_state(
     let (deadline, clock) =
         effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
     if record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED) || deadline <= now {
-        return Some(("lapsed".to_string(), ui::Tone::Warn));
+        // The same word and the same time the gate refuses with ("access
+        // expired at ..."), never the internal "lapsed".
+        let at = match record["lapsedAt"].as_u64() {
+            Some(l) if l > 0 && l < deadline => l,
+            _ => deadline,
+        };
+        // `devices --json` calls a record marked lapsed before its invitation
+        // ended "lapsed"; everything else past its deadline is "expired".
+        let word = if record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED)
+            && not_after.is_some_and(|e| e > now)
+        {
+            "lapsed"
+        } else {
+            "expired"
+        };
+        return Some((format!("{word} {}", format_approval_expiry(at)), ui::Tone::Warn));
     }
     let left = crate::device_view::remaining_span(deadline - now);
     Some((deadline_text(clock, &left), ui::Tone::Dim))
@@ -588,6 +603,18 @@ pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
         }) => {
             let expires =
                 crate::capability::now_secs().saturating_add(parse_duration_secs(&duration)?);
+            // A revoked, forgotten or expired device cannot be let in by a
+            // grant: the gate refuses it first. Approving used to exit 0 with
+            // "ok ... can act as you" while every open was still refused.
+            if let Some(req) = local_request(id) {
+                if let Some(bar) = crate::request_bar(&req.peer) {
+                    crate::withdraw_requests_for(&req.peer);
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Denied,
+                        crate::request_bar_refusal(id, &req.peer, bar),
+                    ));
+                }
+            }
             let reply = crate::ctl::try_approve_request(id, &allow, expires).await;
             match reply {
                 Some(v) => {

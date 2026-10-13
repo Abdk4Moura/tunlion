@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 
-SERVER = os.environ.get("FILAMENT_SERVER", "https://api.filament.autumated.com")
+SERVER = os.environ.get("FILAMENT_SERVER", "https://api.tunlion.autumated.com")
 HEALTH_URL = SERVER.rstrip("/") + "/api/health"
 STATE_FILE = os.environ.get(
     "MONITOR_STATE", os.path.expanduser("~/.cache/filament-signaling-monitor.json")

@@ -2155,7 +2155,7 @@ mod tests {
     fn pubip_cache_freshness() {
         use std::time::Duration;
         let ttl = Duration::from_secs(300);
-        let server = "https://api.filament.autumated.com";
+        let server = "https://api.tunlion.autumated.com";
         // Same server, well within TTL -> reusable.
         assert!(pubip_fresh(server, Duration::from_secs(10), server, ttl));
         // Same server, exactly at the boundary -> expired (strict <).

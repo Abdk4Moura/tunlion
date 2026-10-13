@@ -346,3 +346,257 @@ fn a_code_typed_into_add_is_accepted_not_reminted() {
     assert!(!t.text()[at..].contains("comic-otter-1950-"), "a second code was minted:\n{}", tail(&t.text()));
     t.send("\u{3}");
 }
+
+// ---------------------------------------------------------------------------
+// RC lab item 1: `tunlion receive <code>` in a real terminal printed
+// "done (1 file)." and then never exited. Its terminal reader was tokio's
+// stdin, an uncancellable read on the runtime's blocking pool, and dropping
+// the runtime waits for every blocking task; the signal tasks had died with
+// the runtime, so Ctrl-C and SIGTERM were caught and ignored. Only Enter (or
+// SIGKILL) ended it. Non-TTY runs never showed it: their stdin hits EOF.
+//
+// These run against a real signaling backend (../backend, the one every gate
+// uses). CI installs its Python deps for this job; elsewhere, without them,
+// the cells say so and skip, but under CI a missing backend is a failure, so
+// a green run cannot mean "never ran".
+// ---------------------------------------------------------------------------
+
+/// A local signaling backend, killed on drop.
+#[cfg(unix)]
+struct Backend {
+    child: std::process::Child,
+    url: String,
+}
+
+#[cfg(unix)]
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn health_ok(port: u16) -> bool {
+    use std::net::TcpStream;
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else { return false };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    if s.write_all(b"GET /api/health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).contains(" 200 ")
+}
+
+/// Start ../backend on a free port, or None (skipped) when it cannot run
+/// here. Under CI (the `CI` variable GitHub sets) it must run.
+#[cfg(unix)]
+fn backend() -> Option<Backend> {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("free port");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../backend");
+    let python = std::env::var("TUNLION_TEST_VENV").unwrap_or_else(|_| "python3".to_string());
+    let spawned = std::process::Command::new(&python)
+        .arg("app.py")
+        .current_dir(&dir)
+        .env("PORT", port.to_string())
+        .env("FIL_ASYNC_MODE", "eventlet")
+        .env("FIL_SELF_MONKEYPATCH", "1")
+        .env("FIL_CLAIM_LIMIT", "1000000")
+        .env("FIL_PING_TIMEOUT", "120")
+        .env("FIL_PING_INTERVAL", "25")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            assert!(std::env::var_os("CI").is_none(), "CI must run the backend for the receive pty cells: {e}");
+            eprintln!("SKIP: cannot start the backend ({e})");
+            return None;
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if health_ok(port) {
+            return Some(Backend { child, url: format!("http://127.0.0.1:{port}") });
+        }
+        if let Ok(Some(st)) = child.try_wait() {
+            assert!(std::env::var_os("CI").is_none(), "the backend exited ({st}); CI must run it for the receive pty cells");
+            eprintln!("SKIP: the backend exited ({st}); install its Python deps to run these cells");
+            return None;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    panic!("the backend never answered /api/health on port {port}");
+}
+
+/// A fresh scratch dir for one cell.
+#[cfg(unix)]
+fn scratch(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+/// The `RC=<n>` the shell printed after `want` appeared, within `secs`.
+#[cfg(unix)]
+fn rc_after(t: &Term, from: usize, secs: u64) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        let text = t.text();
+        let tail = &text[from.min(text.len())..];
+        // The echoed command line carries "RC=$?"; only digits count.
+        for (i, _) in tail.match_indices("RC=") {
+            let digits: String = tail[i + 3..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let after = &tail[i + 3 + digits.len()..];
+            if !digits.is_empty() && after.starts_with(|c: char| c == '\r' || c == '\n') {
+                return digits.parse().ok();
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+#[cfg(unix)]
+#[test]
+fn receive_by_code_in_a_terminal_exits_right_after_done() {
+    let Some(b) = backend() else { return };
+    let exe = env!("CARGO_BIN_EXE_tunlion");
+    let root = scratch("recv-done");
+    let (sdir, rdir, drop) = (root.join("s"), root.join("r"), root.join("drop"));
+    for d in [&sdir, &rdir, &drop] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let file = root.join("payload.txt");
+    std::fs::write(&file, b"rc lab item 1\n").unwrap();
+    let send_log = root.join("send.log");
+    let mut sender = std::process::Command::new(exe)
+        .env("TUNLION_CONFIG_DIR", &sdir)
+        .env("TUNLION_NONINTERACTIVE", "1")
+        .args(["--server", &b.url, "send"])
+        .arg(&file)
+        .args(["--word", "gigantic-element"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&send_log).unwrap())
+        .stderr(std::fs::File::create(root.join("send.err")).unwrap())
+        .spawn()
+        .expect("spawn sender");
+    // The code the sender minted.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let code = loop {
+        let text = (std::fs::read_to_string(&send_log).unwrap_or_default()
+            + &std::fs::read_to_string(root.join("send.err")).unwrap_or_default())
+            .to_lowercase();
+        if let Some(i) = text.find("gigantic-element-") {
+            let n: String = text[i + 17..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if n.len() >= 3 {
+                break format!("gigantic-element-{n}");
+            }
+        }
+        assert!(Instant::now() < deadline, "the sender minted no code:\n{text}");
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    let mut t = Term::shell(&rdir);
+    assert!(t.wait_for(&format!("{MARK}> "), 20), "shell never prompted:\n{}", t.text());
+    let at = t.text().len();
+    t.send(&format!(
+        "\"{exe}\" --server {} receive {code} -y --dir \"{}\"; echo RC=$?\r",
+        b.url,
+        drop.display()
+    ));
+    assert!(
+        t.wait_for_from(at, "done (1 file", 60),
+        "the receive never finished; screen:\n{}",
+        tail(&t.text())
+    );
+    let done_at = t.text().len();
+    // Before the fix this waited for Enter forever. The bound is generous for
+    // a loaded runner and far below "forever".
+    let rc = rc_after(&t, at, 8);
+    let _ = sender.kill();
+    let _ = sender.wait();
+    assert_eq!(
+        rc,
+        Some(0),
+        "receive did not exit within 8s of \"done\" (exit {rc:?}); screen after done:\n{}",
+        tail(&t.text()[done_at.min(t.text().len())..])
+    );
+    assert_eq!(std::fs::read(drop.join("payload.txt")).ok().as_deref(), Some(&b"rc lab item 1\n"[..]));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ctrl-C while a receive waits in a terminal (its terminal reader live)
+/// ends it at once with 130.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_ends_a_waiting_receive_in_a_terminal_with_130() {
+    let Some(b) = backend() else { return };
+    let exe = env!("CARGO_BIN_EXE_tunlion");
+    let root = scratch("recv-int");
+    let drop = root.join("drop");
+    std::fs::create_dir_all(&drop).unwrap();
+    let mut t = Term::shell(&root);
+    assert!(t.wait_for(&format!("{MARK}> "), 20), "shell never prompted:\n{}", t.text());
+    let at = t.text().len();
+    t.send(&format!("\"{exe}\" --server {} receive --dir \"{}\"; echo RC=$?\r", b.url, drop.display()));
+    assert!(
+        t.wait_for_from(at, "listening", 30),
+        "receive never started listening; screen:\n{}",
+        tail(&t.text())
+    );
+    t.settle(500, 3);
+    t.send("\u{3}");
+    let rc = rc_after(&t, at, 8);
+    assert_eq!(rc, Some(130), "Ctrl-C did not end the waiting receive with 130 within 8s; screen:\n{}", tail(&t.text()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// SIGTERM while a receive waits in a terminal ends it at once with 143 (it
+/// used to report 130, the SIGINT code, for a SIGTERM).
+#[cfg(target_os = "linux")]
+#[test]
+fn sigterm_ends_a_waiting_receive_in_a_terminal_with_143() {
+    let Some(b) = backend() else { return };
+    let exe = env!("CARGO_BIN_EXE_tunlion");
+    let root = scratch("recv-term");
+    let drop = root.join("drop");
+    std::fs::create_dir_all(&drop).unwrap();
+    let mut t = Term::shell(&root);
+    assert!(t.wait_for(&format!("{MARK}> "), 20), "shell never prompted:\n{}", t.text());
+    let at = t.text().len();
+    t.send(&format!("\"{exe}\" --server {} receive --dir \"{}\"; echo RC=$?\r", b.url, drop.display()));
+    assert!(
+        t.wait_for_from(at, "listening", 30),
+        "receive never started listening; screen:\n{}",
+        tail(&t.text())
+    );
+    // The receive's pid, found by its unique --dir.
+    let marker = drop.display().to_string();
+    let pid = std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
+        .find(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|c| {
+                    let c = String::from_utf8_lossy(&c);
+                    c.contains("receive") && c.contains(&marker) && !c.contains("echo RC")
+                })
+                .unwrap_or(false)
+        })
+        .expect("the receive's pid");
+    let killed = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("kill");
+    assert!(killed.success());
+    let rc = rc_after(&t, at, 8);
+    assert_eq!(rc, Some(143), "SIGTERM did not end the waiting receive with 143 within 8s; screen:\n{}", tail(&t.text()));
+    let _ = std::fs::remove_dir_all(&root);
+}

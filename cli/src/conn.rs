@@ -345,7 +345,10 @@ pub(crate) fn looks_like_session_id(label: &str) -> bool {
     let count = |f: fn(&char) -> bool| label.chars().filter(|c| f(c)).count();
     label.len() == 20
         && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        && count(char::is_ascii_digit) >= 2
+        // One digit, not two: the lab printed "ok DrUEPIADYWGghg6rAAVO", a
+        // real session id with a single digit (and one in ~30 has none at
+        // all, which the case mix below still has to carry).
+        && count(char::is_ascii_digit) >= 1
         && count(char::is_ascii_uppercase) >= 3
         && count(char::is_ascii_lowercase) >= 3
 }
@@ -4436,8 +4439,13 @@ impl Conn {
         links.sort_by(|a, b| a.1.name.cmp(&b.1.name));
         let mut parts = Vec::new();
         let mut seen = false;
+        // A label that is ANY live link's signaling id or uid is an id, not a
+        // name, whatever its shape.
+        let is_some_links_id = |label: &str| {
+            self.links.iter().any(|(k, l)| k == label || l.uid.as_deref() == Some(label))
+        };
         for (id, l) in links {
-            let unnamed = label_is_raw_id(l.label(), id, l.uid.as_deref());
+            let unnamed = label_is_raw_id(l.label(), id, l.uid.as_deref()) || is_some_links_id(l.label());
             if id == pid {
                 seen = true;
                 let label = if unnamed && !show_raw && !label_is_raw_id(fallback_name, pid, None) {
@@ -4712,6 +4720,8 @@ mod raw_label_tests {
         assert!(!label_is_raw_id("p5-b", "sid", Some("uid")));
         // A session id that is not this link's key (the tester's "ok hNZONFIoto2k9bQ9ABGV").
         assert!(label_is_raw_id("hNZONFIoto2k9bQ9ABGV", "other-sid", None));
+        // RC lab item 3: a session id with a single digit.
+        assert!(label_is_raw_id("DrUEPIADYWGghg6rAAVO", "other-sid", None));
         // Names, including long mixed ones, stay names.
         assert!(!label_is_raw_id("WorkstationAlpha2", "sid", None));
         assert!(!label_is_raw_id("my-laptop-2024-home", "sid", None));

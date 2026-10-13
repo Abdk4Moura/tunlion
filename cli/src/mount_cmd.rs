@@ -331,7 +331,7 @@ pub(crate) fn resolve_mount_plan(
                 entered
             }
         }
-        None => bail!("mount needs a remote path in non-interactive mode"),
+        None => crate::bail_usage!("mount needs a remote path in non-interactive mode"),
     };
     let suggested = default_mount_point(&peer, &remote);
     let local = match local {
@@ -420,6 +420,14 @@ pub(crate) async fn mount_fuse_cmd(
         Ok(Ok(resp)) => match resp.result {
             MountResult::Ok(_) => {}
             MountResult::Err(e) => {
+                // An expiry or a revoke reads, and is remedied, exactly as
+                // exec, forward and send say it.
+                if let Some(code) = crate::refusal::code_from_reason(&e.msg) {
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Denied,
+                        crate::refusal::explain("mount", peer, &e.msg, Some(code), None),
+                    ));
+                }
                 bail!("mount refused by {peer}: {} (remote path {remote})", e.msg)
             }
         },

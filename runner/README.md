@@ -96,7 +96,7 @@ from filament_runner import FileRunnerBox, Job
 
 rb = FileRunnerBox(
     petname_box_din="box-in",                       # how the host names the box on din
-    server="https://api.filament.autumated.com",
+    server="https://api.tunlion.autumated.com",
     host_config_dir="~/.filament-jobrunner/host",   # knows box-in (the `send` target)
     host_dout_config_dir="~/.filament-jobrunner/host-dout",  # the results sink (box-out)
     filament_bin="tunlion",

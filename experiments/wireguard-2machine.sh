@@ -108,7 +108,7 @@ iptables -I FORWARD 1 -o srr-h -j ACCEPT
 # WireGuard's registered port, forwarded into the namespace: this is what makes
 # the endpoint reachable, as it would be on a host with a public IP.
 iptables -t nat -A PREROUTING -p udp --dport 51820 -j DNAT --to-destination 10.77.0.2:51820
-ip netns exec srr getent hosts api.filament.autumated.com >/dev/null 2>&1 \
+ip netns exec srr getent hosts api.tunlion.autumated.com >/dev/null 2>&1 \
   && ok "receiver namespace has internet" || { echo "SETUP: no internet in receiver ns"; exit 2; }
 
 say "2. router namespace on the remote machine"
@@ -125,7 +125,7 @@ rsh "sysctl -qw net.ipv4.ip_forward=1
      iptables -I FORWARD 1 -o srp-h -j ACCEPT
      iptables -t nat -A PREROUTING -p udp --dport 51820 -j DNAT --to-destination 10.88.0.2:51820
      mkdir -p $RDIR" 180 >/dev/null
-RNET=$(rsh "ip netns exec srp getent hosts api.filament.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
+RNET=$(rsh "ip netns exec srp getent hosts api.tunlion.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$RNET" = "OK" ] && ok "router namespace has internet" || { echo "SETUP: no internet in router ns"; exit 2; }
 
 say "1. namespaces on both machines"
@@ -140,7 +140,7 @@ mkdir -p /etc/netns/srr && echo "nameserver 1.1.1.1" > /etc/netns/srr/resolv.con
 iptables -t nat -A POSTROUTING -s 10.77.0.0/24 ! -o srr-h -j MASQUERADE
 iptables -I FORWARD 1 -i srr-h -j ACCEPT
 iptables -I FORWARD 1 -o srr-h -j ACCEPT
-ip netns exec srr getent hosts api.filament.autumated.com >/dev/null 2>&1 \
+ip netns exec srr getent hosts api.tunlion.autumated.com >/dev/null 2>&1 \
   && ok "local namespace has internet" || { echo "SETUP: no internet locally"; exit 2; }
 rsh "sysctl -qw net.ipv4.ip_forward=1
      ip netns add srp
@@ -154,7 +154,7 @@ rsh "sysctl -qw net.ipv4.ip_forward=1
      iptables -I FORWARD 1 -i srp-h -j ACCEPT
      iptables -I FORWARD 1 -o srp-h -j ACCEPT
      mkdir -p $RDIR" 200 >/dev/null
-R=$(rsh "ip netns exec srp getent hosts api.filament.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
+R=$(rsh "ip netns exec srp getent hosts api.tunlion.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$R" = "OK" ] && ok "remote namespace has internet" || { echo "SETUP: no internet remotely"; exit 2; }
 RW=$(rsh "command -v wg >/dev/null && echo OK || echo FAIL" 90 | tail -1)
 [ "$RW" = "OK" ] && ok "remote has wireguard-tools" || { echo "SETUP: remote lacks wireguard-tools"; exit 2; }

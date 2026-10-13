@@ -464,7 +464,7 @@ def main(argv):
     ap = argparse.ArgumentParser(description="tunlion box-side file-driven job watcher")
     ap.add_argument("--jobs-root", default=os.environ.get("FILJOB_ROOT", "~/filament-jobs"))
     ap.add_argument("--server", default=os.environ.get("FILJOB_SERVER",
-                    "https://api.filament.autumated.com"))
+                    "https://api.tunlion.autumated.com"))
     ap.add_argument("--bin", default=os.environ.get("TUNLION_BIN", "tunlion"))
     ap.add_argument("--dout-cfg", default=os.environ.get("FILJOB_BOX_DOUT_CFG",
                     "~/filament-jobs/cfg-dout"))

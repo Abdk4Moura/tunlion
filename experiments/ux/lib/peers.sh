@@ -140,7 +140,7 @@ pipe_backend_stop() { [ -n "$PIPE_BACKEND_PID" ] && kill "$PIPE_BACKEND_PID" 2>/
 # if it is missing or points at the prod API. The REAL built app, no mock seam.
 pipe_ensure_frontend() {
   local dist="$REPO_ROOT/frontend/dist/index.html"
-  if [ -f "$dist" ] && ! grep -ql "api.filament.autumated.com" "$REPO_ROOT"/frontend/dist/assets/*.js 2>/dev/null; then
+  if [ -f "$dist" ] && ! grep -ql "api.tunlion.autumated.com" "$REPO_ROOT"/frontend/dist/assets/*.js 2>/dev/null; then
     return 0
   fi
   echo "[peers] (re)building frontend same-origin…" >&2

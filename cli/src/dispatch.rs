@@ -129,15 +129,15 @@ pub(crate) fn grant_operands(
 ) -> Result<(Option<String>, String)> {
     match (tag, device, capability) {
         (Some(_), Some(cap), None) => Ok((None, cap)),
-        (Some(t), Some(dev), Some(_)) => bail!(
+        (Some(t), Some(dev), Some(_)) => crate::bail_usage!(
             "grant --tag {t} takes only the capability (`tunlion grant --tag {t} <capability>`); drop '{dev}' or drop --tag"
         ),
-        (Some(t), None, _) => bail!("missing the capability: tunlion grant --tag {t} <capability>"),
+        (Some(t), None, _) => crate::bail_usage!("missing the capability: tunlion grant --tag {t} <capability>"),
         (None, Some(dev), Some(cap)) => Ok((Some(dev), cap)),
         (None, Some(dev), None) => {
-            bail!("missing the capability: tunlion grant {dev} <capability> (e.g. shell)")
+            crate::bail_usage!("missing the capability: tunlion grant {dev} <capability> (e.g. shell)")
         }
-        (None, None, _) => bail!(
+        (None, None, _) => crate::bail_usage!(
             "name a device or a tag: tunlion grant <device> <capability>, or tunlion grant --tag <tag> <capability>"
         ),
     }
@@ -508,10 +508,10 @@ pub(crate) async fn async_main() -> Result<()> {
     // Record the global --no-interactive opt-out before any command runs (the
     // gate also honors TUNLION_NONINTERACTIVE and a non-TTY stdin).
     if cli.interactive && !std::io::stdin().is_terminal() {
-        bail!("--interactive requires a terminal; remove it or provide every required option");
+        crate::bail_usage!("--interactive requires a terminal; remove it or provide every required option");
     }
     if cli.interactive && (cli.no_interactive || cli.json) {
-        bail!("--interactive conflicts with --no-interactive and --json; pick one mode");
+        crate::bail_usage!("--interactive conflicts with --no-interactive and --json; pick one mode");
     }
     if cli.no_interactive || cli.json {
         NO_INTERACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -648,8 +648,26 @@ pub(crate) async fn async_main() -> Result<()> {
                 .await
             };
             if let (Ok(()), Some(r)) = (&res, remember_name.as_deref()) {
-                if !crate::shared_defs::REMEMBER_STORED.load(std::sync::atomic::Ordering::Relaxed) {
-                    ui::caution(&crate::shared_defs::remember_not_stored_msg(r, true), None, &[]);
+                let answered = crate::shared_defs::REMEMBER_ANSWERED.load(std::sync::atomic::Ordering::Relaxed);
+                let stored = crate::shared_defs::REMEMBER_STORED.load(std::sync::atomic::Ordering::Relaxed);
+                // The true final outcome only. "remembered this device as"
+                // is no longer printed before the receiver answers, so a
+                // decline ("declined to be remembered, nothing stored") is
+                // never contradicted; this adds only what to do about it.
+                if !stored {
+                    ui::caution(
+                        &crate::shared_defs::remember_not_stored_msg(r, true, crate::identity_flow::has_identity()),
+                        None,
+                        &[],
+                    );
+                } else if stored && !answered {
+                    // Kept our half; the receiver never said either way.
+                    let as_name = crate::shared_defs::REMEMBER_STORED_AS
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                        .unwrap_or_else(|| r.to_string());
+                    ui::say(&crate::shared_defs::remember_stored_msg(&as_name));
                 }
             }
             // Both ends keep a structured history; this is the sender's half.
@@ -727,7 +745,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 let res = crate::recv_report::finish(res);
                 if let (Ok(()), Some(r)) = (&res, remember_name.as_deref()) {
                     if !crate::shared_defs::REMEMBER_STORED.load(std::sync::atomic::Ordering::Relaxed) {
-                        ui::caution(&crate::shared_defs::remember_not_stored_msg(r, false), None, &[]);
+                        ui::caution(
+                            &crate::shared_defs::remember_not_stored_msg(r, false, crate::identity_flow::has_identity()),
+                            None,
+                            &[],
+                        );
                     }
                 }
                 if json_out {
@@ -1200,7 +1222,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 let via = match via.as_deref() {
                     Some("code") => Some("code".to_string()),
                     Some("file") => Some("file".to_string()),
-                    Some(other) => bail!("--via takes `code` or `file`, not '{other}'"),
+                    Some(other) => crate::bail_usage!("--via takes `code` or `file`, not '{other}'"),
                     // --out names a file, so it answers HOW by itself.
                     None if out.is_some() => Some("file".to_string()),
                     // An unattended runner is never present to hear a code read
@@ -1261,6 +1283,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 let internal = kind == "device";
                 crate::pair_cmd::FOR_PERSON
                     .store(kind == "person", std::sync::atomic::Ordering::Relaxed);
+                if internal {
+                    if let Some(e) = crate::identity_flow::add_needs_init() {
+                        return Err(e);
+                    }
+                }
                 if internal && load_owner_key().is_none() {
                     bail!(
                         "`add --for device` enrols the other side into your mesh, which \
@@ -1333,7 +1360,7 @@ pub(crate) async fn async_main() -> Result<()> {
             };
             if let Some(code) = code {
                 if invite_file.is_some() || invite_fd.is_some() {
-                    bail!("give a code or an invitation file, not both");
+                    crate::bail_usage!("give a code or an invitation file, not both");
                 }
                 // Same ceremony `add <code>` runs: accepting a code confers no
                 // membership by itself, the offering side decides that.
@@ -1354,7 +1381,7 @@ pub(crate) async fn async_main() -> Result<()> {
             crate::exit_codes::set_json_mode(json || ui_caps.json, Some("devices"));
             if let Some(selector) = caps {
                 if action.is_some() {
-                    bail!("--caps is a view; it takes a device name, not a subcommand");
+                    crate::bail_usage!("--caps is a view; it takes a device name, not a subcommand");
                 }
                 let name = (!selector.is_empty()).then_some(selector.as_str());
                 return crate::device_perms::devices_caps_cmd(name, json || ui_caps.json);
@@ -1502,6 +1529,9 @@ pub(crate) async fn async_main() -> Result<()> {
                     ))?;
                     let report = crate::fleet_support::forget_device(&name, identity::now_secs())?;
                     println!("{report}");
+                    // Its pending access requests cannot be approved into
+                    // anything any more; drop them with the record.
+                    crate::withdraw_requests_for(&name);
                     // The store is written; the RUNNING daemon must act on it too
                     // (revocation_live.rs). Say only what it confirmed. The old
                     // line here promised the forgotten device would hear "never
@@ -1530,6 +1560,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                     ui_caps.confirm(&format!("durably revoke {name} (it will stop being recognized and cannot rejoin until restored)"))?;
                     set_device_revoked(&name, true)?;
+                    crate::withdraw_requests_for(&name);
                     println!(
                         "revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `tunlion devices restore {name}` can)"
                     );
@@ -1625,7 +1656,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     devices[selected].0.clone()
                 }
                 None => {
-                    bail!("shell needs a device in non-interactive mode: tunlion shell <device>")
+                    crate::bail_usage!("shell needs a device in non-interactive mode: tunlion shell <device>")
                 }
             };
             require_known_device(&peer)?;
@@ -1691,7 +1722,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     devices[selected].0.clone()
                 }
                 None => {
-                    bail!(
+                    crate::bail_usage!(
                         "exec needs a device in non-interactive mode: tunlion exec <device> -- <cmd>"
                     )
                 }
@@ -1706,7 +1737,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             }
             if argv.is_empty() {
-                bail!("exec needs a command: tunlion exec <device> -- <cmd>");
+                crate::bail_usage!("exec needs a command: tunlion exec <device> -- <cmd>");
             }
             // --shell wraps here, visibly, on the initiator side: the receiver
             // never invokes a shell on its own.
@@ -1762,14 +1793,14 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         Cmd::Reach { dev, until_direct, timeout, json, socks } => {
             if socks {
-                bail!(
+                crate::bail_usage!(
                     "`reach --socks` moved to `forward --socks`: reach now probes only. Run `tunlion forward <device>:<port> --socks`"
                 );
             }
             let json = json || ui_caps.json;
             crate::exit_codes::set_json_mode(json, Some("reach"));
             match dev {
-                Some(d) if d.contains(':') => bail!(
+                Some(d) if d.contains(':') => crate::bail_usage!(
                     "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `tunlion forward {d}`"
                 ),
                 Some(d) => {
@@ -1805,7 +1836,7 @@ pub(crate) async fn async_main() -> Result<()> {
                         crate::ping::ping_cmd(&server, &d, 1, json, relay, timeout).await
                     }
                 }
-                None => bail!(
+                None => crate::bail_usage!(
                     "reach needs a device to probe: `tunlion reach <device>`. To tunnel a port use `tunlion forward <device>:<port>`."
                 ),
             }
@@ -1824,10 +1855,13 @@ pub(crate) async fn async_main() -> Result<()> {
                 Some((p, r)) => (
                     p.to_string(),
                     r.parse().map_err(|_| {
-                        anyhow!("invalid port in '{target}'; expected <device>:<port>")
+                        crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::Usage,
+                            format!("invalid port in '{target}'; expected <device>:<port>"),
+                        )
                     })?,
                 ),
-                None => bail!("forward needs <device>:<port>, e.g. `tunlion forward laptop:5432`"),
+                None => crate::bail_usage!("forward needs <device>:<port>, e.g. `tunlion forward laptop:5432`"),
             };
             if stdio {
                 // #202: the netcat shape - pipe stdio to the peer's port (the
@@ -1860,7 +1894,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     ui_caps.confirm("unexpose a port")?;
                     expose::unexpose_cmd(p).await
                 } else {
-                    bail!("expose --off requires a port number");
+                    crate::bail_usage!("expose --off requires a port number");
                 }
             } else {
                 expose::expose_cmd(port, to, peer, list).await
@@ -1929,7 +1963,7 @@ pub(crate) async fn async_main() -> Result<()> {
             }
             // grant_operands returns a device whenever there is no --tag.
             let Some(device) = device else {
-                bail!("name a device: tunlion grant <device> <capability>");
+                crate::bail_usage!("name a device: tunlion grant <device> <capability>");
             };
             // Device path. The owner PUBLIC key is needed up front for the same
             // reason as the tag path: it resolves a `route:CIDR` spec to its
@@ -2224,7 +2258,7 @@ pub(crate) async fn async_main() -> Result<()> {
         } => {
             if certificate {
                 if capability.is_some() {
-                    bail!("choose either a capability or --certificate, not both");
+                    crate::bail_usage!("choose either a capability or --certificate, not both");
                 }
                 ui_caps.confirm(&format!("revoke fleet certificate from {device}"))?;
                 let cert = device_cert_for(&device)
@@ -2473,7 +2507,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 mount::check_cmd(&path)
             } else {
                 if options.is_some() || foreground || save_auto {
-                    bail!(
+                    crate::bail_usage!(
                         "--options, --foreground, and --save-auto belong to the retired sshfs path and are not supported by mesh-native mount"
                     );
                 }

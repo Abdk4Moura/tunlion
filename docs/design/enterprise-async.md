@@ -121,7 +121,7 @@ sealed delivery**, and (c) **claim-link keys** for non-users.
 ### 1.3 Self-host + relay knobs (the perimeter substrate)
 
 - `cli/src/main.rs` — `--server` / `TUNLION_SERVER` (default
-  `https://api.filament.autumated.com`) points the client at any signaling
+  `https://api.tunlion.autumated.com`) points the client at any signaling
   endpoint. The server (`backend/app.py`, `backend/signaling.py`) is a **dumb
   pipe**: it tracks room membership and relays opaque signal blobs, *never file
   bytes*. It already has the right shape to extend: `pair_create(code, sid,

@@ -30,7 +30,7 @@
 set -euo pipefail
 
 # ===================== CONFIG (edit or pass via env) =======================
-FILJOB_SERVER="${FILJOB_SERVER:-https://api.filament.autumated.com}"
+FILJOB_SERVER="${FILJOB_SERVER:-https://api.tunlion.autumated.com}"
 SEC_CTL="${SEC_CTL:?set SEC_CTL (openssl rand -hex 32, shared with host)}"
 SEC_DIN="${SEC_DIN:?set SEC_DIN (openssl rand -hex 32, shared with host)}"
 SEC_DOUT="${SEC_DOUT:?set SEC_DOUT (openssl rand -hex 32, shared with host)}"

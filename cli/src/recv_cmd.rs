@@ -1108,14 +1108,22 @@ pub(crate) async fn recv_cmd(
     // lose, room membership, channel subscriptions, the lease. The emits
     // stay as the fast path (and old-server compat); the session is truth.
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.channels = devices.iter().map(|(_, s)| channel_of(s)).collect();
-    // Fleet auto-mesh: one more meeting point, where devices certified by the
-    // SAME owner key find each other with no pairwise pairing. Presence there
-    // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
-    // and docs/design-fleet-automesh.md.
-    if let Some(fc) = fleet::channel() {
-        if !sess.channels.contains(&fc) {
-            sess.channels.push(fc);
+    // A one-shot `receive <code>` meets exactly one peer: whoever holds the
+    // code. Subscribing it to every known device's channel (and the fleet's)
+    // dialed whichever of them was online: the lab saw "known device 'w2-a'
+    // appeared, connecting" during a receive from the unrelated w1-a, and then
+    // that second link on the roster line under its raw signaling id.
+    let code_only = code.is_some() && !daemon;
+    if !code_only {
+        sess.channels = devices.iter().map(|(_, s)| channel_of(s)).collect();
+        // Fleet auto-mesh: one more meeting point, where devices certified by the
+        // SAME owner key find each other with no pairwise pairing. Presence there
+        // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
+        // and docs/design-fleet-automesh.md.
+        if let Some(fc) = fleet::channel() {
+            if !sess.channels.contains(&fc) {
+                sess.channels.push(fc);
+            }
         }
     }
     // L1-a: the ephemeral SPAKE2 ceremony for a `recv <code>` claim. The typed
@@ -1410,7 +1418,8 @@ pub(crate) async fn recv_cmd(
         let tx = tx.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            shutdown::arm_force_exit(130, shutdown::grace());
+            shutdown::note_signal(crate::exit_codes::INTERRUPTED);
+            shutdown::arm_force_exit(crate::exit_codes::INTERRUPTED, shutdown::grace());
             let _ = tx.send(Ev::Interrupted);
         });
     }
@@ -1422,7 +1431,10 @@ pub(crate) async fn recv_cmd(
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             {
                 term.recv().await;
-                shutdown::arm_force_exit(130, shutdown::grace());
+                // SIGTERM exits 143, not 130: the documented taxonomy
+                // (exit_codes.rs) reports the signal that actually arrived.
+                shutdown::note_signal(crate::exit_codes::TERMINATED);
+                shutdown::arm_force_exit(crate::exit_codes::TERMINATED, shutdown::grace());
                 let _ = tx.send(Ev::Interrupted);
             }
         });
@@ -1439,12 +1451,21 @@ pub(crate) async fn recv_cmd(
     if interactive {
         let tx = tx.clone();
         let q = st.question_open.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut stdin = tokio::io::stdin();
+        // A DEDICATED OS thread, never `tokio::io::stdin()`. tokio's stdin is an
+        // uncancellable read on the runtime's blocking pool, and dropping the
+        // runtime waits for every blocking task: a receive that finished
+        // ("done (1 file).") then sat in that drop until someone pressed Enter,
+        // and since the signal tasks die with the runtime, Ctrl-C and SIGTERM
+        // were caught and ignored. A plain thread is reaped by process exit, so
+        // the receive leaves the moment it is done. (Same reason as
+        // l2::spawn_stdin_reader.)
+        std::thread::spawn(move || {
+            use std::io::Read;
+            // Not `.lock()`: a held lock would starve any later plain prompt.
+            let mut stdin = std::io::stdin();
             let mut buf = [0u8; 1];
             let mut line = String::new();
-            while stdin.read(&mut buf).await.map(|n| n == 1).unwrap_or(false) {
+            while stdin.read(&mut buf).map(|n| n == 1).unwrap_or(false) {
                 let c = buf[0] as char;
                 if q.load(std::sync::atomic::Ordering::Relaxed)
                     && "yYnN".contains(c)
@@ -2268,7 +2289,13 @@ pub(crate) async fn recv_cmd(
                             if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
                                 let peer = r.peer.clone();
                                 let cap = r.capability.clone();
-                                if cap != allow {
+                                if let Some(bar) = crate::request_bar(&peer) {
+                                    // The gate refuses this device whatever is
+                                    // granted; never record an approval for it.
+                                    r.status = crate::REQUEST_WITHDRAWN.to_string();
+                                    save_requests(&requests);
+                                    req.reject(&crate::request_bar_refusal(id, &peer, bar)).await;
+                                } else if cap != allow {
                                     req.reject(&format!("request {id} is for '{cap}', not '{allow}'")).await;
                                 } else if !crate::capability::grant_active(expires, crate::capability::now_secs()) {
                                     req.reject("grant expiry must be in the future").await;
@@ -3928,6 +3955,10 @@ pub(crate) async fn recv_cmd(
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own sender/daemon shares these channels
+                }
+                // A code receive dials only the code's holder (see code_only).
+                if code_only {
+                    continue;
                 }
                 // Dialing on a held secret is admitting it (a direct link is born
                 // trusted on that MAC), so match against the store as it is NOW,
@@ -8373,7 +8404,7 @@ pub(crate) async fn recv_cmd(
                 // The signal task already armed a force-exit; cap the disconnect so
                 // we exit cleanly on our own well inside that grace.
                 let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-                crate::exit_codes::interrupted_exit(130);
+                crate::exit_codes::interrupted_exit(shutdown::signal_code());
             }
             // P0 (GAP-1): the inbound transfer stalled (zero bytes, link alive).
             // The receiver participates in the SYMMETRIC direct-QUIC repair: it

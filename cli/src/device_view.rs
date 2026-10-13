@@ -378,6 +378,26 @@ pub(crate) fn same_owner_key() -> Option<[u8; 32]> {
     load_owner_key()
         .map(|key| key.public_key_bytes())
         .or_else(|| local_device_cert().map(|c| c.user_pub))
+        // Display only: after this device's own access ended its certificate
+        // no longer verifies, and the owner it joined was relabelled
+        // "EXTERNAL / other people". It is still that owner.
+        .or_else(|| own_cert_ignoring_expiry().map(|c| c.user_pub))
+}
+
+/// This device's own certificate as stored, WITHOUT the expiry check: for
+/// saying "your access expired" truthfully, never for authorizing anything.
+pub(crate) fn own_cert_ignoring_expiry() -> Option<identity::DeviceCert> {
+    let raw = std::fs::read_to_string(crate::local_device_cert_path()).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let cert = identity::DeviceCert::from_json(&value["cert"])?;
+    let overlay_pub = crate::overlay::overlay_pubkey_bytes().ok()?;
+    (cert.device_pub == overlay_pub).then_some(cert)
+}
+
+/// The row label for the owner this device joined, once this device's own
+/// access has ended. Pure.
+pub(crate) fn own_access_expired_label(expired_at: u64) -> String {
+    format!("your access expired {}", crate::format_approval_expiry(expired_at))
 }
 
 /// The tier `devices` renders TODAY from a stored certificate. Deliberately
@@ -399,6 +419,13 @@ pub(crate) fn tier_for(
 pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
     let warm_names = warm_device_names(warm);
     let same_owner = same_owner_key();
+    // This device joined someone and its own access has ended: the rows of
+    // that owner's devices say so instead of listing what it may no longer do.
+    let own_ended = if load_owner_key().is_none() {
+        own_cert_ignoring_expiry().filter(|c| c.expires <= identity::now_secs())
+    } else {
+        None
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -454,8 +481,25 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
             let revoked = records.iter().any(|r| {
                 r["name"].as_str() == Some(name.as_str()) && record_is_revoked(r)
             });
+            // An expired delegated device has no access either: its row used
+            // to sit under FLEET with an "OWNER-EQUIVALENT shell" badge next
+            // to "lapsed", while devices --json said caps [] and the gate
+            // refused it.
+            // Same state word `devices --json` reports.
+            let ended = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(name.as_str()))
+                .map(|r| crate::device_caps::device_access_json(r, now)["state"].as_str().unwrap_or("").to_string())
+                .filter(|st| st == "expired" || st == "lapsed");
+            let own_ended_here = own_ended
+                .as_ref()
+                .filter(|own| cert.as_ref().is_some_and(|c| c.user_pub == own.user_pub));
             let caps_summary = if revoked {
                 "no access (revoked)".to_string()
+            } else if let Some(own) = own_ended_here {
+                own_access_expired_label(own.expires)
+            } else if let Some(st) = &ended {
+                format!("no access ({st})")
             } else if tier == fleet_ui::devices::DeviceTier::NeedsReview {
                 format!("uncertified · {}", device_caps_summary(&caps, tier))
             } else {

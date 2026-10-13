@@ -19,7 +19,7 @@ use std::collections::{HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
+pub(crate) const DEFAULT_SERVER: &str = "https://api.tunlion.autumated.com";
 
 /// C7: content identity for resume, sha256 over the first 256 KiB.
 pub(crate) const HEAD_BYTES: u64 = 256 * 1024;
@@ -50,13 +50,33 @@ pub(crate) static NO_RELAY: std::sync::atomic::AtomicBool =
 pub(crate) static REMEMBER_STORED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// What to say when `--remember` stored nothing. Pure.
-pub(crate) fn remember_not_stored_msg(name: &str, sending: bool) -> String {
+/// The name a sending `--remember` stored under, until the receiver's answer
+/// settles it. The sender says ONE outcome: it used to print "remembered this
+/// device as 'x'" when it stored its half and then "declined to be
+/// remembered, nothing stored" when the receiver said no.
+pub(crate) static REMEMBER_STORED_AS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set once the receiver answered the remember offer (yes or no), so the
+/// outcome has been said.
+pub(crate) static REMEMBER_ANSWERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What to say when `--remember` stored nothing. `has_identity`: whether this
+/// device has one, because `tunlion add` on a device without one is refused
+/// (exit 9), and a warning must not suggest a command that fails. Pure.
+pub(crate) fn remember_not_stored_msg(name: &str, sending: bool, has_identity: bool) -> String {
     let other = if sending { "receiver" } else { "sender" };
+    let first = if has_identity { "" } else { "tunlion init  (this device has no identity yet), then  " };
     format!(
         "--remember {name}: nothing was remembered. Both sides must pass --remember on the same code transfer, \
-         and the {other} did not. To pair this device for good:  tunlion add {name}  (and `tunlion join <code>` on the other side)"
+         and the {other} did not. To pair this device for good:  {first}tunlion add {name}  (and `tunlion join <code>` on the other side)"
     )
+}
+
+/// The one line a sending `--remember` prints when it kept its half and the
+/// receiver never answered either way. Pure.
+pub(crate) fn remember_stored_msg(stored: &str) -> String {
+    format!("  remembered this device as '{stored}' (it keeps its half only if it passed --remember too)")
 }
 
 /// Set once in `run`, before any worker spawns, from the global `--no-interactive`
@@ -289,6 +309,23 @@ pub(crate) struct TtyGuard {
 #[cfg(test)]
 mod tests {
     use crate::{MAX_PENDING, PartMeta, PendingRequest, ShellPolicy, add_pending_request};
+
+    /// RC lab item 10: the default signaling server is the tunlion host.
+    #[test]
+    fn the_default_server_is_the_tunlion_host() {
+        assert_eq!(crate::DEFAULT_SERVER, "https://api.tunlion.autumated.com");
+    }
+
+    /// RC lab items 6 and 7: the --remember warning never suggests `add` alone
+    /// on a device with no identity (that `add` is refused with exit 9).
+    #[test]
+    fn the_remember_warning_names_init_first_without_an_identity() {
+        let without = super::remember_not_stored_msg("x", true, false);
+        assert!(without.contains("tunlion init") && without.contains("tunlion add x"), "{without}");
+        assert!(without.find("tunlion init") < without.find("tunlion add x"), "{without}");
+        let with = super::remember_not_stored_msg("x", true, true);
+        assert!(!with.contains("tunlion init") && with.contains("tunlion add x"), "{with}");
+    }
 
     #[test]
     fn shell_policy_gates_auto_shell() {

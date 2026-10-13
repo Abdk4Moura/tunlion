@@ -187,6 +187,16 @@ pub(crate) fn err(kind: ExitKind, msg: impl Into<String>) -> anyhow::Error {
     Classified { kind, msg: msg.into() }.into()
 }
 
+/// `bail!` for an argument-shape error: a missing operand, flags that cannot
+/// go together, a value of the wrong form. Exit 2, as clap's own usage errors
+/// do; these used to fall through to 1 (`forward w2-a`, a bare `reach`).
+#[macro_export]
+macro_rules! bail_usage {
+    ($($t:tt)*) => {
+        return Err($crate::exit_codes::err($crate::exit_codes::ExitKind::Usage, format!($($t)*)))
+    };
+}
+
 /// "Already said; exit with this kind." See [`Reported`].
 pub(crate) fn reported(kind: ExitKind) -> anyhow::Error {
     Reported(kind, None).into()
