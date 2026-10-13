@@ -238,7 +238,8 @@ pub(crate) enum Cmd {
         /// Directory to write received files into
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Accept every offer without prompting
+        /// Accept offers in a room (no code) without asking. A code is
+        /// already your consent: `receive <code>` never asks
         #[arg(long, short = 'y')]
         yes: bool,
         /// Join an explicit room instead of the same-network auto room

@@ -93,6 +93,10 @@ pub fn enabled(lvl: Level) -> bool {
 
 pub struct Caps {
     pub tty: bool,
+    /// Redraw in place (progress bar, spinner, erase-line): a tty that is not
+    /// `TERM=dumb`. A dumb terminal promises no control sequences, and
+    /// `ESC[2K` landed there as literal noise on every progress tick.
+    pub live: bool,
     pub color: bool,
     pub truecolor: bool,
     pub unicode: bool,
@@ -114,8 +118,15 @@ pub fn caps() -> &'static Caps {
                 .unwrap_or(false);
         let var = |k: &str| std::env::var(k).ok();
         let unicode = unicode_from(var("LC_ALL"), var("LC_CTYPE"), var("LANG"), &term);
-        Caps { tty, color, truecolor, unicode }
+        let live = live_from(tty, &term);
+        Caps { tty, live, color, truecolor, unicode }
     })
+}
+
+/// Whether stderr can be redrawn in place: a tty whose TERM is not `dumb`.
+/// Pure.
+pub fn live_from(tty: bool, term: &str) -> bool {
+    tty && term != "dumb"
 }
 
 /// Whether to print Unicode glyphs, from the locale and the terminal. Pure.
@@ -382,7 +393,7 @@ pub fn link(url: &str, text: &str) -> String {
 /// clipboard behind it. Callers claim "(copied to clipboard)" only on `true`.
 pub fn clipboard(s: &str) -> bool {
     use base64_mini::enc;
-    if caps().tty {
+    if caps().live {
         err_write(&format!("\x1b]52;c;{}\x07", enc(s.as_bytes())));
         return crate::platform::clipboard_reachable();
     }
@@ -412,7 +423,7 @@ mod base64_mini {
 static LIVE: AtomicBool = AtomicBool::new(false);
 
 fn clear_live() {
-    if LIVE.swap(false, Ordering::Relaxed) && caps().tty {
+    if LIVE.swap(false, Ordering::Relaxed) && caps().live {
         err_write("\r\x1b[2K");
     }
 }
@@ -543,7 +554,7 @@ fn emit(line: &str) {
     err_write(&format!("{line}\n"));
     if let Ok(s) = STICKY.lock() {
         if let Some(st) = s.as_ref() {
-            if caps().tty {
+            if caps().live {
                 paint_live(st);
             }
         }
@@ -655,7 +666,7 @@ pub fn trace(line: &str) {
 /// keypress) outranks transients, progress bars wait their turn rather than
 /// hiding the question (C23: users answered questions they couldn't see).
 pub fn status(line: &str) {
-    if !caps().tty {
+    if !caps().live {
         return;
     }
     if let Ok(s) = STICKY.lock() {
@@ -676,15 +687,26 @@ pub fn answer_echo(c: char) {
 /// A status line that survives interleaved say()s until cleared, for open
 /// questions and countdowns.
 pub fn sticky(line: &str) {
-    if let Ok(mut s) = STICKY.lock() {
-        *s = Some(line.to_string());
+    let was_open = STICKY
+        .lock()
+        .map(|mut s| s.replace(line.to_string()).is_some())
+        .unwrap_or(false);
+    let c = caps();
+    if c.tty && !c.live {
+        // TERM=dumb: no line to repaint, so a new question (or the first
+        // frame of a countdown) is printed once, plainly, rather than not at
+        // all, and its later updates are not.
+        if !was_open {
+            err_write(&format!("{line}\n"));
+        }
+        return;
     }
     status(line);
 }
 
 pub fn clear_sticky() {
     let had = STICKY.lock().map(|mut s| s.take().is_some()).unwrap_or(false);
-    if had && caps().tty {
+    if had && caps().live {
         clear_live();
     }
 }
@@ -731,7 +753,7 @@ impl Progress {
         self.rate_ema = if self.rate_ema == 0.0 { inst } else { 0.85 * self.rate_ema + 0.15 * inst };
         self.last_draw = now;
         self.last_bytes = bytes;
-        if !caps().tty {
+        if !caps().live {
             return;
         }
         let frac = (bytes as f64 / self.total.max(1) as f64).min(1.0);
@@ -981,6 +1003,28 @@ pub fn qr_too_tall_note(url: &str, rows_used: usize) -> Option<String> {
 #[cfg(test)]
 mod verbosity_tests {
     use super::*;
+
+    /// D: the progress bar wrote ESC[2K under TERM=dumb. Only a tty that is
+    /// not dumb is redrawn in place.
+    #[test]
+    fn term_dumb_is_never_redrawn_in_place() {
+        assert!(!live_from(true, "dumb"));
+        assert!(!live_from(false, "xterm-256color"));
+        assert!(live_from(true, "xterm-256color"));
+        assert!(live_from(true, ""));
+    }
+
+    /// D: `-y` said "Accept every offer without prompting", but a code is
+    /// already consent and is never asked about; the help says so now.
+    #[test]
+    fn receive_yes_help_says_what_it_controls() {
+        let cmd = <crate::Cli as clap::CommandFactory>::command();
+        let recv = cmd.find_subcommand("receive").expect("receive");
+        let yes = recv.get_arguments().find(|a| a.get_id() == "yes").expect("-y");
+        let help = yes.get_help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help.contains("room") && help.contains("code"), "{help}");
+        assert!(!help.contains("every offer"), "{help}");
+    }
 
     #[test]
     fn flags_map_to_levels() {
