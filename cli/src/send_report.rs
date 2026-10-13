@@ -11,7 +11,7 @@
 //! ```json
 //! {"ok": true, "verb": "send", "peer": "laptop",
 //!  "file": "a.txt", "bytes": 12, "sha256": "…",
-//!  "files": [{"file": "a.txt", "bytes": 12, "sha256": "…", "delivered": true, "declined": false}]}
+//!  "files": [{"file": "a.txt", "bytes": 12, "sha256": "…", "delivered": true, "declined": false, "refused": false}]}
 //! ```
 //!
 //! `file` and `sha256` are top-level when exactly one file was sent; `bytes`
@@ -29,6 +29,11 @@
 //! or `declined` when a person (or an older receiver) said no without one.
 //! When the send failed because of refusals, `error.message` carries their
 //! sentences too, so a script reading only the top level still learns why.
+//!
+//! `declined` is true only when a person said no (reason `declined`);
+//! `refused` is true when the receiver refused it for a reason of its own
+//! (`no_space`, `read_only`, ...). A full disk used to report
+//! `"declined": true`, which reads as someone saying no.
 
 use crate::exit_codes::{self, ExitKind};
 use crate::ui;
@@ -44,7 +49,10 @@ pub(crate) struct FileReport {
     pub(crate) bytes: u64,
     pub(crate) sha256: Option<String>,
     pub(crate) delivered: bool,
+    /// A person said no (refusal reason `declined`).
     pub(crate) declined: bool,
+    /// The receiver refused it for a reason of its own (disk, name, ...).
+    pub(crate) refused: bool,
     /// The receiver's final name for it, when its ack said so.
     pub(crate) stored_name: Option<String>,
     /// Why it was not delivered: (reason token, sentence). Set for a declined
@@ -162,22 +170,37 @@ fn stored_for(id: &str) -> Option<String> {
 pub(crate) fn record(out: &[Outgoing]) {
     let files = out
         .iter()
-        .map(|o| FileReport {
-            file: o.name.clone(),
-            bytes: o.size,
-            sha256: o.full.clone(),
-            delivered: o.done && !o.declined,
-            declined: o.declined,
-            stored_name: stored_for(&o.id),
-            refusal: o.declined.then(|| {
+        .map(|o| {
+            let refusal = o.declined.then(|| {
                 refused_for(&o.id).unwrap_or_else(|| {
                     ("declined".to_string(), "the receiver declined it".to_string())
                 })
-            }),
+            });
+            let (declined, refused) = refusal_kind(refusal.as_ref());
+            FileReport {
+                file: o.name.clone(),
+                bytes: o.size,
+                sha256: o.full.clone(),
+                delivered: o.done && !o.declined,
+                declined,
+                refused,
+                stored_name: stored_for(&o.id),
+                refusal,
+            }
         })
         .collect();
     if let Ok(mut last) = LAST.lock() {
         *last = files;
+    }
+}
+
+/// (declined, refused) for a file's refusal: declined only when a person said
+/// no (reason `declined`), refused for the receiver's own reasons. Pure.
+pub(crate) fn refusal_kind(refusal: Option<&(String, String)>) -> (bool, bool) {
+    match refusal {
+        None => (false, false),
+        Some((reason, _)) if reason == "declined" => (true, false),
+        Some(_) => (false, true),
     }
 }
 
@@ -290,6 +313,7 @@ pub(crate) fn result_object(files: &[FileReport], peer: Option<&str>, res: &Resu
             "sha256": f.sha256,
             "delivered": f.delivered,
             "declined": f.declined,
+            "refused": f.refused,
             "stored_name": f.stored_name,
             "refusal": refusal_json(f),
         })).collect::<Vec<_>>(),
@@ -403,6 +427,7 @@ mod tests {
             sha256: Some("ab".repeat(32)),
             delivered: true,
             declined: false,
+            refused: false,
             stored_name: None,
             refusal: None,
         }
@@ -418,11 +443,14 @@ mod tests {
         note_refused("t-refused-1", Some("no_space"), why);
         let mut f = one("big.bin", 3_000_000);
         f.delivered = false;
-        f.declined = true;
         f.refusal = refused_for("t-refused-1");
+        (f.declined, f.refused) = refusal_kind(f.refusal.as_ref());
+        assert!(f.refused && !f.declined, "a full disk is a refusal, not a person saying no");
         let res: Result<()> = Err(exit_codes::reported(ExitKind::Denied));
         let v = result_object(&[f.clone()], Some("beta"), &res);
         assert_eq!(v["files"][0]["refusal"]["reason"], json!("no_space"));
+        assert_eq!(v["files"][0]["declined"], json!(false));
+        assert_eq!(v["files"][0]["refused"], json!(true));
         assert_eq!(v["files"][0]["refusal"]["message"], json!(why));
         assert_eq!(v["refusal"]["reason"], json!("no_space"), "single file: at the top too");
         assert_eq!(v["error"]["code"], json!("denied"));
@@ -441,17 +469,18 @@ mod tests {
     fn a_plain_decline_and_a_hostile_token_have_safe_reasons() {
         note_refused("t-refused-2", None, "the receiver declined it");
         assert_eq!(refused_for("t-refused-2").unwrap().0, "declined");
+        assert_eq!(refusal_kind(refused_for("t-refused-2").as_ref()), (true, false), "a person said no");
         assert_eq!(reason_token("NAME_TOO_LONG"), "name_too_long");
         assert_eq!(reason_token("inbox_missing"), "inbox_missing");
         assert_eq!(reason_token("\u{1b}[31mx"), "io");
         assert_eq!(reason_token(""), "io");
         // Two different reasons: per file, and no single top-level reason.
         let mut a = one("a", 1);
-        a.declined = true;
+        a.refused = true;
         a.delivered = false;
         a.refusal = Some(("no_space".into(), "no room for a".into()));
         let mut b = one("b", 1);
-        b.declined = true;
+        b.refused = true;
         b.delivered = false;
         b.refusal = Some(("name_too_long".into(), "bad name b".into()));
         let v = result_object(&[a, b], None, &Err(incomplete(0, 2)));

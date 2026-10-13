@@ -209,7 +209,7 @@ assert d["error"].get("reason") == "no_space", d["error"]
 msg = d["error"]["message"]
 assert "out of disk space" in msg and "needs" in msg and "failed (denied)" not in msg, msg
 f = d["files"][0]
-assert f["declined"] is True and f["delivered"] is False, f
+assert f["refused"] is True and f["declined"] is False and f["delivered"] is False, f
 assert f["refusal"]["reason"] == "no_space" and "needs" in f["refusal"]["message"], f
 PY
 then

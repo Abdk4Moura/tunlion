@@ -383,7 +383,8 @@ Rules that go with them:
   shown under `-v`.
 - **`send --json`** prints one result object: `ok`, `verb`, `peer`, `bytes`
   (total), `files` (each with `file`, `bytes`, `sha256`, `delivered`,
-  `declined`), `file` and `sha256` at the top when exactly one file was sent,
+  `declined` (a person said no), `refused` (the receiver refused it for a
+  reason of its own: disk full, bad name, ...)), `file` and `sha256` at the top when exactly one file was sent,
   and `error` on failure. `stored_name` (top level for one file, and per file)
   is the name the receiver stored it under, from an additive field on its
   delivery-ack; null from an older receiver. A send whose files were all
