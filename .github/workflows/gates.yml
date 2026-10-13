@@ -47,7 +47,10 @@
 # the source areas in its row changed, and the core shards (all of them; the
 # ratchet needs every one) when gates.sh or a core source area changed. The full
 # suite still runs on every pull request and on main, so quick mode is a faster
-# first signal, never the merge gate.
+# first signal, never the merge gate. A branch that already has an open pull
+# request skips the quick run: that pull request's full run starts on the same
+# push and finishes in about the same time, and two runs side by side would only
+# queue each other behind the account's 20-job concurrency limit.
 
 name: Gates
 
@@ -210,6 +213,11 @@ jobs:
           gh api "repos/${{ github.repository }}/compare/${BEFORE}...${AFTER}" --paginate \
             --jq '.files[].filename' > "$RUNNER_TEMP/changed.txt" || rm -f "$RUNNER_TEMP/changed.txt"
           echo "CHANGED_FILES_FILE=$RUNNER_TEMP/changed.txt" >> "$GITHUB_ENV"
+          # A branch with an open pull request gets the full suite from that
+          # pull request's run; plan then stands this quick run down.
+          pr=$(gh api "repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:${GITHUB_REF_NAME}" \
+                 --jq '.[0].number // empty' 2>/dev/null || true)
+          [ -n "$pr" ] && echo "OPEN_PR=#$pr" >> "$GITHUB_ENV" || true
       - name: Plan
         id: plan
         env:

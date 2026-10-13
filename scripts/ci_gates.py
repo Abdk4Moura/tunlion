@@ -175,7 +175,14 @@ def cmd_plan() -> None:
             die(f"{s['path']} is not executable (git update-index --chmod=+x)")
 
     files = changed_files() if mode == "quick" else None
-    if mode == "quick" and files is None:
+    if mode == "quick" and os.environ.get("OPEN_PR"):
+        # The pull request's own run is the full suite, and it starts on the
+        # same push. A quick run beside it would only compete with it for
+        # runners (the account runs 20 jobs at a time), so it stands down.
+        print(f"quick mode: this branch has an open pull request ({os.environ['OPEN_PR']}), "
+              "whose full run covers this push; running nothing here")
+        files = []
+    elif mode == "quick" and files is None:
         print("quick mode, but the changed files are unknown: running everything")
         mode = "full"
 
@@ -183,7 +190,8 @@ def cmd_plan() -> None:
         sel_scripts = scripts
         sel_core = True
     else:
-        print("changed files:\n  " + "\n  ".join(files))
+        if files:
+            print("changed files:\n  " + "\n  ".join(files))
         gate_lib = touches(files, ["cli/tests/lib/fixture.sh"])
         sel_scripts = []
         for s in scripts:
@@ -222,7 +230,7 @@ def cmd_plan() -> None:
         "core_shards": [c["shard"] for c in core_matrix["include"]],
     }
     print(f"mode={mode}: {len(sel_scripts)} gate script(s) in {len(bundles)} bundle(s), "
-          f"{len(core_matrix['include'])} core shard(s) + the unit shard")
+          f"{len(core_matrix['include'])} core shard(s), unit shard: {'yes' if run_unit else 'no'}")
     need_plain = bool(sel_scripts)
     need_hooks = bool(core_matrix["include"])
     build_matrix = {"include": (
@@ -418,7 +426,10 @@ def cmd_verdict() -> None:
 
 
 def main() -> None:
-    cmds = {"plan": cmd_plan, "run-bundle": cmd_run_bundle, "verdict": cmd_verdict}
+    # Line-buffered, so this file's own lines and the ratchet's (a child
+    # process writing to the same log) come out in the order they happened.
+    sys.stdout.reconfigure(line_buffering=True)
+    cmds ={"plan": cmd_plan, "run-bundle": cmd_run_bundle, "verdict": cmd_verdict}
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:
         print(f"usage: ci_gates.py {{{'|'.join(cmds)}}}", file=sys.stderr)
         sys.exit(2)
