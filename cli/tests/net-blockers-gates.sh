@@ -196,7 +196,11 @@ await_link() {
 
 say "P1/P2: SOCKS answers a denied port and an unknown peer fast"
 start_bravo off
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward --socks --port "$SOCKS_PORT" >"$WORK/proxy.log" 2>&1 &
+# The documented shape, `tunlion forward <device>:<port> --socks`: the target
+# is required by the parser and the proxy then serves every <peer>.mesh. It is
+# the same proxy_serve the daemon's auto-proxy runs, on a port of our own so
+# the two daemons on this runner cannot race for 1080.
+env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward bravo:39777 --socks --port "$SOCKS_PORT" >"$WORK/proxy.log" 2>&1 &
 FIX_PIDS+=($!)
 for _ in $(seq 1 20); do grep -qs "SOCKS5 proxy on" "$WORK/proxy.log" && break; sleep 0.5; done
 grep -qs "SOCKS5 proxy on" "$WORK/proxy.log" || { echo "proxy did not start:"; tail -5 "$WORK/proxy.log"; exit 2; }
