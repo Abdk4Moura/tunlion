@@ -1,14 +1,8 @@
 # Tunlion
 
-> **Tunlion is now Tunlion.** Same project, same people, new name. The old name
-> collided with [Tunlion](https://tunlionphp.com) the Laravel admin panel, which
-> owns the search results, so this one is ours alone.
->
-> `tunlion.autumated.com` redirects here and old GitHub links redirect to this repo,
-> so nothing you have bookmarked breaks. The published `filament-cli` crate and the
-> `cli-v0.8.5` release assets keep working unchanged; new releases ship under the new
-> name. **`api.filament.autumated.com` is deliberately unchanged** and stays up: every
-> binary already installed points at it.
+> Tunlion grew out of an earlier project called filament. It is a separate
+> tool now, with its own config, service and command names, so the two can be
+> installed side by side.
 
 **Live: [tunlion.autumated.com](https://tunlion.autumated.com)** — send files and reach your devices, peer to peer. No upload, no size cap, no account.
 
