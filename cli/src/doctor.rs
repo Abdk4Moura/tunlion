@@ -154,7 +154,7 @@ fn probe_result(outcomes: &[crate::l2::ProbeOutcome]) -> Result<()> {
 /// Pure half of `probe_result`: `None` when every probe established.
 fn probe_failure_kind(outcomes: &[crate::l2::ProbeOutcome]) -> Option<ExitKind> {
     let failed = outcomes.iter().find(|o| !o.established)?;
-    Some(crate::ping::cold_failure_kind(failed.error.as_deref()))
+    Some(crate::ping::probe_outcome_kind(failed))
 }
 
 /// A computed verdict for one probe: the headline phase + a human line.
@@ -364,7 +364,7 @@ fn single_json(device: &str, o: &crate::l2::ProbeOutcome) -> Value {
         "failed_phase": o.failed_phase.map(|p| p.label()),
         // The shared failure object (null when the probe established).
         "error": (!o.established).then(|| {
-            verb_error(crate::ping::cold_failure_kind(o.error.as_deref()), o.error.as_deref())
+            verb_error(crate::ping::probe_outcome_kind(o), o.error.as_deref())
         }),
         "path": o.path.as_ref().map(|p| p.to_json()),
         "verdict": {
@@ -406,7 +406,7 @@ fn repeat_json(device: &str, outcomes: &[crate::l2::ProbeOutcome]) -> Value {
     }
     let unhealthy = outcomes.iter().filter(|o| !verdict(o).healthy).count();
     let error = outcomes.iter().find(|o| !o.established).map(|o| {
-        verb_error(crate::ping::cold_failure_kind(o.error.as_deref()), o.error.as_deref())
+        verb_error(crate::ping::probe_outcome_kind(o), o.error.as_deref())
     });
     json!({
         // Every run established, the same rule the exit code applies.

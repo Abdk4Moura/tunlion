@@ -575,8 +575,12 @@ pub(crate) async fn handle_auth_key_enroll_response(
             ack["device_pub"] = json!(hex::encode(device_pub));
             ack["max_offline"] = json!(ak.max_offline);
             let _ = t.send_control(&ack).await;
+            // A `--for <device>` invitation enrolls a lasting device under its
+            // name; only a session-only enrolment is ephemeral.
+            let kind = if persistent { "device" } else { "ephemeral device" };
+            let who = if persistent { stored_name.as_str() } else { pid.as_str() };
             ui::say(&format!(
-                "  {} ephemeral device {pid} enrolled (caps: {})",
+                "  {} {kind} {who} enrolled (caps: {})",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                 capability_list_summary(&ak.caps)
             ));

@@ -113,6 +113,10 @@ mod send_cmd;
 mod send_source;
 /// `tunlion send --json`: the result object.
 mod send_report;
+/// What a one-shot `tunlion receive` stored or refused, its exit, and `--json`.
+mod recv_report;
+/// Corrupt state files are an error naming the file, never "empty".
+mod state_files;
 mod transfer_history;
 /// What `send` says, and how long it waits, when its receiver goes away.
 mod send_liveness;
@@ -718,6 +722,7 @@ fn config_get(key: &str) -> Option<String> {
 
 fn config_set(key: &str, value: &str) -> Result<()> {
     let p = config_path();
+    crate::state_files::before_write(&p)?;
     let mut lines: Vec<String> = std::fs::read_to_string(&p)
         .unwrap_or_default()
         .lines()

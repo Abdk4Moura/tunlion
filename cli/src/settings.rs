@@ -445,6 +445,7 @@ fn global_get(store: &str) -> Option<String> {
 
 fn global_put(store: &str, value: &str) -> Result<()> {
     let p = global_path();
+    crate::state_files::before_write(&p)?;
     let mut lines: Vec<String> = std::fs::read_to_string(&p)
         .unwrap_or_default()
         .lines()
@@ -475,6 +476,7 @@ fn global_remove(store: &str) -> Result<bool> {
         .collect();
     let removed = kept.len() != raw.lines().count();
     if removed {
+        crate::state_files::before_write(&p)?;
         crate::platform::SecretFile::write_str(
             &p,
             &(kept.join("\n") + if kept.is_empty() { "" } else { "\n" }),
@@ -492,6 +494,7 @@ fn peer_load() -> serde_json::Map<String, Value> {
 }
 
 fn peer_save(m: &serde_json::Map<String, Value>) -> Result<()> {
+    crate::state_files::before_write(&peer_path())?;
     crate::platform::SecretFile::write_str(&peer_path(), &serde_json::to_string_pretty(&Value::Object(m.clone()))?)?;
     Ok(())
 }
