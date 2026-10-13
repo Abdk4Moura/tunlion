@@ -383,8 +383,17 @@ rcFG=$?
 pkill -f "up --dir $WORK/$FORGOTTEN-drop" 2>/dev/null || true
 sleep 2
 start_spoke "$DFG" "$FORGOTTEN-again"
-sleep 10
-FG_HELLO=0; grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null && FG_HELLO=1
+# Wait for the hello itself, not a fixed time: a fixed `sleep 10` expired while
+# the restarted daemon was still connecting (~1 run in 7). Bounded at 60 s, then
+# a settle so the owner has had time to (wrongly) re-admit it before we look.
+FG_HELLO=0
+for _ in $(seq 1 60); do
+  if grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null; then
+    FG_HELLO=1; break
+  fi
+  sleep 1
+done
+sleep 5
 FG_REINDEXED=$(python3 -c "import json;print(1 if any(d.get('deviceCert',{}).get('devicePub')=='$FG_PUB' or d.get('name')=='$FORGOTTEN' for d in json.load(open('$DA/devices.json'))) else 0)" 2>/dev/null)
 FG_LISTED=$(python3 -c "import json;print(1 if any(e.get('devicePub')=='$FG_PUB' for e in json.load(open('$DA/revoked-keys.json'))) else 0)" 2>/dev/null)
 echo "## forget rc=$rcFG key=${FG_PUB:0:16}... on key list=$FG_LISTED re-indexed after a fresh hello=$FG_REINDEXED (hello attempted=$FG_HELLO)"
