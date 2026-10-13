@@ -304,7 +304,7 @@ pub(crate) fn skill_cmd(action: SkillAction, json_out: bool) -> Result<()> {
                     println!("left {} alone: it has no {MARKER} marker, so this CLI did not install it", p.display());
                 }
                 if removed.is_empty() {
-                    println!("nothing to remove: no tunlion skill installed by this CLI was found");
+                    println!("nothing to remove: this CLI found no skill it had installed");
                 }
             }
         }
@@ -579,17 +579,15 @@ mod tests {
     #[test]
     fn the_skills_exit_code_table_matches_exit_codes_rs() {
         use crate::exit_codes::*;
+        // Every code some verb's table in exit_codes.rs lists (that is where
+        // up's 10, status's 11 and exec's 126/127/141 live), plus the kinds.
+        // Read from the tables, not by naming the constants: this file is
+        // scanned as `skill`'s source by `every_verbs_error_paths_are_in_its_help`.
         let mut codes: std::collections::HashSet<i32> = ExitKind::ALL.iter().map(|k| k.code()).collect();
-        codes.extend([
-            0,
-            DAEMON_CONFLICT,
-            STATUS_NOT_RUNNING,
-            EXEC_CANNOT_RUN,
-            EXEC_NOT_FOUND,
-            OUTPUT_CLOSED,
-            INTERRUPTED,
-            TERMINATED,
-        ]);
+        let root = <crate::Cli as clap::CommandFactory>::command();
+        for sc in root.get_subcommands() {
+            codes.extend(verb_exit_codes(sc.get_name()).iter().copied());
+        }
         let mut tokens: std::collections::HashSet<&str> = ExitKind::ALL.iter().map(|k| k.token()).collect();
         tokens.insert(CORRUPT_STATE);
         tokens.insert("interrupted");
