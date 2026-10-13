@@ -67,7 +67,7 @@ No inbound ports, no VPN config, no accounts — reachability rides the same aut
 
 ## Use it from an AI agent
 
-Every command that matters to a script takes `--json` and exits with a documented code (`tunlion --help`, EXIT CODES). To teach a coding agent the right commands, install the bundled skill. It is opt-in: nothing else ever installs it.
+Every command that matters to a script takes `--json` and exits with a documented code (`tunlion --help`, EXIT CODES). To teach a coding agent the right commands, install the bundled skill ([cli/skills/tunlion/SKILL.md](cli/skills/tunlion/SKILL.md)). It is opt-in: nothing else ever installs it.
 
 ```sh
 tunlion skill install               # into ~/.claude/skills and/or ~/.agents/skills, whichever exist

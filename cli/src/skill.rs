@@ -1,6 +1,7 @@
 //! `tunlion skill`: the opt-in agent skill.
 //!
-//! The binary carries skills/tunlion/SKILL.md, so the skill it installs always
+//! The binary carries cli/skills/tunlion/SKILL.md (inside the crate, so the
+//! crates.io package has it too), so the skill it installs always
 //! describes the commands this build accepts (`the_skill_names_only_real_commands_and_flags`
 //! below keeps the file honest). Nothing else ever installs it: not `init`, not
 //! `up`, not the install scripts. A person runs `tunlion skill install` or the
@@ -22,7 +23,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// The skill, as this build describes itself.
-pub(crate) const SKILL_MD: &str = include_str!("../../skills/tunlion/SKILL.md");
+pub(crate) const SKILL_MD: &str = include_str!("../skills/tunlion/SKILL.md");
 /// The ownership marker inside an installed skill directory.
 pub(crate) const MARKER: &str = ".tunlion-skill";
 /// The skill's directory name under a skills directory.

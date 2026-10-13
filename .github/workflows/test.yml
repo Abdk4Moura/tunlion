@@ -60,6 +60,22 @@ jobs:
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      # `tunlion skill` embeds cli/skills/tunlion/SKILL.md with include_str!,
+      # and `cargo publish` (publish-registries.yml, cli-v* tags) verifies by
+      # building the packaged crate. A file the package leaves out is a failed
+      # release, found only at tag time. Ask cargo what it would package.
+      - name: The packaged crate carries the agent skill
+        working-directory: cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --list --allow-dirty > "$RUNNER_TEMP/package-list.txt"
+          if ! grep -qx 'skills/tunlion/SKILL.md' "$RUNNER_TEMP/package-list.txt"; then
+            echo "::error::cargo package for filament-cli does not include skills/tunlion/SKILL.md"
+            cat "$RUNNER_TEMP/package-list.txt"
+            exit 1
+          fi
+          echo "OK: skills/tunlion/SKILL.md is in the package"
       # The real-kernel subnet-forwarding rig. It needs root and rewrites the
       # firewall, so it is `#[ignore]` in the plain run above and, until this
       # step existed, ran nowhere: it returned early without
