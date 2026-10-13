@@ -2460,6 +2460,28 @@ fn forward_refusal_fix(peer: &str, reason: &str) -> Option<(String, Option<Strin
     Some(crate::refusal::remedy(code, peer, &me))
 }
 
+/// G: `forward` rides the shell grant, so a device without one was refused
+/// with the shell remedy (a grant, or a re-enrolment for a ceiling) even for a
+/// port the peer had EXPOSED, which needs no shell at all. For a refusal about
+/// shell, also name the route that works for an exposed port: `<peer>.mesh`,
+/// directly with a kernel TUN or through the daemon's SOCKS5 proxy. Pure.
+pub(crate) fn forward_exposed_note(peer: &str, rport: u16, reason: &str) -> Option<String> {
+    use crate::refusal::Code;
+    let code = crate::refusal::code_from_reason(reason)?;
+    matches!(
+        code,
+        Code::ShellOff | Code::TunnelOff | Code::NotGranted | Code::Revoked | Code::Ceiling
+    )
+    .then(|| {
+        let host = format!("{}.mesh", peer.to_ascii_lowercase());
+        format!(
+            "If '{peer}' exposed port {rport} (`tunlion expose {rport}` there), no shell is needed: \
+             open {host}:{rport} directly, or through the SOCKS5 proxy `tunlion up` runs here \
+             (`tunlion status` shows its curl line), e.g. curl -x socks5h://... http://{host}:{rport}/"
+        )
+    })
+}
+
 /// Act on a probe verdict: a POLICY refusal (the peer will refuse every
 /// connection: tunnels off, no grant, revoked) ends the forward now with the
 /// reason and its remedy; a refusal of the target port itself (nothing
@@ -2469,11 +2491,14 @@ fn forward_probe_verdict(peer: &str, rport: u16, probe: ForwardProbe) -> Result<
         ForwardProbe::Accepted | ForwardProbe::Silent => Ok(ForwardTarget::Open),
         ForwardProbe::Refused(reason) => match classify_forward_refusal(&reason) {
             ForwardRefusal::Policy => {
-                let fix = match forward_refusal_fix(peer, &reason) {
+                let mut fix = match forward_refusal_fix(peer, &reason) {
                     Some((text, Some(c))) => format!("\n  {text}\n    {c}"),
                     Some((text, None)) => format!("\n  {text}"),
                     None => String::new(),
                 };
+                if let Some(note) = forward_exposed_note(peer, rport, &reason) {
+                    fix.push_str(&format!("\n  {note}"));
+                }
                 bail!("tunlion: {peer}:{rport} refused the connection: {reason}{fix}");
             }
             ForwardRefusal::NothingListening => {
@@ -3817,6 +3842,9 @@ impl ForwardActivity {
             if let Some(c) = cmd {
                 crate::ui::critical(&format!("    {c}"));
             }
+        }
+        if let Some(note) = forward_exposed_note(&self.peer, self.rport, reason) {
+            crate::ui::critical(&format!("  {note}"));
         }
         if policy {
             let _ = self.denied.send(reason.trim().to_string());
@@ -5878,6 +5906,27 @@ async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
         Ok(Ok(_)) => Some(true),   // a listener answered (sshd banner)
         Ok(Err(_)) => Some(false), // stream error: treat as unreachable
         Err(_) => None,            // no banner in time: inconclusive, don't block
+    }
+}
+
+#[cfg(test)]
+mod forward_exposed_note_tests {
+    use super::forward_exposed_note;
+
+    /// G: a forward refused for want of shell names the route for an exposed
+    /// port; a refusal that has nothing to do with shell does not.
+    #[test]
+    fn a_shell_refusal_points_to_the_mesh_route_for_exposed_ports() {
+        for reason in [
+            crate::capability::CEILING_REASON,
+            crate::capability::TUNNEL_OFF_REASON,
+            crate::capability::SHELL_OFF_REASON,
+            "shell not granted to 'b' here",
+        ] {
+            let n = forward_exposed_note("Alpha", 7777, reason).unwrap_or_else(|| panic!("{reason}"));
+            assert!(n.contains("alpha.mesh:7777") && n.contains("expose 7777") && n.contains("SOCKS5"), "{n}");
+        }
+        assert!(forward_exposed_note("alpha", 7777, "connection refused").is_none());
     }
 }
 
