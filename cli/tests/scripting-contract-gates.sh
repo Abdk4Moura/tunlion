@@ -20,6 +20,16 @@
 #   J5   a send into a receiver whose disk is too small, with --json: exit 4,
 #        error.reason "no_space", the receiver's sentence (with both sizes) in
 #        error.message and in files[0].refusal. It said "failed (denied)".
+#   K1   `receive -y --json` into a disk too small for the offer: exit 12
+#        (local_resource, reason no_space) within seconds. It held the line
+#        25 s and then blamed the sender: "unreachable", exit 6.
+#   K2   `receive --json` with no tty and no -y: exit 2 (usage, reason
+#        no_tty) naming -y, within seconds. It was the same exit 6 after 30 s.
+#   K3   a corrupt devices.json: `devices`, `devices --json` and `send --to`
+#        exit 2 naming the file, and nothing writes over it. It listed no
+#        devices with exit 0 and `send --to` said "no such device" (3).
+#   K4   `send --code --json`: the code arrives on stdout as an event line
+#        first, then the result object. It was on stderr only.
 #
 # J5 mounts a small tmpfs, so it needs passwordless sudo (GitHub's ubuntu
 # runners have it). Without it the script REFUSES (exit 2) rather than report
@@ -203,6 +213,138 @@ then
 else
   bad "J5: disk-full reason in --json (rc=$rc)"
   tail -5 "$WORK/j5.err"; tail -5 "$WORK/B-up.log"
+fi
+
+# ===================================================================== K* ======
+# The receiver tells the truth about itself, and state files are never "empty".
+# The receivers below are fresh config dirs with no identity and no pairing,
+# meeting the sender in an explicit room, so nothing auto-accepts.
+kill "$BDAEMON" 2>/dev/null; sleep 2
+since() { echo $(( $(date +%s) - $1 )); }
+
+# One receive --json result object, checked against what the gate expects.
+# $1 json file, $2 rc, $3 want exit, $4 want code, $5 want reason, $6 elapsed, $7 bound
+check_recv() {
+  "$PYV" - "$@" <<'PY'
+import json, sys
+out, rc, want, code, reason, took, bound = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6]), int(sys.argv[7])
+docs = [l for l in open(out) if l.strip()]
+assert rc == want, f"exit {rc}, want {want}"
+assert len(docs) == 1, f"{len(docs)} documents"
+d = json.loads(docs[0])
+assert d["ok"] is (rc == 0) and d["verb"] == "receive", d
+e = d["error"]
+assert e["code"] == code and e["exit"] == want and e.get("reason") == reason, e
+assert "unreachable" not in e["message"], e["message"]
+f = d["files"][0]
+assert f["received"] is False and f["refusal"]["reason"] == reason, f
+assert took < bound, f"took {took}s: the receive held the line after refusing"
+PY
+}
+
+say "K1: receive into a full disk: exit 12 with its reason, promptly, in --json"
+TINY2="$WORK/tiny2"; mkdir -p "$TINY2"
+sudo -n mount -t tmpfs -o "size=2m,uid=$(id -u),gid=$(id -g),mode=0700" tmpfs "$TINY2" \
+  || { echo "REFUSED: cannot mount a tmpfs at $TINY2"; exit 2; }
+MOUNTS+=("$TINY2")
+DK1="$WORK/cfg-K1"; mkdir -p "$DK1"
+t0=$(date +%s)
+env FILAMENT_CONFIG_DIR="$DK1" timeout 90 "$BIN" --server "$SERVER" receive --room k1room --dir "$TINY2" -y --json \
+  >"$WORK/k1.json" 2>"$WORK/k1.err" &
+K1PID=$!
+sleep 4
+env FILAMENT_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$WORK/three.bin" --room k1room >"$WORK/k1-send.log" 2>&1
+src=$?
+wait "$K1PID"; rc=$?
+took=$(since "$t0")
+echo "## receive rc=$rc in ${took}s, send rc=$src"; cat "$WORK/k1.json"; tail -3 "$WORK/k1.err"
+if check_recv "$WORK/k1.json" "$rc" 12 local_resource no_space "$took" 30; then
+  ok "K1: a receiver out of disk space exits 12 (local_resource, no_space) at once, not 6 after holding the line"
+else
+  bad "K1: receive disk full (rc=$rc, ${took}s)"
+fi
+
+say "K2: receive with no tty and no -y: exit 2 naming -y, promptly, in --json"
+DK2="$WORK/cfg-K2"; mkdir -p "$DK2" "$WORK/k2-drop"
+head -c 1000 /dev/urandom >"$WORK/small.bin"
+t0=$(date +%s)
+env FILAMENT_CONFIG_DIR="$DK2" timeout 90 "$BIN" --server "$SERVER" receive --room k2room --dir "$WORK/k2-drop" --json \
+  </dev/null >"$WORK/k2.json" 2>"$WORK/k2.err" &
+K2PID=$!
+sleep 4
+env FILAMENT_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$WORK/small.bin" --room k2room >"$WORK/k2-send.log" 2>&1
+src=$?
+wait "$K2PID"; rc=$?
+took=$(since "$t0")
+echo "## receive rc=$rc in ${took}s, send rc=$src"; cat "$WORK/k2.json"; tail -3 "$WORK/k2.err"
+if check_recv "$WORK/k2.json" "$rc" 2 usage no_tty "$took" 30 \
+   && grep -q -- "-y" "$WORK/k2.json"; then
+  ok "K2: a receive that cannot ask exits 2 (usage, no_tty) naming -y, not 6 after 30 s"
+else
+  bad "K2: receive without a tty or -y (rc=$rc, ${took}s)"
+fi
+
+say "K3: a corrupt devices.json is an error naming it, and is never written over"
+DK3="$WORK/cfg-K3"; cp -a "$DA" "$DK3"
+printf '{garbage\n' >"$DK3/devices.json"
+env FILAMENT_CONFIG_DIR="$DK3" timeout 20 "$BIN" devices >"$WORK/k3-dev.out" 2>"$WORK/k3-dev.err"; r1=$?
+env FILAMENT_CONFIG_DIR="$DK3" timeout 20 "$BIN" devices --json >"$WORK/k3-json.out" 2>"$WORK/k3-json.err"; r2=$?
+env FILAMENT_CONFIG_DIR="$DK3" timeout 30 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxB >"$WORK/k3-send.out" 2>&1; r3=$?
+env FILAMENT_CONFIG_DIR="$DK3" timeout 20 "$BIN" grant boxB shell -y >"$WORK/k3-grant.out" 2>&1; r4=$?
+echo "## devices rc=$r1 devices --json rc=$r2 send rc=$r3 grant rc=$r4"
+cat "$WORK/k3-dev.err" "$WORK/k3-json.out"
+if [ "$r1" = 2 ] && [ "$r2" = 2 ] && [ "$r3" = 2 ] && [ "$r4" != 0 ] \
+   && grep -q "devices.json" "$WORK/k3-dev.err" && grep -q "devices.json" "$WORK/k3-send.out" \
+   && [ "$(cat "$DK3/devices.json")" = "{garbage" ] \
+   && "$PYV" - "$WORK/k3-json.out" <<'PY'
+import json, sys
+docs = [l for l in open(sys.argv[1]) if l.strip()]
+assert len(docs) == 1, docs
+d = json.loads(docs[0])
+assert d["ok"] is False and d["error"]["code"] == "usage" and d["error"]["exit"] == 2, d
+assert "devices.json" in d["error"]["message"], d
+PY
+then
+  ok "K3: corrupt devices.json: devices, devices --json and send exit 2 naming it; nothing overwrote it"
+else
+  bad "K3: corrupt devices.json (devices=$r1 json=$r2 send=$r3 grant=$r4)"
+  cat "$WORK/k3-send.out" "$WORK/k3-grant.out"
+fi
+
+say "K4: send --json with a code prints the code on stdout before it ends"
+DK4="$WORK/cfg-K4"; mkdir -p "$DK4" "$WORK/k4-drop"
+env FILAMENT_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/small.bin" --code --json \
+  >"$WORK/k4.json" 2>"$WORK/k4.err" &
+K4PID=$!
+CODE=""
+for _ in $(seq 1 30); do
+  CODE=$("$PYV" -c 'import json,sys
+l=open(sys.argv[1]).readline()
+d=json.loads(l) if l.strip() else {}
+print(d.get("code","") if d.get("event")=="code" else "")' "$WORK/k4.json" 2>/dev/null)
+  [ -n "$CODE" ] && break
+  sleep 0.5
+done
+echo "## code from stdout: '$CODE'"
+[ -n "$CODE" ] && env FILAMENT_CONFIG_DIR="$DK4" timeout 60 "$BIN" --server "$SERVER" receive "$CODE" -y --dir "$WORK/k4-drop" \
+  >"$WORK/k4-recv.log" 2>&1
+wait "$K4PID"; rc=$?
+echo "## send rc=$rc"; cat "$WORK/k4.json"
+if [ -n "$CODE" ] && "$PYV" - "$WORK/k4.json" "$rc" "$CODE" <<'PY'
+import json, sys
+docs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+rc, code = int(sys.argv[2]), sys.argv[3]
+assert len(docs) == 2, f"{len(docs)} lines"
+ev, res = docs
+assert ev["event"] == "code" and ev["code"] == code and ev["expires_in_secs"] == 600, ev
+assert "ok" not in ev, ev
+assert res["ok"] is True and rc == 0 and res["verb"] == "send", (rc, res)
+PY
+then
+  ok "K4: code send --json: the code event first on stdout, then the result object"
+else
+  bad "K4: code send --json (rc=$rc code='$CODE')"
+  tail -5 "$WORK/k4.err"; tail -5 "$WORK/k4-recv.log"
 fi
 
 # ========================================================================= sum =

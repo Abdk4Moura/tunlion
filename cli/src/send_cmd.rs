@@ -707,10 +707,16 @@ pub(crate) async fn send_cmd(
     // legitimate transfer is never interrupted by this. Overridable / disablable
     // (0 = off) via FILAMENT_SEND_TIMEOUT.
     // `--timeout` wins over FILAMENT_SEND_TIMEOUT, which stays as the fallback.
-    let establish_deadline = establish_window(
-        timeout,
-        std::env::var("FILAMENT_SEND_TIMEOUT").ok().as_deref(),
-    );
+    // A code send waits for a person to type the code, so its default window
+    // is the code's own lifetime: it advertised "expires in 10 min" and gave
+    // up after 60 s. An explicit --timeout (or FILAMENT_SEND_TIMEOUT) still
+    // wins, and the advertised expiry is then that bound (code_expiry_words).
+    let send_timeout_env = std::env::var("FILAMENT_SEND_TIMEOUT").ok();
+    let establish_deadline = if use_code && known_target.is_none() {
+        code_establish_window(timeout, send_timeout_env.as_deref(), claim_deadline)
+    } else {
+        establish_window(timeout, send_timeout_env.as_deref())
+    };
     // A known device that has shown NO presence on the server is offline, and
     // waiting the whole establishment window for it only delays the answer.
     // Fail with exit 6 after this short, bounded wait instead. Disabled with
@@ -772,8 +778,38 @@ pub(crate) async fn send_cmd(
     let mut receiver_asking = false;
     // The receiver the unfinished files were last offered to (its signaling id).
     let mut offered_to: Option<String> = None;
+    // Progress while waiting on the peer (send_liveness::still_waiting_line).
+    let mut last_heartbeat = Instant::now();
+    let peer_label = known_target
+        .as_ref()
+        .map(|(n, _)| format!("'{n}'"))
+        .unwrap_or_else(|| "the receiver".to_string());
 
     loop {
+        // Never a silent minute: while the peer has not connected, or has
+        // stopped answering mid-send, say so every few seconds. Not while a
+        // code waits to be typed, and not while a person there is deciding.
+        if last_heartbeat.elapsed() >= crate::send_liveness::HEARTBEAT {
+            last_heartbeat = Instant::now();
+            let waiting_for_claim = use_code && known_target.is_none() && !code_used;
+            if !waiting_for_claim && !receiver_asking {
+                let unfinished = outgoing.lock().await.iter().any(|o| !o.done && !o.declined);
+                let heard = conn
+                    .active
+                    .as_ref()
+                    .and_then(|p| conn.transport_of(p))
+                    .and_then(|t| t.heard_ms().or_else(|| Some(t.idle_ms())));
+                if let Some(line) = crate::send_liveness::still_waiting_line(
+                    &peer_label,
+                    established,
+                    started.elapsed(),
+                    heard,
+                    unfinished,
+                ) {
+                    ui::say(&ui::paint(ui::Tone::Dim, &line));
+                }
+            }
+        }
         // No answer to an outstanding offer within the bound: fail, and say what
         // is most likely true, instead of waiting on silence forever.
         if !answer_wait.is_zero() && !receiver_asking {
@@ -818,10 +854,20 @@ pub(crate) async fn send_cmd(
         if !established && !establish_deadline.is_zero() && started.elapsed() >= establish_deadline
         {
             ui::clear_sticky();
+            // With --relay the only path is the TURN relay. A peer that showed
+            // up on the tunlion server and still never connected points at
+            // the relay, not at the peer.
+            let hint = if relay && !saw_known_peer.is_empty() {
+                "the peer is on the tunlion server, but no relayed path came up: the TURN relay \
+                 may be unreachable from here (--relay forces it; drop --relay to try a direct path)"
+                    .to_string()
+            } else {
+                peer_hint.clone()
+            };
             return Err(exit_codes::err(
                 ExitKind::Unreachable,
                 format!(
-                    "no peer connected within {}s: {peer_hint} \
+                    "no peer connected within {}s: {hint} \
                      (--timeout <secs> to change, 0 to wait without limit)",
                     establish_deadline.as_secs()
                 ),
@@ -1113,8 +1159,20 @@ pub(crate) async fn send_cmd(
             // server never echoes any words). The receiver runs the SAME
             // ephemeral SPAKE2 ceremony before any byte flows.
             Ev::PairOk(v) => {
-                let ttl = v["ttl"].as_u64().unwrap_or(600);
+                let ttl = code_expiry_secs(v["ttl"].as_u64().unwrap_or(600), establish_deadline);
                 let full = format!("{send_words}-{send_nameplate}");
+                // Under --json the code is data a script needs BEFORE the
+                // send ends: an event line on stdout now, the result object
+                // at the end (docs/ui/OUTPUT.md). It was on stderr only.
+                if exit_codes::json_mode() {
+                    ui::json_event(&json!({
+                        "event": "code",
+                        "verb": "send",
+                        "code": full,
+                        "expires_in_secs": ttl,
+                        "receive": format!("tunlion receive {full}"),
+                    }));
+                }
                 let site = if server == DEFAULT_SERVER {
                     "https://tunlion.autumated.com".to_string()
                 } else {
@@ -1144,8 +1202,8 @@ pub(crate) async fn send_cmd(
                     ui::paint(
                         ui::Tone::Dim,
                         &format!(
-                            "one claim · expires in {} min · authenticated end-to-end (no key crosses the server)",
-                            ttl / 60
+                            "one claim · expires in {} · authenticated end-to-end (no key crosses the server)",
+                            code_expiry_words(ttl)
                         )
                     )
                 ));
@@ -1209,7 +1267,10 @@ pub(crate) async fn send_cmd(
                             continue;
                         }
                         if !saw_known_peer.contains(n) {
-                            ui::say(&format!("known device '{n}' is online, connecting"));
+                            // Presence on the server, not an answer: a frozen
+                            // or killed daemon stays listed there for a while,
+                            // so this must not claim the peer is online.
+                            ui::say(&format!("found '{n}' on the tunlion server, connecting"));
                         }
                         saw_known_peer.insert(n.clone());
                         // rung-1: both ends are CLIs (known device), try direct
@@ -2216,9 +2277,20 @@ pub(crate) async fn send_cmd(
                 }
             }
             Ev::Interrupted => {
+                // Only a transfer that started can have left a partial there.
+                let started_any = {
+                    let out = outgoing.lock().await;
+                    crate::send_report::record(&out);
+                    out.iter().any(|o| o.accepted_once || o.sent)
+                };
                 ui::say(&format!(
-                    "  {} interrupted, the receiver keeps its partial; re-run the same command to resume",
-                    ui::paint(ui::Tone::Warn, "!")
+                    "  {} {}",
+                    ui::paint(ui::Tone::Warn, "!"),
+                    if started_any {
+                        "interrupted, the receiver keeps its partial; re-run the same command to resume"
+                    } else {
+                        "interrupted before any file was sent; nothing reached the receiver"
+                    }
                 ));
                 let _ = sio.disconnect().await;
                 crate::exit_codes::interrupted_exit(130);
@@ -2872,6 +2944,26 @@ pub(crate) fn establish_window(flag: Option<u64>, env: Option<&str>) -> Duration
     Duration::from_secs(secs)
 }
 
+/// A code send's establishment window: `--timeout`, then FILAMENT_SEND_TIMEOUT,
+/// then the code's lifetime (`claim`). Pure.
+pub(crate) fn code_establish_window(flag: Option<u64>, env: Option<&str>, claim: Duration) -> Duration {
+    if flag.is_none() && env.and_then(|v| v.trim().parse::<u64>().ok()).is_none() {
+        return claim;
+    }
+    establish_window(flag, env)
+}
+
+/// How long the code really stays usable: the server's `ttl`, cut to the
+/// send's own window when that is shorter (0 = no limit). Pure.
+pub(crate) fn code_expiry_secs(ttl: u64, establish: Duration) -> u64 {
+    if establish.is_zero() { ttl } else { ttl.min(establish.as_secs()) }
+}
+
+/// "10 min", or "45 s" under two minutes. Pure.
+pub(crate) fn code_expiry_words(secs: u64) -> String {
+    if secs >= 120 { format!("{} min", secs / 60) } else { format!("{secs} s") }
+}
+
 /// How long a known device may show no presence at all before `send` calls it
 /// offline: 10 s (FILAMENT_SEND_OFFLINE_SECS overrides), never longer than the
 /// establishment window, and `None` when that window is unlimited. Pure.
@@ -3089,5 +3181,26 @@ impl Drop for SendSpan {
         if let Some(a) = self.0.as_mut().filter(|a| !a.finished()) {
             a.fail("send ended before a channel to the device opened");
         }
+    }
+}
+
+#[cfg(test)]
+mod code_window_tests {
+    use super::{code_establish_window, code_expiry_secs, code_expiry_words};
+    use std::time::Duration;
+
+    /// A code send advertised "expires in 10 min" and gave up after 60 s.
+    #[test]
+    fn a_code_send_waits_as_long_as_it_advertises() {
+        let claim = Duration::from_secs(600);
+        let w = code_establish_window(None, None, claim);
+        assert_eq!(w, claim);
+        assert_eq!(code_expiry_words(code_expiry_secs(600, w)), "10 min");
+        let w = code_establish_window(Some(30), None, claim);
+        assert_eq!(w, Duration::from_secs(30));
+        assert_eq!(code_expiry_words(code_expiry_secs(600, w)), "30 s");
+        let w = code_establish_window(None, Some("90"), claim);
+        assert_eq!(code_expiry_secs(600, w), 90);
+        assert_eq!(code_expiry_secs(600, Duration::ZERO), 600);
     }
 }

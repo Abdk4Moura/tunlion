@@ -181,6 +181,28 @@ pub(crate) fn record(out: &[Outgoing]) {
     }
 }
 
+/// The peer this send targets, for an interrupt's result object.
+static PEER: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn set_peer(peer: Option<&str>) {
+    if let Ok(mut p) = PEER.lock() {
+        *p = peer.map(str::to_string);
+    }
+}
+
+/// An interrupted `send --json` answers with the same object as every other
+/// send failure (`peer`, `bytes`, `files`), carrying the interrupt's `error`.
+/// It used to be a bare `{ok, verb, error}`, a different shape for one kind
+/// of failure.
+pub(crate) fn interrupted_object(envelope: Value) -> Value {
+    let files = LAST.lock().map(|l| l.clone()).unwrap_or_default();
+    let peer = PEER.lock().ok().and_then(|p| p.clone());
+    let mut v = result_object(&files, peer.as_deref(), &Ok(()));
+    v["ok"] = json!(false);
+    v["error"] = envelope["error"].clone();
+    v
+}
+
 fn take() -> Vec<FileReport> {
     LAST.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default()
 }
@@ -354,6 +376,18 @@ pub(crate) fn emit(res: Result<()>, peer: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An interrupted send has the shape of every other send failure.
+    #[test]
+    fn an_interrupt_is_the_send_result_object_with_its_error() {
+        let env = json!({"ok": false, "error": {"code": "interrupted", "exit": 130, "signal": "SIGINT"}});
+        let v = interrupted_object(env);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["verb"], json!("send"));
+        assert_eq!(v["error"]["code"], json!("interrupted"));
+        assert_eq!(v["error"]["exit"], json!(130));
+        assert!(v["files"].is_array() && v.get("bytes").is_some() && v.get("peer").is_some(), "{v}");
+    }
 
     #[test]
     fn a_failed_sends_sources_are_named_for_the_history() {

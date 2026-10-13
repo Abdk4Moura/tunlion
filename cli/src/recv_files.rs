@@ -469,11 +469,24 @@ pub(crate) fn inbox_refusal(dir: &Path, name: &str, e: &std::io::Error) -> (&'st
     )
 }
 
+/// Free space under which `inbox_problem` calls the inbox's disk full.
+const INBOX_FULL_BELOW: u64 = 1024 * 1024;
+
 /// What `status` and `doctor` say about an inbox, when something is wrong with
-/// it. `None` when it is a directory.
+/// it: missing, not a directory, or on a full disk. `None` otherwise.
 pub(crate) fn inbox_problem(dir: &Path) -> Option<String> {
     match std::fs::metadata(dir) {
-        Ok(m) if m.is_dir() => None,
+        // A full disk refuses every file as surely as a missing inbox: say it
+        // here too (it was not flagged at 100%).
+        Ok(m) if m.is_dir() => crate::platform::free_space(dir)
+            .filter(|free| *free < INBOX_FULL_BELOW)
+            .map(|free| {
+                format!(
+                    "the disk holding inbox {} is full ({} free): files sent here are refused until space is freed",
+                    dir.display(),
+                    human(free)
+                )
+            }),
         Ok(_) => Some(format!(
             "inbox {} is not a directory: files sent here are refused until it is",
             dir.display()
@@ -808,6 +821,9 @@ pub(crate) async fn finalize_incoming(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     note_stored(&inc.id, &stored_name);
+    if !daemon && ok {
+        crate::recv_report::note_stored(&inc.name, recvd, inc.full.as_deref(), &stored_name);
+    }
     crate::transfer_history::append(&[crate::transfer_history::Record {
         time: crate::transfer_history::now_secs(),
         direction: "in",

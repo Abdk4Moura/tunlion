@@ -241,6 +241,22 @@ pub(crate) fn until_direct_verdict(last: &Probe) -> ExitKind {
     }
 }
 
+/// The exit kind for a probe outcome that did not establish. A probe that
+/// failed in the signaling phase never reached the tunlion server, whatever
+/// its error text says: that is 7, not the peer's 6 (a blackholed --server
+/// said failed_phase "signaling" and exited 6).
+pub(crate) fn probe_outcome_kind(o: &crate::l2::ProbeOutcome) -> ExitKind {
+    cold_kind(o.failed_phase.map(|p| p.label()), o.error.as_deref())
+}
+
+/// [`probe_outcome_kind`] from the outcome's phase label and error. Pure.
+pub(crate) fn cold_kind(phase: Option<&str>, error: Option<&str>) -> ExitKind {
+    if phase == Some("signaling") {
+        return ExitKind::Network;
+    }
+    cold_failure_kind(error)
+}
+
 /// The exit kind for a cold probe that did not establish: the tunlion server
 /// when that is what failed, otherwise the peer.
 pub(crate) fn cold_failure_kind(error: Option<&str>) -> ExitKind {
@@ -370,7 +386,7 @@ async fn print_cold(server: &str, peer: &str, relay: bool, timeout: Option<u64>)
                 ui::paint(Tone::Err, "✗ unreachable"),
                 ui::paint(Tone::Dim, &format!("gave up at the {phase} phase (~{})", fmt_ms(o.total_ms)))
             ));
-            let kind = cold_failure_kind(o.error.as_deref());
+            let kind = probe_outcome_kind(&o);
             if kind == ExitKind::Network {
                 ui::say(&format!("  {}", ui::paint(Tone::Dim, exit_codes::NETWORK_LINE)));
             } else {
@@ -413,7 +429,7 @@ async fn ping_json(
         Some(v) => (reach_json_warm(v), None),
         None => match crate::l2::establish_probe_within(server, peer, relay, timeout).await {
             Ok(o) => {
-                let kind = (!o.established).then(|| cold_failure_kind(o.error.as_deref()));
+                let kind = (!o.established).then(|| probe_outcome_kind(&o));
                 (
                     reach_json_cold(
                         o.established,
@@ -587,6 +603,8 @@ mod tests {
     fn a_dead_server_is_a_network_failure_not_an_offline_peer() {
         let raw = "signaling connect to https://x: failed to lookup address information: Try again";
         assert_eq!(cold_failure_kind(Some(raw)), ExitKind::Network);
+        assert_eq!(cold_kind(Some("signaling"), Some("timed out")), ExitKind::Network);
+        assert_eq!(cold_kind(Some("presence"), Some("timed out")), ExitKind::Unreachable);
         let v = reach_json_cold(false, 0, None, Some(raw), Some(ExitKind::Network), None);
         assert_eq!(v["error"]["message"], json!(exit_codes::NETWORK_LINE));
     }

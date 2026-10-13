@@ -35,12 +35,13 @@ pub(crate) fn with_devices_mut<T>(f: impl FnOnce(&mut Vec<Value>) -> Result<T>) 
     let p = devices_path();
     let mut arr: Vec<Value> = match std::fs::read_to_string(&p) {
         Ok(raw) => {
-            serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parse devices.json: {e}"))?
+            serde_json::from_str(&raw).map_err(|e| crate::state_files::corrupt_error(&p, &e.to_string()))?
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(anyhow::anyhow!("read devices.json: {e}")),
     };
     let out = f(&mut arr)?;
+    crate::state_files::keep_backup(&p);
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
         .context("atomic write devices.json")?;
     Ok(out)

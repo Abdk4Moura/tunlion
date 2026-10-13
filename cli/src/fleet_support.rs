@@ -196,6 +196,7 @@ pub(crate) fn record_key_revocation_at(
         "revokedAt": now,
         "name": name,
     }));
+    crate::state_files::keep_backup(path);
     crate::platform::SecretFile::write_str(path, &serde_json::to_string_pretty(&entries)?)?;
     Ok(())
 }

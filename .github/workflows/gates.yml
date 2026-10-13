@@ -140,7 +140,7 @@ env:
     cli/tests/cap-verbs-gates.sh            suite   4  300  s2  -        capability,device_caps,device_perms,policy
     cli/tests/config-scope-gates.sh         suite   4  300  s2  -        settings,identity_state,daemon_ctl
     cli/tests/daemon-stop-gates.sh          suite   4  300  s2  -        daemon_stop,daemon_ctl,daemon_health,status_cmd,doctor
-    cli/tests/scripting-contract-gates.sh   suite   6  300  s3  -        exit_codes,send_cmd,send_report,refusal
+    cli/tests/scripting-contract-gates.sh   suite  10  300  s3  -        exit_codes,send_cmd,send_report,refusal
     cli/tests/shell-gates.sh                suite  12  300  s3  -        shell_,sshd
     # 4: A2 (serving off still advises the re-enrolment) joined A/B/C.
     cli/tests/reenrol-advice-gates.sh       suite   4  300  s3  -        enrollment,add_for,reset_hints
