@@ -100,7 +100,9 @@ le() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a != "" && a+0 <= b+0)}'; }
 
 start_backend
 init_owner "$DA"
-start_acceptor "$DA"
+# Debug level on alpha's daemon: when a SOCKS answer is slow, the warm-path
+# decisions (which link, refused or zombie) are what explain it.
+ACCEPTOR_LOG=debug start_acceptor "$DA"
 enroll_delegate bravo --allow transfer,mount
 if ! env TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q bravo; then
   echo "setup failed: bravo did not enrol, so nothing below would prove anything"
@@ -215,7 +217,11 @@ for _ in $(seq 1 20); do grep -qs "SOCKS5 proxy on" "$WORK/proxy.log" && break; 
 grep -qs "SOCKS5 proxy on" "$WORK/proxy.log" || { echo "proxy did not start:"; tail -5 "$WORK/proxy.log"; exit 2; }
 await_link
 
+A_MARK=$(wc -l <"$WORK/up.log" 2>/dev/null || echo 0)
 r=$(socks bravo.mesh 39090); echo "## P1 bravo.mesh:39090 -> $r"
+# What alpha's daemon decided while answering P1 (warm link chosen, refused
+# or zombie). Printed every time so a slow pass is as explainable as a fail.
+tail -n +"$((A_MARK + 1))" "$WORK/up.log" 2>/dev/null | grep -Ei 'warm|zombie|link|left|supersed|bravo' | head -30 | sed 's/^/##   alpha: /'
 if [ "$(rep_of "$r")" = "2" ] && le "$(secs_of "$r")" 5; then
   ok "P1: a port bravo did not expose got REP 0x02 in $(secs_of "$r")s"
 else

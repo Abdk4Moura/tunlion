@@ -115,7 +115,9 @@ init_owner() {
 
 # $1 = acceptor config dir. Start the acceptor daemon (TUNLION_L2=1 baked in).
 start_acceptor() {
-  env TUNLION_CONFIG_DIR="$1" TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
+  # ACCEPTOR_LOG (e.g. debug) raises the acceptor's log level, so a gate that
+  # fails on timing can show what the daemon decided.
+  env TUNLION_CONFIG_DIR="$1" TUNLION_L2=1 ${ACCEPTOR_LOG:+TUNLION_LOG="$ACCEPTOR_LOG"} "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 2
 }

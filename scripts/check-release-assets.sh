@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Release asset hygiene check (issue #151).
 #
-# The GitHub release must carry EXACTLY the four platform artifacts, each
-# under its tunlion name AND its pre-rename filament alias, plus SHA256SUMS.
-# The filament-* aliases are a frozen protocol literal: released 0.8.x
-# `filament update` downloads exactly those names (see cli-release.yml).
-# Nothing more, nothing less. A repo-root file named tunlion-* or filament-*
+# The GitHub release must carry EXACTLY the four tunlion platform artifacts
+# plus SHA256SUMS. Nothing more, nothing less. In particular no filament-*
+# asset: filament is a separate product, and its 0.8.x `update` must never
+# find a tunlion build to install. A repo-root file named tunlion-* or filament-*
 # (a dated session doc, a decoy, anything) must not ride along into a release,
 # and a missing artifact must abort the tag.
 #
@@ -25,10 +24,6 @@ EXPECTED=(
   tunlion-x86_64-apple-darwin.tar.gz
   tunlion-x86_64-unknown-linux-musl.tar.gz
   tunlion-x86_64-pc-windows-msvc.zip
-  filament-aarch64-apple-darwin.tar.gz
-  filament-x86_64-apple-darwin.tar.gz
-  filament-x86_64-unknown-linux-musl.tar.gz
-  filament-x86_64-pc-windows-msvc.zip
 )
 
 missing=0
@@ -66,4 +61,4 @@ if [[ "$extra" = 1 ]]; then
   exit 1
 fi
 
-echo "check-release-assets: PASS: exactly the 4 platform artifacts (tunlion + filament alias) plus SHA256SUMS"
+echo "check-release-assets: PASS: exactly the 4 tunlion platform artifacts plus SHA256SUMS"

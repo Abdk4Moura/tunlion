@@ -659,6 +659,25 @@ fn log_warm_miss(conn: &Conn, peer: &str) {
     }
 }
 
+/// DEBUG: every link that names `peer`, and which one the warm path chose, so
+/// a slow warm open on a peer with more than one link is diagnosable.
+#[cfg(unix)]
+fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
+    for (p, l) in conn.links.iter() {
+        if !l.verified_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(peer)) {
+            continue;
+        }
+        ui::debug(&format!(
+            "warm-pick '{peer}': pid={p} chosen={} direct={} alive={} age_ms={:?} deferred_left={}",
+            p == chosen,
+            l.direct,
+            l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
+            l.established_at.map(|t| t.elapsed().as_millis()),
+            conn.deferred_left.contains_key(p),
+        ));
+    }
+}
+
 /// Warm-reuse: open a raw L2 stream to `peer:rport` over its existing link and
 /// bridge it to the client's unix socket (netcat/ssh/forward fast path).
 #[cfg(unix)]
@@ -677,6 +696,7 @@ async fn handle_warm_open(
         req.reject("no warm link to that peer").await;
         return;
     };
+    log_warm_pick(conn, &peer, &pid);
     // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to.
     let mux = l2_muxes
         .entry(pid.clone())
