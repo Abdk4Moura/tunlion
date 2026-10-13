@@ -51,6 +51,8 @@ COMMANDS
   Mesh
     addr                   show your overlay address (or a device's)
     doctor                 diagnose a link
+  Agents
+    skill install          teach your AI agent tunlion (opt-in; writes ~/.claude/skills)
 
 EXAMPLES
   tunlion video.mp4                 send it; mints a speakable one-time code + QR
@@ -145,9 +147,9 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     pub(crate) color: Option<String>,
     /// JSON output (structured, parseable) where a command supports it: init,
-    /// add, join, id, status, set, reach, send, receive, sync, doctor, addr and
-    /// devices. Any other command refuses --json rather than mixing human text
-    /// into it.
+    /// add, join, id, status, set, reach, send, receive, sync, doctor, addr,
+    /// devices and skill. Any other command refuses --json rather than mixing
+    /// human text into it.
     /// Independent of TTY: a pipe still gets human text unless --json is set.
     #[arg(long, global = true)]
     pub(crate) json: bool,
@@ -863,6 +865,59 @@ pub(crate) enum Cmd {
     /// Pass the global `-y`/`--yes` to skip the confirmation prompt (required
     /// from a non-TTY / scripts).
     Reset,
+    // ── Agents ──────────────────────────────────────────────────────
+    /// Teach your AI agent tunlion: install the bundled agent skill (opt-in).
+    ///
+    /// The skill is a SKILL.md that tells an agent (Claude Code, or any tool
+    /// reading ~/.agents/skills) which tunlion commands to run and how to read
+    /// their exit codes. This binary carries the copy that matches it. Nothing
+    /// installs it but this command: not init, not up, not the install scripts.
+    #[command(next_help_heading = "Agents")]
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+}
+
+/// `tunlion skill` actions.
+#[derive(Subcommand)]
+pub(crate) enum SkillAction {
+    /// Print the bundled SKILL.md to stdout.
+    Show,
+    /// Write <skills>/tunlion/SKILL.md plus a `.tunlion-skill` marker.
+    ///
+    /// With no target flag: into each of ~/.claude/skills and ~/.agents/skills
+    /// whose parent (~/.claude, ~/.agents) exists. A directory this command
+    /// installed before is replaced (an update); any other existing
+    /// <skills>/tunlion is refused unless --force.
+    Install {
+        #[command(flatten)]
+        target: SkillTargets,
+        /// Overwrite an existing <skills>/tunlion that tunlion did not install.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove the skill, only where this command installed it (the marker).
+    ///
+    /// With no target flag: looks in both ~/.claude/skills and ~/.agents/skills.
+    Uninstall {
+        #[command(flatten)]
+        target: SkillTargets,
+    },
+}
+
+/// Where `tunlion skill install` / `uninstall` act. Combinable.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub(crate) struct SkillTargets {
+    /// Claude Code's skills directory, ~/.claude/skills.
+    #[arg(long)]
+    pub(crate) claude: bool,
+    /// The shared agents skills directory, ~/.agents/skills.
+    #[arg(long)]
+    pub(crate) agents: bool,
+    /// Any skills directory (the skill goes in <PATH>/tunlion).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) dir: Option<PathBuf>,
 }
 
 /// Ephemeral device commands: mint auth keys, enroll as delegated.
@@ -980,7 +1035,7 @@ mod tests {
             let verb = first.trim_end_matches(':');
             // Group headings in the banner (Start/Share/Serve/Devices/Mesh) are
             // not commands.
-            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh") {
+            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh" | "Agents") {
                 continue;
             }
             if verb.is_empty() || verb.starts_with("add") || verb.starts_with("up") {
@@ -1073,6 +1128,7 @@ mod tests {
         fn sample<'a>(name: &'a str) -> Vec<&'a str> {
             match name {
                 "sync" => vec!["sync", ".", "laptop:dir"],
+                "skill" => vec!["skill", "show"],
                 other => vec![other],
             }
         }

@@ -379,6 +379,7 @@ pub(crate) fn is_light_command(first_arg: Option<&str>) -> bool {
                 | "set"
                 | "completions"
                 | "man"
+                | "skill"
         ),
     }
 }

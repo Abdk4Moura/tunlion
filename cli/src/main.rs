@@ -626,6 +626,7 @@ mod cli_def;
 /// The documented exit codes and the one place a failure is reported.
 mod exit_codes;
 pub(crate) use cli_def::{Cli, Cmd, DevicesAction, EphemeralAction, IdAction};
+mod skill;
 #[cfg(test)]
 pub(crate) use cli_def::EXAMPLES;
 

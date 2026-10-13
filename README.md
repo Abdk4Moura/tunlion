@@ -71,6 +71,17 @@ tunlion mount dovm /srv/data ./data # mount a remote folder over the mesh
 
 No inbound ports, no VPN config, no accounts — reachability rides the same authenticated link as file transfer, so a headless box in another network is one command away.
 
+## Use it from an AI agent
+
+Every command that matters to a script takes `--json` and exits with a documented code (`tunlion --help`, EXIT CODES). To teach a coding agent the right commands, install the bundled skill. It is opt-in: nothing else ever installs it.
+
+```sh
+tunlion skill install               # into ~/.claude/skills and/or ~/.agents/skills, whichever exist
+tunlion skill install --dir ./skills # or any skills directory
+tunlion skill show                  # print the SKILL.md this binary carries
+tunlion skill uninstall             # removes only what skill install wrote
+```
+
 ## Why Tunlion over the alternatives
 
 - **vs croc / magic-wormhole**: superb tools, but both ends must install them. Tunlion's other end can be a browser with nothing installed. The CLI also resumes across restarts (croc parity), and a browser can be either side.

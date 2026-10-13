@@ -117,6 +117,7 @@ pub(crate) fn json_supported(cmd: &Cmd) -> bool {
             | Cmd::Doctor { .. }
             | Cmd::Addr { .. }
             | Cmd::Devices { action: None, .. }
+            | Cmd::Skill { .. }
     )
 }
 
@@ -550,6 +551,7 @@ pub(crate) async fn async_main() -> Result<()> {
             | Cmd::Completions { .. }
             | Cmd::Man { .. }
             | Cmd::Update { .. }
+            | Cmd::Skill { .. }
     );
     if !exempt {
         // A verb with its own --json flag must still answer in JSON.
@@ -2414,6 +2416,7 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
+        Cmd::Skill { action } => crate::skill::skill_cmd(action, ui_caps.json || cli.json),
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup {
             peer,
