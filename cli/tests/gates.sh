@@ -836,6 +836,7 @@ kill_tree $UP2
 echo "  killed the daemon at ${G14BSZ} bytes; sender exit $RCS $((T1 - T0))s after the restart"
 if [ "$G14BSZ" -eq 0 ]; then
   bad "daemon-restart: the daemon received nothing before it was killed, so nothing was mid-transfer"
+  tail -n 5 "$WORK/g14b-up1.log" "$WORK/g14b-send.log"
 elif [ $RCS -eq 0 ] && [ "$(hashof "$DD2/big.bin" 2>/dev/null)" = "$H_BIG" ] \
    && ! grep -q "120s" "$WORK/g14b-send.log"; then
   ok "daemon-restart: the sender picked up the restarted daemon and delivered, hash matches"
