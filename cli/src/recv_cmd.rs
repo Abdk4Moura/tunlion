@@ -3014,8 +3014,8 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                     let mut doomed: Vec<(String, String)> = Vec::new();
-                    // Doomed links whose device KEY is revoked (rather than its
-                    // pair secret forgotten): told "device revoked", not
+                    // Doomed links whose device KEY is revoked in place (its
+                    // pair secret still held): told "device revoked", not
                     // "not recognized".
                     let mut key_revoked: std::collections::HashSet<String> = Default::default();
                     let mut unrouted: Vec<String> = Vec::new();
@@ -3029,10 +3029,16 @@ pub(crate) async fn recv_cmd(
                             &revoked_secrets,
                             &crate::revocation_live::key_listed,
                         ) {
-                            if l
-                                .identity_device_pub
-                                .as_ref()
-                                .is_some_and(crate::revocation_live::key_listed)
+                            // Forgotten (its secret removed) reads "not
+                            // recognized", as every later open is answered;
+                            // "device revoked" only for a key revoked in place.
+                            let secret_gone =
+                                facts.secret.is_some_and(|s| revoked_secrets.contains(s));
+                            if !secret_gone
+                                && l
+                                    .identity_device_pub
+                                    .as_ref()
+                                    .is_some_and(crate::revocation_live::key_listed)
                             {
                                 key_revoked.insert(pid.clone());
                             }
