@@ -189,6 +189,24 @@ const EXEC_CANNOT_RUN: i32 = 126;
 /// "Error: Broken pipe".
 const EXEC_OUTPUT_CLOSED: i32 = 141;
 
+/// How long a running session may hear NOTHING from the serving daemon before
+/// it is declared gone. The daemon answers every `exec-alive` (sent each
+/// EXEC_ALIVE_INTERVAL) with `exec-alive-ack`, and any output counts too, so a
+/// healthy idle session hears something every two seconds. A daemon killed
+/// outright used to be noticed only when the transport itself timed out, up
+/// to ~35 s later.
+const EXEC_PEER_SILENT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// The daemon closed this session's link because it no longer recognizes
+/// this device (`devices forget`, a revocation). A refusal, not a dead link.
+pub(crate) fn revoked_mid_session(peer: &str, v: &Value) -> String {
+    let reason = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or(crate::refusal::UNRECOGNIZED_REASON);
+    format!("'{peer}' refused to continue: {reason}")
+}
+
 /// The shell exit code for a remote refusal that means "could not start the
 /// command", or None for any other refusal. Matched on the remote daemon's
 /// own reason text (exec_recv.rs). Pure.
@@ -461,10 +479,13 @@ async fn exec_once(
         let want_err: Option<u64>;
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
         ticker.tick().await;
+        // Last time anything arrived from the daemon (see EXEC_PEER_SILENT).
+        let mut last_heard = std::time::Instant::now();
         loop {
             tokio::select! {
                 item = out_pipe.recv() => match item {
                     Some(Some(bytes)) => {
+                        last_heard = std::time::Instant::now();
                         out_recv += bytes.len() as u64;
                         if let Err(e) = stdout.write_all(&bytes).await {
                             local_closed = true;
@@ -495,6 +516,7 @@ async fn exec_once(
                 },
                 item = err_pipe.recv() => match item {
                     Some(Some(bytes)) => {
+                        last_heard = std::time::Instant::now();
                         err_recv += bytes.len() as u64;
                         if let Err(e) = stderr.write_all(&bytes).await {
                             local_closed = true;
@@ -529,6 +551,14 @@ async fn exec_once(
                 },
                 ev = rx.recv() => match ev {
                     Some(crate::net::Ev::Control(_pid, v)) => {
+                        last_heard = std::time::Instant::now();
+                        // Forgotten or revoked there while this ran: the daemon
+                        // says so before closing the link, and that is a
+                        // refusal (exit 4), not a link that died.
+                        if v.get("type").and_then(|t| t.as_str()) == Some("link-revoked") {
+                            remote_ended = true;
+                            bail!("{}", revoked_mid_session(peer, &v));
+                        }
                         // #309: the owner re-challenges while an open is parked (and
                         // after any re-adopt), so the same answer is owed here, in
                         // the long-lived pump, not only during the ack wait. Same
@@ -560,6 +590,7 @@ async fn exec_once(
                         }
                     }
                     Some(crate::net::Ev::Chunk(_pid, got, _offset, data)) => {
+                        last_heard = std::time::Instant::now();
                         mux.on_frame(got, data).await;
                     }
                     // Bring-up's LOSER keeps emitting on this shared channel after
@@ -580,6 +611,12 @@ async fn exec_once(
                     // connection is otherwise usable.
                     if mux.transport().is_dead() {
                         bail!("link to '{peer}' died during exec");
+                    }
+                    if last_heard.elapsed() >= EXEC_PEER_SILENT {
+                        bail!(
+                            "link to '{peer}' died during exec: no answer for {}s",
+                            EXEC_PEER_SILENT.as_secs()
+                        );
                     }
                 }
             }

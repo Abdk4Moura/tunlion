@@ -187,6 +187,18 @@ async fn deny_unsettled(
         .await;
 }
 
+/// Answer a dial from a device this daemon no longer recognizes (it was
+/// forgotten here while we ran) with the refusal, over signaling: no link is
+/// built for it, and its sender reports the reason at once instead of
+/// waiting out its establishment window.
+async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str) {
+    let refusal = crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None);
+    let mut data = json!({ "type": "not-recognized", "reason": refusal.reason });
+    refusal.annotate(&mut data);
+    let _ = sio.emit("signal", json!({ "to": pid, "data": data })).await;
+    ui::debug(&format!("refused a dial from {pid}: a device forgotten here"));
+}
+
 /// Every inbound control frame, one line, at debug level. A frame that never
 /// arrived and a frame that arrived and was ignored are indistinguishable from
 /// the outside; this is the line that tells them apart, and its absence is what
@@ -1689,6 +1701,11 @@ pub(crate) async fn recv_cmd(
     let mut revocation_snap = crate::revocation_live::store_snapshot();
     let mut revocation_sweep_now = false;
     let mut revoked_secrets: std::collections::HashSet<String> = Default::default();
+    // Meeting places of devices forgotten while this daemon ran. The server keeps
+    // us listed on them, so the forgotten device still finds us there; a dial on
+    // one is answered `not-recognized` (a refusal it reports at once, exit 4)
+    // instead of being buffered until its sender times out.
+    let mut forgotten_channels: std::collections::HashSet<String> = Default::default();
     // Links whose peer claimed a pairing this store does not hold (its
     // pair-proof failed: forgotten here, or never paired). Every shell-class
     // open on such a link is refused as unrecognized before any handler runs,
@@ -2977,6 +2994,10 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                     let mut doomed: Vec<(String, String)> = Vec::new();
+                    // Doomed links whose device KEY is revoked (rather than its
+                    // pair secret forgotten): told "device revoked", not
+                    // "not recognized".
+                    let mut key_revoked: std::collections::HashSet<String> = Default::default();
                     let mut unrouted: Vec<String> = Vec::new();
                     for (pid, l) in &conn.links {
                         let facts = crate::revocation_live::LinkFacts {
@@ -2988,6 +3009,13 @@ pub(crate) async fn recv_cmd(
                             &revoked_secrets,
                             &crate::revocation_live::key_listed,
                         ) {
+                            if l
+                                .identity_device_pub
+                                .as_ref()
+                                .is_some_and(crate::revocation_live::key_listed)
+                            {
+                                key_revoked.insert(pid.clone());
+                            }
                             doomed.push((pid.clone(), l.shown().to_string()));
                         } else if crate::revocation_live::route_must_withdraw(
                             l.identity_device_pub.as_ref(),
@@ -2996,11 +3024,30 @@ pub(crate) async fn recv_cmd(
                             unrouted.push(pid.clone());
                         }
                     }
+                    forgotten_channels.extend(revoked_secrets.iter().map(|s| channel_of(s)));
                     revoked_secrets.clear();
                     brokered_pids.retain(|p, by| {
                         (conn.links.contains_key(p) || conn.direct_pending.contains_key(p))
                             && !device_cert_revoked(&by.device_pub)
                     });
+                    // Tell each doomed peer WHY before the link goes: a peer
+                    // mid-exec or mid-send otherwise sees only a dead link and
+                    // reports "link died" (exit 6) for what is a refusal.
+                    // drop_link closes the transport only after a grace, so
+                    // this frame leaves first.
+                    for (pid, _) in &doomed {
+                        if let Some(t) = conn.transport_of(pid) {
+                            let code = if key_revoked.contains(pid) {
+                                crate::refusal::Code::CertRevoked
+                            } else {
+                                crate::refusal::Code::Unrecognized
+                            };
+                            let refusal = crate::refusal::Refusal::new(code, None);
+                            let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
+                            refusal.annotate(&mut f);
+                            let _ = t.send_control(&f).await;
+                        }
+                    }
                     for (pid, label) in &doomed {
                         conn.drop_link(pid);
                         l2_muxes.remove(pid);
@@ -3720,6 +3767,17 @@ pub(crate) async fn recv_cmd(
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
                     }
+                } else if v["channel"].as_str().is_some_and(|c| {
+                    forgotten_channels.contains(c)
+                        || revoked_secrets.iter().any(|s| channel_of(s) == c)
+                }) {
+                    // A device forgotten here, dialing the meeting place it still
+                    // finds us on: tell it, rather than leave it waiting.
+                    if let Some(pid) = v["id"].as_str().filter(|p| !p.is_empty()) {
+                        if !conn.links.contains_key(pid) {
+                            refuse_unrecognized_dial(&sio, pid).await;
+                        }
+                    }
                 } else if let Some((sec, broker)) =
                     brokered.get(v["channel"].as_str().unwrap_or("")).cloned()
                 {
@@ -3844,6 +3902,18 @@ pub(crate) async fn recv_cmd(
                     }
                     if data["probe"].as_bool() == Some(true) {
                         conn.answer_upgrade_probe(&from).await;
+                    }
+                    // A dial on the meeting place of a device forgotten here: it
+                    // can never be matched, so refuse it now, by name.
+                    if !conn.direct_pending.contains_key(&from)
+                        && !conn.links.contains_key(&from)
+                        && data["ch"].as_str().is_some_and(|c| {
+                            forgotten_channels.contains(c)
+                                || revoked_secrets.iter().any(|s| channel_of(s) == c)
+                        })
+                    {
+                        refuse_unrecognized_dial(&sio, &from).await;
+                        continue;
                     }
                     // Bug 2: the sender re-dialed after mid-transfer death.
                     // If we don't have a DirectPending, buffer the offer and
@@ -5807,7 +5877,18 @@ pub(crate) async fn recv_cmd(
                         l2::wire_sid(&v),
                         exec_recv::ExecCtl::from_frame(&v),
                     ) {
-                        mux.exec_control(sid, msg).await;
+                        // Answer a heartbeat on the link it came in on: the
+                        // initiator holds the session to these answers, so a
+                        // daemon killed outright is noticed within seconds
+                        // instead of when the transport finally times out.
+                        let live = mux.exec_control(sid, msg).await;
+                        if live && msg == exec_recv::ExecCtl::Alive {
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let _ = t
+                                    .send_control(&json!({ "type": "exec-alive-ack", "sid": sid }))
+                                    .await;
+                            }
+                        }
                     }
                     continue;
                 }

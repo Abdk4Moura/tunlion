@@ -414,10 +414,16 @@ impl Mux {
     /// Acceptor: deliver an initiator's `exec-alive`/`exec-signal` to the
     /// session on `sid`. A frame for no live session is dropped, as is one
     /// that finds the session's small queue full (heartbeats are idempotent,
-    /// and a signal is followed by the initiator's l2-close anyway).
-    pub(crate) async fn exec_control(&self, sid: u32, msg: crate::exec_recv::ExecCtl) {
-        if let Some(tx) = self.exec_ctl.lock().await.get(&sid) {
-            let _ = tx.try_send(msg);
+    /// and a signal is followed by the initiator's l2-close anyway). Returns
+    /// whether a live session holds `sid`, so a heartbeat is answered only for
+    /// a command that is still running here.
+    pub(crate) async fn exec_control(&self, sid: u32, msg: crate::exec_recv::ExecCtl) -> bool {
+        match self.exec_ctl.lock().await.get(&sid) {
+            Some(tx) if !tx.is_closed() => {
+                let _ = tx.try_send(msg);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1383,6 +1389,10 @@ async fn verify_fleet_identity(
     }
 }
 
+/// How long `exec` waits for a single signal from the device it is reaching
+/// before saying it is offline. A live daemon answers the moment it sees us.
+const EXEC_SILENT_PEER: Duration = Duration::from_secs(15);
+
 pub(crate) async fn bring_up_to_known(
     server: &str,
     peer_name: &str,
@@ -1701,12 +1711,22 @@ pub(crate) async fn bring_up_to_known(
                 }
                 continue;
             }
-            _ = offline_check.tick(), if !offline_hinted && !heard_from_peer => {
-                if connect_started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER {
+            _ = offline_check.tick(), if !heard_from_peer => {
+                if !offline_hinted && connect_started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER {
                     offline_hinted = true;
                     if role != "doctor" && !silent {
                         crate::ui::say(&crate::conn::offline_hint(peer_name));
                     }
+                }
+                // `exec` is a one-shot command: a peer that has not said a
+                // single word in this long is not running a daemon (a killed
+                // one lingers on the server's roster as a ghost), and waiting
+                // out the whole connect timeout only delays the answer.
+                if role == "exec" && connect_started.elapsed() >= EXEC_SILENT_PEER {
+                    bail!(
+                        "'{peer_name}' did not answer within {}s: it is offline, or `tunlion up` is not running there",
+                        EXEC_SILENT_PEER.as_secs()
+                    );
                 }
                 continue;
             }

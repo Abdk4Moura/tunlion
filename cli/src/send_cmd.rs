@@ -1289,6 +1289,28 @@ pub(crate) async fn send_cmd(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // The device we dialed answered that it does not recognize us (it
+                // forgot this one while it ran). Only from a peer met on the
+                // target's own meeting place, and never on a brokered one, whose
+                // secret the far side does not hold by design.
+                if data["type"].as_str() == Some("not-recognized") && brokered_target.is_none() {
+                    if let Some((n, sec)) = &known_target {
+                        let on_target = conn
+                            .roster
+                            .get(&from)
+                            .and_then(|r| r["channel"].as_str())
+                            == Some(channel_of(sec).as_str());
+                        if on_target && !use_code {
+                            ui::clear_sticky();
+                            let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                            return Err(exit_codes::err(
+                                ExitKind::Denied,
+                                unrecognized_message(n, data["reason"].as_str()),
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 // rung-1: a relayed transport-offer carries the peer's direct
                 // candidates, kick off the simultaneous-open + auth race.
                 if data["type"].as_str() == Some("transport-offer") {
@@ -1457,6 +1479,32 @@ pub(crate) async fn send_cmd(
                     continue;
                 }
                 conn.mark_ready(&pid, &t, false);
+                // A known device can sit on the server under MORE than one
+                // session: the one its daemon lost (a socket the network
+                // dropped without a close, listed until the server's ping
+                // timeout) and the one it reconnected on. The slot went to
+                // whichever the server listed first, so a ghost could hold it
+                // while the real daemon's link came up here as a mere responder
+                // and was never offered anything: the daemon logged the sender
+                // as verified, and the send waited out its window as "no peer
+                // connected". The session that actually connects and holds the
+                // target's secret IS the target, so it takes the slot.
+                if !conn.is_active(&pid) && !established && !use_code && !fleet_target {
+                    let proves_target = known_target.as_ref().is_some_and(|(_, sec)| {
+                        conn.link(&pid)
+                            .and_then(|l| l.expected_secret.as_ref())
+                            .is_some_and(|(_, s)| s == sec)
+                    });
+                    if proves_target {
+                        if let Some(old) = conn.active.clone() {
+                            ui::debug(&format!(
+                                "send: {pid} connected as the target; releasing the slot held by {old}, which never did"
+                            ));
+                            conn.drop_link(&old);
+                        }
+                        conn.active = Some(pid.clone());
+                    }
+                }
                 // Responder links stop here: connected, polite, idle. Only
                 // the active target gets announcements + offers.
                 if !conn.is_active(&pid) {
@@ -1901,10 +1949,38 @@ pub(crate) async fn send_cmd(
                         }
                     }
                 }
+                // The receiver forgot or revoked this device while the send ran
+                // and is closing the link: a refusal (exit 4), not a lost peer.
+                Some("link-revoked") if conn.is_active(&pid) => {
+                    ui::clear_sticky();
+                    let n = known_target
+                        .as_ref()
+                        .map(|(n, _)| n.clone())
+                        .unwrap_or_else(|| "the receiver".to_string());
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                    return Err(exit_codes::err(
+                        ExitKind::Denied,
+                        unrecognized_message(&n, v["reason"].as_str()),
+                    ));
+                }
                 // C27: their verdict on our identity proof. false = they have
                 // no memory of us, stop acting like a known device.
                 Some("pair-proof-ack") => {
                     if v["ok"].as_bool() == Some(false) {
+                        // Our target refused the identity proof: it holds no
+                        // record of this device. Nothing it would answer to an
+                        // offer can be a yes, so end here with the reason (exit
+                        // 4), as `exec` does, instead of re-offering into it.
+                        if let (Some((n, _)), None, false) = (&known_target, &brokered_target, use_code) {
+                            if conn.is_active(&pid) {
+                                ui::clear_sticky();
+                                let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                                return Err(exit_codes::err(
+                                    ExitKind::Denied,
+                                    unrecognized_message(n, None),
+                                ));
+                            }
+                        }
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         if let Some(l) = conn.link_mut(&pid) {
                             l.expected_secret = None;
@@ -3026,6 +3102,17 @@ pub(crate) fn refusal_text(v: &Value) -> Option<String> {
     Some(clean)
 }
 
+/// The refusal a send reports when the target device no longer recognizes
+/// this one (forgotten there). Pure.
+pub(crate) fn unrecognized_message(peer: &str, reason: Option<&str>) -> String {
+    let reason = reason
+        .filter(|r| !r.is_empty())
+        .unwrap_or(crate::refusal::UNRECOGNIZED_REASON);
+    format!(
+        "'{peer}' refused this send: {reason}. Only the owner of '{peer}' can let this device back in, by pairing or enrolling it again. Nothing was sent."
+    )
+}
+
 /// What to check when nobody connected, worded for who we were waiting for.
 /// A device name is another tunlion; only a code can be opened in a browser.
 pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>) -> String {
@@ -3037,6 +3124,38 @@ pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>)
         }
         (None, false, Some(r)) => format!("is a receiver waiting in room '{r}'?"),
         _ => "is a receiver running on this network?".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod unrecognized_tests {
+    use super::unrecognized_message;
+    use crate::exit_codes::{classify_text, ExitKind};
+
+    /// A forgotten device's send reads as a refusal (exit 4) naming why, for
+    /// the daemon's own reason and for the fallback alike.
+    #[test]
+    fn a_forgotten_senders_refusal_is_denied_and_named() {
+        for m in [
+            unrecognized_message("a", None),
+            unrecognized_message("a", Some("")),
+            unrecognized_message("a", Some(crate::refusal::UNRECOGNIZED_REASON)),
+        ] {
+            assert!(m.contains("not recognized"), "{m}");
+            assert!(m.contains("'a'"), "{m}");
+            assert_eq!(classify_text(&m), ExitKind::Denied, "{m}");
+        }
+    }
+
+    /// The exec counterpart: a session ended by a forget is a refusal too.
+    #[test]
+    fn an_exec_ended_by_a_forget_is_denied() {
+        let v = serde_json::json!({ "type": "link-revoked", "reason": crate::refusal::UNRECOGNIZED_REASON });
+        let m = crate::exec_send::revoked_mid_session("a", &v);
+        assert!(m.contains("not recognized"), "{m}");
+        assert_eq!(classify_text(&m), ExitKind::Denied, "{m}");
+        let m = crate::exec_send::revoked_mid_session("a", &serde_json::json!({ "type": "link-revoked" }));
+        assert_eq!(classify_text(&m), ExitKind::Denied, "{m}");
     }
 }
 

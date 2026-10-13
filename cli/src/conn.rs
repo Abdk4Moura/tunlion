@@ -2535,6 +2535,10 @@ impl Conn {
         // transport-offer rides the OPAQUE signaling relay (same channel as ICE
         // signals); the server cannot read or forge it without failing the MAC.
         let mut offer = json!({ "type": "transport-offer", "v": 1, "proto": 2, "addrs": cands });
+        // The meeting place this dial is for. A daemon that has since FORGOTTEN
+        // the secret behind it can then answer "not recognized" at once instead
+        // of buffering an offer it can never match (recv_cmd, forgotten_channels).
+        offer["ch"] = json!(crate::channel_of(secret));
         if let Some(s) = my_srflx {
             offer["srflx"] = json!(s.to_string());
         }
