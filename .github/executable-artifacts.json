@@ -75,6 +75,17 @@
       ]
     },
     {
+      "path": "cli/tests/net-blockers-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/net-blockers-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/sync-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/sync-gates.sh",
@@ -276,6 +287,7 @@
         "cli/tests/forward-refusal-gates.sh",
         "cli/tests/l2-revoke-gates.sh",
         "cli/tests/mount-revoke-gates.sh",
+        "cli/tests/net-blockers-gates.sh",
         "cli/tests/pty-revoke-gates.sh",
         "cli/tests/reenrol-advice-gates.sh",
         "cli/tests/revocation-live-gates.sh",
