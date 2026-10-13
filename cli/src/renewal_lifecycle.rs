@@ -218,6 +218,12 @@ pub(crate) async fn respond_to_auth_key_enroll_request(
     v: serde_json::Value,
 ) {
     let Some(t) = conn.transport_of(&pid) else {
+        // Never silent: the joiner cannot tell a dropped request from a slow
+        // one, so it waits out its whole deadline. This is how the join hang
+        // looked (net.rs `announce_then_read`): one line here would have named it.
+        ui::say(&format!(
+            "enrolment request from {pid} dropped: its link has no transport attached yet, so no challenge was sent"
+        ));
         return;
     };
 
