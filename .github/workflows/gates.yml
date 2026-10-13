@@ -117,7 +117,11 @@ env:
   #                            suspended lock holder, a cut-off daemon reported
   #   signaling-freeze         a daemon frozen 80 s comes back without a storm
   #   identity-relink          init never replaces an enrolled identity
-  #   scripting-contract       exit codes and --json failure objects are truthful
+  #   scripting-contract       exit codes and --json failure objects are truthful;
+  #                            receive exits with its own reason (12 disk full,
+  #                            2 no tty) at once, a corrupt devices.json is an
+  #                            error naming it, and a code send --json puts the
+  #                            code on stdout first (mounts a tmpfs, uses sudo)
   #   ssh-ca exec sync pty-revoke mount-revoke l2-revoke fleet-cert
   #                            a revoked certificate or grant ends access that is
   #                            ALREADY OPEN, each with its own controls (A: the
@@ -135,18 +139,18 @@ env:
   # diagnostic in the registry rather than a required gate that is red.
   GATE_SCRIPTS: |
     cli/tests/warm-hold-idle-gates.sh       suite   9  420  s1  -        warm,conn.rs,up_logs,crates/filament-transport
-    cli/tests/whoami-candidate-gates.sh     suite   8  300  s2  tcpdump  holepunch,overlay,local.rs,conn.rs,crates/filament-transport
+    cli/tests/whoami-candidate-gates.sh     suite   8  300  s3  tcpdump  holepunch,overlay,local.rs,conn.rs,crates/filament-transport
     # 4: D (an already-covered grant exits 0) joined A/B/C.
-    cli/tests/cap-verbs-gates.sh            suite   4  300  s2  -        capability,device_caps,device_perms,policy
-    cli/tests/config-scope-gates.sh         suite   4  300  s2  -        settings,identity_state,daemon_ctl
-    cli/tests/daemon-stop-gates.sh          suite   4  300  s2  -        daemon_stop,daemon_ctl,daemon_health,status_cmd,doctor
-    cli/tests/scripting-contract-gates.sh   suite  10  300  s3  -        exit_codes,send_cmd,send_report,refusal
-    cli/tests/shell-gates.sh                suite  12  300  s3  -        shell_,sshd
+    cli/tests/cap-verbs-gates.sh            suite   4  300  s3  -        capability,device_caps,device_perms,policy
+    cli/tests/config-scope-gates.sh         suite   4  300  s3  -        settings,identity_state,daemon_ctl
+    cli/tests/daemon-stop-gates.sh          suite   4  300  s5  -        daemon_stop,daemon_ctl,daemon_health,status_cmd,doctor
+    cli/tests/scripting-contract-gates.sh   suite  10  300  s2  -        exit_codes,send_cmd,send_report,refusal
+    cli/tests/shell-gates.sh                suite  12  300  s8  -        shell_,sshd
     # 4: A2 (serving off still advises the re-enrolment) joined A/B/C.
-    cli/tests/reenrol-advice-gates.sh       suite   4  300  s3  -        enrollment,add_for,reset_hints
+    cli/tests/reenrol-advice-gates.sh       suite   4  300  s4  -        enrollment,add_for,reset_hints
     cli/tests/signaling-freeze-gates.sh     suite   5  300  s4  -        signaling_health,session,crates/filament-signal
-    cli/tests/hostile-env-gates.sh          suite  17  300  s4  -        file_io,recv_files,daemon_ctl,platform
-    cli/tests/sync-gates.sh                 revoke 18  300  s4  -        sync_cmd
+    cli/tests/hostile-env-gates.sh          suite  17  300  s7  -        file_io,recv_files,daemon_ctl,platform
+    cli/tests/sync-gates.sh                 revoke 18  300  s8  -        sync_cmd
     # 23 gate slots (FORGET-REFUSED, from #385, is the 23rd). RECON, which read
     # AUTH-A's result and printed a second PASS for it, was removed. A gate that
     # is KNOWN-RED keeps its slot and is counted.
@@ -156,15 +160,15 @@ env:
     cli/tests/revocation-live-gates.sh      revoke 15  300  s6  -        revocation,invite_burn,devices_store
     # 21: Q1/Q2 (a SIGKILLed serving daemon leaves nothing running) and R (a
     # forgotten device is refused as unrecognized) joined the 18.
-    cli/tests/exec-gates.sh                 revoke 21  300  s6  -        exec_
+    cli/tests/exec-gates.sh                 revoke 21  300  s7  -        exec_
     # 4 = gates A/B/C + the setup-grant slot (KNOWN-RED today, counted).
-    cli/tests/shell-posture-gates.sh        revoke  4  300  s6  -        shell_,device_perms
+    cli/tests/shell-posture-gates.sh        revoke  4  300  s8  -        shell_,device_perms
     cli/tests/devices-write-race-gates.sh   suite   2  300  s7  -        devices_store
-    cli/tests/roster-gates.sh               suite   8  300  s7  -        roster,crates/filament-fleet
-    cli/tests/identity-relink-gates.sh      suite   3  300  s7  -        identity_,crates/filament-id
+    cli/tests/roster-gates.sh               suite   8  300  s8  -        roster,crates/filament-fleet
+    cli/tests/identity-relink-gates.sh      suite   3  300  s8  -        identity_,crates/filament-id
     # 4: gate C (the revoked forward exits 4 and says why) joined A, A2, B.
     cli/tests/l2-revoke-gates.sh            revoke  4  300  s7  -        l2,revocation
-    cli/tests/forward-refusal-gates.sh      revoke  6  300  s7  -        l2,refusal,expose
+    cli/tests/forward-refusal-gates.sh      revoke  6  300  s6  -        l2,refusal,expose
     cli/tests/pty-revoke-gates.sh           revoke  3  300  s8  -        pty,shell_support,revocation
     cli/tests/mount-revoke-gates.sh         revoke  4  300  s8  fuse     mount,revocation
 
@@ -246,16 +250,17 @@ jobs:
             echo "::warning::sccache unavailable; building without it"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           fi
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # The compiled third-party dependencies, restored whole. sccache alone hit
+      # 39% of Rust compiles on a re-run of this branch and the dependency half
+      # of the build still took two minutes; restoring target/ leaves cargo only
+      # the workspace's own crates to build. Both variants share one cache (the
+      # test-hooks feature only changes filament-transport and what depends on
+      # it, all workspace crates), saved from one of them.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+          workspaces: cli -> target
+          shared-key: gates-ci-profile
+          save-if: ${{ matrix.variant == 'hooks' }}
       - name: Build
         working-directory: cli
         env:
