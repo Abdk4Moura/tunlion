@@ -168,6 +168,11 @@ windows-sys = { version = "0.59", features = [
     # Console modes for the interactive PTY: VT input so mouse and special keys
     # reach a remote app (see l2.rs win_console). A feature, not a new crate.
     "Win32_System_Console",
+    # A served exec dies with the daemon: a kill-on-close job object
+    # (platform::contain_with_daemon). Threading is what the job's extended
+    # limit struct is gated on.
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
 
 [profile.release]
