@@ -252,6 +252,16 @@ pub(crate) async fn pair_cmd(
                         // we mint matches the number the user saw.
                         preview_nameplate = Some(auto_np);
                     }
+                    // They typed a code they were GIVEN. Accept it, exactly as
+                    // `join <code>` does, instead of minting a second code from
+                    // its words that nobody on the other side is waiting on.
+                    codeentry::Outcome::Claim(given) => {
+                        ui::say(&ui::paint(
+                            ui::Tone::Dim,
+                            &format!("  accepting the code you were given:  tunlion join {given}"),
+                        ));
+                        code = Some(given);
+                    }
                     // Empty submit -> fall through to auto-mint, but still keep the
                     // previewed nameplate so an empty (auto-words) create reuses it.
                     codeentry::Outcome::Empty => preview_nameplate = Some(auto_np),
@@ -263,7 +273,7 @@ pub(crate) async fn pair_cmd(
                 malformed_entry_banner(raw);
                 let prefill = crate::pake::norm_code(raw);
                 match codeentry::run("  add / code  ", codeentry::Mode::Claim, &prefill, "")? {
-                    codeentry::Outcome::Submitted(c) => code = Some(c),
+                    codeentry::Outcome::Submitted(c) | codeentry::Outcome::Claim(c) => code = Some(c),
                     // Empty submit on a claim-fix means "give up on this code".
                     codeentry::Outcome::Empty => return Err(cancelled()),
                     codeentry::Outcome::Cancelled => return Err(cancelled()),

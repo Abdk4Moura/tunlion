@@ -840,6 +840,49 @@ async fn handle_pty_open(
     }
 }
 
+/// Whether an offer is accepted without asking, before the capability layer.
+/// A daemon accepts only proven links. A foreground receive accepts on `-y`,
+/// on a re-enqueued answer the person already gave, on a proven link, on the
+/// resume of a partial it already accepted, and on the CODE: typing the code a
+/// sender's ceremony was bound to is the consent (`receive --help`). Pure.
+pub(crate) fn offer_has_consent(
+    daemon: bool,
+    yes: bool,
+    consented: bool,
+    link_trusted: bool,
+    resuming_partial: bool,
+    code_consent: bool,
+) -> bool {
+    if daemon {
+        link_trusted
+    } else {
+        yes || consented || link_trusted || resuming_partial || code_consent
+    }
+}
+
+#[cfg(test)]
+mod offer_consent_tests {
+    use super::offer_has_consent;
+
+    /// Eval item 6: `receive <code>` asked `accept? [y/N]` at a terminal while
+    /// its help says a code never asks. The code's own sender is accepted.
+    #[test]
+    fn a_code_is_consent_and_nothing_else_is() {
+        assert!(offer_has_consent(false, false, false, false, false, true));
+        // A room offer from an unproven stranger still asks.
+        assert!(!offer_has_consent(false, false, false, false, false, false));
+        // The daemon never treats a code as consent: it holds no code.
+        assert!(!offer_has_consent(true, false, false, false, false, true));
+        assert!(offer_has_consent(true, false, false, true, false, false));
+    }
+
+    #[test]
+    fn the_receive_help_promises_what_the_code_path_does() {
+        let help = include_str!("cli_def.rs");
+        assert!(help.contains("`receive <code>` never asks"));
+    }
+}
+
 pub(crate) async fn recv_cmd(
     server: &str,
     mut code: Option<String>,
@@ -883,7 +926,7 @@ pub(crate) async fn recv_cmd(
             "  enter a code to connect to a specific person, or press enter to use the local network",
         ));
         match codeentry::run("  receive / code  ", codeentry::Mode::Claim, "", "")? {
-            codeentry::Outcome::Submitted(c) => code = Some(c),
+            codeentry::Outcome::Submitted(c) | codeentry::Outcome::Claim(c) => code = Some(c),
             codeentry::Outcome::Empty => { /* fall through to the local-network auto room */ }
             codeentry::Outcome::Cancelled => return Err(cancelled()),
         }
@@ -6947,11 +6990,22 @@ pub(crate) async fn recv_cmd(
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let consented = v["__consent"].as_str() == Some(consent_token());
                     // Legacy (pre-capability) decision, per mode.
-                    let legacy_ok = if daemon {
-                        link_trusted
-                    } else {
-                        yes || consented || link_trusted || (is_resume && offset > 0)
-                    };
+                    // A code is consent: the person typed the code this
+                    // sender's ceremony was bound to, which is what `receive
+                    // --help` promises ("`receive <code>` never asks"). It
+                    // asked `accept? [y/N]` anyway at a terminal. Only the
+                    // ceremony peer carries that consent, never a bystander.
+                    let code_consent = recv_code_path
+                        && recv_pake_done
+                        && conn.is_bound_active_peer(&pid);
+                    let legacy_ok = offer_has_consent(
+                        daemon,
+                        yes,
+                        consented,
+                        link_trusted,
+                        is_resume && offset > 0,
+                        code_consent,
+                    );
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under TUNLION_CAP_AUTHORITATIVE.

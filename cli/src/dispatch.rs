@@ -44,7 +44,6 @@ use crate::doctor;
 use crate::down_cmd;
 use crate::drop_dir;
 use crate::enrollment::enroll_and_send_cmd;
-use crate::ephemeral_cmd;
 use crate::expose;
 use crate::first_screen_actions;
 use crate::fleet_certificate_warning;
@@ -1284,8 +1283,15 @@ pub(crate) async fn async_main() -> Result<()> {
                 // Same ceremony `add <code>` runs: accepting a code confers no
                 // membership by itself, the offering side decides that.
                 pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), None, false).await
+            } else if invite_file.is_none() && invite_fd.is_none() && ui_caps.interactive {
+                // Nothing given at a terminal: ONE prompt that takes a code, an
+                // invitation, or a file path, and runs whichever it is. The
+                // menu's single accept entry lands here; it used to open the
+                // invitation reader, which answered a code with "invitation
+                // has an unknown format".
+                crate::identity_flow::join_guided(&ui_caps, &server, relay, name, to).await
             } else {
-                join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await
+                join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to, None).await
             }
         }
         Cmd::Depart => depart_cmd(&server, relay).await,
@@ -2414,7 +2420,6 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
-        Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup {
             peer,
             source,

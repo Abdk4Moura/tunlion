@@ -257,3 +257,92 @@ fn esc_out_of_the_picker_draws_one_prompt() {
     let n = prompts_after_leaving_picker("\u{1b}", "esc");
     assert_eq!(n, 1, "Esc out of the picker drew {n} prompts, expected 1");
 }
+
+// ---------------------------------------------------------------------------
+// Eval item 1: a fresh device holding a pairing code, driven the way a person
+// drives it. NOT ignored (unlike the #197 cells above): these are regressions,
+// and they run wherever a bash pty exists. They stop at the first line that
+// proves which ceremony was chosen, before any network, then Ctrl-C out.
+// ---------------------------------------------------------------------------
+
+/// A shell in a pty over a fresh config dir, with tunlion's path.
+#[cfg(unix)]
+fn fresh_term(label: &str) -> (Term, String) {
+    let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("cfg dir");
+    let t = Term::shell(&dir);
+    assert!(t.wait_for(&format!("{MARK}> "), 20), "shell never prompted:\n{}", t.text());
+    (t, env!("CARGO_BIN_EXE_tunlion").to_string())
+}
+
+/// The guided menu's accept entry takes a CODE and runs the join path. It
+/// used to be "Pair with a code I was given", which ran `add` and minted a
+/// second code from the typed one ("press enter to create comic-otter-NNNN").
+#[cfg(unix)]
+#[test]
+fn the_menu_accept_entry_takes_a_code_and_joins_with_it() {
+    let (mut t, exe) = fresh_term("menu-accept");
+    // The menu is the BARE form (no arguments at all), so no --server here:
+    // the test stops at the line that names the ceremony, before any network.
+    let before = t.text().len();
+    t.send(&format!("\"{exe}\"\r"));
+    assert!(
+        t.wait_for_from(before, "I have a code or an invitation", 30),
+        "the fresh-device menu has no single accept entry; screen:\n{}",
+        tail(&t.text())
+    );
+    let screen = t.text();
+    assert!(!screen.contains("Pair with a code I was given"), "the old offering entry is back:\n{}", tail(&screen));
+    // Entry 0 is "Set up this first device"; the accept entry is next.
+    t.send("\u{1b}[B");
+    t.settle(300, 3);
+    t.send("\r");
+    assert!(
+        t.wait_for_from(before, "code or invitation:", 20),
+        "the accept entry did not open the accept prompt; screen:\n{}",
+        tail(&t.text())
+    );
+    let typed_at = t.text().len();
+    t.send("comic-otter-1950\r");
+    assert!(
+        t.wait_for_from(typed_at, "tunlion join comic-otter-1950", 20),
+        "a code typed at the accept prompt was not accepted as a code; screen:\n{}",
+        tail(&t.text())
+    );
+    let after = t.text()[typed_at..].to_string();
+    assert!(!after.contains("unknown format"), "answered a code as a bad invitation:\n{}", tail(&after));
+    assert!(!after.contains("press enter to create"), "minted a new code:\n{}", tail(&after));
+    t.send("\u{3}");
+}
+
+/// The OFFERING entry (`tunlion add`) given a code someone read out: it
+/// recognizes the code and accepts it, instead of minting
+/// `<their words>-<our number>` that nobody is waiting on.
+#[cfg(unix)]
+#[test]
+fn a_code_typed_into_add_is_accepted_not_reminted() {
+    let (mut t, exe) = fresh_term("add-code");
+    let before = t.text().len();
+    t.send(&format!("\"{exe}\" --server http://127.0.0.1:9 add\r"));
+    assert!(
+        t.wait_for_from(before, "press Enter for a generated pair", 30),
+        "add never opened its word entry; screen:\n{}",
+        tail(&t.text())
+    );
+    t.send("comic otter 1950");
+    assert!(
+        t.wait_for_from(before, "code you were given", 10),
+        "the entry did not recognize a received code; screen:\n{}",
+        tail(&t.text())
+    );
+    let at = t.text().len();
+    t.send("\r");
+    assert!(
+        t.wait_for_from(at, "accepting the code you were given:  tunlion join comic-otter-1950", 20),
+        "Enter on a received code did not accept it; screen:\n{}",
+        tail(&t.text())
+    );
+    assert!(!t.text()[at..].contains("comic-otter-1950-"), "a second code was minted:\n{}", tail(&t.text()));
+    t.send("\u{3}");
+}

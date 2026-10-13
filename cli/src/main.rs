@@ -202,7 +202,6 @@ pub(crate) use crypto_atoms::{chrono_now, fresh_secret, head_hash, hmac_sha256, 
 pub(crate) use shell_support::shell_grant_names_at;
 #[cfg(test)]
 pub(crate) use shell_support::any_shell_grant_at;
-use enrollment::{enroll_cmd};
 /// `tunlion up --install`: the managed-service unit, per platform.
 mod install_service;
 use install_service::install_system_service;
@@ -625,7 +624,7 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
 mod cli_def;
 /// The documented exit codes and the one place a failure is reported.
 mod exit_codes;
-pub(crate) use cli_def::{Cli, Cmd, DevicesAction, EphemeralAction, IdAction};
+pub(crate) use cli_def::{Cli, Cmd, DevicesAction, IdAction};
 #[cfg(test)]
 pub(crate) use cli_def::EXAMPLES;
 
@@ -1505,22 +1504,6 @@ fn human_duration(secs: u64) -> String {
         s => format!("{s}s"),
     }
 }
-
-
-async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
-    match action {
-        EphemeralAction::Enroll { auth_key_file, to } => {
-            let auth_key = Zeroizing::new(read_owner_only_file(&auth_key_file)?);
-            // #186: the claim token is now the compact v2 invitation.
-            let inv = parse_invitation(auth_key.as_str())?;
-            if inv.expires <= identity::now_secs() {
-                bail!("this invitation has expired");
-            }
-            enroll_cmd(server, inv, to, relay, None, false).await
-        }
-    }
-}
-
 
 
 /// The joined device's owner record: the stored device whose cert chains to our

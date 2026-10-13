@@ -230,7 +230,22 @@ pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation
     let encoded = token
         .strip_prefix(INVITE_PREFIX_V2)
         .or_else(|| token.strip_prefix(INVITE_PREFIX))
-        .ok_or_else(|| anyhow!("invitation has an unknown format"))?;
+        .ok_or_else(|| {
+            // A pairing code handed to an invitation reader is the common
+            // case (the guided menu used to do exactly that): name the verb
+            // that takes it instead of only refusing.
+            let code = crate::pake::norm_code(token);
+            if crate::token_is_pairing_code(code.trim_matches('-')) {
+                anyhow!(
+                    "invitation has an unknown format: that is a pairing code, not an invitation. Accept it with:  tunlion join {}",
+                    code.trim_matches('-')
+                )
+            } else {
+                anyhow!(
+                    "invitation has an unknown format: an invitation starts with `{INVITE_PREFIX}`. A pairing code (like brave-otter-3141) is accepted with:  tunlion join <code>"
+                )
+            }
+        })?;
     let bytes = Zeroizing::new(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
@@ -238,6 +253,22 @@ pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation
     );
     crate::ephemeral::Invitation::from_token(bytes.as_slice())
         .ok_or_else(|| anyhow!("invitation payload is not a valid v2 invitation"))
+}
+
+#[cfg(test)]
+mod invitation_reader_tests {
+    /// Eval item 1: "Join with an invitation" answered a pairing code with a
+    /// bare "invitation has an unknown format". It must say what it is and
+    /// the exact command that accepts it.
+    #[test]
+    fn a_code_given_to_the_invitation_reader_names_join() {
+        let e = super::parse_invitation("comic-otter-1950").unwrap_err().to_string();
+        assert!(e.contains("pairing code"), "{e}");
+        assert!(e.contains("tunlion join comic-otter-1950"), "{e}");
+        let e = super::parse_invitation("hello there").unwrap_err().to_string();
+        assert!(e.contains("filament-invite:"), "{e}");
+        assert!(e.contains("tunlion join"), "{e}");
+    }
 }
 
 #[cfg(test)]
