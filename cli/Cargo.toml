@@ -189,6 +189,23 @@ lto = false
 debug = 0
 incremental = true
 
+# CI test builds: the binary the gates exec and the test binaries `cargo test`
+# runs, everywhere except the release workflow and Capability CI's release
+# smoke job, which keep the shipping profile above. Inherits release, so debug
+# assertions and overflow checks stay OFF exactly as in what ships (in debug the
+# #281 debug_assert panics a daemon the core gates expect to refuse a peer).
+# What it drops is link-time cost: fat LTO and a single codegen unit take most
+# of a release build's ~4 minutes and change no behaviour a gate asserts.
+# opt-level 2 rather than measure's 1 because several gates were measured on
+# release timing (transfer ceilings, stall windows).
+[profile.ci]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+debug = 0
+incremental = false
+
 # SIZE: optimise the COLD crates for size, the hot ones for speed.
 #
 # opt-level "z" costs throughput, so it is applied only where throughput is not

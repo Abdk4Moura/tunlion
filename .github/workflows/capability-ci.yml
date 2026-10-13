@@ -18,6 +18,10 @@
 # testing in the SAME target dir keeps fingerprints valid, so the test step only
 # compiles the harness delta. sccache (GHA backend, shared across workflows)
 # still de-dupes the heavy shared-flag dependency compiles with test.yml.
+#
+# The smoke jobs build in the `ci` profile (cli/Cargo.toml: release without fat
+# LTO, debug assertions still off). The shipping fat-LTO build is checked once,
+# by `release build (no test-hooks)` below, which keeps --release on purpose.
 
 name: Capability CI
 
@@ -143,17 +147,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            cli/target/release/.fingerprint/
-            cli/target/release/deps/
-            cli/target/release/build/
-            cli/target/release/libtunlion_cli*
-          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}
+            cli/target/ci/.fingerprint/
+            cli/target/ci/deps/
+            cli/target/ci/build/
+            cli/target/ci/libtunlion_cli*
+          key: ${{ runner.os }}-target-ci-${{ hashFiles('cli/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-target-
+            ${{ runner.os }}-target-ci-
 
       - name: Build tunlion (test-hooks)
         working-directory: cli
-        run: cargo build --features test-hooks --release
+        run: cargo build --features test-hooks --profile ci
         env:
           RUST_MIN_STACK: 8388608
           CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'sccache' || '' }}
@@ -163,7 +167,7 @@ jobs:
 
       - name: Codesign binary (macOS)
         if: runner.os == 'macOS'
-        run: codesign --force --sign - cli/target/release/tunlion
+        run: codesign --force --sign - cli/target/ci/tunlion
 
       - name: Run capability harness
         working-directory: cli
@@ -177,10 +181,10 @@ jobs:
           # opposite here and briefly declared every macOS harness green
           # invalid; it was wrong and the greens were always valid.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            cargo test --features test-hooks --release --test capability_harness \
+            cargo test --features test-hooks --profile ci --test capability_harness \
               -- --nocapture --test-threads=1 2>&1 | tee /tmp/harness-macos.log
           else
-            cargo test --features test-hooks --release --test capability_harness \
+            cargo test --features test-hooks --profile ci --test capability_harness \
               -- --nocapture --test-threads=1
           fi
         env:

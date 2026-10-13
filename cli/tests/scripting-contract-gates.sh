@@ -56,7 +56,7 @@ trap cleanup EXIT
 sudo -n true 2>/dev/null || { echo "REFUSED: gate J5 mounts a tmpfs and needs passwordless sudo"; exit 2; }
 
 for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
-sleep 1
+for _ in $(seq 1 10); do ss -tln 2>/dev/null | grep -q ":$PORT " || break; sleep 0.1; done  # the old listener is gone (was: sleep 1)
 ( cd "$CLI_DIR/../backend" && PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
     FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
     "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &

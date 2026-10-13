@@ -1,0 +1,443 @@
+# Every real-binary gate in one workflow: the deterministic core (cli/tests/gates.sh,
+# ratcheted by cli/tests/gates-ratchet.sh), the local-fixture gate suite, and the
+# revocation gates. This replaces gates-core.yml, gate-suite.yml and
+# revoke-gates.yml, which each built their own fat-LTO release binary (~4 min)
+# and then ran 13 to 31 gates one after another (13 to 25 min a run).
+#
+# SHAPE OF A RUN
+#
+#   plan      reads the two tables below, decides what runs, refuses a table that
+#             leaves a gate uncovered                                       ~15 s
+#   build     the gate binary, ONCE per variant, in the `ci` profile (opt-level 2,
+#             no LTO, 16 codegen units; cli/Cargo.toml), uploaded as an artifact.
+#             `plain` for the gate scripts (they ran a plain release build) and
+#             `hooks` (--features test-hooks) for gates.sh, which drives the
+#             FILAMENT_TEST_* hooks. Both keep debug assertions OFF, like release:
+#             in debug the #281 debug_assert panics a daemon that the core gates
+#             expect to refuse a peer instead.
+#   unit      gate 0 (cargo test + the pair-code tests), on its own runner beside
+#             the build, since it needs a toolchain and no binary
+#   core      gates.sh split into shards, each with its own fixture backend
+#   bundles   the gate scripts, packed into bundles that each finish inside the
+#             longest single script (warm-hold-idle's deliberate 180 s idle window)
+#   verdict   the only job whose result means anything on its own: see below.
+#
+# The shipping fat-LTO build is not repeated here. It runs in the release
+# workflow and in Capability CI's `release build (no test-hooks)` smoke job.
+#
+# COVERAGE PARITY, and how it is enforced rather than hoped for
+#
+#   * The core is ratcheted exactly as before: the shard logs are put back
+#     together and fed to the SAME cli/tests/gates-ratchet.sh, whose
+#     EXPECTED_GREEN list is unchanged. A shard that did not report leaves its
+#     gates with NO VERDICT, which fails the ratchet.
+#   * gates.sh --list-gates lists every gate block in the file. plan refuses a
+#     CORE_SHARDS table that misses one or lists one twice, and verdict checks
+#     every id appears in the `gates shard ran:` line of some shard's log.
+#   * Every gate script is named in GATE_SCRIPTS with its EXPECT count. A full run
+#     must plan all of them, every one must report a result, and each must exit 0
+#     with exactly EXPECT gates passed. Counting PASS lines, not trusting an exit
+#     code: `bad` only increments a counter in these scripts, so a script that
+#     dies early or skips a branch can still exit zero (#249's second half).
+#   * Each script keeps its own per-gate bound (300 s, 420 s for warm-hold-idle),
+#     so a hang fails THAT script by name and the rest of its bundle still runs.
+#
+# QUICK MODE (D). A push to any branch other than main runs only what the push
+# touched: gate 0 always, a gate script when it, the fixture library, or one of
+# the source areas in its row changed, and the core shards (all of them; the
+# ratchet needs every one) when gates.sh or a core source area changed. The full
+# suite still runs on every pull request and on main, so quick mode is a faster
+# first signal, never the merge gate.
+
+name: Gates
+
+on:
+  push:
+  pull_request:
+    paths:
+      - "cli/**"
+      - "backend/**"
+      # The gates exercise the transport and the crates behind it, so a change
+      # there has to run them. Without crates/** the suite did not run when #323
+      # changed crates/filament-transport, and the regression was attributed to
+      # the wrong commit hours later.
+      - "crates/**"
+      - "scripts/ci_gates.py"
+      - ".github/workflows/gates.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: gates-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+
+  # The gate scripts. One row each:
+  #   path  family  expect  bound(s)  bundle  needs  areas
+  # family: `suite` counts PASS lines (the old Gate Suite), `revoke` counts PASS
+  #   and KNOWN-RED lines (the old Revoke Gates: a gate that is KNOWN-RED keeps
+  #   its slot, so a tracked failure can never make the total look short).
+  # expect: how many gates must pass. Measured against the commit that wired the
+  #   script, never copied from a header comment; carried over unchanged.
+  # bundle: scripts in one bundle run one after another on one runner. Packed so
+  #   each bundle ends inside s1 (warm-hold-idle alone, ~200 s of it a deliberate
+  #   idle window). Moving a row between bundles changes timing, not coverage.
+  # needs: runner setup the script requires (fuse, tcpdump), or `-`.
+  # areas: path fragments that select the script in QUICK mode, or `-`. A wrong
+  #   or missing area only makes a push's quick run skip the script; the pull
+  #   request still runs it.
+  #
+  # What each script asserts (kept from the workflows this replaces):
+  #   cap-verbs                a delegated device's authority is its enrolment
+  #                            ceiling, so grant/revoke cannot bind for it
+  #   devices-write-race       a revoke that reports success must persist (#238)
+  #   roster                   a spoke can SEE the mesh from the owner-signed
+  #                            roster, and roster presence never authorises
+  #   shell                    a shell refusal reaches the initiator as a nonzero
+  #                            exit WITH a reason (#219/#223)
+  #   config-scope             a second config dir gets no copy of the default
+  #                            one's keys and cannot see or stop its daemon
+  #   whoami-candidate         an unchecked /api/whoami answer must not become an
+  #                            advertised candidate (#237), seen ON THE WIRE
+  #   warm-hold-idle           two paired daemons sit idle on ONE link: no
+  #                            re-dials, no reaps, no stall ladder
+  #   hostile-env              full disk, umask 0000, a deep HOME, a stopped
+  #                            daemon and concurrent starts behave as stated
+  #   reenrol-advice           the advice for widening a ceiling runs as printed
+  #   daemon-stop              `down` on a suspended daemon, the next `up`, a
+  #                            suspended lock holder, a cut-off daemon reported
+  #   signaling-freeze         a daemon frozen 80 s comes back without a storm
+  #   identity-relink          init never replaces an enrolled identity
+  #   scripting-contract       exit codes and --json failure objects are truthful
+  #   ssh-ca exec sync pty-revoke mount-revoke l2-revoke fleet-cert
+  #                            a revoked certificate or grant ends access that is
+  #                            ALREADY OPEN, each with its own controls (A: the
+  #                            session streams before the revoke; A2: a healthy
+  #                            session survives its own recheck; B/C: the revoked
+  #                            one stops and the denial reaches the client)
+  #   shell-posture            the shell posture of a vouched record
+  #   forward-refusal          what tunlion says when the far side refuses an
+  #                            l2-open (#232/#268)
+  #   revocation-live          a forget ends access in the RUNNING daemon, and a
+  #                            used invitation stays used across forget + restart
+  #
+  # mount-gates.sh is deliberately NOT here: measured 6 PASS / 2 FAIL on main
+  # 2e8820d (every mutation through the mount returns EIO), so it stays a
+  # diagnostic in the registry rather than a required gate that is red.
+  GATE_SCRIPTS: |
+    cli/tests/warm-hold-idle-gates.sh       suite   9  420  s1  -        warm,conn.rs,up_logs,crates/filament-transport
+    cli/tests/whoami-candidate-gates.sh     suite   8  300  s2  tcpdump  holepunch,overlay,local.rs,conn.rs,crates/filament-transport
+    # 4: D (an already-covered grant exits 0) joined A/B/C.
+    cli/tests/cap-verbs-gates.sh            suite   4  300  s2  -        capability,device_caps,device_perms,policy
+    cli/tests/config-scope-gates.sh         suite   4  300  s2  -        settings,identity_state,daemon_ctl
+    cli/tests/daemon-stop-gates.sh          suite   4  300  s2  -        daemon_stop,daemon_ctl,daemon_health,status_cmd,doctor
+    cli/tests/scripting-contract-gates.sh   suite   6  300  s3  -        exit_codes,send_cmd,send_report,refusal
+    cli/tests/shell-gates.sh                suite  12  300  s3  -        shell_,sshd
+    # 4: A2 (serving off still advises the re-enrolment) joined A/B/C.
+    cli/tests/reenrol-advice-gates.sh       suite   4  300  s3  -        enrollment,add_for,reset_hints
+    cli/tests/signaling-freeze-gates.sh     suite   5  300  s4  -        signaling_health,session,crates/filament-signal
+    cli/tests/hostile-env-gates.sh          suite  17  300  s4  -        file_io,recv_files,daemon_ctl,platform
+    cli/tests/sync-gates.sh                 revoke 18  300  s4  -        sync_cmd
+    # 23 gate slots (FORGET-REFUSED, from #385, is the 23rd). RECON, which read
+    # AUTH-A's result and printed a second PASS for it, was removed. A gate that
+    # is KNOWN-RED keeps its slot and is counted.
+    cli/tests/fleet-cert-gates.sh           revoke 23  300  s5  -        fleet,enrollment,ssh_ca,revocation,crates/filament-fleet,crates/filament-id
+    cli/tests/ssh-ca-gates.sh               revoke  8  300  s5  -        ssh_ca,sshd,sshkeys
+    # 15 = 3 enrolment + 8 live-forget (no restart) + 4 invitation-burn.
+    cli/tests/revocation-live-gates.sh      revoke 15  300  s6  -        revocation,invite_burn,devices_store
+    # 21: Q1/Q2 (a SIGKILLed serving daemon leaves nothing running) and R (a
+    # forgotten device is refused as unrecognized) joined the 18.
+    cli/tests/exec-gates.sh                 revoke 21  300  s6  -        exec_
+    # 4 = gates A/B/C + the setup-grant slot (KNOWN-RED today, counted).
+    cli/tests/shell-posture-gates.sh        revoke  4  300  s6  -        shell_,device_perms
+    cli/tests/devices-write-race-gates.sh   suite   2  300  s7  -        devices_store
+    cli/tests/roster-gates.sh               suite   8  300  s7  -        roster,crates/filament-fleet
+    cli/tests/identity-relink-gates.sh      suite   3  300  s7  -        identity_,crates/filament-id
+    # 4: gate C (the revoked forward exits 4 and says why) joined A, A2, B.
+    cli/tests/l2-revoke-gates.sh            revoke  4  300  s7  -        l2,revocation
+    cli/tests/forward-refusal-gates.sh      revoke  6  300  s7  -        l2,refusal,expose
+    cli/tests/pty-revoke-gates.sh           revoke  3  300  s8  -        pty,shell_support,revocation
+    cli/tests/mount-revoke-gates.sh         revoke  4  300  s8  fuse     mount,revocation
+
+  # The deterministic core, cli/tests/gates.sh, in shards. Every id that
+  # `gates.sh --list-gates` prints must appear in exactly one shard, and 14b must
+  # share a shard with 14 (it reuses 14's pairing); plan refuses anything else.
+  # The browser gates (5 6 12 13 16) print SKIP under SKIP_BROWSER=1 and L2 is
+  # opt-in (L2_GATES=1), exactly as in the unsharded run; they still sit in a
+  # shard so the coverage check stays total. Balanced on measured per-gate times
+  # (2026-10-11 run): roughly 2 minutes each.
+  # `areas` selects the core in quick mode (all shards or none).
+  CORE_SHARDS: |
+    unit: 0
+    c1: 1 2 2b 3 4 5 6 7 8 9 T4
+    c2: 10 11 11b 11c 12 13 15 17 17b 19
+    c3: 14 14b 16 18 18b 20 21 22 T1 T1b T3 L2
+    areas: send_ recv_ resilience transfer session conn.rs pair ceremony pake codeentry ephemeral file_io exit_codes identity up_logs local.rs holepunch backend/ crates/
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      suite_matrix: ${{ steps.plan.outputs.suite_matrix }}
+      core_matrix: ${{ steps.plan.outputs.core_matrix }}
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+      has_suite: ${{ steps.plan.outputs.has_suite }}
+      has_core: ${{ steps.plan.outputs.has_core }}
+      has_build: ${{ steps.plan.outputs.has_build }}
+      has_unit: ${{ steps.plan.outputs.has_unit }}
+      expected: ${{ steps.plan.outputs.expected }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Changed files (quick mode only)
+        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          # A new branch has no `before`; compare against the default branch then.
+          # Any failure leaves the file absent, and plan then runs everything.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then BEFORE="$BASE"; fi
+          gh api "repos/${{ github.repository }}/compare/${BEFORE}...${AFTER}" --paginate \
+            --jq '.files[].filename' > "$RUNNER_TEMP/changed.txt" || rm -f "$RUNNER_TEMP/changed.txt"
+          echo "CHANGED_FILES_FILE=$RUNNER_TEMP/changed.txt" >> "$GITHUB_ENV"
+      - name: Plan
+        id: plan
+        env:
+          MODE: ${{ (github.event_name == 'push' && github.ref != 'refs/heads/main') && 'quick' || 'full' }}
+        run: python3 scripts/ci_gates.py plan
+
+  build:
+    name: build gate binary (${{ matrix.variant }})
+    needs: plan
+    if: needs.plan.outputs.has_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Fall back to uncached builds if the cache backend is down
+        shell: bash
+        run: |
+          # The Actions cache backend can refuse service ("Egress is over the
+          # account limit"), and with RUSTC_WRAPPER=sccache every compile then
+          # fails. A slower uncached build beats a red job that tested nothing.
+          if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
+            echo "::warning::sccache unavailable; building without it"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      - name: Build
+        working-directory: cli
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: |
+          cargo build --profile ci --bin tunlion ${{ matrix.features }}
+          sha256sum target/ci/tunlion
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunlion-${{ matrix.variant }}
+          path: cli/target/ci/tunlion
+          if-no-files-found: error
+          retention-days: 3
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  unit:
+    name: core unit (gate 0)
+    needs: plan
+    if: needs.plan.outputs.has_unit == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Backend deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Fall back to uncached builds if the cache backend is down
+        shell: bash
+        run: |
+          if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
+            echo "::warning::sccache unavailable; building without it"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      # `|| true`: the ratchet in `verdict`, not this exit code, gates the run,
+      # exactly as in the unsharded job.
+      - name: Gate 0 (cargo test, pair-code tests)
+        working-directory: cli
+        env:
+          SKIP_BROWSER: "1"
+          FILAMENT_TEST_AUTOSTART: "1"
+          RUST_BACKTRACE: "1"
+          FILAMENT_GATE_SHARD: "0"
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/core-logs"
+          bash tests/gates.sh --with-relay 2>&1 | tee "$GITHUB_WORKSPACE/core-logs/core-unit.log" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-log-unit
+          path: core-logs/core-unit.log
+          if-no-files-found: warn
+
+  core:
+    name: core shard ${{ matrix.shard }}
+    needs: [plan, build]
+    if: needs.plan.outputs.has_core == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.core_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # gates.sh autostarts this backend on 8077 when FILAMENT_TEST_AUTOSTART=1.
+      - name: Backend deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: tunlion-hooks
+          path: ${{ runner.temp }}/bin
+      - name: Install the gate binary
+        run: |
+          chmod +x "$RUNNER_TEMP/bin/tunlion"
+          sha256sum "$RUNNER_TEMP/bin/tunlion"
+      # Runs WITH --with-relay, the configuration the expected-green list was
+      # measured under: gate 10 starts its own coturn (docker), and skips cleanly
+      # where docker or an interpreter is absent (#284).
+      - name: Run shard ${{ matrix.shard }} (${{ matrix.gates }})
+        working-directory: cli
+        env:
+          SKIP_BROWSER: "1"
+          FILAMENT_TEST_AUTOSTART: "1"
+          RUST_BACKTRACE: "1"
+          FILAMENT_GATE_SHARD: ${{ matrix.gates }}
+          FILAMENT_GATE_BIN: ${{ runner.temp }}/bin/tunlion
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/core-logs"
+          bash tests/gates.sh --with-relay 2>&1 | tee "$GITHUB_WORKSPACE/core-logs/core-${{ matrix.shard }}.log" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-log-${{ matrix.shard }}
+          path: core-logs/core-${{ matrix.shard }}.log
+          if-no-files-found: warn
+
+  bundle:
+    name: gate bundle ${{ matrix.bundle }}
+    needs: [plan, build]
+    if: needs.plan.outputs.has_suite == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.suite_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Backend deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+      # The mount arm mounts a real FUSE filesystem and unmounts it in its trap.
+      - name: Install FUSE
+        if: matrix.fuse == 'true'
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+      # The whoami arm proves its claim ON THE WIRE, so it needs a capture; the
+      # script exits 2 when it cannot capture.
+      - name: Allow the wire capture
+        if: matrix.tcpdump == 'true'
+        run: |
+          command -v tcpdump || { sudo apt-get update && sudo apt-get install -y tcpdump; }
+          sudo setcap cap_net_raw,cap_net_admin+eip "$(command -v tcpdump)"
+      - uses: actions/download-artifact@v4
+        with:
+          name: tunlion-plain
+          path: ${{ runner.temp }}/bin
+      - name: Install the gate binary
+        run: |
+          chmod +x "$RUNNER_TEMP/bin/tunlion"
+          sha256sum "$RUNNER_TEMP/bin/tunlion"
+      - name: Run bundle ${{ matrix.bundle }}
+        env:
+          FILAMENT_BIN: ${{ runner.temp }}/bin/tunlion
+          BUNDLE: ${{ matrix.bundle }}
+          BUNDLE_SCRIPTS: ${{ matrix.scripts }}
+        run: python3 scripts/ci_gates.py run-bundle
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-result-${{ matrix.bundle }}
+          path: gate-results/
+          if-no-files-found: warn
+
+  verdict:
+    name: gates verdict
+    needs: [plan, build, unit, core, bundle]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-result-*
+          path: gate-results
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-log-*
+          path: core-logs
+          merge-multiple: true
+      - name: Verdict
+        env:
+          EXPECTED: ${{ needs.plan.outputs.expected }}
+          RESULTS_DIR: gate-results
+          CORE_DIR: core-logs
+        run: python3 scripts/ci_gates.py verdict
+      - name: Preserve the combined core log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gates-core-log
+          path: core-logs/combined.log
+          if-no-files-found: ignore
