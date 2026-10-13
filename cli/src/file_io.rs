@@ -262,10 +262,10 @@ mod invitation_reader_tests {
     /// the exact command that accepts it.
     #[test]
     fn a_code_given_to_the_invitation_reader_names_join() {
-        let e = super::parse_invitation("comic-otter-1950").unwrap_err().to_string();
+        let e = super::parse_invitation("comic-otter-1950").err().expect("a code is not an invitation").to_string();
         assert!(e.contains("pairing code"), "{e}");
         assert!(e.contains("tunlion join comic-otter-1950"), "{e}");
-        let e = super::parse_invitation("hello there").unwrap_err().to_string();
+        let e = super::parse_invitation("hello there").err().expect("not an invitation").to_string();
         assert!(e.contains("filament-invite:"), "{e}");
         assert!(e.contains("tunlion join"), "{e}");
     }
