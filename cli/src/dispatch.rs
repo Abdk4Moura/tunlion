@@ -112,6 +112,7 @@ pub(crate) fn json_supported(cmd: &Cmd) -> bool {
             | Cmd::Set { .. }
             | Cmd::Reach { .. }
             | Cmd::Send { .. }
+            | Cmd::Receive { .. }
             | Cmd::Sync { .. }
             | Cmd::Doctor { .. }
             | Cmd::Addr { .. }
@@ -541,6 +542,32 @@ pub(crate) async fn async_main() -> Result<()> {
             "--json is not implemented for this operation; refusing to mix human output with machine data",
         ));
     }
+    // A corrupt state file is an error naming it, never an empty store
+    // (state_files.rs). The verbs that stop, repair or only print are exempt.
+    let exempt = matches!(
+        cmd,
+        Cmd::Reset
+            | Cmd::Down
+            | Cmd::Logs { .. }
+            | Cmd::Config { .. }
+            | Cmd::Completions { .. }
+            | Cmd::Man { .. }
+            | Cmd::Update { .. }
+    );
+    if !exempt {
+        // A verb with its own --json flag must still answer in JSON.
+        let own_json = match &cmd {
+            Cmd::Devices { json, .. } => Some((*json, "devices")),
+            Cmd::Status { json } => Some((*json, "status")),
+            Cmd::Reach { json, .. } => Some((*json, "reach")),
+            Cmd::Doctor { json, .. } => Some((*json, "doctor")),
+            _ => None,
+        };
+        if let Some((true, verb)) = own_json {
+            crate::exit_codes::set_json_mode(true, Some(verb));
+        }
+        crate::state_files::check_all()?;
+    }
     match cmd {
         Cmd::Init {
             name,
@@ -588,6 +615,7 @@ pub(crate) async fn async_main() -> Result<()> {
         } => {
             let json_out = ui_caps.json || cli.json;
             let peer = to.clone();
+            crate::send_report::set_peer(peer.as_deref());
             let sources = crate::send_report::source_labels(&paths, name.as_deref());
             let res = if let Some(ak_path) = auth_key {
                 enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
@@ -637,7 +665,15 @@ pub(crate) async fn async_main() -> Result<()> {
                     "`receive --background` was renamed: the always-on receiver is the daemon. Run `up --install` instead"
                 );
             } else {
-                recv_cmd(
+                let json_out = ui_caps.json || cli.json;
+                if json_out && output.as_deref() == Some("-") {
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Usage,
+                        "--json and -o - both write to stdout; pick one",
+                    ));
+                }
+                let shown_dir = dir.display().to_string();
+                let res = recv_cmd(
                     &server,
                     code,
                     dir,
@@ -653,7 +689,14 @@ pub(crate) async fn async_main() -> Result<()> {
                     None,
                     false,
                 )
-                .await
+                .await;
+                // Refused files decide the outcome: all refused is the
+                // refusal's own code, some refused is partial.
+                let res = crate::recv_report::finish(res);
+                if json_out {
+                    return crate::recv_report::emit(res, &shown_dir);
+                }
+                res
             }
         }
         // Every field is named: a `..` here is how `set --yes`, `--json` and
@@ -1300,6 +1343,15 @@ pub(crate) async fn async_main() -> Result<()> {
                                     // link to it AND the device answered a
                                     // liveness ping on that link just now.
                                     "online": online.get(n).copied().flatten(),
+                                    // The human row's word for the same
+                                    // value: "idle" is online:false (no
+                                    // answering link right now), not a
+                                    // second opinion.
+                                    "status": match online.get(n).copied().flatten() {
+                                        Some(true) => json!("online"),
+                                        Some(false) => json!("idle"),
+                                        None => Value::Null,
+                                    },
                                 })
                             })
                             .collect();
@@ -1856,19 +1908,32 @@ pub(crate) async fn async_main() -> Result<()> {
                     &capability,
                     resource_scoped,
                 ) {
-                    crate::pair_cmd::GrantVsCeiling::AlreadyCovered => bail!(
-                        "'{capability}' is already granted to '{device}' by its invitation ceiling; no grant is needed"
-                    ),
-                    _ => bail!(
-                        "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
-                        ceiling.join(", "),
-                        crate::identity_state::reenrol_steps(
-                            &device,
-                            &crate::display_name(),
-                            &capability,
-                            &ceiling
-                        )
-                    ),
+                    // The state asked for already holds: success, not an
+                    // error. It exited 1, so a provisioning script that
+                    // grants idempotently failed on its second run.
+                    crate::pair_cmd::GrantVsCeiling::AlreadyCovered => {
+                        ui::say(&format!(
+                            "'{capability}' is already granted to '{device}' by its invitation ceiling; nothing to do"
+                        ));
+                        return Ok(());
+                    }
+                    // A decision against the request: the documented
+                    // "denied" exit (4), not the catch-all 1.
+                    _ => {
+                        return Err(crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::Denied,
+                            format!(
+                                "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
+                                ceiling.join(", "),
+                                crate::identity_state::reenrol_steps(
+                                    &device,
+                                    &crate::display_name(),
+                                    &capability,
+                                    &ceiling
+                                )
+                            ),
+                        ));
+                    }
                 }
             }
             if user && owner_pk.is_none() {

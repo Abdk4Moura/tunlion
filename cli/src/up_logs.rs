@@ -420,6 +420,15 @@ pub(crate) async fn up_cmd(
     if swept > 0 {
         ui::debug(&format!("removed {swept} stale temporary file(s) from the config directory"));
     }
+    // A previous daemon that died without ending its served `exec` commands
+    // (kill -9, a crash) left their process groups recorded: end them now,
+    // before anything is served. Only the lock holder gets here.
+    let leftovers = crate::exec_recv::kill_leftover_groups();
+    if leftovers > 0 {
+        ui::say(&format!(
+            "  ended {leftovers} remote command(s) a previous daemon left running"
+        ));
+    }
     let dir = drop_dir(dir);
     // The daemon's first start creates the inbox when nothing else has, and
     // this used to be a plain create_dir_all: 0755 under the usual umask, so a

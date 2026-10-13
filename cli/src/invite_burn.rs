@@ -97,6 +97,7 @@ pub(crate) fn record_use_at(
         "lastUsed": now,
     }));
     let body = serde_json::to_string_pretty(&entries).map_err(|_| Refusal::Unverifiable)?;
+    crate::state_files::keep_backup(path);
     crate::platform::SecretFile::write_str(path, &body).map_err(|_| Refusal::Unverifiable)?;
     Ok(())
 }

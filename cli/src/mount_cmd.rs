@@ -177,6 +177,12 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     // The inbox the last daemon served (written by `up`; status and doctor
     // read it). `reset -y` said "clean slate" and kept it.
     ("up.inbox", "last daemon's inbox marker"),
+    // Process groups the daemon is serving for `exec`, swept at its next
+    // start when it died without ending them.
+    (
+        crate::exec_recv::SERVED_GROUPS_FILE,
+        "served exec process groups",
+    ),
     ("proxy.token", "local proxy token"),
     // What the local proxy and the transfer history record. `reset` called the
     // machine a clean slate while both survived it: proxy.json names the
@@ -535,6 +541,7 @@ mod reset_tests {
             "up.ready",
             "up.lock",
             "up.inbox",
+            "exec.groups",
             "proxy.token",
             "proxy.json",
             "transfers.json",

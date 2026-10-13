@@ -12,6 +12,9 @@
 #
 # Gates:
 #   A  a device enrolled without shell is refused exec on its owner (nonzero)
+#   A2 the same exec against an owner NOT serving shells advises the
+#      re-enrolment too (exit 4), never `grant <dev> shell`, which the ceiling
+#      refuses
 #   B  `grant <dev> shell` refuses and prints the re-enrolment steps, every one
 #      of them a real command: forget, add --for with shell, down, reset, join
 #   C  every printed command, run VERBATIM from a script (no terminal, no flag
@@ -55,6 +58,34 @@ else
   bad "gateA: exec outside the ceiling was not refused (rc=$rcA)"
 fi
 
+# ==================================================================== GATE A2 ==
+# The same exec against an owner that is NOT serving shells (plain `up`, no
+# shell grant anywhere: the blind acceptance run's state). The refusal there is
+# "serving is off", whose usual remedy is `grant <dev> shell`, and for this
+# device that grant is refused by the ceiling. So the advice must be the
+# re-enrolment itself, never the grant that would fail.
+say "A2: with shell serving off, the advice is the re-enrolment, not a grant"
+OWNER_PID=$(cat "$DA/up.pid" 2>/dev/null)
+kill "$OWNER_PID" 2>/dev/null
+sleep 2
+env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-off.log" 2>&1 &
+FIX_PIDS+=($!)
+sleep 4
+OUTA2=$(timeout 60 "${D_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/A2.err" </dev/null)
+rcA2=$?
+echo "## (exec, serving off) rc=$rcA2 out='$OUTA2'"; sed 's/^/    /' "$WORK/A2.err" | tail -12
+if [ "$rcA2" = "4" ] && ! echo "$OUTA2" | grep -q SHOULD-NOT-RUN \
+   && grep -qF "tunlion add --for $DEV --allow" "$WORK/A2.err" \
+   && ! grep -q "tunlion grant" "$WORK/A2.err"; then
+  ok "gateA2: serving off + shell outside the ceiling advises the re-enrolment (exit 4, no grant advice)"
+else
+  bad "gateA2: serving-off refusal advised a grant the ceiling refuses, or did not refuse as denied (rc=$rcA2)"
+fi
+kill "$(cat "$DA/up.pid" 2>/dev/null)" 2>/dev/null
+sleep 2
+start_acceptor "$DA"
+sleep 4
+
 # ===================================================================== GATE B ==
 say "B: grant explains the re-enrolment, with real commands"
 OUTB=$("${A_ENV[@]}" "$BIN" --server "$SERVER" grant "$DEV" shell 2>&1)
@@ -70,7 +101,7 @@ need=( "tunlion devices forget $DEV"
 missing=""
 for n in "${need[@]}"; do echo "$OUTB" | grep -qF -- "$n" || missing="$missing [$n]"; done
 ALLOW=$(echo "$OUTB" | grep -oE "add --for $DEV --allow [^ ]+" | head -1 | awk '{print $NF}')
-if [ "$rcB" != "0" ] && [ -z "$missing" ] && echo "$ALLOW" | grep -q shell; then
+if [ "$rcB" = "4" ] && [ -z "$missing" ] && echo "$ALLOW" | grep -q shell; then
   ok "gateB: grant refuses and prints the full re-enrolment (allow: $ALLOW)"
 else
   bad "gateB: grant advice incomplete (rc=$rcB, missing:$missing)"

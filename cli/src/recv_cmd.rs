@@ -518,6 +518,21 @@ async fn handle_forward_open(
     // the mux now, so it can't leak past the stream).
 }
 
+/// The refusal for a shell-class open while serving is OFF here (`off` is
+/// ShellOff or TunnelOff). Its remedy is a grant, which is wrong for a
+/// delegated device whose invitation ceiling excludes shell: `grant` refuses
+/// exactly that, so the device was handed a command that would fail. Such a
+/// device gets the ceiling refusal instead, whose remedy is the re-enrolment.
+fn serving_off_refusal(conn: &Conn, pid: &str, off: crate::refusal::Code) -> crate::refusal::Refusal {
+    let who = conn.link(pid).and_then(|l| l.verified_name.clone());
+    let outside = who.as_deref().and_then(crate::principal_ceiling_for).is_some_and(|c| {
+        crate::pair_cmd::grant_vs_ceiling(Some(c.as_slice()), crate::capability::CAP_SHELL, false)
+            == crate::pair_cmd::GrantVsCeiling::OutsideCeiling
+    });
+    let code = if outside { crate::refusal::Code::Ceiling } else { off };
+    crate::refusal::Refusal::new(code, who)
+}
+
 /// Accept one `pty-open` frame: validate, shell-gate, attach or spawn,
 /// acknowledge. Extracted verbatim from the recv loop arm so unsettled opens
 /// can be parked and re-driven through this same function.
@@ -542,8 +557,7 @@ async fn handle_pty_open(
     // no output. Say so, so the initiator errors instead of waiting.
     if !l2_enabled {
         let sid = l2::wire_sid(&v).unwrap_or(0);
-        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
-        let refusal = crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+        let refusal = serving_off_refusal(conn, &pid, crate::refusal::Code::ShellOff);
         let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
@@ -1675,6 +1689,12 @@ pub(crate) async fn recv_cmd(
     let mut revocation_snap = crate::revocation_live::store_snapshot();
     let mut revocation_sweep_now = false;
     let mut revoked_secrets: std::collections::HashSet<String> = Default::default();
+    // Links whose peer claimed a pairing this store does not hold (its
+    // pair-proof failed: forgotten here, or never paired). Every shell-class
+    // open on such a link is refused as unrecognized before any handler runs,
+    // so a forgotten device hears who refused it and why, not "serving is off"
+    // or "no grant", which named fixes that cannot apply.
+    let mut unrecognized_pids: std::collections::HashSet<String> = Default::default();
     let mut revocation_waiters: Vec<ctl::Req> = Vec::new();
     // How long an offer may wait for its sender to prove itself before we decide
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
@@ -1806,6 +1826,30 @@ pub(crate) async fn recv_cmd(
                         String::new()
                     }
                 );
+            }
+        }
+        // A one-shot receive that refused or declined everything it was offered
+        // ends here, at once, with its own reason and code (recv_report). It
+        // used to hold the line for the sender, which had already been told
+        // no, and then blame it: "the sender is unreachable ... Nothing was
+        // received", exit 6, for a receiver whose own disk was full. It waits
+        // only for the sender to leave, or a few seconds for another offer.
+        if !daemon
+            && !keep_open
+            && st.completed == 0
+            && st.by_sid.is_empty()
+            && st.pending.is_empty()
+            && st.recv_pending_offers.is_empty()
+        {
+            if let Some(since) = crate::recv_report::since_last_refusal() {
+                let sender_gone = conn.rejoin.waiting_rejoin.is_some() || conn.links.is_empty();
+                if sender_gone || since >= Duration::from_secs(3) {
+                    if let Some(e) = crate::recv_report::refused_outcome() {
+                        ui::clear_sticky();
+                        let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
+                        return Err(e);
+                    }
+                }
             }
         }
         // A one-shot receive whose sender left and did not come back ends here,
@@ -5335,6 +5379,37 @@ pub(crate) async fn recv_cmd(
                     }
                 }
                 _ if !conn.links.contains_key(&pid) => {}
+                // A peer whose pair-proof FAILED here (forgotten, or never
+                // paired) and that has proven no other identity since: refuse
+                // every shell-class open with that fact, ahead of the serving
+                // and capability arms below. Those would answer "serving is off"
+                // or "no grant", and either sends the user to a fix that cannot
+                // apply to a device this machine does not know.
+                Some(
+                    ty @ ("exec-open" | "pty-open" | "l2-open" | "mount-open"
+                    | "ssh-sign-request" | "shell-bootstrap"),
+                ) if unrecognized_pids.contains(&pid)
+                    && conn.link(&pid).is_some_and(|l| l.verified_name.is_none()) =>
+                {
+                    ui::say(&format!("l2: {ty} refused: the peer is not a device recognized here"));
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let refusal =
+                            crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None);
+                        if ty == "shell-bootstrap" {
+                            let mut f = json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": refusal.reason,
+                            });
+                            refusal.annotate(&mut f);
+                            let _ = t.send_control(&f).await;
+                        } else if let Some(sid) = v["sid"].as_u64() {
+                            let mut f = json!({ "type": "l2-close", "sid": sid, "err": refusal.reason });
+                            refusal.annotate(&mut f);
+                            let _ = t.send_control(&f).await;
+                        }
+                    }
+                    continue;
+                }
                 // Warm-reuse liveness: the acceptor confirmed a stream WE initiated
                 // (a warm `open`) is connected end to end. Route it to the mux so
                 // verify_first_frame passes even for a client-speaks-first service
@@ -5442,9 +5517,8 @@ pub(crate) async fn recv_cmd(
                 // instead of a hang.
                 Some("l2-open") if !l2_enabled => {
                     if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
-                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
                         let refusal =
-                            crate::refusal::Refusal::new(crate::refusal::Code::TunnelOff, who);
+                            serving_off_refusal(&conn, &pid, crate::refusal::Code::TunnelOff);
                         let _ = t.send_control(&refusal.close_frame(sid)).await;
                     }
                     continue;
@@ -5453,9 +5527,8 @@ pub(crate) async fn recv_cmd(
                 // the caller errors instead of hanging on a silent drop.
                 Some("exec-open") if !l2_enabled => {
                     if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
-                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
                         let refusal =
-                            crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+                            serving_off_refusal(&conn, &pid, crate::refusal::Code::ShellOff);
                         let _ = t.send_control(&refusal.close_frame(sid)).await;
                     }
                     continue;
@@ -5477,9 +5550,8 @@ pub(crate) async fn recv_cmd(
                 #[cfg(unix)]
                 Some("shell-bootstrap") if !l2_enabled => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
                         let refusal =
-                            crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+                            serving_off_refusal(&conn, &pid, crate::refusal::Code::ShellOff);
                         let mut f = json!({
                             "type": "shell-bootstrap-deny",
                             "reason": refusal.reason,
@@ -6218,8 +6290,13 @@ pub(crate) async fn recv_cmd(
                             }
                         }
                         ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
+                        unrecognized_pids.remove(&pid);
                         true
                     } else {
+                        // Remembered for the open guard above; links gone since
+                        // are dropped from the set here so it cannot grow.
+                        unrecognized_pids.retain(|p| conn.links.contains_key(p));
+                        unrecognized_pids.insert(pid.clone());
                         // CRITICAL, a security verdict the user must see (-q too).
                         ui::critical(&ui::paint(
                             ui::Tone::Warn,
@@ -6803,6 +6880,14 @@ pub(crate) async fn recv_cmd(
                         if daemon {
                             enqueue_if_requestable(&sender_name, "transfer");
                         }
+                        note_refusal(
+                            daemon,
+                            &name,
+                            size,
+                            "denied",
+                            &format!("declined {name} from {sender_name} ({reason})"),
+                            crate::exit_codes::ExitKind::Denied,
+                        );
                         t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
                     }
@@ -6847,6 +6932,26 @@ pub(crate) async fn recv_cmd(
                                 }
                             ),
                         ));
+                        match xfer_deny_reason.as_deref() {
+                            Some(reason) => note_refusal(
+                                daemon,
+                                &name,
+                                size,
+                                "denied",
+                                &format!("declined {name} from {sender_name} ({reason})"),
+                                crate::exit_codes::ExitKind::Denied,
+                            ),
+                            None => note_refusal(
+                                daemon,
+                                &name,
+                                size,
+                                "no_tty",
+                                &format!(
+                                    "declined {name} from {sender_name}: no tty to ask on and no -y"
+                                ),
+                                crate::exit_codes::ExitKind::Usage,
+                            ),
+                        }
                         t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
                     }
@@ -6978,6 +7083,7 @@ pub(crate) async fn recv_cmd(
                                 ui::Tone::Err,
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
+                            note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                             t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                             continue;
                         }
@@ -7002,6 +7108,7 @@ pub(crate) async fn recv_cmd(
                                 ui::Tone::Err,
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
+                            note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                             t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                             continue;
                         }
@@ -7039,6 +7146,7 @@ pub(crate) async fn recv_cmd(
                                     ui::Tone::Err,
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
+                                note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                                 t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                                 continue;
                             }
@@ -7082,6 +7190,7 @@ pub(crate) async fn recv_cmd(
                                     ui::Tone::Err,
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
+                                note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                                 t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                                 continue;
                             }
@@ -7224,7 +7333,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(wf) = failed {
                         st.verify_fails.remove(&id);
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon);
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -7403,7 +7512,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(wf) = failed {
                         st.verify_fails.remove(&id);
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon);
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -7570,7 +7679,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         st.verify_fails.remove(&inc.id);
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon);
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -7740,6 +7849,15 @@ pub(crate) async fn recv_cmd(
                         answered = true;
                         let (qpid, qv) = st.pending.pop_front().unwrap();
                         ui::clear_sticky();
+                        let qname = safe_incoming_name(qv["name"].as_str().unwrap_or("file"));
+                        note_refusal(
+                            daemon,
+                            &qname,
+                            qv["size"].as_u64().unwrap_or(0),
+                            "declined",
+                            &format!("declined {qname}"),
+                            crate::exit_codes::ExitKind::Denied,
+                        );
                         ui::say(&ui::paint(
                             ui::Tone::Dim,
                             &format!(
@@ -8143,6 +8261,7 @@ async fn stdout_delivered(inc: &IncomingFile, conn: &Conn, pid: &str, sid: u32) 
         bail!("{}: {why}", inc.name);
     }
     inc.bar.done(written);
+    crate::recv_report::note_stored(&inc.name, written, inc.full.as_deref(), "-");
     if inc.full.is_some() {
         if let Some(t) = conn.transport_of(pid) {
             let _ = t.send_control(&protocol::delivery_ack_msg(&inc.id, sid)).await;
@@ -8260,6 +8379,7 @@ fn refuse_failed_write(
     dir: &Path,
     wf: &crate::recv_files::WriteFailure,
     from: &str,
+    daemon: bool,
 ) -> (String, &'static str, String) {
     let need = inc.size.saturating_sub(inc.received.load(Ordering::Relaxed));
     let free = platform::free_space(dir);
@@ -8270,9 +8390,25 @@ fn refuse_failed_write(
         ui::Tone::Err,
         &format!("  refused {} from {from}: {msg}", inc.name),
     ));
+    note_refusal(daemon, &inc.name, inc.size, token, &msg, crate::recv_report::storage_kind(token));
     let id = inc.id.clone();
     let part = inc.part_path.clone();
     drop(inc);
     crate::recv_files::discard_partial(&part);
     (id, token, msg)
+}
+
+/// Record a refusal for a one-shot receive's outcome (`recv_report`). The
+/// daemon serves many senders and ends with none of them, so it keeps no list.
+fn note_refusal(
+    daemon: bool,
+    name: &str,
+    size: u64,
+    token: &str,
+    msg: &str,
+    kind: crate::exit_codes::ExitKind,
+) {
+    if !daemon {
+        crate::recv_report::note_refused(name, size, token, msg, kind);
+    }
 }

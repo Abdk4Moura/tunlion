@@ -145,8 +145,9 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     pub(crate) color: Option<String>,
     /// JSON output (structured, parseable) where a command supports it: init,
-    /// add, join, id, status, set, reach, send, sync, doctor, addr and devices. Any
-    /// other command refuses --json rather than mixing human text into it.
+    /// add, join, id, status, set, reach, send, receive, sync, doctor, addr and
+    /// devices. Any other command refuses --json rather than mixing human text
+    /// into it.
     /// Independent of TTY: a pipe still gets human text unless --json is set.
     #[arg(long, global = true)]
     pub(crate) json: bool,

@@ -196,6 +196,7 @@ pub(crate) fn record_key_revocation_at(
         "revokedAt": now,
         "name": name,
     }));
+    crate::state_files::keep_backup(path);
     crate::platform::SecretFile::write_str(path, &serde_json::to_string_pretty(&entries)?)?;
     Ok(())
 }
@@ -219,6 +220,20 @@ pub(crate) fn forget_device(name: &str, now: u64) -> Result<String> {
         (&verdict, cert.as_ref())
     {
         record_key_revocation_at(&key_revocations_path(), cert, name, now)?;
+    }
+    // The grants go too. They live in caps.json keyed by the device KEY, not
+    // in the record, so removing the record used to leave a forgotten key
+    // holding `shell` for whoever could present it next. Revoked before the
+    // record goes, so a failure leaves everything where it was.
+    if let Some(cert) = cert.as_ref() {
+        crate::device_caps::revoke_device_grants(cert, now)
+            .map_err(|e| anyhow::anyhow!("could not revoke the grants held by '{name}': {e}"))?;
+    }
+    // And the shell key that grant installed for `shell --ssh`, by name, while
+    // the name still means this device. Only touched when its block is there.
+    let ak = std::fs::read_to_string(crate::sshkeys::authorized_keys_path()).unwrap_or_default();
+    if crate::sshkeys::has_block(&ak, name) {
+        crate::sshkeys::remove_authorized_key(name)?;
     }
     crate::device_caps::devices_remove(name)?;
     Ok(forget_report(name, &verdict))

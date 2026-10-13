@@ -45,7 +45,11 @@
 #                              when delivered), a cold reach --json says cold
 #                              with its path, an interrupted --json verb prints
 #                              its failure object (SIGINT 130, SIGTERM 143), and
-#                              a full receiver's typed reason reaches --json
+#                              a full receiver's typed reason reaches --json;
+#                              receive exits with its own reason (12 disk full,
+#                              2 no tty) at once, a corrupt devices.json is an
+#                              error naming it, and a code send --json puts the
+#                              code on stdout first
 #                              (mounts a small tmpfs, so it uses sudo)
 #   net-blockers-gates.sh      nothing on the mesh holds a client open with no
 #                              answer: SOCKS to a denied port / unknown peer /
@@ -178,19 +182,21 @@ jobs:
         run: |
           set -uo pipefail
           declare -A EXPECT=(
-            [cli/tests/cap-verbs-gates.sh]=3
+            # 4: D (an already-covered grant exits 0) joined A/B/C.
+            [cli/tests/cap-verbs-gates.sh]=4
             [cli/tests/devices-write-race-gates.sh]=2
             [cli/tests/roster-gates.sh]=8
             [cli/tests/shell-gates.sh]=12
             [cli/tests/whoami-candidate-gates.sh]=8
             [cli/tests/warm-hold-idle-gates.sh]=9
             [cli/tests/hostile-env-gates.sh]=17
-            [cli/tests/reenrol-advice-gates.sh]=3
+            # 4: A2 (serving off still advises the re-enrolment) joined A/B/C.
+            [cli/tests/reenrol-advice-gates.sh]=4
             [cli/tests/daemon-stop-gates.sh]=4
             [cli/tests/signaling-freeze-gates.sh]=5
             [cli/tests/config-scope-gates.sh]=4
             [cli/tests/identity-relink-gates.sh]=3
-            [cli/tests/scripting-contract-gates.sh]=6
+            [cli/tests/scripting-contract-gates.sh]=10
             [cli/tests/net-blockers-gates.sh]=12
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
