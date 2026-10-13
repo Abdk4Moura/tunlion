@@ -3295,6 +3295,24 @@ pub fn stdio_is_file(path: &Path) -> bool {
     }
 }
 
+/// True when stdout is a pipe whose reader has gone (`logs -f | head -2` once
+/// `head` exits). A follow with nothing new to print never writes, so it never
+/// meets the EPIPE that would end it; this asks the kernel instead, without
+/// writing. Unix: a pipe's write end polls POLLERR (macOS: POLLHUP) once the
+/// last reader closes. Elsewhere it cannot be asked cheaply and says false.
+pub fn stdout_reader_gone() -> bool {
+    #[cfg(unix)]
+    {
+        let mut p = libc::pollfd { fd: 1, events: 0, revents: 0 };
+        let n = unsafe { libc::poll(&mut p, 1, 0) };
+        n > 0 && (p.revents & (libc::POLLERR | libc::POLLHUP)) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 // --------------------------------------------------------------- disk space --
 
 /// Bytes available to this (unprivileged) user on the filesystem holding `dir`,

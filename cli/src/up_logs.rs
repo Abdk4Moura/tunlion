@@ -1026,12 +1026,31 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
             "  this daemon runs as a service (pid {pid}); its output goes to the journal"
         ));
         ui::say(&ui::paint(ui::Tone::Dim, &format!("    {cmd}")));
-        let status = std::process::Command::new("journalctl")
+        let child = std::process::Command::new("journalctl")
             .args(scope.split_whitespace())
             .args(["-u", unit])
             .args(if follow { vec!["-f"] } else { vec![] })
             .args(["-n", &n.to_string(), "--no-pager"])
-            .status();
+            .spawn();
+        // Polled rather than waited on, so a reader that leaves (`logs -f |
+        // head`) ends the follow even while the journal is quiet.
+        let status = match child {
+            Ok(mut c) => loop {
+                match c.try_wait() {
+                    Ok(Some(st)) => break Ok(st),
+                    Ok(None) => {
+                        if crate::platform::stdout_reader_gone() {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                            return Ok(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Err(e) => break Err(e),
+                }
+            },
+            Err(e) => Err(e),
+        };
         return match status {
             Ok(st) if st.success() => Ok(()),
             // Say which step failed. "no log yet" would be a third
@@ -1123,6 +1142,12 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                         _ = interrupted.notified() => detached!(),
                         res = reader.read_line(&mut line) => {
                             if res? == 0 {
+                                // Nothing new, so nothing is written and no EPIPE
+                                // can say the reader left (`logs -f | head -2`
+                                // hung here after head exited). Ask directly.
+                                if crate::platform::stdout_reader_gone() {
+                                    return Ok(());
+                                }
                                 // The idle wait is a select ARM, not an awaited
                                 // body, so the interrupt stays live through it.
                                 tokio::select! {
@@ -1144,6 +1169,9 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                 }
             }
             Err(_) => {
+                if crate::platform::stdout_reader_gone() {
+                    return Ok(());
+                }
                 // The same window while waiting for the file to appear: a daemon
                 // that is slow to start must not make ctrl-c inert either.
                 tokio::select! {
