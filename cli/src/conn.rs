@@ -1781,8 +1781,9 @@ impl Conn {
     /// device came back on a new instance the peer held two live-looking links
     /// to it and routed warm opens to the dead one, waiting out the 2.5s
     /// verify window on every such open (net-blockers P1). Returns how many
-    /// transports were closed. The caller gives the close a moment to leave
-    /// before exiting; there is no flush-on-close in QUIC.
+    /// transports were closed. The caller must still await something before
+    /// exiting (the endpoint task sends the close frames); there is no
+    /// flush-on-close in QUIC.
     pub(crate) fn close_links_for_exit(&self) -> usize {
         let mut n = 0;
         for l in self.links.values() {
