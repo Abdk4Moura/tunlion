@@ -1190,7 +1190,7 @@ impl Mux {
                 // device a record {name, secret, caps[]}; here we must require the
                 // `forward` cap (and `shell` for port 22) carried/proved in
                 // `v["cap"]` and bound to the DTLS fingerprints, deny-by-default.
-                // The whole L2 acceptor stays OFF unless FILAMENT_L2=1 (opt-in).
+                // The whole L2 acceptor stays OFF unless TUNLION_L2=1 (opt-in).
 
                 let host = v["host"].as_str().unwrap_or("127.0.0.1").to_string();
                 let port = v["rport"]
@@ -1519,8 +1519,8 @@ pub(crate) async fn bring_up_to_known(
     // never came up ("establishment timed out", reproduced live as a consistent
     // pop-os -> do-vm failure that 7s/12s established cleanly). Back to 7s, which
     // clears the real ICE time with margin; field-overridable via
-    // FILAMENT_L2_CANDIDATE_SECS.
-    let candidate_secs: u64 = std::env::var("FILAMENT_L2_CANDIDATE_SECS")
+    // TUNLION_L2_CANDIDATE_SECS.
+    let candidate_secs: u64 = std::env::var("TUNLION_L2_CANDIDATE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -1530,7 +1530,7 @@ pub(crate) async fn bring_up_to_known(
     // `start_direct` in main.rs); when the peer's transport-offer arrives we
     // consume this endpoint into the race. UNCONDITIONAL here: `bring_up_to_known`
     // only ever serves L2 (netcat/ssh/forward), which always wants direct, and
-    // `tunlion shell --ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
+    // `tunlion shell --ssh`/`netcat` do NOT set TUNLION_L2 in their own env, so gating
     // on `direct_enabled()` would kill the direct dial on the live path. main.rs
     // gates because it ALSO serves file transfer; this function never does.
     let mut endpoint: Option<quinn::Endpoint> = None;
@@ -1652,7 +1652,7 @@ pub(crate) async fn bring_up_to_known(
                 // dial. Bind once, advertise to whichever candidate is current
                 // (mirrors `start_direct`); the peer's own offer drives the
                 // race (handled in Ev::Signal below). Gated on
-                // `direct_enabled()` — when `FILAMENT_DIRECT=0` (e.g. macOS
+                // `direct_enabled()` — when `TUNLION_DIRECT=0` (e.g. macOS
                 // hyperkit CI), the L2 establish skips direct-quic entirely and
                 // uses WebRTC (srflx / relay candidates), exercising the relay
                 // fallback path.
@@ -2084,13 +2084,13 @@ pub struct ProbeOutcome {
 /// link (LinkGuard::close) and the mux (no leaked streams/pumps).
 ///
 /// `timeout_secs` is the caller's bound: `reach --timeout` and
-/// `doctor --timeout` pass theirs (None = FILAMENT_DOCTOR_PROBE_SECS or 30 s).
+/// `doctor --timeout` pass theirs (None = TUNLION_DOCTOR_PROBE_SECS or 30 s).
 /// The outer bound of one `doctor <device>` probe, in seconds: `--timeout`,
-/// else FILAMENT_DOCTOR_PROBE_SECS, else 30. Doctor announces it before it
+/// else TUNLION_DOCTOR_PROBE_SECS, else 30. Doctor announces it before it
 /// starts, so the wait is never a silent one.
 pub(crate) fn doctor_probe_secs(timeout_secs: Option<u64>) -> u64 {
     timeout_secs.filter(|n| *n > 0).unwrap_or_else(|| {
-        std::env::var("FILAMENT_DOCTOR_PROBE_SECS")
+        std::env::var("TUNLION_DOCTOR_PROBE_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|n| *n > 0)
@@ -2249,9 +2249,9 @@ async fn open_stream(
         .await
         .ok_or_else(|| anyhow!("l2 open: sid {sid:#x} already in use"))?;
     // The dial target is ALWAYS 127.0.0.1 in production (localhost-only is the
-    // contract). FILAMENT_L2_DIALHOST is a TEST-ONLY override so the SSRF gate
+    // contract). TUNLION_L2_DIALHOST is a TEST-ONLY override so the SSRF gate
     // can drive a non-loopback open and observe the acceptor refuse it.
-    let host = std::env::var("FILAMENT_L2_DIALHOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let host = std::env::var("TUNLION_L2_DIALHOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     mux.transport
         .send_control(&json!({ "type": "l2-open", "sid": sid, "host": host, "rport": rport }))
         .await?;
@@ -2263,10 +2263,10 @@ async fn open_stream(
 /// RTT; for ssh that frame is sshd's banner and for pty the shell prompt, both of
 /// which the peer sends UNPROMPTED, so the wait overlaps work we needed anyway.
 /// Only a black-holed link burns the whole window. Override with
-/// FILAMENT_WARM_VERIFY_MS.
+/// TUNLION_WARM_VERIFY_MS.
 #[cfg(unix)]
 pub(crate) fn warm_verify_window() -> std::time::Duration {
-    let ms = std::env::var("FILAMENT_WARM_VERIFY_MS")
+    let ms = std::env::var("TUNLION_WARM_VERIFY_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -2877,8 +2877,8 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
         }
     }
     // Bound the connect so an unreachable peer fails with a clear message
-    // instead of hanging forever. Override with FILAMENT_CONNECT_SECS.
-    let connect_secs: u64 = std::env::var("FILAMENT_CONNECT_SECS")
+    // instead of hanging forever. Override with TUNLION_CONNECT_SECS.
+    let connect_secs: u64 = std::env::var("TUNLION_CONNECT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n| *n > 0)
@@ -3100,8 +3100,8 @@ async fn pty_attach_once(
     pending: &mut Option<Vec<u8>>,
 ) -> Result<PtyOutcome> {
     // Bound the connect so an unreachable peer fails with a clear message
-    // instead of hanging forever. Override with FILAMENT_CONNECT_SECS.
-    let connect_secs: u64 = std::env::var("FILAMENT_CONNECT_SECS")
+    // instead of hanging forever. Override with TUNLION_CONNECT_SECS.
+    let connect_secs: u64 = std::env::var("TUNLION_CONNECT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n| *n > 0)
@@ -3649,7 +3649,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         );
                         std::process::exit(1);
                     }
-                    let connect_secs: u64 = std::env::var("FILAMENT_CONNECT_SECS")
+                    let connect_secs: u64 = std::env::var("TUNLION_CONNECT_SECS")
                         .ok()
                         .and_then(|s| s.parse().ok())
                         .filter(|n| *n > 0)
@@ -4745,9 +4745,9 @@ pub(crate) fn overlay_settle_window(handshake: Duration) -> Duration {
 
 /// The budget for the WARM half of a proxy `.mesh` CONNECT: the daemon's L2 open
 /// plus its overlay dial must have answered by then: the dial's own bound, its
-/// settle wait, and a second for the open. Override with FILAMENT_PROXY_WARM_MS.
+/// settle wait, and a second for the open. Override with TUNLION_PROXY_WARM_MS.
 fn proxy_warm_budget() -> Duration {
-    std::env::var("FILAMENT_PROXY_WARM_MS")
+    std::env::var("TUNLION_PROXY_WARM_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -4759,9 +4759,9 @@ fn proxy_warm_budget() -> Duration {
 /// How long a connection accepted by `forward` (or a proxy CONNECT on the cold
 /// path) may wait for the peer before it is closed. A forward to a dead peer
 /// used to hold every client open with no data and no close for as long as the
-/// client cared to wait. Override with FILAMENT_FORWARD_CONNECT_SECS.
+/// client cared to wait. Override with TUNLION_FORWARD_CONNECT_SECS.
 pub(crate) fn cold_link_bound() -> Duration {
-    let secs = std::env::var("FILAMENT_FORWARD_CONNECT_SECS")
+    let secs = std::env::var("TUNLION_FORWARD_CONNECT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -5167,8 +5167,8 @@ async fn shell_bootstrap(
 
     // Bound the connect so an unreachable peer fails with a clear, actionable
     // message instead of looping forever (the heartbeat inside reports progress
-    // meanwhile). Override with FILAMENT_SSH_CONNECT_SECS.
-    let connect_secs: u64 = std::env::var("FILAMENT_SSH_CONNECT_SECS")
+    // meanwhile). Override with TUNLION_SSH_CONNECT_SECS.
+    let connect_secs: u64 = std::env::var("TUNLION_SSH_CONNECT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n| *n > 0)
@@ -5216,7 +5216,7 @@ async fn shell_bootstrap(
     }))
     .await?;
 
-    // Await the verdict (bounded, a daemon without FILAMENT_L2 / without the cap
+    // Await the verdict (bounded, a daemon without TUNLION_L2 / without the cap
     // must not hang us forever). Capture it, then ALWAYS tear this link down
     // BEFORE returning, so the ssh data link (netcat ProxyCommand) is the only
     // boxA peer the acceptor sees, no concurrent same-device supersede churn.
@@ -5366,13 +5366,13 @@ async fn bootstrap_key(
     shell_bootstrap(server, peer, relay, ssh_port, cert_only).await
 }
 
-/// The login account for the ssh destination: FILAMENT_SSH_USER wins, else the
+/// The login account for the ssh destination: TUNLION_SSH_USER wins, else the
 /// account the ACCEPTOR installed our key into (from the bootstrap-ack, or the
 /// cache), else local $USER, else root. The acceptor's report is authoritative
 /// over a local $USER guess, which is usually wrong cross-machine (agboola@laptop
 /// vs root@server, the "Permission denied (publickey)" mismatch).
 fn resolve_login(remote_user: Option<String>) -> String {
-    std::env::var("FILAMENT_SSH_USER")
+    std::env::var("TUNLION_SSH_USER")
         .ok()
         .or(remote_user)
         .or_else(|| std::env::var("USER").ok())
@@ -5425,7 +5425,7 @@ async fn run_ssh(
     #[cfg(not(target_os = "linux"))]
     let _ = revive;
     #[cfg(target_os = "linux")]
-    if std::env::var("FILAMENT_NO_L3_SSH").as_deref() != Ok("1") {
+    if std::env::var("TUNLION_NO_L3_SSH").as_deref() != Ok("1") {
         if let Some((mesh_host, addr)) = l3_mesh_addr(peer, rport) {
             // The peer IS on the overlay. PREFER L3 (survives link repairs); only
             // fall to L2 when the overlay genuinely can't carry ssh.
@@ -5613,7 +5613,7 @@ fn spawn_ssh(
 ///
 /// With zero pre-existing ssh setup: bootstrap our managed key + the peer's host
 /// key over the authenticated tunlion channel, pin them, then run ssh pointed
-/// EXCLUSIVELY at filament-managed material (-o IdentityFile / IdentitiesOnly /
+/// EXCLUSIVELY at tunlion-managed material (-o IdentityFile / IdentitiesOnly /
 /// UserKnownHostsFile) with a `tunlion netcat` ProxyCommand. No prompts, no
 /// ~/.ssh, no key copying. The bootstrap is the deny-by-default gate: if the
 /// peer lacks the `shell` cap we abort HERE, before invoking ssh.
@@ -5653,7 +5653,7 @@ async fn revive_l3(peer: &str, rport: u16) {
 }
 
 /// How long to wait for the overlay to come back after a revive nudge (default 15s;
-/// override with FILAMENT_L3_REVIVE_MS). This is a CEILING, not a fixed wait:
+/// override with TUNLION_L3_REVIVE_MS). This is a CEILING, not a fixed wait:
 /// Info needed to connect to a peer over SSH (or sshfs/rsync). Returned by
 /// `ensure_peer_bootstrap` after key installation + host key pinning.
 pub(crate) struct PeerSshInfo {
@@ -5667,26 +5667,19 @@ pub(crate) struct PeerSshInfo {
 
 /// Ensure our managed key is installed on the peer and host keys are pinned.
 /// Returns `PeerSshInfo` with everything needed to spawn sshfs/rsync/ssh.
-// PROTOCOL LITERAL: frozen, do not rename. `filament-<peer>` is the host alias
-// written into the managed known_hosts / bootstrap pin store; released builds
-// wrote it and look it up by exactly this spelling, so a renamed prefix makes
-// every pinned peer look unpinned (and re-bootstraps or prompts).
-const SSH_HOST_ALIAS_PREFIX: &str = "filament-";
-/// Read only, never written: the prefix an unreleased build wrote for a short
-/// while after the rename. Still recognised when mapping an alias to its peer.
-const SSH_HOST_ALIAS_PREFIX_RENAMED: &str = "tunlion-";
+// `tunlion-<peer>` is the host alias written into the managed known_hosts /
+// bootstrap pin store and looked up by exactly this spelling.
+const SSH_HOST_ALIAS_PREFIX: &str = "tunlion-";
 
-/// The host alias for `peer` (always the frozen `filament-` spelling).
+/// The host alias for `peer`.
 fn ssh_host_alias(peer: &str) -> String {
     format!("{SSH_HOST_ALIAS_PREFIX}{peer}")
 }
 
-/// The peer name inside a host alias, accepting both spellings.
+/// The peer name inside a host alias.
 #[allow(dead_code)] // only the Linux L3 path reads it outside tests
 fn peer_from_ssh_host_alias(host: &str) -> &str {
-    host.strip_prefix(SSH_HOST_ALIAS_PREFIX)
-        .or_else(|| host.strip_prefix(SSH_HOST_ALIAS_PREFIX_RENAMED))
-        .unwrap_or(host)
+    host.strip_prefix(SSH_HOST_ALIAS_PREFIX).unwrap_or(host)
 }
 
 pub(crate) async fn ensure_peer_bootstrap(
@@ -5696,7 +5689,7 @@ pub(crate) async fn ensure_peer_bootstrap(
 ) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
     let _host = ssh_host_alias(peer);
-    let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
+    let rport: u16 = std::env::var("TUNLION_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(22);
@@ -5747,7 +5740,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
 pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool, cert_only: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
     let host = ssh_host_alias(peer);
-    let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
+    let rport: u16 = std::env::var("TUNLION_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(22);
@@ -5839,7 +5832,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     // CERT MODE: `shell --ssh` authenticates with an ephemeral certificate,
     // so this bootstrap fetches host keys + sshd status only and installs
     // NOTHING into the peer's authorized_keys.
-    let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
+    let rport: u16 = std::env::var("TUNLION_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(22);
@@ -5884,7 +5877,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
 
 /// ssh exit 255 is ssh's own connect/session failure (no sshd reachable, timed
 /// out, auth) - distinct from a remote command's non-zero exit. In that case point
-/// the user at the filament-native shell, which needs no sshd and survives repairs.
+/// the user at the tunlion-native shell, which needs no sshd and survives repairs.
 fn ssh_failed_hint(peer: &str, code: i32) {
     if code == 255 {
         crate::ui::say(&crate::ui::paint(
@@ -5924,7 +5917,7 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
             format!("start an sshd on '{peer}' listening on localhost (or all interfaces)"),
             format!(
                 "set {} to a different port",
-                crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")
+                crate::ui::paint(crate::ui::Tone::Brand, "TUNLION_SSH_PORT")
             ),
             format!(
                 "use {} for a shell that needs no sshd",
@@ -6946,9 +6939,9 @@ mod h1_tests {
 mod ssh_host_alias_tests {
     use super::*;
 
-    /// The alias is on-disk format shared with released builds: pinned by the
-    /// SHA-256 of the original prefix (`printf '%s' '<prefix>' | sha256sum`),
-    /// which a find-and-replace cannot keep in step.
+    /// The alias is on-disk format: pinned by the SHA-256 of the prefix
+    /// (`printf '%s' '<prefix>' | sha256sum`), which a find-and-replace cannot
+    /// keep in step.
     #[test]
     fn writer_uses_the_frozen_prefix() {
         use sha2::{Digest, Sha256};
@@ -6957,15 +6950,17 @@ mod ssh_host_alias_tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        assert_eq!(got, "a9b2366d5c35fecae4becd94bbbdcd150323114f356d1404517649b7dbf3cab4");
+        assert_eq!(got, "3968f8daf6d3c64a6f999b30e787260f3a254279af6cda2b611a1e31183d66be");
         assert_eq!(ssh_host_alias("laptop"), format!("{SSH_HOST_ALIAS_PREFIX}laptop"));
     }
 
     #[test]
-    fn reader_accepts_both_spellings() {
+    fn reader_maps_the_alias_back_to_its_peer() {
         assert_eq!(peer_from_ssh_host_alias(&ssh_host_alias("laptop")), "laptop");
         assert_eq!(peer_from_ssh_host_alias("tunlion-laptop"), "laptop");
         assert_eq!(peer_from_ssh_host_alias("laptop"), "laptop");
+        // Any other prefix is not ours and is left as it is.
+        assert_eq!(peer_from_ssh_host_alias("filament-laptop"), "filament-laptop");
     }
 }
 

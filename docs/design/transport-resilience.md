@@ -62,8 +62,8 @@ transport-agnostic:
 
 | Rung | Path | Code | Gate | Route label |
 |---|---|---|---|---|
-| 1 | direct-dial QUIC over host/public candidates | `direct.rs::race_connect` | `FILAMENT_DIRECT` / `FILAMENT_L2` | `direct-quic` |
-| 2 | STUN srflx + UDP hole-punch, then rung-1's QUIC verbatim | `holepunch.rs::connect` (+ `direct::race_connect_labeled`) | `FILAMENT_HOLEPUNCH` | `holepunched` |
+| 1 | direct-dial QUIC over host/public candidates | `direct.rs::race_connect` | `TUNLION_DIRECT` / `TUNLION_L2` | `direct-quic` |
+| 2 | STUN srflx + UDP hole-punch, then rung-1's QUIC verbatim | `holepunch.rs::connect` (+ `direct::race_connect_labeled`) | `TUNLION_HOLEPUNCH` | `holepunched` |
 | 3 | WebRTC / ICE (host/srflx/relay), DTLS data channel | `net.rs::Peer` + `DataChannelTransport` | always (the shipped default) | `local` / `direct` / `relayed` |
 
 The rungs run as a **sequential ladder**, not a happy-eyeballs race:
@@ -126,7 +126,7 @@ proven patterns to pull *down* into the transport layer so **every** client gets
 them, not just the runner (`jobrunner-challenges.md` "Layer B"):
 
 - **Retry-until-peer.** Bounded per-invocation send timeout
-  (`FILAMENT_SEND_TIMEOUT`, 45 s) inside a retry loop with backoff against a
+  (`TUNLION_SEND_TIMEOUT`, 45 s) inside a retry loop with backoff against a
   generous overall deadline — "a wedged establishment is abandoned and
   re-invoked (a fresh connect clears a stuck candidate pair)." This is the
   outer-reconnect loop the CLI lacks (1.4).
@@ -154,7 +154,7 @@ Stated honestly, smallest-to-largest:
   channel stops moving data. The only byte-flow signal that exists,
   `Transport::idle_ms()` (`net.rs:131`), was built for a *different* purpose: it
   lets `maybe_adopt`/`reap_deferred` tell a frozen-alive link from a flowing one
-  during a **supersede** decision (#28, threshold `FILAMENT_ADOPT_ACTIVE_MS`,
+  during a **supersede** decision (#28, threshold `TUNLION_ADOPT_ACTIVE_MS`,
   default 3 s). It is **never consulted to abort and re-route a stuck transfer**.
   So a `direct` link that establishes and then moves zero bytes (the Pixel-at-0%
   hang) sits there until something *else* (a socket death, a watchdog on a *new*
@@ -258,8 +258,8 @@ loop while a transfer is in flight (`by_sid` non-empty):
    drained / receive window is open), declare the transport **stalled**. Suggested
    threshold: **5–8 s** (well above a slow-but-moving link's inter-chunk gap on a
    bad mobile uplink, well below human patience). Configurable via a
-   `FILAMENT_STALL_MS` knob mirroring the existing `FILAMENT_ADOPT_ACTIVE_MS` /
-   `FILAMENT_REJOIN_SECS` style.
+   `TUNLION_STALL_MS` knob mirroring the existing `TUNLION_ADOPT_ACTIVE_MS` /
+   `TUNLION_REJOIN_SECS` style.
 2. **Distinguish slow-but-moving from hung.** "Slow" still advances
    `last_activity` (a 1-byte chunk resets it); "hung" does not. The threshold is
    on *time since the last byte*, never on throughput — so we never punish a slow
@@ -555,12 +555,12 @@ generalized from "runner result transfers" to "any transfer":
   from `cli-resilience.md` Part 4 applies: assert *progress/correctness*, never
   MB/s):
   - **Gate (stall-detect):** inject a data-path freeze mid-transfer (a test hook
-    like `FILAMENT_TEST_FREEZE_AFTER_BYTES`); assert the bytes-moved watchdog
+    like `TUNLION_TEST_FREEZE_AFTER_BYTES`); assert the bytes-moved watchdog
     fires within the stall threshold and the correction ladder resumes + completes
     + hash-matches. A/B with the detector disabled must hang (proving the detector
     is load-bearing, mirroring gate 11c's `NO_DEFER` baseline).
   - **Gate (auto-relay):** force all direct rungs to fail (the existing
-    `FILAMENT_DIRECT_TEST_BLOCK`, `direct.rs:57`, generalized to also block
+    `TUNLION_DIRECT_TEST_BLOCK`, `direct.rs:57`, generalized to also block
     WebRTC-direct + holepunch); assert the ladder auto-escalates to relay,
     completes, and the relay state is *surfaced* (the CLI banner / a UI assertion).
   - **Gate (acceptor self-heal):** sever the signaling link under a long-lived

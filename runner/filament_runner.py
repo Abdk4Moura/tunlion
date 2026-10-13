@@ -178,9 +178,9 @@ class RunnerBox:
 
     def _env(self, extra=None, config_dir=None):
         env = dict(os.environ)
-        env["FILAMENT_CONFIG_DIR"] = config_dir or self.cfg
+        env["TUNLION_CONFIG_DIR"] = config_dir or self.cfg
         env["HOME"] = config_dir or self.cfg
-        env["FILAMENT_L2"] = "1"
+        env["TUNLION_L2"] = "1"
         # wide terminal so ffmpeg/`ls` output isn't wrapped in the PTY
         env["COLUMNS"] = "220"
         env["LINES"] = "50"
@@ -456,7 +456,7 @@ class RunnerBox:
         # never co-subscribes the ctl/din channels (no acceptor glare).
         send_cmd = (
             f"cd {scratch} && "
-            f"FILAMENT_CONFIG_DIR={self.box_dout_config_dir} FILAMENT_L2=1 "
+            f"TUNLION_CONFIG_DIR={self.box_dout_config_dir} TUNLION_L2=1 "
             f"tunlion send {quoted} --to {shlex.quote(self.box_host_dout)} "
             f"--server {shlex.quote(self.server)} && echo FILJOB_FETCH_OK"
         )
@@ -618,7 +618,7 @@ class FileRunnerBox:
         # wedged establishment is abandoned and re-invoked — a fresh connect clears
         # a stuck candidate pair. The LOOP (submit_deadline_s) is what waits "until
         # the peer appears": bounded attempts, unbounded-until-deadline retries.
-        cli_send_timeout_s: int = 45,     # FILAMENT_SEND_TIMEOUT per send invocation
+        cli_send_timeout_s: int = 45,     # TUNLION_SEND_TIMEOUT per send invocation
         submit_deadline_s: float = 1800,  # overall window to land a din push
         send_retry_gap_s: float = 4.0,    # base backoff between send re-invocations
         ack_attempts: int = 8,            # how hard to push the completion ack
@@ -641,9 +641,9 @@ class FileRunnerBox:
 
     def _env(self, config_dir):
         env = dict(os.environ)
-        env["FILAMENT_CONFIG_DIR"] = config_dir
+        env["TUNLION_CONFIG_DIR"] = config_dir
         env["HOME"] = config_dir
-        env["FILAMENT_L2"] = "1"
+        env["TUNLION_L2"] = "1"
         return env
 
     def _relay_args(self):
@@ -684,14 +684,14 @@ class FileRunnerBox:
 
         On a flaky link the box's din acceptor may be mid-reconnect when we push,
         so a single `send` would hit "no peer connected" and give up at the stock
-        60s. We (a) set FILAMENT_SEND_TIMEOUT so the CLI itself doesn't give up
+        60s. We (a) set TUNLION_SEND_TIMEOUT so the CLI itself doesn't give up
         early (0 = wait for the peer), and (b) re-invoke with backoff until it
         succeeds or a generous OVERALL deadline elapses. No more single-shot
         give-ups."""
         cmd = [self.bin, "send", *paths, "--to", self.box_din,
                "--server", self.server, *self._relay_args()]
         env = self._env(self.cfg)
-        env["FILAMENT_SEND_TIMEOUT"] = str(self.cli_send_timeout_s)
+        env["TUNLION_SEND_TIMEOUT"] = str(self.cli_send_timeout_s)
         deadline = time.monotonic() + (
             overall_deadline_s if overall_deadline_s is not None else self.submit_deadline_s)
         last = None
@@ -722,7 +722,7 @@ class FileRunnerBox:
         """Push a tiny `ack-<job_id>` file to the box inbox over din so the box
         watcher knows we have the full verified result set and can stop re-shipping.
 
-        Best-effort + persistent: we try a handful of times with FILAMENT_SEND_TIMEOUT
+        Best-effort + persistent: we try a handful of times with TUNLION_SEND_TIMEOUT
         set so each send waits for the peer rather than giving up at 60s. A lost ack
         is self-healing — the box keeps re-shipping until an ack lands, so at worst
         the box does one extra round. We never raise: the result is already in hand."""
@@ -734,7 +734,7 @@ class FileRunnerBox:
             cmd = [self.bin, "send", ack_path, "--to", self.box_din,
                    "--server", self.server, *self._relay_args()]
             env = self._env(self.cfg)
-            env["FILAMENT_SEND_TIMEOUT"] = str(self.cli_send_timeout_s)
+            env["TUNLION_SEND_TIMEOUT"] = str(self.cli_send_timeout_s)
             attempts = max(1, self.ack_attempts)
             for attempt in range(attempts):
                 try:

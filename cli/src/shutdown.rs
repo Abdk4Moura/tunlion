@@ -22,16 +22,16 @@ use std::time::Duration;
 /// Default grace before the watchdog force-exits, in milliseconds. Comfortably
 /// under systemd's default `TimeoutStopSec` (90s) so the process exits on its
 /// own terms well before SIGKILL. Overridable for tests / tuning via
-/// `FILAMENT_SHUTDOWN_GRACE_MS`.
+/// `TUNLION_SHUTDOWN_GRACE_MS`.
 pub const DEFAULT_GRACE_MS: u64 = 3_000;
 
 /// The bounded shutdown grace, env-tunable. Pure given the environment; the
 /// parsing/clamping logic is unit-tested via `grace_from`.
 pub fn grace() -> Duration {
-    grace_from(std::env::var("FILAMENT_SHUTDOWN_GRACE_MS").ok().as_deref())
+    grace_from(std::env::var("TUNLION_SHUTDOWN_GRACE_MS").ok().as_deref())
 }
 
-/// Pure: turn an optional `FILAMENT_SHUTDOWN_GRACE_MS` value into the grace
+/// Pure: turn an optional `TUNLION_SHUTDOWN_GRACE_MS` value into the grace
 /// duration. A missing / unpar0able value falls back to the default. `0` is
 /// honored (force-exit on the next scheduler tick) so an operator can opt into
 /// an immediate exit; everything else is taken verbatim.

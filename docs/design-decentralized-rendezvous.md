@@ -34,7 +34,7 @@ bound to the DTLS session (`cli/src/main.rs:1799` `proof_for`, on-wire at
 peer-natively and blind: identity exchange rides A<->B's own direct DTLS
 DataChannel, and the introducer is not a DTLS endpoint
 (`cli/src/main.rs:2593`, "direct DTLS keeps introducer BLIND"). The server URL
-is fully swappable (`--server` / `FILAMENT_SERVER` / config `server`, falling
+is fully swappable (`--server` / `TUNLION_SERVER` / config `server`, falling
 back to `DEFAULT_SERVER`: `cli/src/main.rs:421`, `cli/src/settings.rs:94`).
 
 **The gap:** trust is already peer-native and blind, but the introducer still

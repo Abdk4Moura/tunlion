@@ -22,22 +22,22 @@
 #
 # A/B: against the OLD (unfixed) binary this gate FAILS at step (1)/(2) — the
 # daemon never learns of the new device, so no log line and no delivery. Against
-# the FIXED binary it PASSES. Run with FILAMENT_AB=old to prove the fail-before
-# (point BIN at an unfixed build, or set FILAMENT_BIN).
+# the FIXED binary it PASSES. Run with TUNLION_AB=old to prove the fail-before
+# (point BIN at an unfixed build, or set TUNLION_BIN).
 #
 #   ./live-pairing-gate.sh
 #
-# Honors: FILAMENT_BIN (default cli/target/release/tunlion),
-#         FILAMENT_TEST_SERVER (else autostarts a local backend),
-#         FILAMENT_TEST_VENV (python with flask_socketio+eventlet).
+# Honors: TUNLION_BIN (default cli/target/release/tunlion),
+#         TUNLION_TEST_SERVER (else autostarts a local backend),
+#         TUNLION_TEST_VENV (python with flask_socketio+eventlet).
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
-SERVER="${FILAMENT_TEST_SERVER:-}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
+SERVER="${TUNLION_TEST_SERVER:-}"
 WORK="$(mktemp -d /tmp/filament-livepair.XXXXXX)"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32mPASS\033[0m: %s\n' "$1"; }
@@ -76,7 +76,7 @@ PY
 if [ -z "$SERVER" ]; then
   PORT="$(free_port)"
   SERVER="http://127.0.0.1:$PORT"
-  [ -x "$PYV" ] || { echo "no test venv python at $PYV (set FILAMENT_TEST_VENV)"; exit 2; }
+  [ -x "$PYV" ] || { echo "no test venv python at $PYV (set TUNLION_TEST_VENV)"; exit 2; }
   ( cd "$CLI_DIR/../backend" && PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
       FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
       "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
@@ -86,7 +86,7 @@ fi
 curl -fsS "$SERVER/api/health" >/dev/null 2>&1 || { echo "no backend at $SERVER"; exit 2; }
 
 # A completed receiver otherwise lingers the full rejoin window.
-export FILAMENT_REJOIN_SECS=3
+export TUNLION_REJOIN_SECS=3
 
 # ---- topology --------------------------------------------------------------
 # UP   = the always-on box (the daemon under test).
@@ -108,7 +108,7 @@ PAY="$WORK/payload.bin"; head -c 800000 /dev/urandom > "$PAY"
 PAYHASH="$(hashof "$PAY")"
 
 say "start the always-on daemon (knows only 'old')"
-FILAMENT_CONFIG_DIR="$UP" timeout -k 5 70 "$BIN" up --dir "$DROP" --server "$SERVER" \
+TUNLION_CONFIG_DIR="$UP" timeout -k 5 70 "$BIN" up --dir "$DROP" --server "$SERVER" \
   </dev/null >"$WORK/up.log" 2>&1 &
 UPPID=$!; PIDS+=("$UPPID")
 wait_log "$WORK/up.log" 'tunlion up —' 20 0.2 || { bad "daemon never printed its ready banner"; exit 1; }
@@ -116,7 +116,7 @@ echo "daemon ready; roster at startup = { old }"
 
 # --- sanity: the device known AT STARTUP connects (startup path not regressed) -
 say "sanity — the pre-paired 'old' device connects (startup path)"
-FILAMENT_CONFIG_DIR="$OLD" timeout -k 5 30 "$BIN" send "$PAY" --to box --server "$SERVER" \
+TUNLION_CONFIG_DIR="$OLD" timeout -k 5 30 "$BIN" send "$PAY" --to box --server "$SERVER" \
   >"$WORK/old-send.log" 2>&1
 old_rc=$?
 sleep 1
@@ -149,7 +149,7 @@ fi
 
 # (2) the new device must actually CONNECT — send a file into the daemon, no restart.
 say "the NEW device sends a file into the still-running daemon"
-FILAMENT_CONFIG_DIR="$NEW" timeout -k 5 30 "$BIN" send "$PAY" --to box --server "$SERVER" \
+TUNLION_CONFIG_DIR="$NEW" timeout -k 5 30 "$BIN" send "$PAY" --to box --server "$SERVER" \
   >"$WORK/new-send.log" 2>&1
 new_rc=$?
 sleep 1

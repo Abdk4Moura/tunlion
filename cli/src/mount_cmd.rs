@@ -56,7 +56,7 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
 
     // 3. Strip the managed authorized_keys blocks BEFORE devices.json is gone,
     //    so we know every petname whose block tunlion may have installed. Only
-    //    the delimited `# BEGIN/END filament-managed <device>` blocks are removed;
+    //    the delimited `# BEGIN/END tunlion-managed <device>` blocks are removed;
     //    everything else in authorized_keys is preserved verbatim.
     let ak_path = crate::sshkeys::authorized_keys_path();
     if let Ok(existing) = std::fs::read_to_string(&ak_path) {
@@ -129,7 +129,7 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
 
 /// Every piece of tunlion's OWN state under the config dir, with the label
 /// `reset` reports for it. An explicit list (NOT a blanket rmdir of the config
-/// dir) so a mis-set FILAMENT_CONFIG_DIR can never take out unrelated files.
+/// dir) so a mis-set TUNLION_CONFIG_DIR can never take out unrelated files.
 /// A writer that adds a file to the config dir must add it here, or `reset`
 /// stops being the clean slate it says it is. Lock sidecars come last.
 pub(crate) const RESET_STATE: &[(&str, &str)] = &[

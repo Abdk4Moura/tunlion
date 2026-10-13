@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # `reach --until-direct`. Two daemons on one box are direct by nature, so this
 # is the arm where the loop must stop at once and exit 0. Hermetic, fixture
-# port 8122 ONLY. FILAMENT_BIN=/path/to/tunlion ./reach-until-direct-gates.sh
+# port 8122 ONLY. TUNLION_BIN=/path/to/tunlion ./reach-until-direct-gates.sh
 #
 #   1  `reach <dev>` prints the one-line shape once ("pong via ...")
 #   2  `reach <dev> --until-direct` names a direct route and exits 0
@@ -9,10 +9,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8122
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-reach.XXXXXX")"
 DA="$WORK/A"
 DB="$WORK/bravo"
@@ -26,18 +26,18 @@ start_acceptor "$DA"
 enroll_delegate bravo --allow shell
 
 # bravo's own daemon is what holds the link `--until-direct` watches.
-env FILAMENT_CONFIG_DIR="$DB" FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/bravo-drop" >"$WORK/upB.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/bravo-drop" >"$WORK/upB.log" 2>&1 &
 FIX_PIDS+=($!)
 sleep 12
 
 say "1: plain reach prints the one-line shape"
-out=$(timeout 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach alpha 2>&1)
+out=$(timeout 60 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach alpha 2>&1)
 n=$(printf '%s\n' "$out" | grep -c "pong via ")
 if [ "$n" = "1" ]; then ok "gate1: exactly one 'pong via' line"
 else bad "gate1: expected one 'pong via' line, got $n (out: $out)"; fi
 
 say "2: --until-direct stops on the direct path, exit 0"
-out=$(timeout 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach alpha --until-direct --timeout 20 2>&1)
+out=$(timeout 60 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach alpha --until-direct --timeout 20 2>&1)
 rc=$?
 echo "$out"
 # The route label must come from the link, so assert a direct one by name
@@ -49,7 +49,7 @@ else
 fi
 
 say "3: --until-direct --json emits the per-probe envelope"
-js=$(timeout 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach alpha --until-direct --timeout 20 --json 2>/dev/null | tail -1)
+js=$(timeout 60 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach alpha --until-direct --timeout 20 --json 2>/dev/null | tail -1)
 rc=$?
 echo "$js"
 if [ "$rc" = "0" ] && python3 -c "

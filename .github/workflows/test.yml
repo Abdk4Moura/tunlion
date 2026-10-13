@@ -63,7 +63,7 @@ jobs:
       # The real-kernel subnet-forwarding rig. It needs root and rewrites the
       # firewall, so it is `#[ignore]` in the plain run above and, until this
       # step existed, ran nowhere: it returned early without
-      # FILAMENT_NETNS_RIG=1 and reported "ok" while testing nothing. The test
+      # TUNLION_NETNS_RIG=1 and reported "ok" while testing nothing. The test
       # binary is built as the runner user (same profile as above, so it is
       # already compiled) and only the binary runs under sudo, so no
       # root-owned files land in target/. `--exact` plus the "1 passed" check
@@ -77,7 +77,7 @@ jobs:
                 | tail -1)
           echo "test binary: $exe"
           [ -x "$exe" ]
-          sudo env FILAMENT_NETNS_RIG=1 PATH="$PATH" "$exe" --ignored --exact --nocapture \
+          sudo env TUNLION_NETNS_RIG=1 PATH="$PATH" "$exe" --ignored --exact --nocapture \
             subnet_forward::tests::forwarding_rules_actually_forward_on_a_real_kernel 2>&1 | tee /tmp/netns-rig.log
           grep -q 'test result: ok. 1 passed' /tmp/netns-rig.log
         env:

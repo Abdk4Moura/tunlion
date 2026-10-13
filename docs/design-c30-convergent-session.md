@@ -93,7 +93,7 @@ corrected (re-offer, re-prove, re-ask) or surfaced honestly.
 ## The meta-gate (what makes it "forever")
 
 **Gate L (lossy chaos): wrap the signaling client in a shim that drops 30 %
-of outbound emits at random** (env `FILAMENT_TEST_EMIT_LOSS=0.3`, seeded for
+of outbound emits at random** (env `TUNLION_TEST_EMIT_LOSS=0.3`, seeded for
 reproducibility), then run the standard pair + transfer + reconnect
 choreography and assert everything still converges: transfer completes,
 hashes match, devices stay mutually visible, both exit clean.

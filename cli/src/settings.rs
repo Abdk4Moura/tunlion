@@ -87,7 +87,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Str,
             default: "",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_NAME"),
+            env: Some("TUNLION_NAME"),
             daemon: true,
             help: "Display name other devices see (default: your platform username@hostname)",
         },
@@ -98,7 +98,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Str,
             default: crate::DEFAULT_SERVER,
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_SERVER"),
+            env: Some("TUNLION_SERVER"),
             daemon: true,
             help: "Signaling server URL",
         },
@@ -107,7 +107,7 @@ pub fn registry() -> &'static [Setting] {
             aliases: &["dir"],
             store: "dir",
             kind: Kind::Path,
-            default: "~/Filament if it exists, else ~/Tunlion",
+            default: "~/Tunlion",
             scope: ScopeKind::GlobalOnly,
             env: None,
             daemon: true,
@@ -131,7 +131,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Str,
             default: "",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_SHELL"),
+            env: Some("TUNLION_SHELL"),
             daemon: true,
             help: "Shell program for PTY sessions (e.g. \"bash -l\", \"pwsh -NoLogo\"). Args allowed. Overrides platform default.",
         },
@@ -310,7 +310,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::List,
             default: "",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_WARM_PEERS"),
+            env: Some("TUNLION_WARM_PEERS"),
             daemon: true,
             help: "Peers to keep connected (comma-separated names). These stay warm for instant ssh/ping. Recently-used peers are also kept warm automatically (last 5).",
         },
@@ -321,7 +321,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Bool,
             default: "on",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_AUTO_WARM"),
+            env: Some("TUNLION_AUTO_WARM"),
             daemon: true,
             help: "Keep a live link to every online paired peer so ssh/pty/ping are instant (Tailscale-style). Turn off to connect on demand only. Capped by warm-max.",
         },
@@ -332,7 +332,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Str,
             default: "12",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_WARM_MAX"),
+            env: Some("TUNLION_WARM_MAX"),
             daemon: true,
             help: "Auto-warm at most this many online peers (most recently used win). Others stay discoverable via signaling and connect on demand.",
         },
@@ -343,7 +343,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Bool,
             default: "on",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_AUTO_PROXY"),
+            env: Some("TUNLION_AUTO_PROXY"),
             daemon: true,
             help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on 127.0.0.1:1080 so native tools reach <peer>.mesh. It requires a username/password (the password is in proxy.token in the config dir, owner-only). Turn off with `tunlion set auto-proxy off`.",
         },
@@ -354,7 +354,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Str,
             default: "info",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_LOG"),
+            env: Some("TUNLION_LOG"),
             daemon: false,
             help: "Default verbosity level: quiet (errors only), info (progress + results), debug (-v equivalent, route/tunnel), trace (-vv equivalent, ICE/per-frame). CLI flags override.",
         },
@@ -365,7 +365,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Str,
             default: "2000",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_GATE_SETTLE_MS"),
+            env: Some("TUNLION_GATE_SETTLE_MS"),
             daemon: false,
             help: "How long a shell-class open waits for identity proof before denying (ms); clamped to 5000 max, garbage means default.",
         },
@@ -376,7 +376,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Str,
             default: "1h",
             scope: ScopeKind::GlobalOnly,
-            env: Some("FILAMENT_SSH_CERT_TTL"),
+            env: Some("TUNLION_SSH_CERT_TTL"),
             daemon: false,
             help: "SSH certificate lifetime for `shell --ssh` (e.g. 30m, 1h, or 3600); clamped to 24h max, garbage refuses to sign.",
         },
@@ -1067,7 +1067,7 @@ pub async fn run_set(
             // setcap the user explicitly opted out of (l3-mode=userspace or the env).
             #[cfg(l3)]
             if !dry_run && s.key == "tun-addr" && !new.is_empty() {
-                let userspace = std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1")
+                let userspace = std::env::var("TUNLION_L3_USERSPACE").as_deref() == Ok("1")
                     || get_str("l3-mode", None).as_deref() == Some("userspace");
                 if !userspace {
                     crate::tun::ensure_net_admin_for_l3();
@@ -1426,8 +1426,8 @@ fn setting_help_line(s: &Setting) -> String {
 /// symlink/hardlink escapes, and tar bombs. Returns the number of files written.
 /// Only ever called for recognized archive extensions, opt-in via `auto-extract`.
 pub fn extract_archive(path: &Path, into: &Path) -> Result<usize> {
-    let max_files: usize = std::env::var("FILAMENT_MAX_EXTRACT_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
-    let max_bytes: u64 = std::env::var("FILAMENT_MAX_EXTRACT_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(20 * 1024 * 1024 * 1024);
+    let max_files: usize = std::env::var("TUNLION_MAX_EXTRACT_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let max_bytes: u64 = std::env::var("TUNLION_MAX_EXTRACT_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(20 * 1024 * 1024 * 1024);
 
     let f = std::fs::File::open(path)?;
     let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
@@ -1505,7 +1505,7 @@ mod tests {
     }
     use super::*;
 
-    // FILAMENT_CONFIG_DIR is process-global, so EVERY test that points it at a
+    // TUNLION_CONFIG_DIR is process-global, so EVERY test that points it at a
     // temp dir must serialize on ONE lock. This used to be a lock private to
     // this module, which excluded only other settings tests: the twelve tests in
     // tests.rs that set the same variable hold the shared lock_test_config()
@@ -1521,9 +1521,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fil-set-test-{}-{:x}", std::process::id(), rand_tag()));
         std::fs::create_dir_all(&dir).unwrap();
         // SAFETY: the lock above makes this the only thread touching the env/dir.
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let r = f();
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
         r
     }

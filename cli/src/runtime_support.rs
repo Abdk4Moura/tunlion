@@ -188,7 +188,7 @@ pub(crate) fn add_pending_request(
         granted_at: None,
     });
     // Fire notify hook if configured
-    if let Ok(hook) = std::env::var("FILAMENT_NOTIFY_HOOK") {
+    if let Ok(hook) = std::env::var("TUNLION_NOTIFY_HOOK") {
         if !hook.is_empty() {
             // ARGV exec, never shell — petname is attacker-influenced
             let _ = std::process::Command::new(&hook)
@@ -276,7 +276,7 @@ pub(crate) fn resolve_for_kind(
 
 pub(crate) fn stop_managed_service(pid: u32) -> bool {
     // Only stop through the manager when THIS daemon is actually the managed
-    // unit's process, AND the right manager. `systemctl stop filament` stops
+    // unit's process, AND the right manager. `systemctl stop tunlion` stops
     // the named unit even when down targets a DIFFERENT daemon (a detached
     // foreground `up` on another config), which killed another machine's
     // service during development. Two units share the name here, so the cgroup

@@ -86,7 +86,7 @@ mints a device cert on demand.
 `created your identity` once and proceeds; a second run prints no such line.
 `tunlion init` on a machine that already has an identity still fails with the
 existing message (`identity_flow.rs:246`), unchanged. A gate in
-`cli/tests/gates.sh` runs both halves against a temp `FILAMENT_CONFIG`.
+`cli/tests/gates.sh` runs both halves against a temp `TUNLION_CONFIG`.
 
 ### U2 — `serve shell` and `shell <code>` · `pi` · **B**
 

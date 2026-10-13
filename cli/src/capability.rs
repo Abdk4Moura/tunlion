@@ -161,7 +161,7 @@ pub fn save_and_list_revoked(
 /// fleets show `flip_ready=false` (paired daemons aren't provisioned, so
 /// authoritative-by-default broke ssh/transfer/mount until every capability was
 /// manually granted). Enable authoritative enforcement explicitly by setting
-/// `FILAMENT_CAP_AUTHORITATIVE=1` (or `true`); any other value, or leaving the
+/// `TUNLION_CAP_AUTHORITATIVE=1` (or `true`); any other value, or leaving the
 /// var unset, keeps legacy shadow gating. The env var is the opt-in switch,
 /// pending same-owner fleet-trust that makes the default-on flip safe.
 ///
@@ -169,7 +169,7 @@ pub fn save_and_list_revoked(
 /// `la_authorized > 0` AND `la_denied == 0` AND `la_no_header == 0`. See
 /// docs/cap-flip-checklist.md for the evidence trail.
 pub fn cap_authoritative() -> bool {
-    std::env::var("FILAMENT_CAP_AUTHORITATIVE")
+    std::env::var("TUNLION_CAP_AUTHORITATIVE")
         .map(|x| x == "1" || x.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -1351,7 +1351,7 @@ mod tests {
         //
         // This proves BUCKETING (which (legacy, cap-outcome) pair increments
         // which counter), not gate behavior. Since the authoritative-default
-        // flip (0.7), cap_gate_effective reads FILAMENT_CAP_AUTHORITATIVE which
+        // flip (0.7), cap_gate_effective reads TUNLION_CAP_AUTHORITATIVE which
         // now defaults ON, so the restrictive gates run. We pass Proven binding
         // + Some(u64::MAX) cert expiry so cap_authorize_proven/expired are BOTH
         // no-ops (a valid, proven, live cert), leaving the raw cap outcome to be
@@ -1467,7 +1467,7 @@ mod tests {
         // Mode-independent since the 0.7 authoritative-default flip: pass
         // Proven binding + Some(u64::MAX) expiry so the restrictive gates are
         // no-ops and each (legacy, cap-outcome) pair is counted verbatim,
-        // whether FILAMENT_CAP_AUTHORITATIVE is on (default) or off (shadow).
+        // whether TUNLION_CAP_AUTHORITATIVE is on (default) or off (shadow).
         let uk = [0xaa; 32];
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1866,7 +1866,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// E2E: after revoke + reconciler, NO filament-managed authorized_keys
+    /// E2E: after revoke + reconciler, NO tunlion-managed authorized_keys
     /// block remains. Exercises the full pipeline: devices_with_shell_revoked
     /// → strip_block → block gone.
     #[test]
@@ -1935,7 +1935,7 @@ mod tests {
 
         // 2. Mock authorized_keys with managed block for "bob"
         let mock_ak = format!(
-            "# BEGIN filament-managed bob\nssh-ed25519 AAAAfake filament-managed\n# END filament-managed bob\n"
+            "# BEGIN tunlion-managed bob\nssh-ed25519 AAAAfake tunlion-managed\n# END tunlion-managed bob\n"
         );
         assert!(crate::sshkeys::has_block(&mock_ak, "bob"));
 
@@ -1960,7 +1960,7 @@ mod tests {
         // Verify the block is actually removed
         assert!(
             !crate::sshkeys::has_block(&cleaned, "bob"),
-            "e2e: after reconcile, NO filament-managed authorized_keys block must remain for bob"
+            "e2e: after reconcile, NO tunlion-managed authorized_keys block must remain for bob"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -1972,7 +1972,7 @@ mod tests {
     /// input so a regression in the gate is caught by CI, not by inspection.
     #[test]
     fn reconcile_shell_keys_gated_on_authoritative() {
-        let mock_ak = "# BEGIN filament-managed bob\nssh-ed25519 AAAAfake filament-managed\n# END filament-managed bob\n";
+        let mock_ak = "# BEGIN tunlion-managed bob\nssh-ed25519 AAAAfake tunlion-managed\n# END tunlion-managed bob\n";
         let revoked = vec!["bob".to_string()];
 
         // Under authoritative, the block IS removed.
@@ -2285,8 +2285,8 @@ mod tests {
         // cert_revoked. A revoked device the legacy path trusts must be denied
         // with authoritative OFF — this is the case broken in production.
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var("FILAMENT_CAP_AUTHORITATIVE").unwrap_or_default();
-        unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", "0") };
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").unwrap_or_default();
+        unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "0") };
         let me = [0x77u8; 32];
         let d = cap_gate_effective(
             true,
@@ -2306,9 +2306,9 @@ mod tests {
             false,
         );
         if prior.is_empty() {
-            unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") };
+            unsafe { std::env::remove_var("TUNLION_CAP_AUTHORITATIVE") };
         } else {
-            unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", &prior) };
+            unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", &prior) };
         }
         assert!(
             !d.allowed(),

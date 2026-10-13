@@ -189,7 +189,7 @@ pub(crate) struct Link {
     pub(crate) verified_name: Option<String>,
     /// C26: what the status roster shows for this peer
     pub(crate) presence: Presence,
-    /// rung-1 (FILAMENT_DIRECT): this link's transport is an authenticated direct
+    /// rung-1 (TUNLION_DIRECT): this link's transport is an authenticated direct
     /// QUIC connection, its pair-secret MAC already proved identity, so the
     /// post-channel DTLS pair-proof is skipped and the link is born trusted.
     pub(crate) direct: bool,
@@ -197,7 +197,7 @@ pub(crate) struct Link {
     /// for rung-1, `holepunched` for rung-2. Ignored for WebRTC links.
     pub(crate) direct_route: &'static str,
     /// Parallel QUIC transports for multi-stream file transfer
-    /// (`FILAMENT_DIRECT_STREAMS` > 1). Empty when striping is disabled
+    /// (`TUNLION_DIRECT_STREAMS` > 1). Empty when striping is disabled
     /// or when the link uses a non-QUIC transport.
     pub(crate) workers: Vec<Arc<dyn Transport>>,
     /// When this link was established. Reported when an establish is refused
@@ -383,7 +383,7 @@ pub(crate) struct ResilienceState {
     pub(crate) relay_committed: std::collections::HashSet<String>,
     /// P3 (GAP-3): the WARM-REDUNDANCY selectivity gate. TRUE only for long-lived
     /// / interactive sessions (the `up`/`up --shell` daemon acceptor; a transfer
-    /// flagged interactive via `FILAMENT_WARM_STANDBY=1` standing in for a tunnel),
+    /// flagged interactive via `TUNLION_WARM_STANDBY=1` standing in for a tunnel),
     /// the sessions §2.4 says a mid-session drop is intolerable for. When set,
     /// `correct_stall` keeps the relay path as a pre-designated WARM standby and
     /// CUTS OVER to it on the FIRST stall (rung b) instead of grinding through the
@@ -393,7 +393,7 @@ pub(crate) struct ResilienceState {
     /// repair ladder correct and bounded, and a warm standby isn't worth a second
     /// socket / NAT mapping / keepalive for a single transfer (the honest cost
     /// tradeoff, §2.4 / §6). Defaulted by session kind at construction, overridable
-    /// by `net::warm_standby_override()` (`FILAMENT_WARM_STANDBY`).
+    /// by `net::warm_standby_override()` (`TUNLION_WARM_STANDBY`).
     pub(crate) warm_standby: bool,
     /// P3: per-peer warm-standby bookkeeping, peers whose relay standby has
     /// already been cut over to in the current stall episode, so a flapping relay
@@ -1038,7 +1038,7 @@ pub(crate) struct DirectPending {
     pub(crate) racing: bool,
     /// kept alive so the bound UDP port stays ours until the race consumes it.
     pub(crate) endpoint: Option<quinn::Endpoint>,
-    /// rung-2 (FILAMENT_HOLEPUNCH): a SECOND raw UDP socket, already STUN'd, kept
+    /// rung-2 (TUNLION_HOLEPUNCH): a SECOND raw UDP socket, already STUN'd, kept
     /// raw (not connected) so its NAT mapping is the one we punch + run QUIC on.
     /// Consumed by the chained ladder in `on_transport_offer` only if rung-1
     /// fails. None when hole-punch is off or STUN discovery failed.
@@ -1118,7 +1118,7 @@ pub(crate) struct Conn {
     /// reconnect paths are untouched. Defaults false, so the send-side and
     /// connecting-phase `on_stuck` callers are unaffected.
     pub(crate) recv_done: bool,
-    /// rung-1 (FILAMENT_DIRECT): in-flight direct-QUIC attempts, keyed by peer
+    /// rung-1 (TUNLION_DIRECT): in-flight direct-QUIC attempts, keyed by peer
     /// sid. While an attempt is pending we do NOT establish WebRTC for that peer
     /// (sequential, per the design review, avoids two transports racing to
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
@@ -1132,7 +1132,7 @@ pub(crate) struct Conn {
     /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
     pub(crate) resil: ResilienceState,
     /// Is the rung-1 direct-QUIC path allowed for THIS session? Normally this is
-    /// just `direct::direct_enabled()` (the FILAMENT_DIRECT/FILAMENT_L2 env gate),
+    /// just `direct::direct_enabled()` (the TUNLION_DIRECT/TUNLION_L2 env gate),
     /// but ANY long-lived acceptor must ALSO take it even when those env vars are
     /// unset: the L2/ssh ACCEPTOR (`up --shell`) AND the plain `up` daemon. An
     /// acceptor that doesn't silently drops the initiator's `transport-offer` AND
@@ -1269,7 +1269,7 @@ impl Conn {
     /// per-command differences are `relay_only`, `to_filter`, and the
     /// warm-standby default). Everything else is the fixed fresh-session state.
     /// `warm_standby_default` is the per-session-kind default that the
-    /// `FILAMENT_WARM_STANDBY` override (via `net::warm_standby_override`) can
+    /// `TUNLION_WARM_STANDBY` override (via `net::warm_standby_override`) can
     /// still force either way. NOTE: the long-lived `up` daemon loop keeps its
     /// own literal on purpose, it is a different (non-command) session.
     pub(crate) fn for_command(
@@ -1403,11 +1403,11 @@ impl Conn {
     /// an old link that's still flowing. A frozen-alive peer (gate 11's
     /// SIGSTOP'd receiver) stops stamping activity, so it reads as not-flowing
     /// and the supersede proceeds as before. Threshold is overridable for
-    /// deterministic gating (FILAMENT_ADOPT_ACTIVE_MS); the 3 s default sits
+    /// deterministic gating (TUNLION_ADOPT_ACTIVE_MS); the 3 s default sits
     /// well above a healthy sub-100 ms inter-frame gap so a transient ICE blip
     /// can't masquerade as idle and let a spurious supersede through.
     fn link_flowing(&self, pid: &str) -> bool {
-        let threshold = std::env::var("FILAMENT_ADOPT_ACTIVE_MS")
+        let threshold = std::env::var("TUNLION_ADOPT_ACTIVE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(3000);
@@ -1518,7 +1518,7 @@ impl Conn {
             return Ok(false);
         }
         if test_hooks::fail_adopt() {
-            anyhow::bail!("ICE config: injected adoption failure (FILAMENT_TEST_FAIL_ADOPT)");
+            anyhow::bail!("ICE config: injected adoption failure (TUNLION_TEST_FAIL_ADOPT)");
         }
         // NOTE: same-install peers (our own daemon) are filtered at the
         // KnownPeer call sites, NOT here, room discovery must keep working
@@ -2178,7 +2178,7 @@ impl Conn {
         };
         self.next_gen += 1;
         let generation = self.next_gen;
-        // P1 relay-fallback gate (test-only): FILAMENT_TEST_WEBRTC_RELAY_ONLY=1
+        // P1 relay-fallback gate (test-only): TUNLION_TEST_WEBRTC_RELAY_ONLY=1
         // models a peer with NO direct WebRTC path (hard NAT), every WebRTC link
         // is relay-only, so when the direct-QUIC ladder freezes/exhausts the
         // transfer can ONLY complete over the TURN relay. Faithful to the real
@@ -2267,7 +2267,7 @@ impl Conn {
         Ok(())
     }
 
-    // --- rung-1 direct-QUIC path (FILAMENT_DIRECT) ---------------------------
+    // --- rung-1 direct-QUIC path (TUNLION_DIRECT) ---------------------------
     //
     // Sequential by design: when both peers are CLIs and a pair secret is known,
     // try a direct authenticated QUIC connection FIRST and only fall back to the
@@ -2493,7 +2493,7 @@ impl Conn {
         // waits on exactly that offer, so overlapping them shaves a round-trip off
         // every cold connect. Both borrow &self immutably, so join! is sound.
         //
-        // rung-2 (FILAMENT_HOLEPUNCH): bind a SECOND raw socket and STUN it so we
+        // rung-2 (TUNLION_HOLEPUNCH): bind a SECOND raw socket and STUN it so we
         // can advertise a server-reflexive candidate. This socket is kept RAW
         // (not handed to quinn), its NAT mapping is the one we'll punch + run
         // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
@@ -2554,7 +2554,7 @@ impl Conn {
             // adversarially-mislabeled offer) whose claimed address is not in
             // its addrs. The peer that dials THIS offer's addrs must NOT name
             // this label on fallback - it never dialed 8.8.8.8:53.
-            let tag = if std::env::var("FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH")
+            let tag = if std::env::var("TUNLION_DIRECT_SERVER_PUBLIC_MISMATCH")
                 .map(|v| v == "1")
                 .unwrap_or(false)
             {
@@ -3229,7 +3229,7 @@ impl Conn {
         // the quiet-exit can't fire (RC=124 hang under contention). DROP it
         // instead: links empties, quiet-exit fires. Fenced to complete-only, so
         // a mid-transfer link (recv_done=false) reconnects normally (gate 2/11c).
-        // FILAMENT_TEST_DISABLE_MODEB_DROP reverts to the old reconnect-always
+        // TUNLION_TEST_DISABLE_MODEB_DROP reverts to the old reconnect-always
         // behaviour so the gate proves A/B with ONE binary: baseline (toggle set)
         // hangs to RC=124 under the churn hook; fix (toggle unset) exits cleanly.
         if self.recv_done && !test_hooks::disable_modeb_drop() {
@@ -3624,7 +3624,7 @@ impl Conn {
                 // P3 (GAP-3) WARM-REDUNDANCY instant failover (rung b): cut straight
                 // to the pre-designated warm relay standby instead of grinding the
                 // slow direct-repair rungs (intolerable for an interactive session).
-                // DEBUG, resilience internal; visible at -v / FILAMENT_LOG=debug.
+                // DEBUG, resilience internal; visible at -v / TUNLION_LOG=debug.
                 ui::debug(&ui::paint(
                     ui::Tone::Warn,
                     "  transfer stalled, cutting over to the warm relay standby (instant failover)",
@@ -3802,7 +3802,7 @@ impl Conn {
         // for a direct path and upgrade back the moment one is confirmed stable.
         // Eligibility mirrors warm redundancy (long-lived/interactive sessions +
         // the daemon, a one-shot send that already completed doesn't need it) and
-        // requires relay to be PERMITTED. The kill switch (`FILAMENT_UPGRADE_PROBE=0`)
+        // requires relay to be PERMITTED. The kill switch (`TUNLION_UPGRADE_PROBE=0`)
         // and `--no-relay` both make this a no-op.
         if self.upgrade_eligible() {
             self.resil
@@ -3819,7 +3819,7 @@ impl Conn {
     /// P5 (GAP-6): is this session eligible to run the relay->direct prober?
     /// Selective like P3's warm redundancy: ON for long-lived / interactive
     /// sessions (the `up`/`up --shell` daemon acceptor; a transfer flagged
-    /// interactive via `FILAMENT_WARM_STANDBY=1`). Gated off by the kill switch
+    /// interactive via `TUNLION_WARM_STANDBY=1`). Gated off by the kill switch
     /// and by `--no-relay` (which never reaches relay anyway).
     fn upgrade_eligible(&self) -> bool {
         self.resil.warm_standby && net::upgrade_prober_enabled() && !relay_forbidden()
@@ -4264,7 +4264,7 @@ impl Conn {
         }
         // Defer the drop while the data channel is still moving bytes, unless
         // this is the force re-injection from reap_deferred (the link has since
-        // gone idle/dead and must drop now). FILAMENT_TEST_NO_DEFER reverts to
+        // gone idle/dead and must drop now). TUNLION_TEST_NO_DEFER reverts to
         // the old unconditional-drop behaviour so an A/B repro can prove the
         // deferral is what saves the live transfer (baseline must FAIL).
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
@@ -4985,7 +4985,7 @@ mod warm_identity_tests {
         let dir = std::env::temp_dir().join(format!("fil-warm-id-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         std::fs::write(
             dir.join("devices.json"),
             r#"[{"name":"x","secret":"s3cret"}]"#,
@@ -5018,7 +5018,7 @@ mod warm_identity_tests {
         assert!(conn.direct_pending.is_empty(), "a re-dial was armed");
         assert!(!conn.links.contains_key("sid-ghost"), "a ghost sid was dialled");
         assert!(conn.warm_hold.auto.contains("x"), "the device is warm-held by petname");
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 

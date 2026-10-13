@@ -9,7 +9,7 @@
 //! path can NEVER end up in a published binary (security gate per Claude).
 //!
 //! CAP MODE: every tunlion process spawned here runs with
-//! `FILAMENT_CAP_AUTHORITATIVE=0` (shadow). These are TRANSPORT / mechanics
+//! `TUNLION_CAP_AUTHORITATIVE=0` (shadow). These are TRANSPORT / mechanics
 //! smoke tests (byte-transparency, PTY exec, pairing, warm-hold latency) run
 //! between two FRESH, UNPROVISIONED daemons with NO cap grant. Since the 0.7
 //! authoritative-default flip, that same setup is denied-by-default, which
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const CODE_WORD: &str = "gigantic-element-tango";
-const BUILD_PROFILE: &str = env!("FILAMENT_BUILD_PROFILE");
+const BUILD_PROFILE: &str = env!("TUNLION_BUILD_PROFILE");
 
 /// Result of waiting for a captured child. Timeout is deliberately distinct
 /// from an ordinary non-zero exit: a stalled transfer is a different finding
@@ -341,7 +341,7 @@ impl Harness {
             std::fs::create_dir_all(dir).expect("create peer dir");
             let rec = dir.join(format!("{name}-recovery.txt"));
             let out = Command::new(&bin)
-                .env("FILAMENT_CONFIG_DIR", dir)
+                .env("TUNLION_CONFIG_DIR", dir)
                 .arg("init")
                 .arg("--name")
                 .arg(name)
@@ -414,16 +414,16 @@ fn spawn_daemon_inner(
     let stderr_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let log_clone = stderr_log.clone();
     let mut child = Command::new(bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_CONFIG_DIR", config_dir)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_LOG", "trace")
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_CONFIG_DIR", config_dir)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_LOG", "trace")
         .env(
-        "FILAMENT_DIRECT_LOOPBACK_ONLY",
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
+        "TUNLION_DIRECT_LOOPBACK_ONLY",
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY")
             .unwrap_or_else(|_| "1".into()),
     )
-        .env("FILAMENT_NAME", name)
+        .env("TUNLION_NAME", name)
         .arg("up")
         .arg("--userspace")
         .arg("--shell")
@@ -551,25 +551,25 @@ fn pair_and_transfer_smoke() {
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
 
-    // FILAMENT_DIRECT_PER_OS is the CI knob; it is forwarded to every spawned
-    // daemon as FILAMENT_DIRECT. Named for the workflow's per-OS matrix, but it
+    // TUNLION_DIRECT_PER_OS is the CI knob; it is forwarded to every spawned
+    // daemon as TUNLION_DIRECT. Named for the workflow's per-OS matrix, but it
     // reads as inert from cli/src because nothing there mentions it: the only
     // consumer is this harness. macOS CI sets it to 0, so direct-QUIC is OFF
     // there and every transfer rides WebRTC.
-    let direct_flag = std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let direct_flag = std::env::var("TUNLION_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
 
     // Spawn send; drain stderr continuously in background to avoid SIGPIPE.
     // Also watch for the minted code prefix.
     let mut send_proc = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
         .env(
-        "FILAMENT_DIRECT_LOOPBACK_ONLY",
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
+        "TUNLION_DIRECT_LOOPBACK_ONLY",
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY")
             .unwrap_or_else(|_| "1".into()),
     )
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .arg("send")
         .arg(&test_file)
         .arg("--word")
@@ -603,15 +603,15 @@ fn pair_and_transfer_smoke() {
     let recv_dir = h.b_dir.join("received");
     std::fs::create_dir_all(&recv_dir).expect("create recv dir");
     let mut recv_proc = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
         .env(
-        "FILAMENT_DIRECT_LOOPBACK_ONLY",
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
+        "TUNLION_DIRECT_LOOPBACK_ONLY",
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY")
             .unwrap_or_else(|_| "1".into()),
     )
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .arg("receive")
         .arg(&full_code)
         .arg("--yes")
@@ -676,14 +676,14 @@ fn revoked_device_first_transfer_is_denied() {
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
     let direct_flag =
-        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
     let loopback_only =
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
     let base_env = [
-        ("FILAMENT_CAP_AUTHORITATIVE", "0"),
-        ("FILAMENT_DIRECT", &direct_flag),
-        ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
-        ("FILAMENT_L3_USERSPACE", "1"),
+        ("TUNLION_CAP_AUTHORITATIVE", "0"),
+        ("TUNLION_DIRECT", &direct_flag),
+        ("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only),
+        ("TUNLION_L3_USERSPACE", "1"),
     ];
 
     // 1. B holds A's device record (cert + secret). Construct it directly from
@@ -714,7 +714,7 @@ fn revoked_device_first_transfer_is_denied() {
 
     // 2. Durable revoke: A is no longer recognized on B.
     let revoke = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .args(["devices", "revoke", "test-a", "--yes"])
         .output()
         .expect("revoke");
@@ -729,7 +729,7 @@ fn revoked_device_first_transfer_is_denied() {
     std::fs::write(&test_file, b"secret bytes that must never land").unwrap();
     let mut send_proc = Command::new(&bin)
         .envs(base_env.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .arg("send")
         .arg(&test_file)
         .arg("--word")
@@ -764,7 +764,7 @@ fn revoked_device_first_transfer_is_denied() {
     std::fs::create_dir_all(&recv_dir).unwrap();
     let mut recv_proc = Command::new(&bin)
         .envs(base_env.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .arg("receive")
         .arg(&full_code)
         .arg("--yes")
@@ -831,8 +831,8 @@ fn live_pair(
 ) {
     let mut create = Command::new(bin);
     create.envs(envs.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_CONFIG_DIR", a_dir)
-        .env("FILAMENT_NAME", "test-a")
+        .env("TUNLION_CONFIG_DIR", a_dir)
+        .env("TUNLION_NAME", "test-a")
         .arg("add")
         .arg("--word")
         .arg(word)
@@ -866,8 +866,8 @@ fn live_pair(
     // times out, and the pairing reports a spurious failure).
     let mut claim = Command::new(bin);
     claim.envs(envs.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_CONFIG_DIR", b_dir)
-        .env("FILAMENT_NAME", "test-b")
+        .env("TUNLION_CONFIG_DIR", b_dir)
+        .env("TUNLION_NAME", "test-b")
         // `join` CLAIMS a code; `add` only offers one. Since #291 the CLI refuses
         // `add <code>` outright ("`add` offers, `join` accepts"), so this claim
         // exited at once, the create waited for a claimant that never came, and
@@ -910,7 +910,7 @@ fn run_send_to(
 ) -> CapturedChild {
     let mut send = Command::new(bin);
     send.envs(envs.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_CONFIG_DIR", sender_dir)
+        .env("TUNLION_CONFIG_DIR", sender_dir)
         .arg("send")
         .arg(payload)
         .arg("--to")
@@ -932,7 +932,7 @@ fn run_send_to(
 /// so a one-shot receiver can never produce the revocation-named denial this
 /// cell asserts. That masking is filed as its own bug.
 ///
-/// Transport is WebRTC-only (FILAMENT_DIRECT=0): the artificial direct-blocked
+/// Transport is WebRTC-only (TUNLION_DIRECT=0): the artificial direct-blocked
 /// fallback glare-loops for already-paired devices (#214, filed), so the exact
 /// direct-blocked scenario cannot be exercised yet, and WebRTC is the transport
 /// the fallback lands on anyway. The direct-blocked residual remains the
@@ -954,14 +954,14 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
     let loopback_only =
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
-    // WebRTC-only (FILAMENT_DIRECT=0): the direct-blocked fallback glare (#214)
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+    // WebRTC-only (TUNLION_DIRECT=0): the direct-blocked fallback glare (#214)
     // prevents the artificial direct-block path for already-paired devices.
     let env = [
-        ("FILAMENT_CAP_AUTHORITATIVE", "0"),
-        ("FILAMENT_DIRECT", "0"),
-        ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
-        ("FILAMENT_L3_USERSPACE", "1"),
+        ("TUNLION_CAP_AUTHORITATIVE", "0"),
+        ("TUNLION_DIRECT", "0"),
+        ("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only),
+        ("TUNLION_L3_USERSPACE", "1"),
     ];
 
     // 1. REAL pairing first: `add --word` mints, `add <code>` claims, and B
@@ -1022,7 +1022,7 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
 
     // 5. Revoke A on B.
     let revoke = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .args(["devices", "revoke", "test-a", "--yes"])
         .output()
         .expect("revoke");
@@ -1061,7 +1061,7 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
 /// This gate was written before, in `cli/tests/transport-gates.sh` (GATE 3), and
 /// it is referenced by no workflow. It has never run in CI. A gate that exists
 /// on disk and never executes is not coverage, and the hook it drives
-/// (`FILAMENT_DIRECT_TEST_BLOCK`, wired at direct.rs `race_connect_labeled`) was
+/// (`TUNLION_DIRECT_TEST_BLOCK`, wired at direct.rs `race_connect_labeled`) was
 /// therefore exercised by nothing.
 ///
 /// Three assertions, and the second and third are the ones that make it mean
@@ -1094,20 +1094,20 @@ fn direct_blocked_falls_back_to_webrtc_promptly() {
         Sha256::digest(&payload).iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
 
-    // DIRECT IS FORCED ON, deliberately ignoring FILAMENT_DIRECT_PER_OS. The
+    // DIRECT IS FORCED ON, deliberately ignoring TUNLION_DIRECT_PER_OS. The
     // whole point is direct-enabled-and-failing; running this with direct off
     // would test the disabled path, which the smoke test already covers.
     // LOOPBACK_ONLY still honours the per-OS knob, because that one is about
     // WebRTC candidate gathering, which the fallback depends on.
-    let loopback = std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+    let loopback = std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
 
     let mut send = Command::new(&bin);
-    send.env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", "1")
-        .env("FILAMENT_DIRECT_TEST_BLOCK", "1")
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+    send.env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", "1")
+        .env("TUNLION_DIRECT_TEST_BLOCK", "1")
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .arg("send").arg(&test_file)
         .arg("--word").arg(CODE_WORD)
         .arg("--server").arg(&server);
@@ -1130,12 +1130,12 @@ fn direct_blocked_falls_back_to_webrtc_promptly() {
     std::fs::create_dir_all(&recv_dir).expect("create recv dir");
 
     let mut recv = Command::new(&bin);
-    recv.env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", "1")
-        .env("FILAMENT_DIRECT_TEST_BLOCK", "1")
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+    recv.env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", "1")
+        .env("TUNLION_DIRECT_TEST_BLOCK", "1")
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .arg("receive").arg(&full_code)
         .arg("--yes")
         .arg("--dir").arg(&recv_dir)
@@ -1232,7 +1232,7 @@ fn two_nodes_pair_each_other() {
     let server = h.server_url();
 
     let out = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
         .args(["--server", &server, "--help"])
         .output()
         .expect("help");
@@ -1264,9 +1264,9 @@ fn pty_one_shot_exec_smoke() {
     let server = h.server_url();
 
     let direct_flag =
-        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
     let loopback_only =
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
 
     h.pair_daemons();
 
@@ -1274,12 +1274,12 @@ fn pty_one_shot_exec_smoke() {
 
     let pair_word = format!("pairtest-mesh-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-a")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-a")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1313,12 +1313,12 @@ fn pty_one_shot_exec_smoke() {
     eprintln!("pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-b")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-b")
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .args(["--server", &server, "join", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1379,11 +1379,11 @@ fn pty_one_shot_exec_smoke() {
 
     let nonce = format!("PTY-OK-{}", std::process::id());
     let mut pty_proc = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "shell", "test-b", "--", "echo", &nonce])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1407,7 +1407,7 @@ fn shell_owner_gate_refuses_real_spawn() {
     let root = std::env::temp_dir().join(format!("filament-shell-gate-{}", std::process::id()));
     let drops = root.join("drops");
     let out = Command::new(env!("CARGO_BIN_EXE_tunlion"))
-        .env("FILAMENT_CONFIG_DIR", &root)
+        .env("TUNLION_CONFIG_DIR", &root)
         .args([
             "up", "--userspace", "--shell", "--server", "http://127.0.0.1:1", "--dir",
             drops.to_str().unwrap(),
@@ -1441,9 +1441,9 @@ fn shell_daemon_live_pairing_no_restart() {
     let server = h.server_url();
 
     let direct_flag =
-        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
     let loopback_only =
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
 
     // Start BOTH daemons with --shell, NO prior pairing.
     // spawn_daemon_inner uses --shell, so the guard at 8381 must let them live.
@@ -1470,12 +1470,12 @@ fn shell_daemon_live_pairing_no_restart() {
     // pick it up without a restart.
     let pair_word = format!("livescan-pair-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-a")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-a")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1509,12 +1509,12 @@ fn shell_daemon_live_pairing_no_restart() {
     eprintln!("live-pairing code: {pair_code}");
 
     let mut claim = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-b")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-b")
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .args(["--server", &server, "join", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1562,11 +1562,11 @@ fn shell_daemon_live_pairing_no_restart() {
 
     let nonce = format!("LIVE-PTY-OK-{}", std::process::id());
     let mut pty_proc = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "shell", "test-b", "--", "echo", &nonce])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1605,9 +1605,9 @@ fn warm_all_makes_first_contact_warm() {
     let server = h.server_url();
 
     let direct_flag =
-        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
     let loopback_only =
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
 
     // Phase 1: Pair the daemons (same flow as pty_one_shot_exec_smoke).
     h.pair_daemons();
@@ -1615,12 +1615,12 @@ fn warm_all_makes_first_contact_warm() {
 
     let pair_word = format!("warmtest-mesh-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-a")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-a")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1654,12 +1654,12 @@ fn warm_all_makes_first_contact_warm() {
     eprintln!("pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-b")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-b")
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .args(["--server", &server, "join", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1673,7 +1673,7 @@ fn warm_all_makes_first_contact_warm() {
     eprintln!("pair-create exit: {}", create_out.status);
 
     // Phase 2: Restart daemons so they come up with each other as known devices.
-    // Stock config: no tun-addr, no warm-peers, no FILAMENT_AUTO_WARM override.
+    // Stock config: no tun-addr, no warm-peers, no TUNLION_AUTO_WARM override.
     eprintln!("warm_all: restarting daemons with stock config");
     if let Some(ref mut c) = h.daemon_a { let _ = c.kill(); let _ = c.wait(); }
     if let Some(ref mut c) = h.daemon_b { let _ = c.kill(); let _ = c.wait(); }
@@ -1730,11 +1730,11 @@ fn warm_all_makes_first_contact_warm() {
     // Assertion 2: FIRST CONTACT TAKES THE WARM PATH
     eprintln!("warm_all: running tunlion ping --json...");
     let mut ping_proc = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "reach", "test-b", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1761,11 +1761,11 @@ fn warm_all_makes_first_contact_warm() {
     eprintln!("warm_all: waiting 20s then re-pinging...");
     std::thread::sleep(Duration::from_secs(20));
     let mut ping_proc2 = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "reach", "test-b", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1785,19 +1785,19 @@ fn warm_all_makes_first_contact_warm() {
     std::thread::sleep(Duration::from_secs(3));
 
     // Spawn auto-warm-OFF daemon via custom Command (spawn_daemon_inner doesn't
-    // support FILAMENT_AUTO_WARM override).
+    // support TUNLION_AUTO_WARM override).
     let mut daemon_a_off = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_LOG", "trace")
-        .env("FILAMENT_AUTO_WARM", "0")
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_LOG", "trace")
+        .env("TUNLION_AUTO_WARM", "0")
         .env(
-            "FILAMENT_DIRECT_LOOPBACK_ONLY",
-            std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
+            "TUNLION_DIRECT_LOOPBACK_ONLY",
+            std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY")
                 .unwrap_or_else(|_| "1".into()),
         )
-        .env("FILAMENT_NAME", "test-a")
+        .env("TUNLION_NAME", "test-a")
         .arg("up")
         .arg("--userspace")
         .arg("--shell")
@@ -1871,21 +1871,21 @@ fn warm_one_shot_pty_reuse() {
     let server = h.server_url();
 
     let direct_flag =
-        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
     let loopback_only =
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
 
     h.pair_daemons();
     eprintln!("warm_one_shot_pty_reuse: daemons started");
 
     let pair_word = format!("warm-reuse-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-a")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-a")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1919,12 +1919,12 @@ fn warm_one_shot_pty_reuse() {
     eprintln!("warm pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-b")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-b")
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .args(["--server", &server, "join", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1940,8 +1940,8 @@ fn warm_one_shot_pty_reuse() {
     // Enable daemon A to proactively warm-hold test-b: write warm-peers
     // config so the daemon's warm_hold_tick establishes ONE link.
     let set = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "set", "warm-peers", "test-b"])
         .output()
         .expect("set warm-peers");
@@ -1988,11 +1988,11 @@ fn warm_one_shot_pty_reuse() {
     // establishes a warm link to test-b. Now pty should hit the warm path.
     let nonce = format!("WARM-OK-{}", std::process::id());
     let out = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "shell", "test-b", "--", "echo", &nonce])
         .output()
         .expect("pty");
@@ -2112,17 +2112,17 @@ fn freeze_stall_detector_classification() {
         use sha2::{Digest, Sha256};
         Sha256::digest(&payload).iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
-    let loopback = std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+    let loopback = std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
 
     let mut send = Command::new(&bin);
-    send.env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", "1")
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
-        .env("FILAMENT_LOG", "debug")
-        .env("FILAMENT_STALL_MS", "2500")
-        .env("FILAMENT_WARM_STANDBY", "0")
-        .env("FILAMENT_TEST_FREEZE_AFTER_BYTES", "700000")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+    send.env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", "1")
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback)
+        .env("TUNLION_LOG", "debug")
+        .env("TUNLION_STALL_MS", "2500")
+        .env("TUNLION_WARM_STANDBY", "0")
+        .env("TUNLION_TEST_FREEZE_AFTER_BYTES", "700000")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .arg("send").arg(&payload_path).arg("--word").arg(CODE_WORD)
         .arg("--server").arg(&server);
     let send = spawn_captured(send).expect("spawn measured sender");
@@ -2143,17 +2143,17 @@ fn freeze_stall_detector_classification() {
     let recv_dir = h.b_dir.join("stall_received");
     std::fs::create_dir_all(&recv_dir).expect("create receive directory");
     let mut recv = Command::new(&bin);
-    recv.env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", "1")
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
-        .env("FILAMENT_LOG", "debug")
-        .env("FILAMENT_STALL_MS", "2500")
-        .env("FILAMENT_WARM_STANDBY", "0")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+    recv.env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", "1")
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback)
+        .env("TUNLION_LOG", "debug")
+        .env("TUNLION_STALL_MS", "2500")
+        .env("TUNLION_WARM_STANDBY", "0")
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .arg("receive").arg(&code).arg("--yes").arg("--dir").arg(&recv_dir)
         .arg("--server").arg(&server);
     let recv = spawn_captured(recv).expect("spawn measured receiver");
-    let deadline_secs = std::env::var("FILAMENT_STALL_MEASUREMENT_DEADLINE_SECS")
+    let deadline_secs = std::env::var("TUNLION_STALL_MEASUREMENT_DEADLINE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
@@ -2226,9 +2226,9 @@ fn warm_one_shot_pty_instant_eof() {
     let server = h.server_url();
 
     let direct_flag =
-        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
     let loopback_only =
-        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+        std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
 
     h.pair_daemons();
     eprintln!("warm_one_shot_pty_instant_eof: daemons started");
@@ -2236,12 +2236,12 @@ fn warm_one_shot_pty_instant_eof() {
     // Pair a, claim b
     let pair_word = format!("warm-eof-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-a")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-a")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2275,12 +2275,12 @@ fn warm_one_shot_pty_instant_eof() {
     eprintln!("warm-eof pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_NAME", "test-b")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_NAME", "test-b")
+        .env("TUNLION_CONFIG_DIR", &h.b_dir)
         .args(["--server", &server, "join", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2294,8 +2294,8 @@ fn warm_one_shot_pty_instant_eof() {
 
     // Enable warm-hold and restart daemons.
     let set = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "set", "warm-peers", "test-b"])
         .output()
         .expect("set warm-peers");
@@ -2348,11 +2348,11 @@ fn warm_one_shot_pty_instant_eof() {
     // serve_stream must NOT tear down the pty before output arrives.
     let nonce = format!("WARM-EOF-OK-{}", std::process::id());
     let out = Command::new(&bin)
-        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-        .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_DIRECT", &direct_flag)
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "shell", "test-b", "--", "printf", &nonce])
         .stdin(Stdio::null())  // instant stdin-EOF
         .output()
@@ -2431,7 +2431,7 @@ fn add_for_device_and_person_carry_different_caps() {
 
     for (for_, file) in [("device", &device_file), ("person", &person_file)] {
         let out = Command::new(&bin)
-            .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+            .env("TUNLION_CONFIG_DIR", &h.a_dir)
             .args(["--server", &server, "add", "--for", for_, "--out"])
             .arg(file)
             .arg("--yes")
@@ -2490,7 +2490,7 @@ fn expired_invitation_refused_as_expired() {
 
     let invite_file = h.work_dir.join("inv-expired.txt");
     let mint = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "add", "--for", "device", "--expires", "2s", "--out"])
         .arg(&invite_file)
         .arg("--yes")
@@ -2506,7 +2506,7 @@ fn expired_invitation_refused_as_expired() {
     std::thread::sleep(Duration::from_secs(4));
     let clean = clean_joiner_dir(&h, "c");
     let join = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &clean)
+        .env("TUNLION_CONFIG_DIR", &clean)
         .args(["--server", &server, "join", "--invite-file"])
         .arg(&invite_file)
         .arg("--yes")
@@ -2540,7 +2540,7 @@ fn pre_084_invitation_refused_with_message_not_parse_error() {
 
     let clean = clean_joiner_dir(&h, "c");
     let join = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &clean)
+        .env("TUNLION_CONFIG_DIR", &clean)
         .args(["--server", &server, "join", "--invite-file"])
         .arg(&invite_file)
         .arg("--yes")
@@ -2679,7 +2679,7 @@ fn join_does_not_change_the_capability_store() {
     // stops HERE with a clear message instead of failing 60s later at the join.
     let invite_file = h.work_dir.join("inv-cap-store.txt");
     let mint = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "add", "--for", "device", "--out"])
         .arg(&invite_file)
         .arg("--yes")
@@ -2710,13 +2710,13 @@ fn join_does_not_change_the_capability_store() {
     // matches the issuer daemon's (direct enabled, same candidate policy) so
     // the enrollment link has the same chances the transfer path does; without
     // it the joiner can end up with only a STUN srflx candidate and ICE fails.
-    let loopback_only = std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+    let loopback_only = std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
     let join = spawn_captured({
         let mut c = Command::new(&bin);
-        c.env("FILAMENT_CONFIG_DIR", &joiner)
-            .env("FILAMENT_DIRECT", "1")
-            .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
-            .env("FILAMENT_L3_USERSPACE", "1")
+        c.env("TUNLION_CONFIG_DIR", &joiner)
+            .env("TUNLION_DIRECT", "1")
+            .env("TUNLION_DIRECT_LOOPBACK_ONLY", &loopback_only)
+            .env("TUNLION_L3_USERSPACE", "1")
             .args(["--server", &server, "join", "--invite-file"])
             .arg(&invite_file)
             .arg("--name")

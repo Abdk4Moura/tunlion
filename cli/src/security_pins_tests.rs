@@ -32,14 +32,14 @@ fn unique_dir(label: &str) -> PathBuf {
     d
 }
 
-/// Run `f` with FILAMENT_CONFIG_DIR pointing at a fresh directory.
+/// Run `f` with TUNLION_CONFIG_DIR pointing at a fresh directory.
 fn with_cfg<T>(f: impl FnOnce(&Path) -> T) -> T {
     let _guard = crate::tests::lock_test_config();
     let dir = unique_dir("cfg");
     // SAFETY: the lock above makes this the only test touching the variable.
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
     match r {
         Ok(v) => v,

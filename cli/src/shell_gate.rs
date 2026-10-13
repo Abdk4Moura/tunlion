@@ -195,11 +195,11 @@ mod tests {
     #[test]
     fn exec_matches_pty_across_gate_matrix() {
         let _guard = crate::tests::lock_test_config();
-        let prior = std::env::var("FILAMENT_CAP_AUTHORITATIVE").ok();
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
         for authoritative in [false, true] {
             unsafe {
                 std::env::set_var(
-                    "FILAMENT_CAP_AUTHORITATIVE",
+                    "TUNLION_CAP_AUTHORITATIVE",
                     if authoritative { "1" } else { "0" },
                 );
             }
@@ -411,8 +411,8 @@ mod tests {
             }
         }
         match prior {
-            Some(v) => unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", v) },
-            None => unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") },
+            Some(v) => unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v) },
+            None => unsafe { std::env::remove_var("TUNLION_CAP_AUTHORITATIVE") },
         }
     }
 

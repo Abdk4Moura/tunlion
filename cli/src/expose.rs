@@ -1,12 +1,12 @@
 //! `tunlion expose <port>`: publish a local service on this device's L3 overlay
 //! address so paired peers reach it at `<this-device>.mesh:<port>`, like a
 //! Tailscale-served port. The daemon binds the overlay address (a ULA reachable
-//! only over filament0) and splices each connection to a local target; nothing is
+//! only over tunlion0) and splices each connection to a local target; nothing is
 //! exposed on any public or LAN interface. Config lives in `expose.json` next to
 //! the other settings and is applied to the running daemon over the control
 //! socket (no restart), mirroring `tunlion set`.
 //!
-//! Access control: a connection can only arrive over filament0 from a paired,
+//! Access control: a connection can only arrive over tunlion0 from a paired,
 //! verified peer, so mesh membership is the primary boundary; `--peer` narrows it
 //! further to named devices. (A malicious paired peer could still forge an inner
 //! source address, so the allowlist is a convenience layer, not a hard boundary

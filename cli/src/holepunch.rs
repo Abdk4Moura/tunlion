@@ -1,4 +1,4 @@
-// Rung-2 UDP HOLE-PUNCHING (FILAMENT_HOLEPUNCH=1).
+// Rung-2 UDP HOLE-PUNCHING (TUNLION_HOLEPUNCH=1).
 //
 // Sits BETWEEN rung-1 (direct-dial QUIC, src/direct.rs) and rung-3 (WebRTC/relay)
 // on the transport ladder. When rung-1's host-candidate race fails, both peers
@@ -29,7 +29,7 @@ use crate::net::Transport;
 
 /// Opt-in gate. Rung-2 is dead unless this is set; rung-1 + WebRTC are unaffected.
 pub fn holepunch_enabled() -> bool {
-    std::env::var("FILAMENT_HOLEPUNCH").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_HOLEPUNCH").map(|v| v == "1").unwrap_or(false)
 }
 
 /// Total budget for the punch handshake before giving up (and stepping down to
@@ -206,11 +206,11 @@ fn parse_xor_mapped_address(buf: &[u8], _txid: &[u8; 12]) -> Option<SocketAddr> 
     None
 }
 
-/// Resolve the STUN server address: `FILAMENT_STUN` (host:port) override wins,
+/// Resolve the STUN server address: `TUNLION_STUN` (host:port) override wins,
 /// else the first `stun:` URL from the ICE config. Returns None if neither is
 /// available (rung-2 then simply doesn't advertise an srflx).
 pub fn stun_server_addr(stun_urls: &[String]) -> Option<SocketAddr> {
-    if let Ok(v) = std::env::var("FILAMENT_STUN") {
+    if let Ok(v) = std::env::var("TUNLION_STUN") {
         if let Some(a) = resolve_host_port(v.trim()) {
             return Some(a);
         }
@@ -227,10 +227,10 @@ pub fn stun_server_addr(stun_urls: &[String]) -> Option<SocketAddr> {
 }
 
 /// All resolvable STUN server addresses for happy-eyeballs (`stun_srflx_any`).
-/// `FILAMENT_STUN` override, when set, is authoritative (returns just it); else
+/// `TUNLION_STUN` override, when set, is authoritative (returns just it); else
 /// every distinct `stun:`/`stuns:` URL from the ICE config that resolves.
 pub fn stun_server_addrs(stun_urls: &[String]) -> Vec<SocketAddr> {
-    if let Ok(v) = std::env::var("FILAMENT_STUN") {
+    if let Ok(v) = std::env::var("TUNLION_STUN") {
         if let Some(a) = resolve_host_port(v.trim()) {
             return vec![a];
         }

@@ -257,7 +257,7 @@ pub async fn mount_cmd(
     // Try daemon first (daemon handles sshfs spawn + monitoring centrally).
     #[cfg(unix)]
     if !foreground && crate::ctl::daemon_present().await {
-        let port: u16 = std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
+        let port: u16 = std::env::var("TUNLION_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
         if let Some(_reply) = crate::ctl::try_mount(peer, &remote_path, &local_path, read_only, auto_restore, port).await {
             if let Some(g) = mp_guard.as_mut() { g.disarm(); }
             crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (daemon-managed)"));
@@ -296,7 +296,7 @@ pub async fn mount_cmd(
             crate::ui::say(&format!(
                 "  note: `tunlion mount` currently rides sshfs and needs an sshd on '{peer}'. \
                  A no-sshd mesh-native mount is in progress; for now run an sshd there, set \
-                 FILAMENT_SSH_PORT, or use `tunlion shell {peer}` for a shell."
+                 TUNLION_SSH_PORT, or use `tunlion shell {peer}` for a shell."
             ));
             return Err(e);
         }

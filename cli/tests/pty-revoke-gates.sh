@@ -3,7 +3,7 @@
 # shell, and the denial must reach the initiator as a nonzero exit with a reason,
 # never as a clean exit or a hang. Standalone, hermetic, fixture port 8113 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./pty-revoke-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./pty-revoke-gates.sh
 #
 # The discriminator is a streaming counter, not a single post-revoke command: a
 # fresh TICK-N proves continuous data-plane liveness (not a buffer replay).
@@ -15,10 +15,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8113
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-pty-revoke.XXXXXX")"
 DA="$WORK/A"
 GRACE=12   # > REVOKE_RECHECK, with slack for a slow box
@@ -32,7 +32,7 @@ start_acceptor "$DA"
 enroll_delegate bravo --allow shell
 
 shell_tick() {
-  env FILAMENT_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" shell alpha -- \
+  env TUNLION_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" shell alpha -- \
     'for i in $(seq 1 60); do echo TICK-$i; sleep 1; done'
 }
 
@@ -67,7 +67,7 @@ fi
 # reason reaches the initiator's stderr. Exit 0 is the #223 false success; a
 # still-running process is a wedge (the terminal stopped but cannot be reaped).
 say B
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
 revoke_rc=$?
 echo "## revoke exit code: $revoke_rc"
 sleep "$GRACE"

@@ -467,7 +467,7 @@ mod tests {
             (Code::TunnelOff, crate::capability::TUNNEL_OFF_REASON),
         ] {
             assert!(!reason.contains("up --shell"), "{reason}");
-            assert!(!reason.contains("FILAMENT_L2"), "{reason}");
+            assert!(!reason.contains("TUNLION_L2"), "{reason}");
             let msg = explain("exec", "beta", reason, Some(code), Some("alpha"));
             assert!(!msg.contains("up --shell"), "{msg}");
             assert_eq!(msg.matches("tunlion ").count(), 1, "{msg}");
@@ -476,7 +476,7 @@ mod tests {
         // What older peers send is still the same cause.
         for legacy in [
             "shell serving is off there; run `tunlion up --shell` on that device",
-            "tunnelling is off there; run `tunlion up --shell` (or set FILAMENT_L2=1) on that device",
+            "tunnelling is off there; run `tunlion up --shell` (or set TUNLION_L2=1) on that device",
         ] {
             assert!(code_from_reason(legacy).is_some(), "{legacy}");
             let msg = explain("exec", "beta", legacy, None, Some("alpha"));

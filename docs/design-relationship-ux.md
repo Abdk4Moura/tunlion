@@ -266,7 +266,7 @@ so two concurrent first commands yield one identity, refuses on a joined device
 owner), prints the line to stderr through `ui::say`, and prints nothing under
 `--json`: the envelope that could carry `created` as a data field is audit
 ticket 1, and until it lands a prose line on a `--json` run is the defect that
-audit exists to remove. `FILAMENT_NO_IMPLICIT_INIT=1` restores the old fail-fast
+audit exists to remove. `TUNLION_NO_IMPLICIT_INIT=1` restores the old fail-fast
 bail for scripts that want it. The recovery phrase is not shown here: an
 implicit identity has nothing worth recovering yet, and `tunlion id` prints the
 phrase on demand. The first verb that creates something worth losing — `add`,
@@ -584,7 +584,7 @@ Every prompt in this design obeys one rule, and the rule is already implemented.
 
 **The gate.** A prompt may open only when `UiCapability.interactive` is true,
 which is `stdin.is_terminal() && !--no-interactive && !--json &&
-FILAMENT_NONINTERACTIVE is unset` (`cli/src/main.rs:459-462`, mirrored by
+TUNLION_NONINTERACTIVE is unset` (`cli/src/main.rs:459-462`, mirrored by
 `policy::interactive_allowed`, `cli/src/policy.rs:38-42`). No new verb may
 compute its own notion of interactivity.
 

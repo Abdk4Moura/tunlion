@@ -124,7 +124,7 @@ jobs:
       # lines is what makes "green" mean "the gates ran AND passed".
       - name: Run revocation gates
         env:
-          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/tunlion
+          TUNLION_BIN: ${{ github.workspace }}/cli/target/release/tunlion
         run: |
           set -uo pipefail
           # Full paths, not bare names under a working-directory. The registry

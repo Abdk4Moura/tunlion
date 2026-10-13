@@ -36,7 +36,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Submit a tunlion compute job (file-driven; no PTY) and fetch artifacts.")
     ap.add_argument("--server", default=os.environ.get("FILJOB_SERVER", DEFAULT_SERVER))
-    ap.add_argument("--bin", default=os.environ.get("FILAMENT_BIN", "tunlion"))
+    ap.add_argument("--bin", default=os.environ.get("TUNLION_BIN", "tunlion"))
     ap.add_argument("--host-cfg", required=True, help="host config dir (din+dout secrets)")
     ap.add_argument("--dout-cfg", required=True, help="host dout sink config dir (dout secret)")
     ap.add_argument("--remote-inbox", default="~/filament-jobs/.inbox", help="box din drop dir (informational)")

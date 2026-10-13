@@ -3,7 +3,7 @@
 # race + corpse cascade). Reproduces on a 1 MB transfer in ONE run what the
 # multi-stream push otherwise hit only ~1-in-5 on 10 GB cross-machine transfers.
 #
-# Mechanism: FILAMENT_TEST_PREMATURE_CLOSE=1 makes the RECEIVER tear the link
+# Mechanism: TUNLION_TEST_PREMATURE_CLOSE=1 makes the RECEIVER tear the link
 # down at the instant the delivery-ack is due (no ack sent, connection dropped),
 # so the SENDER never gets the ack and its transport dies -- exactly the
 # self-inflicted teardown the fix must prevent (RFC 9000 §10.2: QUIC has no
@@ -12,8 +12,8 @@
 #
 # Needs a `--features test-hooks` build (the hook is stripped from release):
 #     cargo build --features test-hooks   (debug, ~20s)  -- default here
-# Point at an external backend with FILAMENT_TEST_SERVER, else it autostarts one
-# from a venv (FILAMENT_TEST_VENV, default /root/filament-bench/venv).
+# Point at an external backend with TUNLION_TEST_SERVER, else it autostarts one
+# from a venv (TUNLION_TEST_VENV, default /root/filament-bench/venv).
 #
 # Verdicts:
 #   baseline (no hook)          -> delivered+verified  (harness OK); else exit 2.
@@ -34,31 +34,31 @@ CLI_DIR="$(dirname "$HERE")"
 # somewhere cargo never writes, failing setup (exit 2) before any verdict. That
 # is a second, independent reason this reproducer produced no signal here.
 TARGET_DIR="${CARGO_TARGET_DIR:-$(cd "$CLI_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null | tr ',' '\n' | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)}"
-# FILAMENT_BIN overrides the binary outright. Needed because the #161 debug_assert
+# TUNLION_BIN overrides the binary outright. Needed because the #161 debug_assert
 # in capability.rs PANICS the receiver on plain code-based receive (WORK-STATE
 # 1v), which kills this harness in its BASELINE round before any verdict. That
 # assertion is compiled out in release, so a `--release --features test-hooks`
 # build has the injection hooks AND no panic, which is the only way to get a
 # verdict out of this script until the ordering question is settled.
-BIN="${FILAMENT_BIN:-${TARGET_DIR:-$CLI_DIR/target}/debug/tunlion}"
-SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
+BIN="${TUNLION_BIN:-${TARGET_DIR:-$CLI_DIR/target}/debug/tunlion}"
+SERVER="${TUNLION_TEST_SERVER:-http://127.0.0.1:8077}"
 WORK="$(mktemp -d /tmp/filament-ackloss.XXXXXX)"
-PYV="${FILAMENT_TEST_VENV:-/root/filament-bench/venv}/bin/python"
+PYV="${TUNLION_TEST_VENV:-/root/filament-bench/venv}/bin/python"
 
 OWN_BACKEND=""
 cleanup() { [ -n "$OWN_BACKEND" ] && kill "$OWN_BACKEND" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 # 0. build with the test hook (debug, fast). Skip if the binary is already built
-#    with hooks and FILAMENT_SKIP_BUILD is set.
-if [ -z "${FILAMENT_SKIP_BUILD:-}" ]; then
+#    with hooks and TUNLION_SKIP_BUILD is set.
+if [ -z "${TUNLION_SKIP_BUILD:-}" ]; then
   ( cd "$CLI_DIR" && cargo build --features test-hooks -q ) || { echo "SETUP: build failed"; exit 2; }
 fi
 [ -x "$BIN" ] || { echo "SETUP: no binary at $BIN"; exit 2; }
 
 # 1. backend (autostart on :8077 if none, claim-limit pinned for determinism)
-if [ -z "${FILAMENT_TEST_SERVER:-}" ]; then
-  [ -x "$PYV" ] || { echo "SETUP: no venv python at $PYV (set FILAMENT_TEST_SERVER or FILAMENT_TEST_VENV)"; exit 2; }
+if [ -z "${TUNLION_TEST_SERVER:-}" ]; then
+  [ -x "$PYV" ] || { echo "SETUP: no venv python at $PYV (set TUNLION_TEST_SERVER or TUNLION_TEST_VENV)"; exit 2; }
   for pid in $(ss -tlnp 2>/dev/null | grep ":8077 " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
   ( cd "$CLI_DIR/../backend" && PORT=8077 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
@@ -113,10 +113,10 @@ fi
 #    STAYS ALIVE; use an `up` daemon receiver -- ROBUST mode, exercise once the
 #    abortable-keepalive + wait_idle fix lands.)
 t0=$SECONDS
-round "FILAMENT_LOG=debug" "FILAMENT_TEST_PREMATURE_CLOSE=1" premature || exit 2
+round "TUNLION_LOG=debug" "TUNLION_TEST_PREMATURE_CLOSE=1" premature || exit 2
 dt=$((SECONDS - t0))
 # Intended verdict from proofs/transport_lifecycle_model.py (rx_gone) and the
-# P4 no-ack window in main.rs: ack_wait=15s (FILAMENT_ACK_TIMEOUT), ack_reprobe=5s.
+# P4 no-ack window in main.rs: ack_wait=15s (TUNLION_ACK_TIMEOUT), ack_reprobe=5s.
 # A VANISHED recv cannot deliver; not-confirmed is correct ONLY if PROMPT. The
 # keepalive leak means is_dead() never fires, the link looks alive, and the sender
 # burns the whole ack_wait+ack_reprobe window (Reprobe then give up). A detected
@@ -124,7 +124,7 @@ dt=$((SECONDS - t0))
 # load-independent: did the sender RE-PROBE? The re-probe line fires only when
 # link_alive was true at the first window, which is exactly the leak. Wall-clock
 # dt is printed as corroboration only (the window constants: main.rs:10988
-# ack_wait = FILAMENT_ACK_TIMEOUT, default 15s; main.rs:10996 ack_reprobe = 5s).
+# ack_wait = TUNLION_ACK_TIMEOUT, default 15s; main.rs:10996 ack_reprobe = 5s).
 reprobe_marker=$(grep -m1 "no delivery-ack yet, re-probing (re-sending file-end)" "$WORK/premature-send.log")
 if confirmed "$WORK/premature-send.log"; then
   echo "  premature-close (recv)    : delivered (${dt}s)      [UNEXPECTED: a vanished receiver cannot deliver; hook/model regression]"

@@ -250,7 +250,7 @@ pub(crate) fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
 /// misconfiguration cannot make the re-check effectively never run, or spin on a
 /// read-heavy stream by re-reading the device store every operation.
 pub(crate) fn revoke_recheck_interval() -> std::time::Duration {
-    let ms = std::env::var("FILAMENT_REVOKE_RECHECK_MS")
+    let ms = std::env::var("TUNLION_REVOKE_RECHECK_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0) // 0 and garbage mean "default", never "never re-check"

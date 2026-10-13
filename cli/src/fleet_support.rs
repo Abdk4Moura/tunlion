@@ -390,7 +390,7 @@ pub(crate) fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
 
 /// The read-only SHARE ROOT a same-owner fleet device may mount without an
 /// explicit grant. Config value `share` (a directory path); default a dedicated
-/// `~/filament-share`, never home. A mount whose requested root escapes this dir
+/// `~/tunlion-share`, never home. A mount whose requested root escapes this dir
 /// is out of scope (the deliberate tier) and needs an explicit grant.
 ///
 /// COMPOSITION INVARIANT (load-bearing — do not break in a refactor): the
@@ -399,14 +399,14 @@ pub(crate) fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
 /// (write, auto-trusted) could place a file — or, absent plain-file-only write
 /// hardening, a symlink — that the read-only `mount` default then serves,
 /// turning two individually-correct defaults into arbitrary filesystem read.
-/// The defaults (`~/Tunlion` vs `~/filament-share`) are disjoint by
+/// The defaults (`~/Tunlion` vs `~/tunlion-share`) are disjoint by
 /// construction; a user who points `dir` and `share` at overlapping paths
 /// re-opens this, so the mount server must additionally refuse to traverse
 /// out of the share root at open time (see the beneath-root hardening).
 pub(crate) fn fleet_share_root() -> PathBuf {
     config_get("share")
         .map(PathBuf::from)
-        .unwrap_or_else(|| platform::Paths::home_dir().join("filament-share"))
+        .unwrap_or_else(|| platform::Paths::home_dir().join("tunlion-share"))
 }
 
 /// Apply a `tunlion set <key>` change to the LIVE daemon state, the heart of

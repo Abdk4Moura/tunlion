@@ -34,13 +34,13 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 case "$BIN" in /*) ;; *) BIN="$(pwd)/$BIN" ;; esac
 PORT=8153
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-daemon-path.XXXXXX")"
-export FILAMENT_SHUTDOWN_GRACE_MS=1500
+export TUNLION_SHUTDOWN_GRACE_MS=1500
 
 PASS=0; FAIL=0; FAILED=""
 say() { printf '\n\033[1m== daemon-path gate %s ==\033[0m\n' "$*"; }
@@ -52,7 +52,7 @@ cleanup() {
   for p in "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
   for r in "${RULES[@]:-}"; do [ -n "$r" ] && sudo -n iptables -D INPUT $r 2>/dev/null; done
   for d in "$WORK"/cfg-*; do
-    [ -d "$d" ] && FILAMENT_CONFIG_DIR="$d" timeout 10 "$BIN" down -y >/dev/null 2>&1
+    [ -d "$d" ] && TUNLION_CONFIG_DIR="$d" timeout 10 "$BIN" down -y >/dev/null 2>&1
   done
   for m in "${MOUNTS[@]:-}"; do [ -n "$m" ] && sudo -n umount -l "$m" 2>/dev/null; done
 }
@@ -77,28 +77,28 @@ for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
 
 # ================================================================ fixture ======
-# Owner A serves exec (FILAMENT_L2=1 + a grant); B joins A's fleet with shell
+# Owner A serves exec (TUNLION_L2=1 + a grant); B joins A's fleet with shell
 # in its ceiling and runs its daemon on a 2 MiB disk.
 DA="$WORK/cfg-A"; DB="$WORK/cfg-B"; mkdir -p "$DA" "$DB"
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1
 start_a() {
-  env FILAMENT_L2=1 FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/A-drop" >>"$WORK/A-up.log" 2>&1 &
+  env TUNLION_L2=1 TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/A-drop" >>"$WORK/A-up.log" 2>&1 &
   ADAEMON=$!; pids+=($ADAEMON)
   sleep 4
 }
 start_a
-env FILAMENT_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxB --allow shell --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
-env FILAMENT_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxB --no-interactive >"$WORK/join.log" 2>&1
-if ! FILAMENT_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxB; then
+env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxB --allow shell --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxB --no-interactive >"$WORK/join.log" 2>&1
+if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxB; then
   echo "setup: boxB did not join"; tail -5 "$WORK/add.log" "$WORK/join.log"; exit 2
 fi
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" grant boxB shell -y >"$WORK/grant.log" 2>&1 \
+env TUNLION_CONFIG_DIR="$DA" "$BIN" grant boxB shell -y >"$WORK/grant.log" 2>&1 \
   || { echo "setup: grant failed"; cat "$WORK/grant.log"; exit 2; }
 TINY="$WORK/tiny"; mkdir -p "$TINY"
 sudo -n mount -t tmpfs -o "size=2m,uid=$(id -u),gid=$(id -g),mode=0700" tmpfs "$TINY" \
   || { echo "REFUSED: cannot mount a tmpfs at $TINY"; exit 2; }
 MOUNTS+=("$TINY")
-env FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$TINY" >>"$WORK/B-up.log" 2>&1 &
+env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$TINY" >>"$WORK/B-up.log" 2>&1 &
 BDAEMON=$!; pids+=($BDAEMON)
 sleep 8
 
@@ -122,7 +122,7 @@ blackhole_b() {
   done
 }
 start_b() {
-  env FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$TINY" >>"$WORK/B-up.log" 2>&1 &
+  env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$TINY" >>"$WORK/B-up.log" 2>&1 &
   BDAEMON=$!; pids+=($BDAEMON)
 }
 ghost_b() {
@@ -137,7 +137,7 @@ saw_ghost() { [ "$(grep -oE 'ADOPT peer=[^ ]+' "$1" | sort -u | wc -l)" -ge 2 ];
 # Sets rc and took (seconds from B's return to the sender's exit).
 send_behind_ghost() {
   ghost_b
-  env FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$2" --to boxB --json >"$WORK/$1.json" 2>"$WORK/$1.err" &
+  env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$2" --to boxB --json >"$WORK/$1.json" 2>"$WORK/$1.err" &
   local sp=$!
   sleep 2
   start_b; local t0; t0=$(ts)
@@ -187,7 +187,7 @@ sleep 4
 
 # ===================================================================== E1 ======
 say "E1: exec b -> a works (positive control)"
-OUT=$(env FILAMENT_CONFIG_DIR="$DB" timeout 40 "$BIN" --server "$SERVER" exec boxA -- /bin/echo E1-OK 2>"$WORK/e1.err" </dev/null); rc=$?
+OUT=$(env TUNLION_CONFIG_DIR="$DB" timeout 40 "$BIN" --server "$SERVER" exec boxA -- /bin/echo E1-OK 2>"$WORK/e1.err" </dev/null); rc=$?
 if [ "$rc" = 0 ] && [ "$OUT" = "E1-OK" ]; then
   ok "E1: exec b -> a ran"
 else
@@ -196,7 +196,7 @@ fi
 
 # ===================================================================== E2 ======
 say "E2: exec running when the serving daemon is kill -9'd: exit 6 within 16 s"
-env FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxA -- /bin/sleep 80 >/dev/null 2>"$WORK/e2.err" </dev/null &
+env TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxA -- /bin/sleep 80 >/dev/null 2>"$WORK/e2.err" </dev/null &
 EP=$!
 sleep 5
 kill -9 "$ADAEMON"; t0=$(ts)
@@ -211,7 +211,7 @@ fi
 # ===================================================================== E3 ======
 say "E3: exec to a dead daemon: exit 6 within 20 s"
 t0=$(ts)
-env FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxA -- /bin/echo SHOULD-NOT-RUN >"$WORK/e3.out" 2>"$WORK/e3.err" </dev/null
+env TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxA -- /bin/echo SHOULD-NOT-RUN >"$WORK/e3.out" 2>"$WORK/e3.err" </dev/null
 rc=$?; took=$(since "$t0")
 echo "## rc=$rc in ${took}s"; tail -3 "$WORK/e3.err"
 if [ "$rc" = 6 ] && [ "$took" -le 20 ] && ! grep -q SHOULD-NOT-RUN "$WORK/e3.out"; then
@@ -224,11 +224,11 @@ sleep 6
 
 # ===================================================================== F1 ======
 say "F1: exec running when a forgets b: exit 4 with the refusal"
-env FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxA -- /bin/sleep 80 >/dev/null 2>"$WORK/f1.err" </dev/null &
+env TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxA -- /bin/sleep 80 >/dev/null 2>"$WORK/f1.err" </dev/null &
 EP=$!
 sleep 6
 if kill -0 "$EP" 2>/dev/null; then
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices forget boxB -y >"$WORK/forget.log" 2>&1; frc=$?; t0=$(ts)
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" devices forget boxB -y >"$WORK/forget.log" 2>&1; frc=$?; t0=$(ts)
   wait "$EP"; rc=$?; took=$(since "$t0")
   echo "## forget rc=$frc; exec rc=$rc ${took}s after it"; tail -3 "$WORK/f1.err"
   if [ "$frc" = 0 ] && [ "$rc" = 4 ] && [ "$took" -le 10 ] && grep -q "not recognized" "$WORK/f1.err" \
@@ -239,14 +239,14 @@ if kill -0 "$EP" 2>/dev/null; then
   fi
 else
   wait "$EP"; bad "F1: the exec ended before the forget (rc=$?)"; tail -5 "$WORK/f1.err"
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices forget boxB -y >"$WORK/forget.log" 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" devices forget boxB -y >"$WORK/forget.log" 2>&1
 fi
 sleep 3
 
 # ===================================================================== F2 ======
 say "F2: after a forgets b, b's send --to a is refused within 15 s, exit 4"
 t0=$(ts)
-env FILAMENT_LOG=debug FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxA --json >"$WORK/f2.json" 2>"$WORK/f2.err"
+env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxA --json >"$WORK/f2.json" 2>"$WORK/f2.err"
 rc=$?; took=$(since "$t0")
 echo "## rc=$rc in ${took}s"; cat "$WORK/f2.json"
 if [ "$rc" = 4 ] && [ "$took" -le 15 ] && "$PYV" - "$WORK/f2.json" <<'PY'

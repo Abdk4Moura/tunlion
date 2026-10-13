@@ -13,7 +13,7 @@
 //! move. That is verified by diffing rustfmt(original) against rustfmt(this file).
 use super::*;
 
-/// FILAMENT_CONFIG_DIR is process-global, so tests that point it at their
+/// TUNLION_CONFIG_DIR is process-global, so tests that point it at their
 /// own temp dir must not run concurrently with each other (a second test
 /// overwriting the env mid-test would make it read/write the wrong store).
 /// Every test that sets the var holds this lock for its whole body.
@@ -21,7 +21,7 @@ pub(crate) static TEST_CONFIG_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 pub(crate) fn lock_test_config() -> std::sync::MutexGuard<'static, ()> {
     // Poison-tolerant: a test that panics while holding the lock must not
-    // poison every later FILAMENT_CONFIG_DIR test.
+    // poison every later TUNLION_CONFIG_DIR test.
     TEST_CONFIG_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
@@ -113,7 +113,7 @@ fn path_within_bounds_the_share_root() {
             .as_nanos()
     );
     let tmp = std::env::temp_dir().join(format!("fil-path-test-{uid}"));
-    let root = tmp.join("filament-share");
+    let root = tmp.join("tunlion-share");
     let docs = root.join("docs");
     let secrets = tmp.join("secrets");
     let ssh_dir = tmp.join(".ssh");
@@ -131,7 +131,7 @@ fn path_within_bounds_the_share_root() {
     assert!(!path_within(&root, &secrets));
     assert!(!path_within(&root, std::path::Path::new("/")));
     // A relative request fails closed (not within an absolute root).
-    assert!(!path_within(&root, std::path::Path::new("filament-share")));
+    assert!(!path_within(&root, std::path::Path::new("tunlion-share")));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -541,7 +541,7 @@ fn shell_owner_ack_is_required_without_user_drop() {
         .to_string();
     assert!(denied.contains("owner's authority"));
     assert!(require_shell_owner_ack(true, None, true, true).is_ok());
-    assert!(require_shell_owner_ack(true, Some("filament-shell"), true, false).is_ok());
+    assert!(require_shell_owner_ack(true, Some("tunlion-shell"), true, false).is_ok());
     assert!(require_shell_owner_ack(false, None, false, false).is_ok());
 }
 
@@ -581,8 +581,8 @@ fn direct_ok_for_covers_daemon_and_l2_acceptors() {
     // SAFETY: single-threaded within this test; the asserts that depend on the
     // env-unset state are the (false,false) and (false,false,daemon=false) ones.
     unsafe {
-        std::env::remove_var("FILAMENT_DIRECT");
-        std::env::remove_var("FILAMENT_L2");
+        std::env::remove_var("TUNLION_DIRECT");
+        std::env::remove_var("TUNLION_L2");
     }
     // A plain `up` daemon (no --shell, no env): MUST take the direct path so it
     // answers the peer's transport-offer instead of glaring with a WebRTC dial.
@@ -597,17 +597,17 @@ fn direct_ok_for_covers_daemon_and_l2_acceptors() {
         "L2 acceptor must take direct even when not a daemon"
     );
     // A one-shot command (daemon=false) with no L2 now defaults to direct-ON
-    // (the default changed from opt-in to opt-out). FILAMENT_DIRECT=0 restores WebRTC.
+    // (the default changed from opt-in to opt-out). TUNLION_DIRECT=0 restores WebRTC.
     assert!(
         direct_ok_for(false, false),
         "default direct-ON for any session"
     );
-    unsafe { std::env::set_var("FILAMENT_DIRECT", "0") };
+    unsafe { std::env::set_var("TUNLION_DIRECT", "0") };
     assert!(
         !direct_ok_for(false, false),
-        "FILAMENT_DIRECT=0 disables direct"
+        "TUNLION_DIRECT=0 disables direct"
     );
-    unsafe { std::env::remove_var("FILAMENT_DIRECT") };
+    unsafe { std::env::remove_var("TUNLION_DIRECT") };
 }
 
 // ---- #243: what a vouch may durably write, and what it may not ----------
@@ -623,7 +623,7 @@ fn td(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("fil-243-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     dir
 }
 
@@ -883,7 +883,7 @@ fn vouch_scope_is_device_so_device_pinning_stays_armed() {
 /// `Vec<Value>` and never touches the filesystem or the environment.
 ///
 /// Two earlier versions went through `update_peer_identity`, which resolves
-/// devices.json from `FILAMENT_CONFIG_DIR`, and both failed only on Windows
+/// devices.json from `TUNLION_CONFIG_DIR`, and both failed only on Windows
 /// CI. The diagnostic showed why: the variable read back as NotPresent
 /// mid-test, so the call operated on the REAL user config dir. Once via a
 /// read, then via a write that consequently found no record to refuse and
@@ -957,7 +957,7 @@ fn require_known_device_names_the_known_devices() {
     let _guard = lock_test_config();
     let dir = std::env::temp_dir().join(format!("fil-known-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let sec = "b".repeat(64);
     let p = dir.join("devices.json");
     std::fs::write(
@@ -980,7 +980,7 @@ fn require_known_device_names_the_known_devices() {
     assert!(msg.contains("popos"), "known names missing: {msg}");
     assert!(msg.contains("pixel"), "known names missing: {msg}");
 
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1007,7 +1007,7 @@ fn roster_wrong_key_rejected_and_epoch_monotone() {
     let _guard = lock_test_config();
     let dir = std::env::temp_dir().join(format!("fil-roster-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
 
     let owner = Ed25519KeyPair::from_seed_unchecked(&[1u8; 32]).unwrap();
     let attacker = Ed25519KeyPair::from_seed_unchecked(&[2u8; 32]).unwrap();
@@ -1099,7 +1099,7 @@ fn roster_wrong_key_rejected_and_epoch_monotone() {
         .unwrap()
     );
 
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1113,7 +1113,7 @@ fn roster_snapshot_filters_revoked_devices() {
     let _guard = lock_test_config();
     let dir = std::env::temp_dir().join(format!("fil-roster-snap-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let owner = Ed25519KeyPair::from_seed_unchecked(&[1u8; 32]).unwrap();
     let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
     let now = identity::now_secs();
@@ -1148,7 +1148,7 @@ fn roster_snapshot_filters_revoked_devices() {
         "revoked device must be filtered: {names:?}"
     );
 
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1162,8 +1162,8 @@ fn forget_and_store_preserve_other_devices_caps() {
     let _guard = lock_test_config();
     let dir = std::env::temp_dir().join(format!("fil-store-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // Serialize: these tests mutate the process-global FILAMENT_CONFIG_DIR.
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    // Serialize: these tests mutate the process-global TUNLION_CONFIG_DIR.
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let p = dir.join("devices.json");
     let sec = "b".repeat(64);
     std::fs::write(
@@ -1214,7 +1214,7 @@ fn forget_and_store_preserve_other_devices_caps() {
     let orig = arr.iter().find(|d| d["name"] == "shellbox").unwrap();
     assert_eq!(orig["secret"].as_str(), Some(sec.as_str()), "original secret untouched");
 
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1228,7 +1228,7 @@ fn revoked_reader_absent_field_is_not_revoked_but_missing_record_is() {
     let _guard = lock_test_config();
     let dir = std::env::temp_dir().join(format!("fil-revoked-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let clean = [0x11u8; 32];
     let revoked = [0x22u8; 32];
     let p = dir.join("devices.json");
@@ -1258,7 +1258,7 @@ fn revoked_reader_absent_field_is_not_revoked_but_missing_record_is() {
         "no record at all is UNKNOWN, not revoked: revocation is a decision about a known device, and a fresh code peer legitimately has no record yet (#161)"
     );
 
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1271,7 +1271,7 @@ fn corrupt_store_fails_closed_to_revoked() {
     let _guard = lock_test_config();
     let dir = std::env::temp_dir().join(format!("fil-revoked-corrupt-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let any = [0x55u8; 32];
     assert!(
         !device_cert_revoked(&any),
@@ -1296,7 +1296,7 @@ fn corrupt_store_fails_closed_to_revoked() {
         device_cert_revoked(&any),
         "a store that exists but cannot be read must fail closed to revoked"
     );
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1649,7 +1649,7 @@ fn reset_leaves_no_inbox_marker() {
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let marker = crate::recv_files::daemon_inbox_marker();
     assert!(marker.starts_with(&dir), "{}", marker.display());
     std::fs::write(&marker, "/somewhere/Tunlion\n").unwrap();
@@ -1661,7 +1661,7 @@ fn reset_leaves_no_inbox_marker() {
     };
     crate::mount_cmd::reset_cmd(&caps).expect("reset -y with no daemon");
     let left = marker.exists();
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
     assert!(!left, "reset kept {}", marker.display());
 }
@@ -1842,8 +1842,8 @@ fn periodic_observation_keeps_idle_connected_device_live() {
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("fil-liveness-{}-{}", std::process::id(), unique));
     std::fs::create_dir_all(&dir).unwrap();
-    // Serialize: tests mutate the process-global FILAMENT_CONFIG_DIR.
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    // Serialize: tests mutate the process-global TUNLION_CONFIG_DIR.
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let p = dir.join("devices.json");
     std::fs::write(
         &p,
@@ -2117,7 +2117,7 @@ fn revoked_record_is_not_revivable_by_enrollment() {
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("fil-revoke-{}-{}", std::process::id(), unique));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let p = dir.join("devices.json");
     std::fs::write(
         &p,
@@ -2626,7 +2626,7 @@ fn hooks_that_nothing_calls() {
     // INSTRUMENT, and that is strictly worse: the gate that injects with it
     // still runs, still passes, and now measures the happy path.
     //
-    // `cli/tests/ack-loss-repro.sh` set FILAMENT_TEST_PREMATURE_CLOSE=1 for
+    // `cli/tests/ack-loss-repro.sh` set TUNLION_TEST_PREMATURE_CLOSE=1 for
     // roughly 620 commits while NOTHING READ the flag. The wiring was added
     // in 12a8db82 and was already gone by the next commit, and no commit
     // deletes it: the else-if chain survived minus its first arm, which is
@@ -3206,22 +3206,22 @@ fn descriptions_of_a_verb_do_not_contradict_each_other() {
 
 #[test]
 fn down_picks_the_right_systemd_manager_for_the_daemon_cgroup() {
-    // Two units can share the name filament.service (system + user under
+    // Two units can share the name tunlion.service (system + user under
     // Linger). down must ask the manager whose cgroup actually owns the
     // daemon, or it stops someone else's unit.
-    let system = "0::/system.slice/filament.service";
+    let system = "0::/system.slice/tunlion.service";
     assert_eq!(
         service_manager_for_cgroup(system),
         Some(ServiceManager::SystemdSystem)
     );
-    let user = "0::/user.slice/user-0.slice/user@0.service/app.slice/filament.service";
+    let user = "0::/user.slice/user-0.slice/user@0.service/app.slice/tunlion.service";
     assert_eq!(
         service_manager_for_cgroup(user),
         Some(ServiceManager::SystemdUser)
     );
     // A neighbouring unit name must not collide (the name is matched as a
     // cgroup segment, not a substring).
-    let neighbour = "0::/system.slice/my-filament.service";
+    let neighbour = "0::/system.slice/my-tunlion.service";
     assert_eq!(service_manager_for_cgroup(neighbour), None);
     // A detached foreground daemon is not a managed service at all.
     let detached = "0::/user.slice/user-0.slice/session-3.scope";
@@ -3399,7 +3399,7 @@ fn revoked_device_survives_cert_renewal() {
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("fil-renew-{}-{}", std::process::id(), unique));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let mk_cert = |dpub: u8| -> identity::DeviceCert {
         identity::DeviceCert::from_json(&serde_json::json!({
             "devicePub": hex::encode([dpub; 32]),
@@ -3491,7 +3491,7 @@ fn mark_lapsed_now_frees_slot_and_keeps_evidence() {
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("fil-depart-{}-{}", std::process::id(), unique));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let p = dir.join("devices.json");
     std::fs::write(
         &p,
@@ -3536,7 +3536,7 @@ fn joined_owner_record_finds_the_owner_not_self() {
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("fil-owner-{}-{}", std::process::id(), unique));
     std::fs::create_dir_all(dir.join("identity")).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     // A real overlay key for "this machine", so local_device_cert resolves.
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
@@ -4091,7 +4091,7 @@ fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
     let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
     let now = identity::now_secs();
     let old = identity::DeviceCert::certify(&uk, [0x51u8; 32], now, 30 * 86_400).unwrap();
@@ -4134,7 +4134,7 @@ fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
     crate::set_device_cert_revoked("p9-b", true).unwrap();
     crate::fleet_support::forget_device("p9-b", now).expect("a revoked record can be forgotten");
     assert!(device_cert_revoked(&new.device_pub), "its revocation outlives the record");
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4306,14 +4306,14 @@ fn implicit_identity_is_minted_once_even_under_contention() {
     unsafe { std::env::remove_var(NO_IMPLICIT_INIT_ENV) };
     assert!(err.contains("tunlion init"), "{err}");
     assert!(!dir.join("identity.ed25519").exists());
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
 }
 
 /// U1: the bare tour screen is an INSPECT surface. It renders whatever
 /// identity it finds and never mints one, so `tunlion` with no arguments
 /// writes no private key as a side effect of being looked at, and cannot fail
 /// on a device that is unable to mint (a joined one, or one with
-/// FILAMENT_NO_IMPLICIT_INIT set). The screen is printed rather than returned,
+/// TUNLION_NO_IMPLICIT_INIT set). The screen is printed rather than returned,
 /// so the assertion is on the source, the same way the verb-description scan
 /// in this file already reads it.
 #[test]
@@ -4554,7 +4554,7 @@ fn grant_to_one_fleet_device_does_not_authorize_its_sibling() {
     let revoked = crate::capability::devices_with_shell_revoked(&dir);
     assert!(revoked.contains(&"desktop".to_string()));
     assert!(!revoked.contains(&"laptop".to_string()));
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4596,7 +4596,7 @@ fn revoking_one_fleet_device_leaves_its_sibling_granted() {
     );
     apply_and_save(&dir, &[regrant]);
     assert!(explicit_shell(&dir, &laptop), "a newer grant re-grants");
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4636,7 +4636,7 @@ fn forget_revokes_the_forgotten_keys_grants_and_only_those() {
         crate::capability::apply_cap_op(&mut store, &hdr, &replay, crate::capability::now_secs()).is_err(),
         "the forgotten key's old grant must not apply again"
     );
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4675,7 +4675,7 @@ fn user_wide_grant_is_explicit_and_a_device_revoke_takes_it() {
     assert_eq!(ops.len(), 2);
     apply_and_save(&dir, &ops);
     assert!(!explicit_shell(&dir, &laptop), "revoke must actually bite");
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4718,7 +4718,7 @@ fn fleet_merge_refuses_a_grant_beaten_by_a_local_tombstone() {
     // A peer relaying the OLD (still validly signed) grant cannot restore it.
     assert_eq!(crate::merge_owner_cap_ops(&[grant_json]), 0);
     assert!(!explicit_shell(&dir, &laptop));
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5007,7 +5007,7 @@ fn every_printed_relink_chain_runs_against_a_store() {
             SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
         let now = identity::now_secs();
         let old = identity::DeviceCert::certify(&uk, [0x61u8; 32], now, 30 * 86_400).unwrap();
@@ -5059,7 +5059,7 @@ fn every_printed_relink_chain_runs_against_a_store() {
     let cmd = &first[first.find("tunlion").unwrap()..];
     run(cmd, now).unwrap_or_else(|e| panic!("`{cmd}` failed: {e}"));
     assert!(crate::device_view::device_cert_for("p9-b").is_none());
-    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5134,7 +5134,7 @@ fn every_reenrolment_recipe_runs_as_printed_in_a_script() {
             SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
         let now = identity::now_secs();
         let live = identity::DeviceCert::certify(&uk, [0x63u8; 32], now, 30 * 86_400).unwrap();
@@ -5156,7 +5156,7 @@ fn every_reenrolment_recipe_runs_as_printed_in_a_script() {
             _ => panic!("{what}: the recipe does not open with a forget: `{forget}`"),
         }
         assert!(crate::device_view::device_cert_for("p9-b").is_none(), "{what}: the name is still held");
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

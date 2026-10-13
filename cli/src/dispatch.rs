@@ -227,9 +227,6 @@ pub(crate) async fn async_main() -> Result<()> {
     // ordering-window probe fires here (and in the harness) but not in unit
     // tests that construct the window state deliberately.
     crate::capability::set_gate_live();
-    // Migrate state from legacy cwd-relative .config/filament (the broken
-    // Windows fallback when HOME was unset) to the platform-correct path.
-    platform::Paths::migrate_legacy();
     match platform::Paths::repair_sensitive_permissions() {
         Ok(repaired) if repaired > 0 => {
             eprintln!("tunlion: repaired permissions on {repaired} sensitive config path(s)");
@@ -342,7 +339,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     std::process::exit(2);
                 }
                 BareTarget::Unknown => {
-                    // Not a command, path, code, or paired device. Give a filament-native
+                    // Not a command, path, code, or paired device. Give a tunlion-native
                     // error with a did-you-mean over BOTH commands and device names,
                     // instead of clap's bare "unrecognized subcommand" (smart errors).
                     // The 0.7.5 rule: a deleted legacy name errors with a did-you-mean.
@@ -479,16 +476,16 @@ pub(crate) async fn async_main() -> Result<()> {
     crate::exit_codes::set_json_mode(cli.json, verb_name.as_deref());
     let ui_caps = UiCapability::from_cli(&cli);
     // Resolve the global output verbosity ONCE, before any worker spawns:
-    // FILAMENT_LOG (if set) overrides the -v/-q flags. Default = info.
+    // TUNLION_LOG (if set) overrides the -v/-q flags. Default = info.
     ui::init_verbosity(cli.verbose, cli.quiet);
     if let Some(n) = &cli.name_as {
         // single-threaded at this point (before the runtime spawns workers)
-        unsafe { std::env::set_var("FILAMENT_NAME", n) };
+        unsafe { std::env::set_var("TUNLION_NAME", n) };
     }
     // A --color flag overrides the NO_COLOR/TERM env contract (flags win); record
     // it before any output so both stdout (readout) and stderr (caps) honor it.
     if let Some(when) = &cli.color {
-        unsafe { std::env::set_var("FILAMENT_COLOR", when) };
+        unsafe { std::env::set_var("TUNLION_COLOR", when) };
     }
     // P1 (GAP-4): record the hard direct-only choice before any worker spawns.
     // Precedence: an explicit --relay/--no-relay flag always wins; otherwise the
@@ -509,7 +506,7 @@ pub(crate) async fn async_main() -> Result<()> {
         }
     };
     // Record the global --no-interactive opt-out before any command runs (the
-    // gate also honors FILAMENT_NONINTERACTIVE and a non-TTY stdin).
+    // gate also honors TUNLION_NONINTERACTIVE and a non-TTY stdin).
     if cli.interactive && !std::io::stdin().is_terminal() {
         bail!("--interactive requires a terminal; remove it or provide every required option");
     }
@@ -1023,7 +1020,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
             if userspace {
-                unsafe { std::env::set_var("FILAMENT_L3_USERSPACE", "1") };
+                unsafe { std::env::set_var("TUNLION_L3_USERSPACE", "1") };
             }
             // Flags win; otherwise fall back to persistent settings. Per-peer
             // `shell on` overrides fold into the shell-only allowlist so
@@ -2181,7 +2178,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // Mirror the grant path: also emit an owner-signed Revoke cap_op so
             // the AUTHORITATIVE capability gate actually denies. The legacy
             // device_set_cap(false) only clears devices.json; it leaves the cap
-            // store granting, so under FILAMENT_CAP_AUTHORITATIVE the gate keeps
+            // store granting, so under TUNLION_CAP_AUTHORITATIVE the gate keeps
             // ALLOWing and a re-connect re-installs the shell key (revocation was
             // a no-op at the gate). apply_cap_op removes the matching grant, so
             // evaluate() then denies and devices_with_shell_revoked lists this
@@ -2286,7 +2283,7 @@ pub(crate) async fn async_main() -> Result<()> {
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
                 println!(
-                    "revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block."
+                    "revoked 'shell' from '{device}' and removed its tunlion-managed authorized_keys block."
                 );
             } else {
                 println!("revoked '{capability}' from '{device}'.");

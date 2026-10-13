@@ -5,7 +5,7 @@
 > so authoritative-by-default denied the owner's OWN ssh/transfer/mount until
 > every capability was granted by hand. `cap_authoritative()` now defaults to
 > OFF (legacy shadow gating) again; authoritative enforcement is **opt-in** via
-> `FILAMENT_CAP_AUTHORITATIVE=1` (or `true`). Any other value, or leaving it
+> `TUNLION_CAP_AUTHORITATIVE=1` (or `true`). Any other value, or leaving it
 > unset, keeps shadow gating. Everything else the flip added (self-genesis
 > header, restrictive gates, shell-key reconciler) stays; only the default
 > changed. Re-throwing the default-on flip is gated on same-owner fleet-trust
@@ -20,7 +20,7 @@
 > reconciler) — but that evidence did not cover an unprovisioned multi-device
 > same-owner fleet, which is what broke. History retained below.
 
-Prerequisites for setting `FILAMENT_CAP_AUTHORITATIVE=1` (making the capability
+Prerequisites for setting `TUNLION_CAP_AUTHORITATIVE=1` (making the capability
 layer the live gate instead of shadow). Do NOT flip until every item holds. The
 first week after a flip is exactly when someone reads the denial logs to work out
 what broke, so the diagnosability items matter as much as the correctness ones.
@@ -134,7 +134,7 @@ responder is ever refactored away.
 
 ## Authoritative-only restrictive gates (added, all purely restrictive)
 
-Under `FILAMENT_CAP_AUTHORITATIVE` the effective decision is composed from the cap
+Under `TUNLION_CAP_AUTHORITATIVE` the effective decision is composed from the cap
 outcome plus these gates, each of which can only downgrade Authorized -> Denied,
 never widen. All are no-ops in shadow. Each has a both-branches CI test.
 
@@ -174,7 +174,7 @@ RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
       zero disagreement, single stable daemon PID). Instrument proven by the six-bucket
       detector-proof.
 - [x] Authoritative grant / evaluate / cap-status display: confirmed working under
-      `FILAMENT_CAP_AUTHORITATIVE=1`.
+      `TUNLION_CAP_AUTHORITATIVE=1`.
 - [~] Live-traffic authoritative ENFORCEMENT: PARTIAL, proven cross-machine (do-vm <->
       4-days-late/other-do over Tailscale, same DC, 2026-07-28). The same-box rig could
       not establish transport (a same-box/loopback limitation, NOT a cap issue); the
@@ -182,7 +182,7 @@ RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
         * transport + file transfer establish and complete cross-machine;
         * the cap gate FIRES on real traffic (counters move, coverage matrix records);
         * DENY-BY-DEFAULT enforced: an unprovisioned transfer that legacy ALLOWS (delivered
-          in shadow) is DECLINED under FILAMENT_CAP_AUTHORITATIVE=1;
+          in shadow) is DECLINED under TUNLION_CAP_AUTHORITATIVE=1;
         * #19 real reason surfaced: "resource unprovisioned (no capability header); run
           tunlion grant/init" (the true cap cause, not a legacy assertion);
         * ROLLBACK: unsetting the flag returns to legacy gating, the transfer delivers again;
@@ -211,6 +211,6 @@ RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
 
 ## Rollback
 
-The flag is the rollback: unset `FILAMENT_CAP_AUTHORITATIVE` to return to legacy
+The flag is the rollback: unset `TUNLION_CAP_AUTHORITATIVE` to return to legacy
 gating instantly. Counters keep accumulating in both modes, so post-flip evidence
 is not lost.

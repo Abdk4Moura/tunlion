@@ -31,16 +31,16 @@ SERVER=${SERVER:-http://127.0.0.1:8093}
 T=${T:-/tmp/l1a-gate9b}
 rm -rf "$T"; mkdir -p "$T/cfgS" "$T/cfgD" "$T/cfgR" "$T/outR" "$T/outD"
 SRC="$T/src.bin"; head -c 300000 /dev/urandom > "$SRC"
-export FILAMENT_NONINTERACTIVE=1 RUST_LOG=
+export TUNLION_NONINTERACTIVE=1 RUST_LOG=
 
 # DECOY first: a plain listener that joins the shared auto room and does nothing.
-FILAMENT_CONFIG_DIR="$T/cfgD" FILAMENT_NAME=decoy \
+TUNLION_CONFIG_DIR="$T/cfgD" TUNLION_NAME=decoy \
   "$BIN" --server "$SERVER" recv -y --dir "$T/outD" </dev/null >"$T/decoy.log" 2>&1 &
 D=$!
 sleep 2  # let the decoy land in the auto room before the sender shows up
 
 WORD="gigantic-element"
-FILAMENT_CONFIG_DIR="$T/cfgS" FILAMENT_NAME=sender \
+TUNLION_CONFIG_DIR="$T/cfgS" TUNLION_NAME=sender \
   "$BIN" --server "$SERVER" send "$SRC" --code --word "$WORD" </dev/null >"$T/send.log" 2>&1 &
 S=$!
 CODE=""
@@ -51,7 +51,7 @@ done
 echo "minted v2 transfer code: ${CODE:-<none>}"
 [ -z "$CODE" ] && { echo "GATE9b FAIL: no v2 code minted"; tail "$T/send.log"; kill $S $D 2>/dev/null; exit 1; }
 
-FILAMENT_CONFIG_DIR="$T/cfgR" FILAMENT_NAME=receiver \
+TUNLION_CONFIG_DIR="$T/cfgR" TUNLION_NAME=receiver \
   "$BIN" --server "$SERVER" recv "$CODE" -y --dir "$T/outR" </dev/null >"$T/recv.log" 2>&1 &
 R=$!
 for i in $(seq 1 120); do [ -f "$T/outR/src.bin" ] && break; sleep 0.5; done

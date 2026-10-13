@@ -22,7 +22,7 @@ use anyhow::bail;
 /// the binary. That is what kills the recurring sudo: a file cap is lost when
 /// `tunlion update` replaces the binary, but an ambient cap is granted afresh by
 /// systemd on every (re)start, so updates never need `setcap` (hence never a
-/// password). Writes `/etc/systemd/system/filament.service`, drops any stale file
+/// password). Writes `/etc/systemd/system/tunlion.service`, drops any stale file
 /// cap, retires a pre-existing --user service, and enables it, using ONE `sudo` for
 /// the privileged steps (a single interactive prompt, NOT a per-update one). If it
 /// cannot elevate, it prints the exact unit + commands to run by hand.
@@ -58,10 +58,9 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
          [Install]\n\
          WantedBy=multi-user.target\n"
     );
-    // PROTOCOL LITERAL: frozen, do not rename. The unit file, and every
-    // systemctl/journalctl/sudoers reference below, name the unit that
-    // released builds installed: crate::platform::SYSTEMD_UNIT (`filament`).
-    let unit_path = "/etc/systemd/system/filament.service";
+    // The unit file, and every systemctl/journalctl/sudoers reference below,
+    // name crate::platform::SYSTEMD_UNIT (`tunlion`).
+    let unit_path = "/etc/systemd/system/tunlion.service";
     let am_root = unsafe { libc::geteuid() } == 0;
     // Run a privileged command, using sudo only when not already root.
     let run_priv = |args: &[&str]| -> bool {
@@ -86,7 +85,7 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
     }
     // Write the unit as root by PIPING it to `tee` under the privileged runner.
     // Deliberately NO on-disk staging: a predictable, world-writable temp file
-    // (e.g. /tmp/filament.service.tmp) is a TOCTOU - another local user could
+    // (e.g. /tmp/tunlion.service.tmp) is a TOCTOU - another local user could
     // swap or symlink it between our write and the privileged copy, yielding an
     // attacker-controlled ROOT-owned systemd unit (root code execution). Piping to
     // `tee` has no intermediary to race; sudo still reads its password from the tty,
@@ -127,7 +126,7 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
             "  sudo tee {unit_path} >/dev/null <<'UNIT'\n{unit}UNIT"
         ));
         ui::say(&format!("  sudo setcap -r {exe} 2>/dev/null || true"));
-        ui::say("  sudo systemctl daemon-reload && sudo systemctl enable --now filament");
+        ui::say("  sudo systemctl daemon-reload && sudo systemctl enable --now tunlion");
         anyhow::bail!("the system service was not installed (could not write {unit_path})");
     }
     // Drop any stale file cap (ambient replaces it; keeps updates clean); retire a
@@ -143,18 +142,18 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
             "  {} system service enabled; CAP_NET_ADMIN comes from systemd, so no setcap on update",
             ui::paint(ui::Tone::Ok, ui::glyph_ok())
         ));
-        ui::say("  logs: journalctl -u filament");
+        ui::say("  logs: journalctl -u tunlion");
     } else {
         // Not "installed": the unit is on disk but nothing runs it. Say what
         // failed and stop, so the exit code tells a script the same thing.
-        ui::say("  wrote the unit, but `systemctl daemon-reload` / `enable --now filament` failed");
+        ui::say("  wrote the unit, but `systemctl daemon-reload` / `enable --now tunlion` failed");
         anyhow::bail!(
-            "the system service is not running; enable it by hand: sudo systemctl daemon-reload && sudo systemctl enable --now filament"
+            "the system service is not running; enable it by hand: sudo systemctl daemon-reload && sudo systemctl enable --now tunlion"
         );
     }
 
     // Belt-and-suspenders: a NOPASSWD sudoers drop-in scoped to JUST restarting this
-    // one service, so any fallback `sudo systemctl restart filament` (e.g. when the
+    // one service, so any fallback `sudo systemctl restart tunlion` (e.g. when the
     // reload op is unavailable) is password-free too. Written the same TOCTOU-safe
     // way (piped to tee, no world-writable staging), mode 0440, and validated with
     // visudo - a malformed sudoers drop-in must NEVER be left in place, so it is
@@ -164,9 +163,8 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
         .find(|p| std::path::Path::new(p).exists())
         .copied()
         .unwrap_or("/usr/bin/systemctl");
-    // PROTOCOL LITERAL: frozen, do not rename (an existing drop-in is replaced
-    // in place only if the name matches what released builds wrote).
-    let sudoers_path = "/etc/sudoers.d/filament";
+    // Named after the unit, so it never collides with another tool's drop-in.
+    let sudoers_path = "/etc/sudoers.d/tunlion";
     let sudoers = format!(
         "{user} ALL=(root) NOPASSWD: {systemctl} restart {unit}, {systemctl} daemon-reload\n",
         unit = crate::platform::SYSTEMD_UNIT,
@@ -200,7 +198,7 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
         let _ = run_priv(&["chmod", "0440", sudoers_path]);
         if run_priv(&["visudo", "-cf", sudoers_path]) {
             ui::say(&format!(
-                "  {} passwordless `systemctl restart filament` for {user}",
+                "  {} passwordless `systemctl restart tunlion` for {user}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok())
             ));
         } else {

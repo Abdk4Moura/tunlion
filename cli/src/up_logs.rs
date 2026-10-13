@@ -39,7 +39,7 @@ use std::time::Duration;
 /// would make a later `set shell off` silently not apply to the service.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DaemonOpts {
-    /// `--server` (or FILAMENT_SERVER) when it is not the default. A service
+    /// `--server` (or TUNLION_SERVER) when it is not the default. A service
     /// does not inherit this shell's environment, so an env value is forwarded
     /// as a flag.
     pub(crate) server: Option<String>,
@@ -181,7 +181,7 @@ pub(crate) async fn up_cmd(
         return Ok(());
     }
     // --shell-program -- persist it so the daemon picks it up (shell_argv reads
-    // this from config). The env var FILAMENT_SHELL is also checked independently.
+    // this from config). The env var TUNLION_SHELL is also checked independently.
     if let Some(ref prog) = shell_program {
         settings::set("shell-program", prog, None).ok();
     }
@@ -476,12 +476,12 @@ pub(crate) async fn up_cmd(
         ShellPolicy::Granted => {}
     }
     // Shell without a dropped account is owner-equivalent at any uid. A dropped
-    // account is only safer if it cannot read FILAMENT_CONFIG_DIR.
+    // account is only safer if it cannot read TUNLION_CONFIG_DIR.
     if shell_policy.enables_l2() {
         let warning = match shell_user.as_deref() {
             Some(user) if can_use_user => {
                 format!(
-                    "  note: shell PTYs run as {user}; verify this account cannot read FILAMENT_CONFIG_DIR or the drop is cosmetic"
+                    "  note: shell PTYs run as {user}; verify this account cannot read TUNLION_CONFIG_DIR or the drop is cosmetic"
                 )
             }
             Some(user) => {
@@ -603,7 +603,7 @@ pub(crate) enum AlreadyUp {
 /// it did before.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LaunchAsk {
-    /// `--server` / FILAMENT_SERVER when it is not the default.
+    /// `--server` / TUNLION_SERVER when it is not the default.
     pub(crate) server: Option<String>,
     /// `--dir`, made absolute (the daemon reports its absolute drop dir).
     pub(crate) dir: Option<String>,
@@ -688,8 +688,8 @@ pub(crate) fn launch_report(
 ) -> serde_json::Value {
     let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     // Same resolution order as `platform::Paths::shell_argv` minus the
-    // per-call flag the daemon never has: FILAMENT_SHELL, then the setting.
-    let shell_program = std::env::var("FILAMENT_SHELL")
+    // per-call flag the daemon never has: TUNLION_SHELL, then the setting.
+    let shell_program = std::env::var("TUNLION_SHELL")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| settings::get_str("shell-program", None));
@@ -699,7 +699,7 @@ pub(crate) fn launch_report(
         "relay": relay,
         "no_relay": crate::NO_RELAY.load(std::sync::atomic::Ordering::Relaxed),
         "name": crate::display_name(),
-        "userspace": std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1"),
+        "userspace": std::env::var("TUNLION_L3_USERSPACE").as_deref() == Ok("1"),
         "shell_program": shell_program,
         "shell_user": shell_user,
         "no_proxy_fallback": no_proxy_fallback,
@@ -1472,7 +1472,7 @@ pub(crate) fn lock_error(e: std::io::Error, lock_path: &std::path::Path) -> anyh
     let shown = short_path(lock_path);
     let why = match platform::storage_failure(&e) {
         Some(platform::StorageFailure::NameTooLong) => format!(
-            "the config directory path is too long for this system ({} bytes); point FILAMENT_CONFIG_DIR or XDG_CONFIG_HOME at a shorter path",
+            "the config directory path is too long for this system ({} bytes); point TUNLION_CONFIG_DIR or XDG_CONFIG_HOME at a shorter path",
             lock_path.as_os_str().len()
         ),
         Some(platform::StorageFailure::ReadOnly) => {

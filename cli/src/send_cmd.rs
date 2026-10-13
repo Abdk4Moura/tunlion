@@ -158,7 +158,7 @@ pub(crate) async fn send_cmd(
             .any(|(n, _)| n.eq_ignore_ascii_case(target))
             || (fleet_indexed_name(target)
                 && (ctl::daemon_present().await
-                    || std::env::var("FILAMENT_FLEET_SEND").as_deref() == Ok("1")));
+                    || std::env::var("TUNLION_FLEET_SEND").as_deref() == Ok("1")));
         if !known {
             if fleet_indexed_name(target) {
                 bail!(
@@ -456,7 +456,7 @@ pub(crate) async fn send_cmd(
         },
         _ => None,
     };
-    if brokered_target.is_none() && std::env::var("FILAMENT_FLEET_SEND").as_deref() != Ok("1") {
+    if brokered_target.is_none() && std::env::var("TUNLION_FLEET_SEND").as_deref() != Ok("1") {
         if let Some(t) = to.as_deref() {
             if fleet_indexed_name(t)
                 && !devices_load()
@@ -489,8 +489,8 @@ pub(crate) async fn send_cmd(
                 // feature should not be the default: without the opt-in,
                 // `send --to <sibling>` keeps the clear "not yet a send target"
                 // message rather than an error that reads like a security alarm.
-                // Set FILAMENT_FLEET_SEND=1 to work on it. The former implementation audit is archived in docs/archive/handoffs/WORK-STATE-2026-09-03.md.
-                if std::env::var("FILAMENT_FLEET_SEND").as_deref() != Ok("1") {
+                // Set TUNLION_FLEET_SEND=1 to work on it. The former implementation audit is archived in docs/archive/handoffs/WORK-STATE-2026-09-03.md.
+                if std::env::var("TUNLION_FLEET_SEND").as_deref() != Ok("1") {
                     return None;
                 }
                 // EXPERIMENTAL, and the honest reason is RELIABILITY, not
@@ -520,7 +520,7 @@ pub(crate) async fn send_cmd(
                 // interleaving is void.
                 ui::say(&ui::paint(
                     ui::Tone::Warn,
-                    "  FILAMENT_FLEET_SEND: experimental. Fails closed and has never misdelivered; it completes about 9 times in 10, and a failure costs a 45s timeout.",
+                    "  TUNLION_FLEET_SEND: experimental. Fails closed and has never misdelivered; it completes about 9 times in 10, and a failure costs a 45s timeout.",
                 ));
                 let rv = fleet::rv()?;
                 fleet_indexed_name(t).then(|| {
@@ -552,7 +552,7 @@ pub(crate) async fn send_cmd(
     // not this one.
     let mut fleet_sess = fleet_session::FleetSession::new();
     let fleet_proof_budget = Duration::from_secs(
-        std::env::var("FILAMENT_FLEET_PROOF_SECS")
+        std::env::var("TUNLION_FLEET_PROOF_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(12),
@@ -677,7 +677,7 @@ pub(crate) async fn send_cmd(
     // if it doesn't confirm, fail LOUDLY ("update to transfer securely") rather
     // than hang. Mirrors `pair`'s ceremony_deadline.
     let pake_budget = Duration::from_secs(
-        std::env::var("FILAMENT_PAIR_GRACE_SECS")
+        std::env::var("TUNLION_PAIR_GRACE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),
@@ -705,13 +705,13 @@ pub(crate) async fn send_cmd(
     // nominates) hung unbounded with the spinner spinning. Cap the time to the
     // FIRST live data channel (ChannelReady); once a channel is up, a long
     // legitimate transfer is never interrupted by this. Overridable / disablable
-    // (0 = off) via FILAMENT_SEND_TIMEOUT.
-    // `--timeout` wins over FILAMENT_SEND_TIMEOUT, which stays as the fallback.
+    // (0 = off) via TUNLION_SEND_TIMEOUT.
+    // `--timeout` wins over TUNLION_SEND_TIMEOUT, which stays as the fallback.
     // A code send waits for a person to type the code, so its default window
     // is the code's own lifetime: it advertised "expires in 10 min" and gave
-    // up after 60 s. An explicit --timeout (or FILAMENT_SEND_TIMEOUT) still
+    // up after 60 s. An explicit --timeout (or TUNLION_SEND_TIMEOUT) still
     // wins, and the advertised expiry is then that bound (code_expiry_words).
-    let send_timeout_env = std::env::var("FILAMENT_SEND_TIMEOUT").ok();
+    let send_timeout_env = std::env::var("TUNLION_SEND_TIMEOUT").ok();
     let establish_deadline = if use_code && known_target.is_none() {
         code_establish_window(timeout, send_timeout_env.as_deref(), claim_deadline)
     } else {
@@ -723,7 +723,7 @@ pub(crate) async fn send_cmd(
     // the window (0 = wait without limit).
     let offline_after = offline_window(
         establish_deadline,
-        std::env::var("FILAMENT_SEND_OFFLINE_SECS").ok().as_deref(),
+        std::env::var("TUNLION_SEND_OFFLINE_SECS").ok().as_deref(),
     );
     let mut established = false;
     // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
@@ -740,9 +740,9 @@ pub(crate) async fn send_cmd(
     // no ack comes. So on no-ack we re-probe once (re-send file-end to prompt a
     // possibly-lost ack), and if the ack still never lands we FAIL the send
     // (nonzero, partial kept resumable), never a false "delivered + verified".
-    // Overridable via FILAMENT_ACK_TIMEOUT (seconds). The never-hangs property
+    // Overridable via TUNLION_ACK_TIMEOUT (seconds). The never-hangs property
     // holds: we reach a terminal state in bounded time, just an honest one.
-    let ack_wait = std::env::var("FILAMENT_ACK_TIMEOUT")
+    let ack_wait = std::env::var("TUNLION_ACK_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -768,8 +768,8 @@ pub(crate) async fn send_cmd(
     // nothing at all), and the send used to wait for it forever. The clock runs
     // only while an offer is outstanding, restarts on every answer, and stops
     // while the receiver reports a person deciding (`file-pending`). Overridable
-    // with FILAMENT_SEND_STALL_SECS (0 disables).
-    let answer_wait = std::env::var("FILAMENT_SEND_STALL_SECS")
+    // with TUNLION_SEND_STALL_SECS (0 disables).
+    let answer_wait = std::env::var("TUNLION_SEND_STALL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -827,7 +827,7 @@ pub(crate) async fn send_cmd(
                         ui::critical(&ui::paint(
                             ui::Tone::Err,
                             &format!(
-                                "  the receiver neither accepted nor refused {} in {}s; it may be unable to save it (a full disk, a name its filesystem refuses). Its log says why: `tunlion logs` there. (FILAMENT_SEND_STALL_SECS changes this bound, 0 disables it.)",
+                                "  the receiver neither accepted nor refused {} in {}s; it may be unable to save it (a full disk, a name its filesystem refuses). Its log says why: `tunlion logs` there. (TUNLION_SEND_STALL_SECS changes this bound, 0 disables it.)",
                                 waiting.join(", "),
                                 answer_wait.as_secs()
                             ),
@@ -2813,7 +2813,7 @@ async fn stream_one(
         let active_sid = active_sid.clone();
         handles.push(tokio::spawn(async move {
             let trace =
-                cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+                cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
             // Every local file operation below maps its failure to a SourceRead:
             // the source stopped being readable (a permission changed, a disk
             // failed, the file was truncated), which no reconnect can repair.
@@ -3011,7 +3011,7 @@ async fn stream_one(
     Ok(())
 }
 
-/// The establishment window: `--timeout` first, then FILAMENT_SEND_TIMEOUT,
+/// The establishment window: `--timeout` first, then TUNLION_SEND_TIMEOUT,
 /// then 60 s. Zero means "wait without limit". Pure.
 pub(crate) fn establish_window(flag: Option<u64>, env: Option<&str>) -> Duration {
     let secs = flag
@@ -3020,7 +3020,7 @@ pub(crate) fn establish_window(flag: Option<u64>, env: Option<&str>) -> Duration
     Duration::from_secs(secs)
 }
 
-/// A code send's establishment window: `--timeout`, then FILAMENT_SEND_TIMEOUT,
+/// A code send's establishment window: `--timeout`, then TUNLION_SEND_TIMEOUT,
 /// then the code's lifetime (`claim`). Pure.
 pub(crate) fn code_establish_window(flag: Option<u64>, env: Option<&str>, claim: Duration) -> Duration {
     if flag.is_none() && env.and_then(|v| v.trim().parse::<u64>().ok()).is_none() {
@@ -3041,7 +3041,7 @@ pub(crate) fn code_expiry_words(secs: u64) -> String {
 }
 
 /// How long a known device may show no presence at all before `send` calls it
-/// offline: 10 s (FILAMENT_SEND_OFFLINE_SECS overrides), never longer than the
+/// offline: 10 s (TUNLION_SEND_OFFLINE_SECS overrides), never longer than the
 /// establishment window, and `None` when that window is unlimited. Pure.
 pub(crate) fn offline_window(establish: Duration, env: Option<&str>) -> Option<Duration> {
     if establish.is_zero() {

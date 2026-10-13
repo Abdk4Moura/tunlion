@@ -917,7 +917,7 @@ mod tests {
     async fn netstack_answers_icmpv6_echo() {
         let me: Ipv6Addr = "fdf1:1af7:c30d:1a1::2".parse().unwrap();
         let peer: Ipv6Addr = "fdf1:1af7:c30d:1a1::99".parse().unwrap();
-        let tun = NetstackTun::open("filament0", &format!("{me}/128"), 1280).unwrap();
+        let tun = NetstackTun::open("tunlion0", &format!("{me}/128"), 1280).unwrap();
         tun.send(&build_echo_request(peer, me)).await.unwrap();
         let mut rbuf = vec![0u8; 1500];
         let n = tokio::time::timeout(Duration::from_secs(2), tun.recv(&mut rbuf))
@@ -935,7 +935,7 @@ mod tests {
     async fn netstack_survives_malformed_injection() {
         let me: Ipv6Addr = "fdf1:1af7:c30d:1a1::2".parse().unwrap();
         let peer: Ipv6Addr = "fdf1:1af7:c30d:1a1::99".parse().unwrap();
-        let tun = NetstackTun::open("filament0", &format!("{me}/128"), 1280).unwrap();
+        let tun = NetstackTun::open("tunlion0", &format!("{me}/128"), 1280).unwrap();
         for i in 0..200u32 {
             let len = (i as usize * 7) % 2000;
             let mut junk = vec![0u8; len];
@@ -963,8 +963,8 @@ mod tests {
     async fn two_netstacks_dial_listen_roundtrip() {
         let a_addr: Ipv6Addr = "fdf1:1af7:c30d:aaa::1".parse().unwrap();
         let b_addr: Ipv6Addr = "fdf1:1af7:c30d:bbb::1".parse().unwrap();
-        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
-        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        let a = Arc::new(NetstackTun::open("tunlion0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("tunlion0", &format!("{b_addr}/128"), 1280).unwrap());
 
         // Wire the "datagram plane": each node's outbound packets become the other's
         // inbound. (In production l3.rs routes by dest IP to the peer's transport.)
@@ -1034,8 +1034,8 @@ mod tests {
     async fn a_dropped_stream_closes_and_the_dialer_reads_eof() {
         let a_addr: Ipv6Addr = "fdf1:1af7:c30d:aab::1".parse().unwrap();
         let b_addr: Ipv6Addr = "fdf1:1af7:c30d:bbc::1".parse().unwrap();
-        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
-        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        let a = Arc::new(NetstackTun::open("tunlion0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("tunlion0", &format!("{b_addr}/128"), 1280).unwrap());
         cross_wire(a.clone(), b.clone(), 0);
         let listener = b.listen(9100).await.unwrap();
         let server = tokio::spawn(async move {
@@ -1087,8 +1087,8 @@ mod tests {
     async fn netstack_transfers_intact_through_packet_loss() {
         let a_addr: Ipv6Addr = "fdf1:1af7:c30d:a11::1".parse().unwrap();
         let b_addr: Ipv6Addr = "fdf1:1af7:c30d:b22::1".parse().unwrap();
-        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
-        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        let a = Arc::new(NetstackTun::open("tunlion0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("tunlion0", &format!("{b_addr}/128"), 1280).unwrap());
         cross_wire(a.clone(), b.clone(), 7); // drop ~1 in 7 packets each way
 
         let listener = b.listen(9100).await.unwrap();
@@ -1133,8 +1133,8 @@ mod tests {
     async fn netstack_serves_many_concurrent_connections() {
         let a_addr: Ipv6Addr = "fdf1:1af7:c30d:c33::1".parse().unwrap();
         let b_addr: Ipv6Addr = "fdf1:1af7:c30d:d44::1".parse().unwrap();
-        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
-        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        let a = Arc::new(NetstackTun::open("tunlion0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("tunlion0", &format!("{b_addr}/128"), 1280).unwrap());
         cross_wire(a.clone(), b.clone(), 0); // lossless
 
         const N: u32 = 12;
@@ -1215,7 +1215,7 @@ mod tests {
         let peer: Ipv6Addr = "fdf1:1af7:c30d:d01::99".parse().unwrap();
 
         let tun = NetstackTun::open_dual(
-            "filament0",
+            "tunlion0",
             &format!("{me6}/128"),
             Some("10.0.0.1/24"),
             1280,
@@ -1268,11 +1268,11 @@ mod tests {
         let peer4: Ipv4Addr = "10.0.42.99".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 
@@ -1338,11 +1338,11 @@ mod tests {
         let b4: Ipv4Addr = "10.0.50.2".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 
@@ -1402,11 +1402,11 @@ mod tests {
         let b4: Ipv4Addr = "10.0.80.2".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 
@@ -1502,11 +1502,11 @@ mod tests {
         let b4: Ipv4Addr = "10.0.81.2".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 
@@ -1559,11 +1559,11 @@ mod tests {
         let b4: Ipv4Addr = "10.0.82.2".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 

@@ -179,7 +179,7 @@ pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
 /// Restores the pre-U1 precondition for scripts that want to fail fast: with
 /// this set (any value but empty or `0`), a verb that needs an identity bails
 /// with the old "run `tunlion init` first" instead of minting one.
-pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "FILAMENT_NO_IMPLICIT_INIT";
+pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "TUNLION_NO_IMPLICIT_INIT";
 
 /// Whether the opt-out above is set (any value except empty and `0`).
 ///
@@ -718,7 +718,7 @@ fn offer_l3_grant(caps: &UiCapability) {
         .unwrap_or_default()
         .is_empty();
     let userspace = settings::get_str("l3-mode", None).as_deref() == Some("userspace")
-        || std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1");
+        || std::env::var("TUNLION_L3_USERSPACE").as_deref() == Ok("1");
     if !l3_on || userspace {
         return;
     }

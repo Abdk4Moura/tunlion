@@ -1136,7 +1136,7 @@ implement them behaves exactly as before, only slower.
   the cert cache (0700) and dies with it: on expiry, revoke, or grant
   loss the master is stopped (`ssh -O exit`) before the cache is wiped,
   so no multiplexed session outlives its authorization.
-  `FILAMENT_NO_SSH_MUX=1` opts out to one-connection-per-invocation for
+  `TUNLION_NO_SSH_MUX=1` opts out to one-connection-per-invocation for
   debugging.
 - B-SIDE ENFORCEMENT (the security property; A's cleanup above is
   hygiene, not enforcement). Revocation happens in B's store and A may

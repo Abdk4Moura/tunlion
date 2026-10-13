@@ -187,7 +187,7 @@ Two real machines, one prefix, one code path; the only difference between the
 two phases is the owner-signed ceiling.
 
     ceiling without route:  refused, LAN unreachable
-    ceiling with route:     10.66.0.0/24 dev filament0, LAN REACHABLE
+    ceiling with route:     10.66.0.0/24 dev tunlion0, LAN REACHABLE
 
 ## Exit nodes (2026-09-02): the plan, and why only the guard is landed
 
@@ -196,8 +196,8 @@ protocol, the capability, the ceiling and the forwarding are already done. The
 ADVERTISING side works today: set `advertise-routes 0.0.0.0/0` and the router
 masquerades and forwards exactly as it does for a LAN prefix.
 
-Accepting one is a different problem. `10.66.0.0/24 dev filament0` is additive.
-`0.0.0.0/0 dev filament0` captures every packet the machine sends, including the
+Accepting one is a different problem. `10.66.0.0/24 dev tunlion0` is additive.
+`0.0.0.0/0 dev tunlion0` captures every packet the machine sends, including the
 ones carrying the overlay. Installed into the main table it routes the tunnel
 through the tunnel: the link dies, the route is withdrawn, the link returns, and
 the machine oscillates. The first packet lost is usually the one to the

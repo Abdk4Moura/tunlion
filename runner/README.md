@@ -180,12 +180,12 @@ runner/pair_host.sh            # plants ~/.filament-jobrunner/{host,host-dout}, 
 ```
 
 On the **T4**, paste the printed `export SEC_CTL=… SEC_DIN=… SEC_DOUT=…` block,
-make the static binary reachable (host it somewhere and set `FILAMENT_URL`, or
+make the static binary reachable (host it somewhere and set `TUNLION_URL`, or
 copy it next to the script as `./tunlion`), then:
 
 ```bash
 # the binary + bringup_t4.sh on the box, secrets exported, then:
-FILAMENT_URL="https://…/filament-musl"  bash bringup_t4.sh
+TUNLION_URL="https://…/filament-musl"  bash bringup_t4.sh
 ```
 
 `bringup_t4.sh` installs only ffmpeg(NVENC)/python3/(optional rclone), drops the
@@ -215,7 +215,7 @@ runner/run_local_test.sh
 ```
 
 Boots a SEPARATE tunlion topology on this host (locally-built binary + isolated
-`FILAMENT_CONFIG_DIR`s + a local signaling backend — never the live daemon or the
+`TUNLION_CONFIG_DIR`s + a local signaling backend — never the live daemon or the
 installed binary): a box **din acceptor + watcher**, paired over din/dout, and
 runs a **real** ffmpeg job through the file-driven `submit` → watcher → `await`
 flow. It asserts: the manifest comes back **over the file channel** with a

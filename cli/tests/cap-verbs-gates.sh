@@ -2,7 +2,7 @@
 # grant / revoke / devices honesty for delegated (ceiling-bounded) devices.
 # Standalone, hermetic, fixture port 8104 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./cap-verbs-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./cap-verbs-gates.sh
 #
 # A delegated device's authority comes from the enrollment ceiling on its fleet
 # certificate, never from the grant store, so `grant`/`revoke` cannot bind for it.
@@ -22,10 +22,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8104
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-cap-verbs.XXXXXX")"
 
 PASS=0; FAIL=0; FAILED=""
@@ -48,9 +48,9 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat
 [ -x "$BIN" ] || { echo "build first: (cd $CLI_DIR && cargo build --release)"; exit 2; }
 
 DA="$WORK/A"; mkdir -p "$DA"
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" init --name alpha --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1 \
+env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name alpha --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1 \
   || { echo "init failed"; exit 2; }
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 2
 
@@ -58,8 +58,8 @@ sleep 2
 enroll() {  # $1 = device name, $2 = extra add flags (e.g. "--allow shell")
   local name="$1"; shift
   local ddir="$WORK/$name"; mkdir -p "$ddir"
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes >/dev/null 2>&1
-  env FILAMENT_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive >"$WORK/$name-join.log" 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive >"$WORK/$name-join.log" 2>&1
   sleep 2
 }
 
@@ -67,7 +67,7 @@ enroll() {  # $1 = device name, $2 = extra add flags (e.g. "--allow shell")
 # #226: grant a capability outside the ceiling must refuse.
 say A
 enroll foxtrot
-OUTA=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant foxtrot shell 2>&1)
+OUTA=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant foxtrot shell 2>&1)
 rcA=$?
 echo "## (grant shell) rc=$rcA"
 echo "$OUTA" | sed 's/^/    /'
@@ -84,7 +84,7 @@ fi
 # #228: revoke a capability inside the ceiling must refuse, naming --certificate.
 say B
 enroll golf --allow mount
-OUTB=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke golf mount --yes 2>&1)
+OUTB=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke golf mount --yes 2>&1)
 rcB=$?
 echo "## (revoke mount) rc=$rcB"
 echo "$OUTB" | sed 's/^/    /'
@@ -98,7 +98,7 @@ fi
 # ===================================================================== GATE C ==
 # devices renders the ceiling, never an inert grant.
 say C
-JSON=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices --json 2>/dev/null)
+JSON=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" devices --json 2>/dev/null)
 echo "$JSON" | python3 -c "
 import sys, json
 doc = json.loads(sys.stdin.read())
@@ -124,7 +124,7 @@ fi
 # and nothing else changes. It exited 1 ("no grant is needed"), so a script
 # that grants idempotently failed on its second run.
 say D
-OUTD=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant golf mount 2>&1)
+OUTD=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant golf mount 2>&1)
 rcD=$?
 echo "## (grant mount, inside golf's ceiling) rc=$rcD"
 echo "$OUTD" | sed 's/^/    /'

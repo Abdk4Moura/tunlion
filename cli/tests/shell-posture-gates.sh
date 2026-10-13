@@ -3,7 +3,7 @@
 # handing that device a shell. The operator ran the security verb, saw a success
 # line, and lost nothing.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./shell-posture-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./shell-posture-gates.sh
 #
 # The subject is a VOUCH-SHAPED record: a petname holding a secret with no
 # certificate and no enrollment ceiling. That shape matters, and is why the test
@@ -28,10 +28,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8114
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-shell-posture.XXXXXX")"
 DA="$WORK/A"
 DEV=vouched
@@ -63,7 +63,7 @@ seed_vouched_record() {
 GRANT_OK=""
 grant_shell() {
   local out rc
-  out="$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant "$DEV" shell --yes 2>&1)"; rc=$?
+  out="$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant "$DEV" shell --yes 2>&1)"; rc=$?
   echo "## grant $DEV shell rc=$rc"
   if [ "$rc" != "0" ]; then printf '%s\n' "$out" | sed 's/^/    /'; fi
   if [ -z "$GRANT_OK" ]; then
@@ -85,8 +85,8 @@ KNOWN_RED_ALLOW=(
 )
 
 stop_daemon() {
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
-  pkill -f "FILAMENT_CONFIG_DIR=$DA" >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
+  pkill -f "TUNLION_CONFIG_DIR=$DA" >/dev/null 2>&1
   for p in "${FIX_PIDS[@]:-}"; do
     if ps -o args= -p "$p" 2>/dev/null | grep -q ' up '; then kill "$p" 2>/dev/null; fi
   done
@@ -99,7 +99,7 @@ stop_daemon() {
 # was serving, so of course nothing warned.
 start_daemon() {
   local label="$1"; shift
-  env FILAMENT_CONFIG_DIR="$DA" FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/drop" "$@" \
+  env TUNLION_CONFIG_DIR="$DA" TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/drop" "$@" \
     >"$WORK/up-$label.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 5
@@ -112,7 +112,7 @@ start_daemon() {
 }
 
 revoke_shell_output() {
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke "$DEV" shell --yes 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke "$DEV" shell --yes 2>&1
 }
 
 CAUTION='still has shell access'
@@ -157,7 +157,7 @@ elif [ "$remedy" != "tunlion devices forget $DEV -y" ]; then
 else
   # Run it as printed: drop the leading program name, keep every word after it.
   read -r -a remedy_args <<<"${remedy#tunlion }"
-  outR="$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" "${remedy_args[@]}" 2>&1)"; rcR=$?
+  outR="$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" "${remedy_args[@]}" 2>&1)"; rcR=$?
   echo "## ran remedy (rc $rcR):"; printf '%s\n' "$outR" | sed 's/^/   /'
   if [ "$rcR" != "0" ]; then
     bad "gateA: the printed remedy '$remedy' failed when typed (rc $rcR)"

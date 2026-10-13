@@ -24,7 +24,7 @@
 /// macOS's 4-byte AF header, is added/stripped inside the backend).
 #[async_trait::async_trait]
 pub trait TunDevice: Send + Sync {
-    /// The interface name (Linux honors `filament0`; macOS assigns `utunN`).
+    /// The interface name (Linux honors `tunlion0`; macOS assigns `utunN`).
     fn name(&self) -> &str;
     /// Await the next OUTBOUND bare IP packet the local stack wants on the wire.
     async fn recv(&self, buf: &mut [u8]) -> anyhow::Result<usize>;

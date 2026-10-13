@@ -223,7 +223,7 @@ mod tests {
 
     use super::*;
 
-    /// Real-kernel check, opt-in via FILAMENT_NETNS_RIG=1 because it needs root
+    /// Real-kernel check, opt-in via TUNLION_NETNS_RIG=1 because it needs root
     /// and mutates the host firewall. Not a unit test pretending to be one: it
     /// builds two network namespaces, proves traffic is BLOCKED first, applies
     /// the real rules, proves it flows, then removes them and proves it is
@@ -236,9 +236,9 @@ mod tests {
     /// real as root with `--ignored`; the env guard stays so a stray
     /// `--ignored` run on a developer box cannot rewrite its firewall.
     #[test]
-    #[ignore = "needs root + FILAMENT_NETNS_RIG=1"]
+    #[ignore = "needs root + TUNLION_NETNS_RIG=1"]
     fn forwarding_rules_actually_forward_on_a_real_kernel() {
-        if std::env::var("FILAMENT_NETNS_RIG").as_deref() != Ok("1") {
+        if std::env::var("TUNLION_NETNS_RIG").as_deref() != Ok("1") {
             return;
         }
         let sh = |c: &str| {
@@ -292,11 +292,11 @@ mod tests {
 
     #[test]
     fn rules_cover_both_directions_asymmetrically() {
-        let r = rules_for("filament0", "eth0", false);
+        let r = rules_for("tunlion0", "eth0", false);
         assert_eq!(r.len(), 2, "no NAT rule when snat is off");
 
         // Overlay -> LAN is unconditional; the peer initiates.
-        assert!(r[0].contains(&"-i".to_string()) && r[0].contains(&"filament0".to_string()));
+        assert!(r[0].contains(&"-i".to_string()) && r[0].contains(&"tunlion0".to_string()));
         assert!(r[0].contains(&"ACCEPT".to_string()));
 
         // LAN -> overlay is REPLIES ONLY. If this were a blanket ACCEPT the LAN
@@ -306,7 +306,7 @@ mod tests {
 
         // NAT is opt-in, because it is needed only when the LAN cannot route
         // back, and it hides the peer's real source address when applied.
-        let n = rules_for("filament0", "eth0", true);
+        let n = rules_for("tunlion0", "eth0", true);
         assert_eq!(n.len(), 3);
         assert!(n[2].contains(&"MASQUERADE".to_string()));
         assert!(n[2].contains(&"nat".to_string()));

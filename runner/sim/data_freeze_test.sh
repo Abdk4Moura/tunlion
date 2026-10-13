@@ -9,7 +9,7 @@
 #
 # The flaky_proxy.py severs the SIGNALING link; it can't freeze the direct-QUIC
 # DATA path (a separate UDP 5-tuple that never rides the proxy). So the data
-# freeze is an IN-BINARY test hook (FILAMENT_TEST_FREEZE_AFTER_BYTES) on the
+# freeze is an IN-BINARY test hook (TUNLION_TEST_FREEZE_AFTER_BYTES) on the
 # direct-QUIC transport: after ~N bytes the FIRST transport's data path goes
 # dark (send_frame parks, connection stays up, control frames keep flowing) —
 # faithful to a NAT-rebind black-hole. The hook is ONE-SHOT, so the correction
@@ -23,11 +23,11 @@
 #                     action.
 #   (iii)PRESERVED  : the receiver resumed from its .part (a "resuming at" line),
 #                     i.e. NOT restart-from-zero.
-#   A/B BASELINE    : with the watchdog disabled (FILAMENT_STALL_MS huge) the
+#   A/B BASELINE    : with the watchdog disabled (TUNLION_STALL_MS huge) the
 #                     same freeze HANGS (never completes) — proving the detector
 #                     is load-bearing, not incidental.
 #
-# Isolated: own backend on a private port, own FILAMENT_CONFIG_DIRs, the BUILT
+# Isolated: own backend on a private port, own TUNLION_CONFIG_DIRs, the BUILT
 # release binary. Never touches the live `up --shell` daemon or ~/.local/bin.
 #
 # Usage (from repo root or anywhere):  runner/sim/data_freeze_test.sh
@@ -39,14 +39,14 @@ BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`
-# level. Export FILAMENT_LOG=debug so every $BIN child prints them; the
+# level. Export TUNLION_LOG=debug so every $BIN child prints them; the
 # value-prop lines (route, relay banner, P5 upgrade) are `critical` and show
 # regardless. Respect an explicit override if the caller set one.
-export FILAMENT_LOG="${FILAMENT_LOG:-debug}"
-PORT="${FILAMENT_TEST_PORT:-8099}"
+export TUNLION_LOG="${TUNLION_LOG:-debug}"
+PORT="${TUNLION_TEST_PORT:-8099}"
 SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/data-freeze.XXXXXX")"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
 [ -x "$PYV" ] || PYV="$(command -v python3)"
 
 # P0 knobs: detect fast, freeze early, so the gate runs in seconds.
@@ -67,7 +67,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resilience gates drive the env-gated test hooks (FILAMENT_TEST_*), which now
+# Resilience gates drive the env-gated test hooks (TUNLION_TEST_*), which now
 # ship ONLY in a `--features test-hooks` build (stripped from default/release).
 # Auto-build that binary unless an explicit FILJOB_BIN was provided.
 if [ -z "${FILJOB_BIN:-}" ]; then
@@ -92,9 +92,9 @@ BIG="$WORK/big.bin"; head -c 4000000 /dev/urandom >"$BIG"; H_BIG=$(hashof "$BIG"
 DA="$WORK/devA"; DB="$WORK/devB"; mkdir -p "$DA" "$DB"
 pair() {
   local W="pair-$$-$RANDOM"
-  FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$BIG" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
+  TUNLION_CONFIG_DIR="$DA" "$BIN" send "$BIG" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
   local SP=$!; sleep 3
-  FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
+  TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
   wait $SP 2>/dev/null
 }
 say "setup: pairing A<->B (--remember over a code)"
@@ -107,7 +107,7 @@ else
 fi
 
 # ---- one freeze->recover attempt; sets globals R_RC / R_FROZE ---------------
-# FILAMENT_DIRECT_LOOPBACK_ONLY pins the QUIC race to 127.0.0.1 so a multi-homed
+# TUNLION_DIRECT_LOOPBACK_ONLY pins the QUIC race to 127.0.0.1 so a multi-homed
 # box's many local candidates (eth0/private/docker/tailscale/bridge) can't win
 # the race with a pair that cannot carry data — keeping the INJECTED freeze the
 # sole cause of the stall under test.
@@ -120,17 +120,17 @@ one_attempt() {
   # long-lived `up` daemon default to a WARM relay standby (instant cutover), which
   # would here escalate the receiver to relay-only ICE — and with no TURN server it
   # can't connect. So this gate explicitly opts OUT of warm standby
-  # (FILAMENT_WARM_STANDBY=0) to exercise the cold ladder it was written for; the
+  # (TUNLION_WARM_STANDBY=0) to exercise the cold ladder it was written for; the
   # warm-standby behaviour has its own gate (warm_standby_test.sh, which runs a real
   # coturn). Not masking anything: P0's property is the cold-ladder recovery.
-  FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 FILAMENT_STALL_MS="$stall_ms" \
-    FILAMENT_WARM_STANDBY=0 \
+  TUNLION_CONFIG_DIR="$DB" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 TUNLION_STALL_MS="$stall_ms" \
+    TUNLION_WARM_STANDBY=0 \
     timeout 90 "$BIN" up --dir "$DG" --server "$SERVER" >"$UPLOG" 2>&1 &
   local UP=$!; pids+=($UP); sleep 3
   R_RC=0
-  FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 FILAMENT_STALL_MS="$stall_ms" \
-    FILAMENT_WARM_STANDBY=0 \
-    FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
+  TUNLION_CONFIG_DIR="$DA" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 TUNLION_STALL_MS="$stall_ms" \
+    TUNLION_WARM_STANDBY=0 \
+    TUNLION_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout 90 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$SENDLOG" 2>&1 || R_RC=1
   sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
   if grep -q "data-path FREEZE engaged" "$SENDLOG" 2>/dev/null; then R_FROZE=1; else R_FROZE=0; fi
@@ -211,7 +211,7 @@ for n in $(seq 1 "$RUNS"); do
 done
 
 # ---- A/B BASELINE: watchdog effectively OFF (huge threshold) => HANGS --------
-say "A/B BASELINE: stall watchdog OFF (FILAMENT_STALL_MS huge) — the freeze must HANG"
+say "A/B BASELINE: stall watchdog OFF (TUNLION_STALL_MS huge) — the freeze must HANG"
 rcb="$(run_freeze "baseline" 99999999 0)"
 GOTB="$WORK/baseline-drop/big.bin"
 if [ "$rcb" != "0" ] || [ ! -f "$GOTB" ] || [ "$(hashof "$GOTB" 2>/dev/null)" != "$H_BIG" ]; then

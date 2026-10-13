@@ -18,11 +18,11 @@ bare exit code. Recording is strictly optional: the default `./run.sh` is
 verdict); `UX_RECORD=1 ./run.sh` also records casts and builds the gallery.
 
 The harness is **self-safe**: every `tunlion` call points at a throwaway
-`FILAMENT_CONFIG_DIR` under `/tmp/ux`, each backend runs on a free loopback port
+`TUNLION_CONFIG_DIR` under `/tmp/ux`, each backend runs on a free loopback port
 (base 8071+, skipping ports other tenants own) and carries the marker
 `FIL_UX_RIG=1`, and teardown kills **only** processes this harness started
 (tracked children + backends bearing that marker). The user's real
-`~/.config/filament`, their running `tunlion up` daemon, the Vite dev servers on
+`~/.config/tunlion`, their running `tunlion up` daemon, the Vite dev servers on
 5180/5181, and a gallery server on 8095 are never touched.
 
 ## Run it
@@ -180,7 +180,7 @@ twice over (a no-recorder verify pass **and** a best-effort visual pass).
   (the `tunlion up —` ready banner, `receive`'s `● listening` line, the sender's
   `code <word>` line, the sshd port opening) via the `wait_for` / `wait_log`
   helpers in `rig/lib.sh`, instead of fixed `sleep 3/4`. Faster and less flaky.
-- **`FILAMENT_REJOIN_SECS` low** (set to 2–3 in the scenarios) — a completed
+- **`TUNLION_REJOIN_SECS` low** (set to 2–3 in the scenarios) — a completed
   `receive -y` otherwise lingers the full rejoin window after the sender drops.
 - **agg `--speed` / `--idle-time-limit`** and **ffmpeg `fps` + `scale` + palette**
   + **gifsicle `--lossy`** — trim idle time and quantize so GIFs are a few MB,
@@ -240,7 +240,7 @@ These are real product behaviors the harness surfaced (not harness bugs):
    regardless of filename so a future rename regression can't fake a pass.
 2. **`receive -y` lingers** the full rejoin window after a completed transfer when
    the sender disconnects first — no prompt-exit on success. Slows demos; needs a
-   low `FILAMENT_REJOIN_SECS` or an outer `timeout`.
+   low `TUNLION_REJOIN_SECS` or an outer `timeout`.
 3. **`tunlion devices` does not surface granted capabilities.** You can't see
    which devices hold `shell` without reading `devices.json` by hand.
 4. **`shell --ssh` is broken in the shipping 0.8.5 binary.** Its ProxyCommand

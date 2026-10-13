@@ -18,7 +18,7 @@ back to the userspace netstack, which needs no privilege but has no kernel route
 so native tools reach peers through the SOCKS proxy instead.
 
 Consequence to be aware of when upgrading: an existing install that never opted
-in will bring up `filament0` on its next daemon restart.
+in will bring up `tunlion0` on its next daemon restart.
 
 ## 2. L3 over relay
 
@@ -100,15 +100,15 @@ auto-mesh admit a peer over a relay link.
 ## Verification
 
 Item 1 is verified live: a fresh install with no `tun-addr` in its config brings
-up `filament0` dual-stack with a working `<name>.mesh`.
+up `tunlion0` dual-stack with a working `<name>.mesh`.
 
 Item 2 is verified working end to end. With the direct ladder refused, two
 daemons hold a DataChannel link, exchange nonces, announce, install routes both
 ways, and a `ping6` across the overlay returns 3/3 with 0% loss. The path under
-test: host to `filament0`, A's L3 pump, a DataChannel datagram on the reserved
+test: host to `tunlion0`, A's L3 pump, a DataChannel datagram on the reserved
 sid, B's smoltcp netstack, ICMP echo reply.
 
-The hook that made this testable: `FILAMENT_TEST_NO_DIRECT=1` refuses the rung-1 direct
+The hook that made this testable: `TUNLION_TEST_NO_DIRECT=1` refuses the rung-1 direct
 ladder even for a daemon, which is otherwise impossible to arrange since
 `direct_ok_for` forces direct ON for every long-lived acceptor (an anti-glare
 rule that is correct in production), so two daemons on one host always find each

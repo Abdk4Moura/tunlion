@@ -2,7 +2,7 @@
 # Certificate revocation against a CERTIFIED fleet device, live. Standalone,
 # hermetic, fixture port 8121 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./fleet-cert-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./fleet-cert-gates.sh
 #
 # WHY THIS EXISTS. Every other shell-class gate in this directory pairs its two
 # daemons by hand-writing a shared secret into both devices.json files. A
@@ -74,7 +74,7 @@
 #       sibling's exec is refused.
 #   D-sh SHADOW EVIDENCE for the flip checklist: a covered fleet exec in
 #       shadow mode logs zero CAP-SHADOW CRITICAL lines.
-#   AUTH-A/B/C under FILAMENT_CAP_AUTHORITATIVE=1 on a restarted owner
+#   AUTH-A/B/C under TUNLION_CAP_AUTHORITATIVE=1 on a restarted owner
 #       daemon: shell within the enrolment ceiling succeeds (A); exec
 #       outside the ceiling (transfer-only enrolment) is refused with the
 #       grant reason (B); revoke --certificate refuses too (C).
@@ -106,10 +106,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8121
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-fleet-cert.XXXXXX")"
 DA="$WORK/owner"
 SPOKE=spoke
@@ -123,7 +123,7 @@ trap fixture_cleanup EXIT
 # passes (so the SIGNING half runs, which is what these gates are about) and
 # ssh itself fails immediately, touching nothing on the host.
 SSHD_STANDIN_PORT=9124
-SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=$SSHD_STANDIN_PORT)
+SSH_ENV=(env TUNLION_NO_L3_SSH=1 TUNLION_SSH_PORT=$SSHD_STANDIN_PORT)
 AK_FILE="$HOME/.ssh/authorized_keys"
 [ -f "$AK_FILE" ] && cp "$AK_FILE" "$WORK/ak.before" || : > "$WORK/ak.before"
 
@@ -134,8 +134,8 @@ AK_FILE="$HOME/.ssh/authorized_keys"
 # what happened to gateAUTH-A (see the header note).
 KNOWN_RED_ALLOW=()
 
-O_ENV=(env FILAMENT_CONFIG_DIR="$DA")
-S_ENV=(env FILAMENT_CONFIG_DIR="$DS")
+O_ENV=(env TUNLION_CONFIG_DIR="$DA")
+S_ENV=(env TUNLION_CONFIG_DIR="$DS")
 
 python3 -c "
 import socket
@@ -204,7 +204,7 @@ fi
 # what is asserted is that the owner's daemon passed the ssh-sign gate and
 # ISSUED, which is the third path through shell_gate::decide.
 say "A3: the owner signs an ssh certificate for the certified spoke"
-timeout 60 "${SSH_ENV[@]}" FILAMENT_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
+timeout 60 "${SSH_ENV[@]}" TUNLION_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
   shell --ssh alpha -- 'echo NO-SSHD-HERE' >"$WORK/A3.out" 2>"$WORK/A3.err" </dev/null
 echo "## (ssh sign) rc=$?"
 SIGNED_BEFORE=$(grep -c "ssh-ca: signed for '$SPOKE'" "$WORK/up.log")
@@ -293,7 +293,7 @@ fi
 # turns "the flow stopped" into "no certificate for a revoked device exists",
 # and A3 is what makes that absence meaningful.
 say "E: the revoked spoke's shell --ssh is refused, and nothing is signed"
-timeout 60 "${SSH_ENV[@]}" FILAMENT_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
+timeout 60 "${SSH_ENV[@]}" TUNLION_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
   shell --ssh alpha -- 'echo SHOULD-NOT-RUN' >"$WORK/E.out" 2>"$WORK/E.err" </dev/null
 rcE=$?
 SIGNED_AFTER=$(grep -c "ssh-ca: signed for '$SPOKE'" "$WORK/up.log")
@@ -431,7 +431,7 @@ print(json.dumps({
   "mallory_absent":sys.argv[3] not in rec,
 },sort_keys=True))
 PY
-M_ENV=(env FILAMENT_CONFIG_DIR="$DM")
+M_ENV=(env TUNLION_CONFIG_DIR="$DM")
 run_impostor_variant() {
   local variant="$1" tag="$2"
   # Per-variant refusal counting: the owner log accumulates, so record the
@@ -439,7 +439,7 @@ run_impostor_variant() {
   local refused_before=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   pkill -f "up --dir $WORK/$MALLORY-drop" 2>/dev/null || true
   sleep 2
-  env FILAMENT_CONFIG_DIR="$DM" FILAMENT_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
+  env TUNLION_CONFIG_DIR="$DM" TUNLION_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
   FIX_PIDS+=($!)
   # Wait for the attempt to happen rather than a fixed 8s. The impostor's
   # record was dropped from the owner's store, and since a running daemon
@@ -509,7 +509,7 @@ say "I3: control-char squat refused"
 run_impostor_variant "$SPOKE$(printf '\007')" ctrl
 
 # ================================================== AUTHORITATIVE MODE ==
-# The same questions under FILAMENT_CAP_AUTHORITATIVE=1 on the owner
+# The same questions under TUNLION_CAP_AUTHORITATIVE=1 on the owner
 # daemon. The daemon reads the flag at startup, so the owner acceptor is
 # restarted with it (same config dir, fresh log); the spokes are untouched.
 # Gate D-sh runs FIRST, while the daemons are still in shadow mode.
@@ -567,10 +567,10 @@ else
   bad "gateD-sh: shadow covered exec unclean (rc=$rcSH out='$OUTSH' new_criticals=$CRITS of $CRITS_ALL total)"
 fi
 
-say "restarting the owner acceptor under FILAMENT_CAP_AUTHORITATIVE=1"
+say "restarting the owner acceptor under TUNLION_CAP_AUTHORITATIVE=1"
 pkill -f "up --dir $WORK/Adrop" 2>/dev/null || true
 sleep 2
-env FILAMENT_CONFIG_DIR="$DA" FILAMENT_CAP_AUTHORITATIVE=1 FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-auth.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" TUNLION_CAP_AUTHORITATIVE=1 TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-auth.log" 2>&1 &
 FIX_PIDS+=($!)
 sleep 6
 
@@ -620,7 +620,7 @@ enroll_delegate "$SPOKE2" --allow transfer
 start_spoke "$DS2" "$SPOKE2"
 sleep 6
 say "AUTH-B: exec outside the enrolment ceiling is refused under authoritative"
-OUTAB=$(timeout 60 env FILAMENT_CONFIG_DIR="$DS2" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AB.err" </dev/null)
+OUTAB=$(timeout 60 env TUNLION_CONFIG_DIR="$DS2" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AB.err" </dev/null)
 rcAB=$?
 echo "## (authoritative uncovered exec) rc=$rcAB out='$OUTAB'"
 if [ "$rcAB" != "0" ] \

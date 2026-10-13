@@ -481,7 +481,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fil-devperms-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let sec = "c".repeat(64);
         let devices = json!([
             {"name": "laptop", "secret": sec, "v": 2, "caps": ["transfer", "shell"],
@@ -526,8 +526,8 @@ mod tests {
     #[test]
     fn rows_come_from_the_store_and_effective_from_the_gate() {
         let _guard = lock_test_config();
-        let prior = std::env::var("FILAMENT_CAP_AUTHORITATIVE").ok();
-        unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", "0") };
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
+        unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "0") };
         let now = capability::now_secs();
         let dir = fixture(now);
         let before = (
@@ -605,10 +605,10 @@ mod tests {
         assert_eq!(before, after, "devices --caps must not write the store");
 
         match prior {
-            Some(v) => unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", v) },
-            None => unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") },
+            Some(v) => unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v) },
+            None => unsafe { std::env::remove_var("TUNLION_CAP_AUTHORITATIVE") },
         }
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -618,7 +618,7 @@ mod tests {
         let now = capability::now_secs();
         let dir = fixture(now);
         assert!(all_device_perms(now).iter().all(|d| d.name != "ghost"));
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

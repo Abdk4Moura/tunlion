@@ -112,7 +112,7 @@ mod invitee_name_tests {
         let _guard = crate::tests::lock_test_config();
         let dir = std::env::temp_dir().join(format!("fil-armed-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let later = crate::capability::now_secs() + 600;
         super::arm("aa".repeat(32), later, Some("beta".into()));
         super::arm("bb".repeat(32), later, None);
@@ -121,7 +121,7 @@ mod invitee_name_tests {
         assert_eq!(super::invitee_name(&"bb".repeat(32)), None, "unnamed invitation");
         assert_eq!(super::invitee_name(&"cc".repeat(32)), None, "an expired key names nobody");
         assert_eq!(super::invitee_name(&"dd".repeat(32)), None);
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -441,7 +441,7 @@ async fn handle_forward_open(
         gate_inputs.ceiling_covers = false;
         let legacy_ok = {
             let blanket = shell_policy.enables_l2()
-                || std::env::var("FILAMENT_L2")
+                || std::env::var("TUNLION_L2")
                     .map(|x| x == "1")
                     .unwrap_or(false);
             let (peer_has_shell, peer_denied) = conn
@@ -589,7 +589,7 @@ async fn handle_pty_open(
         return;
     };
     // #219: the acceptor is OFF (plain `up`, no --shell/--shell-only,
-    // no FILAMENT_L2). The peer is visibly up but cannot serve a
+    // no TUNLION_L2). The peer is visibly up but cannot serve a
     // shell, and dropping the open silently made `shell` hang with
     // no output. Say so, so the initiator errors instead of waiting.
     if !l2_enabled {
@@ -1048,7 +1048,7 @@ pub(crate) async fn recv_cmd(
     const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
     let recv_pake_budget = Duration::from_secs(
-        std::env::var("FILAMENT_PAIR_GRACE_SECS")
+        std::env::var("TUNLION_PAIR_GRACE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),
@@ -1086,7 +1086,7 @@ pub(crate) async fn recv_cmd(
                     // report things that are false, such as "daemon not running"
                     // while this daemon is plainly up. The common real cause is
                     // a socket path longer than the kernel allows (108 bytes on
-                    // Linux, 104 on macOS), e.g. a deep FILAMENT_CONFIG_DIR or a
+                    // Linux, 104 on macOS), e.g. a deep TUNLION_CONFIG_DIR or a
                     // CI/macOS temp directory; found by a first-time-user test
                     // whose sandbox path was 110 bytes.
                     //
@@ -1239,19 +1239,19 @@ pub(crate) async fn recv_cmd(
     }
 
     // L2 acceptor posture (computed here so it also gates the direct-QUIC path).
-    // OFF unless FILAMENT_L2=1 (opt-in) OR an active `up --shell` policy turns it
+    // OFF unless TUNLION_L2=1 (opt-in) OR an active `up --shell` policy turns it
     // on (you can't ssh in without the acceptor). See its second use below.
     // L2/shell is ON when: an `--shell`/`--shell-only` policy turns it on, the
-    // FILAMENT_L2 opt-in is set, OR any known device has been `grant`ed shell (so
+    // TUNLION_L2 opt-in is set, OR any known device has been `grant`ed shell (so
     // `tunlion grant <dev> shell` works on a plain `up` without restarting with a
     // flag, matching what the grant command tells the user). The per-device gate
     // below still denies every non-granted device, so this never widens access.
-    // The launch posture (`--shell`/`--shell-only`, FILAMENT_L2) is fixed for
+    // The launch posture (`--shell`/`--shell-only`, TUNLION_L2) is fixed for
     // the daemon's life: it is what `--i-know` was checked against, so a live
     // `set shell on` must not widen it past that gate. The GRANT half is not
     // fixed: it is recomputed at the top of every loop iteration below.
     let l2_launch = shell_policy.enables_l2()
-        || std::env::var("FILAMENT_L2")
+        || std::env::var("TUNLION_L2")
             .map(|v| v == "1")
             .unwrap_or(false);
     let mut l2_enabled = l2_launch || any_shell_grant();
@@ -1387,7 +1387,7 @@ pub(crate) async fn recv_cmd(
                     None
                 } else {
                     // Endpoint selection: `l3-mode` setting (kernel|userspace|auto),
-                    // default Auto; FILAMENT_L3_USERSPACE / `up --userspace` force
+                    // default Auto; TUNLION_L3_USERSPACE / `up --userspace` force
                     // userspace (handled inside L3::start via the env).
                     let mode = match settings::get_str("l3-mode", None).as_deref() {
                         Some("kernel") => l3::L3Mode::Kernel,
@@ -1520,7 +1520,7 @@ pub(crate) async fn recv_cmd(
                                     .map(|a| format!(" / {a}"))
                                     .unwrap_or_default();
                                 ui::say(&format!(
-                                    "  {} L3 overlay {}{} on filament0",
+                                    "  {} L3 overlay {}{} on tunlion0",
                                     ui::paint(ui::Tone::Brand, "●"),
                                     addr,
                                     v4
@@ -1584,7 +1584,7 @@ pub(crate) async fn recv_cmd(
             // the same ports, so a restart silently dropped what `expose` had just
             // applied, and `status` went on listing ports nothing served. The
             // ports bind on the overlay address only (a ULA reached over
-            // filament0 by paired peers); in userspace the host firewall does not
+            // tunlion0 by paired peers); in userspace the host firewall does not
             // see that traffic, which is said here rather than used as a reason
             // to disagree with the live path.
             let ex = expose::Exposer::new(m.clone());
@@ -1742,7 +1742,7 @@ pub(crate) async fn recv_cmd(
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
     // would turn a clean decline into the 45s timeout it replaced.
     let fleet_offer_grace = Duration::from_secs(
-        std::env::var("FILAMENT_FLEET_OFFER_GRACE_SECS")
+        std::env::var("TUNLION_FLEET_OFFER_GRACE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8),
@@ -1775,7 +1775,7 @@ pub(crate) async fn recv_cmd(
     //  - Ev::SignalingDown : the socket.io close/error fast-path accelerant.
     // Only the daemon acceptor self-heals (`signaling_self_heal`); the one-shot
     // recv/send paths re-invoke fresh, so they keep failing fast (unchanged).
-    // FILAMENT_TEST_NO_SIGNALING_RECONNECT reverts to the OLD no-outer-loop path
+    // TUNLION_TEST_NO_SIGNALING_RECONNECT reverts to the OLD no-outer-loop path
     // so the signaling-drop gate's A/B baseline can prove the acceptor ZOMBIES
     // without the fix (the detector/loop is load-bearing, not incidental).
     let signaling_self_heal = daemon && !test_hooks::no_signaling_reconnect();
@@ -1851,7 +1851,7 @@ pub(crate) async fn recv_cmd(
         // forever, faithfully simulating a peer transport whose inline write
         // never returns. The graceful Ev::Interrupted can no longer be processed;
         // only the signal-owned force-exit watchdog can still terminate us. No-op
-        // unless FILAMENT_TEST_WEDGE_LOOP is set (test-hooks builds only).
+        // unless TUNLION_TEST_WEDGE_LOOP is set (test-hooks builds only).
         if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
             std::future::pending::<()>().await;
         }
@@ -2570,7 +2570,7 @@ pub(crate) async fn recv_cmd(
         // Overall deadline: the backstop. Once we are matched into the sender's
         // room a candidate channel arms this; if NO peer authenticates within it,
         // fail the whole `recv` loudly (a genuinely absent / old sender, mirroring
-        // the previous single-budget intent and FILAMENT_PAIR_GRACE_SECS) rather
+        // the previous single-budget intent and TUNLION_PAIR_GRACE_SECS) rather
         // than hanging forever.
         if recv_code_path && !recv_pake_done {
             if let Some(dl) = recv_pake_overall_deadline {
@@ -3344,7 +3344,7 @@ pub(crate) async fn recv_cmd(
         // left are ones held open purely for their deferred-drop reap (their
         // sender's signaling left AFTER the transfer finished), there is nothing
         // in flight to protect, exit promptly instead of paying the full
-        // FILAMENT_ADOPT_ACTIVE_MS deferral. Restores the pre-#28 prompt exit; an
+        // TUNLION_ADOPT_ACTIVE_MS deferral. Restores the pre-#28 prompt exit; an
         // in-progress reconnect keeps `by_sid` non-empty and so is unaffected.
         if st.completed > 0
             && !keep_open
@@ -3389,7 +3389,7 @@ pub(crate) async fn recv_cmd(
 
         // G-k fallback: everything done, nobody attached, no questions
         // outstanding, if that holds quietly for the quiet-exit window (10s
-        // default, FILAMENT_QUIET_EXIT_SECS overrides), the peer-left we were
+        // default, TUNLION_QUIET_EXIT_SECS overrides), the peer-left we were
         // counting on for a clean exit never arrived; exit anyway. C30 ph2:
         // ALSO satisfied when the server's digest says the room is empty and
         // no room-independent (channel) link remains, lingering dead links
@@ -3416,7 +3416,7 @@ pub(crate) async fn recv_cmd(
         // `Ready`) does not block exit, but a healthy `Ready` link (e.g. a
         // bystander between two human-paced sends, gate 6) STILL does. So this is
         // a no-op for healthy peers, not a behaviour change, only a peer we've
-        // lost contact with stops blocking. FILAMENT_TEST_DISABLE_MODEB_DROP
+        // lost contact with stops blocking. TUNLION_TEST_DISABLE_MODEB_DROP
         // restores the old links-gated behaviour so gate 18b proves the A/B
         // (baseline hangs, fix exits) with one binary.
         // A link whose transport is DEAD is not healthy whatever its presence
@@ -4368,7 +4368,7 @@ pub(crate) async fn recv_cmd(
                     }
                 }
                 // web-shell discovery: tell the peer whether this receiver offers a
-                // terminal (l2_enabled = `up --shell` / FILAMENT_L2). The browser
+                // terminal (l2_enabled = `up --shell` / TUNLION_L2). The browser
                 // shows its per-device shell button ONLY when this is true; the
                 // actual pty-open is still gated server-side by the cap/policy.
                 let _ = t
@@ -5594,7 +5594,7 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                 }
-                // L2 (ssh/TCP tunnel) acceptor. Opt-in (FILAMENT_L2=1). The
+                // L2 (ssh/TCP tunnel) acceptor. Opt-in (TUNLION_L2=1). The
                 // capability gate is the proof-verified `trusted` flag on this
                 // link (placeholder for L1-a caps); localhost-only is enforced in
                 // accept_control. A non-trusted or non-loopback open is refused.
@@ -5623,7 +5623,7 @@ pub(crate) async fn recv_cmd(
                     )
                     .await;
                 }
-                // Seamless-shell bootstrap (acceptor). Opt-in (FILAMENT_L2=1).
+                // Seamless-shell bootstrap (acceptor). Opt-in (TUNLION_L2=1).
                 // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
                 // when the link is proof-verified (`trusted`) AND the proven
                 // device holds the NEW `shell` capability, distinct from
@@ -5762,7 +5762,7 @@ pub(crate) async fn recv_cmd(
                             .unwrap_or(false);
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
-                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    // under TUNLION_CAP_AUTHORITATIVE.
                     let granted = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
@@ -5902,7 +5902,7 @@ pub(crate) async fn recv_cmd(
                                 .unwrap_or(22);
                             let sshd = sshd_listening(ssh_port).await;
                             ui::say(&format!(
-                                "l2: shell granted to '{device}', installed managed key (filament-managed block)"
+                                "l2: shell granted to '{device}', installed managed key (tunlion-managed block)"
                             ));
                             let _ = t
                                 .send_control(&json!({
@@ -6079,7 +6079,7 @@ pub(crate) async fn recv_cmd(
                     let verified = conn.link(&pid).and_then(|l| l.verified_name.clone());
                     // Capability layer for mount evaluated unconditionally (shadow
                     // samples the legacy-allowed population); legacy (trusted) stands
-                    // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
+                    // in shadow, cap gates under TUNLION_CAP_AUTHORITATIVE.
                     let (authorized, read_only) = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
@@ -6954,7 +6954,7 @@ pub(crate) async fn recv_cmd(
                     };
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
-                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    // under TUNLION_CAP_AUTHORITATIVE.
                     let (ok, xfer_deny_reason, xfer_gate) = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
@@ -7543,7 +7543,7 @@ pub(crate) async fn recv_cmd(
                                     // the else-if chain survived MINUS its first arm, which is
                                     // what a botched conflict resolution looks like. For ~620
                                     // commits `cli/tests/ack-loss-repro.sh` set
-                                    // FILAMENT_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
+                                    // TUNLION_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
                                     // its "premature" round ran an ordinary transfer and the
                                     // promptness verdict measured the happy path.
                                     // `hooks_that_nothing_calls` now fails if any hook loses
@@ -7722,7 +7722,7 @@ pub(crate) async fn recv_cmd(
                                     // the else-if chain survived MINUS its first arm, which is
                                     // what a botched conflict resolution looks like. For ~620
                                     // commits `cli/tests/ack-loss-repro.sh` set
-                                    // FILAMENT_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
+                                    // TUNLION_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
                                     // its "premature" round ran an ordinary transfer and the
                                     // promptness verdict measured the happy path.
                                     // `hooks_that_nothing_calls` now fails if any hook loses
@@ -7869,7 +7869,7 @@ pub(crate) async fn recv_cmd(
                 } else if let Some(inc) = st.by_sid.get_mut(&(pid.clone(), sid)) {
                     // --- TRACE recv path ---
                     let trace = cfg!(feature = "debug-logs")
-                        && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+                        && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
                     let t_recv_start = if trace {
                         Some(std::time::Instant::now())
                     } else {

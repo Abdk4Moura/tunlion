@@ -1,7 +1,7 @@
-# authkeys-managed — filament-managed ssh auth material (the seamless
+# authkeys-managed — tunlion-managed ssh auth material (the seamless
 # `tunlion ssh` path). Carved out of the CLI. NEVER touches the user's ~/.ssh
 # except to write/remove a clearly-marked, removable `# BEGIN/END
-# filament-managed <device>` block in authorized_keys.
+# tunlion-managed <device>` block in authorized_keys.
 #
 # Decoupled from the CLI's config-dir resolution: every function that needs the
 # tunlion config root takes `config_dir: &Path` as a parameter (the caller in

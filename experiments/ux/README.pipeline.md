@@ -11,7 +11,7 @@ There is **no `?preview=` mock seam** in the e2e path. Every case stands up
 genuine peers and drives the genuine UI:
 
 - **Real peers.** The locally-built binary `cli/target/release/tunlion` (built
-  on demand if missing), each with its own isolated `FILAMENT_CONFIG_DIR` under
+  on demand if missing), each with its own isolated `TUNLION_CONFIG_DIR` under
   `/tmp/ux-pipeline`, all signaling through a **local backend** we start on a free
   port. The CLI *is* a real peer (`tunlion up`, `tunlion up --shell`).
 - **Real pairing.** A CLI peer mints a PAKE code (`tunlion pair`); Playwright

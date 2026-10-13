@@ -663,10 +663,10 @@ pub(crate) fn stdout_put(
 /// CORE whole-file integrity guarantee the runner used to bolt on above the
 /// transport, now every `recv` gets it.
 ///
-/// Test hook (the truncation/ack gate): `FILAMENT_TEST_CORRUPT_RECV=<id>` flips
+/// Test hook (the truncation/ack gate): `TUNLION_TEST_CORRUPT_RECV=<id>` flips
 /// a byte of the on-disk `.part` for the matching transfer id right before the
 /// hash is computed, deterministically inducing the corrupt-receive case so the
-/// gate can prove reject + recover. `FILAMENT_TEST_CORRUPT_ONCE=1` makes it fire
+/// gate can prove reject + recover. `TUNLION_TEST_CORRUPT_ONCE=1` makes it fire
 /// exactly once (the re-fetch then succeeds), proving auto-recovery.
 /// Recompute the whole-file sha256 and compare against the sender's offered
 /// digest. Flushes (syncs) first. This is the receiver-side core of P4 integrity.

@@ -30,7 +30,7 @@ fn scratch_root() -> std::path::PathBuf {
 
 fn status_json(cfg: &std::path::Path) -> serde_json::Value {
     let out = Command::new(real_bin())
-        .env("FILAMENT_CONFIG_DIR", cfg)
+        .env("TUNLION_CONFIG_DIR", cfg)
         .args(["status", "--json"])
         .output()
         .expect("run tunlion status");
@@ -74,7 +74,7 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
 
     // Spawn the real daemon under the renamed binary.
     let mut child = Command::new(&renamed)
-        .env("FILAMENT_CONFIG_DIR", &cfg)
+        .env("TUNLION_CONFIG_DIR", &cfg)
         .arg("up")
         .arg("--server")
         .arg(&server)

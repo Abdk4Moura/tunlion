@@ -189,7 +189,7 @@ jobs:
 
       - name: Run gates
         env:
-          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/tunlion
+          TUNLION_BIN: ${{ github.workspace }}/cli/target/release/tunlion
         run: |
           set -uo pipefail
           declare -A EXPECT=(

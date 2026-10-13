@@ -2,7 +2,7 @@
 # #235: a revoked certificate must stop an ALREADY-ESTABLISHED mount.
 # Standalone, hermetic, fixture port 8106 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./mount-revoke-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./mount-revoke-gates.sh
 #
 # The property is bounded staleness, not immediacy. The server re-asks the gate
 # every recheck interval, so the gate allows a grace period and then requires the
@@ -16,10 +16,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8106
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-mount-revoke.XXXXXX")"
 DA="$WORK/A"
 GRACE=12   # > REVOKE_RECHECK, with slack for a slow box
@@ -45,14 +45,14 @@ enroll_delegate bravo --allow mount
 mkdir -p "$WORK/share"
 echo "written before the revoke" > "$WORK/share/before.txt"
 # The acceptor serves a mount only inside its SHARE ROOT (the `share` config
-# key, default ~/filament-share); a peer can no longer name any path it likes.
+# key, default ~/tunlion-share); a peer can no longer name any path it likes.
 # Configure alpha's share root as the directory this gate mounts, explicitly,
 # the way an owner would. The daemon reads it per mount-open, so no restart.
 printf 'share %s\n' "$WORK/share" >> "$DA/config"
 
 # ===================================================================== GATE A ==
 say "mount-revoke gate A"
-env FILAMENT_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" mount alpha "$WORK/share" "$WORK/mnt" \
+env TUNLION_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" mount alpha "$WORK/share" "$WORK/mnt" \
     >"$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!; FIX_PIDS+=("$MOUNT_PID")
 for _ in $(seq 1 40); do timeout 5 ls "$WORK/mnt" >/dev/null 2>&1 && break; sleep 0.5; done
@@ -92,7 +92,7 @@ say "mount-revoke gate B"
 # the peer was revoked (the critical line mount_proto.rs prints on that branch).
 REASON="mount: peer revoked, closing the live session"
 reason_before=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
 revoke_rc=$?
 echo "## revoke rc=$revoke_rc"
 echo "written AFTER the revoke" > "$WORK/share/after.txt"

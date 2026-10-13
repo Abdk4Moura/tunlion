@@ -55,7 +55,7 @@ const DIST = path.join(FRONT, 'dist');
 // gate unrunnable rather than failing loudly. Prefer the override, then any
 // venv at the repo root, then whatever python3 is on PATH; the backend needs
 // flask, flask-socketio and flask-cors, and the gate says so if they are absent.
-const VENV_PY = process.env.FILAMENT_TEST_VENV
+const VENV_PY = process.env.TUNLION_TEST_VENV
   || (fs.existsSync(path.join(ROOT, '.venv', 'bin', 'python'))
         ? path.join(ROOT, '.venv', 'bin', 'python')
         : 'python3');

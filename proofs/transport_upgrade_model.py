@@ -99,7 +99,7 @@ Faithfulness -- state <-> code:
   d = PENDING   main.rs direct_pending entry, expiry armed (expired_direct)
   d = LIVE      Link.transport: Some(DirectTransport)  (direct.rs:989)
   direct_ok     main.rs start_direct_inner rel 13, `if !self.direct_ok`
-                (FILAMENT_DIRECT; CI forces 0 on macOS)
+                (TUNLION_DIRECT; CI forces 0 on macOS)
   bind_ok       direct::bind_endpoint, rel 70; failure returns at rel 86,
                 which is 97 lines BEFORE the pending insert at rel 183
   roster        session.rs on_synced -> reconcile; rebuilds a missing link
@@ -400,7 +400,7 @@ if __name__ == '__main__':
     # allowed to say anything about a design we have not run. Each row is a real
     # job result, not a prediction.
     #
-    # macOS CI sets FILAMENT_DIRECT_PER_OS=0 -> direct_ok False.
+    # macOS CI sets TUNLION_DIRECT_PER_OS=0 -> direct_ok False.
     # ubuntu/windows run direct enabled and it succeeds -> direct_ok, bind_ok.
     # main carries #71's roster reconciliation; #79 deliberately does not.
     #

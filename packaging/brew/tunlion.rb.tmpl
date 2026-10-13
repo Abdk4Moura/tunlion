@@ -23,8 +23,6 @@ class Tunlion < Formula
 
   def install
     bin.install "tunlion"
-    # Keep the pre-rename command working for anyone who already has it.
-    bin.install_symlink bin/"tunlion" => "filament"
     generate_completions_from_executable(bin/"tunlion", "completions")
   end
 

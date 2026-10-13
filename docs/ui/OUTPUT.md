@@ -360,13 +360,13 @@ Rules that go with them:
   `logs -f`); "no log yet" and "detached" stay on stderr. `-n`/`--lines` is
   `--tail`.
 - **`reach` confirms liveness.** A warm link is reported only after the peer
-  answers a `reach-ping` on it (1.5 s, FILAMENT_REACH_PING_MS); a peer stopped
+  answers a `reach-ping` on it (1.5 s, TUNLION_REACH_PING_MS); a peer stopped
   or killed keeps its link "alive" locally until QUIC's idle timeout, so with
   no answer reach falls through to the full probe and reports offline, exit 6.
 - **`send` exit codes:** an unreadable local file is 2 (nothing contacted); a
   known device that never appears on the server is offline, 6, after 10 s
-  (FILAMENT_SEND_OFFLINE_SECS) instead of the whole `--timeout`; no peer within
-  `--timeout` (default 60, FILAMENT_SEND_TIMEOUT as the fallback, 0 = no limit)
+  (TUNLION_SEND_OFFLINE_SECS) instead of the whole `--timeout`; no peer within
+  `--timeout` (default 60, TUNLION_SEND_TIMEOUT as the fallback, 0 = no limit)
   is 6; bytes sent but never acknowledged whole is 8.
 - **Transfer history is structured on both ends.** `status --json` `recent` is
   a list of objects `{time, direction, peer, file, stored, bytes, sha256, ok}`

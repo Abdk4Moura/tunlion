@@ -356,7 +356,7 @@ fn single_json(device: &str, o: &crate::l2::ProbeOutcome) -> Value {
     json!({
         // `ok` is the answer: the peer was reached. Exit code agrees (6 if not).
         "ok": o.established,
-        "kind": "filament-doctor-probe",
+        "kind": "tunlion-doctor-probe",
         "device": device,
         "established": o.established,
         "total_ms": o.total_ms,
@@ -412,7 +412,7 @@ fn repeat_json(device: &str, outcomes: &[crate::l2::ProbeOutcome]) -> Value {
         // Every run established, the same rule the exit code applies.
         "ok": established == n,
         "error": error,
-        "kind": "filament-doctor-repeat",
+        "kind": "tunlion-doctor-repeat",
         "device": device,
         "runs": n,
         "established": established,
@@ -671,12 +671,12 @@ async fn check_stun(server: &str) -> IceResult {
 }
 
 /// Resolve the first `stun:`/`stuns:` url to an IPv4 socket address. Honors a
-/// `FILAMENT_STUN` override (host:port) first, mirroring stun_server_addr. Used
+/// `TUNLION_STUN` override (host:port) first, mirroring stun_server_addr. Used
 /// so the doctor's binding learns an IPv4 srflx (the parser + class are v4).
 fn resolve_stun_v4(stun_urls: &[String]) -> Option<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
     let mut hostports: Vec<String> = Vec::new();
-    if let Ok(v) = std::env::var("FILAMENT_STUN") {
+    if let Ok(v) = std::env::var("TUNLION_STUN") {
         hostports.push(v.trim().to_string());
     }
     for url in stun_urls {
@@ -850,7 +850,7 @@ fn preflight_json(
         // owner fingerprint (or null) and the role.
         "identity": identity.0,
         "role": identity.1,
-        "kind": "filament-doctor-preflight",
+        "kind": "tunlion-doctor-preflight",
         "server": server,
         "signaling": sig_json,
         "ice": ice_json,

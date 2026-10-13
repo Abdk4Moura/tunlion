@@ -237,7 +237,7 @@ pub(crate) async fn respond_to_auth_key_enroll_request(
     // enforced in shadow mode too (cap_gate_effective's ceiling check is
     // mode-independent and load-bearing exactly because shadow's effective
     // decision is legacy_allowed, which the ceiling check precedes). An
-    // earlier gate refused enrollment unless FILAMENT_CAP_AUTHORITATIVE=1;
+    // earlier gate refused enrollment unless TUNLION_CAP_AUTHORITATIVE=1;
     // that rationale is stale and it made the flagship join flow fail for a
     // default-configured owner. The joined device's ceiling binds either way.
 

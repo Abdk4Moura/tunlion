@@ -14,7 +14,7 @@ use crate::DEFAULT_SERVER;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
+const VERSION: &str = env!("TUNLION_BUILD_INFO"); // stamped by build.rs
 
 pub(crate) const EXAMPLES: &str = "\
 COMMANDS
@@ -105,7 +105,7 @@ EXIT CODES
 )]
 pub(crate) struct Cli {
     /// Signaling server (self-hosters: point at your own instance)
-    #[arg(long, global = true, env = "FILAMENT_SERVER", default_value = DEFAULT_SERVER)]
+    #[arg(long, global = true, env = "TUNLION_SERVER", default_value = DEFAULT_SERVER)]
     pub(crate) server: String,
     /// Force TURN relay (testing/privacy; hides your IP from the peer)
     #[arg(long, global = true)]
@@ -122,17 +122,17 @@ pub(crate) struct Cli {
     /// Verbose output: -v shows resilience internals (stalls, repairs,
     /// reconnects, upgrade probes); -vv adds ICE/per-frame trace. The
     /// value-prop lines (route, relay banner) always print. Overridden by
-    /// FILAMENT_LOG=<critical|info|debug|trace>.
+    /// TUNLION_LOG=<critical|info|debug|trace>.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     pub(crate) verbose: u8,
     /// Quiet: print only the must-see lines (route label, relay banner, P1/P5
     /// path changes, fatal errors). Conflicts with -v. Overridden by
-    /// FILAMENT_LOG.
+    /// TUNLION_LOG.
     #[arg(short = 'q', long = "quiet", global = true, conflicts_with = "verbose")]
     pub(crate) quiet: bool,
     /// Never drop into the guided interactive code entry, fail fast instead.
     /// Use in scripts/automation. A non-TTY stdin is ALWAYS non-interactive even
-    /// without this; the env var FILAMENT_NONINTERACTIVE=1 does the same thing.
+    /// without this; the env var TUNLION_NONINTERACTIVE=1 does the same thing.
     #[arg(long, global = true)]
     pub(crate) no_interactive: bool,
     /// Open the guided human flow even when all command arguments were supplied.
@@ -141,7 +141,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true, conflicts_with = "no_interactive")]
     pub(crate) interactive: bool,
     /// Colorize output: auto (default; only at a TTY), always, or never. A flag
-    /// overrides NO_COLOR/TERM. Equivalent to FILAMENT_COLOR.
+    /// overrides NO_COLOR/TERM. Equivalent to TUNLION_COLOR.
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     pub(crate) color: Option<String>,
     /// JSON output (structured, parseable) where a command supports it: init,
@@ -169,7 +169,7 @@ pub(crate) enum Cmd {
         /// Name this device (default: hostname).
         #[arg(long)]
         name: Option<String>,
-        /// Directory where received files land (default: ~/Filament if it exists, else ~/Tunlion).
+        /// Directory where received files land (default: ~/Tunlion).
         #[arg(long)]
         inbox: Option<PathBuf>,
         /// Write the recovery phrase to a new owner-only file for automation.
@@ -191,7 +191,7 @@ pub(crate) enum Cmd {
     /// A receiver that refuses a file it cannot store (out of disk space, a
     /// name its filesystem refuses, no permission) says why, and the send
     /// exits 4; one that neither accepts nor refuses an offer within 60s
-    /// exits 6 (FILAMENT_SEND_STALL_SECS changes the bound, 0 disables it).
+    /// exits 6 (TUNLION_SEND_STALL_SECS changes the bound, 0 disables it).
     /// Every code send can return is listed under EXIT CODES below.
     #[command(next_help_heading = "Share")]
     Send {
@@ -217,7 +217,7 @@ pub(crate) enum Cmd {
         #[arg(long)]
         name: Option<String>,
         /// Seconds to wait for the peer to connect (default 60, or
-        /// FILAMENT_SEND_TIMEOUT; 0 waits without limit). A known device that
+        /// TUNLION_SEND_TIMEOUT; 0 waits without limit). A known device that
         /// shows no presence at all fails sooner, with exit 6 (offline).
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
@@ -229,7 +229,7 @@ pub(crate) enum Cmd {
     ///
     /// In a terminal with no code this opens a guided code entry (or press enter
     /// for the local-network auto room). Scripts are safe by default: a non-TTY
-    /// uses the auto room; under a TTY set FILAMENT_NONINTERACTIVE=1 or pass
+    /// uses the auto room; under a TTY set TUNLION_NONINTERACTIVE=1 or pass
     /// --no-interactive to skip the prompt.
     #[command(next_help_heading = "Share")]
     Receive {
@@ -389,13 +389,13 @@ pub(crate) enum Cmd {
         /// when available, userspace otherwise).
         #[arg(long)]
         userspace: bool,
-        /// Drop directory (default: `tunlion config dir`, else ~/Filament if it exists, else ~/Tunlion)
+        /// Drop directory (default: `tunlion config dir`, else ~/Tunlion)
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Serve a shell to ANY paired (proof-verified) device, with no per-device
         /// `grant`: `tunlion shell <this>` (interactive), `tunlion exec <this> -- cmd`
         /// (one command) and `tunlion shell <this> --ssh` (real ssh). Enables the
-        /// tunnel acceptor too (forward/netcat), so FILAMENT_L2=1 is not needed.
+        /// tunnel acceptor too (forward/netcat), so TUNLION_L2=1 is not needed.
         /// Strangers still can't get in (pairing is required). Without
         /// --shell-user the shell runs as you, so this also needs --i-know.
         /// To allow single devices instead: `tunlion grant <device> shell`.
@@ -408,7 +408,7 @@ pub(crate) enum Cmd {
         /// The shell program to spawn for PTY sessions (overrides platform default).
         /// Can carry args: `--shell-program "bash -l"`, `"pwsh -NoLogo"`.
         /// Persistent: use `tunlion set shell-program "<program>"` for the daemon.
-        /// Env: `FILAMENT_SHELL`.
+        /// Env: `TUNLION_SHELL`.
         #[arg(long, value_name = "PROGRAM")]
         shell_program: Option<String>,
         /// Drop the web-shell / ssh PTY and `exec` commands to this non-root
@@ -518,7 +518,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: Option<IdAction>,
     },
-    /// Raw config escape hatch (key value lines in ~/.config/filament/config).
+    /// Raw config escape hatch (key value lines in ~/.config/tunlion/config).
     /// Prefer `tunlion set`; this is kept for scripts that wrote it directly.
     #[command(hide = true)]
     Config {
@@ -856,7 +856,7 @@ pub(crate) enum Cmd {
     /// Removes the local identity + overlay keys, the paired-device store, the
     /// capability store, pending consent requests, and the managed ssh material
     /// (private key, known_hosts, bootstrap cache), and strips the
-    /// filament-managed blocks it installed in ~/.ssh/authorized_keys. Your own
+    /// tunlion-managed blocks it installed in ~/.ssh/authorized_keys. Your own
     /// ssh keys and any non-tunlion lines in authorized_keys are left untouched.
     /// Stop the daemon first (`tunlion down`); reset refuses while it runs.
     ///

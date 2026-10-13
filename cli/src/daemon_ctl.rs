@@ -201,7 +201,7 @@ pub(crate) async fn handle_mount(
     let dest = if let Some(d) = crate::l2::l3_dest(&info) {
         d // L3 direct: user@peer.mesh, no ProxyCommand
     } else {
-        // L2 fallback: user@filament-peer with ProxyCommand
+        // L2 fallback: user@tunlion-peer with ProxyCommand
         let exe = std::env::current_exe().unwrap();
         let exe = exe.to_string_lossy();
         let mut proxy = format!("{exe} --server {server}");
@@ -445,13 +445,13 @@ fn liveness_forget(n: u64) {
     }
 }
 
-/// How long a warm link has to answer `reach-ping` (FILAMENT_REACH_PING_MS,
+/// How long a warm link has to answer `reach-ping` (TUNLION_REACH_PING_MS,
 /// default 1500 ms) before reach treats it as unconfirmed.
 // Called only by the unix control socket's warm ping (no control socket
 // elsewhere), so other targets see it unused.
 #[allow(dead_code)]
 pub(crate) fn liveness_window() -> Duration {
-    let ms = std::env::var("FILAMENT_REACH_PING_MS")
+    let ms = std::env::var("TUNLION_REACH_PING_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -643,7 +643,7 @@ pub(crate) fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn 
 }
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
-/// is diagnosable (visible at `-v` / FILAMENT_LOG=debug only).
+/// is diagnosable (visible at `-v` / TUNLION_LOG=debug only).
 #[cfg(unix)]
 fn log_warm_miss(conn: &Conn, peer: &str) {
     for (p, l) in conn.links.iter() {

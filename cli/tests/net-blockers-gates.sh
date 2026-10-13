@@ -2,7 +2,7 @@
 # Launch blockers from the final blind acceptance test: nothing on the mesh may
 # hold a client open with no answer, and status says what is really bound.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./net-blockers-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./net-blockers-gates.sh
 #
 # Gates:
 #   S1  after a restart, every port in expose.json that `status --json` calls
@@ -34,10 +34,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8161
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-net-blockers.XXXXXX")"
 DA="$WORK/A"
 BDIR="$WORK/bravo"
@@ -45,7 +45,7 @@ SOCKS_PORT=39180
 
 source "$HERE/lib/fixture.sh"
 cleanup() {
-  env FILAMENT_CONFIG_DIR="$BDIR" timeout 15 "$BIN" down -y >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$BDIR" timeout 15 "$BIN" down -y >/dev/null 2>&1
   fixture_cleanup
   pkill -f "$WORK" 2>/dev/null
   rm -rf "$WORK"
@@ -102,13 +102,13 @@ start_backend
 init_owner "$DA"
 start_acceptor "$DA"
 enroll_delegate bravo --allow transfer,mount
-if ! env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q bravo; then
+if ! env TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q bravo; then
   echo "setup failed: bravo did not enrol, so nothing below would prove anything"
   sed 's/^/    /' "$WORK/bravo-join.log" 2>/dev/null | tail -5
   exit 2
 fi
 
-status_json() { env FILAMENT_CONFIG_DIR="$BDIR" timeout 20 "$BIN" status --json 2>/dev/null; }
+status_json() { env TUNLION_CONFIG_DIR="$BDIR" timeout 20 "$BIN" status --json 2>/dev/null; }
 # $1 = port. Prints true|false|missing for that port's `bound` in status --json.
 bound_of() {
   status_json | "$PYV" -c "
@@ -120,10 +120,10 @@ print(str(e[0].get('bound')).lower() if e else 'missing')
 " "$1"
 }
 bravo_up_detached() {
-  env FILAMENT_CONFIG_DIR="$BDIR" FILAMENT_AUTO_PROXY=0 timeout 40 "$BIN" --server "$SERVER" up --detach --dir "$WORK/bdrop" \
+  env TUNLION_CONFIG_DIR="$BDIR" TUNLION_AUTO_PROXY=0 timeout 40 "$BIN" --server "$SERVER" up --detach --dir "$WORK/bdrop" \
     >"$WORK/bravo-detach.out" 2>&1
   for _ in $(seq 1 30); do
-    env FILAMENT_CONFIG_DIR="$BDIR" timeout 5 "$BIN" status >/dev/null 2>&1 && break
+    env TUNLION_CONFIG_DIR="$BDIR" timeout 5 "$BIN" status >/dev/null 2>&1 && break
     sleep 0.5
   done
   sleep 3
@@ -132,10 +132,10 @@ bravo_up_detached() {
 # ----------------------------------------------------------------- S1 / S2
 say "S1/S2: status reports the exposed ports the daemon actually bound"
 bravo_up_detached
-env FILAMENT_CONFIG_DIR="$BDIR" timeout 20 "$BIN" expose 39555 >"$WORK/expose.out" 2>&1
+env TUNLION_CONFIG_DIR="$BDIR" timeout 20 "$BIN" expose 39555 >"$WORK/expose.out" 2>&1
 sed 's/^/   /' "$WORK/expose.out"
 live=$(bound_of 39555)
-env FILAMENT_CONFIG_DIR="$BDIR" timeout 20 "$BIN" down -y >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$BDIR" timeout 20 "$BIN" down -y >/dev/null 2>&1
 sleep 2
 bravo_up_detached
 after=$(bound_of 39555)
@@ -151,7 +151,7 @@ fi
 # ---------------------------------------------------------------------- L1
 say "L1: logs -f exits when its reader goes away"
 t0=$(date +%s.%N)
-env FILAMENT_CONFIG_DIR="$BDIR" timeout 20 sh -c "'$BIN' logs -f | head -2" >"$WORK/logs.out" 2>&1
+env TUNLION_CONFIG_DIR="$BDIR" timeout 20 sh -c "'$BIN' logs -f | head -2" >"$WORK/logs.out" 2>&1
 rcL=$?
 t1=$(date +%s.%N)
 el=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
@@ -162,7 +162,7 @@ else
   bad "L1: logs -f | head -2 did not exit when head closed (rc=$rcL, ${el}s)"
 fi
 
-env FILAMENT_CONFIG_DIR="$BDIR" timeout 20 "$BIN" down -y >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$BDIR" timeout 20 "$BIN" down -y >/dev/null 2>&1
 sleep 2
 down_state=$(bound_of 39555)
 echo "## with the daemon down: bound=$down_state"
@@ -173,7 +173,7 @@ else
 fi
 
 # --------------------------------------------------------------- SOCKS proxy
-# bravo's daemon in the foreground, L2 OFF first (no FILAMENT_L2): every
+# bravo's daemon in the foreground, L2 OFF first (no TUNLION_L2): every
 # loopback tunnel is refused by policy, and 39090 is not exposed.
 BPID=""
 start_bravo() {  # $1 = on|off (L2)
@@ -182,12 +182,12 @@ start_bravo() {  # $1 = on|off (L2)
     for _ in $(seq 1 20); do kill -0 "$BPID" 2>/dev/null || break; sleep 0.5; done
     kill -9 "$BPID" 2>/dev/null
   fi
-  env FILAMENT_CONFIG_DIR="$BDIR" timeout 15 "$BIN" down -y >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$BDIR" timeout 15 "$BIN" down -y >/dev/null 2>&1
   sleep 2
   if [ "$1" = on ]; then
-    env FILAMENT_CONFIG_DIR="$BDIR" FILAMENT_L2=1 FILAMENT_AUTO_PROXY=0 "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" >"$WORK/up-b-$1.log" 2>&1 &
+    env TUNLION_CONFIG_DIR="$BDIR" TUNLION_L2=1 TUNLION_AUTO_PROXY=0 "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" >"$WORK/up-b-$1.log" 2>&1 &
   else
-    env FILAMENT_CONFIG_DIR="$BDIR" FILAMENT_AUTO_PROXY=0 "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" >"$WORK/up-b-$1.log" 2>&1 &
+    env TUNLION_CONFIG_DIR="$BDIR" TUNLION_AUTO_PROXY=0 "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" >"$WORK/up-b-$1.log" 2>&1 &
   fi
   BPID=$!
   FIX_PIDS+=($BPID)
@@ -197,7 +197,7 @@ start_bravo() {  # $1 = on|off (L2)
 # Wait until alpha's daemon holds a link to bravo (bounded).
 await_link() {
   for _ in $(seq 1 30); do
-    env FILAMENT_CONFIG_DIR="$DA" timeout 15 "$BIN" --server "$SERVER" reach bravo >/dev/null 2>&1 && return 0
+    env TUNLION_CONFIG_DIR="$DA" timeout 15 "$BIN" --server "$SERVER" reach bravo >/dev/null 2>&1 && return 0
     sleep 1
   done
   echo "## alpha never reached bravo"; return 1
@@ -209,7 +209,7 @@ start_bravo off
 # is required by the parser and the proxy then serves every <peer>.mesh. It is
 # the same proxy_serve the daemon's auto-proxy runs, on a port of our own so
 # the two daemons on this runner cannot race for 1080.
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward bravo:39777 --socks --port "$SOCKS_PORT" >"$WORK/proxy.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward bravo:39777 --socks --port "$SOCKS_PORT" >"$WORK/proxy.log" 2>&1 &
 FIX_PIDS+=($!)
 for _ in $(seq 1 20); do grep -qs "SOCKS5 proxy on" "$WORK/proxy.log" && break; sleep 0.5; done
 grep -qs "SOCKS5 proxy on" "$WORK/proxy.log" || { echo "proxy did not start:"; tail -5 "$WORK/proxy.log"; exit 2; }
@@ -229,7 +229,7 @@ else
 fi
 
 say "P6/P7: an EXPOSED port, nothing listening and then something (L2 off: only the overlay carries it)"
-env FILAMENT_CONFIG_DIR="$BDIR" timeout 20 "$BIN" expose 39557 >"$WORK/expose-p6.out" 2>&1
+env TUNLION_CONFIG_DIR="$BDIR" timeout 20 "$BIN" expose 39557 >"$WORK/expose-p6.out" 2>&1
 sed 's/^/   /' "$WORK/expose-p6.out"
 sleep 3
 r=$(socks bravo.mesh 39557); echo "## P6 bravo.mesh:39557 (exposed, nothing listening) -> $r"
@@ -269,7 +269,7 @@ fi
 
 # ------------------------------------------------------------------ forward
 say "F1-F4: a forward to a peer that dies closes its clients"
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward bravo:39777 --lport 39802 >"$WORK/fwd.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward bravo:39777 --lport 39802 >"$WORK/fwd.log" 2>&1 &
 FIX_PIDS+=($!)
 for _ in $(seq 1 24); do grep -qsE 'ready|listening on' "$WORK/fwd.log" && break; sleep 0.5; done
 code=$(timeout 20 curl -s -o /dev/null -w '%{http_code}' -m 15 http://127.0.0.1:39802/ 2>/dev/null)

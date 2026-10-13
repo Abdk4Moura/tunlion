@@ -36,7 +36,7 @@ printf '[{"name":"pylab","secret":"%s"}]\n' "$SECRET" > "$CFG/devices.json"
 
 # 3. real tunlion up (the already-present peer), L2 on so it emits offers
 echo "[run_interop] starting real 'tunlion up' (channel $(${PY} -c "from filament_lab import crypto;print(crypto.channel_of('$SECRET')[:12])" ))"
-FILAMENT_CONFIG_DIR="$CFG" HOME="$CFG" FILAMENT_L2=1 \
+TUNLION_CONFIG_DIR="$CFG" HOME="$CFG" TUNLION_L2=1 \
   "$TUNLION" up --server "$SERVER" --name-as rust-up >/tmp/fil_up.log 2>&1 &
 UP_PID=$!
 sleep 3

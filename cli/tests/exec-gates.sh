@@ -4,7 +4,7 @@
 # construction -- the vector is never joined, split, or re-parsed), stdout and
 # stderr stay separate, exit codes surface, and real byte traffic works.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./exec-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./exec-gates.sh
 #
 # Gates:
 #   A  NEGATIVE no-grant -- acceptor serving, initiator NOT granted: refused,
@@ -50,10 +50,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8104
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-exec-gates.XXXXXX")"
 
 PASS=0; FAIL=0; FAILED=""
@@ -96,11 +96,11 @@ SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
 printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
-A_ENV=(env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA)
 
 start_acceptor() { # [log file name, default up.log]
   local drop="$WORK/Bdrop"; mkdir -p "$drop"
-  env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB \
+  env TUNLION_L2=1 TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB \
     "$BIN" up --dir "$drop" --server "$SERVER" >"$WORK/${1:-up.log}" 2>&1 &
   pids+=($!)
   sleep 3
@@ -123,7 +123,7 @@ else
 fi
 
 # =================================================================== grant ====
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
 # ===================================================================== GATE B ==
@@ -406,7 +406,7 @@ fi
 # ===================================================================== GATE J ==
 # NEGATIVE revoked: same command refused again after revoke.
 say J
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
 OUTJ=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" AFTER 2>"$WORK/J.err" </dev/null)
 rcJ=$?
 echo "## (revoked) rc=$rcJ out='$OUTJ'"
@@ -424,11 +424,11 @@ fi
 # shell grant is revoked underneath it -- the receiver ticker re-asks the
 # gate instead of letting the child run out its clock.
 say K
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantK.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantK.log" 2>&1
 timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 30 2>"$WORK/K.err" </dev/null &
 KPid=$!
 sleep 5
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revokeK.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revokeK.log" 2>&1
 wait "$KPid"
 rcK=$?
 echo "## (revoked mid-session) rc=$rcK"
@@ -450,7 +450,7 @@ fi
 # afterwards (the served-groups record is cleared).
 say Q
 if [ "$PLATFORM" = "unix" ] && [ "$(uname -s)" = "Linux" ]; then
-  env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantQ.log" 2>&1
+  env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantQ.log" 2>&1
   "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 3017 \
     >/dev/null 2>"$WORK/Q1.err" </dev/null &
   Q1Pid=$!
@@ -502,11 +502,11 @@ fi
 # then the forget, then the same exec: refused within seconds, exit 4
 # (denied), naming the identity, with no "tunnel up" claim and nothing run.
 say R
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantR.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantR.log" 2>&1
 OUTR0=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" BEFORE-FORGET 2>"$WORK/R0.err" </dev/null)
 rcR0=$?
 cp "$DB/devices.json" "$WORK/devices.before-forget.json"
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices forget boxA -y >"$WORK/forgetR.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices forget boxA -y >"$WORK/forgetR.log" 2>&1
 rcRF=$?
 sleep 3
 t0=$(date +%s)
@@ -551,10 +551,10 @@ else
   DR="$WORK/Broot"; RHOME="$WORK/Broot-home"; RDROP="$WORK/Broot-drop"
   mkdir -p "$DR" "$RHOME" "$RDROP"
   cp "$DB/devices.json" "$DR/devices.json"
-  "${AS_ROOT[@]}" env HOME="$RHOME" XDG_CONFIG_HOME="$RHOME/.config" FILAMENT_CONFIG_DIR="$DR" \
+  "${AS_ROOT[@]}" env HOME="$RHOME" XDG_CONFIG_HOME="$RHOME/.config" TUNLION_CONFIG_DIR="$DR" \
     "$BIN" grant boxA shell >"$WORK/grantL.log" 2>&1
-  "${AS_ROOT[@]}" env HOME="$RHOME" XDG_CONFIG_HOME="$RHOME/.config" FILAMENT_L2=1 \
-    FILAMENT_CONFIG_DIR="$DR" FILAMENT_NAME=boxB \
+  "${AS_ROOT[@]}" env HOME="$RHOME" XDG_CONFIG_HOME="$RHOME/.config" TUNLION_L2=1 \
+    TUNLION_CONFIG_DIR="$DR" TUNLION_NAME=boxB \
     "$BIN" up --dir "$RDROP" --server "$SERVER" --shell-user nobody >"$WORK/upL.log" 2>&1 &
   sleep 4
   OUTL=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- id -un 2>"$WORK/L.err" </dev/null)

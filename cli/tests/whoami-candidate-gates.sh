@@ -3,7 +3,7 @@
 # about US that goes straight into the advertised candidate set, unchecked.
 # Standalone, hermetic, fixture ports 8709 (backend) + 8710 (lying proxy) ONLY.
 #
-#   FILAMENT_BIN=/path/to/filament-something ./whoami-candidate-gates.sh
+#   TUNLION_BIN=/path/to/filament-something ./whoami-candidate-gates.sh
 #
 # WHAT THIS GATE CLAIMS, AND WHAT IT DOES NOT.
 #
@@ -25,7 +25,7 @@
 # the trustworthy control for the consequence, and is deliberately deferred.
 #
 # WHY THERE IS NO SECOND OPINION TO CATCH A WRONG ANSWER. rung-2's STUN srflx is
-# gated on FILAMENT_HOLEPUNCH, default OFF (holepunch.rs). The WebRTC path's STUN
+# gated on TUNLION_HOLEPUNCH, default OFF (holepunch.rs). The WebRTC path's STUN
 # list is whatever `{server}/api/config` returns (net.rs `fetch_config`), so the
 # signaling server names its own contradictors. Two sources chosen by one party
 # are one source.
@@ -33,7 +33,7 @@
 # INJECTION POINT. The lie is told by the SERVER, over the wire, at the real
 # trust boundary: a proxy in front of the fixture backend answers /api/whoami
 # itself and byte-splices everything else (including the socket.io websocket).
-# Deliberately NOT FILAMENT_PUBLIC_IP, which short-circuits `public_ip` before
+# Deliberately NOT TUNLION_PUBLIC_IP, which short-circuits `public_ip` before
 # the fetch and would bypass the very request under test.
 #
 # OBSERVABLE. tcpdump, not a log line. Nothing in the product prints the
@@ -63,12 +63,12 @@
 #                      carries the real message.
 #         C-attribution  a run whose direct path cannot win DIALS the server-
 #                      asserted address for REAL and falls back, naming exactly
-#                      that address. The dial is real: FILAMENT_DIRECT_ONLY_PUBLIC
+#                      that address. The dial is real: TUNLION_DIRECT_ONLY_PUBLIC
 #                      strips the candidate set down to the adopted whoami address
 #                      (published by the injector as TEST-NET, which can never
 #                      answer), and the wire observable proves packets actually
 #                      went there - this is NOT a simulated stand-in. The old
-#                      FILAMENT_DIRECT_TEST_BLOCK substitute is retired from this
+#                      TUNLION_DIRECT_TEST_BLOCK substitute is retired from this
 #                      role (it skips the dial, so its "never answered" was false
 #                      in its own world); it now serves the negative control below.
 #         C-negative   a fallback that happens for an UNRELATED reason with a
@@ -83,7 +83,7 @@
 #                      address itself was dialed.
 #         C-mismatch   the tighter negative: a dial DID happen, but NOT to the
 #                      claimed server-asserted address, so the fallback must
-#                      still print NOTHING. FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH
+#                      still print NOTHING. TUNLION_DIRECT_SERVER_PUBLIC_MISMATCH
 #                      makes the offer tag a server_public label ("8.8.8.8:53")
 #                      that is not in its own addrs - the exact lying-label shape
 #                      a bad or buggy peer can produce. The peer races the LAN/
@@ -120,12 +120,12 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8709
 SERVER="http://127.0.0.1:$PORT"
 PROXY_PORT=8710
 PROXY="http://127.0.0.1:$PROXY_PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-whoami.XXXXXX")"
 DA="$WORK/owner"
 
@@ -141,7 +141,7 @@ echo "## work: $WORK"
 # control.sock is created and every warm-link lookup silently reads as "no link".
 case "$(basename "$BIN")" in
   *tunlion*) ;;
-  *) echo "FILAMENT_BIN basename must contain 'tunlion' (see lib/fixture.sh); got '$(basename "$BIN")'"; exit 2 ;;
+  *) echo "TUNLION_BIN basename must contain 'tunlion' (see lib/fixture.sh); got '$(basename "$BIN")'"; exit 2 ;;
 esac
 command -v tcpdump >/dev/null || { echo "tcpdump is required for the wire observable"; exit 2; }
 # (No `claim_port` helper exists in lib/fixture.sh - the original call here was a
@@ -235,14 +235,14 @@ grep -qi "^X-Tunlion-Gate-Injector: whoami-237" "$WORK/whoami.hdr" || {
 init_owner "$DA"
 mkdir -p "$WORK/Adrop" "$WORK/Bdrop"
 # The owner's daemon must be UP to answer the enrollment, or join just times out.
-env FILAMENT_CONFIG_DIR="$DA" FILAMENT_L2=1 "$BIN" --server "$PROXY" up --dir "$WORK/Adrop" \
+env TUNLION_CONFIG_DIR="$DA" TUNLION_L2=1 "$BIN" --server "$PROXY" up --dir "$WORK/Adrop" \
     >"$WORK/enroll-alpha.log" 2>&1 &
 ENROLL_PID=$!; FIX_PIDS+=("$ENROLL_PID")
 sleep 3
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$PROXY" add --for bravo --allow mount \
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$PROXY" add --for bravo --allow mount \
     --out "$WORK/inv.txt" --yes >/dev/null 2>&1
 DB="$WORK/bravo"; mkdir -p "$DB"
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$PROXY" join --invite-file "$WORK/inv.txt" \
+env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$PROXY" join --invite-file "$WORK/inv.txt" \
     --name bravo --no-interactive >"$WORK/join.log" 2>&1
 kill "$ENROLL_PID" 2>/dev/null; sleep 2
 grep -q "joined as" "$WORK/join.log" || {
@@ -260,23 +260,23 @@ run_arm() {
   tcpdump -n -l -i any "udp and host $LIE_IP" >"$WORK/$label.wire" 2>"$WORK/$label.wire.err" &
   local tp=$!; FIX_PIDS+=("$tp")
   sleep 2
-  # FILAMENT_UID is REQUIRED: without it `is_self_uid` sees two processes of one
+  # TUNLION_UID is REQUIRED: without it `is_self_uid` sees two processes of one
   # install and takes the tcp-localhost shortcut, which gathers no public
   # candidate at all - the path under test would be skipped entirely.
-  env FILAMENT_CONFIG_DIR="$DA" FILAMENT_UID="alpha$$" FILAMENT_L2=1 ${ARM_EXTRA:-} \
+  env TUNLION_CONFIG_DIR="$DA" TUNLION_UID="alpha$$" TUNLION_L2=1 ${ARM_EXTRA:-} \
       "$BIN" ${ARM_FLAGS:-} --server "$PROXY" up --dir "$WORK/Adrop" >"$WORK/$label-alpha.log" 2>&1 &
   local ap=$!; FIX_PIDS+=("$ap")
-  env FILAMENT_CONFIG_DIR="$DB" FILAMENT_UID="bravo$$" FILAMENT_L2=1 ${ARM_EXTRA:-} \
+  env TUNLION_CONFIG_DIR="$DB" TUNLION_UID="bravo$$" TUNLION_L2=1 ${ARM_EXTRA:-} \
       "$BIN" ${ARM_FLAGS:-} --server "$PROXY" up --dir "$WORK/Bdrop" >"$WORK/$label-bravo.log" 2>&1 &
   local bp=$!; FIX_PIDS+=("$bp")
   sleep 18
   # Stop the wire capture BEFORE the `reach` client runs: reach is a fresh
   # process WITHOUT the arm's fault knobs (it would, e.g., dial the lie address
-  # under FILAMENT_DIRECT_TEST_BLOCK and pollute the count). The wire must
+  # under TUNLION_DIRECT_TEST_BLOCK and pollute the count). The wire must
   # show the two daemons' behavior and nothing else.
   kill "$tp" 2>/dev/null
   sleep 1
-  env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$PROXY" reach alpha --json \
+  env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$PROXY" reach alpha --json \
       >"$WORK/$label-reach.json" 2>"$WORK/$label-reach.err"
   kill "$ap" "$bp" 2>/dev/null
   sleep 2
@@ -359,7 +359,7 @@ else
 fi
 ARM_EXTRA=""
 
-# C-attribution (POSITIVE, a REAL dial): FILAMENT_DIRECT_ONLY_PUBLIC strips every
+# C-attribution (POSITIVE, a REAL dial): TUNLION_DIRECT_ONLY_PUBLIC strips every
 # candidate but the server-asserted one, which the injector publishes as
 # TEST-NET (203.0.113.7) - routable-looking, never answerable. Both sides'
 # races therefore DIAL 203.0.113.7 for real (UDP leaves the box, tcpdump proves
@@ -367,7 +367,7 @@ ARM_EXTRA=""
 # and never answered. This is the moment-of-symptom causal statement chief-ux
 # asked for: one reach, a candidate that cannot work, and an assertion on the
 # fallback line.
-ARM_EXTRA="FILAMENT_DIRECT_ONLY_PUBLIC=1"
+ARM_EXTRA="TUNLION_DIRECT_ONLY_PUBLIC=1"
 run_arm "$LIE_IP" attrib
 PA=$(pkts_of attrib)
 ATTRIB=$(cat "$WORK/attrib-alpha.log" "$WORK/attrib-bravo.log" 2>/dev/null \
@@ -389,14 +389,14 @@ ARM_EXTRA=""
 
 # C-negative (the asymmetric control): a fallback that happens for an UNRELATED
 # reason with a server-asserted candidate PRESENT must print NO attribution.
-# FILAMENT_DIRECT_TEST_BLOCK short-circuits the race BEFORE it dials anything
+# TUNLION_DIRECT_TEST_BLOCK short-circuits the race BEFORE it dials anything
 # (the daemons still adopt and advertise the server-asserted address and still
 # fall back when the budget dies). Run with -v so the fallback itself is
 # evidenced ("DIRECT-FALLBACK" is a debug line) - yet, because not a single dial
 # happened, the code has not established that the server-asserted address
 # failed, and pinning "never answered" on it would be a lie. The gate proves
 # the message is conditioned on the DIAL, not on the candidate's presence.
-ARM_EXTRA="FILAMENT_DIRECT_TEST_BLOCK=1"
+ARM_EXTRA="TUNLION_DIRECT_TEST_BLOCK=1"
 ARM_FLAGS="-v"
 run_arm "$LIE_IP" testblocked
 PN=$(pkts_of testblocked)
@@ -416,7 +416,7 @@ ARM_EXTRA=""
 ARM_FLAGS=""
 
 # C-mismatch (the tighter negative): a dial DID happen, but not to the claimed
-# server-asserted address. FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH makes both
+# server-asserted address. TUNLION_DIRECT_SERVER_PUBLIC_MISMATCH makes both
 # daemons advertise addrs=[203.0.113.7:port] (only_public) yet label
 # server_public="8.8.8.8:53" - the lying-label shape a bad peer can produce.
 # The races DIAL 203.0.113.7 for real (packets on the wire), fail for real, and
@@ -424,7 +424,7 @@ ARM_FLAGS=""
 # the fallback must print ZERO attributions. Run with -v so the fallback itself
 # is evidenced. This arm FAILS on the round-2 code (which set the flag for any
 # dial) and passes only when the flag is bound to the named address.
-ARM_EXTRA="FILAMENT_DIRECT_ONLY_PUBLIC=1 FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH=1"
+ARM_EXTRA="TUNLION_DIRECT_ONLY_PUBLIC=1 TUNLION_DIRECT_SERVER_PUBLIC_MISMATCH=1"
 ARM_FLAGS="-v"
 run_arm "$LIE_IP" mismatch
 PM=$(pkts_of mismatch)

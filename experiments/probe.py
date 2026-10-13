@@ -15,7 +15,7 @@ The pair channel is sha256("filament-pair:"+secret) (= the CLI's channel_of).
 
 USAGE
   # passive watch: does a LATE subscriber see an already-present peer?
-  #   (run `FILAMENT_L2=1 tunlion up` first, then:)
+  #   (run `TUNLION_L2=1 tunlion up` first, then:)
   probe.py --secret <hex> watch --seconds 15
 
   # interactive step-in REPL:

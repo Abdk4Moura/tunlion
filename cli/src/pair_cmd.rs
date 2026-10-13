@@ -85,7 +85,7 @@ fn malformed_entry_banner(arg: &str) {
     ui::say(&ui::paint(
         ui::Tone::Dim,
         &format!(
-            "couldn't parse '{arg}', opening guided entry · set FILAMENT_NONINTERACTIVE=1 to fail fast in scripts"
+            "couldn't parse '{arg}', opening guided entry · set TUNLION_NONINTERACTIVE=1 to fail fast in scripts"
         ),
     ));
 }
@@ -457,9 +457,9 @@ pub(crate) async fn pair_cmd(
     // never connect, fail fast instead of orphaning in the room for the full
     // 600s TTL (the D3/D5 divergence the monitor kept catching). 60s is generous
     // (covers a slow cross-NAT WebRTC with its 3×15s establishment retries);
-    // FILAMENT_PAIR_GRACE_SECS shortens it for gate 17b.
+    // TUNLION_PAIR_GRACE_SECS shortens it for gate 17b.
     let ceremony_budget = Duration::from_secs(
-        std::env::var("FILAMENT_PAIR_GRACE_SECS")
+        std::env::var("TUNLION_PAIR_GRACE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),
@@ -749,7 +749,7 @@ pub(crate) async fn pair_cmd(
         // 1) Once we know the peer's signaling sid, send our SPAKE2 element over
         //    the opaque `signal` relay (the server cannot read it).
         if let Some(pid) = pake_peer.clone() {
-            // gate 17b (FILAMENT_TEST_PAIR_STALL): never send our SPAKE2 element,
+            // gate 17b (TUNLION_TEST_PAIR_STALL): never send our SPAKE2 element,
             // so the exchange can't complete on either side and the ceremony's
             // fail-fast `ceremony_deadline` fires, proving the no-10-min-orphan
             // guard. Test-only: `stall` is set solely by that env var.

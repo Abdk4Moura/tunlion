@@ -63,7 +63,7 @@ jobs:
 
       - name: pake-ux
         env:
-          FILAMENT_TEST_VENV: python3
+          TUNLION_TEST_VENV: python3
         run: node frontend/tests/pake-ux.spec.cjs
 
       # Screenshots are the evidence a browser actually rendered, rather than the

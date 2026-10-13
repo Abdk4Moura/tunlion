@@ -163,7 +163,7 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
   // Strangers/unknown peers keep their announced name.
   const displayName = peer.known || peer.verified || peer.name
   // SHELL badge: this device ADVERTISED a terminal (peer.shell, from the CLI's
-  // `caps` message: `up --shell` / FILAMENT_L2). Pure presentation; it makes
+  // `caps` message: `up --shell` / TUNLION_L2). Pure presentation; it makes
   // "this device is a machine" visible at rest. The actual Open-terminal action
   // lives in the DeviceSheet, gated server-side on top of this hint.
   const isMachine = !!peer.shell

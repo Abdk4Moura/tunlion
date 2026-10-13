@@ -12,7 +12,7 @@ macro_rules! dlog {
 // doc proposes Noise-over-TCP; we use QUIC instead: TLS encryption + multiplexed
 // streams + connection migration for free).
 //
-// THE WHOLE PATH IS GATED behind `FILAMENT_DIRECT=1` (see `direct_enabled`).
+// THE WHOLE PATH IS GATED behind `TUNLION_DIRECT=1` (see `direct_enabled`).
 // Flag OFF ⇒ none of this code runs and the shipped WebRTC path is untouched.
 //
 // It is purely ADDITIVE: `DirectTransport` is a second `impl Transport`, so the
@@ -49,25 +49,25 @@ use crate::net::Transport;
 /// Opt-in gate. The ENTIRE direct path is dead unless this is set; default
 /// behaviour (WebRTC) is byte-for-byte unchanged. CHECKPOINT before promoting.
 ///
-/// Item 3: `FILAMENT_L2=1` ALSO implies direct. The L2/ssh use-case needs
+/// Item 3: `TUNLION_L2=1` ALSO implies direct. The L2/ssh use-case needs
 /// reliable CLI<->CLI and WebRTC is too flaky cross-machine (it gets "stuck
 /// while connecting" even over TURN), while direct-QUIC to a reachable peer is
-/// rock-solid. A plain `up`/`send` WITHOUT FILAMENT_L2 keeps the WebRTC default
+/// rock-solid. A plain `up`/`send` WITHOUT TUNLION_L2 keeps the WebRTC default
 /// byte-for-byte unchanged, the file-transfer hard rule.
 pub fn direct_enabled() -> bool {
-    // Default ON. Opt out with FILAMENT_DIRECT=0.
-    std::env::var("FILAMENT_DIRECT").map(|v| v != "0").unwrap_or(true)
-        || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false)
+    // Default ON. Opt out with TUNLION_DIRECT=0.
+    std::env::var("TUNLION_DIRECT").map(|v| v != "0").unwrap_or(true)
+        || std::env::var("TUNLION_L2").map(|v| v == "1").unwrap_or(false)
 }
 
 /// Test-only: force the direct race to fail (simulate a blocked direct path)
 /// so the fallback gate can assert WebRTC still completes WITH the flag ON.
 /// Not a product knob, only the fallback gate sets it.
 fn test_block() -> bool {
-    std::env::var("FILAMENT_DIRECT_TEST_BLOCK").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_DIRECT_TEST_BLOCK").map(|v| v == "1").unwrap_or(false)
 }
 
-/// Bug 2 PROOF hook (test-only): `FILAMENT_DIRECT_TEST_DIE_AT=<bytes>` forces
+/// Bug 2 PROOF hook (test-only): `TUNLION_DIRECT_TEST_DIE_AT=<bytes>` forces
 /// the FIRST established direct transport's QUIC connection to DIE (structurally
 /// error, dead=true) after N cumulative bytes of file data have been written
 /// across all send_frame calls. One-shot via process-global latch: only the
@@ -77,13 +77,13 @@ static DIED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 static TOTAL_DIRECT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn die_after_bytes() -> Option<u64> {
-    std::env::var("FILAMENT_DIRECT_TEST_DIE_AT")
+    std::env::var("TUNLION_DIRECT_TEST_DIE_AT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
 }
 
-/// P0 stall-detector PROOF hook (test-only): `FILAMENT_TEST_FREEZE_AFTER_BYTES=N`
+/// P0 stall-detector PROOF hook (test-only): `TUNLION_TEST_FREEZE_AFTER_BYTES=N`
 /// makes the FIRST direct transport's data path go silently dark after it has
 /// written ~N bytes of *file data*, `send_frame` parks forever while the QUIC
 /// connection stays UP and CONTROL frames keep flowing. That is the exact
@@ -98,13 +98,13 @@ fn die_after_bytes() -> Option<u64> {
 /// under `--features test-hooks`, stripped from default/release builds.
 #[cfg(feature = "test-hooks")]
 fn freeze_after_bytes() -> Option<u64> {
-    std::env::var("FILAMENT_TEST_FREEZE_AFTER_BYTES")
+    std::env::var("TUNLION_TEST_FREEZE_AFTER_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
 }
 
-/// P1 relay-fallback PROOF hook (test-only): `FILAMENT_TEST_FREEZE_PERSIST=1`
+/// P1 relay-fallback PROOF hook (test-only): `TUNLION_TEST_FREEZE_PERSIST=1`
 /// makes the data-path freeze PERSISTENT instead of one-shot, EVERY fresh direct
 /// transport (including the correction ladder's rung-c re-dials) freezes after the
 /// byte threshold. So the direct/in-place-repair ladder can never recover; it
@@ -115,11 +115,11 @@ fn freeze_after_bytes() -> Option<u64> {
 /// `--features test-hooks`, stripped from default/release builds.
 #[cfg(feature = "test-hooks")]
 fn freeze_persist() -> bool {
-    std::env::var("FILAMENT_TEST_FREEZE_PERSIST").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_TEST_FREEZE_PERSIST").map(|v| v == "1").unwrap_or(false)
 }
 
 /// P5 (GAP-6) relay->direct UPGRADE PROOF hook (test-only):
-/// `FILAMENT_TEST_DIRECT_UNBLOCK_MS=N` LIFTS the persistent direct freeze for any
+/// `TUNLION_TEST_DIRECT_UNBLOCK_MS=N` LIFTS the persistent direct freeze for any
 /// transport born after N ms of process uptime. So the timeline is: early direct
 /// transports freeze (the peer falls to relay, rung d), then, once the prober
 /// dials a FRESH direct standby after the unblock moment, that late transport is
@@ -128,13 +128,13 @@ fn freeze_persist() -> bool {
 /// Compiled in ONLY under `--features test-hooks`, stripped from release.
 #[cfg(feature = "test-hooks")]
 fn direct_unblock_after_ms() -> Option<u64> {
-    std::env::var("FILAMENT_TEST_DIRECT_UNBLOCK_MS")
+    std::env::var("TUNLION_TEST_DIRECT_UNBLOCK_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
 }
 
-/// P5 (GAP-6) NO-FLAP PROOF hook (test-only): `FILAMENT_TEST_DIRECT_FLAKY=1`
+/// P5 (GAP-6) NO-FLAP PROOF hook (test-only): `TUNLION_TEST_DIRECT_FLAKY=1`
 /// makes a post-unblock direct standby CONNECT and move a little data, then
 /// RE-FREEZE almost immediately, modelling a flaky direct path that comes up but
 /// won't hold. The verify-before-upgrade guard must catch this and DISCARD the
@@ -144,7 +144,7 @@ fn direct_unblock_after_ms() -> Option<u64> {
 /// `--features test-hooks`, stripped from release.
 #[cfg(feature = "test-hooks")]
 fn direct_flaky_upgrade() -> bool {
-    std::env::var("FILAMENT_TEST_DIRECT_FLAKY").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_TEST_DIRECT_FLAKY").map(|v| v == "1").unwrap_or(false)
 }
 
 /// P5 (GAP-6): tiny byte threshold after which a FLAKY post-unblock standby
@@ -443,7 +443,7 @@ pub fn local_ip_snapshot() -> Vec<String> {
     v
 }
 
-/// Public IP for cross-NAT reachability: `FILAMENT_PUBLIC_IP` override wins,
+/// Public IP for cross-NAT reachability: `TUNLION_PUBLIC_IP` override wins,
 /// else a one-line `GET /api/whoami` echo of CF-Connecting-IP (the droplet is
 /// behind Cloudflare; the backend reads that header). Best-effort, failure
 /// just means we advertise no public candidate.
@@ -490,7 +490,7 @@ fn pubip_fresh(cached_server: &str, age: std::time::Duration, want_server: &str,
 }
 
 async fn public_ip(server: &str) -> Option<IpAddr> {
-    if let Ok(v) = std::env::var("FILAMENT_PUBLIC_IP") {
+    if let Ok(v) = std::env::var("TUNLION_PUBLIC_IP") {
         if let Ok(ip) = v.trim().parse::<IpAddr>() {
             return Some(ip);
         }
@@ -545,7 +545,7 @@ fn cand_str(ip: IpAddr, port: u16) -> String {
 /// catch. This knob models that NAT class so the cone gate can exercise rung-2 in
 /// isolation. NOT a product knob, only the hole-punch gate sets it.
 fn suppress_public() -> bool {
-    std::env::var("FILAMENT_DIRECT_NO_PUBLIC").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_DIRECT_NO_PUBLIC").map(|v| v == "1").unwrap_or(false)
 }
 
 /// Test-only: advertise ONLY the server-asserted (`whoami`) public candidate.
@@ -556,7 +556,7 @@ fn suppress_public() -> bool {
 /// that was actually dialed on the wire - not a simulated stand-in. NOT a
 /// product knob, only the whoami-candidate gate sets it.
 fn only_public() -> bool {
-    std::env::var("FILAMENT_DIRECT_ONLY_PUBLIC").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_DIRECT_ONLY_PUBLIC").map(|v| v == "1").unwrap_or(false)
 }
 
 /// Test-only: pin candidates to loopback (`127.0.0.1`). A multi-homed host (a
@@ -570,7 +570,7 @@ fn only_public() -> bool {
 /// advertises the real candidate set.
 #[cfg(feature = "test-hooks")]
 fn loopback_only() -> bool {
-    std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false)
 }
 #[cfg(not(feature = "test-hooks"))]
 #[inline]
@@ -743,10 +743,10 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     tc.receive_window(quinn::VarInt::from_u32(33_554_432));
     tc.send_window(16_777_216_u64);
     // Congestion control: BBR by default (tolerates non-congestion loss).
-    // CUBIC can be selected via FILAMENT_CUBIC=1 — it responds more
+    // CUBIC can be selected via TUNLION_CUBIC=1 — it responds more
     // aggressively to policer loss (rate-limit drops), which can hold closer
     // to the link ceiling on policed paths (e.g. DO 2 Gbps VM cap).
-    if std::env::var("FILAMENT_CUBIC").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("TUNLION_CUBIC").map(|v| v == "1").unwrap_or(false) {
         use quinn_proto::congestion::CubicConfig;
         tc.congestion_controller_factory(Arc::new(CubicConfig::default()));
     } else {
@@ -1024,7 +1024,7 @@ pub struct DirectTransport {
     #[cfg(feature = "test-hooks")]
     frozen: std::sync::atomic::AtomicBool,
     /// P5 (GAP-6) PROOF hook: process-uptime (ms) at which THIS transport was
-    /// born. The relay->direct upgrade gate uses `FILAMENT_TEST_DIRECT_UNBLOCK_MS`
+    /// born. The relay->direct upgrade gate uses `TUNLION_TEST_DIRECT_UNBLOCK_MS`
     /// to LIFT the persistent freeze for transports born AFTER that moment, so the
     /// peer first falls to relay (early transports freeze) and then the prober's
     /// DIRECT standby (a late transport) actually carries data, proving the
@@ -1061,7 +1061,7 @@ impl DirectTransport {
         hdr[0] = kind;
         hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
         // --- TRACE ---
-        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
         let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
         let mut s = self.send.lock().await;
         let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
@@ -1198,7 +1198,7 @@ impl Transport for DirectTransport {
         // --- PROD PATH: scatter-gather without intermediate Vec copy ---
         // Previously this was behind a test-hook guard (dead code in prod), causing
         // an extra 1 MiB alloc+memcpy per chunk. Now we write directly.
-        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
         let t_total_start = if trace { Some(std::time::Instant::now()) } else { None };
         let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
         let mut s = self.send.lock().await;
@@ -1477,7 +1477,7 @@ fn spawn_reader(
 ) {
     tokio::spawn(async move {
         let mut frames: u64 = 0;
-        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
         let mut last_chunk_time = if trace { Some(std::time::Instant::now()) } else { None };
         let mut chunk_counter: u64 = 0;
         loop {

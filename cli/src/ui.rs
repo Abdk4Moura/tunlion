@@ -35,13 +35,13 @@ pub enum Level {
 static VERBOSITY: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
 /// Resolve and install the global verbosity ONCE, at startup. Precedence:
-///   1. `FILAMENT_LOG=<critical|info|debug|trace>` env, OVERRIDES the flags.
+///   1. `TUNLION_LOG=<critical|info|debug|trace>` env, OVERRIDES the flags.
 ///   2. otherwise the clap flags: `-q/--quiet` -> critical; repeated `-v` raises
 ///      info -> debug -> trace (count saturates at trace).
 ///   3. persistent `verbosity` setting (e.g. `tunlion set verbosity debug`).
 /// Call this from `main` right after parsing, before any worker spawns.
 pub fn init_verbosity(verbose: u8, quiet: bool) {
-    let level = if let Ok(s) = std::env::var("FILAMENT_LOG") {
+    let level = if let Ok(s) = std::env::var("TUNLION_LOG") {
         match s.trim().to_ascii_lowercase().as_str() {
             "critical" | "crit" | "quiet" | "q" => Level::Critical,
             "info" => Level::Info,
@@ -107,7 +107,7 @@ pub fn caps() -> &'static Caps {
     C.get_or_init(|| {
         let tty = std::io::stderr().is_terminal();
         let term = std::env::var("TERM").unwrap_or_default();
-        let color = match std::env::var("FILAMENT_COLOR").as_deref() {
+        let color = match std::env::var("TUNLION_COLOR").as_deref() {
             Ok("always") => true,
             Ok("never") => false,
             _ => tty && std::env::var_os("NO_COLOR").is_none() && term != "dumb",
@@ -321,9 +321,9 @@ pub fn paint(tone: Tone, s: &str) -> String {
 /// Color decision for STDOUT specifically (the `set`/`get` readout surface).
 /// `caps()` is stderr-scoped; stdout must be judged on its OWN tty-ness so that
 /// piped output never carries ANSI (clig.dev: humans first, machines second).
-/// Same env contract as `caps()`: NO_COLOR, TERM=dumb, FILAMENT_COLOR=never|always.
+/// Same env contract as `caps()`: NO_COLOR, TERM=dumb, TUNLION_COLOR=never|always.
 pub fn stdout_color() -> bool {
-    match std::env::var("FILAMENT_COLOR").as_deref() {
+    match std::env::var("TUNLION_COLOR").as_deref() {
         Ok("never") => return false,
         Ok("always") => return true,
         _ => {}
@@ -653,7 +653,7 @@ pub fn debug(line: &str) {
     }
 }
 
-/// TRACE level (`-vv` / `FILAMENT_LOG=trace`): ICE candidates, per-frame,
+/// TRACE level (`-vv` / `TUNLION_LOG=trace`): ICE candidates, per-frame,
 /// signaling / direct-offer detail. No-op below trace.
 pub fn trace(line: &str) {
     if enabled(Level::Trace) {

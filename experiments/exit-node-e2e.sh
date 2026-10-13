@@ -27,11 +27,11 @@
 # also the realistic shape: a remote box fronts a remote network, the owner's
 # machine consumes it.
 #
-# WHY NAMESPACES. l3::ifname() is a hardcoded const ("filament0"), so a second
+# WHY NAMESPACES. l3::ifname() is a hardcoded const ("tunlion0"), so a second
 # daemon on a host that already runs one cannot get a kernel TUN. It silently
 # degrades to the USERSPACE overlay, which installs no kernel routes, and subnet
 # routing then fails for a reason unrelated to subnet routing. A netns gives each
-# test daemon its own filament0 and leaves both machines' real daemons untouched.
+# test daemon its own tunlion0 and leaves both machines' real daemons untouched.
 #
 # NEGATIVE CONTROL FIRST, always: the receiver must FAIL to reach the LAN before
 # the grant exists and succeed after. A run that only checks success cannot tell
@@ -41,7 +41,7 @@ set -uo pipefail
 # PINNED OUT OF THE SHARED CARGO_TARGET_DIR: a concurrent build in another
 # checkout has silently replaced a rig binary mid-run before, which makes every
 # number after it a measurement of something else.
-BIN=${FILAMENT_BIN:-/tmp/sr-bin/tunlion}
+BIN=${TUNLION_BIN:-/tmp/sr-bin/tunlion}
 WANT_SHA=${WANT_SHA:-}
 PEER=${PEER:-interserver-0x0}
 LOCAL_BIN=${LOCAL_BIN:-$HOME/.local/bin/tunlion}   # drives the remote PTY
@@ -65,12 +65,12 @@ rsh() {
         | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b\]3008;[^\\]*\\//g; s/\r//g')
   printf '%s\n' "$out" | awk '/__B__/{f=1;next} /__E__/{f=0} f' | grep -vE '^\s*$'
 }
-# NEVER `export` FILAMENT_CONFIG_DIR: rsh drives the REAL local tunlion, the
+# NEVER `export` TUNLION_CONFIG_DIR: rsh drives the REAL local tunlion, the
 # only thing that can reach the peer at all. Pointing it at the throwaway config
 # breaks every remote step in a way that looks like a network fault.
-own() { ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" "$BIN" "$@"; }
+own() { ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" "$BIN" "$@"; }
 
-# Kill test daemons BY EXECUTABLE. FILAMENT_CONFIG_DIR is an env var and never
+# Kill test daemons BY EXECUTABLE. TUNLION_CONFIG_DIR is an env var and never
 # appears in /proc/<pid>/cmdline, so matching on the config dir killed nothing
 # and every aborted run leaked a live daemon; three had piled up before a
 # "Text file busy" on rebuild gave it away. Matching the exe path also cannot
@@ -109,7 +109,7 @@ rm -rf "$W"; mkdir -p "$W/rtr"
 say "binary: $("$BIN" --version)  sha ${GOT_SHA:0:16}"
 
 
-say "1. receiver namespace (owner side, its own filament0)"
+say "1. receiver namespace (owner side, its own tunlion0)"
 sysctl -qw net.ipv4.ip_forward=1
 ip netns add srr
 ip link add srr-h type veth peer name srr-n && ip link set srr-n netns srr
@@ -178,10 +178,10 @@ say "4. owner identity + receiver daemon"
 own init --yes --name "$MYNAME" --recovery-file "$W/rec.txt" 2>&1 | tail -1
 own id >/dev/null 2>&1 || { echo "SETUP: no owner identity"; exit 2; }
 own set accept-routes true 2>&1 | tail -1
-ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" FILAMENT_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
+ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" TUNLION_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
 for i in $(seq 1 45); do grep -q "L3 overlay" "$W/rtr.log" 2>/dev/null && break; sleep 2; done
 grep -q "userspace" "$W/rtr.log" 2>/dev/null && { echo "SETUP: userspace overlay installs no kernel routes"; exit 2; }
-ok "receiver up with a kernel filament0"
+ok "receiver up with a kernel tunlion0"
 
 say "5. invite the exit node, with route in the ceiling"
 rm -f "$W/inv.txt"
@@ -189,7 +189,7 @@ own add --for "$PEER" --allow transfer,mount,route --out "$W/inv.txt" --yes 2>&1
 [ -s "$W/inv.txt" ] || { echo "SETUP: no invitation"; exit 2; }
 INV=$(cat "$W/inv.txt")
 rsh "umask 077; printf '%s' '$INV' > $RDIR/inv.txt; chmod 600 $RDIR/inv.txt" 90 >/dev/null
-rsh "setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN join $RDIR/inv.txt --yes' >$RDIR/join.log 2>&1 & echo started" 90 >/dev/null
+rsh "setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN join $RDIR/inv.txt --yes' >$RDIR/join.log 2>&1 & echo started" 90 >/dev/null
 J=0
 for i in $(seq 1 25); do
   J=$(rsh "grep -c 'joined as' $RDIR/join.log 2>/dev/null || echo 0" 60 | tail -1)
@@ -198,11 +198,11 @@ done
 [ "${J:-0}" != "0" ] && ok "exit node joined the fleet" || { bad "never joined"; exit 1; }
 
 say "6. the exit node advertises a default route"
-rsh "ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN set advertise-routes '$PREFIX' 2>&1 | tail -1" 90
-rsh "setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN up' >$RDIR/up.log 2>&1 & echo up" 90 >/dev/null
+rsh "ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN set advertise-routes '$PREFIX' 2>&1 | tail -1" 90
+rsh "setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN up' >$RDIR/up.log 2>&1 & echo up" 90 >/dev/null
 sleep 30
 kill_local; sleep 3; : > "$W/rtr.log"
-ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" FILAMENT_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
+ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" TUNLION_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
 for i in $(seq 1 45); do grep -q "L3 overlay" "$W/rtr.log" 2>/dev/null && break; sleep 2; done
 sleep 50
 
@@ -232,8 +232,8 @@ else
 fi
 
 say "8. withdrawing it must restore the ordinary path"
-rsh "ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN set advertise-routes '' 2>&1 | tail -1" 90
-rsh "$KILL_REMOTE; sleep 2; setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN up' >>$RDIR/up.log 2>&1 & echo up" 90 >/dev/null
+rsh "ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN set advertise-routes '' 2>&1 | tail -1" 90
+rsh "$KILL_REMOTE; sleep 2; setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN up' >>$RDIR/up.log 2>&1 & echo up" 90 >/dev/null
 sleep 60
 RESTORED=$(pubip_local)
 echo "  receiver exits as: ${RESTORED:-<unreachable>}"

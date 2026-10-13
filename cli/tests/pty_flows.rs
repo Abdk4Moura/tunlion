@@ -80,7 +80,7 @@ impl Term {
             c
         };
         // Never touch a real store.
-        cmd.env("FILAMENT_CONFIG_DIR", cfg_dir);
+        cmd.env("TUNLION_CONFIG_DIR", cfg_dir);
         cmd.env("HOME", cfg_dir);
         cmd.env("USERPROFILE", cfg_dir);
         cmd.cwd(cfg_dir);

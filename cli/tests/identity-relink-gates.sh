@@ -3,7 +3,7 @@
 # way back after a reset is a chain of commands that all succeed.
 # Standalone, hermetic, fixture port 8141 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion bash cli/tests/identity-relink-gates.sh
+#   TUNLION_BIN=/path/to/tunlion bash cli/tests/identity-relink-gates.sh
 #
 # Gates:
 #   I1a  a joined device with its daemon running, HOME unset: a scripted
@@ -23,11 +23,11 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 case "$BIN" in /*) ;; *) BIN="$(pwd)/$BIN" ;; esac
 PORT=8141
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-relink.XXXXXX")"
 
 PASS=0; FAIL=0; FAILED=""
@@ -38,7 +38,7 @@ bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED="$FAILED|$1"; }
 pids=()
 cleanup() {
   for d in "$WORK"/A "$WORK"/p9b; do
-    [ -d "$d" ] && FILAMENT_CONFIG_DIR="$d" timeout 10 "$BIN" down -y >/dev/null 2>&1
+    [ -d "$d" ] && TUNLION_CONFIG_DIR="$d" timeout 10 "$BIN" down -y >/dev/null 2>&1
   done
   for p in "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
 }
@@ -54,8 +54,8 @@ pids+=($!)
 for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
 
-A() { env FILAMENT_CONFIG_DIR="$WORK/A" timeout 60 "$BIN" --server "$SERVER" "$@" </dev/null; }
-B() { env FILAMENT_CONFIG_DIR="$WORK/p9b" timeout 60 "$BIN" --server "$SERVER" "$@" </dev/null; }
+A() { env TUNLION_CONFIG_DIR="$WORK/A" timeout 60 "$BIN" --server "$SERVER" "$@" </dev/null; }
+B() { env TUNLION_CONFIG_DIR="$WORK/p9b" timeout 60 "$BIN" --server "$SERVER" "$@" </dev/null; }
 # `id --json` reduced to "<identity> <role>", the two fields init must not change.
 who() { "$PYV" -c 'import sys,json; d=json.load(sys.stdin); print(d.get("identity"), d.get("role"))' 2>/dev/null; }
 # `devices --json` reduced to its sorted names (an array, or an envelope around one).
@@ -78,7 +78,7 @@ sleep 2
 # ==================================================================== GATE I1 ==
 say "I1a: init -y on a joined device with its daemon running refuses"
 before=$(B id --json 2>/dev/null | who)
-outI1=$(env -u HOME FILAMENT_CONFIG_DIR="$WORK/p9b" timeout 60 "$BIN" --server "$SERVER" \
+outI1=$(env -u HOME TUNLION_CONFIG_DIR="$WORK/p9b" timeout 60 "$BIN" --server "$SERVER" \
   init --name bogus --recovery-file "$WORK/rec2" --no-background -y </dev/null 2>&1); rcI1=$?
 after=$(B id --json 2>/dev/null | who)
 echo "## rc=$rcI1 before=[$before] after=[$after] rec2 written: $([ -e "$WORK/rec2" ] && echo yes || echo no)"

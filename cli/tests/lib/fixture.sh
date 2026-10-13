@@ -4,7 +4,7 @@
 # helpers below. See mount-revoke-gates.sh / pty-revoke-gates.sh /
 # l2-revoke-gates.sh for the pattern.
 #
-# `FILAMENT_L2=1` on the acceptor is baked into `start_acceptor`, not left to the
+# `TUNLION_L2=1` on the acceptor is baked into `start_acceptor`, not left to the
 # caller, because pty-open / mount-open / l2-open are all gated on `l2_enabled`
 # and a plain `up` leaves it off with a failure that is silent on both sides.
 
@@ -109,13 +109,13 @@ start_backend() {
 # $1 = config dir. Create an owner identity named alpha there.
 init_owner() {
   mkdir -p "$1"
-  env FILAMENT_CONFIG_DIR="$1" "$BIN" init --name alpha --recovery-file "$1/rec.txt" --yes >/dev/null 2>&1 \
+  env TUNLION_CONFIG_DIR="$1" "$BIN" init --name alpha --recovery-file "$1/rec.txt" --yes >/dev/null 2>&1 \
     || { echo "init failed"; exit 2; }
 }
 
-# $1 = acceptor config dir. Start the acceptor daemon (FILAMENT_L2=1 baked in).
+# $1 = acceptor config dir. Start the acceptor daemon (TUNLION_L2=1 baked in).
 start_acceptor() {
-  env FILAMENT_CONFIG_DIR="$1" FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
+  env TUNLION_CONFIG_DIR="$1" TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 2
 }
@@ -130,14 +130,14 @@ enroll_delegate() {
   local name="$1"; shift
   local ddir="$WORK/$name"; mkdir -p "$ddir"
   local out state
-  out=$(fs_bounded 45 env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes)
+  out=$(fs_bounded 45 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes)
   state=$(fs_state)
   case "$state" in
     ok) ;;
     err)  fixture_die "setup: 'add --for $name' failed (fs_state=$state): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
     *)    fixture_die "setup: 'add --for $name' WEDGED after 45s (fs_state=$state). A hang is a failure, not a slow pass; see lib/fixture.sh fs_bounded." ;;
   esac
-  out=$(fs_bounded 45 env FILAMENT_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive)
+  out=$(fs_bounded 45 env TUNLION_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive)
   state=$(fs_state)
   case "$state" in
     ok) ;;
@@ -244,7 +244,7 @@ fs_out() { cat "$WORK/fs.out" 2>/dev/null; }
 
 # $1 = spoke config dir, $2 = spoke name. Start the joined device's daemon.
 start_spoke() {
-  env FILAMENT_CONFIG_DIR="$1" "$BIN" --server "$SERVER" up --dir "$WORK/$2-drop" \
+  env TUNLION_CONFIG_DIR="$1" "$BIN" --server "$SERVER" up --dir "$WORK/$2-drop" \
     >"$WORK/up-$2.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 2
@@ -260,8 +260,8 @@ start_spoke() {
 assert_certified() {
   local odir="$1" sdir="$2" name="$3"
   local ojson sjson
-  ojson=$(env FILAMENT_CONFIG_DIR="$odir" "$BIN" id --json 2>/dev/null)
-  sjson=$(env FILAMENT_CONFIG_DIR="$sdir" "$BIN" id --json 2>/dev/null)
+  ojson=$(env TUNLION_CONFIG_DIR="$odir" "$BIN" id --json 2>/dev/null)
+  sjson=$(env TUNLION_CONFIG_DIR="$sdir" "$BIN" id --json 2>/dev/null)
 
   if printf '%s' "$ojson" | python3 -c "
 import json,sys
@@ -292,7 +292,7 @@ sys.exit(0 if (s.get('configured') and s.get('role')=='joined-device'
   fi
 
   local list
-  list=$(env FILAMENT_CONFIG_DIR="$odir" "$BIN" devices 2>&1)
+  list=$(env TUNLION_CONFIG_DIR="$odir" "$BIN" devices 2>&1)
   if printf '%s' "$list" | grep -q "$name" \
      && ! printf '%s' "$list" | grep -q "NEEDS REVIEW" \
      && ! printf '%s' "$list" | grep -qi "uncertified"; then

@@ -1,6 +1,6 @@
 //! The state files every command trusts, and what happens when one is corrupt.
 //!
-//! `echo "{garbage" > ~/.config/filament/devices.json` used to become "no
+//! `echo "{garbage" > ~/.config/tunlion/devices.json` used to become "no
 //! devices": `devices` exited 0 with an empty list, `devices --json` said
 //! `ok: true`, and `send --to alpha` said there was no such device (3). A
 //! reader that treats an unparseable store as empty hides the damage, and the

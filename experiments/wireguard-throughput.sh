@@ -15,7 +15,7 @@ set -uo pipefail
 # PINNED OUT OF THE SHARED CARGO_TARGET_DIR: a concurrent build in another
 # checkout has silently replaced a rig binary mid-run before, which makes every
 # number after it a measurement of something else.
-BIN=${FILAMENT_BIN:-/tmp/sr-bin/tunlion}
+BIN=${TUNLION_BIN:-/tmp/sr-bin/tunlion}
 WANT_SHA=${WANT_SHA:-}
 PEER=${PEER:-interserver-0x0}
 LOCAL_BIN=${LOCAL_BIN:-$HOME/.local/bin/tunlion}   # drives the remote PTY
@@ -39,12 +39,12 @@ rsh() {
         | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b\]3008;[^\\]*\\//g; s/\r//g')
   printf '%s\n' "$out" | awk '/__B__/{f=1;next} /__E__/{f=0} f' | grep -vE '^\s*$'
 }
-# NEVER `export` FILAMENT_CONFIG_DIR: rsh drives the REAL local tunlion, the
+# NEVER `export` TUNLION_CONFIG_DIR: rsh drives the REAL local tunlion, the
 # only thing that can reach the peer at all. Pointing it at the throwaway config
 # breaks every remote step in a way that looks like a network fault.
-own() { ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" "$BIN" "$@"; }
+own() { ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" "$BIN" "$@"; }
 
-# Kill test daemons BY EXECUTABLE. FILAMENT_CONFIG_DIR is an env var and never
+# Kill test daemons BY EXECUTABLE. TUNLION_CONFIG_DIR is an env var and never
 # appears in /proc/<pid>/cmdline, so matching on the config dir killed nothing
 # and every aborted run leaked a live daemon; three had piled up before a
 # "Text file busy" on rebuild gave it away. Matching the exe path also cannot
@@ -83,7 +83,7 @@ rm -rf "$W"; mkdir -p "$W/rtr"
 say "binary: $("$BIN" --version)  sha ${GOT_SHA:0:16}"
 
 
-say "1. receiver namespace (owner side, its own filament0)"
+say "1. receiver namespace (owner side, its own tunlion0)"
 sysctl -qw net.ipv4.ip_forward=1
 ip netns add srr
 ip link add srr-h type veth peer name srr-n && ip link set srr-n netns srr
@@ -148,10 +148,10 @@ RW=$(rsh "command -v wg >/dev/null && echo OK || echo FAIL" 90 | tail -1)
 say "2. owner up, with the WireGuard plane on"
 own init --yes --name "$MYNAME" --recovery-file "$W/rec" 2>&1 | tail -1
 own set wireguard "${WG_FIRST:-off}" 2>&1 | tail -1
-ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" FILAMENT_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
+ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" TUNLION_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
 for i in $(seq 1 45); do grep -q "L3 overlay" "$W/rtr.log" 2>/dev/null && break; sleep 2; done
 grep -q userspace "$W/rtr.log" && { echo "SETUP: userspace overlay, no kernel TUN"; exit 2; }
-ok "owner up with a kernel filament0"
+ok "owner up with a kernel tunlion0"
 
 say "3. peer joins, with the WireGuard plane on"
 rm -f "$W/inv.txt"
@@ -159,7 +159,7 @@ own add --for "$PEER" --allow transfer,mount --out "$W/inv.txt" --yes 2>&1 | tai
 [ -s "$W/inv.txt" ] || { echo "SETUP: no invitation"; exit 2; }
 INV=$(cat "$W/inv.txt")
 rsh "umask 077; printf '%s' '$INV' > $RDIR/inv.txt; chmod 600 $RDIR/inv.txt" 90 >/dev/null
-rsh "setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN join $RDIR/inv.txt --yes; ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN set wireguard ${WG_FIRST:-off}; ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR FILAMENT_LOG=debug $RBIN up' >$RDIR/up.log 2>&1 & echo started" 90 >/dev/null
+rsh "setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN join $RDIR/inv.txt --yes; ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN set wireguard ${WG_FIRST:-off}; ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR TUNLION_LOG=debug $RBIN up' >$RDIR/up.log 2>&1 & echo started" 90 >/dev/null
 J=0
 for i in $(seq 1 25); do
   J=$(rsh "grep -c 'joined as' $RDIR/up.log 2>/dev/null || echo 0" 60 | tail -1)
@@ -245,13 +245,13 @@ bench() { # $1 = label
 
 say "4. first plane (wireguard=${WG_FIRST:-off})"
 for i in $(seq 1 20); do
-  ip netns exec srr ip -6 route show 2>/dev/null | grep -q filament0 && break; sleep 3
+  ip netns exec srr ip -6 route show 2>/dev/null | grep -q tunlion0 && break; sleep 3
 done
 sleep 15
 # Say which plane this number belongs to, rather than trusting the label: if
 # wireguard is meant to be on and no tunnel is live, the number is a QUIC
 # measurement wearing the wrong name.
-if ip netns exec srr wg show filament-wg latest-handshakes 2>/dev/null | awk '$2>0' | grep -q .; then
+if ip netns exec srr wg show tunlion-wg latest-handshakes 2>/dev/null | awk '$2>0' | grep -q .; then
   echo "  (a WireGuard tunnel IS live for this measurement)"
 else
   echo "  (no WireGuard tunnel: this is the QUIC-datagram plane)"
@@ -267,20 +267,20 @@ fi
 
 say "5. switch this same pair to WireGuard"
 own set wireguard on 2>&1 | tail -1
-rsh "ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN set wireguard on 2>&1 | tail -1" 90 >/dev/null
+rsh "ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN set wireguard on 2>&1 | tail -1" 90 >/dev/null
 # `set` takes effect on the next `up`, so both daemons restart. Same pair, same
 # path, one setting different.
 kill_local; sleep 3; : > "$W/rtr.log"
-ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" FILAMENT_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
-rsh "$KILL_REMOTE; sleep 2; setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR FILAMENT_LOG=debug $RBIN up' >>$RDIR/up.log 2>&1 & echo up" 90 >/dev/null
+ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" TUNLION_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
+rsh "$KILL_REMOTE; sleep 2; setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR TUNLION_LOG=debug $RBIN up' >>$RDIR/up.log 2>&1 & echo up" 90 >/dev/null
 echo "  waiting for the link to go direct again and the 10s reconcile to fire"
 for i in $(seq 1 40); do
-  ip netns exec srr wg show filament-wg latest-handshakes 2>/dev/null | awk '$2>0' | grep -q . && break
+  ip netns exec srr wg show tunlion-wg latest-handshakes 2>/dev/null | awk '$2>0' | grep -q . && break
   sleep 8
 done
-if ip netns exec srr wg show filament-wg latest-handshakes 2>/dev/null | awk '$2>0' | grep -q .; then
+if ip netns exec srr wg show tunlion-wg latest-handshakes 2>/dev/null | awk '$2>0' | grep -q .; then
   ok "WireGuard tunnel is live"
-  ip netns exec srr wg show filament-wg 2>/dev/null | grep -E "endpoint|handshake" | sed 's/^/    /'
+  ip netns exec srr wg show tunlion-wg 2>/dev/null | grep -E "endpoint|handshake" | sed 's/^/    /'
 else
   bad "WireGuard never handshook; the second number would not be a WireGuard measurement"
 fi

@@ -12,7 +12,7 @@
 `tunlion up` attaches an IP plane to the mesh. The current implementation
 (`l3.rs`, `tun/linux.rs`, `direct.rs`) is:
 
-- A kernel TUN device `filament0` (`IFF_TUN | IFF_NO_PI`), configured via iproute2.
+- A kernel TUN device `tunlion0` (`IFF_TUN | IFF_NO_PI`), configured via iproute2.
   This gives a real kernel netdev (routing, host firewall, MagicDNS names). It is
   the only "kernel" part.
 - A **userspace QUIC-datagram data plane**. The hot path is, per packet:
@@ -279,7 +279,7 @@ Plain kernel WireGuard between do-vm and the KVM VPS, no tunlion involved:
 So the earlier conclusion that kernel-to-kernel could not handshake was WRONG,
 and it was wrong because of the test rig, not the code. Each daemon runs in a
 network namespace (l3::ifname() is a const, so two daemons on one host cannot
-both hold filament0), and those namespaces reach the internet through a
+both hold tunlion0), and those namespaces reach the internet through a
 MASQUERADE I wrote. That self-inflicted NAT is what had no inbound mapping for
 WireGuard's port. Both machines have PUBLIC IPs; in the real topology the NAT
 does not exist. An artificial constraint in the harness was read as a property of
@@ -429,7 +429,7 @@ correct place for it to fail.
 ## Status 2026-09-06: wired and reconciling; the key exchange does not yet complete
 
 See the commit history for detail. The module is wired (warnings 115 -> 95),
-reconciles on a 10s tick, and creates `filament-wg` on both machines. The peer is
+reconciles on a 10s tick, and creates `tunlion-wg` on both machines. The peer is
 not configured yet: `wg show` reports zero peers, so no tunnel has carried a
 packet. Three real bugs were found and fixed on the way (a probe interface name
 one character over the Linux 15-char limit, which made the capability check

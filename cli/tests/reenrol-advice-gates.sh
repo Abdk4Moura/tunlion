@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The advice for widening a joined device's ceiling must WORK, end to end.
 #
-#   FILAMENT_BIN=/path/to/tunlion bash cli/tests/reenrol-advice-gates.sh
+#   TUNLION_BIN=/path/to/tunlion bash cli/tests/reenrol-advice-gates.sh
 #
 # The dead end this closes: a device enrolled without shell could not exec on
 # its owner; the refusal said `grant <dev> shell`, which fails on the invitation
@@ -23,21 +23,21 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 case "$BIN" in /*) ;; *) BIN="$(pwd)/$BIN" ;; esac
 PORT=8132
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-reenrol.XXXXXX")"
 DA="$WORK/A"
 # shellcheck source=lib/fixture.sh
 . "$HERE/lib/fixture.sh"
-trap 'fixture_cleanup; for d in "$WORK"/delta; do FILAMENT_CONFIG_DIR="$d" timeout 10 "$BIN" down -y >/dev/null 2>&1; done' EXIT
+trap 'fixture_cleanup; for d in "$WORK"/delta; do TUNLION_CONFIG_DIR="$d" timeout 10 "$BIN" down -y >/dev/null 2>&1; done' EXIT
 
 DEV=delta
 DD="$WORK/$DEV"
-D_ENV=(env FILAMENT_CONFIG_DIR="$DD")
-A_ENV=(env FILAMENT_CONFIG_DIR="$DA")
+D_ENV=(env TUNLION_CONFIG_DIR="$DD")
+A_ENV=(env TUNLION_CONFIG_DIR="$DA")
 
 start_backend
 init_owner "$DA"
@@ -68,7 +68,7 @@ say "A2: with shell serving off, the advice is the re-enrolment, not a grant"
 OWNER_PID=$(cat "$DA/up.pid" 2>/dev/null)
 kill "$OWNER_PID" 2>/dev/null
 sleep 2
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-off.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-off.log" 2>&1 &
 FIX_PIDS+=($!)
 sleep 4
 OUTA2=$(timeout 60 "${D_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/A2.err" </dev/null)
@@ -113,7 +113,7 @@ say "C: the printed steps work, run EXACTLY as printed from a script"
 # terminal (stdin is /dev/null), each on the machine its `on X:` label names,
 # each from its own working directory so the invitation really has to be
 # carried across by the one non-command line, "(copy <file> to <dev>)". The
-# server comes from FILAMENT_SERVER, the environment a user's shell provides,
+# server comes from TUNLION_SERVER, the environment a user's shell provides,
 # so not a word of a command is changed. This gate used to append --yes to
 # `add` and -y to `down` itself, which is exactly why it stayed green while a
 # tester running the printed text got "refusing ... without --yes".
@@ -136,10 +136,10 @@ while IFS= read -r line; do
   args="${BASH_REMATCH[2]}"
   nsteps=$((nsteps+1))
   if [ "$side" = owner ]; then
-    ( cd "$OWN_CWD" && env FILAMENT_CONFIG_DIR="$DA" FILAMENT_SERVER="$SERVER" \
+    ( cd "$OWN_CWD" && env TUNLION_CONFIG_DIR="$DA" TUNLION_SERVER="$SERVER" \
         timeout 60 "$BIN" $args </dev/null ) >"$WORK/c-step$nsteps.log" 2>&1
   else
-    ( cd "$DEV_CWD" && env HOME="$DEV_HOME" FILAMENT_CONFIG_DIR="$DD" FILAMENT_SERVER="$SERVER" \
+    ( cd "$DEV_CWD" && env HOME="$DEV_HOME" TUNLION_CONFIG_DIR="$DD" TUNLION_SERVER="$SERVER" \
         timeout 60 "$BIN" $args </dev/null ) >"$WORK/c-step$nsteps.log" 2>&1
   fi
   rc=$?
