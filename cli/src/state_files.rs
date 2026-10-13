@@ -99,7 +99,7 @@ pub(crate) fn corrupt_error(path: &Path, why: &str) -> anyhow::Error {
     exit_codes::err(
         ExitKind::Usage,
         format!(
-            "{} cannot be parsed ({why}). tunlion will not read it as empty or write over it. {recover}",
+            "{} cannot be parsed ({why}). It is not read as empty, and nothing writes over it until it is fixed. {recover}",
             path.display()
         ),
     )
