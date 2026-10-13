@@ -30,6 +30,13 @@
 #   N  SIGTERM THE INITIATOR (timeout 5) -- rc 124, remote gone within 5 s.
 #   O  CTRL-C -- forwarded as SIGINT, rc 130, remote tree gone.
 #   P  | head -2 -- the remote producer is gone within 5 s of head exiting.
+#   Q1 KILL -9 THE SERVING DAEMON -- its served command is gone within 5 s,
+#      with no restart (Linux: parent-death signal).
+#   Q2 ...and a restarted daemon ends the tree the dead one left, then holds
+#      no record of it.
+#   R  FORGET -- granted exec works, then after `devices forget` the same exec
+#      is refused within seconds as an unrecognized device (exit 4), with no
+#      "tunnel up" claim and no "serving is off" / grant advice.
 #
 # PLATFORM NOTE, stated honestly: executed here on Linux. The wire property
 # under test (array preserved, never re-parsed) is platform-independent code --
@@ -91,10 +98,10 @@ printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
 A_ENV=(env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA)
 
-start_acceptor() {
+start_acceptor() { # [log file name, default up.log]
   local drop="$WORK/Bdrop"; mkdir -p "$drop"
   env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB \
-    "$BIN" up --dir "$drop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
+    "$BIN" up --dir "$drop" --server "$SERVER" >"$WORK/${1:-up.log}" 2>&1 &
   pids+=($!)
   sleep 3
 }
@@ -431,6 +438,95 @@ else
   echo "-- K.err --"; cat "$WORK/K.err"
   bad "gateK: revoked session NOT ended (rc=$rcK)"
 fi
+
+# ===================================================================== GATE Q ==
+# KILL -9 THE SERVING DAEMON: nothing it served outlives it. Found by the blind
+# acceptance run: `exec alpha -- sleep 304`, then `kill -9` of alpha's daemon,
+# left the sleep running with PPID 1, and it survived a fresh `up`. Two shapes
+# at once. Q1, a lone command (the reported one): gone within 5 s of the kill,
+# with no restart (the kernel's parent-death signal, Linux). Q2, a tree whose
+# leader forked: the leader is gone with Q1, and the children it left are
+# ended by the NEXT daemon at its start, which also finds nothing left over
+# afterwards (the served-groups record is cleared).
+say Q
+if [ "$PLATFORM" = "unix" ] && [ "$(uname -s)" = "Linux" ]; then
+  env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantQ.log" 2>&1
+  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 3017 \
+    >/dev/null 2>"$WORK/Q1.err" </dev/null &
+  Q1Pid=$!
+  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sh -c '/bin/sleep 3018 & /bin/sleep 3019; wait' \
+    >/dev/null 2>"$WORK/Q2.err" </dev/null &
+  Q2Pid=$!
+  if started_within 30 '^/bin/sleep 3017$' && started_within 30 '^/bin/sleep 3019$'; then
+    DPID=$(cat "$DB/up.pid" 2>/dev/null)
+    GROUPS_BEFORE=$(wc -l <"$DB/exec.groups" 2>/dev/null || echo 0)
+    kill -9 "$DPID" 2>/dev/null
+    t0=$(date +%s)
+    gone_within 5 '^/bin/sleep 3017$'; goneQ1=$?
+    gone_within 5 "^/bin/sh -c /bin/sleep 3018 & /bin/sleep 3019; wait\$"; goneLeader=$?
+    echo "## (kill -9 daemon pid=$DPID) recorded groups=$GROUPS_BEFORE lone gone=$goneQ1 leader gone=$goneLeader after $(( $(date +%s) - t0 ))s"
+    if [ "$goneQ1" = "0" ] && [ "$goneLeader" = "0" ] && [ "$GROUPS_BEFORE" -ge 2 ]; then
+      ok "gateQ1: kill -9 of the serving daemon ended its served command in $(( $(date +%s) - t0 ))s, no restart"
+    else
+      ps -eo pid,ppid,pgid,args | grep -E '/bin/sleep 301[789]|sleep 3018' | grep -v grep
+      bad "gateQ1: a served command outlived the SIGKILLed daemon (lone gone=$goneQ1 leader gone=$goneLeader groups=$GROUPS_BEFORE)"
+    fi
+    kill -9 "$Q1Pid" "$Q2Pid" 2>/dev/null; wait "$Q1Pid" "$Q2Pid" 2>/dev/null
+    start_acceptor up-Q.log
+    t1=$(date +%s)
+    gone_within 10 '^/bin/sleep 3018$' '^/bin/sleep 3019$'; goneQ2=$?
+    if [ "$goneQ2" = "0" ] && [ ! -e "$DB/exec.groups" ] \
+       && grep -q "remote command(s) a previous daemon left running" "$WORK/up-Q.log"; then
+      ok "gateQ2: the restarted daemon ended the dead daemon's leftover tree and holds no record after"
+    else
+      ps -eo pid,ppid,pgid,args | grep -E '/bin/sleep 301[89]' | grep -v grep
+      echo "-- up-Q.log --"; head -20 "$WORK/up-Q.log"; ls -la "$DB/exec.groups" 2>/dev/null
+      bad "gateQ2: leftovers survived the restart (gone=$goneQ2 record=$([ -e "$DB/exec.groups" ] && echo kept || echo cleared))"
+    fi
+    pkill -f '^/bin/sleep 301[789]$' 2>/dev/null
+  else
+    kill -9 "$Q1Pid" "$Q2Pid" 2>/dev/null
+    echo "-- Q1.err --"; cat "$WORK/Q1.err"; echo "-- Q2.err --"; cat "$WORK/Q2.err"
+    bad "gateQ1: the remote commands never started"
+    bad "gateQ2: the remote commands never started"
+  fi
+else
+  echo "SKIP gateQ1/Q2: the parent-death signal and /proc process checks are Linux"
+fi
+
+# ===================================================================== GATE R ==
+# FORGET ENDS EXEC, AS AN IDENTITY REFUSAL. Found by the blind acceptance run:
+# after `devices forget bravo`, bravo's exec printed "tunnel up to 'alpha'" and
+# alpha refused with "shell serving is off", a fix that cannot apply to a
+# device alpha no longer knows. Positive control first (granted, exec runs),
+# then the forget, then the same exec: refused within seconds, exit 4
+# (denied), naming the identity, with no "tunnel up" claim and nothing run.
+say R
+env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantR.log" 2>&1
+OUTR0=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" BEFORE-FORGET 2>"$WORK/R0.err" </dev/null)
+rcR0=$?
+cp "$DB/devices.json" "$WORK/devices.before-forget.json"
+env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices forget boxA -y >"$WORK/forgetR.log" 2>&1
+rcRF=$?
+sleep 3
+t0=$(date +%s)
+OUTR=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" SHOULD-NOT-RUN 2>"$WORK/R.err" </dev/null)
+rcR=$?
+elR=$(( $(date +%s) - t0 ))
+echo "## (before forget) rc=$rcR0 out='$OUTR0'; (forget) rc=$rcRF; (after forget) rc=$rcR in ${elR}s out='$OUTR'"
+if [ "$rcR0" = "0" ] && [ "$OUTR0" = "BEFORE-FORGET" ] && [ "$rcRF" = "0" ] \
+   && [ "$rcR" = "4" ] && [ "$elR" -lt 20 ] \
+   && ! echo "$OUTR" | grep -q "SHOULD-NOT-RUN" \
+   && grep -q "not recognized" "$WORK/R.err" \
+   && ! grep -qi "tunnel up\|serving is off\|tunlion grant" "$WORK/R.err"; then
+  ok "gateR: after forget, exec was refused as an unrecognized device in ${elR}s (exit 4, no tunnel claim, nothing ran)"
+else
+  echo "-- R0.err --"; cat "$WORK/R0.err"; echo "-- forgetR.log --"; cat "$WORK/forgetR.log"
+  echo "-- R.err --"; cat "$WORK/R.err"; tail -15 "$WORK/up-Q.log" 2>/dev/null
+  bad "gateR: a forgotten device's exec was not refused as unrecognized (before rc=$rcR0, after rc=$rcR in ${elR}s)"
+fi
+# Gate L below re-uses boxB's pairing with boxA.
+cp "$WORK/devices.before-forget.json" "$DB/devices.json"
 
 # ===================================================================== GATE L ==
 # --shell-user REACHES EXEC: a ROOT acceptor started with `--shell-user nobody`
