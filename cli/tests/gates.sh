@@ -869,7 +869,10 @@ kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null
 T0=$(date +%s)
 wait $RP; RC=$?
 T1=$(date +%s)
-if [ $RC -ne 0 ] && grep -q "holding the line" "$WORK/g15-recv.log" \
+# A sender lost mid-transfer is announced as "sender disconnected mid-transfer,
+# waiting up to 8s" (before any transfer it was "stepped away, holding the
+# line up to 8s"): either way the receiver must say it holds, and for how long.
+if [ $RC -ne 0 ] && grep -qE "(holding the line|waiting) up to 8s" "$WORK/g15-recv.log" \
    && grep -q "did not come back within 8s" "$WORK/g15-recv.log" \
    && [ $((T1 - T0)) -ge 8 ]; then
   ok "stepped-away sender: held ${FILAMENT_REJOIN_SECS:-8}s window, then failed honestly"
