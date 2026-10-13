@@ -848,8 +848,10 @@ fn prompt_accept_input() -> Result<Zeroizing<String>> {
         terminal::EnterAlternateScreen,
         terminal::Clear(terminal::ClearType::All)
     )?;
-    eprintln!("  Type the pairing code you were given, or paste the invitation, or give the path to");
-    eprintln!("  the invitation file. A pasted invitation is cleared from this terminal after reading.");
+    eprintln!(
+        "  Type the pairing code you were given, or paste the invitation, or give the path to\n  \
+         the invitation file. A pasted invitation is cleared from this terminal after reading."
+    );
     let result = prompt_line("\n  code or invitation: ");
     let _ = execute!(err, terminal::LeaveAlternateScreen);
     Ok(Zeroizing::new(result?))
