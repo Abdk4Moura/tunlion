@@ -155,6 +155,33 @@ impl std::fmt::Display for Reported {
 }
 impl std::error::Error for Reported {}
 
+/// A state file (devices.json, caps.json, ...) that exists and does not
+/// parse, or is empty. Exit 2 like any local file problem; in `--json` its
+/// `error.code` is `corrupt_state`, so a script can tell "fix this file"
+/// from a bad flag.
+#[derive(Debug)]
+pub(crate) struct CorruptState(pub(crate) String);
+
+impl std::fmt::Display for CorruptState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CorruptState {}
+
+/// The JSON token for a corrupt state file (exit 2).
+pub(crate) const CORRUPT_STATE: &str = "corrupt_state";
+
+/// The `error.code` a `--json` reader gets for `e`: its kind's token, or
+/// `corrupt_state` for a corrupt state file.
+pub(crate) fn json_code(e: &anyhow::Error) -> &'static str {
+    if e.chain().any(|c| c.downcast_ref::<CorruptState>().is_some()) {
+        CORRUPT_STATE
+    } else {
+        classify(e).token()
+    }
+}
+
 /// An error of a known kind.
 pub(crate) fn err(kind: ExitKind, msg: impl Into<String>) -> anyhow::Error {
     Classified { kind, msg: msg.into() }.into()
@@ -181,6 +208,9 @@ pub(crate) fn classify(e: &anyhow::Error) -> ExitKind {
         }
         if let Some(r) = cause.downcast_ref::<Reported>() {
             return r.0;
+        }
+        if cause.downcast_ref::<CorruptState>().is_some() {
+            return ExitKind::Usage;
         }
     }
     classify_text(&format!("{e:#}"))
@@ -613,7 +643,9 @@ pub(crate) fn report(e: &anyhow::Error) -> i32 {
     let network = kind == ExitKind::Network && is_network_text(&raw);
     let message = human_message(e);
     if json_mode() && !JSON_ANSWERED.swap(true, Ordering::SeqCst) {
-        ui::json_out(&json_error(kind, &message, Some(&raw)));
+        let mut v = json_error(kind, &message, Some(&raw));
+        v["error"]["code"] = json!(json_code(e));
+        ui::json_out(&v);
     }
     if network {
         ui::critical(&format!("Error: {NETWORK_LINE}"));

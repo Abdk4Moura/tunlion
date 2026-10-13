@@ -28,6 +28,10 @@
 #   K3   a corrupt devices.json: `devices`, `devices --json` and `send --to`
 #        exit 2 naming the file, and nothing writes over it. It listed no
 #        devices with exit 0 and `send --to` said "no such device" (3).
+#   K5   an EMPTY devices.json or revoked-keys.json, or a corrupt caps.json:
+#        exit 2 (corrupt_state) naming the file, which stays as it was. An
+#        empty devices.json listed "No devices yet." with exit 0 and an
+#        empty revoked-keys.json silently dropped every revocation.
 #   K4   `send --code --json`: the code arrives on stdout as an event line
 #        first, then the result object. It was on stderr only.
 #
@@ -301,7 +305,7 @@ import json, sys
 docs = [l for l in open(sys.argv[1]) if l.strip()]
 assert len(docs) == 1, docs
 d = json.loads(docs[0])
-assert d["ok"] is False and d["error"]["code"] == "usage" and d["error"]["exit"] == 2, d
+assert d["ok"] is False and d["error"]["code"] == "corrupt_state" and d["error"]["exit"] == 2, d
 assert "devices.json" in d["error"]["message"], d
 PY
 then
@@ -309,6 +313,42 @@ then
 else
   bad "K3: corrupt devices.json (devices=$r1 json=$r2 send=$r3 grant=$r4)"
   cat "$WORK/k3-send.out" "$WORK/k3-grant.out"
+fi
+
+say "K5: an EMPTY devices.json / revoked-keys.json, or a corrupt caps.json, is refused by name and left alone"
+DK5="$WORK/cfg-K5"; cp -a "$DA" "$DK5"
+: >"$DK5/devices.json"
+env FILAMENT_CONFIG_DIR="$DK5" timeout 20 "$BIN" devices >"$WORK/k5-dev.out" 2>"$WORK/k5-dev.err"; r1=$?
+env FILAMENT_CONFIG_DIR="$DK5" timeout 20 "$BIN" devices --json >"$WORK/k5-json.out" 2>"$WORK/k5-json.err"; r2=$?
+env FILAMENT_CONFIG_DIR="$DK5" timeout 30 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxB >"$WORK/k5-send.out" 2>&1; r3=$?
+DK5R="$WORK/cfg-K5R"; cp -a "$DA" "$DK5R"
+: >"$DK5R/revoked-keys.json"
+env FILAMENT_CONFIG_DIR="$DK5R" timeout 20 "$BIN" devices >"$WORK/k5-rev.out" 2>"$WORK/k5-rev.err"; r4=$?
+DK5C="$WORK/cfg-K5C"; cp -a "$DA" "$DK5C"
+printf '[{' >"$DK5C/caps.json"
+env FILAMENT_CONFIG_DIR="$DK5C" timeout 20 "$BIN" devices >"$WORK/k5-caps.out" 2>"$WORK/k5-caps.err"; r5=$?
+echo "## empty devices.json: devices=$r1 json=$r2 send=$r3; empty revoked-keys.json: devices=$r4; corrupt caps.json: devices=$r5"
+cat "$WORK/k5-dev.err" "$WORK/k5-json.out" "$WORK/k5-rev.err" "$WORK/k5-caps.err"
+if [ "$r1" = 2 ] && [ "$r2" = 2 ] && [ "$r3" = 2 ] && [ "$r4" = 2 ] && [ "$r5" = 2 ] \
+   && grep -q "devices.json" "$WORK/k5-dev.err" && grep -q "devices.json" "$WORK/k5-send.out" \
+   && grep -q "revoked-keys.json" "$WORK/k5-rev.err" && grep -q "caps.json" "$WORK/k5-caps.err" \
+   && [ -e "$DK5/devices.json" ] && [ ! -s "$DK5/devices.json" ] \
+   && [ -e "$DK5R/revoked-keys.json" ] && [ ! -s "$DK5R/revoked-keys.json" ] \
+   && [ "$(cat "$DK5C/caps.json")" = "[{" ] \
+   && ! grep -qi "no devices yet" "$WORK/k5-dev.out" \
+   && "$PYV" - "$WORK/k5-json.out" <<'PY'
+import json, sys
+docs = [l for l in open(sys.argv[1]) if l.strip()]
+assert len(docs) == 1, docs
+d = json.loads(docs[0])
+assert d["ok"] is False and d["error"]["code"] == "corrupt_state" and d["error"]["exit"] == 2, d
+assert "devices.json" in d["error"]["message"], d
+PY
+then
+  ok "K5: empty devices.json, empty revoked-keys.json and corrupt caps.json exit 2 (corrupt_state) naming the file; none was written over"
+else
+  bad "K5: empty/truncated state file (devices=$r1 json=$r2 send=$r3 revoked=$r4 caps=$r5)"
+  cat "$WORK/k5-dev.out" "$WORK/k5-send.out" "$WORK/k5-rev.out" "$WORK/k5-caps.out"
 fi
 
 say "K4: send --json with a code prints the code on stdout before it ends"

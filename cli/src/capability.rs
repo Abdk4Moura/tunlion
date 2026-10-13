@@ -118,6 +118,11 @@ pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> s
     let p = config_dir.join("caps.json");
     let data = serde_json::to_string_pretty(&serde_json::json!(store))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // A caps.json that does not parse (or was truncated) loads as an empty
+    // store; writing that back would erase every grant and revocation in it
+    // for good. Refuse, leaving it for repair, and keep a .bak otherwise.
+    crate::state_files::before_write(&p)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     crate::platform::SecretFile::write_str(&p, &data)?;
     // Invalidate cache: next load_cap_store will see the new mtime and re-read.
     let cache = cache_init();

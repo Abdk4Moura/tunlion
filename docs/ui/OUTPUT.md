@@ -414,12 +414,14 @@ Rules that go with them:
   `{code, exit, reason, message}` on failure. `--json` with `-o -` is refused
   (both write to stdout).
 - **A corrupt state file is an error, never an empty store.** When
-  `devices.json`, `revoked-keys.json`, `used-invitations.json`, `peerconf` or
-  `config` does not parse, every command (except `reset`, `down`, `logs`,
+  `devices.json`, `revoked-keys.json`, `used-invitations.json`, `caps.json`,
+  `peerconf` or `config` does not parse, or exists but is empty (tunlion never
+  writes an empty one, so an empty file is a truncation), every command (except `reset`, `down`, `logs`,
   `config`, `completions`, `man`, `update`) exits 2 naming the file and the
   parse error, and no write replaces it. Every write first keeps the previous
   good file as `<name>.bak`, and the error names that copy when it exists. A
-  corrupt `devices.json` used to list no devices with exit 0.
+  corrupt or empty `devices.json` used to list no devices with exit 0. In
+  `--json` the error's `code` is `corrupt_state` (exit 2).
 - **`devices --json` rows carry `status`**, the human row's word for the same
   value: `"online"` (`online: true`), `"idle"` (`online: false`: no answering
   link right now), or null.
