@@ -445,6 +445,24 @@ fn scratch(label: &str) -> std::path::PathBuf {
     dir
 }
 
+/// A bare `receive` at a terminal first offers a code entry; Enter there
+/// means "listen on the local network", the long wait these cells interrupt.
+#[cfg(unix)]
+fn start_listening(t: &mut Term, at: usize) {
+    assert!(
+        t.wait_for_from(at, "enter a code", 30),
+        "receive never offered its code entry; screen:\n{}",
+        tail(&t.text())
+    );
+    t.settle(300, 3);
+    t.send("\r");
+    assert!(
+        t.wait_for_from(at, "listening", 30),
+        "receive never started listening; screen:\n{}",
+        tail(&t.text())
+    );
+}
+
 /// The `RC=<n>` the shell printed after `want` appeared, within `secs`.
 #[cfg(unix)]
 fn rc_after(t: &Term, from: usize, secs: u64) -> Option<i32> {
@@ -548,11 +566,7 @@ fn ctrl_c_ends_a_waiting_receive_in_a_terminal_with_130() {
     assert!(t.wait_for(&format!("{MARK}> "), 20), "shell never prompted:\n{}", t.text());
     let at = t.text().len();
     t.send(&format!("\"{exe}\" --server {} receive --dir \"{}\"; echo RC=$?\r", b.url, drop.display()));
-    assert!(
-        t.wait_for_from(at, "listening", 30),
-        "receive never started listening; screen:\n{}",
-        tail(&t.text())
-    );
+    start_listening(&mut t, at);
     t.settle(500, 3);
     t.send("\u{3}");
     let rc = rc_after(&t, at, 8);
@@ -574,11 +588,7 @@ fn sigterm_ends_a_waiting_receive_in_a_terminal_with_143() {
     assert!(t.wait_for(&format!("{MARK}> "), 20), "shell never prompted:\n{}", t.text());
     let at = t.text().len();
     t.send(&format!("\"{exe}\" --server {} receive --dir \"{}\"; echo RC=$?\r", b.url, drop.display()));
-    assert!(
-        t.wait_for_from(at, "listening", 30),
-        "receive never started listening; screen:\n{}",
-        tail(&t.text())
-    );
+    start_listening(&mut t, at);
     // The receive's pid, found by its unique --dir.
     let marker = drop.display().to_string();
     let pid = std::fs::read_dir("/proc")
