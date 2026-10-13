@@ -279,6 +279,10 @@ pub(crate) fn classify_text(s: &str) -> ExitKind {
             "not accepted",
             "not authorized",
             "outside the device's invitation ceiling",
+            // A policy close mid-session: the device's access ended or was
+            // revoked. Either is a decision, never a broken link.
+            "access expired",
+            "access revoked",
             "already been used",
             "invitation has expired",
         ])

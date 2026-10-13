@@ -35,6 +35,13 @@
 # found by hand on the launch candidate because every earlier forget gate
 # restarted a daemon in between, which is exactly what hid them.
 #
+# Also carries invite-expiry-gates: an invitation's --expires is the end of the
+# device's access on every path. It holds an exec and a forward stream open
+# across the end, then asserts they are cut and that new exec, forward,
+# forward --stdio and send are refused with exit 4 naming the expiry. Found on
+# a real two-machine run, where renewal and a proof re-drive carried a guest
+# minutes past its invitation and forward ignored the end entirely.
+#
 # Linux only, deliberately. The mount arm needs FUSE, and the point here is to
 # run the guarantee somewhere real rather than to matrix it.
 
@@ -54,6 +61,7 @@ on:
       - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/forward-refusal-gates.sh'
       - 'cli/tests/revocation-live-gates.sh'
+      - 'cli/tests/invite-expiry-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -72,7 +80,7 @@ jobs:
   revoke-gates:
     name: revoke gates (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -158,6 +166,9 @@ jobs:
             # RUNNING daemon, no restart) + 4 invitation-burn (S2: a used
             # invitation stays used across forget and restart, new key or same).
             [cli/tests/revocation-live-gates.sh]=15
+            # 13 = X0 premise + 3 positives (exec, send, forward --stdio) + the
+            # C0 alive-before-the-end control + X1..X8 after the end.
+            [cli/tests/invite-expiry-gates.sh]=13
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
@@ -169,7 +180,8 @@ jobs:
                    cli/tests/l2-revoke-gates.sh \
                    cli/tests/shell-posture-gates.sh \
                    cli/tests/forward-refusal-gates.sh \
-                   cli/tests/revocation-live-gates.sh; do
+                   cli/tests/revocation-live-gates.sh \
+                   cli/tests/invite-expiry-gates.sh; do
             echo "::group::$g"
             # Label the tree the gates actually run against: CI checks out
             # GitHub's MERGE ref (pull/N/merge) by default, so "CI ran sha X"

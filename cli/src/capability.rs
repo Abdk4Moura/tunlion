@@ -44,6 +44,30 @@ pub const TUNNEL_OFF_PREFIX: &str = "tunnelling is off there";
 /// fresh invitation that includes the capability.
 pub const CEILING_REASON: &str = "this capability is outside the device's invitation ceiling";
 
+/// The device's access ENDED: the invitation that admitted it carried an end
+/// time and that time has passed. Distinct from the ceiling on purpose: the
+/// capability may well be inside the ceiling, it simply expired, and the fix
+/// is a fresh invitation, not a wider one. Every reason built on this starts
+/// with [`EXPIRED_PREFIX`], which is what an initiator recognises.
+pub const EXPIRED_PREFIX: &str = "access expired";
+
+/// The canonical expiry reason, naming WHEN in UTC to the second.
+pub fn expired_reason(at: u64) -> String {
+    let when = chrono::DateTime::from_timestamp(at as i64, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| at.to_string());
+    format!("{EXPIRED_PREFIX} at {when}: the invitation that admitted this device has ended")
+}
+
+/// The expiry time named in an [`expired_reason`], when it parses. Pure.
+pub fn expired_at_from_reason(reason: &str) -> Option<u64> {
+    let rest = reason.trim().strip_prefix(EXPIRED_PREFIX)?.trim_start().strip_prefix("at ")?;
+    let stamp = rest.get(..23)?; // "YYYY-MM-DD HH:MM:SS UTC"
+    chrono::NaiveDateTime::parse_from_str(stamp.trim_end_matches(" UTC"), "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|t| t.and_utc().timestamp().max(0) as u64)
+}
+
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -559,6 +583,36 @@ pub fn cap_gate_effective(
     // ONLY thing enforcing the delegated ceiling in shadow. Deleting it would let
     // a delegated principal exceed its ceiling on every legacy-allowed open until
     // the flip. That is what makes it load-bearing, not stylistic.
+    // === Revoked device, absolute, FIRST =================================
+    // Before the ceiling and the expiry below, so a revoked device is told it
+    // was revoked rather than that its ceiling excludes the action: the reason
+    // decides the remedy the initiator prints.
+    if cert_revoked {
+        return GateDecision::Deny {
+            cap_reason: Some("device revoked".into()),
+        };
+    }
+
+    // === Delegated access ENDED (both modes) ============================
+    // A delegated principal's `cert_expires` is its composed deadline (cert
+    // expiry, invitation end, offline budget), read fresh from the record by
+    // `peer_authz`. `cap_authorize_expired` below enforces expiry only under
+    // authoritative mode, so in the shipped shadow mode an expired guest was
+    // judged by legacy trust alone and kept every capability until something
+    // else happened to empty its ceiling. Expiry is not a policy opinion that
+    // waits for the flip: the owner set an end time, and past it the device
+    // has no access at all. Scoped to delegated principals (auth_key_caps is
+    // Some) so owner devices and fleet siblings keep their existing semantics.
+    if auth_key_caps.is_some() {
+        if let Some(exp) = cert_expires {
+            if now_secs() >= exp {
+                return GateDecision::Deny {
+                    cap_reason: Some(expired_reason(exp)),
+                };
+            }
+        }
+    }
+
     if let Some(caps) = auth_key_caps {
         let action_lc = action.to_lowercase();
         if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
@@ -2400,6 +2454,86 @@ mod tests {
             !d.allowed(),
             "expired cert must deny fleet auto-trust even in-scope"
         );
+    }
+
+    /// A delegated principal past its deadline is refused in EVERY mode, with
+    /// a reason that says it expired. In the shipped shadow mode the effective
+    /// decision is legacy trust, and expiry used to be enforced only under
+    /// authoritative, so an expired guest with a shell grant kept its shell.
+    #[test]
+    fn an_expired_delegated_principal_is_denied_in_shadow_with_an_expiry_reason() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dev = [0x31u8; 32];
+        let usr = [0x32u8; 32];
+        let caps = vec![CAP_SHELL.to_string(), CAP_TRANSFER.to_string()];
+        let past = now_secs().saturating_sub(5);
+        for action in [CAP_SHELL, CAP_TRANSFER] {
+            let d = cap_gate_effective(
+                true, // legacy allows (granted, trusted)
+                &CapOutcome::Authorized,
+                action,
+                "self",
+                Some(&dev),
+                Some(&usr),
+                BindingStrength::Proven,
+                Some(past),
+                Some(caps.as_slice()),
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+            );
+            match d {
+                GateDecision::Deny { cap_reason: Some(r) } => {
+                    assert!(r.starts_with(EXPIRED_PREFIX), "{r}");
+                    assert!(!r.contains("ceiling"), "an expiry is not a ceiling: {r}");
+                }
+                other => panic!(
+                    "expired principal not denied with a reason for {action} (allowed: {})",
+                    other.allowed()
+                ),
+            }
+        }
+        // Control: the same principal before its deadline is allowed.
+        let live = cap_gate_effective(
+            true,
+            &CapOutcome::Authorized,
+            CAP_SHELL,
+            "self",
+            Some(&dev),
+            Some(&usr),
+            BindingStrength::Proven,
+            Some(now_secs() + 600),
+            Some(caps.as_slice()),
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert!(live.allowed(), "a live delegated principal must keep its access");
+        // Revocation outranks expiry: the device is told it was revoked.
+        let both = cap_gate_effective(
+            true,
+            &CapOutcome::Authorized,
+            CAP_SHELL,
+            "self",
+            Some(&dev),
+            Some(&usr),
+            BindingStrength::Proven,
+            Some(past),
+            Some(&[][..]),
+            None,
+            false,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(both.deny_reason(""), "device revoked");
     }
 
     #[test]

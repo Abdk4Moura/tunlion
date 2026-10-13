@@ -74,13 +74,26 @@ fn gate_inputs(
 ) -> ShellGateInputs {
     let config_dir = crate::settings::config_dir();
     let (idev, iusr, binding, expires, ak_caps) = match cert {
-        Some(c) => (
-            Some(c.device_pub),
-            Some(c.user_pub),
-            BindingStrength::Proven,
-            Some(c.expires),
-            persisted_principal_for_cert(c).0.auth_key_caps().map(|s| s.to_vec()),
-        ),
+        // The same composition `peer_authz` feeds the live gate: a delegated
+        // device's deadline and ceiling come fresh from its record, and an
+        // ended one holds no capability. Without this the listing judged an
+        // expired guest by its raw certificate and contradicted the gate.
+        Some(c) => match crate::identity_state::delegated_access_for(&c.device_pub) {
+            Some(a) => (
+                Some(c.device_pub),
+                Some(c.user_pub),
+                BindingStrength::Proven,
+                Some(a.deadline),
+                Some(if a.expired(crate::identity::now_secs()) { Vec::new() } else { a.ceiling }),
+            ),
+            None => (
+                Some(c.device_pub),
+                Some(c.user_pub),
+                BindingStrength::Proven,
+                Some(c.expires),
+                persisted_principal_for_cert(c).0.auth_key_caps().map(|s| s.to_vec()),
+            ),
+        },
         // Never reached with trusted=true (see perms_for); kept total so the
         // matrix stays fabricable.
         None => (None, None, BindingStrength::None, None, None),

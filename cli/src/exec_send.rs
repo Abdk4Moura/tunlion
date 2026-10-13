@@ -391,18 +391,11 @@ async fn exec_once(
                     if v.get("type").and_then(|t| t.as_str()) == Some("l2-close")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
-                        let reason = v.get("err").and_then(|e| e.as_str()).unwrap_or("closed");
                         // The acceptor's code says WHY, and its `as` says what it
                         // calls us, so the remedy names the right fix and the
                         // right device (a missing grant is not "serving is off").
-                        let (code, as_name) = crate::refusal::from_frame(&v, "err");
-                        break Err(crate::refusal::explain(
-                            "exec",
-                            peer,
-                            reason,
-                            code,
-                            as_name.as_deref(),
-                        ));
+                        // An expiry also carries the re-invite to print.
+                        break Err(crate::refusal::explain_frame("exec", peer, &v, "err"));
                     }
                 }
                 crate::net::Ev::Chunk(_pid, got, _offset, data) => {
@@ -503,7 +496,7 @@ async fn exec_once(
                         // a peer that can never send again means waiting is pointless, even though the
                         // connection is otherwise usable.
                         if mux.transport().is_dead() {
-                            bail!("link to '{peer}' died during exec");
+                            bail!("link to '{peer}' died during exec (the output stream ended and the connection is closed)");
                         }
                         // TERMINAL AND NAMED, with no timeout involved: the session's stream ended
                         // and no `exec-close` carrying a status will follow, so waiting longer can
@@ -586,6 +579,14 @@ async fn exec_once(
                             if let Some(code) = spawn_refusal_code(err) {
                                 return Ok(spawn_refused(peer, opts.argv.first().map(String::as_str).unwrap_or("?"), err, code));
                             }
+                            // A POLICY close mid-session (revoked, expired) is a
+                            // refusal, exit 4 with its reason and remedy, not a
+                            // generic failure (it exited 1, which a supervisor
+                            // reads as "broke, retry").
+                            let (code, _) = crate::refusal::from_frame(&v, "err");
+                            if code.is_some() {
+                                bail!("{}", crate::refusal::explain_frame("exec", peer, &v, "err"));
+                            }
                             bail!("'{peer}' closed the exec stream: {err}");
                         }
                     }
@@ -602,7 +603,7 @@ async fn exec_once(
                     // anything else is ignored, with the 2s ticker as backstop.
                     Some(_) => {}
                     None => {
-                        bail!("link to '{peer}' died during exec");
+                        bail!("link to '{peer}' died during exec (the link's event channel closed)");
                     }
                 },
                 _ = ticker.tick() => {
@@ -610,7 +611,7 @@ async fn exec_once(
                     // a peer that can never send again means waiting is pointless, even though the
                     // connection is otherwise usable.
                     if mux.transport().is_dead() {
-                        bail!("link to '{peer}' died during exec");
+                        bail!("link to '{peer}' died during exec (the connection is closed)");
                     }
                     if last_heard.elapsed() >= EXEC_PEER_SILENT {
                         bail!(

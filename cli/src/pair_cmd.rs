@@ -648,6 +648,17 @@ pub(crate) async fn pair_cmd(
                                 // allow_reanchor: the local user accepted this
                                 // pairing ceremony, which is the owner decision
                                 // that permits re-anchoring (e.g. reinstall).
+                                // An explicit `--expires` is an END, not a cert
+                                // lifetime to renew forever: record the device
+                                // as a delegated principal with that end, the
+                                // same record `join` produces for an invitation,
+                                // so the gate, renewal and every live session
+                                // enforce it. Without --expires the device is an
+                                // ordinary fleet member and renews indefinitely.
+                                let lifetime = cert.expires.saturating_sub(cert.issued);
+                                let bounded = enrol_ttl
+                                    .is_some()
+                                    .then_some((caps.as_slice(), cert.expires, lifetime, lifetime));
                                 if let Err(e) = devices_upsert_atomic(
                                     &n,
                                     Some(&sec),
@@ -655,7 +666,7 @@ pub(crate) async fn pair_cmd(
                                     Some(caps),
                                     Some(identity::IntroScope::Device.to_byte()),
                                     None,
-                                    None,
+                                    bounded,
                                     true,
                                 ) {
                                     ui::debug(&format!(

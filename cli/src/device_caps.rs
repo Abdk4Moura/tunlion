@@ -40,6 +40,45 @@ pub(crate) fn effective_device_caps(name: &str) -> Vec<String> {
     }
 }
 
+/// A device's access as the gate enforces it NOW, for `devices --json`:
+/// `(state, effective caps, cert expiry, access deadline)`. `state` is
+/// `revoked`, `expired` (its invitation ended), `lapsed` (marked lapsed by the
+/// sweep or a depart), or `active`; the effective caps are empty for any but
+/// `active`, because past those states the gate refuses every action. `caps`
+/// beside it used to list the ceiling forever, so an owner read
+/// ["transfer","shell"] for a guest the gate had stopped serving.
+pub(crate) fn device_access_json(record: &Value, now: u64) -> Value {
+    let name = record["name"].as_str().unwrap_or("");
+    let granted = effective_device_caps(name);
+    let cert = crate::identity::DeviceCert::from_json(&record["deviceCert"]);
+    let delegated = crate::identity_state::delegated_access_from_record(record);
+    let revoked = record["certRevoked"].as_bool() == Some(true)
+        || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED);
+    let lapsed = record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_LAPSED);
+    let state = if revoked {
+        "revoked"
+    } else if delegated.as_ref().is_some_and(|a| a.expired(now)) {
+        if lapsed && record["principalExpires"].as_u64().is_some_and(|e| e > now) {
+            "lapsed"
+        } else {
+            "expired"
+        }
+    } else if lapsed {
+        "lapsed"
+    } else {
+        "active"
+    };
+    let effective: Vec<String> = if state == "active" { granted.clone() } else { Vec::new() };
+    json!({
+        "state": state,
+        "effectiveCaps": effective,
+        "grantedCaps": granted,
+        "certExpires": cert.as_ref().map(|c| c.expires),
+        "accessUntil": delegated.as_ref().map(|a| a.deadline),
+        "invitationEnds": record["principalExpires"].as_u64(),
+    })
+}
+
 /// Path-explicit core of `device_caps` (testable without touching the global
 /// config-dir env var).
 #[allow(dead_code)]

@@ -43,6 +43,51 @@ pub(crate) enum Code {
     /// before any capability question, so it is never reported as a missing
     /// grant or as serving being off.
     Unrecognized,
+    /// The invitation that admitted this device carried an end time, and it
+    /// has passed. The capability may be inside the ceiling; it simply ended.
+    /// The fix is a fresh invitation from the owner, never a grant or a wider
+    /// ceiling.
+    Expired,
+}
+
+/// What the acceptor knows about the invitation that ended, so the initiator
+/// can print a re-invite that restores exactly what the device had: its
+/// original capabilities and its original lifetime. Carried as additive
+/// fields on the refusal frame (`ceiling`, `lifetime`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Reinvite {
+    pub(crate) ceiling: Vec<String>,
+    pub(crate) lifetime: u64,
+}
+
+/// A lifetime as an `--expires` value, rounded UP to one unit (an invitation
+/// joined a few seconds after it was minted still reads as the "4m" it was
+/// minted with) and never above the 30-day maximum `add` accepts. Pure.
+pub(crate) fn expires_text(secs: u64) -> String {
+    let secs = secs.clamp(1, 30 * 86400);
+    if secs >= 86400 {
+        format!("{}d", secs.div_ceil(86400))
+    } else if secs >= 3600 {
+        format!("{}h", secs.div_ceil(3600))
+    } else if secs >= 60 {
+        format!("{}m", secs.div_ceil(60))
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// The re-invite from a refusal frame, when the acceptor sent one. Pure.
+pub(crate) fn reinvite_from_frame(v: &Value) -> Option<Reinvite> {
+    let ceiling: Vec<String> = v["ceiling"]
+        .as_array()?
+        .iter()
+        .filter_map(|c| c.as_str())
+        // Peer-supplied and printed as a command: capability words only.
+        .filter(|c| !c.is_empty() && c.len() <= 32 && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == ':' || ch == '.' || ch == '/'))
+        .map(str::to_string)
+        .collect();
+    let lifetime = v["lifetime"].as_u64()?;
+    (!ceiling.is_empty()).then_some(Reinvite { ceiling, lifetime })
 }
 
 impl Code {
@@ -56,6 +101,7 @@ impl Code {
             Code::Ceiling => "ceiling",
             Code::UserDropUnavailable => "user-drop-unavailable",
             Code::Unrecognized => "not-recognized",
+            Code::Expired => "expired",
         }
     }
 
@@ -69,6 +115,7 @@ impl Code {
             "ceiling" => Code::Ceiling,
             "user-drop-unavailable" => Code::UserDropUnavailable,
             "not-recognized" => Code::Unrecognized,
+            "expired" => Code::Expired,
             _ => return None,
         })
     }
@@ -107,6 +154,8 @@ pub(crate) struct Refusal {
     pub(crate) reason: String,
     /// The acceptor's petname for the initiator, when proven.
     pub(crate) as_name: Option<String>,
+    /// For an expiry: what to re-invite with.
+    pub(crate) reinvite: Option<Reinvite>,
 }
 
 impl Refusal {
@@ -120,12 +169,47 @@ impl Refusal {
             Code::Ceiling => crate::capability::CEILING_REASON.to_string(),
             Code::UserDropUnavailable => USER_DROP_REASON.to_string(),
             Code::Unrecognized => UNRECOGNIZED_REASON.to_string(),
+            // Without the time; `Refusal::expired` names it.
+            Code::Expired => format!(
+                "{}: the invitation that admitted this device has ended",
+                crate::capability::EXPIRED_PREFIX
+            ),
         };
         Refusal {
             code,
             reason,
             as_name,
+            reinvite: None,
         }
+    }
+
+    /// The refusal for a device whose invitation ended at `at`.
+    pub(crate) fn expired(at: u64, as_name: Option<String>, reinvite: Option<Reinvite>) -> Refusal {
+        Refusal {
+            code: Code::Expired,
+            reason: crate::capability::expired_reason(at),
+            as_name,
+            reinvite,
+        }
+    }
+
+    /// Classify any gate reason (exec, pty, ssh-sign, forward, mount): the
+    /// expiry and revocation causes get their own codes, everything else is
+    /// left to the caller. Pure.
+    pub(crate) fn final_cause(cap_reason: Option<&str>, as_name: Option<String>) -> Option<Refusal> {
+        let r = cap_reason?.trim();
+        if r.starts_with(crate::capability::EXPIRED_PREFIX) {
+            let mut out = match crate::capability::expired_at_from_reason(r) {
+                Some(at) => Refusal::expired(at, as_name, None),
+                None => Refusal::new(Code::Expired, as_name),
+            };
+            out.reason = r.to_string();
+            return Some(out);
+        }
+        if r == "device revoked" {
+            return Some(Refusal::new(Code::CertRevoked, as_name));
+        }
+        None
     }
 
     /// Classify a shell-gate denial. `cap_reason` is the engine's reason when
@@ -136,6 +220,11 @@ impl Refusal {
         cap_reason: Option<&str>,
         as_name: Option<String>,
     ) -> Refusal {
+        if !cert_revoked {
+            if let Some(r) = Refusal::final_cause(cap_reason, as_name.clone()) {
+                return r;
+            }
+        }
         let code = if cert_revoked || cap_reason == Some("device revoked") {
             Code::CertRevoked
         } else if cap_reason == Some(crate::capability::CEILING_REASON) {
@@ -156,11 +245,24 @@ impl Refusal {
         r
     }
 
+    /// For an expiry, attach the re-invite the owner can run (read from this
+    /// device's record of the peer). A no-op for every other cause.
+    pub(crate) fn with_reinvite_for(mut self, idev: Option<&[u8; 32]>) -> Refusal {
+        if self.code == Code::Expired && self.reinvite.is_none() {
+            self.reinvite = idev.and_then(crate::identity_state::reinvite_for);
+        }
+        self
+    }
+
     /// Add the code and name to an outgoing refusal frame.
     pub(crate) fn annotate(&self, frame: &mut Value) {
         frame["code"] = json!(self.code.as_wire());
         if let Some(n) = &self.as_name {
             frame["as"] = json!(n);
+        }
+        if let Some(r) = &self.reinvite {
+            frame["ceiling"] = json!(r.ceiling);
+            frame["lifetime"] = json!(r.lifetime);
         }
     }
 
@@ -186,6 +288,9 @@ pub(crate) fn code_from_reason(reason: &str) -> Option<Code> {
     }
     if r == crate::capability::CEILING_REASON {
         return Some(Code::Ceiling);
+    }
+    if r.starts_with(crate::capability::EXPIRED_PREFIX) {
+        return Some(Code::Expired);
     }
     if r.starts_with("shell revoked for") {
         return Some(Code::Revoked);
@@ -248,8 +353,36 @@ pub(crate) fn word(s: &str) -> String {
 /// `me` is the name `peer` knows this device by (the acceptor's `as`), else
 /// this device's own display name, which is what a pairing files it under.
 pub(crate) fn remedy(code: Code, peer: &str, me: &str) -> (String, Option<String>) {
+    remedy_with(code, peer, me, None)
+}
+
+/// [`remedy`], with what the acceptor said about an ended invitation.
+pub(crate) fn remedy_with(
+    code: Code,
+    peer: &str,
+    me: &str,
+    reinvite: Option<&Reinvite>,
+) -> (String, Option<String>) {
     let me_w = word(me);
     match code {
+        // Not a grant (nothing to grant to an ended principal) and not the
+        // ceiling re-enrolment (the ceiling was fine): the same invitation
+        // again, with the same capabilities and the same lifetime.
+        Code::Expired => match reinvite {
+            Some(r) => (
+                format!(
+                    "the invitation that admitted this device has ended, so '{peer}' refuses everything from it. Only its owner can admit it again, with the same capabilities and lifetime:\n    {}",
+                    reinvite_steps(peer, &me_w, r).join("\n    ")
+                ),
+                None,
+            ),
+            None => (
+                format!(
+                    "the invitation that admitted this device has ended, so '{peer}' refuses everything from it. Only the owner of '{peer}' can admit it again, with a fresh invitation."
+                ),
+                None,
+            ),
+        },
         Code::ShellOff => {
             let cmd = format!("tunlion grant {me_w} shell");
             (
@@ -352,9 +485,53 @@ pub(crate) fn ceiling_steps(peer: &str, me: &str) -> Vec<String> {
     ]
 }
 
+/// The steps that admit an expired device again, each on the machine that
+/// runs it, preserving its capabilities and its lifetime. The forget frees the
+/// name; the device must reset, because a joined device refuses a second
+/// invitation while it holds the first.
+pub(crate) fn reinvite_steps(peer: &str, me: &str, r: &Reinvite) -> Vec<String> {
+    let invite = format!("{me}-invite.txt");
+    let owner = format!("on '{peer}':");
+    let here = "on this device:".to_string();
+    let w = owner.len().max(here.len());
+    let pad = " ".repeat(w);
+    vec![
+        format!("{owner:<w$}  tunlion devices forget {me} -y"),
+        format!(
+            "{pad}  tunlion add --for {me} --allow {} --expires {} --out {invite} --yes",
+            r.ceiling.join(","),
+            expires_text(r.lifetime)
+        ),
+        format!("{pad}  (copy {invite} to this device)"),
+        format!("{here:<w$}  tunlion down -y"),
+        format!("{pad}  tunlion reset -y"),
+        format!("{pad}  tunlion join --invite-file {invite} --name {me}"),
+        format!("{pad}  tunlion up --detach"),
+    ]
+}
+
+/// [`explain`] from a whole refusal frame: the code, the acceptor's name for
+/// us, and (for an expiry) the re-invite it sent.
+pub(crate) fn explain_frame(verb: &str, peer: &str, v: &Value, reason_key: &str) -> String {
+    let reason = v[reason_key].as_str().unwrap_or("closed");
+    let (code, as_name) = from_frame(v, reason_key);
+    explain_with(verb, peer, reason, code, as_name.as_deref(), reinvite_from_frame(v).as_ref())
+}
+
 /// One user-facing explanation: "<verb> refused by 'peer': reason" plus the
 /// matching remedy. `as_name` falls back to this device's display name.
 pub(crate) fn explain(verb: &str, peer: &str, reason: &str, code: Option<Code>, as_name: Option<&str>) -> String {
+    explain_with(verb, peer, reason, code, as_name, None)
+}
+
+pub(crate) fn explain_with(
+    verb: &str,
+    peer: &str,
+    reason: &str,
+    code: Option<Code>,
+    as_name: Option<&str>,
+    reinvite: Option<&Reinvite>,
+) -> String {
     let Some(code) = code.or_else(|| code_from_reason(reason)) else {
         return format!("'{peer}' refused {verb}: {reason}");
     };
@@ -370,7 +547,7 @@ pub(crate) fn explain(verb: &str, peer: &str, reason: &str, code: Option<Code>, 
         .map(str::to_string)
         .or_else(|| name_from_reason(&reason))
         .unwrap_or(fallback);
-    match remedy(code, peer, &me) {
+    match remedy_with(code, peer, &me, reinvite) {
         (text, Some(cmd)) => format!("{head}\n  {text}\n    {cmd}"),
         (text, None) => format!("{head}\n  {text}"),
     }
@@ -380,7 +557,7 @@ pub(crate) fn explain(verb: &str, peer: &str, reason: &str, code: Option<Code>, 
 mod tests {
     use super::*;
 
-    const ALL: [Code; 8] = [
+    const ALL: [Code; 9] = [
         Code::ShellOff,
         Code::TunnelOff,
         Code::NotGranted,
@@ -389,6 +566,7 @@ mod tests {
         Code::Ceiling,
         Code::UserDropUnavailable,
         Code::Unrecognized,
+        Code::Expired,
     ];
 
     #[test]
@@ -521,6 +699,49 @@ mod tests {
         for cmd in &cmds {
             assert!(msg.contains(cmd.as_str()), "{msg}");
         }
+    }
+
+    /// An expired device is told it EXPIRED and when, never that the
+    /// capability is outside its ceiling, and its remedy is the same
+    /// invitation again: the original caps (no mount added) and --expires.
+    #[test]
+    fn an_expiry_names_the_time_and_reinvites_with_the_same_caps() {
+        use clap::Parser;
+        let at = 1_760_384_363; // 2025-10-13 19:39:23 UTC
+        let r = Refusal::from_shell_gate(
+            false,
+            false,
+            Some(&crate::capability::expired_reason(at)),
+            Some("guest-b".into()),
+        );
+        assert_eq!(r.code, Code::Expired);
+        assert!(r.reason.starts_with("access expired at 2025-10-13 19:39:23 UTC"), "{}", r.reason);
+        assert!(!r.reason.contains("ceiling"), "{}", r.reason);
+        assert_eq!(crate::capability::expired_at_from_reason(&r.reason), Some(at));
+        let inv = Reinvite { ceiling: vec!["transfer".into(), "shell".into()], lifetime: 240 };
+        let mut f = Refusal { reinvite: Some(inv.clone()), ..r }.close_frame(9);
+        assert_eq!(f["code"], "expired");
+        assert_eq!(reinvite_from_frame(&f), Some(inv));
+        let msg = explain_frame("exec", "owner-a", &f, "err");
+        assert!(msg.contains("expired at"), "{msg}");
+        assert!(msg.contains("--allow transfer,shell --expires 4m"), "{msg}");
+        assert!(!msg.contains("mount"), "the re-invite must not add mount: {msg}");
+        for cmd in msg.lines().filter_map(|l| l.find("tunlion ").map(|i| l[i..].to_string())) {
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(crate::Cli::try_parse_from(&argv).is_ok(), "step does not parse: {cmd}");
+        }
+        // A hostile ceiling never reaches the printed command.
+        f["ceiling"] = serde_json::json!(["shell; rm -rf /"]);
+        assert_eq!(reinvite_from_frame(&f), None);
+    }
+
+    #[test]
+    fn expires_text_rounds_up_and_caps_at_thirty_days() {
+        assert_eq!(expires_text(20), "20s");
+        assert_eq!(expires_text(223), "4m");
+        assert_eq!(expires_text(3600), "1h");
+        assert_eq!(expires_text(30 * 86400 - 5), "30d");
+        assert_eq!(expires_text(90 * 86400), "30d");
     }
 
     /// Every suggested command is one the CLI ACCEPTS, not merely one with the

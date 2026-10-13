@@ -993,7 +993,7 @@ impl RevokeRecheck {
 
     /// The re-check interval. Timer-driven loops (pty, l2) build a ticker at this
     /// cadence and re-ask the verdict directly; the request-shaped mount uses
-    /// [`Self::revoked`] instead.
+    /// [`Self::cut`] instead.
     pub(crate) fn interval(&self) -> std::time::Duration {
         self.interval
     }
@@ -1001,12 +1001,14 @@ impl RevokeRecheck {
     /// True when the interval has elapsed AND the peer is now revoked. The
     /// caller re-checks at its natural cadence (per request for mount); the
     /// interval bound inside keeps that cadence cheap.
-    pub(crate) fn revoked(&mut self, idev: Option<&[u8; 32]>) -> bool {
+    /// Why the live session must end now (revoked, or its invitation ended),
+    /// checked at most once per interval. None also while the interval runs.
+    pub(crate) fn cut(&mut self, idev: Option<&[u8; 32]>) -> Option<crate::identity_state::LiveCut> {
         if self.last.elapsed() < self.interval {
-            return false;
+            return None;
         }
         self.last = std::time::Instant::now();
-        cert_revoked_for(idev)
+        crate::identity_state::live_session_cut(idev)
     }
 }
 
@@ -1761,15 +1763,34 @@ fn peer_authz(conn: &mut Conn, pid: &str) -> PeerAuthz {
     let link = conn.link(pid);
     let idev = link.and_then(|l| l.identity_device_pub);
     let iusr = link.and_then(|l| l.identity_user_pub);
+    let mut expires = link.and_then(|l| l.identity_cert_expires);
+    let mut ak_caps = link
+        .and_then(|l| l.principal_kind.auth_key_caps())
+        .map(|c| c.to_vec());
+    // A DELEGATED device's deadline and ceiling are read FRESH from its record
+    // at every gate, never trusted from what the link cached when its identity
+    // first resolved. The cached copy is how an invited guest kept access past
+    // its invitation end: the link was resolved while the invitation was live,
+    // nothing re-read it, and a later proof re-bound it from the presented
+    // (renewed) certificate. The record is the owner's own statement, kept in
+    // step by renewal, and it carries the invitation end.
+    if let Some(access) = idev.as_ref().and_then(crate::identity_state::delegated_access_for) {
+        expires = Some(access.deadline);
+        if access.expired(crate::identity::now_secs()) {
+            ak_caps = Some(Vec::new());
+        } else if ak_caps.is_none() {
+            // A delegated record never authorizes as an owner device, whatever
+            // the link's principal says.
+            ak_caps = Some(access.ceiling.clone());
+        }
+    }
     PeerAuthz {
         binding: link
             .map(|l| l.identity_binding)
             .unwrap_or(crate::capability::BindingStrength::None),
-        expires: link.and_then(|l| l.identity_cert_expires),
+        expires,
         cert_revoked: cert_revoked_for(idev.as_ref()),
-        ak_caps: link
-            .and_then(|l| l.principal_kind.auth_key_caps())
-            .map(|c| c.to_vec()),
+        ak_caps,
         idev,
         iusr,
     }

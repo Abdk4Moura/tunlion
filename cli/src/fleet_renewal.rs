@@ -50,6 +50,9 @@ pub struct Standing {
     pub lapsed: bool,
     /// The device_pub actually stored on that record.
     pub stored_device_pub: Option<[u8; 32]>,
+    /// When its admission ends, if it was admitted with an end (a delegated
+    /// record's `principalExpires`). Renewal never signs past it.
+    pub access_until: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -120,6 +123,40 @@ pub fn renewal_ttl(current: &DeviceCert, max_ttl: u64) -> u64 {
     original.clamp(1, max_ttl)
 }
 
+/// The expiry a renewal may sign, or None when renewal may not extend the
+/// certificate at all.
+///
+/// THE INVITATION END IS A CEILING ON EVERY RENEWAL. `renewal_ttl` alone kept
+/// the lifetime from widening, but counted it from NOW, never from the end the
+/// owner chose: a guest invited with `--expires 4m` renewed at 2m45s into a
+/// cert valid until 6m34s, and every renewal after that pushed it further, so a
+/// device that stayed connected kept access for about 5/3 of its invitation
+/// (an extra ~20 days on `--expires 30d`). Measured on a real two-machine run.
+///
+/// `access_until` is the device's invitation end (`principalExpires` on a
+/// delegated record), None for a device enrolled without one (a fleet member
+/// enrolled by pairing code with no `--expires`), which renews indefinitely as
+/// the design intends: removal is "stop renewing".
+///
+/// None when the clamped expiry would not be strictly later than the current
+/// one: the device then simply keeps the cert it has and falls out at its end,
+/// which is the bound being enforced, not a failure.
+pub fn renewal_expiry(
+    current: &DeviceCert,
+    now: u64,
+    max_ttl: u64,
+    access_until: Option<u64>,
+) -> Option<u64> {
+    let mut expires = now.saturating_add(renewal_ttl(current, max_ttl));
+    if let Some(end) = access_until {
+        if now >= end {
+            return None;
+        }
+        expires = expires.min(end);
+    }
+    (expires > current.expires).then_some(expires)
+}
+
 /// The requesting device's half: is this replacement acceptable?
 ///
 /// Renewal MUST NOT WIDEN ANYTHING. Only the clock may move. A renewal that can
@@ -159,7 +196,13 @@ mod tests {
     const OTHER: [u8; 32] = [9u8; 32];
 
     fn good() -> Standing {
-        Standing { known: true, revoked: false, lapsed: false, stored_device_pub: Some(DEV) }
+        Standing {
+            known: true,
+            revoked: false,
+            lapsed: false,
+            stored_device_pub: Some(DEV),
+            access_until: None,
+        }
     }
 
     #[test]
@@ -260,6 +303,57 @@ mod tests {
         let degenerate =
             DeviceCert { device_pub: DEV, user_pub: OTHER, issued: 5, expires: 5, sig: [0u8; 64] };
         assert_eq!(renewal_ttl(&degenerate, 1_000), 1, "never zero");
+    }
+
+    fn cert(issued: u64, expires: u64) -> DeviceCert {
+        DeviceCert { device_pub: DEV, user_pub: OTHER, issued, expires, sig: [0u8; 64] }
+    }
+
+    /// The lab case, to the second: invited at 0 for 240 s, renewed at 165 s.
+    /// The renewal used to sign 165 + 240 = 405; it must stop at 240.
+    #[test]
+    fn renewal_never_extends_past_the_invitation_end() {
+        let current = cert(0, 240);
+        assert_eq!(renewal_expiry(&current, 165, 90 * 86400, Some(240)), None,
+            "the invitation end IS the current expiry, so there is nothing to extend");
+        // A cert shorter than its invitation may grow, but only up to the end.
+        let short = cert(0, 100);
+        assert_eq!(renewal_expiry(&short, 70, 90 * 86400, Some(240)), Some(170));
+        assert_eq!(renewal_expiry(&short, 90, 90 * 86400, Some(150)), Some(150),
+            "clamped to the invitation end, never past it");
+    }
+
+    #[test]
+    fn renewal_past_the_invitation_end_is_refused() {
+        let current = cert(0, 100);
+        assert_eq!(renewal_expiry(&current, 240, 90 * 86400, Some(240)), None);
+        assert_eq!(renewal_expiry(&current, 500, 90 * 86400, Some(240)), None);
+    }
+
+    /// Repeated renewals by a device that never disconnects converge on the
+    /// invitation end instead of walking past it (the ~5T/3 drift).
+    #[test]
+    fn repeated_renewals_converge_on_the_end() {
+        let end = 30 * 86400;
+        let mut c = cert(0, end / 2);
+        let mut now = 0;
+        for _ in 0..20 {
+            now += end / 10;
+            if renewal_due(&c, now) {
+                if let Some(e) = renewal_expiry(&c, now, 90 * 86400, Some(end)) {
+                    c = cert(now, e);
+                }
+            }
+            assert!(c.expires <= end, "renewed to {} past the end {end}", c.expires);
+        }
+    }
+
+    /// A member enrolled with no end (pairing code, no --expires) keeps
+    /// renewing: removal is "stop renewing", not a clock.
+    #[test]
+    fn a_member_without_an_end_still_renews() {
+        let current = cert(0, 300);
+        assert_eq!(renewal_expiry(&current, 250, 90 * 86400, None), Some(550));
     }
 
     #[test]

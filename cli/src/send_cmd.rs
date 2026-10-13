@@ -2610,7 +2610,7 @@ pub(crate) async fn send_cmd(
                 let _ = sio.disconnect().await;
                 if !refused.is_empty() {
                     ui::critical(&format!(
-                        "send failed: the receiver could not store {} file(s):\n  {}",
+                        "send failed: the receiver refused {} file(s):\n  {}",
                         refused.len(),
                         refused.join("\n  ")
                     ));
@@ -2618,7 +2618,7 @@ pub(crate) async fn send_cmd(
                     // carrying the sentences for a --json result.
                     return Err(exit_codes::reported_because(
                         ExitKind::Denied,
-                        format!("the receiver could not store {}", refused.join("; ")),
+                        format!("the receiver refused {}", refused.join("; ")),
                     ));
                 }
                 match send_outcome(completed, declined) {

@@ -563,7 +563,7 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // cadence; the verdict is re-asked directly.
     let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
     revoke_ticker.tick().await; // consume the immediate first tick
-    let mut revoked_reason: Option<&'static str> = None;
+    let mut revoked_reason: Option<String> = None;
     loop {
         tokio::select! {
             r = async { reader.as_mut().unwrap().await }, if !reader_done => {
@@ -595,9 +595,20 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 // Re-ask the gate. A revoked peer loses the live forward; the
                 // denial is a close-with-reason so the client's connection breaks
                 // instead of hanging.
-                if crate::cert_revoked_for(idev.as_ref()) {
-                    crate::ui::critical("l2: peer revoked, closing the live stream");
-                    revoked_reason = Some(crate::capability::REVOKED_REASON);
+                // Revocation AND the delegated deadline: a forward opened while
+                // an invitation was live is cut when it ends, exactly as a
+                // revocation cuts it (it used to check revocation only, so a
+                // stream opened before expiry ran on indefinitely).
+                if let Some(cut) = crate::identity_state::live_session_cut(idev.as_ref()) {
+                    match cut {
+                        crate::identity_state::LiveCut::Revoked => {
+                            crate::ui::critical("l2: peer revoked, closing the live stream")
+                        }
+                        crate::identity_state::LiveCut::Expired(_) => {
+                            crate::ui::critical("l2: peer access expired, closing the live stream")
+                        }
+                    }
+                    revoked_reason = Some(cut.reason());
                     if let Some(r) = reader.take() { r.abort(); }
                     writer.abort();
                     read_result = None;
@@ -977,7 +988,7 @@ pub async fn spawn_pty_session(
         // as a denial (a reason + nonzero exit), never as a clean shell exit.
         let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
         revoke_ticker.tick().await; // consume the immediate first tick
-        let mut revoked_reason: Option<&'static str> = None;
+        let mut revoked_reason: Option<String> = None;
 
         loop {
             tokio::select! {
@@ -1076,11 +1087,20 @@ pub async fn spawn_pty_session(
                     // A lapsed deadline ends it too; unresolvable is no opinion.
                     let lapsed =
                         matches!(crate::identity_state::peer_liveness_alive(idev.as_ref()), Some(false));
-                    if crate::cert_revoked_for(idev.as_ref()) || ceiling_gone || lapsed {
-                        crate::ui::critical("pty: peer revoked, closing the live session");
-                        revoked_reason = Some(crate::capability::REVOKED_REASON);
+                    let cut = crate::identity_state::live_session_cut(idev.as_ref());
+                    if cut.is_some() || ceiling_gone || lapsed {
+                        let reason = match cut {
+                            Some(c) => c.reason(),
+                            None => crate::capability::REVOKED_REASON.to_string(),
+                        };
+                        if matches!(cut, Some(crate::identity_state::LiveCut::Expired(_))) {
+                            crate::ui::critical("pty: peer access expired, closing the live session");
+                        } else {
+                            crate::ui::critical("pty: peer revoked, closing the live session");
+                        }
+                        revoked_reason = Some(reason.clone());
                         if let Some(b) = &bind {
-                            let msg = format!("\r\n[tunlion: {}]\r\n", crate::capability::REVOKED_REASON);
+                            let msg = format!("\r\n[tunlion: {}]\r\n", reason);
                             let _ = b.transport.send_frame(b.sid, 0, msg.as_bytes()).await;
                         }
                         break;
@@ -2869,11 +2889,30 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     // Unix-only: the control socket is a unix-domain socket (no-op elsewhere).
     #[cfg(unix)]
     if !relay {
-        if let Some(sock) = crate::ctl::try_open(peer, rport).await {
-            crate::ui::trace(&format!(
-                "tunlion: reusing warm link to '{peer}' (no establish)"
-            ));
-            return pump_stdio_over(sock).await;
+        match crate::ctl::try_open_reason(peer, rport).await {
+            Ok(sock) => {
+                crate::ui::trace(&format!(
+                    "tunlion: reusing warm link to '{peer}' (no establish)"
+                ));
+                return pump_stdio_over(sock).await;
+            }
+            // The PEER answered no through the warm link (expired, revoked,
+            // not granted): that is definitive, and the cold path would only
+            // ask again. Say it and exit as denied.
+            Err(Some(r)) if r.starts_with("refused:") => {
+                let reason = r.trim_start_matches("refused:").trim().to_string();
+                if classify_forward_refusal(&reason) == ForwardRefusal::Policy {
+                    let (code, as_name) = (
+                        crate::refusal::code_from_reason(&reason),
+                        crate::refusal::name_from_reason(&reason),
+                    );
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Denied,
+                        crate::refusal::explain("forward", peer, &reason, code, as_name.as_deref()),
+                    ));
+                }
+            }
+            Err(_) => {}
         }
     }
     // Bound the connect so an unreachable peer fails with a clear message
@@ -2959,6 +2998,24 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
             }
             None => break, // peer FIN
         }
+    }
+    // The acceptor closed the stream WITH a reason: a refusal at open (no
+    // grant, expired, revoked) or a policy cut mid-stream. That is a denial,
+    // exit 4 with the reason and its remedy, never the clean exit 0 a refused
+    // cold forward used to report with nothing on the terminal. Not waiting on
+    // stdin: the stream is over and nothing more will be read from it.
+    if let Some(reason) = mux.take_close_err(sid).await {
+        reader.abort();
+        mux.drop_stream(sid).await;
+        pump.abort();
+        if classify_forward_refusal(&reason) == ForwardRefusal::Policy {
+            let (code, as_name) = (crate::refusal::code_from_reason(&reason), crate::refusal::name_from_reason(&reason));
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::Denied,
+                crate::refusal::explain("forward", peer, &reason, code, as_name.as_deref()),
+            ));
+        }
+        bail!("forward to {peer}:{rport} closed by {peer}: {reason}");
     }
     let _ = reader.await;
     mux.drop_stream(sid).await;
