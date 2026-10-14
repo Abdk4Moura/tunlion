@@ -48,9 +48,9 @@ function ActionRow({ glyph, label, hint, onClick, tone, accent, T, danger, autoF
       onMouseLeave={() => setHov(false)}
       style={{
         display: 'flex', alignItems: 'center', gap: 11, width: '100%',
-        minHeight: 46, padding: '11px 13px', cursor: 'pointer', textAlign: 'left',
-        font: 'inherit', fontSize: 13, letterSpacing: '.01em',
-        color, border: '1px solid ' + border,
+        minHeight: 48, padding: '11px 13px', cursor: 'pointer', textAlign: 'left',
+        font: 'inherit', fontSize: 15, borderRadius: 8,
+        color, border: '1.5px solid ' + border,
         background: hov
           ? (tone === 'primary' ? accent + '14' : danger ? T.bad + '12' : (T.mode === 'light' ? 'rgba(0,0,0,.03)' : 'rgba(255,255,255,.03)'))
           : (tone === 'primary' ? accent + '0C' : 'transparent'),
@@ -60,7 +60,7 @@ function ActionRow({ glyph, label, hint, onClick, tone, accent, T, danger, autoF
       <span style={{ fontWeight: tone === 'primary' ? 700 : 500, fontSize: 13, width: 18, flexShrink: 0, textAlign: 'center', color }}>{glyph}</span>
       <span style={{ flex: 1, minWidth: 0 }}>
         <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
-        {hint && <span style={{ display: 'block', fontSize: 10.5, color: T.dim, marginTop: 2 }}>{hint}</span>}
+        {hint && <span style={{ display: 'block', fontSize: 13, color: T.dim, marginTop: 2 }}>{hint}</span>}
       </span>
     </button>
   )
@@ -69,8 +69,8 @@ function ActionRow({ glyph, label, hint, onClick, tone, accent, T, danger, autoF
 // A compact read-only info line: dim label on the left, value on the right.
 function InfoLine({ label, value, color, T }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, lineHeight: 1.5, minWidth: 0 }}>
-      <span style={{ color: T.faint, letterSpacing: '.04em', flexShrink: 0 }}>{label}</span>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, lineHeight: 1.5, minWidth: 0 }}>
+      <span style={{ color: T.faint, flexShrink: 0 }}>{label}</span>
       <span style={{ marginLeft: 'auto', color: color || T.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'right' }}>{value}</span>
     </div>
   )
@@ -114,18 +114,17 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
   const header = (
     <div style={{ padding: '14px 14px 12px', borderBottom: '1px solid ' + T.line }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 9, minWidth: 0 }}>
-        <span style={{ width: 14, height: 14, background: peer.color, display: 'block', flexShrink: 0 }} />
-        <span style={{ fontSize: D.dispName, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{displayName}</span>
+        <span style={{ fontSize: D.dispName, fontWeight: 600, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{displayName}</span>
         {known && (
-          <span style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px dashed ' + accent, padding: '2px 5px', whiteSpace: 'nowrap', flexShrink: 0 }}>REMEMBERED</span>
+          <span style={{ font: '600 10.5px/1 ui-monospace, monospace', letterSpacing: '.06em', textTransform: 'uppercase', padding: '5px 7px', borderRadius: 4, background: T.panel2, color: T.sub, whiteSpace: 'nowrap', flexShrink: 0 }}>remembered</span>
         )}
         {peer.shell && (
-          <span style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px solid ' + accent, padding: '2px 5px', whiteSpace: 'nowrap', flexShrink: 0 }}>SHELL</span>
+          <span style={{ font: '600 10.5px/1 ui-monospace, monospace', letterSpacing: '.06em', textTransform: 'uppercase', padding: '5px 7px', borderRadius: 4, background: T.panel2, color: T.sub, whiteSpace: 'nowrap', flexShrink: 0 }}>offers shell</span>
         )}
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 9, fontSize: 11, color: T.dim }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 9, fontSize: 13, color: T.dim }}>
         {rm && <span style={{ color: rm.color, letterSpacing: '.06em' }}>{rm.label}</span>}
-        <span style={{ width: 6, height: 6, background: sc, display: 'block', boxShadow: ready ? '0 0 6px ' + sc : 'none' }} />
+        <span style={{ width: 8, height: 8, borderRadius: 8, background: sc, display: 'block' }} />
         <span style={{ color: sc }}>{PEER_STATUS_LABEL[peer.status] || peer.status}</span>
         {peer.lastSeen && <span style={{ marginLeft: 'auto', color: T.faint }}>{peer.lastSeen}</span>}
       </div>
@@ -136,22 +135,22 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
   // Compact, on-theme; only shows fields the peer actually carries.
   const info = (
     <div style={{ padding: '10px 13px', borderTop: '1px solid ' + T.lineSoft, display: 'flex', flexDirection: 'column', gap: 5 }}>
-      <div style={{ fontSize: 9, letterSpacing: '.14em', color: T.faint, marginBottom: 3 }}>INFO</div>
+      <div style={{ font: '600 11px ui-monospace, monospace', letterSpacing: '.1em', textTransform: 'uppercase', color: T.faint, marginBottom: 3 }}>Info</div>
       {rm && <InfoLine label="route" value={rm.label} color={rm.color} T={T} />}
       {/* Relay honesty: the route line alone is terse; when relayed, spell out
           the no-middleman caveat in plain language right under it (still E2E). */}
       {rm && rm.relay && (
         <div data-testid="sheet-relay-explainer" style={{
-          fontSize: 10.5, lineHeight: 1.5, color: T.warn,
-          border: '1px solid ' + T.warn,
-          background: T.mode === 'light' ? 'rgba(154,107,0,.08)' : 'rgba(255,200,87,.10)',
-          padding: '7px 9px', marginTop: 2, marginBottom: 2,
+          fontSize: 13, lineHeight: 1.5, color: T.warn,
+          border: '1.5px solid ' + T.warn, borderRadius: 6,
+          background: T.warnBg || 'transparent',
+          padding: '8px 10px', marginTop: 2, marginBottom: 2,
         }}>
           {RELAY_EXPLAINER}
         </div>
       )}
       <InfoLine label="status" value={PEER_STATUS_LABEL[peer.status] || peer.status} color={sc} T={T} />
-      <InfoLine label="shell" value={peer.shell ? 'capable' : 'no'} color={peer.shell ? accent : T.sub} T={T} />
+      <InfoLine label="shell" value={peer.shell ? 'offered (it decides who may use it)' : 'not offered'} T={T} />
       {known && <InfoLine label="paired" value="remembered" color={accent} T={T} />}
       {peer.lastSeen && <InfoLine label="last seen" value={peer.lastSeen} T={T} />}
     </div>
@@ -165,10 +164,15 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
           the PRIMARY surface (mobile, sendFirst) Send must lead: first, accent,
           auto-focused so the second tap is immediate. Otherwise (desktop, where a
           tile click already sends) keep terminal-first, the action you came for. */}
+      {!ready && (
+        <div role="status" style={{ fontSize: 14, lineHeight: 1.45, color: T.text, border: '1.5px solid ' + T.line, borderRadius: 8, padding: '10px 12px' }}>
+          {displayName} isn't reachable. It may be off, or tunlion isn't running there.
+        </div>
+      )}
       {sendFirst ? (
         <>
-          <ActionRow glyph="⇪" label="Send files" hint="pick files to send" tone="primary" autoFocus
-            accent={accent} T={T} onClick={openPicker} />
+          {ready && <ActionRow glyph="⇪" label="Send files" hint="pick files to send" tone="primary" autoFocus
+            accent={accent} T={T} onClick={openPicker} />}
           {showShell && (
             <ActionRow glyph="›_" label="Open terminal" hint={`a shell on ${displayName}`}
               accent={accent} T={T} onClick={() => { onClose(); onOpenShell(peer) }} />
@@ -180,8 +184,8 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
             <ActionRow glyph="›_" label="Open terminal" hint={`a shell on ${displayName}`} tone="primary"
               accent={accent} T={T} onClick={() => { onClose(); onOpenShell(peer) }} />
           )}
-          <ActionRow glyph="⇪" label="Send files" hint="pick files to send" accent={accent} T={T}
-            onClick={openPicker} />
+          {ready && <ActionRow glyph="⇪" label="Send files" hint="pick files to send" accent={accent} T={T}
+            onClick={openPicker} />}
         </>
       )}
       {canRename && (
@@ -197,17 +201,17 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
                 // the whole sheet; Esc just cancels the rename.
                 if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setDraft(displayName); setEditing(false) }
               }}
-              placeholder="device name"
+              placeholder="device name" aria-label="device name"
               style={{
-                flex: 1, minWidth: 0, font: 'inherit', fontSize: 13, padding: '9px 10px',
-                background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none',
+                flex: 1, minWidth: 0, font: 'inherit', fontSize: 15, padding: '0 10px', minHeight: 44, borderRadius: 7,
+                background: T.bg, color: T.text, border: '1.5px solid ' + accent,
               }}
             />
             <button onClick={commitRename} title="save name" style={{
-              flexShrink: 0, font: 'inherit', fontSize: 12, padding: '9px 12px', cursor: 'pointer',
-              background: accent, color: T.onAccent, border: '1px solid ' + accent }}>save</button>
-            <button onClick={() => { setDraft(displayName); setEditing(false) }} title="cancel" style={{
-              flexShrink: 0, font: 'inherit', fontSize: 12, padding: '9px 11px', cursor: 'pointer',
+              flexShrink: 0, font: 'inherit', fontSize: 14, padding: '0 12px', minHeight: 44, borderRadius: 7, cursor: 'pointer',
+              background: accent, color: T.onAccent, border: '1px solid ' + accent }}>Save</button>
+            <button onClick={() => { setDraft(displayName); setEditing(false) }} title="cancel" aria-label="cancel rename" style={{
+              flexShrink: 0, font: 'inherit', fontSize: 14, padding: '0 11px', minHeight: 44, minWidth: 44, borderRadius: 7, cursor: 'pointer',
               background: 'transparent', color: T.dim, border: '1px solid ' + T.line }}>✕</button>
           </div>
         ) : (
@@ -239,9 +243,12 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 4500, background: 'rgba(0,0,0,.45)', display: 'flex', alignItems: 'flex-end', font: '13px ' + font }}>
         <div
           ref={panelRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label={`${displayName}: device`}
           onClick={(e) => e.stopPropagation()}
           style={{
-            width: '100%', background: T.panel, borderTop: '1px solid ' + T.line,
+            width: '100%', background: T.panel, borderTop: '1px solid ' + T.line, borderRadius: '14px 14px 0 0',
             transform: 'translateY(' + dragY + 'px)', transition: dragStart.current == null ? 'transform .18s ease-out' : 'none',
             paddingBottom: 'env(safe-area-inset-bottom, 8px)',
             boxShadow: '0 -12px 40px rgba(0,0,0,.4)',
@@ -249,7 +256,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
         >
           <div onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
             style={{ padding: '9px 0 4px', display: 'flex', justifyContent: 'center', cursor: 'grab', touchAction: 'none' }}>
-            <span style={{ width: 36, height: 4, background: T.line, display: 'block' }} />
+            <span style={{ width: 36, height: 4, borderRadius: 2, background: T.line, display: 'block' }} />
           </div>
           {header}
           {rows}
@@ -262,7 +269,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
 
   // ── Desktop: anchored popover ──────────────────────────────────
   // Anchor near the invoking tile; clamp into the viewport so it never clips.
-  const W = 268
+  const W = 300
   const vw = typeof window !== 'undefined' ? window.innerWidth : 1280
   const vh = typeof window !== 'undefined' ? window.innerHeight : 800
   let left = anchorRect ? anchorRect.left : 80
@@ -277,11 +284,14 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
       style={{ position: 'fixed', inset: 0, zIndex: 4500, font: '13px ' + font }}>
       <div
         ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${displayName}: device`}
         onClick={(e) => e.stopPropagation()}
         style={{
           position: 'absolute', left, top, width: W,
-          background: T.panel, border: '1px solid ' + T.line,
-          boxShadow: '0 14px 44px rgba(0,0,0,.45)',
+          background: T.panel, border: '1px solid ' + T.line, borderRadius: 10, overflow: 'hidden',
+          boxShadow: '0 14px 44px rgba(0,0,0,.30)',
         }}
       >
         {header}

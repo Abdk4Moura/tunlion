@@ -70,7 +70,7 @@ function makeSessionId(instanceId) {
 // accessory bar by kbInset (that would double-count the keyboard, leaving a gap
 // and shrinking the terminal). We still listen to visualViewport so a keyboard
 // open/close triggers a refit, we just keep the bar margin at 0.
-export default function WebTerminal({ link, peerName, route, T, accent, font, onClose, onBackground, hidden, instanceId, viewportPinned }) {
+export default function WebTerminal({ link, peerName, route, relation, relayExplainer, T, accent, font, uiFont, narrow, onClose, onBackground, hidden, instanceId, viewportPinned }) {
   const hostRef = useRef(null)
   const termRef = useRef(null)
   const fitRef = useRef(null)
@@ -86,6 +86,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   const [ctrlOn, setCtrlOn] = useState(false) // mirror for the UI
   const [altOn, setAltOn] = useState(false)
   const [status, setStatus] = useState('connecting')
+  const [barOpen, setBarOpen] = useState(false) // the one-line bar, expanded to the full line
   const [kbInset, setKbInset] = useState(0) // visualViewport keyboard height
   const [atBottom, setAtBottom] = useState(true) // false => show scroll-to-bottom
   const [toast, setToast] = useState('') // brief copy/paste feedback
@@ -895,23 +896,43 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
 
   return (
     <div data-session-id={instanceId} style={{ position: 'absolute', inset: 0, background: T.bg, color: T.text, fontFamily: font, display: 'flex', flexDirection: 'column' }}>
-      {/* header */}
-      <div style={{ height: 40, flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 10, padding: '0 14px', borderBottom: `1px solid ${T.line}` }}>
-        <span style={{ width: 8, height: 8, borderRadius: 8, background: dot, boxShadow: `0 0 8px ${dot}` }} />
-        <span style={{ fontSize: 13 }}>{peerName || 'shell'}</span>
-        <span style={{ fontSize: 10.5, color: accent, border: `1px solid ${accent}55`, padding: '2px 6px', background: accent + '14' }}>
-          {route || 'direct'}{status === 'connecting' ? ' · connecting…' : ''}
-        </span>
-        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 14, color: T.dim, fontSize: 13 }}>
-          {/* Background: hide the overlay WITHOUT tearing down the PTY (the
-              instance stays mounted, reachable from the SESSIONS strip). */}
-          {onBackground && (
-            <span title="background (keep running)" onClick={onBackground}
-              style={{ cursor: 'pointer', fontSize: 12, letterSpacing: '.04em' }}>hide</span>
-          )}
-          <span title="close (end session)" onClick={endSession} style={{ cursor: 'pointer', fontSize: 15 }}>✕</span>
-        </span>
-      </div>
+      {/* header: one line, "name · relation · route". Tap it for the full
+          line and the route explainer. Hide keeps the shell running (reachable
+          from Open shells on Home); End closes it. 44 px targets on phones. */}
+      {(() => {
+        const sans = uiFont || font
+        const routeWord = route === 'relayed' ? 'relay' : route === 'local' ? 'on your network' : (route || 'direct')
+        const stateWord = status === 'connecting' ? 'connecting' : status === 'closed' ? 'ended' : routeWord
+        const tgt = narrow || isTouch ? 44 : 36
+        const hb = { minHeight: tgt, minWidth: tgt, padding: '0 12px', borderRadius: 7, cursor: 'pointer', font: `600 14px ${sans}`, background: 'transparent', color: T.text, border: `1.5px solid ${T.line}` }
+        return (
+          <div style={{ flex: '0 0 auto', borderBottom: `1px solid ${T.line}`, background: T.panel || T.bg }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px' }}>
+              <button type="button" onClick={endSession} title="end the shell" aria-label={`end the shell on ${peerName || 'this device'}`} style={hb}>End</button>
+              <button type="button" onClick={() => setBarOpen((v) => !v)} aria-expanded={barOpen}
+                style={{ flex: 1, minWidth: 0, minHeight: tgt, border: 0, background: 'none', color: T.text, textAlign: 'left', cursor: 'pointer', font: `600 14px ${sans}`, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: 8, flexShrink: 0, background: dot }} />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {peerName || 'shell'} · {relation || 'remembered'} · <span style={{ color: route === 'relayed' ? T.warn : T.text }}>{stateWord}</span>
+                </span>
+                <span aria-hidden="true" style={{ color: T.sub }}>{barOpen ? '\u25b4' : '\u25be'}</span>
+              </button>
+              {onBackground && <button type="button" onClick={onBackground} title="hide (keeps running)" style={hb}>Hide</button>}
+            </div>
+            {barOpen && (
+              <div style={{ padding: '4px 12px 10px', display: 'grid', gap: 6, font: `13px/1.45 ${sans}`, color: T.sub }}>
+                <span style={{ font: `500 12.5px/1.45 ${font}`, color: T.text }}>
+                  shell on {peerName || 'this device'} · {relation || 'remembered'} · {route === 'relayed' ? 'via relay' : routeWord}
+                </span>
+                <span style={{ color: route === 'relayed' ? T.warn : T.sub }}>
+                  {route === 'relayed' ? (relayExplainer || 'On relay: not a direct link. Still end-to-end encrypted.') : 'Direct link: bytes go straight between the two devices.'}
+                </span>
+                <span>Whether this browser may open a shell is decided on {peerName || 'that device'}. Hide keeps it running; End closes it.</span>
+              </div>
+            )}
+          </div>
+        )
+      })()}
       {/* terminal (position:relative anchors the scroll-to-bottom affordance) */}
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {/* Let the xterm viewport own vertical panning; our touch handler does the
@@ -980,10 +1001,10 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
         {ROW.map((k, i) => {
           const active = k.on
           return (
-            <button key={i} data-key={k.l} onClick={k.fn || (() => sendKey(k.l))} style={{
-              flex: '0 0 auto', minWidth: 38, padding: '9px 11px', fontFamily: font, fontSize: 12,
+            <button key={i} data-key={k.l} aria-label={k.l} aria-pressed={k.on === undefined ? undefined : !!k.on} onClick={k.fn || (() => sendKey(k.l))} style={{
+              flex: '0 0 auto', minWidth: narrow || isTouch ? 44 : 38, minHeight: narrow || isTouch ? 44 : 34, padding: '0 11px', fontFamily: font, fontSize: 13, borderRadius: 7,
               cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all .1s',
-              border: `1px solid ${active ? accent : T.lineSoft}`, color: active ? T.onAccent : T.sub,
+              border: `1px solid ${active ? accent : T.line}`, color: active ? T.onAccent : T.text,
               background: active ? accent : 'transparent',
             }}>{k.g || k.l}</button>
           )

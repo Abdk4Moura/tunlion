@@ -12,8 +12,8 @@
 //
 // It starts a LOCAL backend serving frontend/dist SAME-ORIGIN (a prod-pointing
 // dist makes every Playwright nav time out — see cli/tests/gates.sh), loads
-// /rooms/<room> (link scope renders the "pair with code" affordance), and:
-//   1. opens the code entry, types "grand hawk ruby 8045" CHAR-BY-CHAR ->
+// /rooms/<room> (the code box is on Home in every scope), and:
+//   1. picks "Remember a device" in the code box, types "grand hawk ruby 8045" CHAR-BY-CHAR ->
 //      asserts value === "GRAND-HAWK-RUBY-8045".
 //   2. THE REGRESSION CHECK: moves the caret into the middle, types a
 //      transform-triggering lowercase char then a chained second char, and
@@ -150,11 +150,13 @@ function startHarnessServer(bundlePath) {
   await page.goto(`${BACK_URL}/rooms/demo-${Date.now()}`, { waitUntil: 'networkidle' });
   ok('page loaded (link scope)');
 
-  // Open the code entry.
-  const pairBtn = page.getByText('pair with code', { exact: true }).first();
-  await pairBtn.waitFor({ timeout: 30000 });
-  await pairBtn.click();
-  const input = page.getByPlaceholder('ENTER CODE');
+  // The code box is always on Home now (one box for every code); pick what the
+  // code is for, then focus the field. The assertions below are unchanged: they
+  // pin the cursor-safe auto-dash, which is the behaviour this gate exists for.
+  const pairMode = page.getByRole('radio', { name: 'Remember a device' }).first();
+  await pairMode.waitFor({ timeout: 30000 });
+  await pairMode.click();
+  const input = page.getByLabel('Enter a code', { exact: true }).first();
   await input.waitFor({ timeout: 10000 });
   await input.click();
   ok('code entry open');
