@@ -1,5 +1,7 @@
 # Relationship UX: derived states, code-addressable verbs, guests
 
+> Superseded where they disagree by `docs/design-ux-from-jobs.md` (merged UX design, 14 Oct 2026).
+
 > Status: design, 2026-09-17. Docs only, no Rust. Companion pieces:
 > `CONTRACT.md` (the wire-visible frames) and `docs/ux-tickets.md` (the build
 > order). Sits on top of `docs/design-identity-access-ux.md` (capabilities, not
