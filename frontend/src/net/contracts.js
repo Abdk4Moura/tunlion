@@ -39,8 +39,8 @@
  * (PAKE pairing, file-transfer) are separate PROTOCOL modules that build on this.
  *
  * @typedef {Object} ProtocolCodec
- * @property {(sid: number, payload: Uint8Array) => Uint8Array} frame
- * @property {(buf: ArrayBuffer) => ({sid: number, payload: Uint8Array}|null)} parseFrame
+ * @property {(sid: number, payload: Uint8Array, offset?: number) => Uint8Array} frame
+ * @property {(buf: ArrayBuffer) => ({sid: number, offset: number, payload: Uint8Array}|null)} parseFrame
  * @property {(obj: object) => string} encodeControl
  * @property {(s: string) => object} decodeControl
  * @property {(n: number) => number} highHalfSid

@@ -41,6 +41,18 @@ jobs:
         working-directory: frontend
         run: npm ci --no-audit --no-fund
 
+      # The pure protocol and state tests (plain node, no browser). wire.test
+      # pins the frame layout to the CLI's; it existed but ran nowhere, which
+      # is how the browser kept a 4-byte header for months after the CLI moved
+      # to 12.
+      - name: Frontend unit tests
+        working-directory: frontend
+        run: |
+          set -e
+          for f in $(find src test -name '*.test.mjs' | sort); do
+            echo "== $f"; node "$f"
+          done
+
       - name: Install Chromium
         working-directory: frontend
         run: npx playwright install --with-deps chromium

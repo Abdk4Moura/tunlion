@@ -336,7 +336,16 @@ export function useTunlion() {
         stores: { partials: partialsRef.current, outgoing: outgoingRef.current },
         sendSignal: (data) => sigRef.current.signal(id, data),
         onStatus: (status) => updatePeer(id, { status }),
-        onTransfer: (t) => upsertTransfer(t),
+        onTransfer: (t) => {
+          upsertTransfer(t)
+          // Receive with code: typing the code was the consent, as on the CLI
+          // (`tunlion receive <code>` never asks). Accept the authenticated
+          // sender's offer instead of leaving it waiting on a second click
+          // while the sender times out.
+          if (t.direction === 'receive' && t.status === 'offered' && ephemeralAuthRef.current.has(id)) {
+            queueMicrotask(() => link.acceptTransfer(t.id))
+          }
+        },
         onRoute: (route) => updatePeer(id, { route }),
         // web-shell: the peer announced whether it offers a terminal, surfaces
         // the per-device shell button only for shell-enabled devices.

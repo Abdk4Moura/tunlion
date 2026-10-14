@@ -706,7 +706,8 @@ export class PeerLink {
 
   _onMessage(data) {
     if (typeof data === 'string') return this._onControl(decodeControl(data))
-    // Binary frame: [4-byte sid][payload]; parseFrame returns null for a runt.
+    // Binary frame: [4-byte sid][8-byte offset][payload]; parseFrame returns
+    // null for a runt.
     const f = wireParseFrame(data)
     if (!f) return
     const { sid, payload } = f
@@ -774,6 +775,7 @@ export class PeerLink {
   // two opens to the same remote PTY.
   openPty(cols, rows, session) {
     this._ptySid = highHalfSid(this._nextSid++)
+    this._ptyOut = 0 // bytes sent on this sid: the frame offset (wire.js)
     this._ptySession = session || null
     // PTY session event: an open is a fresh-or-reattach request carrying the
     // stable session id (the persistence path); the ack ('pty-attach') tells us
@@ -794,7 +796,8 @@ export class PeerLink {
       this._liveness.markFrozenForTest()
       return // drop input on the floor; nothing reaches the wire
     }
-    this.channel.send(wireFrame(this._ptySid, u8))
+    this.channel.send(wireFrame(this._ptySid, u8, this._ptyOut))
+    this._ptyOut += u8.byteLength
   }
   resizePty(cols, rows) {
     if (this._ptySid != null) this._control({ type: 'pty-resize', sid: this._ptySid, cols, rows })
@@ -1114,8 +1117,9 @@ export class PeerLink {
         await new Promise((res) => this._drainWaiters.push(res))
         if (this._closed || this.channel?.readyState !== 'open') return
       }
-      // Frame: [uint32 sid][payload] (net/protocol/wire.js)
-      const framed = wireFrame(sid, new Uint8Array(buf))
+      // Frame: [uint32 sid][uint64 offset][payload] (net/protocol/wire.js). The
+      // CLI receiver places bytes by this offset.
+      const framed = wireFrame(sid, new Uint8Array(buf), offset)
       // P0 test shim (?test=freeze): after FREEZE_AFTER_BYTES on THIS transfer,
       // make the data-path send a no-op ONCE (one-shot per transfer) while the
       // channel stays open, a faithful NAT-rebind black-hole. The control path
