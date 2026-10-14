@@ -605,6 +605,14 @@ pub(crate) async fn handle_auth_key_enroll_response(
                 // Ephemeral: nothing durable is written; the name is session-only.
                 requested_name
             };
+            // A person's invitation enrols with an owner-signed certificate like
+            // a device's; record what was invited so `devices` files them as
+            // someone else's, not as one of the owner's devices.
+            if persistent && crate::armed::invitee_kind(&hex::encode(enroll_pub)).as_deref() == Some("person") {
+                if let Err(error) = crate::devices_store::devices_mark_invited_as(&stored_name, "person") {
+                    ui::debug(&format!("enroll response: could not record the invited kind: {error}"));
+                }
+            }
             // Admit as Delegated principal — structurally, all four fields together
             if let Some(link) = conn.link_mut(&pid) {
                 link.verified_name = Some(stored_name.clone());

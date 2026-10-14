@@ -278,7 +278,7 @@ pub(crate) async fn add_for_cmd(
     // no bind race, no platform branch, no control channel. The only thing the
     // mint cannot guarantee is that a RECEIVER is actually running to pick the
     // key up - check that, and offer to start one.
-    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires, _invitee_name.clone());
+    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires, _invitee_name.clone(), Some(kind.clone()));
     // Make the daemon subscribe the enrollment channel NOW rather than on its next
     // idle tick, so a joiner that arrives within a second (a QR scan, a script) is
     // not left waiting on an empty channel. Measured: ~1.0-1.2 s back-to-back vs

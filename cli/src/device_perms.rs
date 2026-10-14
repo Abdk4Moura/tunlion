@@ -169,7 +169,7 @@ pub(crate) fn perms_for(
 ) -> DevicePerms {
     let name = record["name"].as_str().unwrap_or("").to_string();
     let cert = identity::DeviceCert::from_json(&record["deviceCert"]);
-    let tier = match tier_for(cert.as_ref(), same_owner) {
+    let tier = match tier_for(cert.as_ref(), same_owner, record["invitedAs"].as_str() == Some("person")) {
         DeviceTier::Fleet => "FLEET",
         DeviceTier::External => "EXTERNAL",
         DeviceTier::NeedsReview => "NEEDS REVIEW",
