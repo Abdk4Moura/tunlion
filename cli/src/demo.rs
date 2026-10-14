@@ -11,14 +11,16 @@
 //! the real command-line definition, so the tour cannot drift into showing a
 //! verb or a flag the binary no longer has.
 //!
-//! Look and motion follow the product design: the tunnel mark with its cursor
-//! block, the accent orange, the "pulse" (the cursor squashing on a |..||
-//! rhythm) while waiting on the other side, and the "knock" (three hops) when
-//! something waits on you. Motion stops under --reduced-motion or
-//! TUNLION_REDUCED_MOTION, and on any terminal that cannot redraw in place.
+//! Look and motion come from the shared design palette in `style.rs`: the
+//! tunnel mark with its cursor block, the accent, the "pulse" (the cursor
+//! squashing on a |..|| rhythm) while waiting on the other side, and the
+//! "knock" (three hops) when something waits on you. Motion stops under
+//! --reduced-motion or TUNLION_REDUCED_MOTION, and on any terminal that cannot
+//! redraw in place.
 
 use anyhow::Result;
 use std::io::{IsTerminal, Write};
+use crate::style;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -293,8 +295,8 @@ pub(crate) enum Tone {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Style {
     pub(crate) color: bool,
-    pub(crate) truecolor: bool,
-    pub(crate) light: bool,
+    pub(crate) depth: style::Depth,
+    pub(crate) bg: style::Bg,
     pub(crate) unicode: bool,
     /// The terminal can redraw a line in place.
     pub(crate) live: bool,
@@ -302,30 +304,17 @@ pub(crate) struct Style {
     pub(crate) motion: bool,
 }
 
-/// Whether COLORFGBG says the background is light ("fg;bg", bg 7 or 15). Pure.
-pub(crate) fn light_background(colorfgbg: Option<&str>) -> bool {
-    colorfgbg
-        .and_then(|v| v.rsplit(';').next())
-        .and_then(|bg| bg.trim().parse::<u8>().ok())
-        .is_some_and(|bg| bg == 7 || bg == 15)
-}
-
 impl Style {
     fn detect(reduced: bool) -> Style {
         let term = std::env::var("TERM").unwrap_or_default();
         let tty = std::io::stdout().is_terminal();
         let live = tty && term != "dumb";
-        let color = crate::ui::stdout_color();
-        let truecolor = color
-            && std::env::var("COLORTERM")
-                .map(|v| v.contains("truecolor") || v.contains("24bit"))
-                .unwrap_or(false);
-        let reduced = reduced
-            || std::env::var("TUNLION_REDUCED_MOTION").is_ok_and(|v| !v.is_empty() && v != "0");
+        let var = |k: &str| std::env::var(k).ok();
+        let reduced = reduced || style::reduced_motion_from(var("TUNLION_REDUCED_MOTION").as_deref());
         Style {
-            color,
-            truecolor,
-            light: light_background(std::env::var("COLORFGBG").ok().as_deref()),
+            color: crate::ui::stdout_color(),
+            depth: style::depth_from(var("COLORTERM").as_deref(), &term),
+            bg: style::bg_from(var("TUNLION_THEME").as_deref(), var("COLORFGBG").as_deref()),
             unicode: crate::ui::caps().unicode,
             live,
             motion: live && !reduced,
@@ -335,34 +324,28 @@ impl Style {
     /// Plain text, no color, no motion: what a pipe or a test gets.
     #[cfg(test)]
     fn plain() -> Style {
-        Style { color: false, truecolor: false, light: false, unicode: false, live: false, motion: false }
+        Style {
+            color: false,
+            depth: style::Depth::Ansi256,
+            bg: style::Bg::Unknown,
+            unicode: false,
+            live: false,
+            motion: false,
+        }
     }
 
-    /// The design tokens (tl-ui.jsx), dark or light theme, as SGR.
+    /// The shared design palette (`style.rs`) for each tone.
     fn sgr(&self, t: Tone) -> String {
-        // (truecolor rgb, 256-color index) per token.
-        let (acc, acc_ink, ok, bad, sub) = if self.light {
-            (((213, 92, 19), 166), ((165, 62, 0), 130), ((19, 119, 56), 28), ((175, 59, 67), 131), ((93, 90, 83), 240))
-        } else {
-            (((227, 105, 39), 166), ((241, 146, 102), 209), ((115, 195, 133), 114), ((245, 138, 139), 210), ((162, 158, 148), 247))
+        let (role, bold) = match t {
+            Tone::Plain => return String::new(),
+            Tone::Strong => (style::Role::Strong, true),
+            Tone::Quiet => (style::Role::Sub, false),
+            Tone::Ok => (style::Role::Ok, false),
+            Tone::Bad => (style::Role::Bad, false),
+            Tone::Accent => (style::Role::Accent, true),
+            Tone::Code => (style::Role::Accent, false),
         };
-        let fg = |c: ((u8, u8, u8), u8), bold: bool| {
-            let b = if bold { "1;" } else { "" };
-            if self.truecolor {
-                format!("\x1b[{b}38;2;{};{};{}m", c.0 .0, c.0 .1, c.0 .2)
-            } else {
-                format!("\x1b[{b}38;5;{}m", c.1)
-            }
-        };
-        match t {
-            Tone::Plain => String::new(),
-            Tone::Strong => "\x1b[1m".to_string(),
-            Tone::Quiet => fg(sub, false),
-            Tone::Ok => fg(ok, false),
-            Tone::Bad => fg(bad, false),
-            Tone::Accent => fg(acc, true),
-            Tone::Code => fg(acc_ink, false),
-        }
+        style::sgr(role, bold, self.depth, self.bg)
     }
 
     pub(crate) fn paint(&self, t: Tone, s: &str) -> String {
@@ -388,39 +371,25 @@ impl Style {
 
 // ---------------------------------------------------------------- motion --
 
-/// The cursor block at rest, squashed (pulse) and raised (knock).
-fn block(unicode: bool, state: Block) -> &'static str {
-    match (unicode, state) {
-        (true, Block::Rest) => "▇",
-        (true, Block::Squash) => "▃",
-        (true, Block::Hop) => "█",
-        (false, Block::Rest) => "|",
-        (false, Block::Squash) => ".",
-        (false, Block::Hop) => "!",
-    }
-}
-
+/// Which motif a cursor block shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Block {
+pub(crate) enum Motion {
+    /// At rest (no motion, or reduced motion).
     Rest,
-    Squash,
-    Hop,
+    /// Waiting on the other side: the pulse.
+    Pulse(u128),
+    /// Waiting on you: the knock.
+    Knock(u128),
 }
 
-/// The pulse: one squash, a gap, then two quick ones (|..||), on a 2.4 s loop.
-/// The design's 5 s loop is compressed so a short wait still shows the rhythm.
-/// Pure.
-pub(crate) fn pulse_frame(elapsed_ms: u64) -> Block {
-    let t = elapsed_ms % 2400;
-    let squash = |at: u64| t >= at && t < at + 90;
-    if squash(300) || squash(1100) || squash(1320) { Block::Squash } else { Block::Rest }
-}
-
-/// The knock: three quick hops, then rest, on a 2 s loop. Pure.
-pub(crate) fn knock_frame(elapsed_ms: u64) -> Block {
-    let t = elapsed_ms % 2000;
-    let hop = |at: u64| t >= at && t < at + 80;
-    if hop(0) || hop(160) || hop(320) { Block::Hop } else { Block::Rest }
+/// The cursor block for a motif frame, from the shared palette's motion. Pure.
+fn block(unicode: bool, m: Motion) -> String {
+    match m {
+        Motion::Rest => style::pulse_frame(0, unicode, true),
+        Motion::Pulse(ms) => style::pulse_frame(ms, unicode, false),
+        Motion::Knock(ms) => style::knock_frame(ms, unicode, false),
+    }
+    .to_string()
 }
 
 // ------------------------------------------------------------------ text --
@@ -599,7 +568,7 @@ impl<W: Write> Player<W> {
     fn banner(&mut self) {
         let s = self.style;
         let (top, side) = if s.unicode { ("╭───╮", "│") } else { (".---.", "|") };
-        let b = self.paint(Tone::Accent, block(s.unicode, Block::Rest));
+        let b = self.paint(Tone::Accent, block(s.unicode, Motion::Rest));
         self.line("");
         self.line(&format!("  {top}"));
         let title = self.paint(Tone::Strong, "tunlion demo");
@@ -672,7 +641,7 @@ impl<W: Write> Player<W> {
         self.pause(90)
     }
 
-    fn prompt(&self, on: &str, frame: Block) -> String {
+    fn prompt(&self, on: &str, frame: Motion) -> String {
         format!(
             "{} {} $ ",
             self.paint(Tone::Accent, block(self.style.unicode, frame)),
@@ -704,7 +673,7 @@ impl<W: Write> Player<W> {
         self.fast = false;
         match self.input {
             Input::None => {
-                let p = self.prompt(on, Block::Rest);
+                let p = self.prompt(on, Motion::Rest);
                 self.pause(400)?;
                 self.type_out(&p, cmd)
             }
@@ -740,7 +709,7 @@ impl<W: Write> Player<W> {
         }
     }
 
-    fn input_line(&self, on: &str, cmd: &str, buf: &str, frame: Block) -> (String, usize) {
+    fn input_line(&self, on: &str, cmd: &str, buf: &str, frame: Motion) -> (String, usize) {
         let mut typed = String::new();
         let want: Vec<char> = cmd.chars().collect();
         let mut matches = true;
@@ -776,18 +745,19 @@ impl<W: Write> Player<W> {
         }
         let mut buf = String::new();
         let start = Instant::now();
-        let mut last_frame = None;
+        let mut last_glyph = String::new();
         let mut dirty = true;
         loop {
-            let frame = if self.style.motion { knock_frame(start.elapsed().as_millis() as u64) } else { Block::Rest };
-            if dirty || last_frame != Some(frame) {
+            let frame = if self.style.motion { Motion::Knock(start.elapsed().as_millis()) } else { Motion::Rest };
+            let glyph = block(self.style.unicode, frame);
+            if dirty || glyph != last_glyph {
                 let (l, back) = self.input_line(on, cmd, &buf, frame);
                 self.redraw(&l);
                 if back > 0 {
                     let _ = write!(self.out, "\x1b[{back}D");
                     let _ = self.out.flush();
                 }
-                last_frame = Some(frame);
+                last_glyph = glyph;
                 dirty = false;
             }
             let Some(k) = read_key(Duration::from_millis(40)) else { continue };
@@ -805,12 +775,12 @@ impl<W: Write> Player<W> {
                 Key::CtrlU => buf.clear(),
                 Key::Char(c) => buf.push(c),
                 Key::Enter if buf.trim().is_empty() => {
-                    let p = self.prompt(on, Block::Rest);
+                    let p = self.prompt(on, Motion::Rest);
                     self.redraw("");
                     return self.type_out(&p, cmd);
                 }
                 Key::Enter if same_command(&buf, cmd) => {
-                    let (l, _) = self.input_line(on, cmd, cmd, Block::Rest);
+                    let (l, _) = self.input_line(on, cmd, cmd, Motion::Rest);
                     self.redraw(&l);
                     self.line("");
                     return Ok(());
@@ -829,14 +799,14 @@ impl<W: Write> Player<W> {
     fn wait(&mut self, label: &str, ms: u32) -> Result<(), Stop> {
         let scaled = if self.speed <= 0.0 { 0.0 } else { ms as f64 / self.speed };
         if !self.style.motion || self.fast || scaled < 1.0 {
-            let l = format!("  {} {}", self.paint(Tone::Accent, block(self.style.unicode, Block::Rest)), self.paint(Tone::Quiet, label));
+            let l = format!("  {} {}", self.paint(Tone::Accent, block(self.style.unicode, Motion::Rest)), self.paint(Tone::Quiet, label));
             self.line(&l);
             return self.pause(ms);
         }
         let start = Instant::now();
         let total = Duration::from_secs_f64(scaled / 1000.0);
         while start.elapsed() < total {
-            let f = pulse_frame(start.elapsed().as_millis() as u64);
+            let f = Motion::Pulse(start.elapsed().as_millis());
             let l = format!("  {} {}", self.paint(Tone::Accent, block(self.style.unicode, f)), self.paint(Tone::Quiet, label));
             self.redraw(&l);
             self.pause_raw(40)?;
@@ -1172,18 +1142,27 @@ mod tests {
     }
 
     #[test]
-    fn color_uses_the_design_tokens() {
+    fn color_uses_the_shared_palette() {
         let mut st = Style::plain();
         st.color = true;
         let p = Player::new(Vec::new(), st, true, 0.0, 80);
-        // Accent orange in 256 colors, success green, error red (dark theme).
-        assert!(p.render_out("*  code").contains("38;5;166"));
-        assert!(p.render_out("OK done").contains("38;5;114"));
-        assert!(p.render_out("ERR no").contains("38;5;210"));
-        st.truecolor = true;
-        assert!(st.paint(Tone::Accent, "x").contains("38;2;227;105;39"));
-        st.light = true;
-        assert!(st.paint(Tone::Ok, "x").contains("38;2;19;119;56"));
+        // The accent, ok and bad roles of style.rs, unknown background, 256 colors.
+        assert!(p.render_out("*  code").contains(&style::sgr(style::Role::Accent, true, style::Depth::Ansi256, style::Bg::Unknown)));
+        assert!(p.render_out("OK done").contains(&style::sgr(style::Role::Ok, false, style::Depth::Ansi256, style::Bg::Unknown)));
+        assert!(p.render_out("ERR no").contains(&style::sgr(style::Role::Bad, false, style::Depth::Ansi256, style::Bg::Unknown)));
+        st.depth = style::Depth::True;
+        st.bg = style::Bg::Light;
+        assert_eq!(st.paint(Tone::Ok, "x"), format!("{}x\x1b[0m", style::sgr(style::Role::Ok, false, style::Depth::True, style::Bg::Light)));
+    }
+
+    #[test]
+    fn the_cursor_block_moves_only_when_asked() {
+        assert_eq!(block(true, Motion::Rest), block(true, Motion::Pulse(0)));
+        let pulse: std::collections::BTreeSet<String> = (0..2000).step_by(10).map(|t| block(true, Motion::Pulse(t))).collect();
+        assert!(pulse.len() >= 2, "the pulse never squashes");
+        let knock: std::collections::BTreeSet<String> = (0..2000).step_by(10).map(|t| block(true, Motion::Knock(t))).collect();
+        assert!(knock.len() >= 2, "the knock never hops");
+        assert!(block(false, Motion::Rest).is_ascii());
     }
 
     #[test]
@@ -1194,25 +1173,6 @@ mod tests {
         assert_eq!(p.render_out("~quiet"), "quiet");
         assert_eq!(p.render_out("a {.} b"), "a - b");
         assert_eq!(p.render_out("$ tunlion init   set up"), "  tunlion init   set up");
-    }
-
-    #[test]
-    fn pulse_squashes_once_then_twice() {
-        let squashes: Vec<u64> = (0..2400).step_by(10).filter(|&t| pulse_frame(t) == Block::Squash).collect();
-        assert!(squashes.contains(&300) && squashes.contains(&1100) && squashes.contains(&1320));
-        assert_eq!(pulse_frame(0), Block::Rest);
-        assert_eq!(pulse_frame(2000), Block::Rest);
-        // Three separate squashes: the |..|| rhythm.
-        let starts = squashes.windows(2).filter(|w| w[1] - w[0] > 10).count() + 1;
-        assert_eq!(starts, 3);
-    }
-
-    #[test]
-    fn knock_hops_three_times() {
-        let hops: Vec<u64> = (0..2000).step_by(10).filter(|&t| knock_frame(t) == Block::Hop).collect();
-        let starts = hops.windows(2).filter(|w| w[1] - w[0] > 10).count() + 1;
-        assert_eq!(starts, 3);
-        assert_eq!(knock_frame(1000), Block::Rest);
     }
 
     #[test]
@@ -1232,12 +1192,4 @@ mod tests {
         assert!(!same_command("tunlion ad", "tunlion add"));
     }
 
-    #[test]
-    fn light_background_from_colorfgbg() {
-        assert!(light_background(Some("0;15")));
-        assert!(light_background(Some("0;default;7")));
-        assert!(!light_background(Some("15;0")));
-        assert!(!light_background(None));
-        assert!(!light_background(Some("garbage")));
-    }
 }
