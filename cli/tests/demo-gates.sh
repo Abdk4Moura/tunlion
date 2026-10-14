@@ -18,8 +18,8 @@
 #   C  Ctrl-C at an interactive prompt exits 130 and restores the terminal
 #      (cursor shown, raw mode off).
 #   N  NO_COLOR and TERM=dumb: no color and no in-place redraw sequences.
-#   Z  isolation: nothing is written under HOME (no ~/.config/tunlion), and the
-#      private temp config directory is gone afterwards.
+#   Z  isolation: nothing is written under HOME (no ~/.config/tunlion) or the
+#      temp directory, whatever the exit path (including a refused run).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
@@ -150,7 +150,7 @@ else
 fi
 
 # ---------------------------------------------------------------------- Z --
-say "Z: nothing written outside a private temp directory, and that is removed"
+say "Z: nothing written under HOME or the temp directory"
 leftover=0; written=0
 for h in "$WORK"/home-*; do
   [ -e "$h/.config/tunlion" ] && written=$((written+1))
@@ -158,7 +158,7 @@ for h in "$WORK"/home-*; do
   [ -n "$(ls -A "$h/tmp" 2>/dev/null)" ] && leftover=$((leftover+1))
 done
 if [ "$written" = 0 ] && [ "$leftover" = 0 ]; then
-  ok "Z: every run left HOME untouched and removed its temp config directory"
+  ok "Z: every run, including the refused one, left HOME and the temp directory untouched"
 else
   bad "Z isolation ($written HOMEs written, $leftover temp dirs left)"
   for h in "$WORK"/home-*; do find "$h" -mindepth 1 | head -5; done

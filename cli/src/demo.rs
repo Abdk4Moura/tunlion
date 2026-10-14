@@ -2,9 +2,10 @@
 //!
 //! Every peer, code and output line in the tour is scripted. Nothing here
 //! opens a socket, reads the user's identity or writes their state:
-//! `async_main` calls [`isolate`] before its start-up housekeeping runs, so
-//! TUNLION_CONFIG_DIR points at a private temp directory for the whole
-//! process, and [`cleanup`] removes it on every exit path.
+//! `async_main` calls [`isolate`] first, which points TUNLION_CONFIG_DIR at a
+//! path under the temp directory that is never created, and skips its
+//! start-up housekeeping (the permission sweep writes a stamp file), so the
+//! real config directory is neither read nor written.
 //!
 //! The commands shown are the real ones. A unit test parses each of them with
 //! the real command-line definition, so the tour cannot drift into showing a
@@ -241,31 +242,23 @@ pub(crate) fn invoked(argv: &[String]) -> bool {
 
 static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Point this process's config directory at a fresh private temp directory,
-/// before anything can read or write the real one.
+/// Point this process's config directory at a path under the temp directory,
+/// before anything can read the real one. The path is never created: a
+/// missing directory reads as an empty state, and nothing in the demo writes.
 pub(crate) fn isolate() {
     let dir = std::env::temp_dir().join(format!("tunlion-demo-{}", std::process::id()));
-    let made = {
-        let mut b = std::fs::DirBuilder::new();
-        b.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            b.mode(0o700);
-        }
-        b.create(&dir).is_ok()
-    };
-    if made {
-        let _ = TEMP_DIR.set(dir.clone());
-    }
-    // Set even when creating it failed: a missing directory reads as an empty
-    // state, which is still not the user's real one.
+    let _ = TEMP_DIR.set(dir.clone());
     // SAFETY: called at the top of async_main, before this process spawns any
     // task of its own; the same pattern sets TUNLION_NAME there.
     unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
 }
 
-/// Remove the temp directory [`isolate`] made. Idempotent.
+/// Whether [`isolate`] ran in this process.
+pub(crate) fn isolated() -> bool {
+    TEMP_DIR.get().is_some()
+}
+
+/// Remove the isolated config path if anything did create it. Idempotent.
 pub(crate) fn cleanup() {
     if let Some(d) = TEMP_DIR.get() {
         let _ = std::fs::remove_dir_all(d);
@@ -273,7 +266,11 @@ pub(crate) fn cleanup() {
 }
 
 /// Leave the terminal as we found it: cooked mode, cursor shown, colors off.
+/// A pipe gets nothing: it was never a terminal to restore.
 fn restore_terminal() {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
     let _ = crossterm::terminal::disable_raw_mode();
     let mut out = std::io::stdout();
     let _ = write!(out, "\x1b[0m\x1b[?25h");
