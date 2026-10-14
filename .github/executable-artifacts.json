@@ -141,6 +141,17 @@
       ]
     },
     {
+      "path": "cli/tests/exec-latency-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/exec-latency-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/fleet-cert-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/fleet-cert-gates.sh",
@@ -338,6 +349,7 @@
       "disposition": "support",
       "invoked_by": [
         "cli/tests/devices-write-race-gates.sh",
+        "cli/tests/exec-latency-gates.sh",
         "cli/tests/fleet-cert-gates.sh",
         "cli/tests/forward-refusal-gates.sh",
         "cli/tests/invite-expiry-gates.sh",
