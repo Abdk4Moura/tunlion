@@ -504,6 +504,8 @@ pub(crate) struct Player<W: Write> {
     width: usize,
     /// Rest of this step plays without pauses (Enter during playback).
     fast: bool,
+    /// Nothing has been printed since the step header (which ends in a blank).
+    fresh: bool,
     /// The keys hint has been shown.
     hinted: bool,
 }
@@ -517,7 +519,7 @@ impl<W: Write> Player<W> {
         } else {
             Input::Lines
         };
-        Player { out, style, input, speed, width: width.clamp(40, 80), fast: false, hinted: false }
+        Player { out, style, input, speed, width: width.clamp(40, 80), fast: false, fresh: true, hinted: false }
     }
 
     fn nl(&self) -> &'static str {
@@ -606,6 +608,10 @@ impl<W: Write> Player<W> {
     }
 
     fn say(&mut self, text: &str) -> Result<(), Stop> {
+        // Set an explanation apart from the output above it.
+        if !self.fresh {
+            self.line("");
+        }
         for l in wrap(text, self.width, "  ") {
             let l = self.paint(Tone::Quiet, &l);
             self.line(&l);
@@ -714,7 +720,9 @@ impl<W: Write> Player<W> {
         let want: Vec<char> = cmd.chars().collect();
         let mut matches = true;
         for (i, c) in buf.chars().enumerate() {
-            if want.get(i) == Some(&c) {
+            // After the first wrong character everything is wrong: a later
+            // character that happens to line up is not progress.
+            if matches && want.get(i) == Some(&c) {
                 typed.push_str(&self.paint(Tone::Strong, &c.to_string()));
             } else {
                 matches = false;
@@ -859,6 +867,12 @@ impl<W: Write> Player<W> {
     }
 
     fn act(&mut self, a: &Act) -> Result<(), Stop> {
+        let r = self.act_inner(a);
+        self.fresh = matches!(a, Say(_)) && r.is_ok();
+        r
+    }
+
+    fn act_inner(&mut self, a: &Act) -> Result<(), Stop> {
         match a {
             Say(t) => self.say(t),
             Run { on, cmd } => self.run_cmd(on, cmd),
@@ -912,6 +926,7 @@ impl<W: Write> Player<W> {
         for (i, step) in STEPS.iter().enumerate().skip(from) {
             self.header(i, n, step.title);
             self.fast = false;
+            self.fresh = true;
             let mut skipped = false;
             for a in step.acts {
                 match self.act(a) {
