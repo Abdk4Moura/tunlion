@@ -55,10 +55,17 @@ tty_shell() {
     "$out.pid" "$session" "$WORK/$dev" "$BIN" "$SERVER" "$cmd")
   script -qfec "sh -c $(printf '%q' "$inner")" "$out" >/dev/null 2>&1 &
   FIX_PIDS+=($!)
+  echo $! > "$out.spid"
   local i
   for i in $(seq 1 50); do [ -s "$out.pid" ] && break; sleep 0.2; done
   FIX_PIDS+=("$(cat "$out.pid" 2>/dev/null)")
 }
+
+# Stop and continue the CLIENT. util-linux `script` mirrors a stopped child by
+# stopping itself, and then nobody would copy the client's output to the file,
+# so it is continued too.
+client_stop() { kill -STOP "$(cat "$1.pid")"; }
+client_cont() { kill -CONT "$(cat "$1.pid")" "$(cat "$1.spid")" 2>/dev/null; }
 
 wait_for() {  # $1 = seconds, $2 = file, $3 = extended regex
   local i
@@ -77,11 +84,11 @@ if ! wait_for 30 "$WORK/r.tty" 'TICK-5'; then
   tail -c 600 "$WORK/r.tty"
   declare_known_red_summary; exit 1
 fi
-kill -STOP "$RPID"
+client_stop "$WORK/r.tty"
 stopped_at=$(grep -oE 'TICK-[0-9]+' "$WORK/r.tty" | tail -1 | cut -d- -f2)
 echo "## client stopped after TICK-$stopped_at; holding ${DETACH_WAIT}s"
 sleep "$DETACH_WAIT"
-kill -CONT "$RPID"
+client_cont "$WORK/r.tty"
 target=$((stopped_at + DETACH_WAIT + 10))
 if wait_for 60 "$WORK/r.tty" "TICK-$target\b"; then
   ok "R1: the shell survived the link replacement (TICK-$target arrived after it)"
@@ -97,7 +104,9 @@ dups=$(printf '%s\n' "$ticks" | sort -n | uniq -d | tr '\n' ' ')
 expected=$(seq 1 "${max:-0}" | tr '\n' ' ')
 got=$(printf '%s\n' "$ticks" | tr '\n' ' ')
 echo "## ticks seen: $n, highest $max, repeated: [${dups}]"
-if [ -n "$dups" ]; then
+if [ "${max:-0}" -le "$stopped_at" ]; then
+  bad "R2: nothing arrived after the break, so intactness across it is unproven"
+elif [ -n "$dups" ]; then
   bad "R2: output repeated after the reattach (ticks seen twice: $dups)"
 elif [ "$got" != "$expected" ]; then
   bad "R2: output has a gap or is out of order"
@@ -112,7 +121,7 @@ tty_shell bravo "$WORK/x.tty" \
   "echo BRAVO-MARK; while :; do date +%s > $WORK/beat-x; sleep 1; done" shared
 XPID=$(cat "$WORK/x.tty.pid")
 wait_for 30 "$WORK/x.tty" 'BRAVO-MARK' || fixture_die "X1: setup: bravo's named shell never started"
-kill -STOP "$XPID"
+client_stop "$WORK/x.tty"
 sleep "$DETACH_WAIT"
 out=$(fs_bounded 45 env TUNLION_SHELL_SESSION=shared TUNLION_CONFIG_DIR="$WORK/charlie" \
   "$BIN" --server "$SERVER" shell alpha -- 'echo CHARLIE-RAN')
@@ -129,14 +138,14 @@ if [ "$age" -le 4 ]; then
 else
   bad "X2: bravo's detached shell stopped (beat ${age}s old)"
 fi
-kill -CONT "$XPID"; kill "$XPID" 2>/dev/null
+client_cont "$WORK/x.tty"; kill "$XPID" 2>/dev/null
 
 # ===================================================================== V1/V2 ==
 say "V1/V2"
 tty_shell bravo "$WORK/v.tty" "while :; do date +%s > $WORK/beat-v; sleep 1; done"
 VPID=$(cat "$WORK/v.tty.pid")
 for i in $(seq 1 30); do [ -s "$WORK/beat-v" ] && break; sleep 1; done
-kill -STOP "$VPID"
+client_stop "$WORK/v.tty"
 sleep "$DETACH_WAIT"
 age=$(file_age "$WORK/beat-v")
 if [ "$age" -le 4 ]; then
@@ -156,7 +165,7 @@ elif [ "$age" -ge 5 ]; then
 else
   bad "V2: the revoked device's detached shell is still running ${GRACE}s after the revoke"
 fi
-kill -CONT "$VPID" 2>/dev/null; kill "$VPID" 2>/dev/null
+client_cont "$WORK/v.tty"; kill "$VPID" 2>/dev/null
 
 echo
 echo "==========================================="
