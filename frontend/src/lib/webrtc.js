@@ -25,6 +25,7 @@ import {
   highHalfSid,
   encodeControl,
   decodeControl,
+  ptyOpenMsg,
 } from '../net/protocol/wire.js'
 // PROTOCOL transfer layer: the file-offer/accept/end/delivery-ack ceremony's
 // message vocabulary + pure decisions, extracted from this file. PeerLink keeps
@@ -773,7 +774,10 @@ export class PeerLink {
   // output instead of spawning a fresh shell (issue #4). Each open allocates a
   // NEW per-link sid (the old link is gone), but the `session` is what binds the
   // two opens to the same remote PTY.
-  openPty(cols, rows, session) {
+  // `resumeFrom` is how many bytes of this session's output the terminal has
+  // already shown. On a reattach it lets the CLI replay only what was missed
+  // instead of the whole buffer again; omitted on the first open.
+  openPty(cols, rows, session, resumeFrom) {
     this._ptySid = highHalfSid(this._nextSid++)
     this._ptyOut = 0 // bytes sent on this sid: the frame offset (wire.js)
     this._ptySession = session || null
@@ -781,7 +785,7 @@ export class PeerLink {
     // stable session id (the persistence path); the ack ('pty-attach') tells us
     // which it was. Tagged shell:true since a PTY now exists on this link.
     linkdiag.record('pty', { what: 'open', session: this._ptySession }, this._diagMeta())
-    this._control({ type: 'pty-open', sid: this._ptySid, cols, rows, session: this._ptySession })
+    this._control(ptyOpenMsg(this._ptySid, cols, rows, this._ptySession, resumeFrom))
     return this._ptySid
   }
   sendPtyInput(u8) {

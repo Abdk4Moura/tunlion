@@ -113,3 +113,11 @@ export function encodeControl(obj) {
 export function decodeControl(s) {
   return JSON.parse(s)
 }
+
+// The pty-open control frame. `resume_from` rides only on a reattach (a finite
+// byte count), so a first open looks exactly as it always did. Pure.
+export function ptyOpenMsg(sid, cols, rows, session, resumeFrom) {
+  const msg = { type: 'pty-open', sid, cols, rows, session }
+  if (Number.isFinite(resumeFrom) && resumeFrom >= 0) msg.resume_from = Math.floor(resumeFrom)
+  return msg
+}
