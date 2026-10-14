@@ -52,6 +52,8 @@ COMMANDS
     doctor                 diagnose a link
   Agents
     skill install          teach your AI agent tunlion (opt-in; writes ~/.claude/skills)
+  Learn
+    demo                   a guided tour in this terminal, played offline
 
 EXAMPLES
   tunlion video.mp4                 send it; mints a speakable one-time code + QR

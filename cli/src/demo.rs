@@ -59,7 +59,7 @@ pub(crate) static STEPS: &[Step] = &[
     Step {
         title: "Send a file with a code",
         acts: &[
-            Say("Send a file to anyone. tunlion prints a short code you can read out loud. No account, no upload: the file goes straight from this machine to theirs."),
+            Say("Send a file to anyone. You get a short code you can read out loud. No account, no upload: the file goes straight from this machine to theirs."),
             Run { on: "laptop", cmd: "tunlion send holiday-photos.zip --code" },
             Out("send: holiday-photos.zip (2.9 MiB)"),
             Out(""),
@@ -164,7 +164,7 @@ pub(crate) static STEPS: &[Step] = &[
     Step {
         title: "Access that ends by itself",
         acts: &[
-            Say("A guest needs a shell for a short job. Give them an invitation with an end time. tunlion enforces it everywhere, even in a session that is still open."),
+            Say("A guest needs a shell for a short job. Give them an invitation with an end time. The end time is enforced everywhere, even in a session that is still open."),
             Run { on: "laptop", cmd: "tunlion add guest --allow transfer,shell --expires 2m --out guest.txt" },
             Out("OK invitation written to guest.txt"),
             Out("   Anyone who reads that file can join until it is used or expires."),
@@ -417,7 +417,9 @@ pub(crate) fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
 }
 
 /// Split a command line the way a shell would for these simple cases:
-/// whitespace separates, double quotes group. Pure.
+/// whitespace separates, double quotes group. Pure. Used by the test that
+/// parses every command the tour shows.
+#[cfg(test)]
 pub(crate) fn split_command(cmd: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -580,8 +582,8 @@ impl<W: Write> Player<W> {
         self.line("");
         let how = match self.input {
             Input::None => "Playing the whole tour. Nothing here touches the network, an account or your files. Ctrl-C stops it.",
-            Input::Keys => "Each step shows a real tunlion command. Type it, or press Enter and it is typed for you. Nothing here touches the network, an account or your files.",
-            Input::Lines => "Each step shows a real tunlion command. Type it and press Enter, or press Enter on an empty line. Type skip to skip a step. Nothing here touches the network or your files.",
+            Input::Keys => "Each step shows a real command. Type it, or press Enter and it is typed for you. Nothing here touches the network, an account or your files.",
+            Input::Lines => "Each step shows a real command. Type it and press Enter, or press Enter on an empty line. Type skip to skip a step. Nothing here touches the network or your files.",
         };
         for l in wrap(how, self.width, "  ") {
             let l = self.paint(Tone::Quiet, &l);
@@ -999,7 +1001,7 @@ pub(crate) async fn demo_cmd(opts: Opts) -> Result<()> {
     let interactive_ok = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !opts.auto && !interactive_ok {
         crate::bail_usage!(
-            "tunlion demo is an interactive tour and needs a terminal. To play it without input (for a recording or a pipe), run: tunlion demo --auto"
+            "The demo is an interactive tour and needs a terminal. To play it without input (for a recording or a pipe), run: tunlion demo --auto"
         );
     }
     let style = Style::detect(opts.reduced_motion);
