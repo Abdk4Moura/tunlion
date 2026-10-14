@@ -65,10 +65,15 @@ if (import.meta.env.PROD && 'serviceWorker' in navigator) {
     document.body.appendChild(bar)
   }
 
-  // Auto-reload ONCE when the new SW takes control (debounced against a loop).
+  // Auto-reload ONCE when a NEW SW replaces the one controlling this page
+  // (debounced against a loop). On a first visit there is no controller yet, and
+  // the first install taking control (clients.claim) also fires controllerchange:
+  // reloading then throws away whatever the visitor already did, including a
+  // code read from the link's #fragment (cleared from the address bar on read).
+  const hadController = !!navigator.serviceWorker.controller
   let reloaded = false
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (reloaded) return
+    if (!hadController || reloaded) return
     reloaded = true
     window.location.reload()
   })
