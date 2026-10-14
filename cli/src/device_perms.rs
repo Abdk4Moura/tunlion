@@ -454,7 +454,7 @@ pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
         let message = format!("no device named '{}', see `tunlion devices`", name.unwrap_or(""));
         crate::ui::exit_code_on_closed_pipe(3);
         if json {
-            println!(
+            crate::outln!(
                 "{}",
                 json!({"ok": false, "verb": "devices", "error": {"code": "unknown_device", "exit": 3, "message": message}})
             );
@@ -465,7 +465,7 @@ pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
     }
     if json {
         let devices: Vec<Value> = selected.iter().map(|d| to_json(d)).collect();
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
@@ -474,7 +474,7 @@ pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
             }))?
         );
     } else {
-        println!("{}", render(&selected, now));
+        crate::outln!("{}", render(&selected, now));
     }
     Ok(())
 }

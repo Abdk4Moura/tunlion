@@ -354,6 +354,67 @@ pub fn header(lead: Tone, rest: Tone, s: &str) -> String {
     out
 }
 
+/// `s` without terminal escapes: SGR color codes and OSC 8 links (the link
+/// text stays). Pure.
+pub fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match it.peek() {
+            Some('[') => {
+                // CSI: parameters and intermediates up to a final byte @..~
+                it.next();
+                for d in it.by_ref() {
+                    if ('@'..='~').contains(&d) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: up to BEL or ST (ESC \)
+                it.next();
+                while let Some(d) = it.next() {
+                    if d == '\x07' {
+                        break;
+                    }
+                    if d == '\x1b' && it.peek() == Some(&'\\') {
+                        it.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Print a human line to STDOUT. Lines are painted against stderr's terminal
+/// (`caps`), so when stdout is piped or redirected while stderr is a terminal
+/// (`tunlion devices | less`, `> file`) the escapes are removed here: a pipe
+/// always reads plain text.
+pub fn out_line(s: &str) {
+    if stdout_color() {
+        println!("{s}");
+    } else {
+        println!("{}", strip_ansi(s));
+    }
+}
+
+/// `println!` for human output on stdout, through `ui::out_line`.
+#[macro_export]
+macro_rules! outln {
+    () => { println!() };
+    ($($t:tt)*) => { $crate::ui::out_line(&format!($($t)*)) };
+}
+
 /// Color decision for STDOUT specifically (the `set`/`get` readout surface).
 /// `caps()` is stderr-scoped; stdout must be judged on its OWN tty-ness so that
 /// piped output never carries ANSI (clig.dev: humans first, machines second).
@@ -1246,5 +1307,22 @@ mod scripting_output_tests {
             fold_decision(&mut seen, &format!("line {i}"), t0);
         }
         assert!(seen.len() <= DEDUP_MAX);
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_and_links_keeps_text() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[1;38;5;166mFLEET\x1b[0m  /  x"), "FLEET  /  x");
+        assert_eq!(strip_ansi("\x1b[38;2;216;102;42mcode\x1b[0m"), "code");
+        assert_eq!(strip_ansi("\x1b]8;;https://a.b\x1b\\site\x1b]8;;\x1b\\ ok"), "site ok");
+        assert_eq!(strip_ansi("a\x1b]52;c;Zm9v\x07b"), "ab");
+        assert_eq!(strip_ansi("caf\u{e9} \u{2713}"), "caf\u{e9} \u{2713}", "non-ASCII text survives");
+    }
+
+    #[test]
+    fn header_keeps_its_text() {
+        // Whatever the color decision, the words of a heading never change.
+        let h = header(Tone::Brand, Tone::Dim, "TUNLION  /  3 DEVICES  /  AVAILABLE");
+        assert_eq!(strip_ansi(&h), "TUNLION  /  3 DEVICES  /  AVAILABLE");
     }
 }

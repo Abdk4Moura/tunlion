@@ -714,7 +714,7 @@ pub(crate) async fn init_experience(
     }
 
     if caps.json {
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
