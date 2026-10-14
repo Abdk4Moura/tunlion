@@ -830,7 +830,13 @@ export class PeerLink {
         this.onPtyReady()
         return
       case 'l2-close':
-        if (msg.sid === this._ptySid) { this.onPtyClose(); this._ptySid = null }
+        // A refused open arrives as an l2-close carrying the CLI's reason
+        // (`err`), its code and the CLI's name for this device (`as`): pass
+        // them on so the terminal can say why instead of "session ended".
+        if (msg.sid === this._ptySid) {
+          this.onPtyClose(msg.err ? { err: msg.err, code: msg.code || null, as: msg.as || null } : null)
+          this._ptySid = null
+        }
         return
       case CTRL.BRB:
         this._awayUntil = Date.now() + Math.min(msg.ttl || 120, 300) * 1000
