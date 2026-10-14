@@ -1070,9 +1070,9 @@ mod tests {
             }
             let first = trimmed.split_whitespace().next().unwrap_or("");
             let verb = first.trim_end_matches(':');
-            // Group headings in the banner (Start/Share/Serve/Devices/Mesh) are
-            // not commands.
-            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh" | "Agents") {
+            // Group headings in the banner (Start/Share/Serve/Devices/Mesh/
+            // Agents/Learn) are not commands.
+            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh" | "Agents" | "Learn") {
                 continue;
             }
             if verb.is_empty() || verb.starts_with("add") || verb.starts_with("up") {
