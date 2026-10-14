@@ -1650,7 +1650,10 @@ pub(crate) async fn send_cmd(
                     } else if is_direct {
                         ui::debug(&format!(
                             "    {}",
-                            ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))
+                            ui::paint(
+                                ui::Tone::Dim,
+                                &format!("route: {}", crate::conn::shown_direct_route(direct_route, &t))
+                            )
                         ));
                     }
                     // L1-a: on the `--code` path, run the ephemeral SPAKE2

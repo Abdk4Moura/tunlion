@@ -335,6 +335,16 @@ pub(crate) fn label_is_raw_id(label: &str, id: &str, uid: Option<&str>) -> bool 
         || looks_like_session_id(label)
 }
 
+/// The route line for a direct link: its internal "direct-quic" label in the
+/// words every other route uses ("direct over lo", "direct over eth0"), read
+/// from the address the link is pinned to. Other labels pass through.
+pub(crate) fn shown_direct_route(label: &str, t: &Arc<dyn Transport>) -> String {
+    match (label, t.remote_addr()) {
+        ("direct-quic", Some(remote)) => filament_transport::net::direct_route_label(remote),
+        _ => label.to_string(),
+    }
+}
+
 /// A signaling session id by its shape: 20 base64url characters mixing upper
 /// case, lower case and digits (`hNZONFIoto2k9bQ9ABGV`). A link can carry one
 /// that is not its own key (the name it was filed under came from an earlier

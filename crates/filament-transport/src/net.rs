@@ -1984,6 +1984,23 @@ pub fn is_own_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The route a person reads for a direct-QUIC link pinned to `remote`, in the
+/// same words [`Peer::route`] uses for a WebRTC one: "direct over lo" when the
+/// peer is this host, else "direct over <interface>". The link's own label
+/// ("direct-quic") is an internal name: printed as the route, it left a
+/// same-host code transfer saying neither local nor direct-over-anything on
+/// either end, once code transfers moved to QUIC after the ceremony.
+pub fn direct_route_label(remote: std::net::SocketAddr) -> String {
+    let ip = remote.ip();
+    if ip.is_loopback() || is_own_addr(&ip.to_string()) {
+        return "direct over lo".into();
+    }
+    match source_ip_for(remote) {
+        Some(local) => format!("direct over {}", resolve_iface_name(&local.to_string())),
+        None => "direct".into(),
+    }
+}
+
 /// The local source IP the kernel would use to reach `remote`. Same no-packets
 /// UDP-connect trick as `is_own_addr`: after `connect()`, `local_addr()` reports
 /// the source the routing table picked. Lets `tunlion ping` name the outbound
@@ -2508,5 +2525,18 @@ mod tests {
         assert!(roster_from_ack(&[json!({"peers": "oops"})]).is_empty());
         // No payload values at all.
         assert!(roster_from_ack(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod direct_route_label_tests {
+    use super::direct_route_label;
+
+    /// A same-host direct-QUIC link reads as the same-host WebRTC route does,
+    /// never as the internal "direct-quic" label (gates.sh gate 1).
+    #[test]
+    fn a_same_host_direct_link_is_direct_over_lo() {
+        assert_eq!(direct_route_label("127.0.0.1:52986".parse().unwrap()), "direct over lo");
+        assert_eq!(direct_route_label("[::1]:4000".parse().unwrap()), "direct over lo");
     }
 }
