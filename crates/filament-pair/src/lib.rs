@@ -89,6 +89,13 @@ pub fn finish(state: Spake2<Ed25519Group>, peer_msg: &[u8]) -> Option<Vec<u8>> {
     state.finish(peer_msg).ok()
 }
 
+/// Introduction scope the browser binds into its confirmation MAC (the wasm
+/// bindings pass it on every call). Every code flow the browser takes part in,
+/// receive by code and pair by code, is Device-scoped on the CLI side
+/// (`IntroScope::Device`, 0x01), and the MAC verifies only when both ends bind
+/// the same byte. A CLI test pins the two together.
+pub const BROWSER_SCOPE: u8 = 0x01;
+
 /// §4 key-confirmation MAC. Folds the SORTED DTLS fingerprints (so a DTLS-layer
 /// MITM is detected, §5.2) AND the agreed capability set (so a server that
 /// rewrites caps breaks the MAC, §6.1). `dir` is the direction tag
@@ -341,14 +348,14 @@ mod wasm {
         /// symmetric role derivation so the browser can't get it wrong.
         #[wasm_bindgen(js_name = ourConfirm)]
         pub fn our_confirm_js(&self, my_fp: &str, their_fp: &str, caps: &str) -> Option<Vec<u8>> {
-            self.k.as_ref().map(|k| super::our_confirm(k, my_fp, their_fp, caps))
+            self.k.as_ref().map(|k| super::our_confirm(k, my_fp, their_fp, caps, BROWSER_SCOPE))
         }
 
         /// Verify the peer's confirmation MAC under our K. true == confirmed.
         #[wasm_bindgen(js_name = verifyPeerConfirm)]
         pub fn verify_peer_confirm_js(&self, my_fp: &str, their_fp: &str, caps: &str, received: &[u8]) -> bool {
             match self.k.as_ref() {
-                Some(k) => super::verify_peer_confirm(k, my_fp, their_fp, caps, received),
+                Some(k) => super::verify_peer_confirm(k, my_fp, their_fp, caps, BROWSER_SCOPE, received),
                 None => false,
             }
         }

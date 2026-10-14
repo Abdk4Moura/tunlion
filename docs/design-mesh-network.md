@@ -137,7 +137,7 @@ signaling trajectory at the bottom of this note, promoted from "eventual" to
 **The rule that is not optional.** If a mesh contains a peer that is publicly
 reachable, that peer is the rendezvous for the mesh. The hosted server is a hard
 fallback, not the normal path. A user may change which hosted server is their
-fallback, and `--server` / `FILAMENT_SERVER` already allows this.
+fallback, and `--server` / `TUNLION_SERVER` already allows this.
 
 **Considered and dropped.** Volunteering a public peer as a rendezvous for
 strangers was part of the original proposal. It does not survive #237 and is not

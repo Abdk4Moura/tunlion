@@ -30,7 +30,7 @@
 #   up_supervisor.sh --cadence 25 --log /path/up.log -- \
 #       tunlion up --server "$SRV" --name-as box-din --dir "$INBOX" --relay
 #
-# Env: FILAMENT_CONFIG_DIR / HOME / FILAMENT_L2 are inherited by the child as set.
+# Env: TUNLION_CONFIG_DIR / HOME / TUNLION_L2 are inherited by the child as set.
 set -u
 
 CADENCE=25

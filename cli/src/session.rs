@@ -10,7 +10,7 @@
 //! ghost / invisible device / zombie lease (the C24/C28/#14 disease class).
 //!
 //! The loss shim lives here on purpose: ALL session-state emits flow through
-//! `lossy_emit`, so gate L (`FILAMENT_TEST_EMIT_LOSS` + `_SEED`) adversarially
+//! `lossy_emit`, so gate L (`TUNLION_TEST_EMIT_LOSS` + `_SEED`) adversarially
 //! drops them and the suite proves convergence survives.
 
 use filament_signal::Client;
@@ -44,18 +44,18 @@ pub struct SyncedRoster {
     pub channel_peers: Vec<Value>,
 }
 
-/// gate L (`FILAMENT_TEST_EMIT_LOSS` + `_SEED`): the loss-shim parameters. These
+/// gate L (`TUNLION_TEST_EMIT_LOSS` + `_SEED`): the loss-shim parameters. These
 /// are env-gated test injectors compiled in ONLY under `--features test-hooks`.
 /// The `not` twin returns the production no-loss defaults (loss 0.0, fixed seed),
 /// so the shipped binary never reads the env and `emit` never drops.
 #[cfg(feature = "test-hooks")]
 fn emit_loss_params() -> (f64, u64) {
-    let loss = std::env::var("FILAMENT_TEST_EMIT_LOSS")
+    let loss = std::env::var("TUNLION_TEST_EMIT_LOSS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|l| (0.0..1.0).contains(l))
         .unwrap_or(0.0);
-    let seed = std::env::var("FILAMENT_TEST_EMIT_SEED")
+    let seed = std::env::var("TUNLION_TEST_EMIT_SEED")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0xF11A_C30D);

@@ -67,7 +67,7 @@ export class UpgradeProber {
     const h = this.h
     this.timer = null
     if (h._closed || h.route !== 'relayed') return this.disarm()
-    // Kill-switch (browser analog of FILAMENT_UPGRADE_PROBE=0).
+    // Kill-switch (browser analog of TUNLION_UPGRADE_PROBE=0).
     try {
       if (localStorage.getItem('tunlionUpgradeProbe') === '0') {
         rlog.debug('upgrade prober disabled (tunlionUpgradeProbe=0), staying on relay', h.id.slice(-6))

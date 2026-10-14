@@ -7,54 +7,33 @@ use anyhow::Result;
 /// Platform-specific paths for the tunlion CLI.
 ///
 /// Uses the `directories` crate for proper OS placement:
-/// - Linux:   `$XDG_CONFIG_HOME/filament` (falls back to `$HOME/.config/filament`)
-/// - macOS:   `$HOME/Library/Application Support/filament`
-/// - Windows: `%APPDATA%/filament`
+/// - Linux:   `$XDG_CONFIG_HOME/tunlion` (falls back to `$HOME/.config/tunlion`)
+/// - macOS:   `$HOME/Library/Application Support/tunlion`
+/// - Windows: `%APPDATA%/tunlion`
 ///
-/// All paths honor `FILAMENT_CONFIG_DIR` as an override (hermetic tests,
+/// All paths honor `TUNLION_CONFIG_DIR` as an override (hermetic tests,
 /// custom deployments).
 pub struct Paths;
 
 impl Paths {
     /// Config directory root.
-    ///
-    /// On first access, checks for legacy `./.config/filament` (cwd-relative,
-    /// the broken Windows fallback when HOME was unset) and migrates contents
-    /// to the platform-correct path.
     pub fn config_dir() -> PathBuf {
-        if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
+        if let Ok(d) = std::env::var("TUNLION_CONFIG_DIR") {
             return PathBuf::from(d);
         }
         Self::platform_config_dir()
     }
 
     fn platform_config_dir() -> PathBuf {
-        // THE DIRECTORY NAME STAYS `filament` ACROSS THE RENAME, and that is
-        // deliberate rather than an oversight. This path holds the user key, the
-        // device certificate, devices.json and the capability store: everything
-        // that makes an install *this* install. Renaming it would present every
-        // existing user with a machine that has forgotten its identity, every
-        // pairing, and every grant, with no error message -- it would simply look
-        // like a fresh install. A brand is not worth that, and a migration that
-        // moves live secrets is a worse risk than a directory with the old name.
-        //
-        // A `tunlion` directory is honoured only when it ALREADY exists (for
-        // example one created by hand). Nothing here creates it: a fresh
-        // install, before or after the rename, gets the `filament` directory.
-        //
-        // PROTOCOL LITERAL: frozen, do not rename (the `filament` dir name).
+        // Always `tunlion`. Never read or write a `filament` directory: the two
+        // tools can be installed side by side on one machine, and each must keep
+        // its own identity, pairings and grants.
         if let Some(proj) = directories::ProjectDirs::from("", "", "tunlion") {
-            let new_dir = proj.config_dir().to_path_buf();
-            if new_dir.exists() {
-                return new_dir;
-            }
-        }
-        if let Some(proj) = directories::ProjectDirs::from("", "", "filament") {
             return proj.config_dir().to_path_buf();
         }
         // #184: route through home_dir() (USERPROFILE on Windows) instead of a
         // bare HOME read that falls back to "." on Windows.
-        Self::home_dir().join(".config").join("filament")
+        Self::home_dir().join(".config").join("tunlion")
     }
 
     /// Resolve a config-relative path (file or subdirectory).
@@ -90,40 +69,6 @@ impl Paths {
         // once more next time, which is acceptable for a migration.
         let _ = SecretFile::write_str(&stamp, &MIGRATION_VERSION.to_string());
         Ok(repaired)
-    }
-
-    /// Migrate state from a legacy `%USERPROFILE%\.config\filament` directory
-    /// (the broken Windows fallback when HOME was unset) into the platform
-    /// directory. Best-effort, safe to call repeatedly.
-    ///
-    /// WHY IT IS THIS NARROW. It used to run on every platform and COPY every
-    /// file. On Linux the "legacy" path, `$HOME/.config/filament`, is simply the
-    /// default config directory, so `XDG_CONFIG_HOME=/some/new/dir tunlion init`
-    /// found the live config there and copied identity.ed25519, overlay.ed25519,
-    /// proxy.token, devices.json, the logs and up.pid into the new directory
-    /// (only subdirectories escaped, because `fs::copy` cannot copy one). init
-    /// then refused with the OLD identity's fingerprint, `up` reported the old
-    /// config's daemon as already running, and `down` there killed it: a key
-    /// clone plus a second config acting on the first one's daemon.
-    ///
-    /// So, see `legacy_migration`: only on Windows, where the two directories
-    /// really are the old and new homes of the same install; never under an
-    /// explicit FILAMENT_CONFIG_DIR or XDG_CONFIG_HOME (the caller chose where
-    /// their config lives, #149); and as a MOVE of the whole directory, never a
-    /// copy, so secrets never exist in two places. A move that fails leaves
-    /// the legacy directory where it was and copies nothing.
-    pub fn migrate_legacy() {
-        let overridden = std::env::var_os("FILAMENT_CONFIG_DIR").is_some()
-            || std::env::var_os("XDG_CONFIG_HOME").is_some();
-        let Some(home) = Self::home_dir_known() else { return };
-        let legacy = home.join(".config").join("filament");
-        let target = Self::config_dir();
-        if let Some((from, to)) = legacy_migration(&legacy, &target, overridden, cfg!(windows)) {
-            if let Some(parent) = to.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::rename(&from, &to);
-        }
     }
 
     /// Platform-aware home directory for the current user.
@@ -164,7 +109,7 @@ impl Paths {
     ///
     /// Resolution order (first match wins):
     /// 1. `shell_program` (from `--shell-program` flag)
-    /// 2. `FILAMENT_SHELL` env var
+    /// 2. `TUNLION_SHELL` env var
     /// 3. `tunlion set shell` config (passed via `shell_config`)
     /// 4. `$SHELL` on Unix / powershell→cmd on Windows
     /// 5. Hardcoded fallback (`/bin/bash` → `/bin/sh` / `cmd.exe`)
@@ -177,7 +122,7 @@ impl Paths {
     pub fn shell_argv(shell_program: Option<&str>, shell_config: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
         let shell = shell_program
             .map(|s| s.to_string())
-            .or_else(|| std::env::var("FILAMENT_SHELL").ok().filter(|s| !s.is_empty()))
+            .or_else(|| std::env::var("TUNLION_SHELL").ok().filter(|s| !s.is_empty()))
             .or_else(|| shell_config.map(|s| s.to_string()))
             .unwrap_or_else(|| Self::default_shell());
 
@@ -293,23 +238,6 @@ impl Paths {
     }
 }
 
-/// The one legacy move `migrate_legacy` may make, as (from, to), or None.
-/// Pure so every refusal is testable: not on a platform whose legacy path is
-/// its real config dir (everything but Windows), not under an explicit config
-/// location, not onto a directory that already exists, and not a directory
-/// onto itself.
-pub(crate) fn legacy_migration(
-    legacy: &Path,
-    target: &Path,
-    overridden: bool,
-    windows: bool,
-) -> Option<(PathBuf, PathBuf)> {
-    if !windows || overridden || legacy == target || target.exists() || !legacy.is_dir() {
-        return None;
-    }
-    Some((legacy.to_path_buf(), target.to_path_buf()))
-}
-
 /// The home directory the password database records for this effective uid.
 #[cfg(unix)]
 fn passwd_home() -> Option<PathBuf> {
@@ -411,7 +339,7 @@ fn create_dirs_with_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
 /// migration: it holds keys, grants and the proxy token, and a dir someone
 /// loosened (or a tool created 0755) would expose new files' NAMES and any file
 /// a writer forgot to restrict. Only a directory this user owns, that is not a
-/// symlink, and that is not a shared sticky dir (a FILAMENT_CONFIG_DIR pointed
+/// symlink, and that is not a shared sticky dir (a TUNLION_CONFIG_DIR pointed
 /// at /tmp must never be chmodded) is touched. Windows: the profile ACL is
 /// already owner-only.
 pub fn tighten_config_dir(dir: &Path) {
@@ -851,6 +779,156 @@ pub fn contain_with_daemon(child: &tokio::process::Child) {
     }
 }
 
+/// Spawn `cmd` so that `record` runs with the child's pid BEFORE the child can
+/// run a single instruction of the program, and return what it produced.
+///
+/// Why: the daemon records each served process group (`exec.groups`) so the
+/// next daemon can end what a SIGKILLed one left behind. Recorded after
+/// `spawn()` returned, the child was already running user code while the
+/// record did not name it yet: a `kill -9` of the daemon inside that window
+/// left a group no later daemon could find (and exec-gates gateQ1, which reads
+/// the record as soon as the child shows in `ps`, once saw too few groups).
+///
+/// Unix: the child, last thing before exec (after the process group and the
+/// parent-death signal are set up, so register this after
+/// [`die_with_daemon`]), writes its pid to a pipe and blocks on a second one.
+/// A helper thread reads the pid, runs `record` (which writes and fsyncs the
+/// record), and only then releases the child. std's `spawn` blocks until the
+/// child has exec'd, which is why the release cannot come from the spawning
+/// thread; the fork itself stays on the calling thread, which is the thread
+/// the parent-death signal follows. A child that is not released (the record
+/// panicked, the pipe broke) refuses to exec, so nothing unrecorded ever runs.
+/// Elsewhere the record follows the spawn; Windows ties the tree to the
+/// daemon with a job object instead ([`contain_with_daemon`]).
+pub fn spawn_recorded<R: Send>(
+    cmd: &mut tokio::process::Command,
+    record: impl FnOnce(u32) -> R + Send,
+) -> std::io::Result<(tokio::process::Child, Option<R>)> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        const GO: u8 = b'g';
+        let (report_r, report_w) = cloexec_pipe()?;
+        let (release_r, release_w) = cloexec_pipe()?;
+        let (rr, rw) = (report_r.as_raw_fd(), report_w.as_raw_fd());
+        let (lr, lw) = (release_r.as_raw_fd(), release_w.as_raw_fd());
+        // SAFETY: only async-signal-safe calls (close, getpid, write, read)
+        // run between fork and exec, and nothing is allocated.
+        unsafe {
+            cmd.pre_exec(move || {
+                // The parent's ends: holding them would keep this child from
+                // ever seeing the pipe close.
+                libc::close(rr);
+                libc::close(lw);
+                let pid = (libc::getpid() as u32).to_ne_bytes();
+                if !fd_write_all(rw, &pid) {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
+                }
+                let mut go = [0u8; 1];
+                if !fd_read_exact(lr, &mut go) || go[0] != GO {
+                    // Not released: the record does not name us, so do not run.
+                    return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                }
+                Ok(())
+            });
+        }
+        std::thread::scope(|s| {
+            let recorder = s.spawn(|| {
+                let mut pid = [0u8; 4];
+                if !fd_read_exact(report_r.as_raw_fd(), &mut pid) {
+                    return None;
+                }
+                let pid = u32::from_ne_bytes(pid);
+                if pid == 0 {
+                    // The spawn ended without reaching the gate.
+                    return None;
+                }
+                let r = record(pid);
+                fd_write_all(release_w.as_raw_fd(), &[GO]);
+                Some(r)
+            });
+            let spawned = cmd.spawn();
+            // Wake the recorder if no child ever reached the gate (spawn failed
+            // before it). Harmless otherwise: it has already read the real pid,
+            // and the read end stays open until this function returns.
+            fd_write_all(report_w.as_raw_fd(), &0u32.to_ne_bytes());
+            let recorded = recorder.join().unwrap_or(None);
+            drop(release_r);
+            spawned.map(|child| (child, recorded))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let child = cmd.spawn()?;
+        let recorded = child.id().map(record);
+        Ok((child, recorded))
+    }
+}
+
+/// A pipe whose ends close on exec, so no other spawned program inherits them.
+#[cfg(unix)]
+fn cloexec_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    let rc = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == 0 {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        rc
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe just returned these two fresh descriptors, owned by no one.
+    Ok(unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    })
+}
+
+/// Write all of `buf` to `fd`, retrying on EINTR. Async-signal-safe (no
+/// allocation), so the spawn gate can call it between fork and exec.
+#[cfg(unix)]
+fn fd_write_all(fd: libc::c_int, buf: &[u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe { libc::write(fd, buf[off..].as_ptr().cast(), buf.len() - off) };
+        if n > 0 {
+            off += n as usize;
+        } else if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fill `buf` from `fd`, retrying on EINTR; false on EOF or error.
+/// Async-signal-safe, like [`fd_write_all`].
+#[cfg(unix)]
+fn fd_read_exact(fd: libc::c_int, buf: &mut [u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe { libc::read(fd, buf[off..].as_mut_ptr().cast(), buf.len() - off) };
+        if n > 0 {
+            off += n as usize;
+        } else if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 /// Names this boot, so a process group recorded before a reboot is never
 /// mistaken for one that is still ours (after a reboot its number belongs to
 /// whatever happens to hold it now). None where the platform cannot say,
@@ -1195,8 +1273,8 @@ impl ServiceHost {
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
-                // PROTOCOL LITERAL: frozen, do not rename (plist file = LAUNCHD_LABEL).
-                let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.filament.plist");
+                // The plist file is named after LAUNCHD_LABEL.
+                let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.tunlion.plist");
                 std::fs::write(plist, launchd_plist(LAUNCHD_LABEL, exe, argv))?;
                 launchctl_bootstrap("system", plist)
             }
@@ -1409,36 +1487,35 @@ impl ServiceHost {
     }
 }
 
-// PROTOCOL LITERAL: frozen, do not rename. These are the names released builds
-// registered with the OS service managers (systemd unit `filament.service`,
-// launchd label `autumated.filament`, HKCU Run value and scheduled task
-// `Filament`, SCM service `filament`, firewall rule `Filament QUIC`). Every
-// later start, stop, status, log, uninstall and sudoers rule must name the SAME
-// thing, or an upgraded install can no longer manage the service it already
-// has (and a second one appears beside it). Pinned by `frozen_service_names`.
-pub(crate) const SYSTEMD_UNIT: &str = "filament";
+// The names registered with the OS service managers (systemd unit
+// `tunlion.service`, launchd label `autumated.tunlion`, HKCU Run value and
+// scheduled task `Tunlion`, SCM service `tunlion`, firewall rule `Tunlion
+// QUIC`). Every start, stop, status, log, uninstall and sudoers rule must name
+// the SAME thing, and none may be filament's, since both tools can be
+// installed side by side. Pinned by `frozen_service_names`.
+pub(crate) const SYSTEMD_UNIT: &str = "tunlion";
 #[allow(dead_code)] // macOS only
-const LAUNCHD_LABEL: &str = "autumated.filament";
+const LAUNCHD_LABEL: &str = "autumated.tunlion";
 #[allow(dead_code)] // Windows only
-const WINDOWS_AUTOSTART_NAME: &str = "Filament";
+const WINDOWS_AUTOSTART_NAME: &str = "Tunlion";
 #[allow(dead_code)] // Windows only
-const WINDOWS_SERVICE_NAME: &str = "filament";
+const WINDOWS_SERVICE_NAME: &str = "tunlion";
 #[allow(dead_code)] // Windows only
-const WINDOWS_FIREWALL_RULE: &str = "name=Filament QUIC";
+const WINDOWS_FIREWALL_RULE: &str = "name=Tunlion QUIC";
 
 #[cfg(test)]
 mod frozen_service_names {
-    /// Each digest is SHA-256 of the ORIGINAL literal (`printf '%s' '<name>' |
+    /// Each digest is SHA-256 of the literal (`printf '%s' '<name>' |
     /// sha256sum`); a find-and-replace cannot keep a digest in step.
     #[test]
     fn frozen_service_names() {
         use sha2::{Digest, Sha256};
         for (name, value, digest) in [
-            ("SYSTEMD_UNIT", super::SYSTEMD_UNIT, "5696d135fe7eb0f05ce06041ec050633b7e8820d0afc490c936e73e5cafb378e"),
-            ("LAUNCHD_LABEL", super::LAUNCHD_LABEL, "550c6c611b45bb2f7a356cfa36bf28a44df6b963c22b7dd8517db8b592b4c3c2"),
-            ("WINDOWS_AUTOSTART_NAME", super::WINDOWS_AUTOSTART_NAME, "0a9066fa6acd2d7a545af769171444d090e5b7940f5dd39e77b9a2c924b5982c"),
-            ("WINDOWS_SERVICE_NAME", super::WINDOWS_SERVICE_NAME, "5696d135fe7eb0f05ce06041ec050633b7e8820d0afc490c936e73e5cafb378e"),
-            ("WINDOWS_FIREWALL_RULE", super::WINDOWS_FIREWALL_RULE, "89a571ce57a1e8b0ed042cfa0e474c33e112170f01d9175f64f5123781a5fb1d"),
+            ("SYSTEMD_UNIT", super::SYSTEMD_UNIT, "931e7d3a2f5b8af576a8b7401605527f62ef670364021e8b7ea8bbcd76a5b828"),
+            ("LAUNCHD_LABEL", super::LAUNCHD_LABEL, "1682586d67d66cdd3064800d94e8e5450f72a33a6410484969822f45977f8276"),
+            ("WINDOWS_AUTOSTART_NAME", super::WINDOWS_AUTOSTART_NAME, "5a48d0f29c16f94f2c7d9ec0ee1a94a814a225d4385e4ab8961ae3506bda6d21"),
+            ("WINDOWS_SERVICE_NAME", super::WINDOWS_SERVICE_NAME, "931e7d3a2f5b8af576a8b7401605527f62ef670364021e8b7ea8bbcd76a5b828"),
+            ("WINDOWS_FIREWALL_RULE", super::WINDOWS_FIREWALL_RULE, "bcc6d3bc87bccdca4e38f824d518b8509a592fd4635ad9322d6d9b7e22ec5bfa"),
         ] {
             let got: String = Sha256::digest(value.as_bytes())
                 .as_slice()
@@ -1685,7 +1762,7 @@ fn install_scheduled_task(exe: &Path, argv: &[String]) -> Result<()> {
         xml_escape(&exe.display().to_string()),
         xml_escape(&windows_args_line(argv))
     );
-    let tmp = std::env::temp_dir().join("filament-task.xml");
+    let tmp = std::env::temp_dir().join("tunlion-task.xml");
     std::fs::write(&tmp, &task_xml)?;
     let out = std::process::Command::new("schtasks")
         .args(["/create", "/tn", WINDOWS_AUTOSTART_NAME, "/xml", &tmp.to_string_lossy(), "/f"])
@@ -1739,7 +1816,7 @@ mod service_argv_encoding {
     #[test]
     fn plist_has_one_string_element_per_argument() {
         let a = argv(&["up", "--shell-only=a,b", "--dir=/Users/k/A&B <x>", "--i-know"]);
-        let p = launchd_plist("autumated.filament", Path::new("/opt/tun lion/tunlion"), &a);
+        let p = launchd_plist("autumated.tunlion", Path::new("/opt/tun lion/tunlion"), &a);
         let start = p.find("<array>").expect("array");
         let end = p.find("</array>").expect("array end");
         let body = &p[start + "<array>".len()..end];
@@ -1764,7 +1841,7 @@ mod service_argv_encoding {
             .map(|s| s.split("</string>").nth(1).unwrap_or(""))
             .collect::<String>();
         assert!(stripped.trim().is_empty(), "raw text inside <array>: {stripped:?}");
-        assert!(p.contains("<key>Label</key><string>autumated.filament</string>"));
+        assert!(p.contains("<key>Label</key><string>autumated.tunlion</string>"));
     }
 
     #[test]
@@ -2156,7 +2233,7 @@ pub struct ShellHost {
 impl ShellHost {
     /// Resolve the shell from the precedence chain. No external resolution
     /// is done here — callers pass the already-resolved argv (from
-    /// --shell-program / FILAMENT_SHELL / config / $SHELL / platform default).
+    /// --shell-program / TUNLION_SHELL / config / $SHELL / platform default).
     pub fn new(shell_argv: &[String]) -> Self {
         let binary = shell_argv.first().map(|s| s.as_str()).unwrap_or("");
         let name = Path::new(binary)
@@ -2231,6 +2308,55 @@ impl ShellHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The record is in place before the child runs any of the program: the
+    // child itself checks for what `record` wrote, so a record that landed
+    // after the program started would fail the run. Repeated, because the
+    // ungated version lost this race only sometimes.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_recorded_records_before_the_program_runs() {
+        let dir = mode_tmp("spawn-recorded");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _rt = rt.enter();
+        for i in 0..20 {
+            let marker = dir.join(format!("rec-{i}"));
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(r#"test "$(cat "$1")" = "$$""#).arg("sh").arg(&marker);
+            own_process_group(&mut cmd);
+            die_with_daemon(&mut cmd);
+            let m = marker.clone();
+            let (mut child, recorded) = spawn_recorded(&mut cmd, move |pid| {
+                // A slow record must still win: the child waits for it.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::fs::write(&m, pid.to_string()).unwrap();
+                pid
+            })
+            .expect("spawn");
+            assert_eq!(recorded, child.id(), "recorded pid is the child's");
+            let st = rt.block_on(child.wait()).unwrap();
+            assert!(st.success(), "run {i}: the program ran before its record existed");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A spawn whose exec fails returns the error (whatever was recorded is
+    // handed back to be dropped with it) instead of hanging the recorder.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_recorded_failed_spawn_returns_the_error() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _rt = rt.enter();
+        let mut cmd = tokio::process::Command::new("/definitely/not/a/tunlion/program");
+        let r = spawn_recorded(&mut cmd, |pid| pid);
+        assert!(r.is_err());
+    }
 
     fn mode_tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("tunlion-mode-{}-{name}", std::process::id()));
@@ -2705,147 +2831,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Regression for #149: setting FILAMENT_CONFIG_DIR to a fresh path from a
-    /// shell whose cwd is $HOME must NOT migrate the production identity into
-    /// it. Before the fix, `.config/filament` (cwd-relative) resolved to
-    /// $HOME/.config/filament, the live production config, and the migration
-    /// copied it wholesale into the override: a key clone.
-    #[cfg(unix)]
+    /// tunlion and filament can be installed side by side, so tunlion must
+    /// never resolve its config dir to filament's, even when filament's dir is
+    /// the only one that exists. A populated `$HOME/.config/filament` is
+    /// ignored: the resolved dir is named `tunlion` and no path component is
+    /// `filament`.
     #[test]
-    fn override_config_dir_is_not_migrated_into() {
-        let uid = format!("{}-cfgdir-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let work = std::env::temp_dir().join(format!("fil-cfg-{uid}"));
-        let home = work.join("home");
-        let legacy = home.join(".config").join("filament");
-        let target = work.join("target");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("identity.ed25519"), b"production key").unwrap();
-        std::fs::write(legacy.join("overlay.ed25519"), b"production key 2").unwrap();
-
-        // Snapshot the real process state so it can be restored even if the
-        // assertion below fails (the failure must not leak into parallel tests).
-        let old_cwd = std::env::current_dir().unwrap();
-        // Mutates HOME, FILAMENT_CONFIG_DIR and the process cwd, all process-wide.
-        // Without the shared lock it could swap the config dir out from under any
-        // concurrently running test that reads it.
-        let _guard = crate::tests::lock_test_config();
-        let old_home = std::env::var_os("HOME");
-        let old_override = std::env::var_os("FILAMENT_CONFIG_DIR");
-
-        // Reproduce the report: fresh override, cwd == $HOME, populated legacy.
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("FILAMENT_CONFIG_DIR", &target);
-        }
-        std::env::set_current_dir(&home).unwrap();
-
-        Paths::migrate_legacy();
-
-        // Restore process-global state BEFORE asserting, so a failure cannot
-        // leave env/cwd mutated for sibling tests.
-        std::env::set_current_dir(&old_cwd).unwrap();
-        match old_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match old_override {
-            Some(v) => unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", v) },
-            None => unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") },
-        }
-
-        // The override must stay EMPTY: migrating production keys into a fresh
-        // explicit config dir is the #149 key clone.
-        let entries: Vec<_> = std::fs::read_dir(&target)
-            .map(|it| it.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
-            .unwrap_or_default();
-        assert!(
-            entries.is_empty(),
-            "FILAMENT_CONFIG_DIR override was populated by legacy migration: {entries:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&work);
-    }
-
-    /// The blind-test report, exactly: a populated default config at
-    /// `$HOME/.config/filament`, then `XDG_CONFIG_HOME=<new empty dir>`. The
-    /// new directory received copies of identity.ed25519, overlay.ed25519,
-    /// proxy.token, devices.json and up.pid. Nothing may appear there, and the
-    /// default config must be left exactly as it was.
-    #[test]
-    fn an_xdg_config_home_is_never_filled_from_the_default_config() {
+    fn the_config_dir_is_tunlion_and_never_the_filament_dir() {
         let uid = format!(
-            "{}-xdg-{}",
+            "{}-cfgname-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         );
-        let work = std::env::temp_dir().join(format!("fil-cfg-{uid}"));
+        let work = std::env::temp_dir().join(format!("tl-cfg-{uid}"));
         let home = work.join("home");
-        let legacy = home.join(".config").join("filament");
-        let xdg = work.join("deep").join("new-xdg");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::create_dir_all(&xdg).unwrap();
-        for f in ["identity.ed25519", "overlay.ed25519", "proxy.token", "devices.json", "up.pid"] {
-            std::fs::write(legacy.join(f), b"the default config's").unwrap();
-        }
+        let other = home.join(".config").join("filament");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("identity.ed25519"), b"filament's key").unwrap();
 
         let _guard = crate::tests::lock_test_config();
         let old_home = std::env::var_os("HOME");
-        let old_override = std::env::var_os("FILAMENT_CONFIG_DIR");
+        let old_override = std::env::var_os("TUNLION_CONFIG_DIR");
         let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
         unsafe {
             std::env::set_var("HOME", &home);
-            std::env::remove_var("FILAMENT_CONFIG_DIR");
-            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::remove_var("TUNLION_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
         }
-        Paths::migrate_legacy();
+        let dir = Paths::config_dir();
         let restore = |k: &str, v: Option<std::ffi::OsString>| match v {
             Some(v) => unsafe { std::env::set_var(k, v) },
             None => unsafe { std::env::remove_var(k) },
         };
         restore("HOME", old_home);
-        restore("FILAMENT_CONFIG_DIR", old_override);
+        restore("TUNLION_CONFIG_DIR", old_override);
         restore("XDG_CONFIG_HOME", old_xdg);
 
-        let mut copied = Vec::new();
-        let mut stack = vec![xdg.clone()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-                if e.path().is_dir() {
-                    stack.push(e.path());
-                } else {
-                    copied.push(e.path());
-                }
-            }
-        }
-        assert!(copied.is_empty(), "the new XDG config dir received files: {copied:?}");
-        for f in ["identity.ed25519", "overlay.ed25519", "proxy.token", "devices.json", "up.pid"] {
-            assert!(legacy.join(f).is_file(), "the default config lost {f}");
-        }
-        let _ = std::fs::remove_dir_all(&work);
-    }
-
-    #[test]
-    fn the_legacy_move_happens_only_on_windows_unoverridden_and_never_onto_a_dir() {
-        let work = std::env::temp_dir().join(format!("fil-legacy-pure-{}", std::process::id()));
-        let legacy = work.join("legacy");
-        let target = work.join("appdata").join("filament");
-        std::fs::create_dir_all(&legacy).unwrap();
-        // The one case that moves: Windows, no override, target absent.
+        let names: Vec<String> =
+            dir.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().any(|n| n == "tunlion"), "config dir is not tunlion's: {dir:?}");
+        assert!(!names.iter().any(|n| n == "filament"), "config dir is filament's: {dir:?}");
+        assert_ne!(dir, other);
         assert_eq!(
-            legacy_migration(&legacy, &target, false, true),
-            Some((legacy.clone(), target.clone()))
+            std::fs::read(other.join("identity.ed25519")).unwrap(),
+            b"filament's key",
+            "filament's config must be left exactly as it was"
         );
-        // Linux and macOS: the "legacy" path is the real config dir.
-        assert_eq!(legacy_migration(&legacy, &target, false, false), None);
-        // An explicit FILAMENT_CONFIG_DIR or XDG_CONFIG_HOME.
-        assert_eq!(legacy_migration(&legacy, &target, true, true), None);
-        // Onto itself, or onto a directory that already exists.
-        assert_eq!(legacy_migration(&legacy, &legacy, false, true), None);
-        std::fs::create_dir_all(&target).unwrap();
-        assert_eq!(legacy_migration(&legacy, &target, false, true), None);
-        // No legacy directory: nothing to move.
-        let _ = std::fs::remove_dir_all(&target);
-        assert_eq!(legacy_migration(&work.join("absent"), &target, false, true), None);
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -3485,6 +3516,24 @@ pub fn stdio_is_file(path: &Path) -> bool {
     }
 }
 
+/// True when stdout is a pipe whose reader has gone (`logs -f | head -2` once
+/// `head` exits). A follow with nothing new to print never writes, so it never
+/// meets the EPIPE that would end it; this asks the kernel instead, without
+/// writing. Unix: a pipe's write end polls POLLERR (macOS: POLLHUP) once the
+/// last reader closes. Elsewhere it cannot be asked cheaply and says false.
+pub fn stdout_reader_gone() -> bool {
+    #[cfg(unix)]
+    {
+        let mut p = libc::pollfd { fd: 1, events: 0, revents: 0 };
+        let n = unsafe { libc::poll(&mut p, 1, 0) };
+        n > 0 && (p.revents & (libc::POLLERR | libc::POLLHUP)) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 // --------------------------------------------------------------- disk space --
 
 /// Bytes available to this (unprivileged) user on the filesystem holding `dir`,
@@ -3680,7 +3729,7 @@ pub fn prepare_socket_dir(sock: &Path) -> std::io::Result<()> {
 
 /// Err unless `dir` is a directory (not a symlink) owned by this user and not
 /// writable by group or others. Root may use a directory another user owns: a
-/// daemon run with sudo against that user's FILAMENT_CONFIG_DIR (the
+/// daemon run with sudo against that user's TUNLION_CONFIG_DIR (the
 /// `--shell-user` setup) binds its socket there, and root can already do
 /// anything that user can.
 #[cfg(unix)]

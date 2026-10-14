@@ -4,7 +4,7 @@
 #   - drives the REAL /root/.local/bin/tunlion against our LOCAL backend,
 #   - ends by printing a single line "RESULT <id> PASS|FAIL <detail>".
 #
-# Every scenario sets FILAMENT_CONFIG_DIR under /tmp/ux (never the real store)
+# Every scenario sets TUNLION_CONFIG_DIR under /tmp/ux (never the real store)
 # and only kills processes it started (tracked, or matched by its own cfg dir).
 #
 # This file is SOURCED by record.sh inside an asciinema session (one scenario
@@ -29,7 +29,7 @@ fail() { printf '\n%s  ✘ FAIL%s  %s\n' "$C_BAD" "$C_RESET" "$1"; echo "RESULT 
 
 # A receiver that completes a transfer can linger in the rejoin window after the
 # sender disconnects; bound it tight so demos stay snappy.
-export FILAMENT_REJOIN_SECS=3
+export TUNLION_REJOIN_SECS=3
 
 # poll a logfile for the minted 4-segment pair code (lower-cased)
 wait_code() { local f="$1" n=0 c=""; while [ $n -lt 80 ]; do
@@ -38,7 +38,7 @@ wait_code() { local f="$1" n=0 c=""; while [ $n -lt 80 ]; do
 
 # kill only tunlion procs whose env points at the given cfg-dir prefix
 kill_by_cfg() { local pfx="$1"; for p in $(pgrep -f "$TUNLION" 2>/dev/null); do
-  tr '\0' ' ' < /proc/$p/environ 2>/dev/null | grep -q "FILAMENT_CONFIG_DIR=$pfx" && kill "$p" 2>/dev/null; done; }
+  tr '\0' ' ' < /proc/$p/environ 2>/dev/null | grep -q "TUNLION_CONFIG_DIR=$pfx" && kill "$p" 2>/dev/null; done; }
 
 # Payload lives under the per-scenario UX_TMP so parallel rigs never race on a
 # shared file (each isolated rig gets its own /tmp/ux/<id>).
@@ -51,21 +51,21 @@ sc_01_pair() {
   local DA=$(fresh_cfg s01A) DB=$(fresh_cfg s01B) W
   W=$(ux_words)
   runA "tunlion add --word '$W' --name phone"
-  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 40 "$TUNLION" add --word "$W" --name phone -y --server "$UX_SERVER" >"$UX_WORK/01a.log" 2>&1 & local PA=$!; track $PA
+  TUNLION_CONFIG_DIR="$DA" timeout -k 5 40 "$TUNLION" add --word "$W" --name phone -y --server "$UX_SERVER" >"$UX_WORK/01a.log" 2>&1 & local PA=$!; track $PA
   local C; C=$(wait_code "$UX_WORK/01a.log") || { fail "code never minted"; return; }
   a "minted: ${C^^}"; pause
   runB "tunlion add $C --name laptop"
-  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 40 "$TUNLION" add "$C" --name laptop -y --server "$UX_SERVER" >"$UX_WORK/01b.log" 2>&1
+  TUNLION_CONFIG_DIR="$DB" timeout -k 5 40 "$TUNLION" add "$C" --name laptop -y --server "$UX_SERVER" >"$UX_WORK/01b.log" 2>&1
   wait $PA
   # Invariant: each store lists the other device. The claim only succeeds with
   # a code carrying the channel the mint derived, so mutual listing IS the proof
   # the ceremony ran end-to-end. (The old "channel id" field is gone from
   # `devices` in 0.8.5; asserting on a removed field is how this rotted.)
-  a "$(FILAMENT_CONFIG_DIR="$DA" "$TUNLION" devices 2>/dev/null)"
-  b "$(FILAMENT_CONFIG_DIR="$DB" "$TUNLION" devices 2>/dev/null)"
+  a "$(TUNLION_CONFIG_DIR="$DA" "$TUNLION" devices 2>/dev/null)"
+  b "$(TUNLION_CONFIG_DIR="$DB" "$TUNLION" devices 2>/dev/null)"
   local okA okB
-  okA=$(FILAMENT_CONFIG_DIR="$DA" "$TUNLION" devices 2>/dev/null | grep -q phone && echo 1 || echo 0)
-  okB=$(FILAMENT_CONFIG_DIR="$DB" "$TUNLION" devices 2>/dev/null | grep -q laptop && echo 1 || echo 0)
+  okA=$(TUNLION_CONFIG_DIR="$DA" "$TUNLION" devices 2>/dev/null | grep -q phone && echo 1 || echo 0)
+  okB=$(TUNLION_CONFIG_DIR="$DB" "$TUNLION" devices 2>/dev/null | grep -q laptop && echo 1 || echo 0)
   [ "$okA" = "1" ] && [ "$okB" = "1" ] && pass "paired; A lists phone, B lists laptop" || fail "mutual recognition missing (A→phone=$okA B→laptop=$okB)"
 }
 
@@ -79,11 +79,11 @@ sc_02_devices() {
   pair_two "$DC" tv     "$D3" box || { fail "pair_two tv failed"; return; }
   note "paired 3 devices for real: laptop, phone, tv"
   runA "tunlion grant laptop shell"
-  FILAMENT_CONFIG_DIR="$DC" "$TUNLION" grant laptop shell; pause
-  runA "tunlion devices"; FILAMENT_CONFIG_DIR="$DC" "$TUNLION" devices; pause
-  runA "tunlion devices rename tv livingroom"; FILAMENT_CONFIG_DIR="$DC" "$TUNLION" devices rename tv livingroom; pause
-  runA "tunlion devices forget phone"; FILAMENT_CONFIG_DIR="$DC" "$TUNLION" devices forget phone; pause
-  runA "tunlion devices"; FILAMENT_CONFIG_DIR="$DC" "$TUNLION" devices
+  TUNLION_CONFIG_DIR="$DC" "$TUNLION" grant laptop shell; pause
+  runA "tunlion devices"; TUNLION_CONFIG_DIR="$DC" "$TUNLION" devices; pause
+  runA "tunlion devices rename tv livingroom"; TUNLION_CONFIG_DIR="$DC" "$TUNLION" devices rename tv livingroom; pause
+  runA "tunlion devices forget phone"; TUNLION_CONFIG_DIR="$DC" "$TUNLION" devices forget phone; pause
+  runA "tunlion devices"; TUNLION_CONFIG_DIR="$DC" "$TUNLION" devices
   local survived
   survived=$(python3 -c "import json;d=json.load(open('$DC/devices.json'));print('yes' if any(x['name']=='laptop' and 'shell' in x.get('caps',[]) for x in d) else 'no')")
   note "regression check: laptop's shell cap after forgetting a DIFFERENT device = $survived"
@@ -108,13 +108,13 @@ sc_03_code_xfer() {
   for try in 1 2 3; do
     rm -rf "$OUT"; mkdir -p "$OUT"; W="ux-$RANDOM-demo"
     runA "tunlion send report.pdf --word $W"
-    FILAMENT_CONFIG_DIR="$DS" timeout -k 5 30 "$TUNLION" send "$PAY" --word "$W" --name report.pdf --server "$UX_SERVER" >"$UX_WORK/03s.log" 2>&1 & local SP=$!; track $SP
+    TUNLION_CONFIG_DIR="$DS" timeout -k 5 30 "$TUNLION" send "$PAY" --word "$W" --name report.pdf --server "$UX_SERVER" >"$UX_WORK/03s.log" 2>&1 & local SP=$!; track $SP
     # wait until the sender has registered the code, then take the FULL code.
     wait_log "$UX_WORK/03s.log" "code +$W" 12 0.15 || pause 1.5
     C=$(grep -oE "${W}-[0-9]+" "$UX_WORK/03s.log" 2>/dev/null | head -1)
     a "code is ${C:-$W} — read it to the other device"
     runB "tunlion receive ${C:-$W} -y"
-    FILAMENT_CONFIG_DIR="$DR" timeout -k 5 28 "$TUNLION" receive "${C:-$W}" -y --dir "$OUT" --server "$UX_SERVER" >"$UX_WORK/03r.log" 2>&1
+    TUNLION_CONFIG_DIR="$DR" timeout -k 5 28 "$TUNLION" receive "${C:-$W}" -y --dir "$OUT" --server "$UX_SERVER" >"$UX_WORK/03r.log" 2>&1
     wait $SP 2>/dev/null
     RCV=$(ls "$OUT" 2>/dev/null | head -1); h2=$(hashof "$OUT/$RCV" 2>/dev/null || echo none)
     [ "$h2" = "$h1" ] && break
@@ -134,12 +134,12 @@ sc_04_to_known() {
   pair_two "$DA" laptop "$DB" phone || { fail "pair_two failed"; return; }
   note "phone and laptop already know each other (paired earlier)"
   runB "tunlion up   (laptop, always-on receiver)"
-  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 40 "$TUNLION" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/04up.log" 2>&1 & local UP=$!; track $UP
+  TUNLION_CONFIG_DIR="$DB" timeout -k 5 40 "$TUNLION" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/04up.log" 2>&1 & local UP=$!; track $UP
   # wait for the receiver to print its ready banner instead of a blind sleep
   wait_log "$UX_WORK/04up.log" 'tunlion up —' 15 0.15 || note "up ready-banner not seen (continuing)"
   pause 0.4   # tiny settle so the receiver has joined its room
   runA "tunlion send slides.key --to laptop"
-  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 30 "$TUNLION" send "$PAY" --name slides.key --to laptop --server "$UX_SERVER" >"$UX_WORK/04s.log" 2>&1
+  TUNLION_CONFIG_DIR="$DA" timeout -k 5 30 "$TUNLION" send "$PAY" --name slides.key --to laptop --server "$UX_SERVER" >"$UX_WORK/04s.log" 2>&1
   local rc=$?; pause 1; kill $UP 2>/dev/null
   b "$(grep -m1 'known device\|verified (whole-file sha256 matched)' "$UX_WORK/04up.log" | sed 's/\x1b\[[0-9;]*m//g')"
   # The receiver lands the file under the sender's --name (0.8.5 up honors it)
@@ -160,16 +160,16 @@ sc_05_up_status_down() {
   note "pairing A with B for real via the shipping add ceremony"
   pair_two "$DA" laptop "$DB" phone || { fail "pair_two failed"; return; }
   runB "tunlion up   (laptop)"
-  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 45 "$TUNLION" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/05up.log" 2>&1 & local UP=$!; track $UP
+  TUNLION_CONFIG_DIR="$DB" timeout -k 5 45 "$TUNLION" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/05up.log" 2>&1 & local UP=$!; track $UP
   wait_log "$UX_WORK/05up.log" 'tunlion up —' 15 0.15 || note "up ready-banner not seen (continuing)"
   pause 0.4
   runA "tunlion send backup.tar --to laptop"
-  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 30 "$TUNLION" send "$PAY" --name backup.tar --to laptop --server "$UX_SERVER" >"$UX_WORK/05s.log" 2>&1; local rc=$?
+  TUNLION_CONFIG_DIR="$DA" timeout -k 5 30 "$TUNLION" send "$PAY" --name backup.tar --to laptop --server "$UX_SERVER" >"$UX_WORK/05s.log" 2>&1; local rc=$?
   pause 1
   runB "tunlion status"
-  local ST; ST=$(FILAMENT_CONFIG_DIR="$DB" "$TUNLION" status 2>&1 | sed 's/\x1b\[[0-9;]*m//g'); echo "$ST"
+  local ST; ST=$(TUNLION_CONFIG_DIR="$DB" "$TUNLION" status 2>&1 | sed 's/\x1b\[[0-9;]*m//g'); echo "$ST"
   pause 0.5
-  runB "tunlion down"; FILAMENT_CONFIG_DIR="$DB" "$TUNLION" down 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+  runB "tunlion down"; TUNLION_CONFIG_DIR="$DB" "$TUNLION" down 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
   pause 0.5; kill $UP 2>/dev/null
   # `up` lands the file under the sender's --name; verify bytes by hash.
   local h2 RCV; RCV=$(ls "$DD" 2>/dev/null | head -1); h2=$(hashof "$DD/$RCV" 2>/dev/null || echo none)
@@ -204,23 +204,23 @@ CFG
   local DA="$W/A" DB="$W/B"; mkdir -p "$DA" "$DB"
   note "pairing A (you) with B (the box) for real, via the shipping add ceremony"
   pair_two "$DA" server "$DB" laptop || { fail "pair_two A/B failed"; return; }
-  note "topology: B = the box you ssh INTO (acceptor, FILAMENT_L2=1); A = you"
-  runB "FILAMENT_L2=1 tunlion up    (the box, accepts tunnels)"
-  env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" FILAMENT_L2=1 FILAMENT_NAME=laptop \
-      FILAMENT_SSH_HOSTKEY="$SSHD/hostkey.pub" USER="$USERNAME" \
+  note "topology: B = the box you ssh INTO (acceptor, TUNLION_L2=1); A = you"
+  runB "TUNLION_L2=1 tunlion up    (the box, accepts tunnels)"
+  env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=laptop \
+      TUNLION_SSH_HOSTKEY="$SSHD/hostkey.pub" USER="$USERNAME" \
       "$TUNLION" up --dir "$W/drop" --server "$UX_SERVER" >"$W/up.log" 2>&1 & local UP=$!; track $UP
   # wait for the acceptor's ready banner instead of a fixed 4s
   wait_log "$W/up.log" 'tunlion up —' 20 0.2 || note "L2 up ready-banner not seen (continuing)"
   pause 0.5
   runB "tunlion grant laptop shell   (consent: deny-by-default)"
-  env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "$TUNLION" grant laptop shell 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+  env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "$TUNLION" grant laptop shell 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
   pause 0.5   # small settle so the grant propagates before the ssh attempt
   local AHOME="$W/Ahome"; mkdir -p "$AHOME"
   runA "tunlion shell server --ssh -- echo OK"
   local OUT rc tries=0
   while [ $tries -lt 3 ]; do
-    OUT=$(timeout 35 env HOME="$AHOME" FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=server \
-       FILAMENT_SSH_PORT="$PORT" FILAMENT_SSH_USER="$USERNAME" \
+    OUT=$(timeout 35 env HOME="$AHOME" TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=server \
+       TUNLION_SSH_PORT="$PORT" TUNLION_SSH_USER="$USERNAME" \
        "$TUNLION" --server "$UX_SERVER" shell server --ssh 'echo OK-OVER-TUNLION' 2>"$W/ssh.err" </dev/null)
     rc=$?; echo "$OUT" | grep -q OK-OVER-TUNLION && break
     tries=$((tries+1)); sleep 2
@@ -246,7 +246,7 @@ sc_11_live_pairing() {
   # The daemon starts knowing ONLY 'old', created by a real ceremony.
   pair_two "$DUP" old "$DOLD" box || { fail "pair_two old failed"; return; }
   runB "tunlion up   (the box — knows only 'old' right now)"
-  FILAMENT_CONFIG_DIR="$DUP" timeout -k 5 60 "$TUNLION" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/11up.log" 2>&1 & local UP=$!; track $UP
+  TUNLION_CONFIG_DIR="$DUP" timeout -k 5 60 "$TUNLION" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/11up.log" 2>&1 & local UP=$!; track $UP
   wait_log "$UX_WORK/11up.log" 'tunlion up —' 15 0.15 || note "up ready-banner not seen (continuing)"
   pause 0.6
   b "roster at startup: { old }   (the daemon is now running, untouched from here on)"
@@ -267,7 +267,7 @@ sc_11_live_pairing() {
   fi
   pause 0.8
   runA "new device:  tunlion send report.pdf --to box   (no restart, no code)"
-  FILAMENT_CONFIG_DIR="$DNEW" timeout -k 5 30 "$TUNLION" send "$PAY" --name report.pdf --to box --server "$UX_SERVER" >"$UX_WORK/11s.log" 2>&1; local rc=$?
+  TUNLION_CONFIG_DIR="$DNEW" timeout -k 5 30 "$TUNLION" send "$PAY" --name report.pdf --to box --server "$UX_SERVER" >"$UX_WORK/11s.log" 2>&1; local rc=$?
   pause 1
   kill $UP 2>/dev/null
   local h2 RCV; RCV=$(ls "$DD" 2>/dev/null | head -1); h2=$(hashof "$DD/$RCV" 2>/dev/null || echo none)
@@ -316,8 +316,8 @@ Description=tunlion ux rig system daemon
 After=network-online.target
 [Service]
 Type=simple
-Environment=FILAMENT_CONFIG_DIR=$DSYS
-Environment=FILAMENT_SERVER=$UX_SERVER
+Environment=TUNLION_CONFIG_DIR=$DSYS
+Environment=TUNLION_SERVER=$UX_SERVER
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$TUNLION up --dir $DS
 [Install]
@@ -328,8 +328,8 @@ UNIT
 Description=tunlion ux rig user daemon
 [Service]
 Type=simple
-Environment=FILAMENT_CONFIG_DIR=$DUSR
-Environment=FILAMENT_SERVER=$UX_SERVER
+Environment=TUNLION_CONFIG_DIR=$DUSR
+Environment=TUNLION_SERVER=$UX_SERVER
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$TUNLION up --dir $DU
 [Install]
@@ -347,7 +347,7 @@ UNIT
   kill -0 "$PID_SYS" 2>/dev/null || { fail "system daemon not alive"; cleanup12; return; }
   kill -0 "$PID_USR" 2>/dev/null || { fail "user daemon not alive"; cleanup12; return; }
   runA "tunlion down -y   (config dir of the SYSTEM daemon)"
-  FILAMENT_CONFIG_DIR="$DSYS" "$TUNLION" down -y 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+  TUNLION_CONFIG_DIR="$DSYS" "$TUNLION" down -y 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
   sleep 2
   # invariant: the targeted (system) daemon is gone; the user daemon is untouched.
   local sys_gone=1 usr_same=0

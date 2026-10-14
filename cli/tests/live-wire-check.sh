@@ -19,7 +19,7 @@
 # wire.test.mjs). See docs/archive/plans/consolidation-plan-2026-06-15.md.
 #
 # Env (sensible defaults; override as needed):
-#   FILAMENT_TEST_VENV  python with the backend deps (flask/eventlet/socketio)
+#   TUNLION_TEST_VENV  python with the backend deps (flask/eventlet/socketio)
 #   PLAYWRIGHT_NODE_PATH NODE_PATH dir that resolves `require('playwright')`
 #                        (a cached `npx playwright` install is fine)
 #   PORT                 backend port (default 8077)
@@ -30,7 +30,7 @@ REPO="$(dirname "$CLI_DIR")"
 BIN="$CLI_DIR/target/release/tunlion"
 PORT="${PORT:-8077}"
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 # Resolve playwright: prefer an installed cli/tests/node_modules, else env hint.
 if [ -d "$HERE/node_modules/playwright" ]; then
   export NODE_PATH="$HERE/node_modules${NODE_PATH:+:$NODE_PATH}"

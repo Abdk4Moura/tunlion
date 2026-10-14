@@ -1,6 +1,6 @@
 //! The state files every command trusts, and what happens when one is corrupt.
 //!
-//! `echo "{garbage" > ~/.config/filament/devices.json` used to become "no
+//! `echo "{garbage" > ~/.config/tunlion/devices.json` used to become "no
 //! devices": `devices` exited 0 with an empty list, `devices --json` said
 //! `ok: true`, and `send --to alpha` said there was no such device (3). A
 //! reader that treats an unparseable store as empty hides the damage, and the
@@ -14,9 +14,15 @@
 //! - a write over one that does not parse is refused (`before_write`), so the
 //!   damaged file stays for a person to inspect or repair;
 //! - every write first copies the current, valid file to `<name>.bak`, and the
-//!   refusal names that copy, so recovery is one `cp`.
+//!   refusal names that copy, so recovery is one `cp`;
+//! - a file that exists but is empty (zero bytes, or only whitespace) is
+//!   corrupt too. tunlion never writes one (an empty store is `[]`, an empty
+//!   `config` is removed), so a truncated `devices.json` or
+//!   `revoked-keys.json` is damage, and reading it as "nothing" would forget
+//!   every device or silently drop every revocation;
+//! - in `--json` the refusal's `error.code` is `corrupt_state` (exit 2).
 
-use crate::exit_codes::{self, ExitKind};
+use crate::exit_codes;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -30,10 +36,12 @@ pub(crate) enum Shape {
 }
 
 /// The files checked, relative to the config directory.
-pub(crate) const FILES: [(&str, Shape); 5] = [
+pub(crate) const FILES: [(&str, Shape); 6] = [
     ("devices.json", Shape::JsonArray),
     ("revoked-keys.json", Shape::JsonArray),
     ("used-invitations.json", Shape::JsonArray),
+    // The signed capability store: grants and their revocations.
+    ("caps.json", Shape::JsonArray),
     ("peerconf", Shape::JsonObject),
     ("config", Shape::KeyValue),
 ];
@@ -44,14 +52,15 @@ fn shape_of(path: &Path) -> Option<Shape> {
 }
 
 /// Why `raw` is not a valid file of this shape, or None when it is. An empty
-/// file is valid (it holds nothing). Pure.
+/// (or whitespace-only) file is NOT valid: tunlion never writes one, so it is
+/// a truncation, and reading it as empty would drop what it held. Pure.
 pub(crate) fn parse_problem(raw: &[u8], shape: Shape) -> Option<String> {
     let text = match std::str::from_utf8(raw) {
         Ok(t) => t,
         Err(e) => return Some(format!("not UTF-8 text ({e})")),
     };
     if text.trim().is_empty() {
-        return None;
+        return Some("the file is empty, and no command writes an empty one, so it was truncated".to_string());
     }
     match shape {
         Shape::JsonArray => match serde_json::from_str::<serde_json::Value>(text) {
@@ -96,13 +105,11 @@ pub(crate) fn corrupt_error(path: &Path, why: &str) -> anyhow::Error {
     } else {
         "Fix it, or move it aside to start with an empty one (that forgets what it held)".to_string()
     };
-    exit_codes::err(
-        ExitKind::Usage,
-        format!(
-            "{} cannot be parsed ({why}). It is not read as empty, and nothing writes over it until it is fixed. {recover}",
-            path.display()
-        ),
-    )
+    exit_codes::CorruptState(format!(
+        "{} cannot be parsed ({why}). It is not read as empty, and nothing writes over it until it is fixed. {recover}",
+        path.display()
+    ))
+    .into()
 }
 
 /// Ok when `path` is absent or parses; the corrupt-file error otherwise.
@@ -156,7 +163,11 @@ mod tests {
         assert!(parse_problem(b"{garbage", Shape::JsonArray).is_some());
         assert!(parse_problem(b"{}", Shape::JsonArray).is_some());
         assert!(parse_problem(b"[]", Shape::JsonArray).is_none());
-        assert!(parse_problem(b"", Shape::JsonArray).is_none());
+        // Empty is a truncation, not "nothing": for every shape.
+        for shape in [Shape::JsonArray, Shape::JsonObject, Shape::KeyValue] {
+            assert!(parse_problem(b"", shape).is_some(), "{shape:?}");
+            assert!(parse_problem(b" \n\t\n", shape).is_some(), "{shape:?}");
+        }
         assert!(parse_problem(b"{\"a\":{}}", Shape::JsonObject).is_none());
         assert!(parse_problem(b"[1]", Shape::JsonObject).is_some());
         assert!(parse_problem(b"server http://x\nname box\n", Shape::KeyValue).is_none());
@@ -177,9 +188,43 @@ mod tests {
         let e = before_write(&p).unwrap_err();
         let m = e.to_string();
         assert!(m.contains("devices.json") && m.contains("cp "), "{m}");
-        assert_eq!(exit_codes::classify(&e), ExitKind::Usage);
+        assert_eq!(exit_codes::classify(&e), exit_codes::ExitKind::Usage);
+        assert_eq!(exit_codes::json_code(&e), "corrupt_state");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{garbage");
         assert_eq!(std::fs::read_to_string(backup_path(&p)).unwrap(), "[]");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A: `: > devices.json` listed "No devices yet." with exit 0, and an
+    /// empty revoked-keys.json dropped the revocation list. Both are refused
+    /// by name now, as is a corrupt caps.json, and none is written over.
+    #[test]
+    fn an_empty_or_truncated_store_is_corrupt_and_left_alone() {
+        let d = std::env::temp_dir().join(format!("tunlion-state-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(FILES.iter().any(|(n, _)| *n == "caps.json"), "caps.json is checked");
+        for (name, body) in [
+            ("devices.json", ""),
+            ("revoked-keys.json", ""),
+            ("used-invitations.json", "  \n"),
+            ("caps.json", "[{"),
+            ("peerconf", ""),
+        ] {
+            let p = d.join(name);
+            std::fs::write(&p, body).unwrap();
+            let e = before_write(&p).unwrap_err();
+            assert!(e.to_string().contains(name), "{name}: {e}");
+            assert_eq!(exit_codes::classify(&e).code(), 2, "{name}");
+            assert_eq!(exit_codes::json_code(&e), "corrupt_state", "{name}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), body, "{name} untouched");
+            let shape = shape_of(&p).unwrap();
+            assert!(check_file(&p, shape).is_err(), "{name}");
+        }
+        // `[]` is legitimately empty.
+        let p = d.join("devices.json");
+        std::fs::write(&p, "[]").unwrap();
+        assert!(before_write(&p).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

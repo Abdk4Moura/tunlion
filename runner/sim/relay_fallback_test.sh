@@ -9,7 +9,7 @@
 # direct-only promise.
 #
 # How the "direct can't, relay can" condition is forced deterministically:
-#   - FILAMENT_TEST_FREEZE_AFTER_BYTES=N + FILAMENT_TEST_FREEZE_PERSIST=1 make
+#   - TUNLION_TEST_FREEZE_AFTER_BYTES=N + TUNLION_TEST_FREEZE_PERSIST=1 make
 #     EVERY direct-QUIC transport go dark after ~N data bytes (the one-shot P0
 #     freeze made PERSISTENT) — so rung-c's fresh re-dials keep stalling and the
 #     direct ladder EXHAUSTS. The only path left that doesn't ride the frozen
@@ -29,7 +29,7 @@
 #     (f) PROMPTLY: the sender exits well before its timeout (no hang).
 #
 # Isolated: own backend on a private port, own coturn on private ports, own
-# FILAMENT_CONFIG_DIRs, the BUILT release binary. Never the live daemon / installed CLI.
+# TUNLION_CONFIG_DIRs, the BUILT release binary. Never the live daemon / installed CLI.
 #
 # Usage (from repo root or anywhere):  runner/sim/relay_fallback_test.sh
 set -uo pipefail
@@ -40,14 +40,14 @@ BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`
-# level. Export FILAMENT_LOG=debug so every $BIN child prints them; the
+# level. Export TUNLION_LOG=debug so every $BIN child prints them; the
 # value-prop lines (route, relay banner, P5 upgrade) are `critical` and show
 # regardless. Respect an explicit override if the caller set one.
-export FILAMENT_LOG="${FILAMENT_LOG:-debug}"
-PORT="${FILAMENT_TEST_PORT:-8098}"
+export TUNLION_LOG="${TUNLION_LOG:-debug}"
+PORT="${TUNLION_TEST_PORT:-8098}"
 SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/relay-fallback.XXXXXX")"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
 [ -x "$PYV" ] || PYV="$(command -v python3)"
 
 # coturn (local TURN) — private ports, loopback only.
@@ -76,7 +76,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resilience gates drive the env-gated test hooks (FILAMENT_TEST_*), which now
+# Resilience gates drive the env-gated test hooks (TUNLION_TEST_*), which now
 # ship ONLY in a `--features test-hooks` build (stripped from default/release).
 # Auto-build that binary unless an explicit FILJOB_BIN was provided.
 if [ -z "${FILJOB_BIN:-}" ]; then
@@ -130,9 +130,9 @@ BIG="$WORK/big.bin"; head -c 4000000 /dev/urandom >"$BIG"; H_BIG=$(hashof "$BIG"
 DA="$WORK/devA"; DB="$WORK/devB"; mkdir -p "$DA" "$DB"
 pair() {
   local W="pair-$$-$RANDOM"
-  FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$BIG" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
+  TUNLION_CONFIG_DIR="$DA" "$BIN" send "$BIG" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
   local SP=$!; sleep 3
-  FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
+  TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
   wait $SP 2>/dev/null
 }
 say "setup: pairing A<->B (--remember over a code)"
@@ -145,10 +145,10 @@ else
 fi
 
 # ---- one relay-fallback attempt (relay ALLOWED). Sets R_RC / R_FROZE --------
-# FILAMENT_DIRECT_LOOPBACK_ONLY pins the QUIC race to 127.0.0.1 (multi-homed box).
-# FILAMENT_TEST_FREEZE_PERSIST=1 makes EVERY direct transport freeze -> the direct
+# TUNLION_DIRECT_LOOPBACK_ONLY pins the QUIC race to 127.0.0.1 (multi-homed box).
+# TUNLION_TEST_FREEZE_PERSIST=1 makes EVERY direct transport freeze -> the direct
 # ladder exhausts -> rung-d escalation to relay is the ONLY way to complete.
-# FILAMENT_WARM_STANDBY=0: P1 tests the SYMMETRIC cold-ladder -> rung-d escalation
+# TUNLION_WARM_STANDBY=0: P1 tests the SYMMETRIC cold-ladder -> rung-d escalation
 # (both ends grind direct then escalate together). P3 (GAP-3) made the long-lived
 # `up` receiver default to a WARM relay standby (instant cutover on stall #1); left
 # on, the receiver would relay-commit early while the one-shot SEND end still grinds
@@ -158,15 +158,15 @@ one_relay_attempt() {
   local tag="$1"
   local DG="$WORK/$tag-drop"; rm -rf "$DG"; mkdir -p "$DG"
   local UPLOG="$WORK/$tag-up.log"; local SENDLOG="$WORK/$tag-send.log"
-  FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=0 FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
-    FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
+  TUNLION_CONFIG_DIR="$DB" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 \
+    TUNLION_STALL_MS="$STALL_MS" TUNLION_WARM_STANDBY=0 TUNLION_TEST_FREEZE_PERSIST=1 TUNLION_TEST_WEBRTC_RELAY_ONLY=1 \
+    TUNLION_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout 120 "$BIN" up --dir "$DG" --server "$SERVER" >"$UPLOG" 2>&1 &
   local UP=$!; pids+=($UP); sleep 3
   R_RC=0
-  FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=0 FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
-    FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
+  TUNLION_CONFIG_DIR="$DA" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 \
+    TUNLION_STALL_MS="$STALL_MS" TUNLION_WARM_STANDBY=0 TUNLION_TEST_FREEZE_PERSIST=1 TUNLION_TEST_WEBRTC_RELAY_ONLY=1 \
+    TUNLION_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout 120 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$SENDLOG" 2>&1 || R_RC=1
   sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
   if grep -q "data-path FREEZE engaged" "$SENDLOG" 2>/dev/null; then R_FROZE=1; else R_FROZE=0; fi
@@ -265,15 +265,15 @@ done
 one_norelay_attempt() {
   local DGN="$WORK/norelay-drop"; rm -rf "$DGN"; mkdir -p "$DGN"
   UPLOGN="$WORK/norelay-up.log"; SENDLOGN="$WORK/norelay-send.log"
-  FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=0 FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
-    FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
+  TUNLION_CONFIG_DIR="$DB" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 \
+    TUNLION_STALL_MS="$STALL_MS" TUNLION_WARM_STANDBY=0 TUNLION_TEST_FREEZE_PERSIST=1 TUNLION_TEST_WEBRTC_RELAY_ONLY=1 \
+    TUNLION_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout 150 "$BIN" --no-relay up --dir "$DGN" --server "$SERVER" >"$UPLOGN" 2>&1 &
   local UPN=$!; pids+=($UPN); sleep 3
   local T0; T0=$(date +%s); RCN=0
-  FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=0 FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
-    FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
+  TUNLION_CONFIG_DIR="$DA" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 \
+    TUNLION_STALL_MS="$STALL_MS" TUNLION_WARM_STANDBY=0 TUNLION_TEST_FREEZE_PERSIST=1 TUNLION_TEST_WEBRTC_RELAY_ONLY=1 \
+    TUNLION_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout "$NORELAY_BUDGET" "$BIN" --no-relay send "$BIG" --to boxB --server "$SERVER" >"$SENDLOGN" 2>&1 || RCN=$?
   local T1; T1=$(date +%s); ELAPSED=$((T1 - T0))
   kill $UPN 2>/dev/null; wait $UPN 2>/dev/null

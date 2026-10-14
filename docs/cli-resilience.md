@@ -21,7 +21,7 @@ concurrently — two suites share the auto-room and contaminate each other).
 Last full run: **18/18, 2026-06-07** (incl. gate 13 multi-link and gate 14
 daemon). Earlier milestone runs:
 **15/15, 2026-06-06**, plus live-production runs through
-`api.filament.autumated.com`: CLI↔CLI direct, CLI↔CLI forced-relay
+`api.tunlion.autumated.com`: CLI↔CLI direct, CLI↔CLI forced-relay
 (`route: relayed` both ends), and the real `tunlion.autumated.com` site
 sending 64 KiB-framed files to `tunlion recv`.
 
@@ -64,7 +64,7 @@ the same way, but is no longer required for correctness).
 chunkSize 65536 — the exact production config — browser sends two 65,540-byte-
 framed files, hashes match), and a LIVE run against the real production site:
 headless Chromium on `https://tunlion.autumated.com` sent 4 MB to
-`tunlion recv` through `api.filament.autumated.com`, hash identical,
+`tunlion recv` through `api.tunlion.autumated.com`, hash identical,
 10.3 MB/s (2026-06-06). The failure mode no longer occurs in the live system.
 
 ### C2. Route label disagreement — **VERIFIED** (with documented residual)
@@ -111,7 +111,7 @@ backend fixture).
 replaces it (mark old closed, spawn teardown, fresh connect, transfers
 re-offered with resume). **Verified by:** gate 11 — receiver SIGSTOPped
 mid-transfer (socket alive, lease alive), replacement with the SAME uid
-(`FILAMENT_UID` test hook) joins, sender logs "superseding old link", resume
+(`TUNLION_UID` test hook) joins, sender logs "superseding old link", resume
 completes, hash matches. Gate 2 covers the different-uid replacement flavor.
 
 ### C6b. Live signaling reconnect must not tear down a flowing link (#28) — **VERIFIED**
@@ -122,7 +122,7 @@ a separate change, commit `a55e494`):
 
 - **Supersede trigger** (`maybe_adopt`, ~1161): the reconnect arrives as a new
   sid carrying the same uid. If the existing link is still flowing
-  (`link_flowing` — `idle_ms()` below `FILAMENT_ADOPT_ACTIVE_MS`, default 3s),
+  (`link_flowing` — `idle_ms()` below `TUNLION_ADOPT_ACTIVE_MS`, default 3s),
   the reconnect is cosmetic; KEEP the old link ("keeping active link") instead
   of superseding. A frozen-alive peer (gate 11) stops stamping activity, reads
   idle, and still supersedes. **Verified by:** gate 11b.
@@ -144,8 +144,8 @@ a separate change, commit `a55e494`):
   blocker. The adoption gate treats a deferred-active slot as claimable
   (`active_deferred`), so a DIFFERENT-uid replacement (gate 2) still takes over
   during the deferral window instead of being squatted out. **Verified by:**
-  gate 11c (A/B: `FILAMENT_TEST_INJECT_PEER_LEFT` synthesizes the peer-left for
-  the active sid mid-stream without touching the channel; `FILAMENT_TEST_NO_DEFER`
+  gate 11c (A/B: `TUNLION_TEST_INJECT_PEER_LEFT` synthesizes the peer-left for
+  the active sid mid-stream without touching the channel; `TUNLION_TEST_NO_DEFER`
   proves the baseline drops it and the transfer dies). Side effect: a receiver
   now defers the sender's link on NORMAL completion too, reaping ~one threshold
   later before its clean exit (bounded ~3-5s, exits 0; measured).
@@ -244,7 +244,7 @@ end-to-end against the LIVE release:
 ### C17. Never run against production — **VERIFIED (2026-06-06)**
 - Hermetic relay: gate 10 — local coturn, relay-only ICE policy, transfer
   completes, `route: relayed` reported.
-- Live production: CLI↔CLI through `api.filament.autumated.com` — direct
+- Live production: CLI↔CLI through `api.tunlion.autumated.com` — direct
   (8.3 MB/s, `route: local`/`direct`) and forced `--relay` through the
   droplet's coturn (5–7 MB/s, **`route: relayed` on both ends**, sha256
   verified). TURN ephemeral credentials, the Cloudflare tunnel, and the :3478
@@ -421,7 +421,7 @@ ONE repair loop (5 s tick / socket-up / tab-visible; invalidate on fresh sid).
 The five belts (#14 rejoin, C28 retries+reconcile+debounce, the C24 lease
 refresh client half, the CLI welcome re-subscribes ×3) are dissolved into it.
 ALL CLI session-state emits flow through the module's loss shim
-(`FILAMENT_TEST_EMIT_LOSS`/`_SEED`, deterministic xorshift), which is what
+(`TUNLION_TEST_EMIT_LOSS`/`_SEED`, deterministic xorshift), which is what
 gate 19 (gate L) attacks: seed 16 drops BOTH processes' join+subscribe; the
 rendezvous succeeds only through repair. The choreography found two real
 bugs BEFORE becoming a gate: (1) `send --to`'s full-deadline blocking read
@@ -579,8 +579,8 @@ completion depends on a remote peer behaving. Gate 11 verifies.
   and a fallback quiet-check runs every iteration: if `completed > 0 &&
   !keep_open && by_sid.is_empty() && conn.links.is_empty() && pending.is_empty()`
   holds quietly for the quiet-exit window (10 s default, overridable via
-  `FILAMENT_QUIET_EXIT_SECS` — the gate-18 test knob, mirroring
-  `FILAMENT_REJOIN_SECS`), recv prints the same `done (N files).` line the
+  `TUNLION_QUIET_EXIT_SECS` — the gate-18 test knob, mirroring
+  `TUNLION_REJOIN_SECS`), recv prints the same `done (N files).` line the
   peer-left path emits (preceded by a dim "(peer-left never arrived — exiting
   on quiet)" note) and disconnects cleanly. Any attaching link / new question
   resets the timer.
@@ -588,7 +588,7 @@ completion depends on a remote peer behaving. Gate 11 verifies.
   SIGSTOP'd the instant it logs `done.` (flush precedes that print, so all
   bytes + file-end are already delivered) — its frozen socket keeps the server
   lease alive, so peer-left is never emitted, while its peerconnection goes
-  silent. recv (`FILAMENT_QUIET_EXIT_SECS=3`) watches its link die through the
+  silent. recv (`TUNLION_QUIET_EXIT_SECS=3`) watches its link die through the
   disconnect→grace→retry teardown, then the quiet branch fires: recv exits 0,
   its log carries "(peer-left never arrived — exiting on quiet)" and
   "done (1 file)", and the received hash matches. The teardown latency

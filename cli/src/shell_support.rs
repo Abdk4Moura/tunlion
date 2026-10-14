@@ -219,13 +219,13 @@ pub(crate) fn owner_shell_refusal(is_root: bool) -> String {
 }
 
 pub(crate) fn service_manager_for_cgroup(cg: &str) -> Option<ServiceManager> {
-    // The unit name is matched as a cgroup segment (`/filament.service`), never
-    // as a substring, so a neighbouring unit (`my-filament.service`) cannot
+    // The unit name is matched as a cgroup segment (`/tunlion.service`), never
+    // as a substring, so a neighbouring unit (`my-tunlion.service`) cannot
     // collide. The scope decides which manager.
-    if cg.contains("/system.slice/filament.service") {
+    if cg.contains("/system.slice/tunlion.service") {
         return Some(ServiceManager::SystemdSystem);
     }
-    if cg.contains("/app.slice/filament.service") && cg.contains("/user.slice/") {
+    if cg.contains("/app.slice/tunlion.service") && cg.contains("/user.slice/") {
         return Some(ServiceManager::SystemdUser);
     }
     None

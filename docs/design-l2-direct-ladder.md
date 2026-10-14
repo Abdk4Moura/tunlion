@@ -18,7 +18,7 @@ the leg that works, and nothing performs it.
 
 ## The hard rule (must not break)
 `up` is BOTH the file-transfer acceptor and the L2/ssh acceptor. Do NOT change the
-file-transfer default transport. `FILAMENT_DIRECT` stays opt-in for file transfer. Scope
+file-transfer default transport. `TUNLION_DIRECT` stays opt-in for file transfer. Scope
 direct-for-L2 to the L2 use-case only.
 
 ## Reusable primitives (already public in `direct.rs` — no extraction needed)
@@ -31,10 +31,10 @@ direct-for-L2 to the L2 use-case only.
 
 ## The change (two scoped edits)
 
-### 1. Acceptor enablement — make `FILAMENT_L2` imply direct (small, safe)
-In `direct::direct_enabled()` (direct.rs:43): return true if `FILAMENT_DIRECT==1` **OR
-`FILAMENT_L2==1`**. Rationale: the L2 acceptor (`FILAMENT_L2=1 tunlion up`) wants reliable
-CLI↔CLI; a plain `tunlion up`/`send` WITHOUT FILAMENT_L2 keeps the WebRTC default
+### 1. Acceptor enablement — make `TUNLION_L2` imply direct (small, safe)
+In `direct::direct_enabled()` (direct.rs:43): return true if `TUNLION_DIRECT==1` **OR
+`TUNLION_L2==1`**. Rationale: the L2 acceptor (`TUNLION_L2=1 tunlion up`) wants reliable
+CLI↔CLI; a plain `tunlion up`/`send` WITHOUT TUNLION_L2 keeps the WebRTC default
 untouched (hard rule preserved). The acceptor already sends offers + races once enabled.
 
 ### 2. Initiator — give `bring_up_to_known` a direct dial that races WebRTC
@@ -68,7 +68,7 @@ arm already does and should be replicated).
 - **Gates, no regression:** `cli/tests/ssh-gates.sh` (4), `l2-gates.sh` (5),
   `transport-gates.sh` rung-1 (4), and `gates.sh` send/recv (file transfer untouched).
 - **Live (human runs — agent can't reach pop-os):**
-  - do-vm: `FILAMENT_L2=1 tunlion up`   (no FILAMENT_DIRECT needed now)
+  - do-vm: `TUNLION_L2=1 tunlion up`   (no TUNLION_DIRECT needed now)
   - do-vm: `tunlion grant popos shell`  (already granted)
   - pop-os: `tunlion ssh root@dovm 'hostname'`  → returns do-vm's hostname, route
     direct-quic, no keys, no prompts.

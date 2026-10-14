@@ -2,7 +2,7 @@
 # Forget takes effect in the RUNNING daemon, and a used invitation stays used.
 # Standalone, hermetic, fixture port 8151 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./revocation-live-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./revocation-live-gates.sh
 #
 # WHY THIS EXISTS. A blind test of the launch candidate found both of these by
 # hand, and no gate could have: every forget gate restarted a daemon somewhere
@@ -50,10 +50,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8151
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-revlive.XXXXXX")"
 DA="$WORK/owner"
 SPOKE=beta
@@ -64,8 +64,8 @@ trap fixture_cleanup EXIT
 
 KNOWN_RED_ALLOW=()
 
-O_ENV=(env FILAMENT_CONFIG_DIR="$DA")
-S_ENV=(env FILAMENT_CONFIG_DIR="$DS")
+O_ENV=(env TUNLION_CONFIG_DIR="$DA")
+S_ENV=(env TUNLION_CONFIG_DIR="$DS")
 
 start_backend
 init_owner "$DA"
@@ -220,7 +220,7 @@ sleep 4
 # ==================================================================== GATE IB ==
 say "IB: the used invitation is refused for a NEW device key, after forget and restart"
 mkdir -p "$WORK/$GAMMA-newkey"
-fs_bounded 45 env FILAMENT_CONFIG_DIR="$WORK/$GAMMA-newkey" "$BIN" --server "$SERVER" \
+fs_bounded 45 env TUNLION_CONFIG_DIR="$WORK/$GAMMA-newkey" "$BIN" --server "$SERVER" \
   join --invite-file "$WORK/$GAMMA-inv.txt" --name "$GAMMA" --no-interactive >"$WORK/IB.out" 2>&1
 stIB=$(fs_state); rcIB=$(fs_rc)
 REC_IB=$(grep -c "\"name\": *\"$GAMMA" "$DA/devices.json" || true)
@@ -234,7 +234,7 @@ fi
 
 # ==================================================================== GATE IC ==
 say "IC: the used invitation is refused for the SAME device key"
-fs_bounded 45 env FILAMENT_CONFIG_DIR="$WORK/$GAMMA-samekey" "$BIN" --server "$SERVER" \
+fs_bounded 45 env TUNLION_CONFIG_DIR="$WORK/$GAMMA-samekey" "$BIN" --server "$SERVER" \
   join --invite-file "$WORK/$GAMMA-inv.txt" --name "$GAMMA" --no-interactive >"$WORK/IC.out" 2>&1
 stIC=$(fs_state); rcIC=$(fs_rc)
 REC_IC=$(grep -c "\"name\": *\"$GAMMA" "$DA/devices.json" || true)

@@ -108,7 +108,7 @@ jobs:
             echo "::error::WINGET_TOKEN secret is not set — cannot fork winget-pkgs or open the PR. Add a classic PAT with public_repo scope as WINGET_TOKEN."
             exit 1
           fi
-          git config --global user.name  "filament-release-bot"
+          git config --global user.name  "tunlion-release-bot"
           git config --global user.email "release-bot@users.noreply.github.com"
           # Make plain `git push` (used by release-followup.sh to push the
           # winget-pkgs fork branch) authenticate with the token — otherwise git

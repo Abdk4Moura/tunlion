@@ -23,7 +23,7 @@ CLI_DIR="$(dirname "$HERE")"
 BIN="$CLI_DIR/target/release/tunlion"
 PORT=8097
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
 WORK="$(mktemp -d /root/.claude/jobs/330c2366/tmp/wt-l2build-gates.XXXXXX)"
 
 PASS=0; FAIL=0; FAILED=""
@@ -57,27 +57,27 @@ SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
 printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
-# Start the acceptor (side B) ONCE; reused across gates. FILAMENT_L2=1 opts in.
+# Start the acceptor (side B) ONCE; reused across gates. TUNLION_L2=1 opts in.
 B_DROP="$WORK/Bdrop"; mkdir -p "$B_DROP"
-FILAMENT_CONFIG_DIR="$DB" FILAMENT_L2=1 FILAMENT_NAME=boxB \
+TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxB \
   "$BIN" up --dir "$B_DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 # Give the daemon time to subscribe to A's presence channel.
 sleep 3
 
-A_ENV=(env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA)
 
 # ===================================================================== gate 4 ==
 # Capability + SSRF deny. The acceptor must refuse a non-loopback dial target
 # (localhost-only is the default contract; the SSRF defense). Production netcat
 # always dials 127.0.0.1, so the test injects a non-loopback host into the
-# l2-open via FILAMENT_L2_DIALHOST (a test-only override) and asserts the
+# l2-open via TUNLION_L2_DIALHOST (a test-only override) and asserts the
 # acceptor answers l2-close{non-loopback denied}. The TRUSTED capability gate is
 # exercised positively by gates 1/2 (only a proof-verified link reaches accept);
 # a link whose proof fails never gets `trusted=true` so its l2-open is denied
 # the same way.
 say 4
-FILAMENT_L2_DIALHOST=8.8.8.8 timeout 25 "${A_ENV[@]}" "$BIN" netcat boxB 53 --server "$SERVER" </dev/null >"$WORK/g4.log" 2>&1 || true
+TUNLION_L2_DIALHOST=8.8.8.8 timeout 25 "${A_ENV[@]}" "$BIN" netcat boxB 53 --server "$SERVER" </dev/null >"$WORK/g4.log" 2>&1 || true
 if grep -q "non-loopback denied" "$WORK/up.log"; then
   ok "gate4: non-loopback dial refused (l2-close{non-loopback denied})"
 else
@@ -167,11 +167,11 @@ ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED"; cat "$
 # ProxyCommand to that port (tunlion ssh hardcodes 22; for the gate we point a
 # custom ProxyCommand at our throwaway sshd to avoid needing real :22).
 PROXY="$BIN --server $SERVER netcat boxB $SSHD_PORT"
-OUT=$(FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA timeout 60 ssh \
+OUT=$(TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA timeout 60 ssh \
   -o ProxyCommand="$PROXY" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o IdentitiesOnly=yes -i "$SSHD/id" -o BatchMode=yes \
-  "$USERNAME@filament-peer" \
+  "$USERNAME@tunlion-peer" \
   'echo SSH-OVER-TUNLION-OK; id -un' 2>"$WORK/ssh.err")
 rc1=$?
 echo "## ssh rc=$rc1"; echo "$OUT" | sed 's/^/##   /'
@@ -209,7 +209,7 @@ sleep 1
 FIFO="$WORK/fifo"; mkfifo "$FIFO"
 ( exec 3>"$FIFO"; sleep 30 ) &  # holds the fifo writer open ~30s
 HOLDER=$!
-FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA timeout 30 "$BIN" netcat boxB $HOLD_PORT --server "$SERVER" <"$FIFO" >"$WORK/nc5.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA timeout 30 "$BIN" netcat boxB $HOLD_PORT --server "$SERVER" <"$FIFO" >"$WORK/nc5.log" 2>&1 &
 NC=$!
 sleep 4
 # Kill the initiator; the acceptor's stream must end cleanly (no hang/leak).

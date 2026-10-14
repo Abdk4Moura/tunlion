@@ -1,4 +1,4 @@
-# Rung-2: UDP hole-punching (FILAMENT_HOLEPUNCH=1)
+# Rung-2: UDP hole-punching (TUNLION_HOLEPUNCH=1)
 
 > Status: proposed. Design only; no implementation claim is implied.
 
@@ -13,9 +13,9 @@ fails do we step down to WebRTC/relay.
 
 ## Non-negotiables (what makes this safe to land)
 
-- **Gated.** The entire rung-2 path is dead unless `FILAMENT_HOLEPUNCH=1`. With
+- **Gated.** The entire rung-2 path is dead unless `TUNLION_HOLEPUNCH=1`. With
   the flag off, `start_direct` / `on_transport_offer` behave byte-for-byte as
-  rung-1 does today. With `FILAMENT_DIRECT` *also* off, neither rung runs and the
+  rung-1 does today. With `TUNLION_DIRECT` *also* off, neither rung runs and the
   WebRTC path is untouched.
 - **Reuses rung-1 wholesale.** Rung-2 changes ONLY how the UDP socket becomes
   connectable: it punches a hole, then hands the punched socket to a quinn
@@ -63,7 +63,7 @@ so we don't drain it.
 
 `start_direct(pid, name, secret)` (flag on):
 1. `bind_endpoint()` → rung-1 quinn endpoint + its port (as today).
-2. If `FILAMENT_HOLEPUNCH=1`: bind a second raw `UdpSocket` on `0.0.0.0:0`; run a
+2. If `TUNLION_HOLEPUNCH=1`: bind a second raw `UdpSocket` on `0.0.0.0:0`; run a
    STUN Binding against the configured STUN server to learn its srflx; remember
    the raw socket + srflx in the pending state. STUN/public-IP failure just means
    no srflx is advertised (graceful — rung-2 simply won't fire for this peer).
@@ -113,7 +113,7 @@ candidate prediction, which we explicitly do not.
 
 The STUN server URL comes from the existing ICE config (`stun:host:port` in
 `/api/config`'s iceServers) — the same coturn rung-3 already uses. An env
-override `FILAMENT_STUN` is honored for the lab.
+override `TUNLION_STUN` is honored for the lab.
 
 ## Validation (netns lab — real NAT, not loopback)
 
@@ -137,7 +137,7 @@ natural RTT real WAN has, so quinn's Initial can't beat the mapping in netns.
 Added as a lab-prefixed helper in lib.sh.
 
 Rung-1's `transport-gates.sh` must still pass unchanged (flag-off and
-`FILAMENT_DIRECT=1` paths are untouched by rung-2).
+`TUNLION_DIRECT=1` paths are untouched by rung-2).
 
 ## Confinement / safety
 

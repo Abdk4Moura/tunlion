@@ -187,6 +187,43 @@ async fn deny_unsettled(
         .await;
 }
 
+/// Answer a dial from a device this daemon no longer recognizes (it was
+/// forgotten here while we ran) with the refusal, over signaling: no link is
+/// built for it, and its sender reports the reason at once instead of
+/// waiting out its establishment window.
+async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str) {
+    let refusal = crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None);
+    let mut data = json!({ "type": "not-recognized", "reason": refusal.reason });
+    refusal.annotate(&mut data);
+    let _ = sio.emit("signal", json!({ "to": pid, "data": data })).await;
+    ui::debug(&format!("refused a dial from {pid}: a device forgotten here"));
+}
+
+/// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
+/// serving loop.
+///
+/// The daemon (`up`) serves every peer from this one loop, so a bare `?` on a
+/// per-peer step ended the process for all of them. A two-machine run lost
+/// its daemon 9 s after a restart to one peer's ICE-config timeout ("direct
+/// fallback adoption failed ... no answer within 3s"). In the daemon the
+/// failure is logged and the step is skipped (`Ok(None)`): the steps routed
+/// here leave the peer's existing state intact on error (an establish builds
+/// before it destroys), and the next roster push, warm-hold tick or retry
+/// rung drives that peer again. A one-shot `receive` has exactly one sender,
+/// so there the error still ends the run, unchanged, with its exit code.
+fn peer_step<T>(daemon: bool, pid: &str, what: &str, r: Result<T>) -> Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if daemon => {
+            ui::debug(&format!(
+                "tunlion: PEER-STEP-FAILED peer={pid} step={what}: {e:#}; the daemon keeps serving"
+            ));
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Every inbound control frame, one line, at debug level. A frame that never
 /// arrived and a frame that arrived and was ignored are indistinguishable from
 /// the outside; this is the line that tells them apart, and its absence is what
@@ -218,6 +255,46 @@ async fn retire_link_streams(
 fn log_ctl_rx<'a>(pid: &str, ty: Option<&'a str>) -> Option<&'a str> {
     crate::ui::debug(&format!("ctl rx {} <- {pid}", ty.unwrap_or("?")));
     ty
+}
+
+/// May this overlay key hold a route here? Not when its device was revoked,
+/// and not once the invitation that admitted it ended: a route is access too,
+/// the one a device keeps without opening anything.
+pub(crate) fn overlay_key_refused(pubkey: &[u8; 32]) -> bool {
+    device_cert_revoked(pubkey)
+        || crate::identity_state::delegated_access_for(pubkey)
+            .is_some_and(|a| a.expired(crate::identity::now_secs()))
+}
+
+/// The decline for an offer the gate refused. A refusal with a known cause
+/// (access expired, device revoked, outside the ceiling) travels as a TYPED
+/// refusal carrying the reason, so the sender prints why ("access expired at
+/// ...") instead of a bare "declined" that reads as a person saying no. A
+/// plain no stays a plain decline. Pure.
+pub(crate) fn policy_decline_msg(id: &str, reason: Option<&str>) -> Value {
+    match reason.and_then(|r| crate::refusal::code_from_reason(r).map(|c| (c, r))) {
+        Some((code, r)) => protocol::refuse_msg(id, code.as_wire(), r),
+        None => protocol::decline_msg(id),
+    }
+}
+
+/// May a parked open's re-drive overturn this deny once the peer proves its
+/// key? Only when the deny could be ABOUT the missing proof. Expiry, the
+/// enrolment ceiling, revocation (of the device or of a grant), an explicit
+/// owner deny and an unrecognized device are decisions no proof changes, so
+/// their verdict is final at once. Pure, so the rule is unit-testable.
+pub(crate) fn deny_is_proof_attributable(reason: &str) -> bool {
+    let r = reason.trim();
+    let final_prefixes = [
+        crate::capability::EXPIRED_PREFIX,
+        crate::capability::CEILING_REASON,
+        crate::capability::REVOKED_REASON,
+        "device revoked",
+        "shell revoked for",
+        "explicitly denied",
+        crate::refusal::UNRECOGNIZED_REASON,
+    ];
+    !final_prefixes.iter().any(|p| r.starts_with(p))
 }
 
 /// Settle-then-evaluate, called with an ALREADY-DENIED verdict: decide
@@ -254,6 +331,14 @@ pub(crate) async fn park_on_deny(
     if binding_proven {
         return false;
     }
+    // A proof can only ever supply PROOF. A deny whose reason is something a
+    // proof cannot change (the access expired, the ceiling excludes it, the
+    // device was revoked or explicitly denied) is final: parking it handed the
+    // verdict to the re-drive, and the re-drive overturned an expiry it had
+    // no business touching (the exec ran ~2.5 min past the invitation end).
+    if !deny_is_proof_attributable(gate_reason) {
+        return false;
+    }
     // No resolved key: there is nothing for a hold to bind to, so the LIVE
     // verdict stands -- the caller sends its own reason and raises the
     // access request. Answering here would replace a real denial ("no shell
@@ -268,6 +353,13 @@ pub(crate) async fn park_on_deny(
         return false;
     }
     if crate::identity_state::cert_revoked_for(Some(&device_pub)) {
+        return false;
+    }
+    // And independently of how the reason was worded: an ended delegated
+    // device never parks.
+    if crate::identity_state::delegated_access_for(&device_pub)
+        .is_some_and(|a| a.expired(crate::identity::now_secs()))
+    {
         return false;
     }
     if let Some(n) = name.as_deref() {
@@ -357,6 +449,7 @@ async fn handle_forward_open(
     // Attempt through the whole loop. The initiator path (l2.rs) is
     // fully instrumented and is the side that exhibits the stall.
     let Some(t) = conn.transport_of(&pid) else {
+        crate::conn::dropped_no_transport(&pid, "forward open");
         return;
     };
     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
@@ -404,7 +497,7 @@ async fn handle_forward_open(
         gate_inputs.ceiling_covers = false;
         let legacy_ok = {
             let blanket = shell_policy.enables_l2()
-                || std::env::var("FILAMENT_L2")
+                || std::env::var("TUNLION_L2")
                     .map(|x| x == "1")
                     .unwrap_or(false);
             let (peer_has_shell, peer_denied) = conn
@@ -458,8 +551,25 @@ async fn handle_forward_open(
             .unwrap_or("device not granted shell");
         ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
         let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
-        let mut close = json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" });
-        crate::refusal::Refusal::new(crate::refusal::Code::NotGranted, who).annotate(&mut close);
+        // The gate's own cause when it is final (expired, revoked): a revoked
+        // device used to be told "device lacks shell grant", which sent it to
+        // ask for a grant that could not help.
+        let close = match crate::refusal::Refusal::final_cause(l2_deny_reason.as_deref(), who.clone()) {
+            Some(mut r) => {
+                if r.code == crate::refusal::Code::Expired {
+                    r.reinvite = conn
+                        .link(&pid)
+                        .and_then(|l| l.identity_device_pub)
+                        .and_then(|d| crate::identity_state::reinvite_for(&d));
+                }
+                r.close_frame(sid)
+            }
+            None => {
+                let mut close = json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" });
+                crate::refusal::Refusal::new(crate::refusal::Code::NotGranted, who).annotate(&mut close);
+                close
+            }
+        };
         let _ = t.send_control(&close).await;
     } else {
         // Opt-in gateway: if the target is non-loopback, allow it
@@ -549,10 +659,11 @@ async fn handle_pty_open(
     parked: &mut Vec<ParkedOpen>,
 ) {
     let Some(t) = conn.transport_of(&pid) else {
+        crate::conn::dropped_no_transport(&pid, "pty open");
         return;
     };
     // #219: the acceptor is OFF (plain `up`, no --shell/--shell-only,
-    // no FILAMENT_L2). The peer is visibly up but cannot serve a
+    // no TUNLION_L2). The peer is visibly up but cannot serve a
     // shell, and dropping the open silently made `shell` hang with
     // no output. Say so, so the initiator errors instead of waiting.
     if !l2_enabled {
@@ -613,7 +724,8 @@ async fn handle_pty_open(
             gate_inputs.denied,
             cap_reason.as_deref(),
             dev.clone(),
-        );
+        )
+        .with_reinvite_for(gate_inputs.idev.as_ref());
         let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
@@ -692,7 +804,9 @@ async fn handle_pty_open(
         let _ = t
             .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
             .await;
-        sess.attach(t.clone(), sid);
+        // How much output the client already has, so only the missed part is
+        // replayed (absent from older clients and the browser: replay all).
+        sess.attach(t.clone(), sid, v["resume_from"].as_u64());
         sess.resize(cols, rows);
         pty_bindings
             .entry(pid.clone())
@@ -803,6 +917,76 @@ async fn handle_pty_open(
     }
 }
 
+/// Whether an offer is accepted without asking, before the capability layer.
+/// A daemon accepts only proven links. A foreground receive accepts on `-y`,
+/// on a re-enqueued answer the person already gave, on a proven link, on the
+/// resume of a partial it already accepted, and on the CODE: typing the code a
+/// sender's ceremony was bound to is the consent (`receive --help`). Pure.
+pub(crate) fn offer_has_consent(
+    daemon: bool,
+    yes: bool,
+    consented: bool,
+    link_trusted: bool,
+    resuming_partial: bool,
+    code_consent: bool,
+) -> bool {
+    if daemon {
+        link_trusted
+    } else {
+        yes || consented || link_trusted || resuming_partial || code_consent
+    }
+}
+
+/// Why a code receive ended with no sender authenticated. "Older version" was
+/// said for every expiry, including when other codes' senders sharing the room
+/// ran their (current) ceremonies at us. Say it only when no peer ran one. Pure.
+pub(crate) fn recv_pake_expired_message(any_pake_heard: bool, budget_secs: u64) -> String {
+    if any_pake_heard {
+        format!(
+            "no device in the sender's room completed the encrypted handshake for this code within {budget_secs}s: \
+             the code may be mistyped, or its sender stopped waiting. Nothing was received; ask for a FRESH code."
+        )
+    } else {
+        "the other device uses an older version and can't send securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was received.".to_string()
+    }
+}
+
+#[cfg(test)]
+mod pake_expired_tests {
+    use super::recv_pake_expired_message;
+
+    #[test]
+    fn older_version_only_when_no_peer_ran_a_ceremony() {
+        assert!(recv_pake_expired_message(false, 60).contains("older version"));
+        let m = recv_pake_expired_message(true, 60);
+        assert!(!m.contains("older version"), "{m}");
+        assert!(m.contains("60s") && m.contains("FRESH code"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod offer_consent_tests {
+    use super::offer_has_consent;
+
+    /// Eval item 6: `receive <code>` asked `accept? [y/N]` at a terminal while
+    /// its help says a code never asks. The code's own sender is accepted.
+    #[test]
+    fn a_code_is_consent_and_nothing_else_is() {
+        assert!(offer_has_consent(false, false, false, false, false, true));
+        // A room offer from an unproven stranger still asks.
+        assert!(!offer_has_consent(false, false, false, false, false, false));
+        // The daemon never treats a code as consent: it holds no code.
+        assert!(!offer_has_consent(true, false, false, false, false, true));
+        assert!(offer_has_consent(true, false, false, true, false, false));
+    }
+
+    #[test]
+    fn the_receive_help_promises_what_the_code_path_does() {
+        let help = include_str!("cli_def.rs");
+        assert!(help.contains("`receive <code>` never asks"));
+    }
+}
+
 pub(crate) async fn recv_cmd(
     server: &str,
     mut code: Option<String>,
@@ -840,15 +1024,21 @@ pub(crate) async fn recv_cmd(
     // offer: type a code to connect to a specific person, or press Enter on an
     // empty buffer to use the local network (today's default). When the gate is
     // closed we fall straight through to the auto-room default below.
-    if !daemon && code.is_none() && interactive_allowed() {
+    // An explicit --room (or --to) already says where to meet: asking for a
+    // code there contradicted the flag the user typed.
+    if !daemon && code.is_none() && room.is_none() && to.is_none() && interactive_allowed() {
         ui::say(&ui::paint(
             ui::Tone::Dim,
             "  enter a code to connect to a specific person, or press enter to use the local network",
         ));
         match codeentry::run("  receive / code  ", codeentry::Mode::Claim, "", "")? {
-            codeentry::Outcome::Submitted(c) => code = Some(c),
+            codeentry::Outcome::Submitted(c) | codeentry::Outcome::Claim(c) => code = Some(c),
             codeentry::Outcome::Empty => { /* fall through to the local-network auto room */ }
             codeentry::Outcome::Cancelled => return Err(cancelled()),
+            // Ctrl-C is an interrupt, not a choice: 130, as a shell reports it.
+            codeentry::Outcome::Interrupted => {
+                crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+            }
         }
     }
     if opened_flow {
@@ -955,14 +1145,22 @@ pub(crate) async fn recv_cmd(
     // lose, room membership, channel subscriptions, the lease. The emits
     // stay as the fast path (and old-server compat); the session is truth.
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.channels = devices.iter().map(|(_, s)| channel_of(s)).collect();
-    // Fleet auto-mesh: one more meeting point, where devices certified by the
-    // SAME owner key find each other with no pairwise pairing. Presence there
-    // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
-    // and docs/design-fleet-automesh.md.
-    if let Some(fc) = fleet::channel() {
-        if !sess.channels.contains(&fc) {
-            sess.channels.push(fc);
+    // A one-shot `receive <code>` meets exactly one peer: whoever holds the
+    // code. Subscribing it to every known device's channel (and the fleet's)
+    // dialed whichever of them was online: the lab saw "known device 'w2-a'
+    // appeared, connecting" during a receive from the unrelated w1-a, and then
+    // that second link on the roster line under its raw signaling id.
+    let code_only = code.is_some() && !daemon;
+    if !code_only {
+        sess.channels = devices.iter().map(|(_, s)| channel_of(s)).collect();
+        // Fleet auto-mesh: one more meeting point, where devices certified by the
+        // SAME owner key find each other with no pairwise pairing. Presence there
+        // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
+        // and docs/design-fleet-automesh.md.
+        if let Some(fc) = fleet::channel() {
+            if !sess.channels.contains(&fc) {
+                sess.channels.push(fc);
+            }
         }
     }
     // L1-a: the ephemeral SPAKE2 ceremony for a `recv <code>` claim. The typed
@@ -1011,7 +1209,7 @@ pub(crate) async fn recv_cmd(
     const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
     let recv_pake_budget = Duration::from_secs(
-        std::env::var("FILAMENT_PAIR_GRACE_SECS")
+        std::env::var("TUNLION_PAIR_GRACE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),
@@ -1021,6 +1219,9 @@ pub(crate) async fn recv_cmd(
     // budgets only drop individual mis-latch candidates; this is the backstop for
     // a genuinely absent / old sender. Armed on the first candidate channel.
     let mut recv_pake_overall_deadline: Option<Instant> = None;
+    // Did ANY peer send PAKE traffic? A peer that runs a ceremony is a current
+    // build, so the "older version" message is only true when none did.
+    let mut recv_pake_heard = false;
     // Memory bound: a crowded room cannot blow us up. We mint at most this many
     // concurrent candidate ceremonies; further candidates are ignored (the real
     // sender is, in practice, among the first to share the room with the claimer).
@@ -1049,7 +1250,7 @@ pub(crate) async fn recv_cmd(
                     // report things that are false, such as "daemon not running"
                     // while this daemon is plainly up. The common real cause is
                     // a socket path longer than the kernel allows (108 bytes on
-                    // Linux, 104 on macOS), e.g. a deep FILAMENT_CONFIG_DIR or a
+                    // Linux, 104 on macOS), e.g. a deep TUNLION_CONFIG_DIR or a
                     // CI/macOS temp directory; found by a first-time-user test
                     // whose sandbox path was 110 bytes.
                     //
@@ -1116,7 +1317,7 @@ pub(crate) async fn recv_cmd(
             if crate::armed::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
             } else {
-                ui::debug("enrollment closed (no armed keys — mint or arm an auth-key to open)");
+                ui::debug("enrollment closed (no armed keys: mint or arm an auth-key to open)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             let mut c = chans;
@@ -1202,19 +1403,19 @@ pub(crate) async fn recv_cmd(
     }
 
     // L2 acceptor posture (computed here so it also gates the direct-QUIC path).
-    // OFF unless FILAMENT_L2=1 (opt-in) OR an active `up --shell` policy turns it
+    // OFF unless TUNLION_L2=1 (opt-in) OR an active `up --shell` policy turns it
     // on (you can't ssh in without the acceptor). See its second use below.
     // L2/shell is ON when: an `--shell`/`--shell-only` policy turns it on, the
-    // FILAMENT_L2 opt-in is set, OR any known device has been `grant`ed shell (so
+    // TUNLION_L2 opt-in is set, OR any known device has been `grant`ed shell (so
     // `tunlion grant <dev> shell` works on a plain `up` without restarting with a
     // flag, matching what the grant command tells the user). The per-device gate
     // below still denies every non-granted device, so this never widens access.
-    // The launch posture (`--shell`/`--shell-only`, FILAMENT_L2) is fixed for
+    // The launch posture (`--shell`/`--shell-only`, TUNLION_L2) is fixed for
     // the daemon's life: it is what `--i-know` was checked against, so a live
     // `set shell on` must not widen it past that gate. The GRANT half is not
     // fixed: it is recomputed at the top of every loop iteration below.
     let l2_launch = shell_policy.enables_l2()
-        || std::env::var("FILAMENT_L2")
+        || std::env::var("TUNLION_L2")
             .map(|v| v == "1")
             .unwrap_or(false);
     let mut l2_enabled = l2_launch || any_shell_grant();
@@ -1257,7 +1458,8 @@ pub(crate) async fn recv_cmd(
         let tx = tx.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            shutdown::arm_force_exit(130, shutdown::grace());
+            shutdown::note_signal(crate::exit_codes::INTERRUPTED);
+            shutdown::arm_force_exit(crate::exit_codes::INTERRUPTED, shutdown::grace());
             let _ = tx.send(Ev::Interrupted);
         });
     }
@@ -1269,7 +1471,10 @@ pub(crate) async fn recv_cmd(
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             {
                 term.recv().await;
-                shutdown::arm_force_exit(130, shutdown::grace());
+                // SIGTERM exits 143, not 130: the documented taxonomy
+                // (exit_codes.rs) reports the signal that actually arrived.
+                shutdown::note_signal(crate::exit_codes::TERMINATED);
+                shutdown::arm_force_exit(crate::exit_codes::TERMINATED, shutdown::grace());
                 let _ = tx.send(Ev::Interrupted);
             }
         });
@@ -1286,12 +1491,21 @@ pub(crate) async fn recv_cmd(
     if interactive {
         let tx = tx.clone();
         let q = st.question_open.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut stdin = tokio::io::stdin();
+        // A DEDICATED OS thread, never `tokio::io::stdin()`. tokio's stdin is an
+        // uncancellable read on the runtime's blocking pool, and dropping the
+        // runtime waits for every blocking task: a receive that finished
+        // ("done (1 file).") then sat in that drop until someone pressed Enter,
+        // and since the signal tasks die with the runtime, Ctrl-C and SIGTERM
+        // were caught and ignored. A plain thread is reaped by process exit, so
+        // the receive leaves the moment it is done. (Same reason as
+        // l2::spawn_stdin_reader.)
+        std::thread::spawn(move || {
+            use std::io::Read;
+            // Not `.lock()`: a held lock would starve any later plain prompt.
+            let mut stdin = std::io::stdin();
             let mut buf = [0u8; 1];
             let mut line = String::new();
-            while stdin.read(&mut buf).await.map(|n| n == 1).unwrap_or(false) {
+            while stdin.read(&mut buf).map(|n| n == 1).unwrap_or(false) {
                 let c = buf[0] as char;
                 if q.load(std::sync::atomic::Ordering::Relaxed)
                     && "yYnN".contains(c)
@@ -1350,7 +1564,7 @@ pub(crate) async fn recv_cmd(
                     None
                 } else {
                     // Endpoint selection: `l3-mode` setting (kernel|userspace|auto),
-                    // default Auto; FILAMENT_L3_USERSPACE / `up --userspace` force
+                    // default Auto; TUNLION_L3_USERSPACE / `up --userspace` force
                     // userspace (handled inside L3::start via the env).
                     let mode = match settings::get_str("l3-mode", None).as_deref() {
                         Some("kernel") => l3::L3Mode::Kernel,
@@ -1483,7 +1697,7 @@ pub(crate) async fn recv_cmd(
                                     .map(|a| format!(" / {a}"))
                                     .unwrap_or_default();
                                 ui::say(&format!(
-                                    "  {} L3 overlay {}{} on filament0",
+                                    "  {} L3 overlay {}{} on tunlion0",
                                     ui::paint(ui::Tone::Brand, "●"),
                                     addr,
                                     v4
@@ -1541,39 +1755,32 @@ pub(crate) async fn recv_cmd(
     #[cfg(l3)]
     let exposer: Option<std::sync::Arc<expose::Exposer>> = match l3.as_ref() {
         Some(m) => {
-            // POSTURE (user decision): a node that SILENTLY fell back to userspace
-            // (Auto, no explicit opt-in) must NOT auto-honor expose.json, because
-            // userspace bypasses host firewall/nftables on filament0 - an operator
-            // who assumed kernel-mode scoping would silently lose it. Only honor
-            // expose in userspace when the user opted in (`--userspace` / the env /
-            // `l3-mode=userspace`). Kernel mode always honors it.
-            let userspace_opt_in = std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1")
-                || settings::get_str("l3-mode", None).as_deref() == Some("userspace");
-            if m.is_userspace() && !userspace_opt_in {
-                if !expose::load().is_empty() {
+            // Honored in EVERY mode, userspace included, exactly as a live
+            // `tunlion expose` (ReloadExpose) already was. Startup used to refuse
+            // expose.json after a userspace fallback while the live apply bound
+            // the same ports, so a restart silently dropped what `expose` had just
+            // applied, and `status` went on listing ports nothing served. The
+            // ports bind on the overlay address only (a ULA reached over
+            // tunlion0 by paired peers); in userspace the host firewall does not
+            // see that traffic, which is said here rather than used as a reason
+            // to disagree with the live path.
+            let ex = expose::Exposer::new(m.clone());
+            let n = ex.reconcile().await;
+            if n > 0 {
+                ui::say(&format!(
+                    "  {} exposing {} port{} on the overlay",
+                    ui::paint(ui::Tone::Brand, "●"),
+                    n,
+                    if n == 1 { "" } else { "s" }
+                ));
+                if m.is_userspace() {
                     ui::say(&ui::paint(
-                        ui::Tone::Warn,
-                        "  expose.json NOT honored: L3 fell back to userspace (host firewall is bypassed there).",
-                    ));
-                    ui::say(
-                        "    opt in with `tunlion up --userspace` or `tunlion set l3-mode userspace` to expose in userspace mode",
-                    );
-                }
-                let ex = expose::Exposer::new(m.clone());
-                Some(ex) // held so a later live opt-in via ReloadExpose can still bind
-            } else {
-                let ex = expose::Exposer::new(m.clone());
-                let n = ex.reconcile().await;
-                if n > 0 {
-                    ui::say(&format!(
-                        "  {} exposing {} port{} on the overlay",
-                        ui::paint(ui::Tone::Brand, "●"),
-                        n,
-                        if n == 1 { "" } else { "s" }
+                        ui::Tone::Dim,
+                        "    (userspace overlay: paired peers reach these directly; the host firewall does not filter them)",
                     ));
                 }
-                Some(ex)
             }
+            Some(ex)
         }
         None => None,
     };
@@ -1695,7 +1902,14 @@ pub(crate) async fn recv_cmd(
     // were noticed, until the sweep closes the links that used them.
     let mut revocation_snap = crate::revocation_live::store_snapshot();
     let mut revocation_sweep_now = false;
+    // Links whose device's invitation ended, already withdrawn (said once).
+    let mut expired_unrouted: std::collections::HashSet<String> = Default::default();
     let mut revoked_secrets: std::collections::HashSet<String> = Default::default();
+    // Meeting places of devices forgotten while this daemon ran. The server keeps
+    // us listed on them, so the forgotten device still finds us there; a dial on
+    // one is answered `not-recognized` (a refusal it reports at once, exit 4)
+    // instead of being buffered until its sender times out.
+    let mut forgotten_channels: std::collections::HashSet<String> = Default::default();
     // Links whose peer claimed a pairing this store does not hold (its
     // pair-proof failed: forgotten here, or never paired). Every shell-class
     // open on such a link is refused as unrecognized before any handler runs,
@@ -1707,7 +1921,7 @@ pub(crate) async fn recv_cmd(
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
     // would turn a clean decline into the 45s timeout it replaced.
     let fleet_offer_grace = Duration::from_secs(
-        std::env::var("FILAMENT_FLEET_OFFER_GRACE_SECS")
+        std::env::var("TUNLION_FLEET_OFFER_GRACE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8),
@@ -1740,7 +1954,7 @@ pub(crate) async fn recv_cmd(
     //  - Ev::SignalingDown : the socket.io close/error fast-path accelerant.
     // Only the daemon acceptor self-heals (`signaling_self_heal`); the one-shot
     // recv/send paths re-invoke fresh, so they keep failing fast (unchanged).
-    // FILAMENT_TEST_NO_SIGNALING_RECONNECT reverts to the OLD no-outer-loop path
+    // TUNLION_TEST_NO_SIGNALING_RECONNECT reverts to the OLD no-outer-loop path
     // so the signaling-drop gate's A/B baseline can prove the acceptor ZOMBIES
     // without the fix (the detector/loop is load-bearing, not incidental).
     let signaling_self_heal = daemon && !test_hooks::no_signaling_reconnect();
@@ -1816,7 +2030,7 @@ pub(crate) async fn recv_cmd(
         // forever, faithfully simulating a peer transport whose inline write
         // never returns. The graceful Ev::Interrupted can no longer be processed;
         // only the signal-owned force-exit watchdog can still terminate us. No-op
-        // unless FILAMENT_TEST_WEDGE_LOOP is set (test-hooks builds only).
+        // unless TUNLION_TEST_WEDGE_LOOP is set (test-hooks builds only).
         if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
             std::future::pending::<()>().await;
         }
@@ -1965,12 +2179,36 @@ pub(crate) async fn recv_cmd(
                                                 req.reject("unknown overlay peer").await;
                                                 return;
                                             };
-                                            match m.dial(addr, port).await {
-                                                Ok(mut stream) => {
+                                            // BOUNDED. A port the peer did not expose can
+                                            // black-hole the SYN, and an unbounded dial held
+                                            // the proxy's client with no reply at all.
+                                            let t0 = std::time::Instant::now();
+                                            match tokio::time::timeout(l2::OVERLAY_DIAL_BOUND, m.dial(addr, port)).await {
+                                                Ok(Ok(mut stream)) => {
+                                                    // An exposed port's overlay listener completes
+                                                    // the handshake before `expose` dials what is
+                                                    // behind it, so a connect is not an answer.
+                                                    // Settle first: the peer closing at once means
+                                                    // nothing listens there (SOCKS 0x05), and the
+                                                    // proxy must not say "granted" and then hold.
+                                                    let window = l2::overlay_settle_window(t0.elapsed());
+                                                    let mut first = vec![0u8; 16 * 1024];
+                                                    let got = match tokio::time::timeout(window, tokio::io::AsyncReadExt::read(&mut stream, &mut first)).await {
+                                                        Ok(Ok(0)) | Ok(Err(_)) => {
+                                                            req.reject(l2::OVERLAY_TARGET_CLOSED).await;
+                                                            return;
+                                                        }
+                                                        Ok(Ok(n)) => n,
+                                                        Err(_) => 0,
+                                                    };
                                                     let mut sock = req.accept().await;
+                                                    if got > 0 && tokio::io::AsyncWriteExt::write_all(&mut sock, &first[..got]).await.is_err() {
+                                                        return;
+                                                    }
                                                     let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
                                                 }
-                                                Err(e) => req.reject(&format!("overlay dial failed: {e}")).await,
+                                                Ok(Err(e)) => req.reject(&format!("overlay dial failed: {e}")).await,
+                                                Err(_) => req.reject(l2::OVERLAY_DIAL_TIMED_OUT).await,
                                             }
                                         });
                                     }
@@ -2091,7 +2329,13 @@ pub(crate) async fn recv_cmd(
                             if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
                                 let peer = r.peer.clone();
                                 let cap = r.capability.clone();
-                                if cap != allow {
+                                if let Some(bar) = crate::request_bar(&peer) {
+                                    // The gate refuses this device whatever is
+                                    // granted; never record an approval for it.
+                                    r.status = crate::REQUEST_WITHDRAWN.to_string();
+                                    save_requests(&requests);
+                                    req.reject(&crate::request_bar_refusal(id, &peer, bar)).await;
+                                } else if cap != allow {
                                     req.reject(&format!("request {id} is for '{cap}', not '{allow}'")).await;
                                 } else if !crate::capability::grant_active(expires, crate::capability::now_secs()) {
                                     req.reject("grant expiry must be in the future").await;
@@ -2146,7 +2390,19 @@ pub(crate) async fn recv_cmd(
                 },
                 next_ev(&mut rx, &conn, !st.pending.is_empty()),
             ) => match res {
-                Ok(res) => res?,
+                Ok(Ok(ev)) => ev,
+                // A daemon is not one sender's receiver: a peer that left
+                // mid-transfer and outlived its rejoin window closes that
+                // window, and the daemon keeps serving everyone else (its
+                // .part stays for a later resume). A one-shot ends here.
+                Ok(Err(e)) if daemon && conn.rejoin.waiting_rejoin.is_some() => {
+                    ui::debug(&format!(
+                        "tunlion: rejoin window closed ({e:#}); the daemon keeps serving"
+                    ));
+                    conn.rejoin.waiting_rejoin = None;
+                    None
+                }
+                Ok(Err(e)) => return Err(e),
                 Err(_) => None, // tick: run the settle sweep + quiet-check below
             },
         };
@@ -2351,6 +2607,7 @@ pub(crate) async fn recv_cmd(
             for p in fire {
                 crate::ui::say(&format!("l2: {:?} open proven; re-driving", p.kind));
                 let Some(t) = conn.transport_of(&p.pid) else {
+                    crate::conn::dropped_no_transport(&p.pid, &format!("parked {:?} open", p.kind));
                     continue;
                 };
                 match p.kind {
@@ -2499,14 +2756,12 @@ pub(crate) async fn recv_cmd(
         // Overall deadline: the backstop. Once we are matched into the sender's
         // room a candidate channel arms this; if NO peer authenticates within it,
         // fail the whole `recv` loudly (a genuinely absent / old sender, mirroring
-        // the previous single-budget intent and FILAMENT_PAIR_GRACE_SECS) rather
+        // the previous single-budget intent and TUNLION_PAIR_GRACE_SECS) rather
         // than hanging forever.
         if recv_code_path && !recv_pake_done {
             if let Some(dl) = recv_pake_overall_deadline {
                 if Instant::now() > dl {
-                    bail!(
-                        "the other device uses an older version and can't send securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was received."
-                    );
+                    bail!(recv_pake_expired_message(recv_pake_heard, recv_pake_budget.as_secs()));
                 }
             }
         }
@@ -2980,6 +3235,10 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                     let mut doomed: Vec<(String, String)> = Vec::new();
+                    // Doomed links whose device KEY is revoked in place (its
+                    // pair secret still held): told "device revoked", not
+                    // "not recognized".
+                    let mut key_revoked: std::collections::HashSet<String> = Default::default();
                     let mut unrouted: Vec<String> = Vec::new();
                     for (pid, l) in &conn.links {
                         let facts = crate::revocation_live::LinkFacts {
@@ -2991,6 +3250,19 @@ pub(crate) async fn recv_cmd(
                             &revoked_secrets,
                             &crate::revocation_live::key_listed,
                         ) {
+                            // Forgotten (its secret removed) reads "not
+                            // recognized", as every later open is answered;
+                            // "device revoked" only for a key revoked in place.
+                            let secret_gone =
+                                facts.secret.is_some_and(|s| revoked_secrets.contains(s));
+                            if !secret_gone
+                                && l
+                                    .identity_device_pub
+                                    .as_ref()
+                                    .is_some_and(crate::revocation_live::key_listed)
+                            {
+                                key_revoked.insert(pid.clone());
+                            }
                             doomed.push((pid.clone(), l.shown().to_string()));
                         } else if crate::revocation_live::route_must_withdraw(
                             l.identity_device_pub.as_ref(),
@@ -2999,11 +3271,30 @@ pub(crate) async fn recv_cmd(
                             unrouted.push(pid.clone());
                         }
                     }
+                    forgotten_channels.extend(revoked_secrets.iter().map(|s| channel_of(s)));
                     revoked_secrets.clear();
                     brokered_pids.retain(|p, by| {
                         (conn.links.contains_key(p) || conn.direct_pending.contains_key(p))
                             && !device_cert_revoked(&by.device_pub)
                     });
+                    // Tell each doomed peer WHY before the link goes: a peer
+                    // mid-exec or mid-send otherwise sees only a dead link and
+                    // reports "link died" (exit 6) for what is a refusal.
+                    // drop_link closes the transport only after a grace, so
+                    // this frame leaves first.
+                    for (pid, _) in &doomed {
+                        if let Some(t) = conn.transport_of(pid) {
+                            let code = if key_revoked.contains(pid) {
+                                crate::refusal::Code::CertRevoked
+                            } else {
+                                crate::refusal::Code::Unrecognized
+                            };
+                            let refusal = crate::refusal::Refusal::new(code, None);
+                            let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
+                            refusal.annotate(&mut f);
+                            let _ = t.send_control(&f).await;
+                        }
+                    }
                     for (pid, label) in &doomed {
                         conn.drop_link(pid);
                         l2_muxes.remove(pid);
@@ -3028,10 +3319,55 @@ pub(crate) async fn recv_cmd(
                     }
                     let _ = &unrouted;
                     let closed = doomed.len();
+                    // Links to a device revoked IN PLACE stay up to carry the
+                    // refusal; count them so `devices revoke` can say so.
+                    let refused = conn
+                        .links
+                        .values()
+                        .filter(|l| {
+                            crate::revocation_live::route_must_withdraw(
+                                l.identity_device_pub.as_ref(),
+                                &device_cert_revoked,
+                            )
+                        })
+                        .count();
                     for req in revocation_waiters.drain(..) {
-                        req.reply(&json!({ "ok": true, "closed": closed })).await;
+                        req.reply(&json!({ "ok": true, "closed": closed, "refused": refused })).await;
                     }
                 }
+            }
+            // Invitation ends are TIME, not store changes, so they are checked on
+            // every scan rather than on a snapshot change: a link whose device's
+            // invitation has ended loses its overlay route here (opens on it are
+            // refused by the gate, and its open sessions are cut by the live
+            // re-check in each serving loop).
+            {
+                let now = identity::now_secs();
+                let ended: Vec<(String, String)> = conn
+                    .links
+                    .iter()
+                    .filter(|(pid, _)| !expired_unrouted.contains(*pid))
+                    .filter_map(|(pid, l)| {
+                        let d = l.identity_device_pub?;
+                        crate::identity_state::delegated_access_for(&d)
+                            .filter(|a| a.expired(now))
+                            .map(|_| (pid.clone(), l.shown().to_string()))
+                    })
+                    .collect();
+                for (pid, label) in ended {
+                    expired_unrouted.insert(pid.clone());
+                    ui::say(&format!(
+                        "access for '{label}' ended (its invitation expired): refusing it from here on"
+                    ));
+                    #[cfg(l3)]
+                    {
+                        l3_seen.remove(&pid);
+                        if let Some(m) = l3.as_ref() {
+                            m.remove_by_pid(&pid).await;
+                        }
+                    }
+                }
+                expired_unrouted.retain(|p| conn.links.contains_key(p));
             }
             let mut new_chans: Vec<String> = Vec::new();
             for (n, s) in devices_load() {
@@ -3086,9 +3422,10 @@ pub(crate) async fn recv_cmd(
         // ADOPT for the same peer; that sequence is not sound if peers recover
         // concurrently, so caller attribution alone is insufficient here.
         for (pid, info, (n, sec)) in conn.expired_direct() {
-            conn.maybe_adopt(&info, true).await.with_context(|| {
+            let adopted = conn.maybe_adopt(&info, true).await.with_context(|| {
                 format!("direct fallback adoption failed for peer {pid} on receive path")
-            })?;
+            });
+            peer_step(daemon, &pid, "direct fallback adoption", adopted)?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
@@ -3236,7 +3573,7 @@ pub(crate) async fn recv_cmd(
         // left are ones held open purely for their deferred-drop reap (their
         // sender's signaling left AFTER the transfer finished), there is nothing
         // in flight to protect, exit promptly instead of paying the full
-        // FILAMENT_ADOPT_ACTIVE_MS deferral. Restores the pre-#28 prompt exit; an
+        // TUNLION_ADOPT_ACTIVE_MS deferral. Restores the pre-#28 prompt exit; an
         // in-progress reconnect keeps `by_sid` non-empty and so is unaffected.
         if st.completed > 0
             && !keep_open
@@ -3281,7 +3618,7 @@ pub(crate) async fn recv_cmd(
 
         // G-k fallback: everything done, nobody attached, no questions
         // outstanding, if that holds quietly for the quiet-exit window (10s
-        // default, FILAMENT_QUIET_EXIT_SECS overrides), the peer-left we were
+        // default, TUNLION_QUIET_EXIT_SECS overrides), the peer-left we were
         // counting on for a clean exit never arrived; exit anyway. C30 ph2:
         // ALSO satisfied when the server's digest says the room is empty and
         // no room-independent (channel) link remains, lingering dead links
@@ -3308,7 +3645,7 @@ pub(crate) async fn recv_cmd(
         // `Ready`) does not block exit, but a healthy `Ready` link (e.g. a
         // bystander between two human-paced sends, gate 6) STILL does. So this is
         // a no-op for healthy peers, not a behaviour change, only a peer we've
-        // lost contact with stops blocking. FILAMENT_TEST_DISABLE_MODEB_DROP
+        // lost contact with stops blocking. TUNLION_TEST_DISABLE_MODEB_DROP
         // restores the old links-gated behaviour so gate 18b proves the A/B
         // (baseline hangs, fix exits) with one binary.
         // A link whose transport is DEAD is not healthy whatever its presence
@@ -3374,7 +3711,7 @@ pub(crate) async fn recv_cmd(
                             paired,
                         );
                         ui::say(&q); // permanent: a new question fronted (C25)
-                        ui::sticky(&q);
+                        ui::sticky_ask(&q);
                         st.question_shown = Instant::now();
                     }
                 } else {
@@ -3481,7 +3818,8 @@ pub(crate) async fn recv_cmd(
                             conn.start_direct(&pid, &name, &secret).await;
                             // Channel-digest recovery remains intentionally outside
                             // the room give-up suppression scope.
-                            conn.maybe_adopt(p, true).await?;
+                            let r = conn.maybe_adopt(p, true).await;
+                            peer_step(daemon, &pid, "channel-digest adoption", r)?;
                             if let Some(l) = conn.link_mut(&pid) {
                                 l.expected_secret = Some((name, secret));
                             }
@@ -3491,7 +3829,9 @@ pub(crate) async fn recv_cmd(
                             let enroll_channel =
                                 crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                             if p["channel"].as_str() == Some(enroll_channel.as_str()) {
-                                conn.maybe_adopt(p, true).await?;
+                                let r = conn.maybe_adopt(p, true).await;
+                                let pid = p["id"].as_str().unwrap_or_default();
+                                peer_step(daemon, pid, "enrollment-digest adoption", r)?;
                             }
                         }
                     }
@@ -3542,7 +3882,8 @@ pub(crate) async fn recv_cmd(
                                 ui::Tone::Dim,
                                 "  (digest: adopting a peer we never heard join)",
                             ));
-                            conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
+                            let r = conn.maybe_adopt_from(p, true, AdoptSource::Digest).await;
+                            peer_step(daemon, id, "digest adoption", r)?;
                         }
                     }
                     // known room-sourced link absent ×2 → a peer-left we
@@ -3640,7 +3981,9 @@ pub(crate) async fn recv_cmd(
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
-                        conn.maybe_adopt(p, true).await?;
+                        let r = conn.maybe_adopt(p, true).await;
+                        let pid = p["id"].as_str().unwrap_or_default();
+                        peer_step(daemon, pid, "welcome adoption", r)?;
                     }
                 }
                 // C30 (dissolves the C28 belt): a welcome means a fresh sid,
@@ -3651,6 +3994,10 @@ pub(crate) async fn recv_cmd(
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own sender/daemon shares these channels
+                }
+                // A code receive dials only the code's holder (see code_only).
+                if code_only {
+                    continue;
                 }
                 // Dialing on a held secret is admitting it (a direct link is born
                 // trusted on that MAC), so match against the store as it is NOW,
@@ -3719,9 +4066,21 @@ pub(crate) async fn recv_cmd(
                     // rung-1: known device = both CLIs; try direct QUIC first.
                     let (n, sec) = (n.clone(), sec.clone());
                     conn.start_direct(&pid, &n, &sec).await;
-                    conn.maybe_adopt(&v, true).await?;
+                    let r = conn.maybe_adopt(&v, true).await;
+                    peer_step(daemon, &pid, "known-device adoption", r)?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
+                    }
+                } else if v["channel"].as_str().is_some_and(|c| {
+                    forgotten_channels.contains(c)
+                        || revoked_secrets.iter().any(|s| channel_of(s) == c)
+                }) {
+                    // A device forgotten here, dialing the meeting place it still
+                    // finds us on: tell it, rather than leave it waiting.
+                    if let Some(pid) = v["id"].as_str().filter(|p| !p.is_empty()) {
+                        if !conn.links.contains_key(pid) {
+                            refuse_unrecognized_dial(&sio, pid).await;
+                        }
                     }
                 } else if let Some((sec, broker)) =
                     brokered.get(v["channel"].as_str().unwrap_or("")).cloned()
@@ -3753,7 +4112,8 @@ pub(crate) async fn recv_cmd(
                     let name = crate::revocation_live::brokered_dial_name(&broker);
                     brokered_pids.insert(pid.clone(), broker.clone());
                     conn.start_direct(&pid, &name, &sec).await;
-                    conn.maybe_adopt(&v, true).await?;
+                    let r = conn.maybe_adopt(&v, true).await;
+                    peer_step(daemon, &pid, "brokered adoption", r)?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((name, sec));
                         if l.transport.is_some() {
@@ -3790,7 +4150,8 @@ pub(crate) async fn recv_cmd(
                             conn.start_direct_fleet(&pid, &rv).await;
                         }
                     }
-                    conn.maybe_adopt(&v, true).await?;
+                    let r = conn.maybe_adopt(&v, true).await;
+                    peer_step(daemon, &pid, "fleet adoption", r)?;
                 } else if let Ok(Some(uk)) =
                     crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
                 {
@@ -3804,13 +4165,17 @@ pub(crate) async fn recv_cmd(
                         {
                             ui::debug("enrollment peer appeared on channel, dialing");
                         }
-                        conn.maybe_adopt(&v, true).await?;
+                        let r = conn.maybe_adopt(&v, true).await;
+                        peer_step(daemon, &pid, "enrollment adoption", r)?;
                     }
                 }
             }
             Ev::PeerJoined(v) => {
                 let had_partials = !st.by_sid.is_empty();
-                if conn.maybe_adopt(&v, true).await? && had_partials {
+                let r = conn.maybe_adopt(&v, true).await;
+                let pid = v["id"].as_str().unwrap_or_default();
+                let now_active = peer_step(daemon, pid, "peer-joined adoption", r)?;
+                if now_active.unwrap_or(false) && had_partials {
                     // Stale per-link sid routing dies with the old link; the
                     // .part files live on and the sender's resume re-offers.
                     flush_inflight(&mut st.by_sid).await;
@@ -3847,6 +4212,18 @@ pub(crate) async fn recv_cmd(
                     }
                     if data["probe"].as_bool() == Some(true) {
                         conn.answer_upgrade_probe(&from).await;
+                    }
+                    // A dial on the meeting place of a device forgotten here: it
+                    // can never be matched, so refuse it now, by name.
+                    if !conn.direct_pending.contains_key(&from)
+                        && !conn.links.contains_key(&from)
+                        && data["ch"].as_str().is_some_and(|c| {
+                            forgotten_channels.contains(c)
+                                || revoked_secrets.iter().any(|s| channel_of(s) == c)
+                        })
+                    {
+                        refuse_unrecognized_dial(&sio, &from).await;
+                        continue;
                     }
                     // Bug 2: the sender re-dialed after mid-transfer death.
                     // If we don't have a DirectPending, buffer the offer and
@@ -3910,6 +4287,22 @@ pub(crate) async fn recv_cmd(
                     if recv_pake_done {
                         continue;
                     }
+                    // A sender of ANOTHER code on the same device shares this
+                    // room and may run its ceremony at us. It names its own
+                    // nameplate: not ours to run, and not a reason to fail.
+                    // Any PAKE traffic still proves that peer is a current build.
+                    recv_pake_heard = true;
+                    let ours_np = recv_pake_template.as_ref().map(|(_, np)| np.as_str()).unwrap_or("");
+                    if crate::pake_ceremony::addressed_to(&data, ours_np) == Some(false) {
+                        st.recv_cers.remove(&from);
+                        st.recv_deadlines.remove(&from);
+                        st.recv_pending_offers.remove(&from);
+                        recv_pending_direct.remove(&from);
+                        ui::debug(&format!(
+                            "recv: {from} runs another code's ceremony; not our sender"
+                        ));
+                        continue;
+                    }
                     // Mint this peer's ceremony on first sight (bounded), or route
                     // into its existing one. If the peer was already dropped (budget
                     // expired) or we are at the candidate cap, ignore its traffic.
@@ -3947,10 +4340,12 @@ pub(crate) async fn recv_cmd(
                     let mut secret_opt: Option<String> = None;
                     let mut is_abort = false;
                     let mut abort_why = String::new();
+                    let mut peer_direct = false;
                     if let Some(cer) = st.recv_cers.get_mut(&from) {
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
                                 secret_opt = cer.secret().cloned();
+                                peer_direct = cer.peer_supports_direct();
                             }
                             PakeInbound::Abort(why) => {
                                 is_abort = true;
@@ -3967,7 +4362,13 @@ pub(crate) async fn recv_cmd(
                         ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
                         // Option A: start the direct-QUIC race. start_direct owns
                         // replacement after all fallible setup and pending registration.
-                        let promo = conn.start_direct_promote(&from, &from, &sec).await;
+                        // A browser sender cannot take direct QUIC:
+                        // promoting it would drop the WebRTC link it is on.
+                        let promo = if peer_direct {
+                            conn.start_direct_promote(&from, &from, &sec).await
+                        } else {
+                            crate::conn::Promotion::Retained
+                        };
                         conn.bind_active(&from);
                         // A retained link is unannounced here too, and this loop's
                         // ChannelReady arm sends `caps` and the signed L3 announce,
@@ -4036,7 +4437,12 @@ pub(crate) async fn recv_cmd(
                 }
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
-                conn.ensure_responder(&from, &data).await?;
+                // A responder that could not be built (or a peer announcing a
+                // malformed uid) gets no signal applied; the daemon carries on.
+                let r = conn.ensure_responder(&from, &data).await;
+                if peer_step(daemon, &from, "responder", r)?.is_none() {
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             // rung-1: authenticated direct-QUIC won the race, adopt as a
@@ -4219,7 +4625,7 @@ pub(crate) async fn recv_cmd(
                     }
                 }
                 // web-shell discovery: tell the peer whether this receiver offers a
-                // terminal (l2_enabled = `up --shell` / FILAMENT_L2). The browser
+                // terminal (l2_enabled = `up --shell` / TUNLION_L2). The browser
                 // shows its per-device shell button ONLY when this is true; the
                 // actual pty-open is still gated server-side by the cap/policy.
                 let _ = t
@@ -4310,7 +4716,7 @@ pub(crate) async fn recv_cmd(
                                     ui::debug(&format!(
                                         "  l3-announce from {pid} ignored: relayed link and peer does not advertise relay datagrams"
                                     ));
-                                } else if device_cert_revoked(&pending.pubkey) {
+                                } else if overlay_key_refused(&pending.pubkey) {
                                     // The overlay key IS the device key: a
                                     // revoked or forgotten device gets no route.
                                     ui::debug(&format!(
@@ -4334,12 +4740,32 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                 }
+                // Name the peer once, and only by a name. A second link to the
+                // same sender (a candidate or a re-dial) announced itself again,
+                // and a link not yet named by proof announced its raw signaling
+                // id: the lab read "ok w1-a" then "ok DrUEPIADYWGghg6rAAVO".
+                let announce = conn.link(&pid).and_then(|l| {
+                    let label = l.label().to_string();
+                    let raw = crate::conn::label_is_raw_id(&label, &pid, l.uid.as_deref())
+                        || conn.links.keys().any(|k| k == &label);
+                    let dup = conn.links.iter().any(|(k, o)| {
+                        k != &pid && o.presence == Presence::Ready && o.label() == label
+                    });
+                    if (raw && !ui::enabled(ui::Level::Debug)) || dup {
+                        ui::debug(&format!("link ready: {label} (pid {pid}), not announced"));
+                        None
+                    } else {
+                        Some(label)
+                    }
+                });
                 if let Some(l) = conn.link_mut(&pid) {
-                    ui::say(&format!(
-                        "  {} {}",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, l.label())
-                    ));
+                    if let Some(label) = &announce {
+                        ui::say(&format!(
+                            "  {} {}",
+                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            ui::paint(ui::Tone::Bold, label)
+                        ));
+                    }
                     l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
                     let is_direct = l.direct;
@@ -4373,7 +4799,10 @@ pub(crate) async fn recv_cmd(
                     } else if is_direct {
                         ui::debug(&format!(
                             "    {}",
-                            ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))
+                            ui::paint(
+                                ui::Tone::Dim,
+                                &format!("route: {}", crate::conn::shown_direct_route(direct_route, &t))
+                            )
                         ));
                     }
                 }
@@ -4437,9 +4866,12 @@ pub(crate) async fn recv_cmd(
                             );
                             st.recv_deadlines
                                 .insert(pid.clone(), Instant::now() + recv_pake_budget);
+                            // Once per receive, not once per candidate in the room.
+                            if recv_pake_overall_deadline.is_none() {
+                                ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
+                            }
                             recv_pake_overall_deadline
                                 .get_or_insert_with(|| Instant::now() + recv_pake_budget);
-                            ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
                         }
                     }
                 }
@@ -4818,7 +5250,7 @@ pub(crate) async fn recv_cmd(
                                         Ok(ip) => {
                                             // The overlay key IS the device key: a
                                             // revoked or forgotten device gets no route.
-                                            if device_cert_revoked(&ann.pubkey) {
+                                            if overlay_key_refused(&ann.pubkey) {
                                                 ui::debug(&format!(
                                                     "  l3-announce from {pid} ignored: its key is revoked here"
                                                 ));
@@ -5445,7 +5877,7 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                 }
-                // L2 (ssh/TCP tunnel) acceptor. Opt-in (FILAMENT_L2=1). The
+                // L2 (ssh/TCP tunnel) acceptor. Opt-in (TUNLION_L2=1). The
                 // capability gate is the proof-verified `trusted` flag on this
                 // link (placeholder for L1-a caps); localhost-only is enforced in
                 // accept_control. A non-trusted or non-loopback open is refused.
@@ -5474,7 +5906,7 @@ pub(crate) async fn recv_cmd(
                     )
                     .await;
                 }
-                // Seamless-shell bootstrap (acceptor). Opt-in (FILAMENT_L2=1).
+                // Seamless-shell bootstrap (acceptor). Opt-in (TUNLION_L2=1).
                 // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
                 // when the link is proof-verified (`trusted`) AND the proven
                 // device holds the NEW `shell` capability, distinct from
@@ -5566,6 +5998,7 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "shell-bootstrap");
                         continue;
                     };
                     // #30 GAP 2 (shell): honor the pending_proven hold. If a
@@ -5613,7 +6046,7 @@ pub(crate) async fn recv_cmd(
                             .unwrap_or(false);
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
-                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    // under TUNLION_CAP_AUTHORITATIVE.
                     let granted = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
@@ -5753,7 +6186,7 @@ pub(crate) async fn recv_cmd(
                                 .unwrap_or(22);
                             let sshd = sshd_listening(ssh_port).await;
                             ui::say(&format!(
-                                "l2: shell granted to '{device}', installed managed key (filament-managed block)"
+                                "l2: shell granted to '{device}', installed managed key (tunlion-managed block)"
                             ));
                             let _ = t
                                 .send_control(&json!({
@@ -5810,12 +6243,24 @@ pub(crate) async fn recv_cmd(
                         l2::wire_sid(&v),
                         exec_recv::ExecCtl::from_frame(&v),
                     ) {
-                        mux.exec_control(sid, msg).await;
+                        // Answer a heartbeat on the link it came in on: the
+                        // initiator holds the session to these answers, so a
+                        // daemon killed outright is noticed within seconds
+                        // instead of when the transport finally times out.
+                        let live = mux.exec_control(sid, msg).await;
+                        if live && msg == exec_recv::ExecCtl::Alive {
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let _ = t
+                                    .send_control(&json!({ "type": "exec-alive-ack", "sid": sid }))
+                                    .await;
+                            }
+                        }
                     }
                     continue;
                 }
                 Some("exec-open") => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "exec-open");
                         continue;
                     };
                     let mux = l2_muxes
@@ -5841,6 +6286,7 @@ pub(crate) async fn recv_cmd(
                 // parked on an unproven-identity deny like the shell-class opens.
                 Some("sync-open") => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "sync-open");
                         continue;
                     };
                     let mux = l2_muxes
@@ -5876,6 +6322,7 @@ pub(crate) async fn recv_cmd(
                 // the handler sends its own cert/refusal replies.
                 Some("ssh-sign-request") => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "ssh-sign-request");
                         continue;
                     };
                     crate::ssh_ca::handle_ssh_sign(
@@ -5891,6 +6338,7 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("mount-open") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "mount-open");
                         continue;
                     };
                     // wire_sid rejects a missing OR out-of-range sid instead of
@@ -5919,7 +6367,7 @@ pub(crate) async fn recv_cmd(
                     let verified = conn.link(&pid).and_then(|l| l.verified_name.clone());
                     // Capability layer for mount evaluated unconditionally (shadow
                     // samples the legacy-allowed population); legacy (trusted) stands
-                    // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
+                    // in shadow, cap gates under TUNLION_CAP_AUTHORITATIVE.
                     let (authorized, read_only) = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
@@ -6025,7 +6473,17 @@ pub(crate) async fn recv_cmd(
                             authorized.deny_reason("not authorized (mount capability required)")
                         ));
                         enqueue_if_requestable(&who, "mount");
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
+                        // An expiry or revocation says so; anything else stays
+                        // the coarse category that leaks no authz internals.
+                        let deny = authorized.deny_reason("");
+                        let close = match crate::refusal::Refusal::final_cause(
+                            (!deny.is_empty()).then_some(deny),
+                            verified.clone(),
+                        ) {
+                            Some(r) => r.close_frame(sid),
+                            None => json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" }),
+                        };
+                        let _ = t.send_control(&close).await;
                         continue;
                     }
                     let Some(root_path) = confined_root else {
@@ -6173,6 +6631,8 @@ pub(crate) async fn recv_cmd(
                         let kept = match (&remember, ceremony_peer) {
                             (Some(name), true) => match devices_store(name, &sec) {
                                 Ok(stored) => {
+                                    crate::shared_defs::REMEMBER_STORED
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
                                     ui::say(&format!(
                                         "remembered this device as '{stored}', future sends auto-accept after proof"
                                     ));
@@ -6545,7 +7005,8 @@ pub(crate) async fn recv_cmd(
                         if !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
                             ui::debug(&format!("enrollment peer appeared on channel, dialing"));
                         }
-                        conn.maybe_adopt(&v, true).await?;
+                        let r = conn.maybe_adopt(&v, true).await;
+                        peer_step(daemon, &pid, "enrollment adoption", r)?;
                     }
                 }
                                                                 }
@@ -6563,6 +7024,7 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("file-offer") => {
                     let Some(t) = conn.transport_of(&pid) else {
+                        crate::conn::dropped_no_transport(&pid, "file-offer");
                         continue;
                     };
                     // L1-a (shared-room hardened): on the code path, accept bytes
@@ -6786,14 +7248,25 @@ pub(crate) async fn recv_cmd(
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let consented = v["__consent"].as_str() == Some(consent_token());
                     // Legacy (pre-capability) decision, per mode.
-                    let legacy_ok = if daemon {
-                        link_trusted
-                    } else {
-                        yes || consented || link_trusted || (is_resume && offset > 0)
-                    };
+                    // A code is consent: the person typed the code this
+                    // sender's ceremony was bound to, which is what `receive
+                    // --help` promises ("`receive <code>` never asks"). It
+                    // asked `accept? [y/N]` anyway at a terminal. Only the
+                    // ceremony peer carries that consent, never a bystander.
+                    let code_consent = recv_code_path
+                        && recv_pake_done
+                        && conn.is_bound_active_peer(&pid);
+                    let legacy_ok = offer_has_consent(
+                        daemon,
+                        yes,
+                        consented,
+                        link_trusted,
+                        is_resume && offset > 0,
+                        code_consent,
+                    );
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
-                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    // under TUNLION_CAP_AUTHORITATIVE.
                     let (ok, xfer_deny_reason, xfer_gate) = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
@@ -6891,7 +7364,8 @@ pub(crate) async fn recv_cmd(
                             &format!("declined {name} from {sender_name} ({reason})"),
                             crate::exit_codes::ExitKind::Denied,
                         );
-                        t.send_control(&protocol::decline_msg(&id)).await?;
+                        let r = t.send_control(&policy_decline_msg(&id, Some(reason.as_str()))).await;
+                        peer_step(daemon, &pid, "decline", r)?;
                         continue;
                     }
                     if !ok {
@@ -6908,7 +7382,7 @@ pub(crate) async fn recv_cmd(
                                 // sticky as the live answer tail.
                                 let q = offer_question(&sender_name, &name, size, paired);
                                 ui::say(&q);
-                                ui::sticky(&q);
+                                ui::sticky_ask(&q);
                                 st.question_shown = Instant::now();
                             }
                             continue; // decision arrives later via StdinLine
@@ -6955,7 +7429,10 @@ pub(crate) async fn recv_cmd(
                                 crate::exit_codes::ExitKind::Usage,
                             ),
                         }
-                        t.send_control(&protocol::decline_msg(&id)).await?;
+                        let r = t
+                            .send_control(&policy_decline_msg(&id, xfer_deny_reason.as_deref()))
+                            .await;
+                        peer_step(daemon, &pid, "decline", r)?;
                         continue;
                     }
 
@@ -7087,7 +7564,8 @@ pub(crate) async fn recv_cmd(
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
                             note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
-                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                            let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
+                            peer_step(daemon, &pid, "refusal", r)?;
                             continue;
                         }
                     }
@@ -7112,7 +7590,8 @@ pub(crate) async fn recv_cmd(
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
                             note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
-                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                            let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
+                            peer_step(daemon, &pid, "refusal", r)?;
                             continue;
                         }
                     }
@@ -7150,7 +7629,8 @@ pub(crate) async fn recv_cmd(
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
                                 note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
-                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                                let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
+                                peer_step(daemon, &pid, "refusal", r)?;
                                 continue;
                             }
                         }
@@ -7194,7 +7674,8 @@ pub(crate) async fn recv_cmd(
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
                                 note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
-                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                                let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
+                                peer_step(daemon, &pid, "refusal", r)?;
                                 continue;
                             }
                         }
@@ -7228,7 +7709,13 @@ pub(crate) async fn recv_cmd(
                             stdout: None,
                         },
                     );
-                    t.send_control(&protocol::accept_msg(&id, offset)).await?;
+                    // The accept could not be sent (the link died under us): drop
+                    // the stream just registered. Its .part stays for the
+                    // sender's resume on the next link.
+                    let r = t.send_control(&protocol::accept_msg(&id, offset)).await;
+                    if peer_step(daemon, &pid, "accept", r)?.is_none() {
+                        st.by_sid.remove(&(pid.clone(), sid));
+                    }
                 }
                 // The sender could not read its own source part way through: the
                 // partial here can never be completed from it, so it is removed,
@@ -7370,7 +7857,7 @@ pub(crate) async fn recv_cmd(
                                     // the else-if chain survived MINUS its first arm, which is
                                     // what a botched conflict resolution looks like. For ~620
                                     // commits `cli/tests/ack-loss-repro.sh` set
-                                    // FILAMENT_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
+                                    // TUNLION_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
                                     // its "premature" round ran an ordinary transfer and the
                                     // promptness verdict measured the happy path.
                                     // `hooks_that_nothing_calls` now fails if any hook loses
@@ -7549,7 +8036,7 @@ pub(crate) async fn recv_cmd(
                                     // the else-if chain survived MINUS its first arm, which is
                                     // what a botched conflict resolution looks like. For ~620
                                     // commits `cli/tests/ack-loss-repro.sh` set
-                                    // FILAMENT_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
+                                    // TUNLION_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
                                     // its "premature" round ran an ordinary transfer and the
                                     // promptness verdict measured the happy path.
                                     // `hooks_that_nothing_calls` now fails if any hook loses
@@ -7696,7 +8183,7 @@ pub(crate) async fn recv_cmd(
                 } else if let Some(inc) = st.by_sid.get_mut(&(pid.clone(), sid)) {
                     // --- TRACE recv path ---
                     let trace = cfg!(feature = "debug-logs")
-                        && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+                        && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
                     let t_recv_start = if trace {
                         Some(std::time::Instant::now())
                     } else {
@@ -7869,10 +8356,12 @@ pub(crate) async fn recv_cmd(
                             ),
                         ));
                         if let Some(t) = conn.transport_of(&qpid) {
-                            t.send_control(&protocol::decline_msg(
-                                qv["id"].as_str().unwrap_or_default(),
-                            ))
-                            .await?;
+                            let r = t
+                                .send_control(&protocol::decline_msg(
+                                    qv["id"].as_str().unwrap_or_default(),
+                                ))
+                                .await;
+                            peer_step(daemon, &qpid, "decline", r)?;
                         }
                     }
                     // show the next queued question (or re-show on gibberish)
@@ -7888,7 +8377,7 @@ pub(crate) async fn recv_cmd(
                             ui::say(&q); // a NEW question fronted, permanent line (C25)
                             st.question_shown = Instant::now();
                         }
-                        ui::sticky(&q);
+                        ui::sticky_ask(&q);
                     } else {
                         st.question_open
                             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -7914,12 +8403,22 @@ pub(crate) async fn recv_cmd(
                 } else if let Some(n) = ans.strip_prefix("forget ") {
                     let n = n.trim();
                     if devices.iter().any(|(dn, _)| dn == n) {
-                        devices_remove(n)?;
-                        devices.retain(|(dn, _)| dn != n);
-                        ui::say(&format!(
-                            "  {} forgot '{n}', it can no longer find this machine",
-                            ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                        ));
+                        // A typed command that fails is answered, never a
+                        // reason to stop serving everyone else.
+                        match devices_remove(n) {
+                            Ok(()) => {
+                                devices.retain(|(dn, _)| dn != n);
+                                ui::say(&format!(
+                                    "  {} forgot '{n}', it can no longer find this machine",
+                                    ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                ));
+                            }
+                            Err(e) if daemon => ui::say(&format!(
+                                "  {} could not forget '{n}': {e:#}; still listening",
+                                ui::paint(ui::Tone::Err, ui::glyph_err())
+                            )),
+                            Err(e) => return Err(e),
+                        }
                     } else {
                         ui::say(&ui::paint(
                             ui::Tone::Dim,
@@ -7985,12 +8484,22 @@ pub(crate) async fn recv_cmd(
                 if let Some(g) = &tty_guard {
                     g.restore(); // process::exit skips Drop
                 }
+                // Tell every peer this instance is gone: close each link's QUIC
+                // connection. A peer that is not told keeps a live-looking link
+                // to this dead instance for QUIC's 30s idle timeout and routes
+                // warm opens into it. The close frames go out from the endpoint
+                // task while the signaling disconnect below is awaited, so this
+                // adds no wait of its own: a fixed sleep here delayed the exit
+                // enough that a daemon restarted right after `kill` on the same
+                // config found the old one still running (gates 14 then 14b).
+                conn.close_links_for_exit();
+                tokio::task::yield_now().await;
                 // Best-effort, BOUNDED: a wedged signaling socket must not turn the
                 // graceful exit into the very hang the watchdog exists to catch.
                 // The signal task already armed a force-exit; cap the disconnect so
                 // we exit cleanly on our own well inside that grace.
                 let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-                crate::exit_codes::interrupted_exit(130);
+                crate::exit_codes::interrupted_exit(shutdown::signal_code());
             }
             // P0 (GAP-1): the inbound transfer stalled (zero bytes, link alive).
             // The receiver participates in the SYMMETRIC direct-QUIC repair: it
@@ -8275,6 +8784,38 @@ async fn stdout_delivered(inc: &IncomingFile, conn: &Conn, pid: &str, sid: u32) 
 }
 
 #[cfg(test)]
+mod peer_step_tests {
+    use super::*;
+
+    /// The daemon survives a peer's failure: the step is skipped, not the loop.
+    #[test]
+    fn daemon_skips_a_failed_peer_step() {
+        let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"));
+        assert!(matches!(peer_step(true, "p1", "adoption", r), Ok(None)));
+    }
+
+    /// A one-shot receive still fails, with the very error it met (no added
+    /// context: the exit-code taxonomy classifies on that text).
+    #[test]
+    fn one_shot_keeps_the_error_unchanged() {
+        let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"))
+            .context("direct fallback adoption failed for peer p1 on receive path");
+        let e = peer_step(false, "p1", "adoption", r).unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "direct fallback adoption failed for peer p1 on receive path: ICE config: no answer within 3s"
+        );
+    }
+
+    /// Success passes the value through in both modes.
+    #[test]
+    fn success_passes_through() {
+        assert!(matches!(peer_step(true, "p1", "adoption", Ok(true)), Ok(Some(true))));
+        assert!(matches!(peer_step(false, "p1", "adoption", Ok(false)), Ok(Some(false))));
+    }
+}
+
+#[cfg(test)]
 mod settle_tests {
     use super::*;
 
@@ -8413,5 +8954,59 @@ fn note_refusal(
 ) {
     if !daemon {
         crate::recv_report::note_refused(name, size, token, msg, kind);
+    }
+}
+
+#[cfg(test)]
+mod expiry_redrive_tests {
+    use super::{deny_is_proof_attributable, policy_decline_msg};
+
+    /// The lab defect: an exec denied because the guest's invitation had ended
+    /// was parked "for identity proof", then RE-DRIVEN and run once the peer
+    /// proved its key. A proof can only supply proof; a decision it cannot
+    /// change must keep its verdict.
+    #[test]
+    fn the_redrive_never_overturns_a_final_deny() {
+        for reason in [
+            crate::capability::expired_reason(1_760_000_000),
+            crate::capability::CEILING_REASON.to_string(),
+            crate::capability::REVOKED_REASON.to_string(),
+            "device revoked".to_string(),
+            "shell revoked for 'b' here".to_string(),
+            "explicitly denied by owner (deniedCaps)".to_string(),
+            crate::refusal::UNRECOGNIZED_REASON.to_string(),
+        ] {
+            assert!(!deny_is_proof_attributable(&reason), "parked a final deny: {reason}");
+        }
+    }
+
+    /// The settle path still exists for what it was built for: a deny that is
+    /// about the binding not being proven yet.
+    #[test]
+    fn a_deny_about_missing_proof_still_parks() {
+        for reason in [
+            "identity not proven",
+            "fleet device: action needs an explicit grant (deliberate tier or out of scope)",
+            "device not granted shell",
+            "no shell cap / untrusted",
+        ] {
+            assert!(deny_is_proof_attributable(reason), "refused to park: {reason}");
+        }
+    }
+
+    /// A send refused for a known cause carries it, so the sender can say
+    /// "access expired at ..." instead of a bare "declined".
+    #[test]
+    fn a_policy_decline_carries_its_reason() {
+        let r = crate::capability::expired_reason(1_760_000_000);
+        let m = policy_decline_msg("x", Some(&r));
+        assert_eq!(m["type"], "file-decline");
+        assert_eq!(m["reason"], "expired");
+        assert!(m["error"].as_str().unwrap().starts_with("access expired at"));
+        let rv = policy_decline_msg("x", Some("device revoked"));
+        assert_eq!(rv["reason"], "cert-revoked");
+        // A person's plain no (or an unknown reason) stays a plain decline.
+        assert!(policy_decline_msg("x", None).get("reason").is_none());
+        assert!(policy_decline_msg("x", Some("unverified peer")).get("reason").is_none());
     }
 }

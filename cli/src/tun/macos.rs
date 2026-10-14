@@ -4,7 +4,7 @@
 //!
 //! Two macOS specifics are hidden here so `l3.rs` stays portable:
 //! - utun devices are kernel-named `utunN` and cannot be renamed, so the requested
-//!   name (`filament0`) is ignored and the real name is reported by `name()`.
+//!   name (`tunlion0`) is ignored and the real name is reported by `name()`.
 //! - each packet on a utun carries a 4-byte address-family header; `recv`/`send`
 //!   strip/prepend it with readv/writev so callers exchange bare IP packets.
 //!

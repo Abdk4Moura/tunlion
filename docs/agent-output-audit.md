@@ -163,7 +163,7 @@ Exactly one JSON document on stdout, never interleaved with anything else.
 refinement; `error.exit` repeats the process code. `data` preserves today's shapes
 verbatim one level down: `devices` keeps its array (`dispatch.rs:1037-1044`) as
 `data.devices`, `status` keeps `{running,pid,devices,exposed,recent}`
-(`status_cmd.rs:106-112`) as `data`, `doctor` keeps `kind: "filament-doctor-probe"`
+(`status_cmd.rs:106-112`) as `data`, `doctor` keeps `kind: "tunlion-doctor-probe"`
 (`doctor.rs:293-310`) as `data`. No existing consumer re-learns a field.
 
 Two rules that keep it honest:

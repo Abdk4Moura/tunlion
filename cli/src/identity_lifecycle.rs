@@ -65,6 +65,17 @@ pub(crate) fn resolve_peer_identity(link: &mut Link) {
     let now = crate::identity::now_secs();
     if cert.verify(now).is_err() {
         pin_delegated_denied(link, &name);
+        // An INVITED device whose certificate ran out has ended, and the gate
+        // must be able to say so. Leaving the link with no identity made every
+        // refusal read "outside the device's invitation ceiling" (the pinned
+        // empty ceiling), which sent the user to widen a ceiling that was fine.
+        // The key is the record's own, so this names who the link is without
+        // trusting anything the peer said; binding stays unproven.
+        if principal_ceiling_for(&name).is_some() {
+            link.identity_device_pub = Some(cert.device_pub);
+            link.identity_user_pub = Some(cert.user_pub);
+            link.identity_cert_expires = Some(cert.expires);
+        }
         return;
     }
     link.identity_device_pub = Some(cert.device_pub);
@@ -386,7 +397,14 @@ pub(crate) fn handle_identity_expose(
         let (deadline, _clock) =
             effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
         l.identity_cert_expires = Some(deadline);
-        l.principal_kind = principal_kind;
+        // The same liveness rule `resolve_peer_identity` applies. Assigning the
+        // stored principal unconditionally here is what let a PROOF overturn an
+        // expiry: a parked open was denied because the delegated deadline had
+        // passed (empty ceiling), the peer then proved possession of a key
+        // whose certificate renewal had extended, and this line restored the
+        // full ceiling, so the re-driven exec ran past the invitation end.
+        let alive = deadline > identity::now_secs();
+        l.principal_kind = principal_after_liveness(principal_kind, alive);
     }
     // The raw signaling id is an internal: -v only. The person already sees
     // the peer named on the roster line; the proof itself is not news to them.
@@ -517,9 +535,15 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
         // all, and a silent one is exactly how a link that cannot prove itself
         // reads as a link that was refused. Same class as the capsule's other
         // refusals, which are visible at the default level.
-        crate::ui::say(
-            "identity challenge NOT answered: this device holds no certificate for its own key",
-        );
+        // EXPECTED on a device with no identity (a code transfer from a fresh
+        // machine): there is nothing to prove, the code is the trust, and the
+        // line read as a fault on every such send. Only -v shows it there.
+        let msg = "identity challenge NOT answered: this device holds no certificate for its own key";
+        if crate::identity_flow::has_identity() {
+            crate::ui::say(msg);
+        } else {
+            crate::ui::debug(msg);
+        }
         say_identity_unavailable(t, nonce_hex).await;
         return;
     };

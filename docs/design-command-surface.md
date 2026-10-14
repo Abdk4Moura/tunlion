@@ -137,7 +137,7 @@ note: `tunlion netcat` is now `tunlion reach`. Same behavior.
 ```
 
 Rules: **stderr only** (stdout stays script-clean), **once per invocation**,
-suppressible with `FILAMENT_NO_DEPRECATION=1`, **never changes exit code or output**,
+suppressible with `TUNLION_NO_DEPRECATION=1`, **never changes exit code or output**,
 `--json` consumers never see it. Aliases live the whole 0.x line; earliest removal is a
 1.0 major with a migration note.
 

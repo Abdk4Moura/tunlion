@@ -27,7 +27,7 @@ from __future__ import annotations
 import secrets
 
 from labkit import netns
-from labkit.context import LinkContext, FILAMENT_BIN
+from labkit.context import LinkContext, TUNLION_BIN
 from providers import underlay
 
 # serve-tun rendezvous port on the listener's (node-a's) underlay IP.
@@ -35,11 +35,11 @@ PORT = 51820
 
 
 def up(ctx: LinkContext) -> None:
-    if not FILAMENT_BIN.exists():
+    if not TUNLION_BIN.exists():
         raise RuntimeError(
-            f"locally-built tunlion not found at {FILAMENT_BIN}; "
+            f"locally-built tunlion not found at {TUNLION_BIN}; "
             f"build it: (cd cli && cargo build --release).")
-    fb = str(FILAMENT_BIN)
+    fb = str(TUNLION_BIN)
 
     # The veth underlay between the two netns is serve-tun's transport (unlike the
     # old host-ns relay model, native serve-tun connects directly over it).

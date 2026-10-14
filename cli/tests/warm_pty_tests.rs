@@ -24,8 +24,8 @@ fn one_shot_pty_basic_output() {
     let connect_secs = 5;
 
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-pty-test-basic"))
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-warm-pty-test-basic"))
         .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")
@@ -52,7 +52,7 @@ fn one_shot_pty_basic_output() {
     );
 }
 
-/// Test that one-shot pty respects FILAMENT_CONNECT_SECS environment variable.
+/// Test that one-shot pty respects TUNLION_CONNECT_SECS environment variable.
 /// Note: the error may be "no known device" (before timeout) or "can't reach"
 /// (timeout path), both are valid failure modes for an unreachable peer.
 #[test]
@@ -62,8 +62,8 @@ fn one_shot_pty_timeout_respects_env_var() {
 
     let start = std::time::Instant::now();
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-pty-test-timeout"))
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-warm-pty-test-timeout"))
         .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")
@@ -103,8 +103,8 @@ fn one_shot_pty_stdin_forwarding() {
     // Pipe stdin with data - the command should fail (unreachable peer),
     // but the structure should accept stdin input
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-pty-test-stdin"))
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-warm-pty-test-stdin"))
         .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")

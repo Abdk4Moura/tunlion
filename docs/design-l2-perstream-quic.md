@@ -79,7 +79,7 @@ QUIC per-stream receive windows ARE the per-stream backpressure: a stream whose
 reader stalls stops advancing its own window, parking only that stream's
 `write_all`. The connection-level window still bounds total memory. No app credit,
 no `l2-credit` message, no `wnd` advertisement. (Delete the `feat/l2-credit`
-machinery; keep `FILAMENT_L2_WINDOW` only if a connection-level tune is wanted.)
+machinery; keep `TUNLION_L2_WINDOW` only if a connection-level tune is wanted.)
 
 ## Test hooks to preserve (currently in `send_frame`)
 

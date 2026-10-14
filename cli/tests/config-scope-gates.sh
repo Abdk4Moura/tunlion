@@ -4,7 +4,7 @@
 # piped its output into `head`. Each gate drives the real binary end to end and
 # asserts the user-visible property.
 #
-#   FILAMENT_BIN=/path/to/tunlion bash cli/tests/config-scope-gates.sh
+#   TUNLION_BIN=/path/to/tunlion bash cli/tests/config-scope-gates.sh
 #
 # Gates:
 #   A  a new XDG_CONFIG_HOME dir next to a live default config: before init it
@@ -22,11 +22,11 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 case "$BIN" in /*) ;; *) BIN="$(pwd)/$BIN" ;; esac
 PORT=8133
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-cfgscope.XXXXXX")"
 
 PASS=0; FAIL=0; FAILED=""
@@ -35,10 +35,10 @@ ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED="$FAILED|$1"; }
 
 HOMEA="$WORK/home"
-DEFCFG="$HOMEA/.config/filament"
+DEFCFG="$HOMEA/.config/tunlion"
 # The default config is selected the way a user's is: by HOME, with no
-# FILAMENT_CONFIG_DIR and no XDG_CONFIG_HOME.
-dflt() { env -u FILAMENT_CONFIG_DIR -u XDG_CONFIG_HOME HOME="$HOMEA" "$@"; }
+# TUNLION_CONFIG_DIR and no XDG_CONFIG_HOME.
+dflt() { env -u TUNLION_CONFIG_DIR -u XDG_CONFIG_HOME HOME="$HOMEA" "$@"; }
 
 pids=()
 cleanup() {
@@ -79,7 +79,7 @@ say "A: a new XDG_CONFIG_HOME is its own config, never a copy of the default"
 # the short per-user fallback.
 XDG="$WORK/deep/$(printf 'x%.0s' $(seq 1 120))/$(printf 'y%.0s' $(seq 1 40))"
 mkdir -p "$XDG"
-xdgc() { env -u FILAMENT_CONFIG_DIR HOME="$HOMEA" XDG_CONFIG_HOME="$XDG" "$@"; }
+xdgc() { env -u TUNLION_CONFIG_DIR HOME="$HOMEA" XDG_CONFIG_HOME="$XDG" "$@"; }
 echo "## XDG_CONFIG_HOME is ${#XDG} bytes"
 # Any command runs the legacy migration; status is the read-only one.
 xdgc timeout 20 "$BIN" status >"$WORK/xdg-status0.log" 2>&1; rcS0=$?
@@ -91,12 +91,12 @@ xdgc timeout 20 "$BIN" status >"$WORK/xdg-status0.log" 2>&1; rcS0=$?
 leaked=""
 for f in $(cd "$DEFCFG" && find . -type f | sed 's|^\./||'); do
   [ "$f" = "permissions-migration" ] && continue
-  [ -e "$XDG/filament/$f" ] && leaked="$leaked $f"
+  [ -e "$XDG/tunlion/$f" ] && leaked="$leaked $f"
 done
 others=$(find "$XDG" -type f ! -name permissions-migration 2>/dev/null | sed "s|$XDG/||" | tr '\n' ' ')
 [ -n "$others" ] && leaked="$leaked [unexpected: $others]"
 xdgc "$BIN" init --name bravo --recovery-file "$WORK/bravo-rec.txt" --yes >"$WORK/xdg-init.log" 2>&1; rcI=$?
-NEWCFG="$XDG/filament"
+NEWCFG="$XDG/tunlion"
 same_key=no
 cmp -s "$DEFCFG/identity.ed25519" "$NEWCFG/identity.ed25519" 2>/dev/null && same_key=yes
 xdgc timeout 20 "$BIN" status >"$WORK/xdg-status.log" 2>&1
@@ -146,14 +146,14 @@ say "P: a closed pipe keeps a nonzero answer: status with no daemon"
 # PIPESTATUS 0 where plain `status` exits 11, so a script lost the answer. The
 # command decides its exit code before printing and a closed pipe exits with it.
 DP="$WORK/cfg-pipe"
-env FILAMENT_CONFIG_DIR="$DP" "$BIN" init --name piper --recovery-file "$WORK/piper-rec.txt" --yes >/dev/null 2>&1
-env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status >/dev/null 2>&1; rcPU=$?
-env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status --json >/dev/null 2>&1; rcPUJ=$?
-{ sleep 0.5; env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status 2>&1; echo $? >"$WORK/pipe-p.rc"; } | true
-{ sleep 0.5; env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status --json; echo $? >"$WORK/pipe-pj.rc"; } 2>"$WORK/pipe-pj.err" | true
+env TUNLION_CONFIG_DIR="$DP" "$BIN" init --name piper --recovery-file "$WORK/piper-rec.txt" --yes >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DP" timeout 20 "$BIN" status >/dev/null 2>&1; rcPU=$?
+env TUNLION_CONFIG_DIR="$DP" timeout 20 "$BIN" status --json >/dev/null 2>&1; rcPUJ=$?
+{ sleep 0.5; env TUNLION_CONFIG_DIR="$DP" timeout 20 "$BIN" status 2>&1; echo $? >"$WORK/pipe-p.rc"; } | true
+{ sleep 0.5; env TUNLION_CONFIG_DIR="$DP" timeout 20 "$BIN" status --json; echo $? >"$WORK/pipe-pj.rc"; } 2>"$WORK/pipe-pj.err" | true
 rcPP=$(cat "$WORK/pipe-p.rc"); rcPPJ=$(cat "$WORK/pipe-pj.rc")
 # And through `head -1`, exactly as reported.
-env FILAMENT_CONFIG_DIR="$DP" timeout 20 "$BIN" status 2>&1 | head -1 >/dev/null; rcPH=${PIPESTATUS[0]}
+env TUNLION_CONFIG_DIR="$DP" timeout 20 "$BIN" status 2>&1 | head -1 >/dev/null; rcPH=${PIPESTATUS[0]}
 echo "## no daemon: status rc=$rcPU (piped $rcPP, | head -1 $rcPH); --json rc=$rcPUJ (piped $rcPPJ)"
 if [ "$rcPP" = "$rcPU" ] && [ "$rcPH" = "$rcPU" ] && [ "$rcPPJ" = "$rcPUJ" ] \
    && ! grep -qi "panicked\|failed printing" "$WORK/pipe-pj.err"; then
@@ -168,11 +168,11 @@ PWHOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
 # init creates the default inbox under the password-database home; remove it
 # afterwards only if this gate created it (and it is still empty).
 [ -n "$PWHOME" ] && [ ! -e "$PWHOME/Tunlion" ] && CREATED_INBOX="$PWHOME/Tunlion"
-( cd "$WORK" && env -u HOME FILAMENT_CONFIG_DIR="$DH" "$BIN" init --yes --name charlie \
+( cd "$WORK" && env -u HOME TUNLION_CONFIG_DIR="$DH" "$BIN" init --yes --name charlie \
     --recovery-file "$WORK/charlie-rec.txt" >"$WORK/nohome-init.log" 2>&1 ); rcH=$?
 DIRH=$(grep '^dir ' "$DH/config" 2>/dev/null | cut -d' ' -f2-)
 DR="$WORK/cfg-relinbox"
-( cd "$WORK" && env FILAMENT_CONFIG_DIR="$DR" "$BIN" init --yes --name delta --inbox rel-inbox \
+( cd "$WORK" && env TUNLION_CONFIG_DIR="$DR" "$BIN" init --yes --name delta --inbox rel-inbox \
     --recovery-file "$WORK/delta-rec.txt" >"$WORK/relinbox-init.log" 2>&1 ); rcR=$?
 DIRR=$(grep '^dir ' "$DR/config" 2>/dev/null | cut -d' ' -f2-)
 echo "## env -u HOME init rc=$rcH, dir=[$DIRH] (password-database home: $PWHOME)"

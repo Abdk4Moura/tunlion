@@ -23,7 +23,7 @@ fn mint_writes_the_armed_store_without_a_daemon() {
     // init (local, no network): creates the identity the mint signs with.
     let rec = dir.join("recovery.txt");
     let init = Command::new(filament_bin())
-        .env("FILAMENT_CONFIG_DIR", &dir)
+        .env("TUNLION_CONFIG_DIR", &dir)
         .args(["init", "--json", "--name", "armtest", "--recovery-file", rec.to_str().unwrap(), "--yes"])
         .output()
         .expect("init");
@@ -33,7 +33,7 @@ fn mint_writes_the_armed_store_without_a_daemon() {
     // the key, writes armed.json, and writes the token. No daemon, no network.
     let out = dir.join("invite.txt");
     let mint = Command::new(filament_bin())
-        .env("FILAMENT_CONFIG_DIR", &dir)
+        .env("TUNLION_CONFIG_DIR", &dir)
         .args(["add", "--for", "device", "--out", out.to_str().unwrap()])
         .output()
         .expect("mint");

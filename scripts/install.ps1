@@ -5,7 +5,7 @@
 # Detects your platform, downloads the latest release .zip from GitHub, verifies
 # its SHA-256 against the release's SHA256SUMS, and installs tunlion.exe (with
 # the bundled wintun.dll) to %LOCALAPPDATA%\Programs\tunlion, adding it to your
-# user PATH. Override the location with $env:FILAMENT_INSTALL_DIR. No admin, no
+# user PATH. Override the location with $env:TUNLION_INSTALL_DIR. No admin, no
 # telemetry. Source: scripts/install.ps1 in https://github.com/Abdk4Moura/tunlion
 #
 # Prefer a package manager? `winget install Abdk4Moura.Tunlion` works too.
@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $Repo = 'Abdk4Moura/tunlion'
-$InstallDir = if ($env:FILAMENT_INSTALL_DIR) { $env:FILAMENT_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\tunlion' }
+$InstallDir = if ($env:TUNLION_INSTALL_DIR) { $env:TUNLION_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\tunlion' }
 
 function Say([string]$m) { Write-Host "tunlion: $m" -ForegroundColor Cyan }
 function Die([string]$m) { Write-Host "tunlion: $m" -ForegroundColor Red; exit 1 }
@@ -31,9 +31,9 @@ $Asset = "tunlion-$Target.zip"
 # ------------------------------------------------------- resolve latest tag
 # CLI releases are tagged cli-vX.Y.Z. Pick the HIGHEST stable version (the API's
 # order is not newest-first); prereleases (cli-v0.2.1-beta.1) are skipped unless
-# $env:FILAMENT_CHANNEL = 'beta'. Falls back to the newest prerelease if no
+# $env:TUNLION_CHANNEL = 'beta'. Falls back to the newest prerelease if no
 # stable exists yet, matching scripts/install.sh.
-$headers = @{ 'User-Agent' = 'filament-install' }
+$headers = @{ 'User-Agent' = 'tunlion-install' }
 try {
     $releases = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repo/releases?per_page=20"
 } catch { Die 'could not reach the GitHub releases API' }
@@ -50,13 +50,13 @@ function Pick-Any {
     ($tags | Sort-Object { [version](($_ -replace '^cli-v', '') -replace '-.*$', '') }, { $_ } | Select-Object -Last 1)
 }
 
-if ($env:FILAMENT_CHANNEL -eq 'beta') {
+if ($env:TUNLION_CHANNEL -eq 'beta') {
     $Tag = Pick-Any
 } else {
     $Tag = Pick-Stable
     if (-not $Tag) {
         $Tag = Pick-Any
-        if ($Tag) { Say "no stable release yet; installing prerelease $Tag (set `$env:FILAMENT_CHANNEL='beta' to silence)" }
+        if ($Tag) { Say "no stable release yet; installing prerelease $Tag (set `$env:TUNLION_CHANNEL='beta' to silence)" }
     }
 }
 if (-not $Tag) { Die 'could not find a CLI release' }

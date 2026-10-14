@@ -9,9 +9,9 @@ working within it effortless, never looser.
 
 - Tones: `Brand` teal `#7cf6c8`, `Ok` green, `Warn` amber, `Err` red, `Dim`, `Bold`.
 - Glyphs: `✓`/`ok`, `✗`/`x`, `↳` (the codebase's "equivalent command" echo), `•`, `→`.
-- Env contract honored: `NO_COLOR`, `TERM=dumb`, `FILAMENT_COLOR`, unicode→ascii fallback.
+- Env contract honored: `NO_COLOR`, `TERM=dumb`, `TUNLION_COLOR`, unicode→ascii fallback.
 - Interactivity gate exists: TTY & not opted out → guided; non-TTY / `--no-interactive` /
-  `FILAMENT_NONINTERACTIVE` → pure flags, fail loud, never block.
+  `TUNLION_NONINTERACTIVE` → pure flags, fail loud, never block.
 - Voice: lowercase, terse, honest, teach-the-flags, consequence-framed not scary-vague.
 
 ## The design language (one grammar across mint / pair / devices / requests)

@@ -4,7 +4,7 @@
 # stopped daemon, concurrent starts). Each gate reproduces one reported defect
 # end to end against the real binary and asserts the user-visible property.
 #
-#   FILAMENT_BIN=/path/to/tunlion bash cli/tests/hostile-env-gates.sh
+#   TUNLION_BIN=/path/to/tunlion bash cli/tests/hostile-env-gates.sh
 #
 # Gates:
 #   R  five concurrent `up --detach`: exactly one daemon, every launcher exits 0
@@ -47,11 +47,11 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 case "$BIN" in /*) ;; *) BIN="$(pwd)/$BIN" ;; esac
 PORT=8131
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-hostile.XXXXXX")"
 
 PASS=0; FAIL=0; FAILED=""
@@ -64,7 +64,7 @@ pids=()
 cleanup() {
   for p in "${pids[@]:-}"; do [ -n "$p" ] && kill -CONT "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
   for d in "$WORK"/cfg-*; do
-    [ -d "$d" ] && FILAMENT_CONFIG_DIR="$d" timeout 10 "$BIN" down -y >/dev/null 2>&1
+    [ -d "$d" ] && TUNLION_CONFIG_DIR="$d" timeout 10 "$BIN" down -y >/dev/null 2>&1
   done
   for m in "${MOUNTS[@]:-}"; do [ -n "$m" ] && sudo -n umount -l "$m" 2>/dev/null; done
   chmod -R u+w "$WORK" 2>/dev/null
@@ -96,10 +96,10 @@ fill_up() { dd if=/dev/zero of="$1/.fill" bs=4k >/dev/null 2>&1; dd if=/dev/zero
 # ===================================================================== GATE R ==
 say "R: five concurrent up --detach"
 DR="$WORK/cfg-race"; mkdir -p "$DR"
-env FILAMENT_CONFIG_DIR="$DR" "$BIN" init --name racer --recovery-file "$DR/rec.txt" --yes >/dev/null 2>&1 \
+env TUNLION_CONFIG_DIR="$DR" "$BIN" init --name racer --recovery-file "$DR/rec.txt" --yes >/dev/null 2>&1 \
   || { echo "init failed"; exit 2; }
 for i in 1 2 3 4 5; do
-  ( env FILAMENT_CONFIG_DIR="$DR" timeout 60 "$BIN" --server "$SERVER" up --detach --dir "$WORK/race-drop" \
+  ( env TUNLION_CONFIG_DIR="$DR" timeout 60 "$BIN" --server "$SERVER" up --detach --dir "$WORK/race-drop" \
       >"$WORK/race-$i.log" 2>&1; echo $? >"$WORK/race-$i.rc" ) &
 done
 wait_for() { for _ in $(seq 1 60); do [ -f "$1" ] && return 0; sleep 0.5; done; return 1; }
@@ -107,7 +107,7 @@ for i in 1 2 3 4 5; do wait_for "$WORK/race-$i.rc"; done
 sleep 4
 ndaemons=0
 for p in $(pgrep -f "tunlion.*up" 2>/dev/null); do
-  if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "FILAMENT_CONFIG_DIR=$DR"; then
+  if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "TUNLION_CONFIG_DIR=$DR"; then
     ndaemons=$((ndaemons+1)); pids+=("$p")
   fi
 done
@@ -122,18 +122,18 @@ else
   bad "gateR: concurrent up --detach (daemons=$ndaemons rcs=[$rcs] already=$already log=${logsize}B)"
   tail -5 "$DR/daemon.log" 2>/dev/null
 fi
-FILAMENT_CONFIG_DIR="$DR" timeout 15 "$BIN" down -y >/dev/null 2>&1
+TUNLION_CONFIG_DIR="$DR" timeout 15 "$BIN" down -y >/dev/null 2>&1
 
 # ===================================================================== GATE U ==
 say "U: umask 0000 never leaves state open to others"
-DU="$WORK/cfg-umask/nested/filament"
+DU="$WORK/cfg-umask/nested/tunlion"
 (
   umask 0000
-  env FILAMENT_CONFIG_DIR="$DU" "$BIN" init --name opener --recovery-file "$WORK/umask-rec.txt" --yes >/dev/null 2>&1
-  env FILAMENT_CONFIG_DIR="$DU" "$BIN" set auto-extract on >/dev/null 2>&1
-  env FILAMENT_CONFIG_DIR="$DU" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/umask-drop" >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DU" "$BIN" init --name opener --recovery-file "$WORK/umask-rec.txt" --yes >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DU" "$BIN" set auto-extract on >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DU" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/umask-drop" >/dev/null 2>&1
   sleep 3
-  env FILAMENT_CONFIG_DIR="$DU" timeout 15 "$BIN" down -y >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DU" timeout 15 "$BIN" down -y >/dev/null 2>&1
 )
 sleep 1
 open_items=$(find "$WORK/cfg-umask" \( -type d -perm /077 \) -o \( -type f -perm /077 \) 2>/dev/null)
@@ -148,14 +148,14 @@ fi
 
 # ===================================================================== GATE S ==
 say "S: a config dir too deep for a socket path still gets a control socket"
-DS="$WORK/cfg-deep/$(printf 'd%.0s' $(seq 1 60))/$(printf 'e%.0s' $(seq 1 40))/filament"
+DS="$WORK/cfg-deep/$(printf 'd%.0s' $(seq 1 60))/$(printf 'e%.0s' $(seq 1 40))/tunlion"
 mkdir -p "$DS"
 echo "## config dir is ${#DS} bytes; $DS/control.sock would be $(( ${#DS} + 13 ))"
-env FILAMENT_CONFIG_DIR="$DS" "$BIN" init --name deep --recovery-file "$WORK/deep-rec.txt" --yes >/dev/null 2>&1
-env FILAMENT_CONFIG_DIR="$DS" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/deep-drop" >"$WORK/deep-up.log" 2>&1
+env TUNLION_CONFIG_DIR="$DS" "$BIN" init --name deep --recovery-file "$WORK/deep-rec.txt" --yes >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DS" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/deep-drop" >"$WORK/deep-up.log" 2>&1
 sleep 3
-STJ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null)
-ST=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1)
+STJ=$(env TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null)
+ST=$(env TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1)
 DPID=$(head -1 "$DS/up.pid" 2>/dev/null)
 [ -n "$DPID" ] && pids+=("$DPID")
 echo "$ST" | sed 's/^/    /'
@@ -174,8 +174,8 @@ say "K: a client with a different XDG_RUNTIME_DIR still reaches the daemon"
 # one; it computed a different directory and called a healthy daemon "not
 # responding" at a path that never existed.
 OTHERRUN="$WORK/other-run"; mkdir -p "$OTHERRUN"; chmod 700 "$OTHERRUN"
-STK1=$(env -u XDG_RUNTIME_DIR FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcK1=$?
-STK2=$(env XDG_RUNTIME_DIR="$OTHERRUN" FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcK2=$?
+STK1=$(env -u XDG_RUNTIME_DIR TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcK1=$?
+STK2=$(env XDG_RUNTIME_DIR="$OTHERRUN" TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcK2=$?
 echo "## XDG_RUNTIME_DIR unset: rc=$rcK1; XDG_RUNTIME_DIR=$OTHERRUN: rc=$rcK2 (daemon's: ${XDG_RUNTIME_DIR:-unset})"
 echo "$STK1" | head -2 | sed 's/^/    unset: /'; echo "$STK2" | head -2 | sed 's/^/    other: /'
 if [ "$rcK1" = "0" ] && [ "$rcK2" = "0" ] && echo "$STK1" | grep -qE "up( but degraded)? \(pid $DPID\)" \
@@ -188,8 +188,8 @@ fi
 # ===================================================================== GATE P ==
 say "P: a stopped daemon is not reported up"
 if [ -n "$DPID" ] && kill -STOP "$DPID" 2>/dev/null; then
-  STP=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcP=$?
-  STPJ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null); rcPJ=$?
+  STP=$(env TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcP=$?
+  STPJ=$(env TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null); rcPJ=$?
   kill -CONT "$DPID" 2>/dev/null
   echo "## status rc=$rcP"; echo "$STP" | sed 's/^/    /'
   if echo "$STP" | grep -q "not responding" && ! echo "$STP" | grep -q " up (pid" && [ "$rcP" = "6" ]; then
@@ -209,11 +209,11 @@ say "C: a copied config dir does not see or stop the original's daemon"
 sleep 1
 DC="$WORK/cfg-copy"
 cp -a "$DS" "$DC" 2>/dev/null
-STC=$(env FILAMENT_CONFIG_DIR="$DC" timeout 20 "$BIN" status 2>&1); rcC=$?
-DNC=$(env FILAMENT_CONFIG_DIR="$DC" timeout 20 "$BIN" down -y 2>&1)
+STC=$(env TUNLION_CONFIG_DIR="$DC" timeout 20 "$BIN" status 2>&1); rcC=$?
+DNC=$(env TUNLION_CONFIG_DIR="$DC" timeout 20 "$BIN" down -y 2>&1)
 sleep 1
 aliveC=no; [ -n "$DPID" ] && kill -0 "$DPID" 2>/dev/null && aliveC=yes
-STO=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1)
+STO=$(env TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1)
 echo "## copy has up.pid=$(head -1 "$DC/up.pid" 2>/dev/null); copy status rc=$rcC; original pid $DPID alive after down in copy: $aliveC"
 echo "$STC" | head -1 | sed 's/^/    copy status: /'; echo "$DNC" | head -1 | sed 's/^/    copy down:   /'
 echo "$STO" | head -1 | sed 's/^/    original:    /'
@@ -223,12 +223,12 @@ if [ "$rcC" = "11" ] && echo "$STC" | grep -q "not running" && ! echo "$DNC" | g
 else
   bad "gateC: copied config dir acted on the original's daemon (status rc=$rcC, original alive=$aliveC)"
 fi
-env FILAMENT_CONFIG_DIR="$DS" timeout 15 "$BIN" down -y >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DS" timeout 15 "$BIN" down -y >/dev/null 2>&1
 
 # ===================================================================== GATE Z ==
 say "Z: status after down says not running and exits 11"
-STZ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcZ=$?
-STZJ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null); rcZJ=$?
+STZ=$(env TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcZ=$?
+STZJ=$(env TUNLION_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null); rcZJ=$?
 echo "## status rc=$rcZ, status --json rc=$rcZJ"; echo "$STZ" | head -1 | sed 's/^/    /'
 if [ "$rcZ" = "11" ] && echo "$STZ" | grep -q "not running" && [ "$rcZJ" = "11" ] \
    && echo "$STZJ" | "$PYV" -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get("running") is False else 1)'; then
@@ -265,7 +265,7 @@ fi
 # ===================================================================== GATE L ==
 say "L: a config path past PATH_MAX names the length"
 DL="$WORK/cfg-long"; for _ in $(seq 1 22); do DL="$DL/$(printf 'L%.0s' $(seq 1 200))"; done
-outL=$(env FILAMENT_CONFIG_DIR="$DL" timeout 30 "$BIN" --server "$SERVER" up --detach 2>&1); rcL=$?
+outL=$(env TUNLION_CONFIG_DIR="$DL" timeout 30 "$BIN" --server "$SERVER" up --detach 2>&1); rcL=$?
 echo "## config path ${#DL} bytes; up rc=$rcL"; echo "$outL" | tail -2 | cut -c1-300 | sed 's/^/    /'
 if [ "$rcL" != "0" ] && echo "$outL" | grep -q "too long" && ! echo "$outL" | grep -q "writable?"; then
   ok "gateL: the failure names the path length, not writability"
@@ -290,10 +290,10 @@ time.sleep(120)
 pids+=($!)
 sleep 1
 DX="$WORK/cfg-socks"; mkdir -p "$DX"
-env FILAMENT_CONFIG_DIR="$DX" "$BIN" init --name socksy --recovery-file "$WORK/socks-rec.txt" --yes >/dev/null 2>&1
-env FILAMENT_CONFIG_DIR="$DX" "$BIN" set l3-mode userspace >/dev/null 2>&1
-env FILAMENT_CONFIG_DIR="$DX" "$BIN" set auto-proxy on >/dev/null 2>&1
-env FILAMENT_CONFIG_DIR="$DX" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/socks-drop" >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DX" "$BIN" init --name socksy --recovery-file "$WORK/socks-rec.txt" --yes >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DX" "$BIN" set l3-mode userspace >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DX" "$BIN" set auto-proxy on >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DX" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/socks-drop" >/dev/null 2>&1
 for _ in $(seq 1 20); do grep -q "SOCKS5 proxy" "$DX/daemon.log" 2>/dev/null && break; sleep 0.5; done
 grep -i "socks5" "$DX/daemon.log" 2>/dev/null | sed 's/^/    /' | head -5
 if grep -qE "started SOCKS5 proxy on 127\.0\.0\.1:10(8[1-9]) \(1080 was taken\)" "$DX/daemon.log" 2>/dev/null \
@@ -303,32 +303,32 @@ else
   bad "gateX: auto-proxy port report"
   tail -15 "$DX/daemon.log" 2>/dev/null
 fi
-FILAMENT_CONFIG_DIR="$DX" timeout 15 "$BIN" down -y >/dev/null 2>&1
+TUNLION_CONFIG_DIR="$DX" timeout 15 "$BIN" down -y >/dev/null 2>&1
 
 # ============================================= transfer fixture (D, W, N) ======
 # Owner A runs a daemon; B joins A's fleet and receives into a tiny disk.
 DA="$WORK/cfg-A"; DB="$WORK/cfg-B"; mkdir -p "$DA" "$DB"
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/A-drop" >"$WORK/A-up.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/A-drop" >"$WORK/A-up.log" 2>&1 &
 ADAEMON=$!; pids+=($ADAEMON)
 sleep 3
-env FILAMENT_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxB --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
-env FILAMENT_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxB --no-interactive >"$WORK/join.log" 2>&1
+env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxB --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxB --no-interactive >"$WORK/join.log" 2>&1
 # The sends below are one-shots from A, as in transport-gates.sh: A's daemon
 # was only needed to admit the join.
 kill "$ADAEMON" 2>/dev/null; sleep 2
-if ! FILAMENT_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxB; then
+if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxB; then
   echo "setup: boxB did not join"; tail -5 "$WORK/add.log" "$WORK/join.log"
 fi
 FULL="$WORK/tiny"; mount_small "$FULL" 2m
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$FULL" >"$WORK/B-up.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$FULL" >"$WORK/B-up.log" 2>&1 &
 pids+=($!)
 sleep 4
 
 # ===================================================================== GATE D ==
 say "D: a file larger than the receiver's free space"
 head -c 3000000 /dev/urandom >"$WORK/three.bin"
-outD=$(env FILAMENT_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/three.bin" --to boxB 2>&1); rcD=$?
+outD=$(env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/three.bin" --to boxB 2>&1); rcD=$?
 echo "## send rc=$rcD"; echo "$outD" | tail -8 | sed 's/^/    /'
 leftD=$(ls -A "$FULL" 2>/dev/null | tr '\n' ' ')
 if [ "$rcD" = "4" ] && echo "$outD" | grep -q "out of disk space" && echo "$outD" | grep -q "needs" \
@@ -342,7 +342,7 @@ fi
 # ===================================================================== GATE W ==
 say "W: ENOSPC part way through is out of disk space, not corruption"
 head -c 1500000 /dev/urandom >"$WORK/w1.bin"; head -c 1500000 /dev/urandom >"$WORK/w2.bin"
-outW=$(env FILAMENT_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/w1.bin" "$WORK/w2.bin" --to boxB 2>&1); rcW=$?
+outW=$(env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/w1.bin" "$WORK/w2.bin" --to boxB 2>&1); rcW=$?
 echo "## send rc=$rcW"; echo "$outW" | tail -8 | sed 's/^/    /'
 if [ "$rcW" = "4" ] && echo "$outW" | grep -q "out of disk space" \
    && ! grep -qi "checksum still wrong" "$WORK/B-up.log" && ! ls "$FULL"/*.part >/dev/null 2>&1; then
@@ -358,7 +358,7 @@ say "N: a 250-character file name"
 LONGNAME="$(printf 'n%.0s' $(seq 1 246)).bin"
 mkdir -p "$WORK/longsrc"
 head -c 1000 /dev/urandom >"$WORK/longsrc/$LONGNAME" 2>/dev/null || cp "$WORK/w1.bin" "$WORK/longsrc/x.bin"
-outN=$(env FILAMENT_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$WORK/longsrc/$LONGNAME" --to boxB 2>&1); rcN=$?
+outN=$(env TUNLION_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$WORK/longsrc/$LONGNAME" --to boxB 2>&1); rcN=$?
 echo "## send rc=$rcN"; echo "$outN" | tail -5 | sed 's/^/    /'
 gotN=$(ls "$FULL" 2>/dev/null | grep '\.bin$' | head -1)
 echo "## landed as: ${gotN:-(nothing)} (${#gotN} bytes)"
@@ -372,7 +372,7 @@ fi
 # ===================================================================== GATE O ==
 say "O: add --out onto a full disk"
 OUTDISK="$WORK/outdisk"; mount_small "$OUTDISK" 1m; fill_up "$OUTDISK"
-outO=$(env FILAMENT_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for ghost --out "$OUTDISK/inv.txt" --yes 2>&1); rcO=$?
+outO=$(env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for ghost --out "$OUTDISK/inv.txt" --yes 2>&1); rcO=$?
 echo "## add rc=$rcO"; echo "$outO" | tail -4 | sed 's/^/    /'
 if [ "$rcO" != "0" ] && [ ! -e "$OUTDISK/inv.txt" ] && echo "$outO" | grep -qi "no space\|could not write"; then
   ok "gateO: add --out on a full disk prints the error and leaves no partial file"
@@ -383,10 +383,10 @@ fi
 # ===================================================================== GATE T ==
 say "T: a settings write on a full disk leaves no temp file"
 CFGDISK="$WORK/cfgdisk"; mount_small "$CFGDISK" 1m
-DT="$CFGDISK/filament"
-env FILAMENT_CONFIG_DIR="$DT" "$BIN" set auto-extract on >/dev/null 2>&1
+DT="$CFGDISK/tunlion"
+env TUNLION_CONFIG_DIR="$DT" "$BIN" set auto-extract on >/dev/null 2>&1
 fill_up "$CFGDISK"
-outT=$(env FILAMENT_CONFIG_DIR="$DT" "$BIN" set auto-extract off 2>&1); rcT=$?
+outT=$(env TUNLION_CONFIG_DIR="$DT" "$BIN" set auto-extract off 2>&1); rcT=$?
 temps=$(ls -A "$DT" 2>/dev/null | grep '\.tmp\.' | tr '\n' ' ')
 echo "## set rc=$rcT temps=[$temps]"; echo "$outT" | tail -3 | sed 's/^/    /'
 if [ "$rcT" != "0" ] && [ -z "$temps" ]; then
@@ -398,10 +398,10 @@ fi
 # ===================================================================== GATE I ==
 say "I: init under a read-only parent leaves no orphan recovery file"
 RO="$WORK/rohome"; mkdir -p "$RO"; chmod 555 "$RO"
-outI=$(env FILAMENT_CONFIG_DIR="$RO/filament" "$BIN" init --name ro --recovery-file "$WORK/ro-rec.txt" --yes 2>&1); rcI=$?
+outI=$(env TUNLION_CONFIG_DIR="$RO/tunlion" "$BIN" init --name ro --recovery-file "$WORK/ro-rec.txt" --yes 2>&1); rcI=$?
 chmod 755 "$RO"
 echo "## init rc=$rcI"; echo "$outI" | tail -3 | sed 's/^/    /'
-if [ "$rcI" != "0" ] && [ ! -e "$WORK/ro-rec.txt" ] && [ ! -e "$RO/filament/identity.ed25519" ]; then
+if [ "$rcI" != "0" ] && [ ! -e "$WORK/ro-rec.txt" ] && [ ! -e "$RO/tunlion/identity.ed25519" ]; then
   ok "gateI: failed init wrote neither an identity nor an orphan recovery phrase"
 else
   bad "gateI: init on a read-only parent (rc=$rcI, phrase file left: $([ -e "$WORK/ro-rec.txt" ] && echo yes || echo no))"
@@ -412,7 +412,7 @@ say "H: up --detach with a HOME that does not exist names the path"
 # Under / so it cannot be created by this (non-root) user: a HOME under $WORK
 # would simply be created, which is not the case being tested.
 NOHOME="/nonexistent-tunlion-home-$$"
-outH=$(env -u FILAMENT_CONFIG_DIR -u XDG_CONFIG_HOME HOME="$NOHOME" timeout 30 "$BIN" --server "$SERVER" up --detach 2>&1); rcH=$?
+outH=$(env -u TUNLION_CONFIG_DIR -u XDG_CONFIG_HOME HOME="$NOHOME" timeout 30 "$BIN" --server "$SERVER" up --detach 2>&1); rcH=$?
 echo "## up rc=$rcH"; echo "$outH" | tail -3 | sed 's/^/    /'
 if [ "$rcH" != "0" ] && echo "$outH" | grep -q "$NOHOME"; then
   ok "gateH: the failure names the path it could not create"

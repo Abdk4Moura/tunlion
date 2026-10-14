@@ -26,12 +26,12 @@
 
 use std::path::PathBuf;
 
-/// `{config_dir}/control.sock`, honoring FILAMENT_CONFIG_DIR (hermetic tests),
-/// else `~/.config/filament`. Mirrors `devices_path()` / `pidfile()`. Portable
+/// `{config_dir}/control.sock`, honoring TUNLION_CONFIG_DIR (hermetic tests),
+/// else `~/.config/tunlion`. Mirrors `devices_path()` / `pidfile()`. Portable
 /// (just path math); only used on unix where the socket is actually bound.
 ///
 /// When that path is too long for a unix socket (a deep HOME or
-/// FILAMENT_CONFIG_DIR), a short per-user directory is used instead; see
+/// TUNLION_CONFIG_DIR), a short per-user directory is used instead; see
 /// `platform::control_socket_path`. Daemon and clients both resolve it here.
 pub fn control_sock_path() -> PathBuf {
     crate::platform::control_socket_path(
@@ -43,13 +43,13 @@ pub fn control_sock_path() -> PathBuf {
 /// True if the warm-reuse fast path is disabled by the operator. An escape hatch
 /// so a user can force every session back onto a fresh establish for debugging.
 pub fn reuse_disabled() -> bool {
-    std::env::var("FILAMENT_NO_WARM_REUSE").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_NO_WARM_REUSE").map(|v| v == "1").unwrap_or(false)
 }
 
 #[cfg(unix)]
 pub use imp::{
     daemon_present, daemon_responds, forward_probe, send_reply, serve_at, try_approve_request,
-    try_bootstrap, try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous,
+    try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
     try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
     try_revocation_sync, try_unmount, try_wake, Req, ReqKind,
@@ -117,18 +117,32 @@ mod imp {
     /// asserted). Returns the bridged socket, or `None` if there is no daemon / the
     /// peer is unknown / L3 is down, so the caller can report a clean failure.
     pub async fn try_dial(peer: &str, port: u16) -> Option<UnixStream> {
+        try_dial_reason(peer, port).await.ok()
+    }
+
+    /// Like `try_dial`, but reports WHY the daemon said no: `Err(Some(reason))`
+    /// is the daemon's answer (unknown peer, the dial refused or timed out),
+    /// `Err(None)` means there was no daemon to ask. The proxy needs the
+    /// difference to pick the right SOCKS reply instead of hanging.
+    pub async fn try_dial_reason(
+        peer: &str,
+        port: u16,
+    ) -> std::result::Result<UnixStream, Option<String>> {
         if reuse_disabled() {
-            return None;
+            return Err(None);
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
         let req = json!({ "op": "dial", "peer": peer, "port": port });
-        let mut line = serde_json::to_vec(&req).ok()?;
+        let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
         line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = read_line(&mut s, 4096).await.ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(s)
+        s.write_all(&line).await.map_err(|_| None)?;
+        s.flush().await.map_err(|_| None)?;
+        let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
+        let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
+        if v["ok"].as_bool() == Some(true) {
+            return Ok(s);
+        }
+        Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
     }
 
     /// Try to open an L2 stream to `peer:rport` THROUGH a local daemon's warm
@@ -886,7 +900,7 @@ mod imp {
             assert!(p.as_os_str().len() < crate::platform::SOCKET_PATH_MAX, "{}", p.display());
             assert_eq!(p.extension().and_then(|e| e.to_str()), Some("sock"), "{}", p.display());
             // A short config dir keeps the socket where it always was.
-            let short = std::path::Path::new("/home/u/.config/filament");
+            let short = std::path::Path::new("/home/u/.config/tunlion");
             assert_eq!(
                 crate::platform::control_socket_path(&short.join("control.sock"), short),
                 short.join("control.sock")
@@ -896,7 +910,7 @@ mod imp {
         #[test]
         fn an_overlong_config_dir_gets_a_short_private_socket_path() {
             // The first-time-user sandbox that found this was 110 bytes deep.
-            let deep = std::path::PathBuf::from(format!("/home/u/{}/filament", "d".repeat(120)));
+            let deep = std::path::PathBuf::from(format!("/home/u/{}/tunlion", "d".repeat(120)));
             let a = crate::platform::control_socket_path(&deep.join("control.sock"), &deep);
             assert!(a.as_os_str().len() < crate::platform::SOCKET_PATH_MAX, "{}", a.display());
             assert!(
@@ -906,7 +920,7 @@ mod imp {
             );
             // Deterministic (daemon and client must meet) and per-config.
             assert_eq!(a, crate::platform::control_socket_path(&deep.join("control.sock"), &deep));
-            let other = std::path::PathBuf::from(format!("/home/v/{}/filament", "d".repeat(120)));
+            let other = std::path::PathBuf::from(format!("/home/v/{}/tunlion", "d".repeat(120)));
             assert_ne!(a, crate::platform::control_socket_path(&other.join("control.sock"), &other));
         }
 

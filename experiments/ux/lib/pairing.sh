@@ -21,7 +21,7 @@ PIPE_LAST_PAIR_PID=""
 pipe_mint_code() {
   local cfg="$1" name="$2" log="$3"
   : > "$log"
-  FILAMENT_CONFIG_DIR="$cfg" timeout -k 5 120 "$FILAMENT_BIN" pair --name "$name" \
+  TUNLION_CONFIG_DIR="$cfg" timeout -k 5 120 "$TUNLION_BIN" pair --name "$name" \
     --name-as "$name" --server "$PIPE_SERVER" >"$log" 2>&1 &
   PIPE_LAST_PAIR_PID=$!
   pipe_track "$PIPE_LAST_PAIR_PID"
@@ -51,7 +51,7 @@ pipe_start_shell_peer() {
   local cfg="$1" name="$2" log="$3"; shift 3
   : > "$log"
   [ -f "$cfg/devices.json" ] || pipe_seed_store "$cfg" "[{\"name\":\"seed\",\"secret\":\"$(pipe_mk_secret)\"}]"
-  FILAMENT_CONFIG_DIR="$cfg" "$FILAMENT_BIN" up --shell --name-as "$name" \
+  TUNLION_CONFIG_DIR="$cfg" "$TUNLION_BIN" up --shell --name-as "$name" \
     --server "$PIPE_SERVER" "$@" </dev/null >"$log" 2>&1 &
   local pid=$!; pipe_track "$pid"
   PIPE_LAST_UP_PID="$pid"
@@ -63,7 +63,7 @@ pipe_start_shell_peer() {
 pipe_start_up_peer() {
   local cfg="$1" name="$2" dir="$3" log="$4"; shift 4
   mkdir -p "$dir"; : > "$log"
-  FILAMENT_CONFIG_DIR="$cfg" "$FILAMENT_BIN" up --dir "$dir" --name-as "$name" \
+  TUNLION_CONFIG_DIR="$cfg" "$TUNLION_BIN" up --dir "$dir" --name-as "$name" \
     --server "$PIPE_SERVER" "$@" </dev/null >"$log" 2>&1 &
   local pid=$!; pipe_track "$pid"
   PIPE_LAST_UP_PID="$pid"

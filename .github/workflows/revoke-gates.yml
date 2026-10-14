@@ -35,6 +35,13 @@
 # found by hand on the launch candidate because every earlier forget gate
 # restarted a daemon in between, which is exactly what hid them.
 #
+# Also carries invite-expiry-gates: an invitation's --expires is the end of the
+# device's access on every path. It holds an exec and a forward stream open
+# across the end, then asserts they are cut and that new exec, forward,
+# forward --stdio and send are refused with exit 4 naming the expiry. Found on
+# a real two-machine run, where renewal and a proof re-drive carried a guest
+# minutes past its invitation and forward ignored the end entirely.
+#
 # Linux only, deliberately. The mount arm needs FUSE, and the point here is to
 # run the guarantee somewhere real rather than to matrix it.
 
@@ -48,12 +55,14 @@ on:
       - 'cli/src/**'
       - 'cli/tests/*revoke-gates.sh'
       - 'cli/tests/ssh-ca-gates.sh'
+      - 'cli/tests/pty-resume-gates.sh'
       - 'cli/tests/exec-gates.sh'
       - 'cli/tests/sync-gates.sh'
       - 'cli/tests/fleet-cert-gates.sh'
       - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/forward-refusal-gates.sh'
       - 'cli/tests/revocation-live-gates.sh'
+      - 'cli/tests/invite-expiry-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -69,10 +78,16 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   revoke-gates:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: revoke gates (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -124,7 +139,7 @@ jobs:
       # lines is what makes "green" mean "the gates ran AND passed".
       - name: Run revocation gates
         env:
-          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/tunlion
+          TUNLION_BIN: ${{ github.workspace }}/cli/target/release/tunlion
         run: |
           set -uo pipefail
           # Full paths, not bare names under a working-directory. The registry
@@ -146,6 +161,9 @@ jobs:
             # so a tracked failure can never make the total look short.
             [cli/tests/fleet-cert-gates.sh]=23
             [cli/tests/pty-revoke-gates.sh]=3
+            # R1/R2 (a shell outlives its link, output intact), X1/X2 (a session
+            # name never crosses devices), V1/V2 (revoke ends a DETACHED shell).
+            [cli/tests/pty-resume-gates.sh]=6
             [cli/tests/mount-revoke-gates.sh]=4
             # 4: gate C (the revoked forward exits 4 and says why) joined A, A2, B.
             [cli/tests/l2-revoke-gates.sh]=4
@@ -158,6 +176,11 @@ jobs:
             # RUNNING daemon, no restart) + 4 invitation-burn (S2: a used
             # invitation stays used across forget and restart, new key or same).
             [cli/tests/revocation-live-gates.sh]=15
+            # 17 = X0 premise + 3 positives (exec, send, forward --stdio) + the
+            # C0 alive-before-the-end control + X1..X8 after the end + X9..X11
+            # (requests, device lists, one remedy: fix/rc-polish) + X12 (exec,
+            # forward and send print one re-invite line: fix/concurrent-code-sends).
+            [cli/tests/invite-expiry-gates.sh]=17
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
@@ -165,11 +188,13 @@ jobs:
                    cli/tests/sync-gates.sh \
                    cli/tests/fleet-cert-gates.sh \
                    cli/tests/pty-revoke-gates.sh \
+                   cli/tests/pty-resume-gates.sh \
                    cli/tests/mount-revoke-gates.sh \
                    cli/tests/l2-revoke-gates.sh \
                    cli/tests/shell-posture-gates.sh \
                    cli/tests/forward-refusal-gates.sh \
-                   cli/tests/revocation-live-gates.sh; do
+                   cli/tests/revocation-live-gates.sh \
+                   cli/tests/invite-expiry-gates.sh; do
             echo "::group::$g"
             # Label the tree the gates actually run against: CI checks out
             # GitHub's MERGE ref (pull/N/merge) by default, so "CI ran sha X"

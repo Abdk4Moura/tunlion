@@ -16,7 +16,7 @@
 //!    does not), or an owner-signed explicit grant, and no recorded deny.
 //! 2. Confinement: the served root must lie within the SHARE ROOT
 //!    (`fleet_share_root()`: the `share` config key, default
-//!    `~/filament-share`), which is what the `mount` help already promised
+//!    `~/tunlion-share`), which is what the `mount` help already promised
 //!    ("the remote share root and grant remain authoritative"). A relative
 //!    root is resolved against the share root, so the default `.` means the
 //!    share root itself. To serve a different directory, the OWNER points

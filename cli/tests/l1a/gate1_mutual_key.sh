@@ -13,7 +13,7 @@ CFG_A=$T/g1-cfgA; CFG_B=$T/g1-cfgB
 rm -rf "$CFG_A" "$CFG_B"; mkdir -p "$CFG_A" "$CFG_B"
 
 # Creator: mint a code, pair, store under name "bee".
-FILAMENT_CONFIG_DIR=$CFG_A FILAMENT_PAIR_GRACE_SECS=30 \
+TUNLION_CONFIG_DIR=$CFG_A TUNLION_PAIR_GRACE_SECS=30 \
   "$BIN" --server "$SERVER" pair --name bee </dev/null >"$T/g1-creator.log" 2>&1 &
 CRE=$!
 
@@ -29,7 +29,7 @@ if [ -z "$CODE" ]; then echo "GATE1 FAIL: creator never printed a code"; cat "$T
 echo "minted code: $CODE"
 
 # Claimer types the code (lowercased — the CLI normalizes anyway).
-FILAMENT_CONFIG_DIR=$CFG_B FILAMENT_PAIR_GRACE_SECS=30 \
+TUNLION_CONFIG_DIR=$CFG_B TUNLION_PAIR_GRACE_SECS=30 \
   "$BIN" --server "$SERVER" pair "$(echo "$CODE" | tr 'A-Z' 'a-z')" --name ant </dev/null >"$T/g1-claimer.log" 2>&1 &
 CLA=$!
 

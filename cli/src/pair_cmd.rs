@@ -85,9 +85,106 @@ fn malformed_entry_banner(arg: &str) {
     ui::say(&ui::paint(
         ui::Tone::Dim,
         &format!(
-            "couldn't parse '{arg}', opening guided entry · set FILAMENT_NONINTERACTIVE=1 to fail fast in scripts"
+            "couldn't parse '{arg}', opening guided entry · set TUNLION_NONINTERACTIVE=1 to fail fast in scripts"
         ),
     ));
+}
+
+/// Set by `add --for person` before the ceremony: the operator asked for a
+/// person, so a peer that turns out to hold this identity is reported as kept,
+/// not silently re-filed.
+pub(crate) static FOR_PERSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the "filed as EXTERNAL" notice applies: only when this side asked
+/// for one of its own devices and the peer turned out to hold a different
+/// identity. Pure.
+pub(crate) fn external_notice_applies(
+    asked_for_own_device: bool,
+    same_person: bool,
+    joined_mesh: bool,
+    issued_cert: bool,
+    peer_has_identity: bool,
+) -> bool {
+    asked_for_own_device && !same_person && !joined_mesh && !issued_cert && peer_has_identity
+}
+
+/// Does `records` hold a device named `who` certified by `owner_pub`? Pure.
+pub(crate) fn names_own_device(records: &[Value], who: &str, owner_pub: &[u8; 32]) -> bool {
+    records.iter().any(|r| {
+        r["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(who))
+            && identity::DeviceCert::from_json(&r["deviceCert"]).is_some_and(|c| &c.user_pub == owner_pub)
+    })
+}
+
+/// `add --for person --name <who>` where <who> is already one of this
+/// identity's devices: the refusal, or None when it is not.
+pub(crate) fn person_names_own_device(who: &str) -> Option<String> {
+    let owner = load_owner_key()
+        .map(|k| k.public_key_bytes())
+        .or_else(|| local_device_cert().map(|c| c.user_pub))?;
+    let records: Vec<Value> = std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    names_own_device(&records, who, &owner).then(|| person_own_device_msg(who))
+}
+
+/// The refusal text. Pure.
+pub(crate) fn person_own_device_msg(who: &str) -> String {
+    let w = crate::refusal::word(who);
+    format!(
+        "'{who}' is already one of your devices (it holds your identity's certificate), so it cannot be added as a person. \
+         To pair it as your device:  tunlion add {w}. To make it someone else's, remove it from your fleet first:  \
+         tunlion devices forget {w} -y  (then on it: tunlion down --yes && tunlion reset)"
+    )
+}
+
+#[cfg(test)]
+mod relationship_tests {
+    use super::*;
+
+    /// Eval item 3: on a `--for person` pairing both sides printed "filed as
+    /// EXTERNAL ... tunlion down --yes && tunlion reset" although EXTERNAL is
+    /// what was asked for. The notice is for an asked-for OWN device only.
+    #[test]
+    fn the_external_notice_is_only_for_an_own_device_that_was_not() {
+        assert!(external_notice_applies(true, false, false, false, true));
+        // --for person, a plain add, and the claiming side never asked for theirs.
+        assert!(!external_notice_applies(false, false, false, false, true));
+        // Same identity, joined, or certified by us: not external at all.
+        assert!(!external_notice_applies(true, true, false, false, true));
+        assert!(!external_notice_applies(true, false, true, false, true));
+        assert!(!external_notice_applies(true, false, false, true, true));
+    }
+
+    /// `add --for person --name u2-a` where u2-a holds our certificate is
+    /// refused up front with the reason and the commands that do apply.
+    #[test]
+    fn a_person_pairing_cannot_name_one_of_your_devices() {
+        let owner = [7u8; 32];
+        let cert = |user: [u8; 32]| {
+            serde_json::json!({
+                "devicePub": hex::encode([1u8; 32]),
+                "userPub": hex::encode(user),
+                "sig": hex::encode([0u8; 64]),
+                "expires": 10u64,
+                "issued": 0u64,
+            })
+        };
+        let records = vec![
+            serde_json::json!({"name": "u2-a", "deviceCert": cert(owner)}),
+            serde_json::json!({"name": "carol", "deviceCert": cert([8u8; 32])}),
+            serde_json::json!({"name": "plain"}),
+        ];
+        assert!(names_own_device(&records, "u2-a", &owner));
+        assert!(names_own_device(&records, "U2-A", &owner));
+        assert!(!names_own_device(&records, "carol", &owner));
+        assert!(!names_own_device(&records, "plain", &owner));
+        assert!(!names_own_device(&records, "nobody", &owner));
+        let msg = person_own_device_msg("u2-a");
+        assert!(msg.contains("already one of your devices"), "{msg}");
+        assert!(msg.contains("tunlion add u2-a"), "{msg}");
+    }
 }
 
 pub(crate) fn invitation_not_a_code_msg() -> String {
@@ -252,10 +349,23 @@ pub(crate) async fn pair_cmd(
                         // we mint matches the number the user saw.
                         preview_nameplate = Some(auto_np);
                     }
+                    // They typed a code they were GIVEN. Accept it, exactly as
+                    // `join <code>` does, instead of minting a second code from
+                    // its words that nobody on the other side is waiting on.
+                    codeentry::Outcome::Claim(given) => {
+                        ui::say(&ui::paint(
+                            ui::Tone::Dim,
+                            &format!("  accepting the code you were given:  tunlion join {given}"),
+                        ));
+                        code = Some(given);
+                    }
                     // Empty submit -> fall through to auto-mint, but still keep the
                     // previewed nameplate so an empty (auto-words) create reuses it.
                     codeentry::Outcome::Empty => preview_nameplate = Some(auto_np),
                     codeentry::Outcome::Cancelled => return Err(cancelled()),
+                    codeentry::Outcome::Interrupted => {
+                        crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+                    }
                 }
             }
             // Malformed positional -> banner + prefilled CLAIM entry.
@@ -263,10 +373,13 @@ pub(crate) async fn pair_cmd(
                 malformed_entry_banner(raw);
                 let prefill = crate::pake::norm_code(raw);
                 match codeentry::run("  add / code  ", codeentry::Mode::Claim, &prefill, "")? {
-                    codeentry::Outcome::Submitted(c) => code = Some(c),
+                    codeentry::Outcome::Submitted(c) | codeentry::Outcome::Claim(c) => code = Some(c),
                     // Empty submit on a claim-fix means "give up on this code".
                     codeentry::Outcome::Empty => return Err(cancelled()),
                     codeentry::Outcome::Cancelled => return Err(cancelled()),
+                    codeentry::Outcome::Interrupted => {
+                        crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+                    }
                 }
             }
             // A well-formed positional -> no prompt, proceed as today.
@@ -457,9 +570,9 @@ pub(crate) async fn pair_cmd(
     // never connect, fail fast instead of orphaning in the room for the full
     // 600s TTL (the D3/D5 divergence the monitor kept catching). 60s is generous
     // (covers a slow cross-NAT WebRTC with its 3×15s establishment retries);
-    // FILAMENT_PAIR_GRACE_SECS shortens it for gate 17b.
+    // TUNLION_PAIR_GRACE_SECS shortens it for gate 17b.
     let ceremony_budget = Duration::from_secs(
-        std::env::var("FILAMENT_PAIR_GRACE_SECS")
+        std::env::var("TUNLION_PAIR_GRACE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),
@@ -648,6 +761,17 @@ pub(crate) async fn pair_cmd(
                                 // allow_reanchor: the local user accepted this
                                 // pairing ceremony, which is the owner decision
                                 // that permits re-anchoring (e.g. reinstall).
+                                // An explicit `--expires` is an END, not a cert
+                                // lifetime to renew forever: record the device
+                                // as a delegated principal with that end, the
+                                // same record `join` produces for an invitation,
+                                // so the gate, renewal and every live session
+                                // enforce it. Without --expires the device is an
+                                // ordinary fleet member and renews indefinitely.
+                                let lifetime = cert.expires.saturating_sub(cert.issued);
+                                let bounded = enrol_ttl
+                                    .is_some()
+                                    .then_some((caps.as_slice(), cert.expires, lifetime, lifetime));
                                 if let Err(e) = devices_upsert_atomic(
                                     &n,
                                     Some(&sec),
@@ -655,7 +779,7 @@ pub(crate) async fn pair_cmd(
                                     Some(caps),
                                     Some(identity::IntroScope::Device.to_byte()),
                                     None,
-                                    None,
+                                    bounded,
                                     true,
                                 ) {
                                     ui::debug(&format!(
@@ -695,17 +819,85 @@ pub(crate) async fn pair_cmd(
                         // That used to happen silently, even for `add <device>`,
                         // which reads as "make it one of mine". Say so, on both
                         // ends, and name the real path to one identity.
-                        if !same_person
-                            && !joined_mesh
-                            && issued_cert.is_none()
-                            && peer_identity_cert.is_some()
-                        {
+                        // Eval item 3: printed on BOTH sides of every pairing
+                        // between two identities, including `--for person`,
+                        // where EXTERNAL is exactly what was asked for. It is a
+                        // surprise only when this side asked for one of ITS OWN
+                        // devices (`internal`) and got a different identity.
+                        if external_notice_applies(
+                            internal,
+                            same_person,
+                            joined_mesh,
+                            issued_cert.is_some(),
+                            peer_identity_cert.is_some(),
+                        ) {
                             let (headline, detail, steps) =
                                 external_pairing_notice(&n, &display_name(), internal);
                             ui::caution(&headline, Some(detail.as_str()), &steps);
                         }
+                        // Eval item 2: a device forgotten earlier and added again
+                        // printed "joined your fleet" while the forget's key block
+                        // still refused every send. On the OWNER side, a completed
+                        // pairing the operator started is consent to lift that
+                        // block; say so. A device REVOKED in place (record kept,
+                        // `devices revoke`) is not re-admitted by a pairing: say
+                        // that openly and fail, never print "joined".
+                        if load_owner_key().is_some() {
+                            let peer_key = peer_identity_cert
+                                .as_ref()
+                                .map(|c| c.device_pub)
+                                .or_else(|| issued_cert.as_ref().map(|(c, _)| c.device_pub));
+                            if let Some(key) = peer_key {
+                                match crate::fleet_support::lift_key_revocation(&key) {
+                                    Ok(lifted) => {
+                                        if let Some((_, at, _)) = lifted.first() {
+                                            ui::say(&format!(
+                                                "  {} {}",
+                                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                crate::fleet_support::readmit_line(&n, *at)
+                                            ));
+                                            let _ = crate::revocation_live::tell_daemon().await;
+                                        }
+                                    }
+                                    Err(e) => bail!(
+                                        "{n} paired, but it was forgotten earlier and its key is still refused here: {e}"
+                                    ),
+                                }
+                            }
+                            if crate::device_view::device_record_revoked(&n) {
+                                bail!(
+                                    "{n} paired, but it is REVOKED on this device, so it stays refused. \
+                                     To let it back in:  tunlion devices restore {n}"
+                                );
+                            }
+                        }
+                        // A member pairing with another device of the SAME
+                        // identity (its owner, or a sibling) holds no owner key,
+                        // so `same_person` is false here; it used to fall through
+                        // to the EXTERNAL notice while the owner side said
+                        // "joined your fleet". Both sides now report one
+                        // relationship.
+                        let same_identity_member = !same_person
+                            && peer_identity_cert.as_ref().is_some_and(|c| {
+                                local_device_cert().is_some_and(|mine| mine.user_pub == c.user_pub)
+                            });
+                        if same_person && FOR_PERSON.load(std::sync::atomic::Ordering::Relaxed) {
+                            ui::caution(
+                                &format!("'{n}' is one of your own devices, so it was kept as one, not filed as a person"),
+                                Some(
+                                    "it holds your identity's certificate, and pairing cannot make your own device someone else's",
+                                ),
+                                &[format!("tunlion devices forget {} -y", crate::refusal::word(&n))],
+                            );
+                        }
                         if same_person {
                             ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
+                        } else if same_identity_member {
+                            ui::say(&format!(
+                                "  {} {} is in the same fleet as this device (same identity); paired",
+                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                ui::paint(ui::Tone::Bold, &n),
+                            ));
                         } else {
                             ui::say(&format!(
                                 "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
@@ -749,7 +941,7 @@ pub(crate) async fn pair_cmd(
         // 1) Once we know the peer's signaling sid, send our SPAKE2 element over
         //    the opaque `signal` relay (the server cannot read it).
         if let Some(pid) = pake_peer.clone() {
-            // gate 17b (FILAMENT_TEST_PAIR_STALL): never send our SPAKE2 element,
+            // gate 17b (TUNLION_TEST_PAIR_STALL): never send our SPAKE2 element,
             // so the exchange can't complete on either side and the ceremony's
             // fail-fast `ceremony_deadline` fires, proving the no-10-min-orphan
             // guard. Test-only: `stall` is set solely by that env var.

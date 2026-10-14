@@ -155,9 +155,46 @@ impl std::fmt::Display for Reported {
 }
 impl std::error::Error for Reported {}
 
+/// A state file (devices.json, caps.json, ...) that exists and does not
+/// parse, or is empty. Exit 2 like any local file problem; in `--json` its
+/// `error.code` is `corrupt_state`, so a script can tell "fix this file"
+/// from a bad flag.
+#[derive(Debug)]
+pub(crate) struct CorruptState(pub(crate) String);
+
+impl std::fmt::Display for CorruptState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CorruptState {}
+
+/// The JSON token for a corrupt state file (exit 2).
+pub(crate) const CORRUPT_STATE: &str = "corrupt_state";
+
+/// The `error.code` a `--json` reader gets for `e`: its kind's token, or
+/// `corrupt_state` for a corrupt state file.
+pub(crate) fn json_code(e: &anyhow::Error) -> &'static str {
+    if e.chain().any(|c| c.downcast_ref::<CorruptState>().is_some()) {
+        CORRUPT_STATE
+    } else {
+        classify(e).token()
+    }
+}
+
 /// An error of a known kind.
 pub(crate) fn err(kind: ExitKind, msg: impl Into<String>) -> anyhow::Error {
     Classified { kind, msg: msg.into() }.into()
+}
+
+/// `bail!` for an argument-shape error: a missing operand, flags that cannot
+/// go together, a value of the wrong form. Exit 2, as clap's own usage errors
+/// do; these used to fall through to 1 (`forward w2-a`, a bare `reach`).
+#[macro_export]
+macro_rules! bail_usage {
+    ($($t:tt)*) => {
+        return Err($crate::exit_codes::err($crate::exit_codes::ExitKind::Usage, format!($($t)*)))
+    };
 }
 
 /// "Already said; exit with this kind." See [`Reported`].
@@ -181,6 +218,9 @@ pub(crate) fn classify(e: &anyhow::Error) -> ExitKind {
         }
         if let Some(r) = cause.downcast_ref::<Reported>() {
             return r.0;
+        }
+        if cause.downcast_ref::<CorruptState>().is_some() {
+            return ExitKind::Usage;
         }
     }
     classify_text(&format!("{e:#}"))
@@ -249,6 +289,10 @@ pub(crate) fn classify_text(s: &str) -> ExitKind {
             "not accepted",
             "not authorized",
             "outside the device's invitation ceiling",
+            // A policy close mid-session: the device's access ended or was
+            // revoked. Either is a decision, never a broken link.
+            "access expired",
+            "access revoked",
             "already been used",
             "invitation has expired",
         ])
@@ -325,6 +369,8 @@ const LOGS_CODES: &[i32] = &[0, 1, 2, 130, 143];
 const DOWN_CODES: &[i32] = &[0, 1, 2, 6];
 const PAIRING_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 130, 143];
 const LOCAL_CODES: &[i32] = &[0, 1, 2, 3, 9, 12];
+/// `skill`: a refused or unresolvable target is 2, a full disk 12.
+const SKILL_CODES: &[i32] = &[0, 1, 2, 12];
 /// Verbs not listed above: the codes any command can produce.
 const DEFAULT_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 130, 143];
 
@@ -344,6 +390,7 @@ pub(crate) fn verb_exit_codes(verb: &str) -> &'static [i32] {
         "down" => DOWN_CODES,
         "init" | "add" | "join" | "pair" | "depart" | "enroll" | "grant" | "revoke" => PAIRING_CODES,
         "set" | "addr" | "id" | "config" | "completions" | "man" => LOCAL_CODES,
+        "skill" => SKILL_CODES,
         _ => DEFAULT_CODES,
     }
 }
@@ -500,6 +547,8 @@ pub(crate) fn report_interrupted(code: i32) {
 /// Exit for an interrupt: the `--json` failure object first, then the code.
 /// Every interrupt exit goes through here so none of them leaves stdout empty.
 pub(crate) fn interrupted_exit(code: i32) -> ! {
+    // An interrupted send is still a send outcome: the history records it.
+    crate::send_report::persist_outcome(Some(&format!("interrupted ({}) before it finished", signal_name(code))));
     report_interrupted(code);
     std::process::exit(code)
 }
@@ -613,13 +662,15 @@ pub(crate) fn report(e: &anyhow::Error) -> i32 {
     let network = kind == ExitKind::Network && is_network_text(&raw);
     let message = human_message(e);
     if json_mode() && !JSON_ANSWERED.swap(true, Ordering::SeqCst) {
-        ui::json_out(&json_error(kind, &message, Some(&raw)));
+        let mut v = json_error(kind, &message, Some(&raw));
+        v["error"]["code"] = json!(json_code(e));
+        ui::json_out(&v);
     }
     if network {
-        ui::critical(&format!("Error: {NETWORK_LINE}"));
+        ui::critical(&format!("{} {NETWORK_LINE}", ui::error_label()));
         ui::debug(&format!("  cause: {raw}"));
     } else {
-        ui::critical(&format!("Error: {}", error_with_causes(e)));
+        ui::critical(&format!("{} {}", ui::error_label(), error_with_causes(e)));
     }
     kind.code()
 }
@@ -829,12 +880,13 @@ mod tests {
         // (the network verdict for a daemon that died starting), which are
         // up's codes. status's own codes are decided in one function,
         // status_exit_code, and asserted below.
-        let sources: [(&str, &str); 5] = [
+        let sources: [(&str, &str); 6] = [
             ("send", concat!(include_str!("send_cmd.rs"), include_str!("send_report.rs"), include_str!("send_source.rs"))),
             ("sync", include_str!("sync_cmd.rs")),
             ("exec", include_str!("exec_send.rs")),
             ("reach", include_str!("ping.rs")),
             ("receive", include_str!("recv_cmd.rs")),
+            ("skill", include_str!("skill.rs")),
         ];
         for (verb, src) in sources {
             let allowed = verb_exit_codes(verb);

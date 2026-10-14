@@ -20,7 +20,7 @@ fn devices_empty_shows_message() {
     let bin = filament_bin();
 
     let output = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-devices-test-empty"))
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-devices-test-empty"))
         .arg("devices")
         .output()
         .expect("failed to execute tunlion");
@@ -53,7 +53,7 @@ fn devices_shows_table_headers() {
     ]"#).unwrap();
 
     let output = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &config_dir)
+        .env("TUNLION_CONFIG_DIR", &config_dir)
         .arg("devices")
         .output()
         .expect("failed to execute tunlion");
@@ -132,7 +132,7 @@ fn devices_json_includes_new_fields() {
     ]"#).unwrap();
 
     let output = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &config_dir)
+        .env("TUNLION_CONFIG_DIR", &config_dir)
         .arg("devices")
         .arg("--json")
         .output()

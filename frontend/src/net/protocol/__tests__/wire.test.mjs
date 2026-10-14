@@ -2,7 +2,7 @@
 // run with: node frontend/src/net/protocol/__tests__/wire.test.mjs
 // These pin the byte-level behavior the consolidation rewrite must preserve.
 import {
-  SID_BYTES, MSG, frame, parseFrame, isCloseFrame, highHalfSid,
+  SID_BYTES, HEADER_BYTES, MSG, frame, parseFrame, isCloseFrame, highHalfSid,
   encodeControl, decodeControl,
 } from '../wire.js'
 
@@ -13,28 +13,41 @@ const eq = (label, got, want) => {
   else console.log(`  ${label}: OK`)
 }
 
-// --- framing: [4-byte BE sid][payload] ---
+// --- framing: [4-byte BE sid][8-byte BE offset][payload], the CLI's layout ---
 eq('SID_BYTES', SID_BYTES, 4)
+eq('HEADER_BYTES', HEADER_BYTES, 12)
 eq('frame low sid bytes',
   Array.from(frame(0x01020304, new Uint8Array([0xaa, 0xbb]))),
-  [0x01, 0x02, 0x03, 0x04, 0xaa, 0xbb])
+  [0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0xbb])
+eq('frame carries the offset big-endian',
+  Array.from(frame(7, new Uint8Array([1]), 0x0102030405)),
+  [0, 0, 0, 7, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 1])
 // high-half sid must survive the >>>0 (no sign corruption)
 eq('frame high-half sid bytes',
   Array.from(frame(highHalfSid(1), new Uint8Array([9]))),
-  [0x80, 0x00, 0x00, 0x01, 9])
-eq('frame empty payload is 4 bytes',
+  [0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 9])
+eq('frame empty payload is 12 bytes',
   Array.from(frame(0x80000001, new Uint8Array(0))),
-  [0x80, 0x00, 0x00, 0x01])
+  [0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0])
 eq('highHalfSid(1)', highHalfSid(1), 0x80000001)
 
-// --- parseFrame: inverse of frame, runt → null ---
+// --- parseFrame: inverse of frame, runt -> null ---
 {
-  const f = frame(0x80000005, new Uint8Array([1, 2, 3]))
+  const f = frame(0x80000005, new Uint8Array([1, 2, 3]), 65536)
   const p = parseFrame(f.buffer.slice(f.byteOffset, f.byteOffset + f.byteLength))
   eq('parseFrame sid', p && p.sid, 0x80000005)
+  eq('parseFrame offset', p && p.offset, 65536)
   eq('parseFrame payload', p && Array.from(p.payload), [1, 2, 3])
 }
-eq('parseFrame runt (<4) → null', parseFrame(new Uint8Array([1, 2]).buffer), null)
+eq('parseFrame runt (<12) -> null', parseFrame(new Uint8Array([0, 0, 0, 1, 9]).buffer), null)
+{
+  // A frame exactly as the CLI's send_frame builds it: sid, offset, payload.
+  const cli = new Uint8Array([0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0x10, 0, 0xde, 0xad])
+  const p = parseFrame(cli.buffer)
+  eq('parseFrame CLI frame sid', p && p.sid, 3)
+  eq('parseFrame CLI frame offset', p && p.offset, 4096)
+  eq('parseFrame CLI frame payload', p && Array.from(p.payload), [0xde, 0xad])
+}
 {
   const f = frame(0x00000007, new Uint8Array(0))
   const p = parseFrame(f.buffer)

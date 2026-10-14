@@ -9,9 +9,9 @@
 # depended on it.
 #
 # Two network namespaces on one host, because each daemon needs its own kernel
-# filament0 (l3::ifname() is a const) and its own WireGuard device.
+# tunlion0 (l3::ifname() is a const) and its own WireGuard device.
 set -uo pipefail
-BIN=${FILAMENT_BIN:-/tmp/wg-bin/tunlion}
+BIN=${TUNLION_BIN:-/tmp/wg-bin/tunlion}
 W=/tmp/wg-e2e
 FAIL=0
 say() { printf '\n=== %s\n' "$*"; }
@@ -45,7 +45,7 @@ ns_teardown() { # $1=ns $2=hostveth $3=third octet
 cleanup() {
   say "cleanup"
   ns_teardown wga wga-h 1; ns_teardown wgb wgb-h 2
-  ip link del filament-wg 2>/dev/null
+  ip link del tunlion-wg 2>/dev/null
   echo "  namespaces and interfaces removed"
 }
 [ "${KEEP:-0}" = "1" ] || trap cleanup EXIT
@@ -60,19 +60,19 @@ say "binary: $("$BIN" --version)"
 say "1. two namespaces, each with internet"
 ns_setup wga wga-h 1; ns_setup wgb wgb-h 2
 for n in wga wgb; do
-  ip netns exec $n getent hosts api.filament.autumated.com >/dev/null 2>&1 \
+  ip netns exec $n getent hosts api.tunlion.autumated.com >/dev/null 2>&1 \
     || { echo "SETUP: $n has no internet"; exit 2; }
 done
 ok "both namespaces resolve and route"
 
 say "2. pair the two daemons, with the WireGuard plane enabled"
-A="FILAMENT_CONFIG_DIR=$W/a"; B="FILAMENT_CONFIG_DIR=$W/b"
+A="TUNLION_CONFIG_DIR=$W/a"; B="TUNLION_CONFIG_DIR=$W/b"
 env $A "$BIN" init --yes --name wg-a --recovery-file "$W/a/rec" >/dev/null 2>&1
 # NO init on B: `join` creates the identity, and running init first makes join
 # refuse with "this device already has an identity". Same trap as the other rigs.
 env $A "$BIN" set wireguard on >/dev/null 2>&1
 env $B "$BIN" set wireguard on >/dev/null 2>&1
-ip netns exec wga env $A FILAMENT_LOG=debug setsid nohup "$BIN" up --name-as wg-a >"$W/a.log" 2>&1 &
+ip netns exec wga env $A TUNLION_LOG=debug setsid nohup "$BIN" up --name-as wg-a >"$W/a.log" 2>&1 &
 for i in $(seq 1 45); do grep -q "L3 overlay" "$W/a.log" 2>/dev/null && break; sleep 2; done
 grep -q userspace "$W/a.log" && { echo "SETUP: A fell back to userspace (no kernel TUN)"; exit 2; }
 
@@ -82,7 +82,7 @@ env $A "$BIN" add --for wg-b --allow transfer,mount --out "$W/inv.txt" --yes >/d
 # No --name-as on the JOIN: adding it stopped the enrolment dead at "invitation
 # loaded". The device enrols under the machine hostname, which is why the
 # assertion below counts a device rather than matching a name.
-ip netns exec wgb env $B setsid nohup bash -c "\"$BIN\" join '$W/inv.txt' --yes; FILAMENT_LOG=debug \"$BIN\" up --name-as wg-b" >"$W/b.log" 2>&1 &
+ip netns exec wgb env $B setsid nohup bash -c "\"$BIN\" join '$W/inv.txt' --yes; TUNLION_LOG=debug \"$BIN\" up --name-as wg-b" >"$W/b.log" 2>&1 &
 J=0
 for i in $(seq 1 30); do
   J=$(grep -c "joined as" "$W/b.log" 2>/dev/null || echo 0)
@@ -104,23 +104,23 @@ fi
 sleep 70
 
 say "3. did a WireGuard tunnel come up?"
-for i in $(seq 1 10); do wg show filament-wg >/dev/null 2>&1 && break; sleep 6; done
+for i in $(seq 1 10); do wg show tunlion-wg >/dev/null 2>&1 && break; sleep 6; done
 grep -E "WireGuard" "$W/a.log" "$W/b.log" | tail -4 | sed 's/^/    /'
-if wg show filament-wg >/dev/null 2>&1; then
-  ok "filament-wg exists"
-  PEERS=$(wg show filament-wg peers 2>/dev/null | wc -l)
+if wg show tunlion-wg >/dev/null 2>&1; then
+  ok "tunlion-wg exists"
+  PEERS=$(wg show tunlion-wg peers 2>/dev/null | wc -l)
   echo "  peers configured: $PEERS"
-  wg show filament-wg 2>/dev/null | grep -E "peer|endpoint|allowed ips|transfer|handshake" | head -6 | sed "s/^/    /"
+  wg show tunlion-wg 2>/dev/null | grep -E "peer|endpoint|allowed ips|transfer|handshake" | head -6 | sed "s/^/    /"
   [ "${PEERS:-0}" -ge 1 ] && ok "a peer is configured on the tunnel" || bad "interface exists but has no peer"
   # A tunnel with no handshake has carried nothing; this is the difference
   # between "configured" and "working".
-  if wg show filament-wg latest-handshakes 2>/dev/null | awk '{exit ($2>0)?0:1}'; then
+  if wg show tunlion-wg latest-handshakes 2>/dev/null | awk '{exit ($2>0)?0:1}'; then
     ok "the tunnel completed a handshake (it is carrying traffic)"
   else
     bad "no WireGuard handshake: the interface is configured but dead"
   fi
 else
-  bad "no filament-wg interface; the plane did not come up"
+  bad "no tunlion-wg interface; the plane did not come up"
 fi
 
 say "4. does overlay traffic still work?"

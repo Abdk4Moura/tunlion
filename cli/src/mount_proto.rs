@@ -722,9 +722,14 @@ pub fn spawn_mount_server(
                 // Re-ask the gate, rate-limited by the shared interval helper so a
                 // read-heavy mount does not re-read the device store per operation
                 // (#235).
-                if recheck.revoked(idev.as_ref()) {
+                if let Some(cut) = recheck.cut(idev.as_ref()) {
+                    let cut_reason = cut.reason_for(idev.as_ref());
                     crate::ui::critical(&format!(
-                        "mount: peer revoked, closing the live session (sid {sid})"
+                        "mount: peer {}, closing the live session (sid {sid})",
+                        match cut {
+                            crate::identity_state::LiveCut::Revoked => "revoked",
+                            crate::identity_state::LiveCut::Expired(_) => "access expired",
+                        }
                     ));
                     // Answer the in-flight request before tearing the stream
                     // down, and then say so on the control channel. Returning
@@ -741,7 +746,7 @@ pub fn spawn_mount_server(
                         bin: None,
                         result: MountResult::Err(MountError {
                             code: EACCES,
-                            msg: crate::capability::REVOKED_REASON.into(),
+                            msg: cut_reason.clone(),
                         }),
                     };
                     let mut p = serde_json::to_vec(&resp).unwrap_or_default();
@@ -752,7 +757,7 @@ pub fn spawn_mount_server(
                         .send_control(&serde_json::json!({
                             "type": "l2-close",
                             "sid": sid,
-                            "err": crate::capability::REVOKED_REASON,
+                            "err": cut_reason,
                         }))
                         .await;
                     return;

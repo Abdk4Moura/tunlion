@@ -158,7 +158,7 @@ pub(crate) async fn send_cmd(
             .any(|(n, _)| n.eq_ignore_ascii_case(target))
             || (fleet_indexed_name(target)
                 && (ctl::daemon_present().await
-                    || std::env::var("FILAMENT_FLEET_SEND").as_deref() == Ok("1")));
+                    || std::env::var("TUNLION_FLEET_SEND").as_deref() == Ok("1")));
         if !known {
             if fleet_indexed_name(target) {
                 bail!(
@@ -456,7 +456,7 @@ pub(crate) async fn send_cmd(
         },
         _ => None,
     };
-    if brokered_target.is_none() && std::env::var("FILAMENT_FLEET_SEND").as_deref() != Ok("1") {
+    if brokered_target.is_none() && std::env::var("TUNLION_FLEET_SEND").as_deref() != Ok("1") {
         if let Some(t) = to.as_deref() {
             if fleet_indexed_name(t)
                 && !devices_load()
@@ -489,8 +489,8 @@ pub(crate) async fn send_cmd(
                 // feature should not be the default: without the opt-in,
                 // `send --to <sibling>` keeps the clear "not yet a send target"
                 // message rather than an error that reads like a security alarm.
-                // Set FILAMENT_FLEET_SEND=1 to work on it. The former implementation audit is archived in docs/archive/handoffs/WORK-STATE-2026-09-03.md.
-                if std::env::var("FILAMENT_FLEET_SEND").as_deref() != Ok("1") {
+                // Set TUNLION_FLEET_SEND=1 to work on it. The former implementation audit is archived in docs/archive/handoffs/WORK-STATE-2026-09-03.md.
+                if std::env::var("TUNLION_FLEET_SEND").as_deref() != Ok("1") {
                     return None;
                 }
                 // EXPERIMENTAL, and the honest reason is RELIABILITY, not
@@ -520,7 +520,7 @@ pub(crate) async fn send_cmd(
                 // interleaving is void.
                 ui::say(&ui::paint(
                     ui::Tone::Warn,
-                    "  FILAMENT_FLEET_SEND: experimental. Fails closed and has never misdelivered; it completes about 9 times in 10, and a failure costs a 45s timeout.",
+                    "  TUNLION_FLEET_SEND: experimental. Fails closed and has never misdelivered; it completes about 9 times in 10, and a failure costs a 45s timeout.",
                 ));
                 let rv = fleet::rv()?;
                 fleet_indexed_name(t).then(|| {
@@ -552,7 +552,7 @@ pub(crate) async fn send_cmd(
     // not this one.
     let mut fleet_sess = fleet_session::FleetSession::new();
     let fleet_proof_budget = Duration::from_secs(
-        std::env::var("FILAMENT_FLEET_PROOF_SECS")
+        std::env::var("TUNLION_FLEET_PROOF_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(12),
@@ -627,7 +627,7 @@ pub(crate) async fn send_cmd(
         let waiting = waiting.clone();
         tokio::spawn(async move {
             while waiting.load(std::sync::atomic::Ordering::Relaxed) {
-                ui::status(&format!("  {} waiting...", ui::spinner_frame()));
+                ui::status(&format!("  {} waiting...", ui::pulse()));
                 tokio::time::sleep(Duration::from_millis(120)).await;
             }
         });
@@ -677,12 +677,15 @@ pub(crate) async fn send_cmd(
     // if it doesn't confirm, fail LOUDLY ("update to transfer securely") rather
     // than hang. Mirrors `pair`'s ceremony_deadline.
     let pake_budget = Duration::from_secs(
-        std::env::var("FILAMENT_PAIR_GRACE_SECS")
+        std::env::var("TUNLION_PAIR_GRACE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),
     );
     let mut pake_deadline: Option<Instant> = None;
+    // Every peer that sent us PAKE traffic, ours or not. A peer that ran ANY
+    // ceremony is a current build, so "older version" is only true when none did.
+    let mut pake_heard: HashSet<String> = HashSet::new();
     // C30 phase 3: link mini-sync, pings out, divergence corrections in.
     let mut last_state_ping = Instant::now();
     let mut reproved: std::collections::HashSet<String> = Default::default();
@@ -705,13 +708,13 @@ pub(crate) async fn send_cmd(
     // nominates) hung unbounded with the spinner spinning. Cap the time to the
     // FIRST live data channel (ChannelReady); once a channel is up, a long
     // legitimate transfer is never interrupted by this. Overridable / disablable
-    // (0 = off) via FILAMENT_SEND_TIMEOUT.
-    // `--timeout` wins over FILAMENT_SEND_TIMEOUT, which stays as the fallback.
+    // (0 = off) via TUNLION_SEND_TIMEOUT.
+    // `--timeout` wins over TUNLION_SEND_TIMEOUT, which stays as the fallback.
     // A code send waits for a person to type the code, so its default window
     // is the code's own lifetime: it advertised "expires in 10 min" and gave
-    // up after 60 s. An explicit --timeout (or FILAMENT_SEND_TIMEOUT) still
+    // up after 60 s. An explicit --timeout (or TUNLION_SEND_TIMEOUT) still
     // wins, and the advertised expiry is then that bound (code_expiry_words).
-    let send_timeout_env = std::env::var("FILAMENT_SEND_TIMEOUT").ok();
+    let send_timeout_env = std::env::var("TUNLION_SEND_TIMEOUT").ok();
     let establish_deadline = if use_code && known_target.is_none() {
         code_establish_window(timeout, send_timeout_env.as_deref(), claim_deadline)
     } else {
@@ -723,7 +726,7 @@ pub(crate) async fn send_cmd(
     // the window (0 = wait without limit).
     let offline_after = offline_window(
         establish_deadline,
-        std::env::var("FILAMENT_SEND_OFFLINE_SECS").ok().as_deref(),
+        std::env::var("TUNLION_SEND_OFFLINE_SECS").ok().as_deref(),
     );
     let mut established = false;
     // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
@@ -740,9 +743,9 @@ pub(crate) async fn send_cmd(
     // no ack comes. So on no-ack we re-probe once (re-send file-end to prompt a
     // possibly-lost ack), and if the ack still never lands we FAIL the send
     // (nonzero, partial kept resumable), never a false "delivered + verified".
-    // Overridable via FILAMENT_ACK_TIMEOUT (seconds). The never-hangs property
+    // Overridable via TUNLION_ACK_TIMEOUT (seconds). The never-hangs property
     // holds: we reach a terminal state in bounded time, just an honest one.
-    let ack_wait = std::env::var("FILAMENT_ACK_TIMEOUT")
+    let ack_wait = std::env::var("TUNLION_ACK_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -768,8 +771,8 @@ pub(crate) async fn send_cmd(
     // nothing at all), and the send used to wait for it forever. The clock runs
     // only while an offer is outstanding, restarts on every answer, and stops
     // while the receiver reports a person deciding (`file-pending`). Overridable
-    // with FILAMENT_SEND_STALL_SECS (0 disables).
-    let answer_wait = std::env::var("FILAMENT_SEND_STALL_SECS")
+    // with TUNLION_SEND_STALL_SECS (0 disables).
+    let answer_wait = std::env::var("TUNLION_SEND_STALL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -780,6 +783,7 @@ pub(crate) async fn send_cmd(
     let mut offered_to: Option<String> = None;
     // Progress while waiting on the peer (send_liveness::still_waiting_line).
     let mut last_heartbeat = Instant::now();
+    let mut remedy_said = false;
     let peer_label = known_target
         .as_ref()
         .map(|(n, _)| format!("'{n}'"))
@@ -827,7 +831,7 @@ pub(crate) async fn send_cmd(
                         ui::critical(&ui::paint(
                             ui::Tone::Err,
                             &format!(
-                                "  the receiver neither accepted nor refused {} in {}s; it may be unable to save it (a full disk, a name its filesystem refuses). Its log says why: `tunlion logs` there. (FILAMENT_SEND_STALL_SECS changes this bound, 0 disables it.)",
+                                "  the receiver neither accepted nor refused {} in {}s; it may be unable to save it (a full disk, a name its filesystem refuses). Its log says why: `tunlion logs` there. (TUNLION_SEND_STALL_SECS changes this bound, 0 disables it.)",
                                 waiting.join(", "),
                                 answer_wait.as_secs()
                             ),
@@ -988,10 +992,25 @@ pub(crate) async fn send_cmd(
         if !pake_done {
             if let Some(dl) = pake_deadline {
                 if Instant::now() > dl {
-                    ui::clear_sticky();
-                    bail!(
-                        "the other device uses an older version and can't receive securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was sent."
-                    );
+                    match pake_expiry(pake_peer.is_some(), !pake_heard.is_empty()) {
+                        PakeExpiry::Unfinished => {
+                            ui::clear_sticky();
+                            bail!(
+                                "the receiver that claimed this code started the encrypted handshake but did not finish it within {}s. Nothing was sent; ask for a FRESH code.",
+                                pake_budget.as_secs()
+                            );
+                        }
+                        PakeExpiry::OlderPeer => {
+                            ui::clear_sticky();
+                            bail!(
+                                "the other device uses an older version and can't receive securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was sent."
+                            );
+                        }
+                        // Only other codes' receivers spoke: they are new
+                        // builds, not ours. Keep waiting for our own claimer,
+                        // bounded by the code's establishment window.
+                        PakeExpiry::KeepWaiting => pake_deadline = None,
+                    }
                 }
             }
         }
@@ -1007,7 +1026,10 @@ pub(crate) async fn send_cmd(
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
-            if conn.to_filter.is_none() && conn.active.is_none() {
+            if conn.to_filter.is_none()
+                && conn.active.is_none()
+                && (!use_code || pake_peer.as_deref() == Some(pid.as_str()))
+            {
                 conn.active = Some(pid.clone());
             }
         }
@@ -1087,7 +1109,7 @@ pub(crate) async fn send_cmd(
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
-                        conn.maybe_adopt(p, code_used).await?;
+                        conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done)).await?;
                     }
                 }
                 // C30 (dissolves the C28 belt): fresh sid = everything
@@ -1104,7 +1126,7 @@ pub(crate) async fn send_cmd(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt_from(p, code_used, AdoptSource::Digest)
+                        conn.maybe_adopt_from(p, adopt_wants_active(code_used, use_code, pake_done), AdoptSource::Digest)
                             .await?;
                     }
                     if let Some((name, secret)) = &known_target {
@@ -1244,7 +1266,7 @@ pub(crate) async fn send_cmd(
                 code_used = true;
             }
             Ev::PeerJoined(v) => {
-                conn.maybe_adopt(&v, code_used).await?;
+                conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done)).await?;
             }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
@@ -1289,6 +1311,28 @@ pub(crate) async fn send_cmd(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // The device we dialed answered that it does not recognize us (it
+                // forgot this one while it ran). Only from a peer met on the
+                // target's own meeting place, and never on a brokered one, whose
+                // secret the far side does not hold by design.
+                if data["type"].as_str() == Some("not-recognized") && brokered_target.is_none() {
+                    if let Some((n, sec)) = &known_target {
+                        let on_target = conn
+                            .roster
+                            .get(&from)
+                            .and_then(|r| r["channel"].as_str())
+                            == Some(channel_of(sec).as_str());
+                        if on_target && !use_code {
+                            ui::clear_sticky();
+                            let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                            return Err(exit_codes::err(
+                                ExitKind::Denied,
+                                unrecognized_message(n, data["reason"].as_str()),
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 // rung-1: a relayed transport-offer carries the peer's direct
                 // candidates, kick off the simultaneous-open + auth race.
                 if data["type"].as_str() == Some("transport-offer") {
@@ -1363,7 +1407,34 @@ pub(crate) async fn send_cmd(
                     Some("pake-msg") | Some("pake-confirm")
                 ) {
                     if let Some(cer) = send_cer.as_mut() {
-                        pake_peer.get_or_insert(from.clone());
+                        // Concurrent code sends on one device share the auto
+                        // room, so a receiver claiming ANOTHER code meets this
+                        // sender too and runs its ceremony at us. That peer is
+                        // not ours: it must never feed our one ceremony, never
+                        // take the slot, and never fail this transfer. Only the
+                        // claimer of OUR nameplate may (see `pake_partner`).
+                        pake_heard.insert(from.clone());
+                        match pake_partner(
+                            pake_peer.as_deref(),
+                            &from,
+                            data["type"].as_str() == Some("pake-msg"),
+                            crate::pake_ceremony::addressed_to(&data, &send_nameplate),
+                            code_used,
+                        ) {
+                            PakePartner::Ours => {}
+                            PakePartner::Latch => {
+                                pake_peer = Some(from.clone());
+                                // The budget runs for THIS peer's ceremony.
+                                pake_deadline = Some(Instant::now() + pake_budget);
+                                ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
+                            }
+                            PakePartner::NotOurs => {
+                                ui::debug(&format!(
+                                    "send: PAKE from {from} is not for this code's ceremony; ignored"
+                                ));
+                                continue;
+                            }
+                        }
                         let fps = match conn.link(&from) {
                             Some(l) => match &l.peer {
                                 Some(p) => p.fingerprints().await,
@@ -1386,11 +1457,26 @@ pub(crate) async fn send_cmd(
                                         // If direct wins: transfer rides QUIC (130+ MB/s).
                                         // If direct fails: expired_direct → establish → WebRTC fallback
                                         //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
-                                        let promo =
-                                            conn.start_direct_promote(&from, &from, &sec).await;
-                                        if conn.active.is_none() {
-                                            conn.active = Some(from.clone());
+                                        // A browser cannot take direct QUIC: promoting
+                                        // it would drop the WebRTC link it is on.
+                                        let promo = if cer.peer_supports_direct() {
+                                            conn.start_direct_promote(&from, &from, &sec).await
+                                        } else {
+                                            crate::conn::Promotion::Retained
+                                        };
+                                        // THE AUTHENTICATED PEER IS THE TARGET: it
+                                        // takes the slot, which no peer was given
+                                        // before this point on the code path. Not
+                                        // `bind_active`: after a hard-killed
+                                        // receiver, a replacement that kept the
+                                        // partial must still be able to take the
+                                        // slot over and resume (gates.sh gate 2).
+                                        if let Some(old) = conn.active.clone().filter(|a| a != &from) {
+                                            ui::debug(&format!(
+                                                "send: {from} authenticated this code; releasing the slot held by {old}"
+                                            ));
                                         }
+                                        conn.active = Some(from.clone());
                                         // Offers were deferred pending this confirm, and
                                         // the ChannelReady handler ignores a non-active
                                         // pid, so this must follow the claim above.
@@ -1457,6 +1543,39 @@ pub(crate) async fn send_cmd(
                     continue;
                 }
                 conn.mark_ready(&pid, &t, false);
+                // A known device can sit on the server under MORE than one
+                // session: the one its daemon lost (a socket the network
+                // dropped without a close, listed until the server's ping
+                // timeout) and the one it reconnected on. The slot went to
+                // whichever the server listed first, so a ghost could hold it
+                // while the real daemon's link came up here as a mere responder
+                // and was never offered anything: the daemon logged the sender
+                // as verified, and the send waited out its window as "no peer
+                // connected". The session that actually connects and holds the
+                // target's secret IS the target, so it takes the slot.
+                if !conn.is_active(&pid) && !established && !use_code && !fleet_target {
+                    let proves_target = known_target.as_ref().is_some_and(|(_, sec)| {
+                        conn.link(&pid)
+                            .and_then(|l| l.expected_secret.as_ref())
+                            .is_some_and(|(_, s)| s == sec)
+                    });
+                    if proves_target {
+                        if let Some(old) = conn.active.clone() {
+                            ui::debug(&format!(
+                                "send: {pid} connected as the target; releasing the slot held by {old}, which never did"
+                            ));
+                            conn.drop_link(&old);
+                        }
+                        conn.active = Some(pid.clone());
+                    }
+                }
+                // Code path: a channel came up after our code was claimed.
+                // Bound how long it may take for SOMEONE to run our ceremony,
+                // so a receiver too old to run it fails loudly. Which peer it
+                // is gets settled by the ceremony, not by this channel.
+                if use_code && !pake_done && code_used && pake_deadline.is_none() {
+                    pake_deadline = Some(Instant::now() + pake_budget);
+                }
                 // Responder links stop here: connected, polite, idle. Only
                 // the active target gets announcements + offers.
                 if !conn.is_active(&pid) {
@@ -1493,12 +1612,18 @@ pub(crate) async fn send_cmd(
                         fleet_session::Action::Idle => {}
                     }
                 }
+                // By name only: a link built from a bare signal is filed under
+                // its signaling id, and the lab read "ok FfcE6CxL__13XT3tAAXB".
+                let shown = conn.display_name_of(&pid);
                 if let Some(l) = conn.link(&pid) {
-                    ui::say(&format!(
-                        "  {} {}",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, l.label())
-                    ));
+                    match &shown {
+                        Some(n) => ui::say(&format!(
+                            "  {} {}",
+                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            ui::paint(ui::Tone::Bold, n)
+                        )),
+                        None => ui::debug(&format!("link ready: pid {pid}, no name to show")),
+                    }
                     let is_direct = l.direct;
                     let direct_route = l.direct_route;
                     if let Some(p) = l.peer.clone() {
@@ -1530,7 +1655,10 @@ pub(crate) async fn send_cmd(
                     } else if is_direct {
                         ui::debug(&format!(
                             "    {}",
-                            ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))
+                            ui::paint(
+                                ui::Tone::Dim,
+                                &format!("route: {}", crate::conn::shown_direct_route(direct_route, &t))
+                            )
                         ));
                     }
                     // L1-a: on the `--code` path, run the ephemeral SPAKE2
@@ -1540,10 +1668,10 @@ pub(crate) async fn send_cmd(
                     // loop) drives the ceremony; on confirm the Signal handler
                     // sets `pake_done` and re-emits ChannelReady to fall through
                     // here and offer. The secret is DISCARDED after auth.
+                    // The partner is chosen by the ceremony (the Signal arm),
+                    // never by whichever channel came up first: in a shared
+                    // room that was another code's receiver.
                     if use_code && !is_direct && !pake_done {
-                        pake_peer.get_or_insert(pid.clone());
-                        pake_deadline.get_or_insert_with(|| Instant::now() + pake_budget);
-                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
                         continue; // offers/remember wait for PAKE confirm
                     }
                     // Same rule for a FLEET target, for the same reason: the link
@@ -1881,8 +2009,15 @@ pub(crate) async fn send_cmd(
                 Some("pair-keep-ack") => {
                     if let Some(name) = remembered_as.clone() {
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        crate::shared_defs::REMEMBER_ANSWERED
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         if v["ok"].as_bool() == Some(false) {
                             devices_remove(&name)?;
+                            crate::shared_defs::REMEMBER_STORED
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            // The one outcome line: nothing said "remembered"
+                            // before this (see file-accept), so it cannot be
+                            // contradicted.
                             ui::say(&conn.roster(
                                 &pid,
                                 ui::glyph_err(),
@@ -1895,16 +2030,44 @@ pub(crate) async fn send_cmd(
                                 &pid,
                                 ui::glyph_ok(),
                                 ui::Tone::Ok,
-                                "mutually remembered, you'll reconnect automatically",
+                                &format!("mutually remembered as '{name}', you'll reconnect automatically"),
                                 &n,
                             ));
                         }
                     }
                 }
+                // The receiver forgot or revoked this device while the send ran
+                // and is closing the link: a refusal (exit 4), not a lost peer.
+                Some("link-revoked") if conn.is_active(&pid) => {
+                    ui::clear_sticky();
+                    let n = known_target
+                        .as_ref()
+                        .map(|(n, _)| n.clone())
+                        .unwrap_or_else(|| "the receiver".to_string());
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                    return Err(exit_codes::err(
+                        ExitKind::Denied,
+                        unrecognized_message(&n, v["reason"].as_str()),
+                    ));
+                }
                 // C27: their verdict on our identity proof. false = they have
                 // no memory of us, stop acting like a known device.
                 Some("pair-proof-ack") => {
                     if v["ok"].as_bool() == Some(false) {
+                        // Our target refused the identity proof: it holds no
+                        // record of this device. Nothing it would answer to an
+                        // offer can be a yes, so end here with the reason (exit
+                        // 4), as `exec` does, instead of re-offering into it.
+                        if let (Some((n, _)), None, false) = (&known_target, &brokered_target, use_code) {
+                            if conn.is_active(&pid) {
+                                ui::clear_sticky();
+                                let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                                return Err(exit_codes::err(
+                                    ExitKind::Denied,
+                                    unrecognized_message(n, None),
+                                ));
+                            }
+                        }
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         if let Some(l) = conn.link_mut(&pid) {
                             l.expected_secret = None;
@@ -1953,10 +2116,16 @@ pub(crate) async fn send_cmd(
                                 // A NEW record, suffixed when <name> is taken: a
                                 // remember never re-keys an existing device (C1).
                                 let stored = crate::devices_store(name, &sec)?;
-                                ui::say(&format!(
-                                    "  remembered this device as '{stored}' (it keeps its half only if it passed --remember too)"
-                                ));
+                                // Not said yet: the receiver's answer decides
+                                // what is true (pair-keep-ack), and the summary
+                                // after the transfer says it if none comes.
+                                ui::debug(&format!("stored our half of the remember as '{stored}'"));
+                                if let Ok(mut g) = crate::shared_defs::REMEMBER_STORED_AS.lock() {
+                                    *g = Some(stored.clone());
+                                }
                                 remembered_as = Some(stored);
+                                crate::shared_defs::REMEMBER_STORED
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }
@@ -2046,6 +2215,16 @@ pub(crate) async fn send_cmd(
                                 crate::send_report::note_refused(id, v["reason"].as_str(), &why);
                                 if !o.done {
                                     refused.push(format!("{}: {why}", o.name));
+                                }
+                                // The same remedy exec, forward and mount give
+                                // for this cause, once per send.
+                                if !remedy_said {
+                                    if let Some(peer) = known_target.as_ref().map(|(n, _)| n.clone()) {
+                                        if let Some(text) = final_refusal_remedy(&peer, &why) {
+                                            ui::critical(&text);
+                                            remedy_said = true;
+                                        }
+                                    }
                                 }
                             }
                             None => {
@@ -2534,7 +2713,7 @@ pub(crate) async fn send_cmd(
                 let _ = sio.disconnect().await;
                 if !refused.is_empty() {
                     ui::critical(&format!(
-                        "send failed: the receiver could not store {} file(s):\n  {}",
+                        "send failed: the receiver refused {} file(s):\n  {}",
                         refused.len(),
                         refused.join("\n  ")
                     ));
@@ -2542,7 +2721,7 @@ pub(crate) async fn send_cmd(
                     // carrying the sentences for a --json result.
                     return Err(exit_codes::reported_because(
                         ExitKind::Denied,
-                        format!("the receiver could not store {}", refused.join("; ")),
+                        format!("the receiver refused {}", refused.join("; ")),
                     ));
                 }
                 match send_outcome(completed, declined) {
@@ -2737,7 +2916,7 @@ async fn stream_one(
         let active_sid = active_sid.clone();
         handles.push(tokio::spawn(async move {
             let trace =
-                cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+                cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
             // Every local file operation below maps its failure to a SourceRead:
             // the source stopped being readable (a permission changed, a disk
             // failed, the file was truncated), which no reconnect can repair.
@@ -2935,7 +3114,7 @@ async fn stream_one(
     Ok(())
 }
 
-/// The establishment window: `--timeout` first, then FILAMENT_SEND_TIMEOUT,
+/// The establishment window: `--timeout` first, then TUNLION_SEND_TIMEOUT,
 /// then 60 s. Zero means "wait without limit". Pure.
 pub(crate) fn establish_window(flag: Option<u64>, env: Option<&str>) -> Duration {
     let secs = flag
@@ -2944,7 +3123,7 @@ pub(crate) fn establish_window(flag: Option<u64>, env: Option<&str>) -> Duration
     Duration::from_secs(secs)
 }
 
-/// A code send's establishment window: `--timeout`, then FILAMENT_SEND_TIMEOUT,
+/// A code send's establishment window: `--timeout`, then TUNLION_SEND_TIMEOUT,
 /// then the code's lifetime (`claim`). Pure.
 pub(crate) fn code_establish_window(flag: Option<u64>, env: Option<&str>, claim: Duration) -> Duration {
     if flag.is_none() && env.and_then(|v| v.trim().parse::<u64>().ok()).is_none() {
@@ -2965,7 +3144,7 @@ pub(crate) fn code_expiry_words(secs: u64) -> String {
 }
 
 /// How long a known device may show no presence at all before `send` calls it
-/// offline: 10 s (FILAMENT_SEND_OFFLINE_SECS overrides), never longer than the
+/// offline: 10 s (TUNLION_SEND_OFFLINE_SECS overrides), never longer than the
 /// establishment window, and `None` when that window is unlimited. Pure.
 pub(crate) fn offline_window(establish: Duration, env: Option<&str>) -> Option<Duration> {
     if establish.is_zero() {
@@ -3026,6 +3205,108 @@ pub(crate) fn refusal_text(v: &Value) -> Option<String> {
     Some(clean)
 }
 
+/// The remedy for a refusal no retry changes (an expiry or a revoked
+/// device), worded exactly as exec, forward and mount word it. None for every
+/// other refusal. Pure but for this device's display name.
+pub(crate) fn final_refusal_remedy(peer: &str, reason: &str) -> Option<String> {
+    use crate::refusal::Code;
+    let code = crate::refusal::code_from_reason(reason)?;
+    if !matches!(code, Code::Expired | Code::CertRevoked) {
+        return None;
+    }
+    let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
+    Some(match crate::refusal::remedy_from_reason(code, peer, &me, reason) {
+        (text, Some(cmd)) => format!("  {text}\n    {cmd}"),
+        (text, None) => format!("  {text}"),
+    })
+}
+
+/// The refusal a send reports when the target device no longer recognizes
+/// this one (forgotten there). Pure.
+pub(crate) fn unrecognized_message(peer: &str, reason: Option<&str>) -> String {
+    let reason = reason
+        .filter(|r| !r.is_empty())
+        .unwrap_or(crate::refusal::UNRECOGNIZED_REASON);
+    format!(
+        "'{peer}' refused this send: {reason}. Only the owner of '{peer}' can let this device back in, by pairing or enrolling it again. Nothing was sent."
+    )
+}
+
+/// Who may run this send's code ceremony. Decided per PAKE message.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PakePartner {
+    /// From the peer already running our ceremony: feed it.
+    Ours,
+    /// The first peer to open OUR ceremony: it becomes the partner.
+    Latch,
+    /// Anyone else: ignore it entirely. It may not feed, latch or abort.
+    NotOurs,
+}
+
+/// Concurrent `send --code` on one device share the sender's auto room (the
+/// server moves a claimer into its creator's CURRENT room), so a receiver that
+/// claimed another code meets this sender as well and runs its ceremony here.
+/// The sender used to latch whoever spoke first and abort the whole transfer on
+/// that peer's (necessarily) failed confirmation: code 2's sender refused its
+/// own, never-claimed code, and code 1's sender could lock onto code 2's
+/// receiver. A message is ours when it names our nameplate (`np`), or, from a
+/// build that names none, once our code has actually been claimed. Only a
+/// `pake-msg` opens a ceremony; a confirm cannot come first. Pure.
+pub(crate) fn pake_partner(
+    latched: Option<&str>,
+    from: &str,
+    is_msg: bool,
+    addressed: Option<bool>,
+    code_claimed: bool,
+) -> PakePartner {
+    match latched {
+        Some(p) if p == from => PakePartner::Ours,
+        Some(_) => PakePartner::NotOurs,
+        None => {
+            let ours = match addressed {
+                Some(mine) => mine,
+                None => code_claimed,
+            };
+            if ours && is_msg {
+                PakePartner::Latch
+            } else {
+                PakePartner::NotOurs
+            }
+        }
+    }
+}
+
+/// What the code ceremony's budget running out means.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PakeExpiry {
+    /// Our claimer started the ceremony and did not finish it.
+    Unfinished,
+    /// A peer connected after the claim and NOBODY ran a ceremony at all: the
+    /// only case where "the other device is older" is actually true.
+    OlderPeer,
+    /// Only other codes' receivers spoke. Not a failure of this transfer.
+    KeepWaiting,
+}
+
+/// "Older version" was the message for every expiry, including a receiver of
+/// another code that ran a ceremony against us (a current build by
+/// definition). Say it only when no peer ran one. Pure.
+pub(crate) fn pake_expiry(partner_latched: bool, any_pake_heard: bool) -> PakeExpiry {
+    match (partner_latched, any_pake_heard) {
+        (true, _) => PakeExpiry::Unfinished,
+        (false, false) => PakeExpiry::OlderPeer,
+        (false, true) => PakeExpiry::KeepWaiting,
+    }
+}
+
+/// May an adopted room peer take the transfer slot? On the code path, no peer
+/// is the target until one authenticated (it takes the slot at confirm); after
+/// that the slot behaves as a room send's does (a rejoin, or a replacement
+/// receiver resuming a killed one's partial). Pure.
+pub(crate) fn adopt_wants_active(code_claimed: bool, use_code: bool, pake_done: bool) -> bool {
+    code_claimed && (!use_code || pake_done)
+}
+
 /// What to check when nobody connected, worded for who we were waiting for.
 /// A device name is another tunlion; only a code can be opened in a browser.
 pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>) -> String {
@@ -3037,6 +3318,38 @@ pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>)
         }
         (None, false, Some(r)) => format!("is a receiver waiting in room '{r}'?"),
         _ => "is a receiver running on this network?".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod unrecognized_tests {
+    use super::unrecognized_message;
+    use crate::exit_codes::{classify_text, ExitKind};
+
+    /// A forgotten device's send reads as a refusal (exit 4) naming why, for
+    /// the daemon's own reason and for the fallback alike.
+    #[test]
+    fn a_forgotten_senders_refusal_is_denied_and_named() {
+        for m in [
+            unrecognized_message("a", None),
+            unrecognized_message("a", Some("")),
+            unrecognized_message("a", Some(crate::refusal::UNRECOGNIZED_REASON)),
+        ] {
+            assert!(m.contains("not recognized"), "{m}");
+            assert!(m.contains("'a'"), "{m}");
+            assert_eq!(classify_text(&m), ExitKind::Denied, "{m}");
+        }
+    }
+
+    /// The exec counterpart: a session ended by a forget is a refusal too.
+    #[test]
+    fn an_exec_ended_by_a_forget_is_denied() {
+        let v = serde_json::json!({ "type": "link-revoked", "reason": crate::refusal::UNRECOGNIZED_REASON });
+        let m = crate::exec_send::revoked_mid_session("a", &v);
+        assert!(m.contains("not recognized"), "{m}");
+        assert_eq!(classify_text(&m), ExitKind::Denied, "{m}");
+        let m = crate::exec_send::revoked_mid_session("a", &serde_json::json!({ "type": "link-revoked" }));
+        assert_eq!(classify_text(&m), ExitKind::Denied, "{m}");
     }
 }
 
@@ -3186,8 +3499,51 @@ impl Drop for SendSpan {
 
 #[cfg(test)]
 mod code_window_tests {
-    use super::{code_establish_window, code_expiry_secs, code_expiry_words};
+    use super::{
+        adopt_wants_active, code_establish_window, code_expiry_secs, code_expiry_words, pake_expiry,
+        pake_partner, PakeExpiry, PakePartner,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn another_codes_receiver_never_runs_this_ceremony() {
+        // Run B: code 2's sender, never claimed, met code 1's receiver in the
+        // shared room. Tagged with code 1's nameplate: not ours.
+        assert_eq!(pake_partner(None, "r1", true, Some(false), false), PakePartner::NotOurs);
+        // Even after our code is claimed, a message for another nameplate is
+        // not ours (Run A: code 1's sender latched code 2's receiver).
+        assert_eq!(pake_partner(None, "r2", true, Some(false), true), PakePartner::NotOurs);
+        // Our claimer's tagged message opens the ceremony.
+        assert_eq!(pake_partner(None, "r1", true, Some(true), true), PakePartner::Latch);
+        assert_eq!(pake_partner(None, "r1", true, Some(true), false), PakePartner::Latch);
+        // An untagged build counts only once our code was claimed.
+        assert_eq!(pake_partner(None, "r1", true, None, false), PakePartner::NotOurs);
+        assert_eq!(pake_partner(None, "r1", true, None, true), PakePartner::Latch);
+        // A confirm cannot open a ceremony.
+        assert_eq!(pake_partner(None, "r1", false, Some(true), true), PakePartner::NotOurs);
+        // Once latched: only that peer, and nobody else, even with our tag.
+        assert_eq!(pake_partner(Some("r1"), "r1", false, Some(true), true), PakePartner::Ours);
+        assert_eq!(pake_partner(Some("r1"), "r2", true, Some(true), true), PakePartner::NotOurs);
+    }
+
+    #[test]
+    fn older_version_only_when_nobody_ran_a_ceremony() {
+        assert_eq!(pake_expiry(false, false), PakeExpiry::OlderPeer);
+        assert_eq!(pake_expiry(false, true), PakeExpiry::KeepWaiting);
+        assert_eq!(pake_expiry(true, true), PakeExpiry::Unfinished);
+        assert_eq!(pake_expiry(true, false), PakeExpiry::Unfinished);
+    }
+
+    #[test]
+    fn a_code_send_binds_the_slot_only_after_authentication() {
+        // Room send (no code): the first peer may take the slot, as before.
+        assert!(adopt_wants_active(true, false, false));
+        // Code send: nobody before the ceremony confirms, claimed or not.
+        assert!(!adopt_wants_active(true, true, false));
+        assert!(!adopt_wants_active(false, true, false));
+        // After it: a rejoining or replacement receiver may take it over.
+        assert!(adopt_wants_active(true, true, true));
+    }
 
     /// A code send advertised "expires in 10 min" and gave up after 60 s.
     #[test]

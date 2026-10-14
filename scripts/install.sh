@@ -5,13 +5,13 @@
 #
 # Detects your platform, downloads the latest release binary from GitHub,
 # verifies its SHA-256 against the release's SHA256SUMS, and installs to
-# ~/.local/bin (override with FILAMENT_INSTALL_DIR). No sudo, no telemetry,
+# ~/.local/bin (override with TUNLION_INSTALL_DIR). No sudo, no telemetry,
 # fully static binary on Linux. Source: scripts/install.sh in
 # https://github.com/Abdk4Moura/tunlion
 set -eu
 
 REPO="Abdk4Moura/tunlion"
-INSTALL_DIR="${FILAMENT_INSTALL_DIR:-$HOME/.local/bin}"
+INSTALL_DIR="${TUNLION_INSTALL_DIR:-$HOME/.local/bin}"
 
 say() { printf '\033[1mtunlion:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31mtunlion:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -32,12 +32,7 @@ case "$OS" in
   MINGW*|MSYS*|CYGWIN*) die "on Windows use:  winget install Abdk4Moura.Tunlion" ;;
   *) die "unsupported OS: $OS" ;;
 esac
-# Releases cut before the rename ship `filament-<target>`; everything from the
-# first post-rename release ships `tunlion-<target>`. Try the new name and fall
-# back, so this installer works against BOTH and never has a window where the
-# documented one-liner is broken.
 ASSET="tunlion-$TARGET.tar.gz"
-LEGACY_ASSET="filament-$TARGET.tar.gz"
 
 # ------------------------------------------------------------------ download
 command -v curl >/dev/null || die "curl is required"
@@ -47,14 +42,14 @@ trap 'rm -rf "$TMP"' EXIT
 # /releases/latest redirects to the newest release; CLI releases are tagged
 # cli-vX.Y.Z, so resolve the newest cli-v* tag via the API (no auth needed).
 # Stable tags are digits-and-dots only; prereleases (cli-v0.2.1-beta.1) are
-# skipped unless the caller opts in with FILAMENT_CHANNEL=beta. Fetch once.
+# skipped unless the caller opts in with TUNLION_CHANNEL=beta. Fetch once.
 RELEASES=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=20") \
   || die "could not reach the GitHub releases API"
 # Highest version, NOT first listed — the API's order is not newest-tag-first
 # (observed live). sort -V orders 0.2.0 < 0.2.1-beta.1 < 0.2.1 correctly.
 pick_tag() { printf '%s\n' "$RELEASES" | grep -o "$1" | cut -d'"' -f4 | sort -V | tail -n 1; }
 
-if [ "${FILAMENT_CHANNEL:-stable}" = "beta" ]; then
+if [ "${TUNLION_CHANNEL:-stable}" = "beta" ]; then
   TAG=$(pick_tag '"tag_name": *"cli-v[^"]*"')
 else
   TAG=$(pick_tag '"tag_name": *"cli-v[0-9.]*"')
@@ -63,19 +58,14 @@ else
   # it is preferred automatically.
   if [ -z "$TAG" ]; then
     TAG=$(pick_tag '"tag_name": *"cli-v[^"]*"')
-    [ -n "$TAG" ] && say "no stable release yet; installing prerelease $TAG (FILAMENT_CHANNEL=beta to silence)"
+    [ -n "$TAG" ] && say "no stable release yet; installing prerelease $TAG (TUNLION_CHANNEL=beta to silence)"
   fi
 fi
 [ -n "$TAG" ] || die "could not find a CLI release"
 BASE="https://github.com/$REPO/releases/download/$TAG"
 
 say "downloading tunlion $TAG for $TARGET ..."
-if ! curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET" 2>/dev/null; then
-  curl -fsSL "$BASE/$LEGACY_ASSET" -o "$TMP/$LEGACY_ASSET" \
-    || die "no asset $ASSET or $LEGACY_ASSET in $TAG"
-  ASSET="$LEGACY_ASSET"
-  say "using the pre-rename asset name for $TAG"
-fi
+curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET" 2>/dev/null || die "no asset $ASSET in $TAG"
 curl -fsSL "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS"
 
 # -------------------------------------------------------------------- verify
@@ -93,16 +83,9 @@ say "checksum verified"
 # ------------------------------------------------------------------- install
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
-# The archive holds `tunlion` after the rename and `filament` before it.
-if [ -f "$TMP/tunlion" ]; then SRC="$TMP/tunlion"; else SRC="$TMP/filament"; fi
-[ -f "$SRC" ] || die "archive $ASSET contained neither tunlion nor filament"
-install -m 755 "$SRC" "$INSTALL_DIR/tunlion"
-# Keep the old command name working. Anyone who installed before the rename has
-# scripts, aliases and a systemd unit calling `filament`; the rename should cost
-# them nothing.
-ln -sf tunlion "$INSTALL_DIR/filament"
+[ -f "$TMP/tunlion" ] || die "archive $ASSET did not contain tunlion"
+install -m 755 "$TMP/tunlion" "$INSTALL_DIR/tunlion"
 say "installed $INSTALL_DIR/tunlion ($("$INSTALL_DIR/tunlion" --version 2>/dev/null || echo "$TAG"))"
-say 'filament still works; it is a symlink to tunlion'
 
 # man page (best effort, never fatal)
 if command -v man >/dev/null 2>&1; then

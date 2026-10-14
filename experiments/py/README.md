@@ -55,7 +55,7 @@ cd backend && PORT=8099 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
 ```
 
 This plants `devices.json` with a shared secret, starts the **real release
-binary** `tunlion up` (with `FILAMENT_L2=1` so it emits transport-offers),
+binary** `tunlion up` (with `TUNLION_L2=1` so it emits transport-offers),
 then runs the Python peer as the late subscriber.
 
 ## The REPL (step in by hand)

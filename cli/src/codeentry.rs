@@ -94,6 +94,18 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
     let normalized = crate::pake::norm_code(buf);
     let trimmed = normalized.trim_matches('-');
 
+    // An INVITATION pasted into a code reader. The buffer filter drops the
+    // colons, so it arrives as `filament-invitev2...`. It is never a code,
+    // and pressing Enter on it would mint or claim garbage: name the reader
+    // that takes it instead.
+    if pasted_invitation(trimmed) {
+        return Judgment {
+            level: Level::Incomplete,
+            steer: INVITATION_IN_CODE_ENTRY.to_string(),
+            preview: None,
+        };
+    }
+
     if trimmed.is_empty() {
         let steer = match mode {
             Mode::Claim => "type the code they read you, e.g. brave-otter-3141".to_string(),
@@ -143,6 +155,18 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
             }
         }
         Mode::Create => {
+            // A whole code typed where words are chosen: someone was GIVEN a
+            // code and is accepting it. The nameplate is always machine-minted,
+            // so a creator never types one; minting `<their words>-<our number>`
+            // from it (what this used to do) left both sides waiting on
+            // different codes. Enter accepts it instead (Outcome::Claim).
+            if let Some(code) = received_code_in_create(trimmed) {
+                return Judgment {
+                    level: Level::Ready,
+                    steer: format!("\u{2713} that is a code you were given, press enter to accept {code}"),
+                    preview: None,
+                };
+            }
             // Create side: keep ALL words as the password; the nameplate is always
             // machine-minted. `split_chosen_code` only strips a trailing 3-5 digit
             // group, so "gigantic-element" keeps both words.
@@ -164,17 +188,45 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
     }
 }
 
+/// What the steer line says when an invitation lands in a code entry.
+pub(crate) const INVITATION_IN_CODE_ENTRY: &str =
+    "that is an invitation, not a code: press Esc, then run `tunlion join` and paste it there";
+
+/// Does the (normalized) buffer hold a pasted invitation? Pure.
+pub(crate) fn pasted_invitation(normalized: &str) -> bool {
+    normalized.starts_with("filament-invite")
+}
+
+/// In a CREATE entry, a buffer that is a complete received code (two or more
+/// words, then a 3-5 digit nameplate) is the code to accept, normalized. A
+/// creator never types the number, so its presence is the signal. Pure.
+pub(crate) fn received_code_in_create(normalized: &str) -> Option<String> {
+    let trimmed = normalized.trim_matches('-');
+    let (np, pw) = crate::pake::split_code(trimmed);
+    if is_nameplate(&np) && crate::password_word_tokens(&pw) >= 2 {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
 /// The OUTCOME of one interactive entry session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// The user submitted a Ready buffer. For CREATE this is the words-only
     /// password (no nameplate); for CLAIM it's the normalized full code.
     Submitted(String),
+    /// CREATE only: the user typed a complete code they were GIVEN. The caller
+    /// accepts it (the join path) instead of minting a new one.
+    Claim(String),
     /// The user pressed Enter on an EMPTY buffer (a deliberate "use the default",
     /// auto-mint for create, local-network for recv/send).
     Empty,
-    /// Esc / Ctrl-C, the user backed out entirely.
+    /// Esc (or Ctrl-D on an empty buffer), the user backed out entirely.
     Cancelled,
+    /// Ctrl-C. Raw mode turns it into a key, so no SIGINT arrives; the caller
+    /// must still exit as an interrupt (130), as the shell would report it.
+    Interrupted,
 }
 
 // --------------------------------------------------------------------------
@@ -211,15 +263,12 @@ impl Drop for RawGuard {
     }
 }
 
-/// ANSI color for a level, respecting the existing ui caps/no-color story.
-fn level_color(level: Level) -> Option<&'static str> {
-    if !ui::caps().color {
-        return None;
-    }
-    Some(match level {
-        Level::Empty => "\x1b[2m",       // dim
-        Level::Incomplete => "\x1b[33m", // amber/yellow
-        Level::Ready => "\x1b[32m",      // green
+/// The color for a level, from the design palette (nothing when color is off).
+fn level_color(level: Level) -> String {
+    ui::tone_code(match level {
+        Level::Empty => ui::Tone::Dim,
+        Level::Incomplete => ui::Tone::Warn,
+        Level::Ready => ui::Tone::Ok,
     })
 }
 
@@ -230,12 +279,10 @@ fn level_color(level: Level) -> Option<&'static str> {
 /// consistently on every terminal.
 fn render(prompt: &str, buf: &str, j: &Judgment) {
     let mut err = std::io::stderr();
-    let reset = if ui::caps().color { "\x1b[0m" } else { "" };
-    let color = level_color(j.level).unwrap_or("");
+    let reset = ui::tone_reset();
+    let color = level_color(j.level);
     let preview = match &j.preview {
-        Some(p) => {
-            if ui::caps().color { format!("  \x1b[2m{p}{reset}") } else { format!("  {p}") }
-        }
+        Some(p) => format!("  {}", ui::paint(ui::Tone::Dim, p)),
         None => String::new(),
     };
     // Clear the whole line, then draw: prompt+buffer, a gap, the colored steer
@@ -278,7 +325,6 @@ const VIEWPORT: usize = 7;
 
 fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints: &[(char, &str)]) {
     let mut err = std::io::stderr();
-    let color = ui::caps().color;
     // Header + items + (a hint line, when there are hints). The cursor rewind
     // must count exactly what was drawn or the redraw walks up the scrollback.
     // A viewport, so a long list does not scroll the terminal away. The window
@@ -290,17 +336,17 @@ fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints
     if redraw {
         let _ = write!(err, "\x1b[{drawn}A");
     }
-    let _ = write!(err, "\r\x1b[2K{header}\r\n");
-    let dim = if color { "\x1b[2m" } else { "" };
-    let reset0 = if color { "\x1b[0m" } else { "" };
+    let _ = write!(err, "\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header));
+    let dim = ui::tone_code(ui::Tone::Dim);
+    let reset0 = ui::tone_reset();
     if above > 0 {
         let _ = write!(err, "\r\x1b[2K  {dim}\u{2191} {above} more{reset0}\r\n");
     }
     for (i, it) in items.iter().enumerate().skip(first).take(view) {
         let (mark, c, r) = if i == sel {
-            ("\u{276f}", if color { "\x1b[36m" } else { "" }, if color { "\x1b[0m" } else { "" })
+            ("\u{276f}", ui::tone_code(ui::Tone::Brand), ui::tone_reset())
         } else {
-            (" ", "", "")
+            (" ", String::new(), "")
         };
         let _ = write!(err, "\r\x1b[2K  {c}{mark} {it}{r}\r\n");
     }
@@ -312,8 +358,7 @@ fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints
     // a choice with the same weight as the real ones. A hint is present without
     // competing, and the list stays about the actual decision.
     if !hints.is_empty() {
-        let dim = if color { "\x1b[2m" } else { "" };
-        let reset = if color { "\x1b[0m" } else { "" };
+        let reset = ui::tone_reset();
         let mut line = String::from("  \u{2191}\u{2193} move \u{b7} \u{23ce} select");
         for (k, label) in hints {
             line.push_str(&format!(" \u{b7} {k} {label}"));
@@ -420,11 +465,11 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
         }
         match code {
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(Outcome::Cancelled);
+                return Ok(Outcome::Interrupted);
             }
             KeyCode::Char('\u{3}') => {
                 // #203: the lone 0x03 byte in raw mode.
-                return Ok(Outcome::Cancelled);
+                return Ok(Outcome::Interrupted);
             }
             KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-D on empty = cancel (EOF-like); otherwise ignore.
@@ -437,6 +482,13 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
                 let j = judge(&buf, mode, auto_nameplate);
                 match j.level {
                     Level::Ready => {
+                        if mode == Mode::Create {
+                            if let Some(code) =
+                                received_code_in_create(&crate::pake::norm_code(&buf))
+                            {
+                                return Ok(Outcome::Claim(code));
+                            }
+                        }
                         let result = match mode {
                             // CREATE submits the words-only password (no nameplate);
                             // the caller mints the nameplate.
@@ -606,12 +658,35 @@ mod tests {
     }
 
     #[test]
-    fn create_strips_user_typed_number_from_password() {
-        // a user-typed 3-5 digit trailing group is dropped from the password
-        // (the nameplate is always machine-minted)
-        let j = judge("gigantic-element-999", Mode::Create, NP);
+    fn create_treats_a_typed_full_code_as_one_to_accept() {
+        // Eval item 1: "Pair with a code I was given" opened this entry, the
+        // person typed the code they were given, and it minted
+        // `comic-otter-<our number>` from it, so both sides waited on
+        // different codes. A creator never types the number (it is always
+        // machine-minted), so a full code here is a code to ACCEPT. This
+        // replaces the old assertion that the number was silently stripped,
+        // which pinned exactly that bug.
+        let j = judge("comic-otter-1950", Mode::Create, NP);
         assert_eq!(j.level, Level::Ready);
-        assert_eq!(j.preview.as_deref(), Some("gigantic-element-1234"));
+        assert!(j.steer.contains("code you were given"), "{}", j.steer);
+        assert!(j.steer.contains("comic-otter-1950"), "{}", j.steer);
+        assert_eq!(j.preview, None, "must not preview a freshly minted code");
+        assert_eq!(
+            received_code_in_create(&crate::pake::norm_code("Comic Otter 1950")).as_deref(),
+            Some("comic-otter-1950")
+        );
+        // Choosing words is unchanged.
+        assert_eq!(received_code_in_create("gigantic-element"), None);
+    }
+
+    #[test]
+    fn an_invitation_in_a_code_entry_names_join() {
+        let pasted = format_buffer("filament-invite:v2:AbCdEf0123");
+        for mode in [Mode::Create, Mode::Claim] {
+            let j = judge(&pasted, mode, NP);
+            assert_eq!(j.level, Level::Incomplete, "{mode:?}");
+            assert!(j.steer.contains("tunlion join"), "{}", j.steer);
+        }
     }
 
     #[test]

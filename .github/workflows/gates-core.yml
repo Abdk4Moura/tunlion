@@ -48,7 +48,13 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   ratchet:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: deterministic core ratchet
     runs-on: ubuntu-latest
     # The suite genuinely takes this long: the CI attempt at 45 was cut off
@@ -67,7 +73,7 @@ jobs:
           python-version: "3.12"
 
       # Same pinned set as capability-ci.yml. gates.sh autostarts this backend
-      # on 8077 when FILAMENT_TEST_AUTOSTART=1 and a usable interpreter exists;
+      # on 8077 when TUNLION_TEST_AUTOSTART=1 and a usable interpreter exists;
       # without one it silently skipped and every gate reported "no backend",
       # which is why the interpreter is resolved rather than hardcoded (#284).
       - name: Backend deps
@@ -101,7 +107,7 @@ jobs:
         working-directory: cli
         env:
           SKIP_BROWSER: "1"
-          FILAMENT_TEST_AUTOSTART: "1"
+          TUNLION_TEST_AUTOSTART: "1"
           RUST_BACKTRACE: "1"
           # NOT optional, and not a speed choice. The expected-green list was
           # measured in RELEASE. In debug the #281 debug_assert is live, and a
@@ -110,7 +116,7 @@ jobs:
           # gates down with it (kill-resume, code transfer, corruption guard,
           # dir/stdin, deferred-drop). Running this job in debug would fail the
           # ratchet on day one against gates that are fine.
-          FILAMENT_GATE_RELEASE: "1"
+          TUNLION_GATE_RELEASE: "1"
         run: bash tests/gates.sh --with-relay 2>&1 | tee /tmp/gates.log || true
 
       - name: Ratchet

@@ -1,12 +1,12 @@
 //! `tunlion expose <port>`: publish a local service on this device's L3 overlay
 //! address so paired peers reach it at `<this-device>.mesh:<port>`, like a
 //! Tailscale-served port. The daemon binds the overlay address (a ULA reachable
-//! only over filament0) and splices each connection to a local target; nothing is
+//! only over tunlion0) and splices each connection to a local target; nothing is
 //! exposed on any public or LAN interface. Config lives in `expose.json` next to
 //! the other settings and is applied to the running daemon over the control
 //! socket (no restart), mirroring `tunlion set`.
 //!
-//! Access control: a connection can only arrive over filament0 from a paired,
+//! Access control: a connection can only arrive over tunlion0 from a paired,
 //! verified peer, so mesh membership is the primary boundary; `--peer` narrows it
 //! further to named devices. (A malicious paired peer could still forge an inner
 //! source address, so the allowlist is a convenience layer, not a hard boundary
@@ -38,6 +38,33 @@ pub fn load() -> Vec<Binding> {
     std::fs::read_to_string(expose_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Where the daemon records the exposed ports it actually BOUND, so `status`
+/// reports what is served rather than what `expose.json` asks for. The two
+/// differ whenever a bind failed or no overlay is up.
+fn bound_path() -> PathBuf {
+    crate::settings::config_dir().join("expose-bound.json")
+}
+
+/// The ports the daemon with pid `daemon` has recorded as bound. Empty when no
+/// daemon runs, or when the record was written by another process (a daemon
+/// that is gone serves nothing, whatever its last record says).
+pub fn bound_ports(daemon: Option<u32>) -> Vec<u16> {
+    let Some(pid) = daemon else { return Vec::new() };
+    let Some(v) = std::fs::read_to_string(bound_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return Vec::new();
+    };
+    if v["pid"].as_u64() != Some(u64::from(pid)) {
+        return Vec::new();
+    }
+    v["ports"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| p.as_u64().and_then(|n| u16::try_from(n).ok())).collect())
         .unwrap_or_default()
 }
 
@@ -182,6 +209,14 @@ mod imp {
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
 
+    /// Record the ports THIS daemon has bound right now (see `bound_ports`).
+    fn record_bound(ports: &[u16]) {
+        let v = serde_json::json!({ "pid": std::process::id(), "ports": ports });
+        if let Err(e) = crate::platform::SecretFile::write_str(&super::bound_path(), &v.to_string()) {
+            crate::ui::debug(&format!("tunlion: could not record the bound expose ports: {e}"));
+        }
+    }
+
     /// Owns the live overlay listeners (one per exposed port) and reconciles them
     /// against `expose.json` on demand. Keyed by port; each value pairs the binding
     /// that spawned the listener (to detect changes) with its task handle.
@@ -234,6 +269,9 @@ mod imp {
                     )),
                 }
             }
+            let mut ports: Vec<u16> = active.keys().copied().collect();
+            ports.sort_unstable();
+            record_bound(&ports);
             active.len()
         }
 

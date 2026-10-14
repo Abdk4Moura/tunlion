@@ -45,8 +45,8 @@ fn pty_unreachable_peer_exits_with_timeout() {
     let dir = std::env::temp_dir().join("filament-timeout-test-pty");
     let peer = store_with_unreachable_peer(&dir);
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", &dir)
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", &dir)
         .arg("shell")
         .arg(&peer)
         .arg("--")
@@ -93,8 +93,8 @@ fn netcat_unreachable_peer_exits_with_error() {
     let connect_secs = 5;
 
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-timeout-test-netcat"))
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-timeout-test-netcat"))
         .arg("forward")
         .arg("definitely-unreachable-peer-12345:8080")
         .output()
@@ -118,7 +118,7 @@ fn netcat_unreachable_peer_exits_with_error() {
     );
 }
 
-/// Test that the timeout respects FILAMENT_CONNECT_SECS environment variable.
+/// Test that the timeout respects TUNLION_CONNECT_SECS environment variable.
 /// With a very short timeout (1s), the command should fail quickly.
 #[test]
 fn pty_timeout_respects_env_var() {
@@ -129,8 +129,8 @@ fn pty_timeout_respects_env_var() {
     let peer_env = store_with_unreachable_peer(&dir_env);
     let start = std::time::Instant::now();
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", &dir_env)
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", &dir_env)
         .arg("shell")
         .arg(&peer_env)
         .arg("--")
@@ -142,7 +142,7 @@ fn pty_timeout_respects_env_var() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // #245: FILAMENT_CONNECT_SECS no longer bounds `shell`. #223 added a bounded
+    // #245: TUNLION_CONNECT_SECS no longer bounds `shell`. #223 added a bounded
     // wait for pty-open-ack ON TOP of the connect budget, so connect_secs=1 exits
     // in ~10s rather than ~1s. The guarantee this test protects is "bounded,
     // never hangs", which still holds. The env var not meaning what it says is a

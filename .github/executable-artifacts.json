@@ -11,7 +11,7 @@
     {
       "path": "cli/tests/cap-verbs-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/cap-verbs-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/cap-verbs-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -22,7 +22,40 @@
     {
       "path": "cli/tests/config-scope-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/config-scope-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/config-scope-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/concurrent-code-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/concurrent-code-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/rc-polish-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/rc-polish-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/state-ux-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/state-ux-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -33,7 +66,7 @@
     {
       "path": "cli/tests/devices-write-race-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/devices-write-race-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/devices-write-race-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -44,7 +77,7 @@
     {
       "path": "cli/tests/exec-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/exec-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/exec-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -55,7 +88,7 @@
     {
       "path": "cli/tests/identity-relink-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/identity-relink-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/identity-relink-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -66,7 +99,29 @@
     {
       "path": "cli/tests/scripting-contract-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/scripting-contract-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/scripting-contract-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/daemon-path-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/daemon-path-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/net-blockers-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/net-blockers-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -77,7 +132,7 @@
     {
       "path": "cli/tests/sync-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/sync-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/sync-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -88,7 +143,7 @@
     {
       "path": "cli/tests/fleet-cert-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/fleet-cert-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/fleet-cert-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -99,7 +154,18 @@
     {
       "path": "cli/tests/revocation-live-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/revocation-live-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/revocation-live-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/invite-expiry-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/invite-expiry-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -110,7 +176,7 @@
     {
       "path": "cli/tests/forward-refusal-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/forward-refusal-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/forward-refusal-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -121,7 +187,7 @@
     {
       "path": "cli/tests/hostile-env-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/hostile-env-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/hostile-env-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -132,7 +198,7 @@
     {
       "path": "cli/tests/daemon-stop-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/daemon-stop-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/daemon-stop-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -143,7 +209,7 @@
     {
       "path": "cli/tests/reenrol-advice-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/reenrol-advice-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/reenrol-advice-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -259,7 +325,7 @@
     {
       "path": "cli/tests/l2-revoke-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/l2-revoke-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/l2-revoke-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -274,8 +340,11 @@
         "cli/tests/devices-write-race-gates.sh",
         "cli/tests/fleet-cert-gates.sh",
         "cli/tests/forward-refusal-gates.sh",
+        "cli/tests/invite-expiry-gates.sh",
         "cli/tests/l2-revoke-gates.sh",
         "cli/tests/mount-revoke-gates.sh",
+        "cli/tests/net-blockers-gates.sh",
+        "cli/tests/pty-resume-gates.sh",
         "cli/tests/pty-revoke-gates.sh",
         "cli/tests/reenrol-advice-gates.sh",
         "cli/tests/revocation-live-gates.sh",
@@ -322,7 +391,7 @@
     {
       "path": "cli/tests/mount-revoke-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/mount-revoke-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/mount-revoke-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -355,9 +424,20 @@
       ]
     },
     {
+      "path": "cli/tests/pty-resume-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/pty-resume-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/pty-revoke-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/pty-revoke-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/pty-revoke-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -374,7 +454,7 @@
     {
       "path": "cli/tests/roster-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/roster-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/roster-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -385,7 +465,7 @@
     {
       "path": "cli/tests/shell-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/shell-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/shell-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -396,7 +476,7 @@
     {
       "path": "cli/tests/shell-posture-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/shell-posture-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/shell-posture-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -407,7 +487,7 @@
     {
       "path": "cli/tests/signaling-freeze-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/signaling-freeze-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/signaling-freeze-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -418,7 +498,7 @@
     {
       "path": "cli/tests/ssh-ca-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/ssh-ca-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/ssh-ca-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -457,7 +537,7 @@
     {
       "path": "cli/tests/warm-hold-idle-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/warm-hold-idle-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/warm-hold-idle-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -468,7 +548,7 @@
     {
       "path": "cli/tests/whoami-candidate-gates.sh",
       "disposition": "required",
-      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/whoami-candidate-gates.sh",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/whoami-candidate-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -610,6 +690,17 @@
       "path": "proofs/fleet_automesh_model.py",
       "disposition": "required",
       "entrypoint": "python3 proofs/fleet_automesh_model.py",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "model-checker"
+        }
+      ]
+    },
+    {
+      "path": "proofs/link_manager_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/link_manager_model.py",
       "matrix": [
         {
           "platform": "portable",

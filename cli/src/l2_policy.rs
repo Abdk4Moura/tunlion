@@ -1,7 +1,7 @@
 //! L2 allow/open policy for the receive side.
 //!
 //! Whether an incoming l2 request is allowed in: the blanket modes
-//! (--shell / --shell-only / FILAMENT_L2) keep their existing behaviour, the
+//! (--shell / --shell-only / TUNLION_L2) keep their existing behaviour, the
 //! allow-list path and its loader, and the target checks that decide whether a
 //! specific requested target is permitted.
 //!
@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 /// Whether to serve an `l2-open` (TCP tunnel / ssh data link) from a peer.
-/// Blanket modes (`--shell` / `--shell-only` / `FILAMENT_L2`) keep their existing
+/// Blanket modes (`--shell` / `--shell-only` / `TUNLION_L2`) keep their existing
 /// trusted-gated behavior. But when L2 is on ONLY because some device was
 /// `grant`ed shell, the OPENING peer must itself hold that grant: otherwise a
 /// grant for ONE device would let EVERY trusted device open loopback tunnels.
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn l2_open_gate_scopes_grant_mode() {
-        // Blanket mode (--shell / --shell-only / FILAMENT_L2): any trusted peer
+        // Blanket mode (--shell / --shell-only / TUNLION_L2): any trusted peer
         // may open, regardless of its own per-device grant (unchanged behavior).
         assert!(l2_open_allowed(true, false, false));
         assert!(l2_open_allowed(true, true, false));

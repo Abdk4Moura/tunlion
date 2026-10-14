@@ -201,7 +201,7 @@ pub(crate) async fn handle_mount(
     let dest = if let Some(d) = crate::l2::l3_dest(&info) {
         d // L3 direct: user@peer.mesh, no ProxyCommand
     } else {
-        // L2 fallback: user@filament-peer with ProxyCommand
+        // L2 fallback: user@tunlion-peer with ProxyCommand
         let exe = std::env::current_exe().unwrap();
         let exe = exe.to_string_lossy();
         let mut proxy = format!("{exe} --server {server}");
@@ -445,13 +445,13 @@ fn liveness_forget(n: u64) {
     }
 }
 
-/// How long a warm link has to answer `reach-ping` (FILAMENT_REACH_PING_MS,
+/// How long a warm link has to answer `reach-ping` (TUNLION_REACH_PING_MS,
 /// default 1500 ms) before reach treats it as unconfirmed.
 // Called only by the unix control socket's warm ping (no control socket
 // elsewhere), so other targets see it unused.
 #[allow(dead_code)]
 pub(crate) fn liveness_window() -> Duration {
-    let ms = std::env::var("FILAMENT_REACH_PING_MS")
+    let ms = std::env::var("TUNLION_REACH_PING_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -569,36 +569,7 @@ pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
     req.reply(&json!({ "ok": true, "links": links })).await;
 }
 
-/// A non-direct (relay/WebRTC) link has no QUIC keepalive, so an idle one may be
-/// silently NAT/relay-evicted while `is_alive()`/`is_dead()` still lag (the read
-/// loop hasn't seen the EOF yet). Container/DERP paths evict ~10s; reusing such a
-/// link would open a stream into a black hole and hang. So past this idle window
-/// we refuse to warm-reuse a non-direct link and fall back to a fresh establish
-/// (correct, just not free). Direct links are exempt: the 5s keepalive keeps them
-/// genuinely alive across idle gaps, and their `idle_ms()` is unreliable here
-/// anyway (quinn keepalive frames don't stamp last_activity).
-/// The net.rs 5s relay keepalive keeps idle_ms under this gate on healthy links;
-/// tripping it means the keepalive stopped, so a fresh establish is the right answer.
-const WARM_RELAY_STALE_MS: u64 = 8_000;
-
-/// Is the PEER on this link demonstrably there right now? What `devices` may
-/// call "online" and what refreshes a device's "last seen". Pure.
-///
-/// `alive` is the transport's own verdict (a direct QUIC link flips it within
-/// its 21 s idle timeout of a peer going silent). `heard_ms` is how long since
-/// the peer last sent anything, where the transport tracks it (relay links):
-/// both ends send a keepalive every 5 s, so past WARM_RELAY_STALE_MS of silence
-/// the peer is gone even though our own keepalive writes keep succeeding. It
-/// used to be judged on `idle_ms`, which those writes stamp, so a relay link to
-/// a SIGSTOPped or wiped peer read as "online (last seen just now)" forever.
-/// Without `heard_ms`, a relay link falls back to the old `idle_ms` rule.
-pub(crate) fn peer_present(alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
-    alive
-        && match heard_ms {
-            Some(h) => h < WARM_RELAY_STALE_MS,
-            None => direct || idle_ms < WARM_RELAY_STALE_MS,
-        }
-}
+pub(crate) use crate::link_manager::peer_present;
 
 #[cfg(unix)]
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
@@ -607,43 +578,43 @@ pub(crate) fn peer_present(alive: bool, direct: bool, heard_ms: Option<u64>, idl
 /// eligibility rule lives in exactly one place. A miss means the caller falls
 /// back to a fresh establish, which is correct.
 pub(crate) fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn net::Transport>)> {
-    conn.links
+    use crate::link_manager::{LinkObs, Placement, Work, place};
+    // Eligibility is "do I know WHO this link reaches", because the caller is
+    // asking to route a request AT that peer. `l.trusted` is a narrower thing:
+    // the legacy blanket-trust flag, which a fleet link deliberately never sets
+    // (its identity comes from a verified certificate, and `admit_delegated`
+    // avoids `trusted` precisely so it cannot leak into the legacy_ok gates).
+    // Testing only `trusted` made every fleet sibling ineligible for the warm
+    // path, so `shell`/`open` fell through to a cold dial for a peer we hold no
+    // secret for and reported it as unreachable while a healthy link sat right
+    // there. A Proven identity binding answers the actual question.
+    // NOTE: this decides ROUTING, not permission. What the peer may do to us is
+    // still decided by the capability gate on the receiving side.
+    let links: Vec<LinkObs<'_>> = conn
+        .links
         .iter()
-        .filter(|(_, l)| {
-            // Eligibility here is "do I know WHO this link reaches", because the
-            // caller is asking to route a request AT that peer. `l.trusted` is a
-            // narrower thing: the legacy blanket-trust flag, which a fleet link
-            // deliberately never sets (its identity comes from a verified
-            // certificate, and `admit_delegated` avoids `trusted` precisely so it
-            // cannot leak into the legacy_ok gates). Testing only `trusted` made
-            // every fleet sibling ineligible for the warm path, so `shell`/`open`
-            // fell through to a cold dial for a peer we hold no secret for and
-            // reported it as unreachable while a healthy link sat right there.
-            // A Proven identity binding answers the actual question.
-            // NOTE: this decides ROUTING, not permission. What the peer may do to
-            // us is still decided by the capability gate on the receiving side.
-            let identity_known =
-                l.trusted || l.identity_binding == crate::capability::BindingStrength::Proven;
-            identity_known
-                && l.verified_name
-                    .as_deref()
-                    .map(|n| n.eq_ignore_ascii_case(peer))
-                    .unwrap_or(false)
-                && l.transport
-                    .as_ref()
-                    .map(|t| {
-                        // Alive, AND (direct OR a relay link that hasn't been idle long
-                        // enough to be a silently-evicted zombie).
-                        t.is_alive() && (l.direct || t.idle_ms() < WARM_RELAY_STALE_MS)
-                    })
-                    .unwrap_or(false)
+        .map(|(pid, l)| LinkObs {
+            pid: pid.as_str(),
+            verified_name: l.verified_name.as_deref(),
+            identity_known: l.trusted
+                || l.identity_binding == crate::capability::BindingStrength::Proven,
+            has_transport: l.transport.is_some(),
+            alive: l.transport.as_ref().is_some_and(|t| t.is_alive()),
+            direct: l.direct,
+            idle_ms: l.transport.as_ref().map_or(u64::MAX, |t| t.idle_ms()),
         })
-        .max_by_key(|(_, l)| l.direct as u8)
-        .map(|(pid, l)| (pid.clone(), l.transport.clone().unwrap()))
+        .collect();
+    match place(Work::Interactive, peer, &links) {
+        Placement::Reuse { pid } => {
+            let t = conn.links.get(&pid)?.transport.clone()?;
+            Some((pid, t))
+        }
+        Placement::Establish => None,
+    }
 }
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
-/// is diagnosable (visible at `-v` / FILAMENT_LOG=debug only).
+/// is diagnosable (visible at `-v` / TUNLION_LOG=debug only).
 #[cfg(unix)]
 fn log_warm_miss(conn: &Conn, peer: &str) {
     for (p, l) in conn.links.iter() {
@@ -655,6 +626,25 @@ fn log_warm_miss(conn: &Conn, peer: &str) {
             l.transport.is_some(),
             l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
             l.direct,
+        ));
+    }
+}
+
+/// DEBUG: every link that names `peer`, and which one the warm path chose, so
+/// a slow warm open on a peer with more than one link is diagnosable.
+#[cfg(unix)]
+fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
+    for (p, l) in conn.links.iter() {
+        if !l.verified_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(peer)) {
+            continue;
+        }
+        ui::debug(&format!(
+            "warm-pick '{peer}': pid={p} chosen={} direct={} alive={} age_ms={:?} deferred_left={}",
+            p == chosen,
+            l.direct,
+            l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
+            l.established_at.map(|t| t.elapsed().as_millis()),
+            conn.deferred_left.contains_key(p),
         ));
     }
 }
@@ -677,6 +667,7 @@ async fn handle_warm_open(
         req.reject("no warm link to that peer").await;
         return;
     };
+    log_warm_pick(conn, &peer, &pid);
     // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to.
     let mux = l2_muxes
         .entry(pid.clone())

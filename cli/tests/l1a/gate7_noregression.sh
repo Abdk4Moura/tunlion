@@ -15,10 +15,10 @@ head -c 200000 /dev/urandom > "$SRC"; mkdir -p "$OUT"
 
 # --- Part 1: vanilla code-room send/recv (no pairing) -----------------------
 ROOM="g7room-$$"
-FILAMENT_CONFIG_DIR=$T/g7/cfgR "$BIN" --server "$SERVER" recv --room "$ROOM" -y --dir "$OUT" </dev/null >"$T/g7/recv.log" 2>&1 &
+TUNLION_CONFIG_DIR=$T/g7/cfgR "$BIN" --server "$SERVER" recv --room "$ROOM" -y --dir "$OUT" </dev/null >"$T/g7/recv.log" 2>&1 &
 R=$!
 sleep 2
-FILAMENT_CONFIG_DIR=$T/g7/cfgS "$BIN" --server "$SERVER" send "$SRC" --room "$ROOM" </dev/null >"$T/g7/send.log" 2>&1 &
+TUNLION_CONFIG_DIR=$T/g7/cfgS "$BIN" --server "$SERVER" send "$SRC" --room "$ROOM" </dev/null >"$T/g7/send.log" 2>&1 &
 S=$!
 for i in $(seq 1 60); do
   [ -f "$OUT/src.bin" ] && break
@@ -49,9 +49,9 @@ cat > "$T/g7/cfgB/devices.json" <<EOF
 [{"name":"alice","secret":"$SECRET","v":2,"caps":["transfer"],"addedAt":1700000000}]
 EOF
 
-FILAMENT_CONFIG_DIR=$T/g7/cfgA FILAMENT_NAME=alice "$BIN" --server "$SERVER" up --dir "$T/g7/upA" </dev/null >"$T/g7/upA.log" 2>&1 &
+TUNLION_CONFIG_DIR=$T/g7/cfgA TUNLION_NAME=alice "$BIN" --server "$SERVER" up --dir "$T/g7/upA" </dev/null >"$T/g7/upA.log" 2>&1 &
 UA=$!
-FILAMENT_CONFIG_DIR=$T/g7/cfgB FILAMENT_NAME=bob "$BIN" --server "$SERVER" up --dir "$T/g7/upB" </dev/null >"$T/g7/upB.log" 2>&1 &
+TUNLION_CONFIG_DIR=$T/g7/cfgB TUNLION_NAME=bob "$BIN" --server "$SERVER" up --dir "$T/g7/upB" </dev/null >"$T/g7/upB.log" 2>&1 &
 UB=$!
 # Give presence a few seconds to converge, then look for a known-device match.
 sleep 6

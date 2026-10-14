@@ -188,7 +188,7 @@ pub(crate) fn add_pending_request(
         granted_at: None,
     });
     // Fire notify hook if configured
-    if let Ok(hook) = std::env::var("FILAMENT_NOTIFY_HOOK") {
+    if let Ok(hook) = std::env::var("TUNLION_NOTIFY_HOOK") {
         if !hook.is_empty() {
             // ARGV exec, never shell — petname is attacker-influenced
             let _ = std::process::Command::new(&hook)
@@ -276,7 +276,7 @@ pub(crate) fn resolve_for_kind(
 
 pub(crate) fn stop_managed_service(pid: u32) -> bool {
     // Only stop through the manager when THIS daemon is actually the managed
-    // unit's process, AND the right manager. `systemctl stop filament` stops
+    // unit's process, AND the right manager. `systemctl stop tunlion` stops
     // the named unit even when down targets a DIFFERENT daemon (a detached
     // foreground `up` on another config), which killed another machine's
     // service during development. Two units share the name here, so the cgroup
@@ -323,11 +323,12 @@ pub(crate) async fn next_ev(
                 .rejoin_window
                 .saturating_sub(since.elapsed())
                 .as_secs();
-            ui::sticky(&ui::paint(
-                ui::Tone::Dim,
-                &format!(
-                    "  {} holding the line, {left}s for them to come back (Ctrl-C to stop)",
-                    ui::spinner_frame()
+            ui::sticky(&format!(
+                "  {} {}",
+                ui::pulse(),
+                ui::paint(
+                    ui::Tone::Dim,
+                    &format!("holding the line, {left}s for them to come back (Ctrl-C to stop)")
                 ),
             ));
         }
@@ -379,6 +380,7 @@ pub(crate) fn is_light_command(first_arg: Option<&str>) -> bool {
                 | "set"
                 | "completions"
                 | "man"
+                | "skill"
         ),
     }
 }

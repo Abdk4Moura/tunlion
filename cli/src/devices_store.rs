@@ -87,6 +87,9 @@ pub(crate) fn upsert_peer_record(
             existing["principalExpires"] = json!(expires);
             existing["principalMaxOffline"] = json!(max_offline);
             existing["principalMaxOfflineCeiling"] = json!(max_offline_ceiling);
+            // When this admission began, so a refusal at its end can offer a
+            // re-invite with the same lifetime.
+            existing["principalIssued"] = json!(identity::now_secs());
             // A fresh enrollment is a NEW signed claim: its bounds WIN over any
             // prior record's, never merged (a device re-joining with a narrower
             // key must not inherit its wider old ceiling). Clearing the terminal
@@ -159,6 +162,7 @@ pub(crate) fn upsert_peer_record(
             "principalMaxOfflineCeiling".to_string(),
             json!(max_offline_ceiling),
         );
+        obj.insert("principalIssued".to_string(), json!(identity::now_secs()));
     }
     obj.insert(
         "addedAt".to_string(),

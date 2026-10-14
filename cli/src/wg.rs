@@ -28,7 +28,7 @@ use std::process::{Command, Stdio};
 /// capability are both present without waiting for a real failure mid-session.
 /// The interface tunlion manages. One device carries every peer, as WireGuard
 /// intends: peers are distinguished by public key and allowed-ips, not by device.
-pub const WG_DEV: &str = "filament-wg";
+pub const WG_DEV: &str = "tunlion-wg";
 
 /// Linux refuses an interface name longer than this, and does it with a message
 /// that names neither the length nor the field.
@@ -41,7 +41,7 @@ pub fn usable() -> bool {
     // "ip addr add ... /128" with no address in front of the prefix, because the
     // address it would have used does not exist. wg tools and the module being
     // present says nothing about that.
-    if !std::path::Path::new("/sys/class/net/filament0").exists() {
+    if !std::path::Path::new("/sys/class/net/tunlion0").exists() {
         return false;
     }
     debug_assert!(WG_DEV.len() <= MAX_IFNAME, "wg device name too long for Linux");
@@ -49,13 +49,12 @@ pub fn usable() -> bool {
         return false;
     }
     // SHORT ON PURPOSE. Linux caps an interface name at 15 characters, and
-    // "filament-wgprobe" is 16, so the probe failed with "Attribute failed
-    // policy validation" on every machine and usable() always returned false.
-    // That silently disabled the entire feature: no error, no log, just a
-    // capability check that could never say yes. The device itself,
-    // "filament-wg", is 11 and was always fine, which is why this only showed up
-    // when the probe was added.
-    const PROBE: &str = "fil-wgprobe";
+    // "filament-wgprobe" (the pre-rename name) is 16, so the probe failed
+    // with "Attribute failed policy validation" on every machine and usable()
+    // always returned false. That silently disabled the entire feature: no
+    // error, no log, just a capability check that could never say yes. The
+    // device itself, "tunlion-wg", is 10 and fine.
+    const PROBE: &str = "tl-wgprobe";
     let _ = ip(&["link", "del", PROBE]);
     if ip(&["link", "add", PROBE, "type", "wireguard"]).is_err() {
         return false;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #232/#268: what `forward` tells the user when the peer says no.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./forward-refusal-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./forward-refusal-gates.sh
 #
 # This gate exists because there was none. Every other gate in this directory is
 # a same-host fixture, and a same-host fixture cannot produce the state that
@@ -26,7 +26,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
 # The default path is a trap on this box: ~/.cargo/config.toml sets a SHARED
 # `target-dir = /root/.cargo-target`, so `cargo build` does NOT write to
-# cli/target/release. Running the gate without FILAMENT_BIN silently picked up a
+# cli/target/release. Running the gate without TUNLION_BIN silently picked up a
 # three-day-old binary and failed every assertion for reasons that had nothing
 # to do with the code under test. Prefer the shared dir when it holds a newer
 # build, and say which one was chosen.
@@ -35,10 +35,10 @@ _default_bin() {
     local b="/root/.cargo-target/release/tunlion"
     if [ -x "$b" ] && { [ ! -x "$a" ] || [ "$b" -nt "$a" ]; }; then echo "$b"; else echo "$a"; fi
 }
-BIN="${FILAMENT_BIN:-$(_default_bin)}"
+BIN="${TUNLION_BIN:-$(_default_bin)}"
 PORT=8116
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-fwd-refusal.XXXXXX")"
 DA="$WORK/A"
 # The bound that separates "refused" from "hung". #268 hung until curl's own
@@ -74,14 +74,14 @@ enroll_delegate bravo --allow transfer,mount
 # the daemon running would exercise a different path from the one being
 # asserted, which is exactly the warm/cold confound that briefly made an earlier
 # A/B look like a fix. Stop it so the path is the one named in the assertions.
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
 sleep 2
 
 # Assert the precondition rather than discovering it three gates later. Without
 # this, gateA "passed" in 0.0s with curl rc=7, connection refused because
 # nothing was listening, which is indistinguishable in the assertion from a
 # fast, correct refusal by the peer.
-if ! env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q bravo; then
+if ! env TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q bravo; then
   echo "setup failed: bravo did not enrol, so nothing below would prove anything"
   sed 's/^/    /' "$WORK/bravo-join.log" 2>/dev/null | tail -5
   exit 2
@@ -90,7 +90,7 @@ fi
 # $1 = "on"|"off" (L2 on the acceptor), starts bravo's daemon in its own dir
 ACCEPTOR_PID=""
 start_acceptor_l2() {
-  # Kill the PREVIOUS acceptor by pid. `pkill -f FILAMENT_CONFIG_DIR=...` matched
+  # Kill the PREVIOUS acceptor by pid. `pkill -f TUNLION_CONFIG_DIR=...` matched
   # nothing: `env VAR=v prog` execs prog, so the assignment is in the
   # environment and never in argv. The old daemon survived, the second `up`
   # found its pidfile and printed "daemon already running; following its log"
@@ -100,14 +100,14 @@ start_acceptor_l2() {
     for _ in $(seq 1 20); do kill -0 "$ACCEPTOR_PID" 2>/dev/null || break; sleep 0.5; done
     kill -9 "$ACCEPTOR_PID" 2>/dev/null
   fi
-  env FILAMENT_CONFIG_DIR="$BDIR" "$BIN" down >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$BDIR" "$BIN" down >/dev/null 2>&1
   sleep 2
   if [ "$1" = on ]; then
-    env FILAMENT_CONFIG_DIR="$BDIR" FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" \
+    env TUNLION_CONFIG_DIR="$BDIR" TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" \
       >"$WORK/up-$1.log" 2>&1 &
   else
-    # No FILAMENT_L2, no --shell: l2_enabled is false. This is the #268 state.
-    env FILAMENT_CONFIG_DIR="$BDIR" "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" \
+    # No TUNLION_L2, no --shell: l2_enabled is false. This is the #268 state.
+    env TUNLION_CONFIG_DIR="$BDIR" "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" \
       >"$WORK/up-$1.log" 2>&1 &
   fi
   ACCEPTOR_PID=$!
@@ -127,7 +127,7 @@ run_forward() {
   local lport="$1" rport="$2" ncurl="${3:-1}"
   FORWARD_UP=0; FORWARD_EXITED=0; FWD_RC=""; FWD_SECS=""
   local s0; s0=$(date +%s)
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward "bravo:$rport" --lport "$lport" \
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward "bravo:$rport" --lport "$lport" \
     >"$WORK/fwd-$lport.log" 2>&1 &
   local fpid=$!
   echo $fpid >"$WORK/fwd.pid"

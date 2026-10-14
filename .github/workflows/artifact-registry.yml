@@ -19,3 +19,11 @@ jobs:
         run: python3 scripts/test_artifact_registry.py
       - name: Reject unregistered or invalid executable artifacts
         run: python3 scripts/check_artifact_registry.py
+      # Browser-only changes skip the Rust jobs (changes.yml). This keeps that
+      # true as workflows change: every cargo job gated fail-open, no required
+      # check behind a trigger path filter, browser and pake gates still wired.
+      - name: CI path policy
+        run: |
+          python3 -m pip install --quiet pyyaml==6.0.2
+          python3 scripts/check_ci_paths.py --self-test
+          python3 scripts/check_ci_paths.py

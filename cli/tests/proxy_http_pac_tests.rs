@@ -42,7 +42,7 @@ fn proxy_http_port_zero_disables() {
 
     // Start proxy with http-port=0 (disabled), then kill it after a moment
     let mut child = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-proxy-test-disabled"))
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-proxy-test-disabled"))
         .arg("forward")
         .arg("--socks")
         .arg("localhost:9")
@@ -82,7 +82,7 @@ fn pac_file_returns_correct_socks_port() {
 
     // Start proxy with custom ports
     let mut child = Command::new(&bin)
-        .env("FILAMENT_CONFIG_DIR", &config_dir)
+        .env("TUNLION_CONFIG_DIR", &config_dir)
         .arg("forward")
         .arg("--socks")
         .arg("localhost:9")

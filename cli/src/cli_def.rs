@@ -1,8 +1,7 @@
 //! The clap command surface: the version and help text and the whole CLI shape.
 //!
 //! `const VERSION`, `const EXAMPLES`, `struct Cli`, `enum Cmd` and the four
-//! subcommand enums `Cmd`'s variants are built from (`EphemeralAction`,
-//! `IdAction`, `RequestsAction`, `DevicesAction`) -- moved as one group, verbatim
+//! subcommand enums `Cmd`'s variants are built from (`IdAction`, `RequestsAction`, `DevicesAction`) -- moved as one group, verbatim
 //! and in order, so every `#[command(...)]` attribute, every derive and every doc
 //! comment that clap turns into help text travelled with the item it belongs to.
 //!
@@ -14,7 +13,7 @@ use crate::DEFAULT_SERVER;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
+const VERSION: &str = env!("TUNLION_BUILD_INFO"); // stamped by build.rs
 
 pub(crate) const EXAMPLES: &str = "\
 COMMANDS
@@ -45,12 +44,13 @@ COMMANDS
     devices                list your known devices
     requests               approve or deny access others asked for
     grant / revoke         give or take a capability on a device
-    add --for runner       a temporary key someone can enrol with (CI, borrowed box)
-    ephemeral enroll       use such a key to enrol (run on the CI / borrowed box)
+    add --for runner       a temporary key for a CI or borrowed box; it runs `tunlion join <file>`
     status                 what the daemon is doing / recently received
   Mesh
     addr                   show your overlay address (or a device's)
     doctor                 diagnose a link
+  Agents
+    skill install          teach your AI agent tunlion (opt-in; writes ~/.claude/skills)
 
 EXAMPLES
   tunlion video.mp4                 send it; mints a speakable one-time code + QR
@@ -89,6 +89,23 @@ EXIT CODES
   With --json, a failure is one JSON object on stdout (an interrupt too):
   {\"ok\":false,\"error\":{\"code\":\"unknown_device\",\"exit\":3,\"message\":\"...\"}}";
 
+/// Help colors from the design palette: headings and usage in the accent,
+/// flags in bold, placeholders faint. Clap prints these only to a terminal
+/// and honours NO_COLOR, so piped help stays plain. 256-color index 166 is
+/// the accent (see `style.rs`); a 16-color terminal maps it to its nearest.
+const HELP_STYLES: clap::builder::styling::Styles = {
+    use clap::builder::styling::{Ansi256Color, AnsiColor, Color, Style, Styles};
+    let accent = Style::new().bold().fg_color(Some(Color::Ansi256(Ansi256Color(166))));
+    Styles::styled()
+        .header(accent)
+        .usage(accent)
+        .literal(Style::new().bold())
+        .placeholder(Style::new().dimmed())
+        .error(Style::new().bold().fg_color(Some(Color::Ansi(AnsiColor::Red))))
+        .valid(Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green))))
+        .invalid(Style::new().bold().fg_color(Some(Color::Ansi(AnsiColor::Yellow))))
+};
+
 #[derive(Parser)]
 // Custom help template: clap has no native grouping for SUBCOMMANDS
 // (next_help_heading groups args, not subcommands), so we omit the auto
@@ -101,11 +118,12 @@ EXIT CODES
     version = VERSION,
     about = "One thread across your devices, end-to-end encrypted: send, receive, mount files, and open an authorized shell without an account or cloud upload.",
     after_help = EXAMPLES,
+    styles = HELP_STYLES,
     help_template = "{about-with-newline}\n{usage-heading} {usage}\n\n{after-help}\n\nOptions:\n{options}"
 )]
 pub(crate) struct Cli {
     /// Signaling server (self-hosters: point at your own instance)
-    #[arg(long, global = true, env = "FILAMENT_SERVER", default_value = DEFAULT_SERVER)]
+    #[arg(long, global = true, env = "TUNLION_SERVER", default_value = DEFAULT_SERVER)]
     pub(crate) server: String,
     /// Force TURN relay (testing/privacy; hides your IP from the peer)
     #[arg(long, global = true)]
@@ -122,17 +140,17 @@ pub(crate) struct Cli {
     /// Verbose output: -v shows resilience internals (stalls, repairs,
     /// reconnects, upgrade probes); -vv adds ICE/per-frame trace. The
     /// value-prop lines (route, relay banner) always print. Overridden by
-    /// FILAMENT_LOG=<critical|info|debug|trace>.
+    /// TUNLION_LOG=<critical|info|debug|trace>.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     pub(crate) verbose: u8,
     /// Quiet: print only the must-see lines (route label, relay banner, P1/P5
     /// path changes, fatal errors). Conflicts with -v. Overridden by
-    /// FILAMENT_LOG.
+    /// TUNLION_LOG.
     #[arg(short = 'q', long = "quiet", global = true, conflicts_with = "verbose")]
     pub(crate) quiet: bool,
     /// Never drop into the guided interactive code entry, fail fast instead.
     /// Use in scripts/automation. A non-TTY stdin is ALWAYS non-interactive even
-    /// without this; the env var FILAMENT_NONINTERACTIVE=1 does the same thing.
+    /// without this; the env var TUNLION_NONINTERACTIVE=1 does the same thing.
     #[arg(long, global = true)]
     pub(crate) no_interactive: bool,
     /// Open the guided human flow even when all command arguments were supplied.
@@ -141,13 +159,13 @@ pub(crate) struct Cli {
     #[arg(long, global = true, conflicts_with = "no_interactive")]
     pub(crate) interactive: bool,
     /// Colorize output: auto (default; only at a TTY), always, or never. A flag
-    /// overrides NO_COLOR/TERM. Equivalent to FILAMENT_COLOR.
+    /// overrides NO_COLOR/TERM. Equivalent to TUNLION_COLOR.
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     pub(crate) color: Option<String>,
     /// JSON output (structured, parseable) where a command supports it: init,
-    /// add, join, id, status, set, reach, send, receive, sync, doctor, addr and
-    /// devices. Any other command refuses --json rather than mixing human text
-    /// into it.
+    /// add, join, id, status, set, reach, send, receive, sync, doctor, addr,
+    /// devices and skill. Any other command refuses --json rather than mixing
+    /// human text into it.
     /// Independent of TTY: a pipe still gets human text unless --json is set.
     #[arg(long, global = true)]
     pub(crate) json: bool,
@@ -169,7 +187,7 @@ pub(crate) enum Cmd {
         /// Name this device (default: hostname).
         #[arg(long)]
         name: Option<String>,
-        /// Directory where received files land (default: ~/Filament if it exists, else ~/Tunlion).
+        /// Directory where received files land (default: ~/Tunlion).
         #[arg(long)]
         inbox: Option<PathBuf>,
         /// Write the recovery phrase to a new owner-only file for automation.
@@ -191,7 +209,7 @@ pub(crate) enum Cmd {
     /// A receiver that refuses a file it cannot store (out of disk space, a
     /// name its filesystem refuses, no permission) says why, and the send
     /// exits 4; one that neither accepts nor refuses an offer within 60s
-    /// exits 6 (FILAMENT_SEND_STALL_SECS changes the bound, 0 disables it).
+    /// exits 6 (TUNLION_SEND_STALL_SECS changes the bound, 0 disables it).
     /// Every code send can return is listed under EXIT CODES below.
     #[command(next_help_heading = "Share")]
     Send {
@@ -217,7 +235,7 @@ pub(crate) enum Cmd {
         #[arg(long)]
         name: Option<String>,
         /// Seconds to wait for the peer to connect (default 60, or
-        /// FILAMENT_SEND_TIMEOUT; 0 waits without limit). A known device that
+        /// TUNLION_SEND_TIMEOUT; 0 waits without limit). A known device that
         /// shows no presence at all fails sooner, with exit 6 (offline).
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
@@ -229,7 +247,7 @@ pub(crate) enum Cmd {
     ///
     /// In a terminal with no code this opens a guided code entry (or press enter
     /// for the local-network auto room). Scripts are safe by default: a non-TTY
-    /// uses the auto room; under a TTY set FILAMENT_NONINTERACTIVE=1 or pass
+    /// uses the auto room; under a TTY set TUNLION_NONINTERACTIVE=1 or pass
     /// --no-interactive to skip the prompt.
     #[command(next_help_heading = "Share")]
     Receive {
@@ -238,7 +256,8 @@ pub(crate) enum Cmd {
         /// Directory to write received files into
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Accept every offer without prompting
+        /// Accept offers in a room (no code) without asking. A code is
+        /// already your consent: `receive <code>` never asks
         #[arg(long, short = 'y')]
         yes: bool,
         /// Join an explicit room instead of the same-network auto room
@@ -328,7 +347,9 @@ pub(crate) enum Cmd {
         /// Read the invitation from an already-open file descriptor.
         #[arg(long, value_name = "FD", conflicts_with = "invite_file")]
         invite_fd: Option<i32>,
-        /// Proposed name for this device (default: hostname).
+        /// With an invitation file: the name proposed for this device (default:
+        /// hostname). With a code: what to call the device that showed the code
+        /// (default: the name it announces); that device names this one.
         #[arg(long)]
         name: Option<String>,
         /// Owner device display name when several owners are present.
@@ -388,13 +409,13 @@ pub(crate) enum Cmd {
         /// when available, userspace otherwise).
         #[arg(long)]
         userspace: bool,
-        /// Drop directory (default: `tunlion config dir`, else ~/Filament if it exists, else ~/Tunlion)
+        /// Drop directory (default: `tunlion config dir`, else ~/Tunlion)
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Serve a shell to ANY paired (proof-verified) device, with no per-device
         /// `grant`: `tunlion shell <this>` (interactive), `tunlion exec <this> -- cmd`
         /// (one command) and `tunlion shell <this> --ssh` (real ssh). Enables the
-        /// tunnel acceptor too (forward/netcat), so FILAMENT_L2=1 is not needed.
+        /// tunnel acceptor too (forward/netcat), so TUNLION_L2=1 is not needed.
         /// Strangers still can't get in (pairing is required). Without
         /// --shell-user the shell runs as you, so this also needs --i-know.
         /// To allow single devices instead: `tunlion grant <device> shell`.
@@ -407,7 +428,7 @@ pub(crate) enum Cmd {
         /// The shell program to spawn for PTY sessions (overrides platform default).
         /// Can carry args: `--shell-program "bash -l"`, `"pwsh -NoLogo"`.
         /// Persistent: use `tunlion set shell-program "<program>"` for the daemon.
-        /// Env: `FILAMENT_SHELL`.
+        /// Env: `TUNLION_SHELL`.
         #[arg(long, value_name = "PROGRAM")]
         shell_program: Option<String>,
         /// Drop the web-shell / ssh PTY and `exec` commands to this non-root
@@ -517,7 +538,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: Option<IdAction>,
     },
-    /// Raw config escape hatch (key value lines in ~/.config/filament/config).
+    /// Raw config escape hatch (key value lines in ~/.config/tunlion/config).
     /// Prefer `tunlion set`; this is kept for scripts that wrote it directly.
     #[command(hide = true)]
     Config {
@@ -840,42 +861,71 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: Option<RequestsAction>,
     },
-    /// Mint auth keys or enroll as an ephemeral delegated device.
-    ///
-    /// Unhidden 2026-08-29. It was hidden while the banner did not mention it,
-    /// so the only way to find a working verb was to already know it existed.
-    /// `help_banner_agrees_with_clap_visibility` states the rule this now
-    /// satisfies: a command that works is discoverable, or it is removed.
-    Ephemeral {
-        #[command(subcommand)]
-        action: EphemeralAction,
-    },
     /// Wipe this machine's tunlion state (clean slate). DESTRUCTIVE.
     ///
     /// Removes the local identity + overlay keys, the paired-device store, the
     /// capability store, pending consent requests, and the managed ssh material
     /// (private key, known_hosts, bootstrap cache), and strips the
-    /// filament-managed blocks it installed in ~/.ssh/authorized_keys. Your own
+    /// tunlion-managed blocks it installed in ~/.ssh/authorized_keys. Your own
     /// ssh keys and any non-tunlion lines in authorized_keys are left untouched.
     /// Stop the daemon first (`tunlion down`); reset refuses while it runs.
     ///
     /// Pass the global `-y`/`--yes` to skip the confirmation prompt (required
     /// from a non-TTY / scripts).
     Reset,
+    // ── Agents ──────────────────────────────────────────────────────
+    /// Teach your AI agent tunlion: install the bundled agent skill (opt-in).
+    ///
+    /// The skill is a SKILL.md that tells an agent (Claude Code, or any tool
+    /// reading ~/.agents/skills) which tunlion commands to run and how to read
+    /// their exit codes. This binary carries the copy that matches it. Nothing
+    /// installs it but this command: not init, not up, not the install scripts.
+    #[command(next_help_heading = "Agents")]
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
 }
 
-/// Ephemeral device commands: mint auth keys, enroll as delegated.
+/// `tunlion skill` actions.
 #[derive(Subcommand)]
-pub(crate) enum EphemeralAction {
-    /// Enroll as an ephemeral delegated device using an auth key.
-    Enroll {
-        /// Owner-only file containing the auth key bundle.
-        #[arg(long, value_name = "PATH")]
-        auth_key_file: PathBuf,
-        /// Target peer display name or channel (the owner device to enroll at)
+pub(crate) enum SkillAction {
+    /// Print the bundled SKILL.md to stdout.
+    Show,
+    /// Write <skills>/tunlion/SKILL.md plus a `.tunlion-skill` marker.
+    ///
+    /// With no target flag: into each of ~/.claude/skills and ~/.agents/skills
+    /// whose parent (~/.claude, ~/.agents) exists. A directory this command
+    /// installed before is replaced (an update); any other existing
+    /// <skills>/tunlion is refused unless --force.
+    Install {
+        #[command(flatten)]
+        target: SkillTargets,
+        /// Overwrite an existing <skills>/tunlion that tunlion did not install.
         #[arg(long)]
-        to: Option<String>,
+        force: bool,
     },
+    /// Remove the skill, only where this command installed it (the marker).
+    ///
+    /// With no target flag: looks in both ~/.claude/skills and ~/.agents/skills.
+    Uninstall {
+        #[command(flatten)]
+        target: SkillTargets,
+    },
+}
+
+/// Where `tunlion skill install` / `uninstall` act. Combinable.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub(crate) struct SkillTargets {
+    /// Claude Code's skills directory, ~/.claude/skills.
+    #[arg(long)]
+    pub(crate) claude: bool,
+    /// The shared agents skills directory, ~/.agents/skills.
+    #[arg(long)]
+    pub(crate) agents: bool,
+    /// Any skills directory (the skill goes in <PATH>/tunlion).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) dir: Option<PathBuf>,
 }
 
 /// User identity management: generate the identity key, show the fingerprint,
@@ -936,7 +986,8 @@ pub(crate) enum DevicesAction {
     /// Durable revoke: the device stops being recognized NOW and forever (the
     /// record survives as evidence; the gate refuses it on reconnect).
     Revoke { name: String },
-    /// Undo a durable revoke. The device returns to its prior state.
+    /// Undo a revoke (the device returns to its prior record), or lift the
+    /// key block a `forget` left behind (then re-add it with `tunlion add`).
     Restore { name: String },
 }
 
@@ -979,7 +1030,7 @@ mod tests {
             let verb = first.trim_end_matches(':');
             // Group headings in the banner (Start/Share/Serve/Devices/Mesh) are
             // not commands.
-            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh") {
+            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh" | "Agents") {
                 continue;
             }
             if verb.is_empty() || verb.starts_with("add") || verb.starts_with("up") {
@@ -1072,6 +1123,7 @@ mod tests {
         fn sample<'a>(name: &'a str) -> Vec<&'a str> {
             match name {
                 "sync" => vec!["sync", ".", "laptop:dir"],
+                "skill" => vec!["skill", "show"],
                 other => vec![other],
             }
         }
@@ -1157,5 +1209,27 @@ mod tests {
         let src = include_str!("pair_cmd.rs");
         assert!(!src.contains("make sure both run `tunlion add`"));
         assert!(src.contains("while the other runs `tunlion join <code>`"));
+    }
+
+    /// Eval item 8: --help said a runner key is claimed with `ephemeral
+    /// enroll` while `add --for runner` printed `tunlion join <file>`. One
+    /// claim verb: the help, the add output and the parser all name `join`,
+    /// and the second spelling no longer parses.
+    #[test]
+    fn runner_keys_are_claimed_with_join_everywhere() {
+        use clap::Parser;
+        let runner_row = EXAMPLES
+            .lines()
+            .find(|l| l.trim_start().starts_with("add --for runner"))
+            .expect("the banner lists add --for runner");
+        assert!(runner_row.contains("tunlion join <file>"), "{runner_row}");
+        assert!(!EXAMPLES.contains("ephemeral enroll"), "the banner still names ephemeral enroll");
+        let step = crate::add_for::join_next_step("runner-invite.txt", None);
+        assert!(step.ends_with("tunlion join runner-invite.txt"), "{step}");
+        assert!(Cli::try_parse_from(["tunlion", "join", "runner-invite.txt"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["tunlion", "ephemeral", "enroll", "--auth-key-file", "k"]).is_err(),
+            "a second claim verb for the same file must not exist"
+        );
     }
 }

@@ -1,14 +1,8 @@
 # Tunlion
 
-> **Tunlion is now Tunlion.** Same project, same people, new name. The old name
-> collided with [Tunlion](https://tunlionphp.com) the Laravel admin panel, which
-> owns the search results, so this one is ours alone.
->
-> `tunlion.autumated.com` redirects here and old GitHub links redirect to this repo,
-> so nothing you have bookmarked breaks. The published `filament-cli` crate and the
-> `cli-v0.8.5` release assets keep working unchanged; new releases ship under the new
-> name. **`api.filament.autumated.com` is deliberately unchanged** and stays up: every
-> binary already installed points at it.
+> Tunlion grew out of an earlier project called filament. It is a separate
+> tool now, with its own config, service and command names, so the two can be
+> installed side by side.
 
 **Live: [tunlion.autumated.com](https://tunlion.autumated.com)** — send files and reach your devices, peer to peer. No upload, no size cap, no account.
 
@@ -70,6 +64,17 @@ tunlion mount dovm /srv/data ./data # mount a remote folder over the mesh
 ```
 
 No inbound ports, no VPN config, no accounts — reachability rides the same authenticated link as file transfer, so a headless box in another network is one command away.
+
+## Use it from an AI agent
+
+Every command that matters to a script takes `--json` and exits with a documented code (`tunlion --help`, EXIT CODES). To teach a coding agent the right commands, install the bundled skill ([cli/skills/tunlion/SKILL.md](cli/skills/tunlion/SKILL.md)). It is opt-in: nothing else ever installs it.
+
+```sh
+tunlion skill install               # into ~/.claude/skills and/or ~/.agents/skills, whichever exist
+tunlion skill install --dir ./skills # or any skills directory
+tunlion skill show                  # print the SKILL.md this binary carries
+tunlion skill uninstall             # removes only what skill install wrote
+```
 
 ## Why Tunlion over the alternatives
 

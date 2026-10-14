@@ -13,7 +13,7 @@ tunlion are never touched. This runbook is the operational contract.
 2. **Never touch the live system.** Not the running `tunlion up` daemon, not
    `~/.local/bin/tunlion`, not `~/.config/tunlion`, not the live site/T4. The
    `tunlion` link uses the **locally-built** `cli/target/release/tunlion` and
-   **isolated** `FILAMENT_CONFIG_DIR` identities under `.state/logs/<lab>/`.
+   **isolated** `TUNLION_CONFIG_DIR` identities under `.state/logs/<lab>/`.
 3. **Root only where needed.** netns/tun/wg require root; `lab doctor` and every
    `up` check it and fail clearly otherwise.
 
@@ -60,7 +60,7 @@ ls lab/.state/*.json                       # expect: no ledgers for torn-down la
   for i in $(ip -br link | awk '{print $1}' | grep -E '^lab(tun|u-|wg)'); do sudo ip link del "$i"; done
   pkill -f 'fil_relay.py'; pkill -f 'udp_relay.py'
   # isolated tunlion endpoints (lab only — NEVER the real daemon):
-  pkill -f 'FILAMENT_CONFIG_DIR=.*\.state/logs'
+  pkill -f 'TUNLION_CONFIG_DIR=.*\.state/logs'
   rm -f lab/.state/*.json
   ```
 - **Confirm the real daemon is untouched:** `tunlion status` should still show

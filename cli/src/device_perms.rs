@@ -51,6 +51,9 @@ pub(crate) struct DevicePerms {
     pub caveats: Vec<String>,
     pub caps: Vec<CapRow>,
     pub denies: Vec<String>,
+    /// The certificate's clock, rendered by `device_view::cert_expiry_text`,
+    /// the one sentence `devices` prints for the same device. Text view only.
+    pub cert_expires: Option<u64>,
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -74,13 +77,26 @@ fn gate_inputs(
 ) -> ShellGateInputs {
     let config_dir = crate::settings::config_dir();
     let (idev, iusr, binding, expires, ak_caps) = match cert {
-        Some(c) => (
-            Some(c.device_pub),
-            Some(c.user_pub),
-            BindingStrength::Proven,
-            Some(c.expires),
-            persisted_principal_for_cert(c).0.auth_key_caps().map(|s| s.to_vec()),
-        ),
+        // The same composition `peer_authz` feeds the live gate: a delegated
+        // device's deadline and ceiling come fresh from its record, and an
+        // ended one holds no capability. Without this the listing judged an
+        // expired guest by its raw certificate and contradicted the gate.
+        Some(c) => match crate::identity_state::delegated_access_for(&c.device_pub) {
+            Some(a) => (
+                Some(c.device_pub),
+                Some(c.user_pub),
+                BindingStrength::Proven,
+                Some(a.deadline),
+                Some(if a.expired(crate::identity::now_secs()) { Vec::new() } else { a.ceiling }),
+            ),
+            None => (
+                Some(c.device_pub),
+                Some(c.user_pub),
+                BindingStrength::Proven,
+                Some(c.expires),
+                persisted_principal_for_cert(c).0.auth_key_caps().map(|s| s.to_vec()),
+            ),
+        },
         // Never reached with trusted=true (see perms_for); kept total so the
         // matrix stays fabricable.
         None => (None, None, BindingStrength::None, None, None),
@@ -162,7 +178,9 @@ pub(crate) fn perms_for(
     let state = record["principalState"].as_str();
     let mut caveats = Vec::new();
     match cert.as_ref() {
-        None => caveats.push("uncertified, trusted in full".to_string()),
+        None => caveats.push(format!(
+            "uncertified: pairing permissions only, not scoped by an owner key. If it is yours, run `tunlion add {name}` on the device you ran `tunlion init` on, and `tunlion join <code>` on {name}"
+        )),
         Some(c) if c.expires <= now => caveats.push(format!("cert expired {}", when(c.expires, now))),
         Some(_) => {}
     }
@@ -203,7 +221,10 @@ pub(crate) fn perms_for(
             continue; // the ceiling row above is the one enforcement reads
         }
         let until = record["capExpires"][&cap].as_u64();
-        let source = if v1 { "pair-secret legacy (v1 default)" } else { "pair-secret legacy" };
+        // v2 `caps` is what `add` and `join` write TODAY; calling a pairing
+        // made a minute ago "legacy" was jargon leaking from the gate's
+        // internal fold. Only a v1 record (no `caps`) is legacy.
+        let source = if v1 { "pair-secret legacy (v1 default)" } else { "pairing" };
         rows.push(row(&cap, "self", source, until));
     }
     // 3. Owner-signed ops in the cap store that name this device's keys (user
@@ -261,7 +282,7 @@ pub(crate) fn perms_for(
             }
             Err(None) => {
                 r.effective = Some(false);
-                r.reason = "refused: legacy trust does not allow it".to_string();
+                r.reason = "refused: not among this pairing's permissions".to_string();
             }
         }
     }
@@ -278,6 +299,7 @@ pub(crate) fn perms_for(
         caveats,
         caps: rows,
         denies: strings(&record["deniedCaps"]),
+        cert_expires: cert.as_ref().map(|c| c.expires),
     }
 }
 
@@ -351,11 +373,17 @@ pub(crate) fn render(devices: &[&DevicePerms], now: u64) -> String {
         let fp = d.fingerprint.as_deref().unwrap_or("no certificate");
         let addr = d.addr.as_deref().unwrap_or("");
         out.push(format!(
-            "  {}  {}  {}  {}",
+            "  {}  {}  {}  {}  {}",
             ui::paint(ui::Tone::Bold, &d.name),
             ui::paint(ui::Tone::Brand, d.tier),
             ui::paint(ui::Tone::Dim, fp),
-            ui::paint(ui::Tone::Dim, addr)
+            ui::paint(ui::Tone::Dim, addr),
+            ui::paint(
+                ui::Tone::Dim,
+                &d.cert_expires
+                    .map(|e| crate::device_view::cert_expiry_text(Some(e), now))
+                    .unwrap_or_default()
+            )
         ));
         for c in &d.caveats {
             out.push(format!("     {} {}", ui::paint(ui::Tone::Warn, ui::glyph_warn()), c));
@@ -371,7 +399,10 @@ pub(crate) fn render(devices: &[&DevicePerms], now: u64) -> String {
                         r.action.clone(),
                         r.resource.clone(),
                         r.source.clone(),
-                        r.valid_until.map_or("no expiry".to_string(), |t| when(t, now)),
+                        // A row without its own clock: say whose clock is
+                        // missing. The DEVICE's expiry (its certificate) is on
+                        // the header line, in the words `devices` uses.
+                        r.valid_until.map_or("no grant expiry".to_string(), |t| when(t, now)),
                         match r.effective {
                             Some(true) => "yes".to_string(),
                             Some(false) => "no".to_string(),
@@ -423,7 +454,7 @@ pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
         let message = format!("no device named '{}', see `tunlion devices`", name.unwrap_or(""));
         crate::ui::exit_code_on_closed_pipe(3);
         if json {
-            println!(
+            crate::outln!(
                 "{}",
                 json!({"ok": false, "verb": "devices", "error": {"code": "unknown_device", "exit": 3, "message": message}})
             );
@@ -434,7 +465,7 @@ pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
     }
     if json {
         let devices: Vec<Value> = selected.iter().map(|d| to_json(d)).collect();
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
@@ -443,7 +474,7 @@ pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
             }))?
         );
     } else {
-        println!("{}", render(&selected, now));
+        crate::outln!("{}", render(&selected, now));
     }
     Ok(())
 }
@@ -481,7 +512,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fil-devperms-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let sec = "c".repeat(64);
         let devices = json!([
             {"name": "laptop", "secret": sec, "v": 2, "caps": ["transfer", "shell"],
@@ -526,8 +557,8 @@ mod tests {
     #[test]
     fn rows_come_from_the_store_and_effective_from_the_gate() {
         let _guard = lock_test_config();
-        let prior = std::env::var("FILAMENT_CAP_AUTHORITATIVE").ok();
-        unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", "0") };
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
+        unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "0") };
         let now = capability::now_secs();
         let dir = fixture(now);
         let before = (
@@ -546,12 +577,12 @@ mod tests {
         let signed = find(laptop, "shell", "grant by 11111111 v5");
         assert_eq!(signed.valid_until, Some(now + 3600));
         assert_eq!(signed.effective, Some(true), "{}", signed.reason);
-        assert_eq!(find(laptop, "shell", "pair-secret legacy").effective, Some(true));
-        assert_eq!(find(laptop, "transfer", "pair-secret legacy").effective, Some(true));
+        assert_eq!(find(laptop, "shell", "pairing").effective, Some(true));
+        assert_eq!(find(laptop, "transfer", "pairing").effective, Some(true));
 
         // An expired grant is listed, not effective, and says when it lapsed.
         let oldbox = by("oldbox");
-        let legacy = find(oldbox, "mount", "pair-secret legacy");
+        let legacy = find(oldbox, "mount", "pairing");
         assert_eq!(legacy.valid_until, Some(now - 10));
         assert!(legacy.effective == Some(false) && legacy.reason.starts_with("expired"), "{}", legacy.reason);
         let sig = find(oldbox, "mount", "grant by 11111111 v9");
@@ -579,7 +610,7 @@ mod tests {
         let locked = by("locked");
         assert_eq!(locked.denies, vec!["shell".to_string()]);
         assert!(locked.caveats.iter().any(|c| c == "cert revoked"));
-        let xfer = find(locked, "transfer", "pair-secret legacy");
+        let xfer = find(locked, "transfer", "pairing");
         assert!(xfer.effective == Some(false) && xfer.reason.contains("revoked"), "{}", xfer.reason);
 
         // An expired cert keeps the tier `devices` gives it and gains the caveat.
@@ -595,8 +626,22 @@ mod tests {
         assert_eq!(base.effective, None);
         assert!(base.reason.starts_with("not evaluated"), "{}", base.reason);
 
+        // Eval item 7: a fresh v2 pairing is never called "legacy", and the
+        // header carries the same expiry sentence `devices` prints.
+        for d in &all {
+            if d.name != "plain" {
+                assert!(d.caps.iter().all(|r| !r.source.contains("legacy")), "{}: {:?}", d.name, d.caps.iter().map(|r| &r.source).collect::<Vec<_>>());
+            }
+        }
         // Read-only: the view wrote nothing.
         let rendered = render(&all.iter().collect::<Vec<_>>(), now);
+        assert!(!rendered.contains("no expiry"), "{rendered}");
+        let laptop_cert = laptop.cert_expires.expect("laptop has a certificate");
+        let laptop_line = rendered.lines().find(|l| l.contains("laptop")).unwrap();
+        assert!(
+            laptop_line.contains(&crate::device_view::cert_expiry_text(Some(laptop_cert), now)),
+            "the caps view must state the device expiry the device list states: {laptop_line}"
+        );
         assert!(rendered.contains("grant by 11111111 v5"));
         let after = (
             std::fs::read(dir.join("devices.json")).unwrap(),
@@ -605,10 +650,10 @@ mod tests {
         assert_eq!(before, after, "devices --caps must not write the store");
 
         match prior {
-            Some(v) => unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", v) },
-            None => unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") },
+            Some(v) => unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v) },
+            None => unsafe { std::env::remove_var("TUNLION_CAP_AUTHORITATIVE") },
         }
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -618,7 +663,7 @@ mod tests {
         let now = capability::now_secs();
         let dir = fixture(now);
         assert!(all_device_perms(now).iter().all(|d| d.name != "ghost"));
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

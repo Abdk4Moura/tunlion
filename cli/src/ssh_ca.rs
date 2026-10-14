@@ -398,7 +398,7 @@ pub(crate) async fn ensure_ca_key_with(
         std::time::Duration::from_secs(10),
         tokio::process::Command::new(keygen_bin)
             .kill_on_drop(true)
-            .args(["-q", "-t", "ed25519", "-N", "", "-C", "filament-ca", "-f"])
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "tunlion-ca", "-f"])
             .arg(&key)
             .stdin(std::process::Stdio::null())
             .status(),
@@ -844,7 +844,7 @@ impl EphemeralKey {
                     "-N",
                     "",
                     "-C",
-                    "filament-ephemeral",
+                    "tunlion-ephemeral",
                 ])
                 .stdin(std::process::Stdio::null())
                 .status(),

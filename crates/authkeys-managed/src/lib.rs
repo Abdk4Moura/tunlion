@@ -1,4 +1,4 @@
-// sshkeys, filament-managed ssh auth material for the seamless `tunlion ssh`
+// sshkeys, tunlion-managed ssh auth material for the seamless `tunlion ssh`
 // path (docs/design-seamless-ssh.md). NEVER touches the user's ~/.ssh.
 //
 // Two roles:
@@ -8,7 +8,7 @@
 //     with ZERO ssh setup connects with no prompts and no key copying.
 //   * ACCEPTOR installs an initiator's managed pubkey into its OWN
 //     $HOME/.ssh/authorized_keys inside a CLEARLY-MARKED, removable
-//     `# BEGIN/END filament-managed <device>` block, ONLY over the authenticated
+//     `# BEGIN/END tunlion-managed <device>` block, ONLY over the authenticated
 //     channel AND ONLY when the `shell` cap is granted (enforced by the caller).
 //     It also reports its real host public keys so the initiator can pin them.
 
@@ -65,7 +65,7 @@ pub fn ensure_managed_key(config_dir: &Path) -> Result<String> {
             chmod(dir, 0o700);
         }
         let st = std::process::Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-C", "filament-managed", "-f"])
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "tunlion-managed", "-f"])
             .arg(&key)
             .status()
             .context("run ssh-keygen (is openssh-client installed?)")?;
@@ -94,8 +94,8 @@ pub fn ensure_managed_key(config_dir: &Path) -> Result<String> {
 
 // ----------------------------------------------------- ACCEPTOR: authorized_keys
 
-const BEGIN: &str = "# BEGIN filament-managed";
-const END: &str = "# END filament-managed";
+const BEGIN: &str = "# BEGIN tunlion-managed";
+const END: &str = "# END tunlion-managed";
 
 /// Path to the ACCEPTOR daemon user's authorized_keys ($HOME/.ssh/authorized_keys).
 /// Deliberately rooted at $HOME (NOT the config dir), that is where sshd reads
@@ -171,12 +171,12 @@ pub fn install_authorized_key(device: &str, pubkey: &str) -> Result<()> {
 }
 
 /// Markers for tunlion's OWN CA-trust line. Deliberately a different prefix from
-/// the per-device blocks (`# BEGIN filament-managed <device>`): blocks are keyed
+/// the per-device blocks (`# BEGIN tunlion-managed <device>`): blocks are keyed
 /// by device NAME, and a device could be named anything, so sharing that scheme
 /// would let a device called e.g. "tunlion-ssh-ca" overwrite the trust line on a
 /// shell grant, or delete it when revoked. With its own markers no device block
 /// can ever equal it, and the shell-key reconciler, which strips only
-/// `filament-managed <device>` blocks, never touches it.
+/// `tunlion-managed <device>` blocks, never touches it.
 const CA_BEGIN: &str = "# BEGIN tunlion-ca-trust";
 const CA_END: &str = "# END tunlion-ca-trust";
 
@@ -280,7 +280,7 @@ pub fn remove_authorized_key(device: &str) -> Result<()> {
     Ok(())
 }
 
-/// Return `content` with the `# BEGIN/END filament-managed <device>` block (and
+/// Return `content` with the `# BEGIN/END tunlion-managed <device>` block (and
 /// the lines between) removed. Lines outside any such block are preserved
 /// verbatim. Path-pure (testable), the file I/O wrappers call this.
 pub fn strip_block(content: &str, device: &str) -> String {
@@ -315,11 +315,11 @@ pub fn has_block(content: &str, device: &str) -> bool {
 // --------------------------------------------------------- ACCEPTOR: host keys
 
 /// Read the acceptor's real public host keys. Prod reads /etc/ssh/ssh_host_*.pub;
-/// the gate points FILAMENT_SSH_HOSTKEY at a throwaway sshd's hostkey pubfile so
+/// the gate points TUNLION_SSH_HOSTKEY at a throwaway sshd's hostkey pubfile so
 /// it never needs to touch the system's. Returns the raw pubkey lines (e.g.
 /// "ssh-ed25519 AAAA...").
 pub fn host_pubkeys() -> Vec<String> {
-    if let Ok(p) = std::env::var("FILAMENT_SSH_HOSTKEY") {
+    if let Ok(p) = std::env::var("TUNLION_SSH_HOSTKEY") {
         if let Ok(s) = std::fs::read_to_string(&p) {
             return s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
         }
@@ -502,12 +502,12 @@ mod tests {
     #[test]
     fn strip_block_removes_only_the_named_device() {
         let c = "ssh-rsa AAAAother user@host\n\
-                 # BEGIN filament-managed boxA\n\
-                 ssh-ed25519 AAAAtunlion filament-managed\n\
-                 # END filament-managed boxA\n\
+                 # BEGIN tunlion-managed boxA\n\
+                 ssh-ed25519 AAAAtunlion tunlion-managed\n\
+                 # END tunlion-managed boxA\n\
                  ssh-ed25519 AAAAkeep keep@host\n";
         let out = strip_block(c, "boxA");
-        assert!(!out.contains("filament-managed"));
+        assert!(!out.contains("tunlion-managed"));
         assert!(out.contains("AAAAother"));
         assert!(out.contains("AAAAkeep"));
         assert!(!has_block(&out, "boxA"));
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn validate_pubkey_accepts_a_single_well_formed_key() {
-        let ok = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabcDEF123+/= filament-managed";
+        let ok = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabcDEF123+/= tunlion-managed";
         let v = validate_pubkey(ok).expect("a clean single-line key is accepted");
         assert_eq!(v, ok);
         // No-comment form is fine too.

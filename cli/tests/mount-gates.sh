@@ -22,7 +22,7 @@ CLI_DIR="$(dirname "$HERE")"
 BIN="$CLI_DIR/target/release/tunlion"
 PORT=8098
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-/root/filament-bench/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/filament-bench/venv/bin/python}"
 WORK="$(mktemp -d /tmp/wt-mount-gates.XXXXXX)"
 
 PASS=0; FAIL=0; FAILED=""
@@ -44,7 +44,7 @@ trap cleanup EXIT
 [ -x "$BIN" ] || { echo "build first: (cd $CLI_DIR && cargo build --release)"; exit 2; }
 [ -e /dev/fuse ] || { echo "no /dev/fuse on this host"; exit 2; }
 command -v fusermount3 >/dev/null || command -v fusermount >/dev/null || { echo "no fusermount"; exit 2; }
-[ -x "$PYV" ] || { echo "no python venv at $PYV (set FILAMENT_TEST_VENV)"; exit 2; }
+[ -x "$PYV" ] || { echo "no python venv at $PYV (set TUNLION_TEST_VENV)"; exit 2; }
 
 # --- own fixture backend on 8098 (kill only our own listeners on 8098) ---
 for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
@@ -71,10 +71,10 @@ printf 'nested\n' > "$SERVED/subdir/inner.txt"
 WEIRD=$'caf\xffe.bin'
 printf 'non-utf8-name-payload' > "$SERVED/$WEIRD"
 
-# Start the acceptor (side B) ONCE. FILAMENT_L2=1 opts into the L2/mount path.
+# Start the acceptor (side B) ONCE. TUNLION_L2=1 opts into the L2/mount path.
 B_DROP="$WORK/Bdrop"; mkdir -p "$B_DROP"
 start_boxB() {
-  FILAMENT_CONFIG_DIR="$DB" FILAMENT_L2=1 FILAMENT_NAME=boxB \
+  TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxB \
     "$BIN" up --dir "$B_DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
   BPID=$!
   pids+=("$BPID")
@@ -83,7 +83,7 @@ start_boxB() {
 BPID=""
 start_boxB
 
-A_ENV=(env FILAMENT_CONFIG_DIR="$DA" FILAMENT_L2=1 FILAMENT_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_L2=1 TUNLION_NAME=boxA)
 
 # Helper: mount $SERVED at $1 in the background; wait until it is live.
 start_mount() {

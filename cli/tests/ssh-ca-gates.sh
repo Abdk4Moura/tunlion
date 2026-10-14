@@ -2,13 +2,13 @@
 # `tunlion shell --ssh` via local CA, end to end. Standalone, hermetic,
 # fixture port 8120 ONLY. No host files are touched: the throwaway sshd
 # listens on 127.0.0.1:9123 (reached through the mesh tunnel because
-# FILAMENT_SSH_PORT overrides the dial port), with temp hostkeys, temp
+# TUNLION_SSH_PORT overrides the dial port), with temp hostkeys, temp
 # PidFile, and B's daemon runs with HOME in the work dir, so the per-user
 # CA trust line it writes lands in a temp authorized_keys that the temp
 # sshd is pointed at (AuthorizedKeysFile). The runner's own
 # ~/.ssh/authorized_keys is never written.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./ssh-ca-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./ssh-ca-gates.sh
 #
 # Gates:
 #   A  POSITIVE cert login -- ephemeral key signed over the mesh, real sshd
@@ -37,10 +37,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8120
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-ssh-ca-gates.XXXXXX")"
 
 PASS=0; FAIL=0; FAILED=""
@@ -63,7 +63,7 @@ sleep 1
 pids+=($!)
 for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
-[ -x "$BIN" ] || { echo "build first: FILAMENT_BIN=/path/to/tunlion"; exit 2; }
+[ -x "$BIN" ] || { echo "build first: TUNLION_BIN=/path/to/tunlion"; exit 2; }
 command -v sshd >/dev/null || { echo "no sshd on PATH"; exit 2; }
 command -v ssh-keygen >/dev/null || { echo "no ssh-keygen on PATH"; exit 2; }
 command -v ssh >/dev/null || { echo "no ssh on PATH"; exit 2; }
@@ -73,12 +73,12 @@ SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
 printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
-A_ENV=(env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA)
 B_USER="$(id -un)"
 # B's daemon HOME: where the per-user CA trust line (and any managed key
 # block) is written. The temp sshd reads authorized_keys from here.
 BHOME="$WORK/Bhome"; mkdir -p "$BHOME"
-SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=9123)
+SSH_ENV=(env TUNLION_NO_L3_SSH=1 TUNLION_SSH_PORT=9123)
 
 # NO hand-provisioned CA key: up/grant arming mints it (CC-4 proves the
 # mint path live -- gate A would fail without it).
@@ -97,18 +97,18 @@ SSHD_PORT=9123
 # --- B acceptor (daemon user = root via USER; hostkeys pinned to temp) ---
 # Hook paths overridden to temp files: up/grant arming writes here (real
 # writer code, observable), never to the live /etc/ssh.
-HOOK_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/hooked-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/hooked-principals" FILAMENT_SSH_CA_PUB_ANCHOR="$WORK/hooked-ca.pub")
+HOOK_ENV=(env TUNLION_SSH_SSHD_CONFIG="$WORK/hooked-sshd-config" TUNLION_SSH_PRINCIPALS_DIR="$WORK/hooked-principals" TUNLION_SSH_CA_PUB_ANCHOR="$WORK/hooked-ca.pub")
 ssh-keygen -q -t ed25519 -f "$WORK/hooked-hostkey" -N ""
 chmod 600 "$WORK/hooked-hostkey"
 printf 'Port 9123\nHostKey %s\nListenAddress 127.0.0.1\nPidFile %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPermitRootLogin prohibit-password\nLogLevel VERBOSE\nAuthorizedKeysFile %s\n' "$WORK/hooked-hostkey" "$SSHD/sshd.pid" "$BHOME/.ssh/authorized_keys" > "$WORK/hooked-sshd-config"
 # Byte copy of the config as WE wrote it: gate C asserts arming left it alone.
 cp "$WORK/hooked-sshd-config" "$WORK/sshd-config.as-written"
-env FILAMENT_L2=1 HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
-  FILAMENT_SSH_HOSTKEY="$WORK/hooked-hostkey.pub" \
+env TUNLION_L2=1 HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB USER="$B_USER" \
+  TUNLION_SSH_HOSTKEY="$WORK/hooked-hostkey.pub" \
   "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 3
-env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
 
 # A ~10-minute grant window, seeded AFTER the grant (grant rewrites the
 # device record and would wipe a pre-seeded capExpires -- gate D caught
@@ -161,7 +161,7 @@ fi
 # ===================================================================== GATE B ==
 # NEGATIVE revoked: same command refused after the grant goes (nonzero).
 say B
-env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
+env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
 OUTB=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo SHOULD-NOT-RUN' 2>"$WORK/B.err" </dev/null)
 rcB=$?
 echo "## (revoked) rc=$rcB out='$OUTB'"
@@ -224,8 +224,8 @@ say C2
 DC="$WORK/C"; mkdir -p "$DC"; : > "$WORK/home-is-a-file"
 # Same valid base as B's (arming runs `sshd -t` on the result).
 cp "$WORK/sshd-config.as-written" "$WORK/c2-sshd-config"
-C2_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/c2-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/c2-principals" FILAMENT_SSH_CA_PUB_ANCHOR="$WORK/c2-ca.pub")
-env FILAMENT_L2=1 HOME="$WORK/home-is-a-file" FILAMENT_CONFIG_DIR="$DC" FILAMENT_NAME=boxC USER="$B_USER" \
+C2_ENV=(env TUNLION_SSH_SSHD_CONFIG="$WORK/c2-sshd-config" TUNLION_SSH_PRINCIPALS_DIR="$WORK/c2-principals" TUNLION_SSH_CA_PUB_ANCHOR="$WORK/c2-ca.pub")
+env TUNLION_L2=1 HOME="$WORK/home-is-a-file" TUNLION_CONFIG_DIR="$DC" TUNLION_NAME=boxC USER="$B_USER" \
   "${C2_ENV[@]}" "$BIN" up --shell --dir "$WORK/Cdrop" --server "$SERVER" >"$WORK/upC.log" 2>&1 &
 C2_PID=$!; pids+=($C2_PID)
 for _ in $(seq 1 30); do [ -s "$WORK/c2-ca.pub" ] && grep -q TrustedUserCAKeys "$WORK/c2-sshd-config" && break; sleep 0.5; done
@@ -259,7 +259,7 @@ fi
 # cached bootstrap hits 255, the rebootstrap (cert mode too) retries, ssh
 # fails 255 again -- and STILL nothing is installed. Proves the 255 retry
 # path honors cert-only.
-env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grantE2.log" 2>&1
+env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grantE2.log" 2>&1
 kill "$SSHD_PID" 2>/dev/null; sleep 1
 OUTE2=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo NOPE' 2>"$WORK/E2.err" </dev/null)
 rcE2=$?

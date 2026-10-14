@@ -80,11 +80,16 @@ fn report_invitation_uptake(ttl_abs: u64) {
 pub(crate) async fn add_for_cmd(
     caps: &UiCapability,
     for_: Option<String>,
+    name: Option<String>,
     allow: Vec<String>,
     expires: Option<String>,
     out: Option<PathBuf>,
 ) -> Result<()> {
     use base64::Engine;
+    // Before any question or prompt: no identity, no invitation (exit 9).
+    if let Some(e) = crate::identity_flow::add_needs_init() {
+        return Err(e);
+    }
     // The Some("") -> "ask me" normalisation now lives in resolve_for_kind, so
     // both callers get it. Doing it here as well is what let the other caller
     // look correct while it was not.
@@ -92,7 +97,10 @@ pub(crate) async fn add_for_cmd(
     // device/person is a DEVICE NAME: select device-kind and pre-fill the
     // invitation so the owner can name the invitee up front. The literals
     // keep working for scripts.
-    let (kind, _invitee_name) = resolve_for_kind(caps, for_)?;
+    let (kind, named) = resolve_for_kind(caps, for_)?;
+    // `add --for device --name b` named the invitee b, and the device joined
+    // as its hostname: --name never reached the invitation path.
+    let _invitee_name = invitee_name(named, name)?;
     // A name already held by a paired device cannot pass to the new key this
     // invitation enrols (it is stored as `<name>-2`), which is how a reset
     // device came back as a second record beside its stale self. Say so now,
@@ -354,7 +362,7 @@ pub(crate) async fn add_for_cmd(
         report_invitation_uptake(ttl_abs);
     }
     if caps.json {
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
@@ -410,6 +418,37 @@ pub(crate) fn receiver_not_running_note(can_install: bool) -> String {
     format!(
         "  note: the always-on receiver is not running; start `{start}` before anyone claims this invitation."
     )
+}
+
+/// The invitee's name from `--for <name>` (or `add <name>`) and `--name`.
+/// Either alone names them; both naming the same is fine; two different
+/// names is a contradiction, refused rather than silently resolved. Pure.
+pub(crate) fn invitee_name(named: Option<String>, name: Option<String>) -> Result<Option<String>> {
+    let name = name.filter(|n| !n.trim().is_empty());
+    match (named, name) {
+        (Some(a), Some(b)) if a != b => Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            format!("you named the invitee twice: '{a}' and --name {b}. Use one."),
+        )),
+        (a, b) => Ok(b.or(a)),
+    }
+}
+
+#[cfg(test)]
+mod invitee_name_tests {
+    use super::invitee_name;
+
+    /// F: `add --for device --name b` must name the device b.
+    #[test]
+    fn name_names_the_invitee_on_the_invitation_path() {
+        assert_eq!(invitee_name(None, Some("b".into())).unwrap().as_deref(), Some("b"));
+        assert_eq!(invitee_name(Some("b".into()), None).unwrap().as_deref(), Some("b"));
+        assert_eq!(invitee_name(Some("b".into()), Some("b".into())).unwrap().as_deref(), Some("b"));
+        assert_eq!(invitee_name(None, None).unwrap(), None);
+        assert_eq!(invitee_name(None, Some(" ".into())).unwrap(), None);
+        let e = invitee_name(Some("a".into()), Some("b".into())).unwrap_err();
+        assert_eq!(crate::exit_codes::classify(&e).code(), 2);
+    }
 }
 
 /// The step printed after `add --out`: copy the file, then join with it. When

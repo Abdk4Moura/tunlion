@@ -2,7 +2,7 @@
 # Daemon stop/start truth gates: `down`, `up` and `status` say what is actually
 # true about the daemon process, including when it is suspended or cut off.
 #
-#   FILAMENT_BIN=/path/to/tunlion bash cli/tests/daemon-stop-gates.sh
+#   TUNLION_BIN=/path/to/tunlion bash cli/tests/daemon-stop-gates.sh
 #
 # THE DEFECTS (blind test on a hostile container):
 #   - with the daemon SIGSTOPped, `down --yes` printed "stopped (pid N)" and
@@ -28,11 +28,11 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 case "$BIN" in /*) ;; *) BIN="$(pwd)/$BIN" ;; esac
 PORT=8134
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-dstop.XXXXXX")"
 D="$WORK/cfg"
 
@@ -63,14 +63,14 @@ start_backend() {
 stop_backend() {
   for p in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill -9 "$p" 2>/dev/null; done
 }
-T() { env FILAMENT_CONFIG_DIR="$D" timeout "$1" "$BIN" "${@:2}"; }
+T() { env TUNLION_CONFIG_DIR="$D" timeout "$1" "$BIN" "${@:2}"; }
 # Gone: no /proc entry, or a zombie waiting to be reaped.
 gone() { local st; st=$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null); [ -z "$st" ] || [ "$st" = "Z" ]; }
 daemon_pid() { for _ in $(seq 1 40); do [ -s "$D/up.pid" ] && { head -1 "$D/up.pid"; return 0; }; sleep 0.25; done; return 1; }
 
 start_backend
 mkdir -p "$D"
-env FILAMENT_CONFIG_DIR="$D" "$BIN" init --name stopper --recovery-file "$WORK/rec.txt" --yes >/dev/null 2>&1 \
+env TUNLION_CONFIG_DIR="$D" "$BIN" init --name stopper --recovery-file "$WORK/rec.txt" --yes >/dev/null 2>&1 \
   || { echo "init failed"; exit 2; }
 
 # ===================================================================== GATE A ==

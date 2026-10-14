@@ -26,9 +26,9 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // main.rs was 154 before the 2026-09-12 decomposition (26,261 -> 1,845
         // lines); its prints moved with their code. Sum 337 -> 328.
         ("main.rs", 1),
-        ("dispatch.rs", 64),
-        ("identity_flow.rs", 20),
-        ("add_for.rs", 12),
+        ("dispatch.rs", 25),
+        ("identity_flow.rs", 19),
+        ("add_for.rs", 11),
         ("mount_cmd.rs", 8),
         ("recv_cmd.rs", 8),
         ("update_cmd.rs", 8),
@@ -37,30 +37,24 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // (per-file JSONL, the final summary, the error envelope). Human
         // lines go through ui::. Machine output is what println! is for.
         ("sync_cmd.rs", 3),
+        // skill.rs: two println! sites, each printing one path the command
+        // wrote or removed (`installed|updated <path>`, `removed <path>`) to
+        // stdout for a script; the asides go through ui::.
+        ("skill.rs", 2),
         ("conn.rs", 4),
         ("up_logs.rs", 3),
         ("runtime_support.rs", 3),
         ("devices_store.rs", 1),
-        // `devices --caps` prints its table or its one JSON document to stdout
-        // for a script to consume, the same contract as the `devices` arm in
-        // dispatch.rs; its human asides go through ui::.
-        ("device_perms.rs", 3),
         ("enrollment.rs", 1),
         ("pair_cmd.rs", 1),
         ("recv_files.rs", 1),
-        ("status_cmd.rs", 1),
         ("mount.rs", 47),
-        ("doctor.rs", 41),
         ("settings.rs", 36),
         ("direct.rs", 14),
-        // reach now renders every human line through ui:: (the route label is
-        // must-see, so ui::critical); the one left is the --until-direct
-        // per-probe envelope (the plain --json result goes through ui::json_out).
-        ("ping.rs", 1),
         ("tun/linux.rs", 11),
         // interact.rs: 5 -> 0 after #391 routed its prompts through ui::.
         // ui.rs is the emitter of last resort; these ARE the implementation.
-        ("ui.rs", 4),
+        ("ui.rs", 3),
         ("l2.rs", 3),
         ("net.rs", 3),
         ("capability.rs", 2),

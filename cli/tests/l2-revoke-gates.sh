@@ -3,7 +3,7 @@
 # forward stream. The denial arrives as a stream close (the client's connection
 # breaks), never a hang. Standalone, hermetic, fixture port 8114 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./l2-revoke-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./l2-revoke-gates.sh
 #
 # Gates:
 #   A  the forward streams before the revoke           (positive control)
@@ -15,10 +15,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8114
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-l2-revoke.XXXXXX")"
 DA="$WORK/A"
 GRACE=12
@@ -50,7 +50,7 @@ while True:
 FIX_PIDS+=($!)
 sleep 1
 
-env FILAMENT_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" forward "alpha:$COUNTER_PORT" --lport 9123 >"$WORK/fwd.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" forward "alpha:$COUNTER_PORT" --lport 9123 >"$WORK/fwd.log" 2>&1 &
 FWD_PID=$!
 FIX_PIDS+=($FWD_PID)
 sleep 3
@@ -90,7 +90,7 @@ fi
 say B
 REASON="l2: peer revoked, closing the live stream"
 reason_before=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
 revoke_rc=$?
 sleep "$GRACE"
 reason_after=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
@@ -121,7 +121,7 @@ if kill -0 "$FWD_PID" 2>/dev/null; then
 else
   wait "$FWD_PID"; FWD_RC=$?
   fwdlog=$(tr -d '\r' <"$WORK/fwd.log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
-  if [ "$FWD_RC" -eq 4 ] && printf '%s\n' "$fwdlog" | grep -q 'access revoked' \
+  if [ "$FWD_RC" -eq 4 ] && printf '%s\n' "$fwdlog" | grep -q 'device revoked' \
      && printf '%s\n' "$fwdlog" | grep -q 'stopped'; then
     ok "gateC: the revoked forward exited 4 and said why"
   else

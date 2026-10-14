@@ -24,13 +24,13 @@
 #   SEC_CTL/SEC_DIN/SEC_DOUT   the three 64-hex pair secrets shared with the host
 #       (generate with:  openssl rand -hex 32   — run THREE times on the host,
 #        give the same three to both sides; keep them secret).
-#   FILAMENT_URL    URL to fetch the static musl binary (or place ./tunlion next
-#                   to this script / set FILAMENT_BIN to an existing path).
+#   TUNLION_URL    URL to fetch the static musl binary (or place ./tunlion next
+#                   to this script / set TUNLION_BIN to an existing path).
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 # ===================== CONFIG (edit or pass via env) =======================
-FILJOB_SERVER="${FILJOB_SERVER:-https://api.filament.autumated.com}"
+FILJOB_SERVER="${FILJOB_SERVER:-https://api.tunlion.autumated.com}"
 SEC_CTL="${SEC_CTL:?set SEC_CTL (openssl rand -hex 32, shared with host)}"
 SEC_DIN="${SEC_DIN:?set SEC_DIN (openssl rand -hex 32, shared with host)}"
 SEC_DOUT="${SEC_DOUT:?set SEC_DOUT (openssl rand -hex 32, shared with host)}"
@@ -43,8 +43,8 @@ HOST_DOUT_NAME="${HOST_DOUT_NAME:-host-out}"
 
 ROOT_DIR="${FILJOB_ROOT:-$HOME/filament-jobs}"
 INBOX="$ROOT_DIR/.inbox"
-BIN="${FILAMENT_BIN:-$ROOT_DIR/tunlion}"
-FILAMENT_URL="${FILAMENT_URL:-}"          # optional: fetch the static binary
+BIN="${TUNLION_BIN:-$ROOT_DIR/tunlion}"
+TUNLION_URL="${TUNLION_URL:-}"          # optional: fetch the static binary
 INSTALL_RCLONE="${INSTALL_RCLONE:-0}"      # 1 to install rclone for R2 durability
 # ===========================================================================
 
@@ -81,10 +81,10 @@ fi
 
 # --- 2. the static tunlion binary -----------------------------------------
 if [ ! -x "$BIN" ]; then
-  if [ -n "$FILAMENT_URL" ]; then
-    log "fetching static tunlion binary from $FILAMENT_URL"
+  if [ -n "$TUNLION_URL" ]; then
+    log "fetching static tunlion binary from $TUNLION_URL"
     dl="$ROOT_DIR/.tunlion.dl"
-    curl -fsSL "$FILAMENT_URL" -o "$dl"
+    curl -fsSL "$TUNLION_URL" -o "$dl"
     # Standard release assets are .tar.gz; the one-off asset is a raw binary.
     # Detect and handle BOTH (tar -tzf succeeds only on a real gzip tarball).
     if tar -tzf "$dl" >/dev/null 2>&1; then
@@ -103,7 +103,7 @@ if [ ! -x "$BIN" ]; then
   else
     log "ERROR: no tunlion binary. Build it on the host with:"
     log "  cargo build --release --target x86_64-unknown-linux-musl"
-    log "then host it (FILAMENT_URL) or copy it next to this script as ./tunlion"
+    log "then host it (TUNLION_URL) or copy it next to this script as ./tunlion"
     exit 1
   fi
 fi
@@ -178,13 +178,13 @@ log "starting din acceptor (--relay -> $INBOX)"
 # Proven by runner/sim/signaling_drop_test.sh (baseline with the loop reverted
 # ZOMBIES). The supervisor is DEPRECATED (kept belt-and-suspenders for older
 # binaries). --relay stays (stable over flaky NAT); partials still resume.
-FILAMENT_CONFIG_DIR="$ROOT_DIR/cfg-din" HOME="$ROOT_DIR/cfg-din" \
+TUNLION_CONFIG_DIR="$ROOT_DIR/cfg-din" HOME="$ROOT_DIR/cfg-din" \
   nohup "$BIN" up --server "$FILJOB_SERVER" --name-as filjob-box-din --dir "$INBOX" --relay \
   >>"$ROOT_DIR/din.log" 2>&1 &
 echo $! > "$ROOT_DIR/din.pid"
 
 log "starting file-driven watcher (--relay results on dout)"
-FILJOB_ROOT="$ROOT_DIR" FILJOB_SERVER="$FILJOB_SERVER" FILAMENT_BIN="$BIN" \
+FILJOB_ROOT="$ROOT_DIR" FILJOB_SERVER="$FILJOB_SERVER" TUNLION_BIN="$BIN" \
   FILJOB_BOX_DOUT_CFG="$ROOT_DIR/cfg-dout" FILJOB_HOST_DOUT_PEER="$HOST_DOUT_NAME" \
   nohup python3 "$ROOT_DIR/watcher.py" --relay >"$ROOT_DIR/watcher.log" 2>&1 &
 echo $! > "$ROOT_DIR/watcher.pid"
@@ -198,7 +198,7 @@ log "watcher up — pid $(cat "$ROOT_DIR/watcher.pid"), log: $ROOT_DIR/watcher.l
 # stability over flaky NAT. Disable with FILJOB_OPS_SHELL=0.
 if [ "${FILJOB_OPS_SHELL:-1}" != "0" ]; then
   log "starting ops shell (up --shell --relay on ctl — inspection only)"
-  FILAMENT_CONFIG_DIR="$ROOT_DIR/cfg-ctl" HOME="$ROOT_DIR/cfg-ctl" FILAMENT_L2=1 \
+  TUNLION_CONFIG_DIR="$ROOT_DIR/cfg-ctl" HOME="$ROOT_DIR/cfg-ctl" TUNLION_L2=1 \
     nohup "$BIN" up --server "$FILJOB_SERVER" --shell --relay --name-as filjob-box-ops \
     --dir "$ROOT_DIR/ctldrop" >"$ROOT_DIR/ctl.log" 2>&1 &
   echo $! > "$ROOT_DIR/ctl.pid"

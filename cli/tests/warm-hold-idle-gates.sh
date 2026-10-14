@@ -5,7 +5,7 @@
 # runs ordinary one-shot commands at them now and then. Standalone, hermetic,
 # fixture port 8131 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./warm-hold-idle-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./warm-hold-idle-gates.sh
 #
 # The defect this pins (deterministic whenever petname != display name):
 # warm-hold keyed the device by its roster DISPLAY name, but a direct link is
@@ -55,10 +55,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8131
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-warm-idle.XXXXXX")"
 DA="$WORK/A"; DB="$WORK/B"
 IDLE_SECS="${WARM_IDLE_SECS:-180}"
@@ -74,10 +74,10 @@ printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
 printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
 # Display names deliberately differ from the petnames each side stores.
-env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME="user@boxA-host" FILAMENT_LOG=debug \
+env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME="user@boxA-host" TUNLION_LOG=debug \
   "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1 &
 FIX_PIDS+=($!)
-env FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME="user@boxB-host" FILAMENT_LOG=debug \
+env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME="user@boxB-host" TUNLION_LOG=debug \
   "$BIN" --server "$SERVER" up --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1 &
 FIX_PIDS+=($!)
 
@@ -153,11 +153,11 @@ cat >"$WORK/traffic.sh" <<'SH'
 # $1 = rounds. Writes one line per command: "<tag> rc=<rc> ms=<ms>".
 for n in $(seq 1 "$1"); do
   t0=$(date +%s%N)
-  timeout 15 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach boxA --json </dev/null >"$WORK/traffic-reach-$n.out" 2>&1
+  timeout 15 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach boxA --json </dev/null >"$WORK/traffic-reach-$n.out" 2>&1
   rc=$?; t1=$(date +%s%N); echo "reach-$n rc=$rc ms=$(( (t1 - t0) / 1000000 ))"
   printf 'probe %s\n' "$n" >"$WORK/probe-$n.txt"
   t0=$(date +%s%N)
-  timeout 15 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" send "$WORK/probe-$n.txt" --to boxA </dev/null >"$WORK/traffic-send-$n.out" 2>&1
+  timeout 15 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" send "$WORK/probe-$n.txt" --to boxA </dev/null >"$WORK/traffic-send-$n.out" 2>&1
   rc=$?; t1=$(date +%s%N); echo "send-$n rc=$rc ms=$(( (t1 - t0) / 1000000 ))"
   sleep 30
 done
@@ -268,7 +268,7 @@ fi
 # --- a round trip at the end --------------------------------------------------
 say "round trip after idle"
 t0=$(date +%s%N)
-fs_cli 30 env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" reach boxB
+fs_cli 30 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" reach boxB
 rc=$?
 t1=$(date +%s%N)
 ms=$(( (t1 - t0) / 1000000 ))

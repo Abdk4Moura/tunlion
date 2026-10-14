@@ -17,7 +17,7 @@ set -uo pipefail
 #           (pair_cmd lived in main.rs until the 2026-09-12 decomposition)
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN=${BIN:-$HERE/../../target/release/tunlion}
-PY=${PY:-${FILAMENT_TEST_VENV:-python3}}
+PY=${PY:-${TUNLION_TEST_VENV:-python3}}
 MAIN=${MAIN:-$HERE/../../src/pair_cmd.rs}
 BACKEND_DIR=${BACKEND_DIR:-$HERE/../../../backend}
 T=${T:-/tmp/l1a-gate6}
@@ -31,7 +31,7 @@ sleep 1
 for i in $(seq 1 20); do curl -s http://127.0.0.1:8093/api/config >/dev/null 2>&1 && break; sleep 0.3; done
 
 # A v2 creator against the stripping server.
-FILAMENT_CONFIG_DIR=$T/g6/cfg FILAMENT_PAIR_GRACE_SECS=10 \
+TUNLION_CONFIG_DIR=$T/g6/cfg TUNLION_PAIR_GRACE_SECS=10 \
   "$BIN" --server http://127.0.0.1:8093 pair --name v </dev/null >"$T/g6/creator.log" 2>&1 &
 CRE=$!
 for i in $(seq 1 30); do kill -0 $CRE 2>/dev/null || break; sleep 0.3; done

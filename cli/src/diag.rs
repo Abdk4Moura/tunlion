@@ -381,7 +381,7 @@ fn phase_from_label(s: &str) -> Option<Phase> {
 }
 
 /// Read the local diag JSONL and digest the most recent `limit` terminal spans.
-/// Reads from `{FILAMENT_CONFIG_DIR else ~/.config/filament}/diag.jsonl`. A
+/// Reads from `{TUNLION_CONFIG_DIR else ~/.config/tunlion}/diag.jsonl`. A
 /// missing/empty file yields an all-zero `Summary` (a fresh install with no
 /// history, not an error).
 pub fn summarize(limit: usize) -> Summary {
@@ -709,7 +709,7 @@ mod local_span_tests {
         let _guard = crate::tests::lock_test_config();
         let dir = std::env::temp_dir().join(format!("fil-diag-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let mut ok = super::Attempt::new_local("abcdef0123", "send");
         ok.enter(super::Phase::Presence);
         ok.up("relayed", "datachannel");
@@ -719,7 +719,7 @@ mod local_span_tests {
         bad.fail("offline");
         let h = super::summarize(10);
         assert_eq!((h.considered, h.ups, h.fails), (2, 1, 1));
-        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -75,7 +75,7 @@ Bootstrap, initiator side (`shell_bootstrap`):
 - `bring_up_to_known(server, peer, relay)` → authenticated transport.
 - Ensure our managed keypair exists (generate on demand, see below); read its
   pubkey.
-- Send control `{type:"shell-bootstrap", v:1, pubkey:"ssh-ed25519 AAAA... filament-managed"}`.
+- Send control `{type:"shell-bootstrap", v:1, pubkey:"ssh-ed25519 AAAA... tunlion-managed"}`.
 - Pump `rx` for:
   - `{type:"shell-bootstrap-ack", hostkeys:[...], user:"<login>"}` → install the
     host keys into our private known_hosts pinned to the destination token, then
@@ -85,31 +85,31 @@ Bootstrap, initiator side (`shell_bootstrap`):
   - timeout → abort.
 
 Bootstrap, acceptor side (new `Ev::Control` arm in `up`, next to `l2-open`,
-**gated on `FILAMENT_L2=1` like the rest of the tunnel acceptor**):
+**gated on `TUNLION_L2=1` like the rest of the tunnel acceptor**):
 - Resolve the link's verified petname; require `l.trusted &&
   device_allows(name, "shell")`. (Localhost/SSRF rules are irrelevant here — no
   dial happens; this is a local file edit + host-key read.)
 - Granted:
   - Append/replace our managed block in `$HOME/.ssh/authorized_keys`:
     ```
-    # BEGIN filament-managed <device>
+    # BEGIN tunlion-managed <device>
     <pubkey>
-    # END filament-managed <device>
+    # END tunlion-managed <device>
     ```
     Idempotent: a re-grant replaces the block for that device (no dup lines).
     File created `0700` dir / `0600` file if absent. Marked, auditable, removable.
   - Read the host's public host keys (prod: `/etc/ssh/ssh_host_*.pub`;
-    env-overridable `FILAMENT_SSH_HOSTKEY` for the gate's throwaway sshd).
+    env-overridable `TUNLION_SSH_HOSTKEY` for the gate's throwaway sshd).
   - Reply `shell-bootstrap-ack{hostkeys, user}`.
 - Not granted: reply `shell-bootstrap-deny{reason:"shell capability not granted"}`
   and log `l2: shell bootstrap refused: <device> (no shell cap)`.
 
-## filament-managed ssh material (never touches `~/.ssh`)
+## tunlion-managed ssh material (never touches `~/.ssh`)
 
-Under the tunlion config dir (`FILAMENT_CONFIG_DIR`, default `~/.config/filament`):
+Under the tunlion config dir (`TUNLION_CONFIG_DIR`, default `~/.config/tunlion`):
 
 - `ssh/id_ed25519` + `ssh/id_ed25519.pub` — managed keypair, generated on demand
-  via `ssh-keygen -t ed25519 -N "" -C filament-managed`, `0600`. NEVER the user's
+  via `ssh-keygen -t ed25519 -N "" -C tunlion-managed`, `0600`. NEVER the user's
   `~/.ssh`.
 - `ssh/known_hosts` — filament-private pin store.
 
@@ -143,19 +143,19 @@ feature is fully functional over the existing WebRTC L2 transport — that is th
 status quo for `netcat`/`forward`/`ssh`, NOT a regression. A genuine direct-first
 preference for the L2 path is two-sided (both the initiator's `bring_up_to_known`
 AND the acceptor's `up` must dial direct), and `up` is also the file-transfer
-acceptor, so enabling direct there for `FILAMENT_L2` links without a flag risks
-the file-transfer/`FILAMENT_DIRECT` hard-rule. Doing only the initiator half is
+acceptor, so enabling direct there for `TUNLION_L2` links without a flag risks
+the file-transfer/`TUNLION_DIRECT` hard-rule. Doing only the initiator half is
 worse than nothing (it adds a transport-offer round-trip then falls back). Left
 as a follow-up; the design below is the intended shape.
 
 The L2/ssh path (the bootstrap link AND the ProxyCommand `netcat` child) should
 prefer the **direct-QUIC** transport to a known device, falling back to WebRTC,
-**without the user setting `FILAMENT_DIRECT`**. Scope this to `bring_up_to_known`
+**without the user setting `TUNLION_DIRECT`**. Scope this to `bring_up_to_known`
 ONLY (the tunnel path) — do NOT flip the global file-transfer default, so file
-transfer / pairing / existing FILAMENT_DIRECT behavior cannot regress.
+transfer / pairing / existing TUNLION_DIRECT behavior cannot regress.
 
 Mechanism: `bring_up_to_known` treats a known-device link as "try direct first"
-by default. `FILAMENT_DIRECT=0` can still force WebRTC-only for that path; absence
+by default. `TUNLION_DIRECT=0` can still force WebRTC-only for that path; absence
 of the var no longer means "WebRTC only" *for this path*. Direct is attempted with
 a short budget and falls back to the existing WebRTC bring-up on failure. (If the
 direct dial wiring proves too invasive for this rung, the fallback path is the
@@ -183,7 +183,7 @@ New `cli/tests/ssh-gates.sh`, hermetic, fixture backend, sandboxed `HOME`:
 - **GATE B (negative, no cap):** a paired device WITHOUT `shell` is REFUSED the
   bootstrap (`shell-bootstrap-deny`), `tunlion ssh` aborts before invoking ssh,
   zero shell. Clear denial in output.
-- **Marked + removable:** assert the `# BEGIN/END filament-managed <device>` block
+- **Marked + removable:** assert the `# BEGIN/END tunlion-managed <device>` block
   is present after grant and gone after `revoke`.
 - **No regression:** `gates.sh` (pairing + transfer core), `transport-gates.sh`
   (rung-1 direct), `l2-gates.sh` still pass.

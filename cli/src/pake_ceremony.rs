@@ -128,6 +128,28 @@ pub struct Ceremony {
     aborted: Option<String>,
     sent_msg: bool,
     sent_confirm: bool,
+    /// The public routing nameplate this ceremony is for. Carried (as `np`) on
+    /// every payload so a peer can tell whose ceremony a message belongs to:
+    /// two concurrent `send --code` on one device share the sender's auto room,
+    /// and a receiver claiming one code meets BOTH senders there. The nameplate
+    /// already crosses the server (pair-create / pair-claim); it is routing, not
+    /// a secret, and changing it cannot make a ceremony agree (SPAKE2 binds it).
+    nameplate: String,
+    /// The peer said it can take a direct QUIC connection (`"direct": true` on
+    /// its PAKE payloads). A browser cannot, and never says so. Promoting a
+    /// browser to direct QUIC tears down the WebRTC link it is using, and the
+    /// re-established link never came back, so a code transfer to a browser
+    /// stalled forever after "authenticated". Only routing, not a secret: a
+    /// server that strips it just keeps the transfer on WebRTC.
+    peer_direct: bool,
+}
+
+/// Is this PAKE payload for the ceremony on `nameplate`? `Some(true)` when the
+/// payload names our nameplate, `Some(false)` when it names a DIFFERENT one
+/// (another code's ceremony sharing the room: never ours to answer or to fail
+/// on), `None` when it names none (a build that predates the tag). Pure.
+pub fn addressed_to(data: &Value, nameplate: &str) -> Option<bool> {
+    data["np"].as_str().map(|np| np == nameplate)
 }
 
 impl Ceremony {
@@ -154,6 +176,8 @@ impl Ceremony {
             aborted: None,
             sent_msg: false,
             sent_confirm: false,
+            nameplate: nameplate.to_string(),
+            peer_direct: false,
         }
     }
 
@@ -163,6 +187,7 @@ impl Ceremony {
     /// Scope is preserved (same introduction).
     pub fn restart(&mut self, password: &str, nameplate: &str) {
         let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
+        self.nameplate = nameplate.to_string();
         self.state = Some(state);
         self.msg = msg;
         self.k = None;
@@ -177,6 +202,7 @@ impl Ceremony {
     #[cfg(test)]
     pub fn restart_with_scope(&mut self, password: &str, nameplate: &str, scope: u8) {
         let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
+        self.nameplate = nameplate.to_string();
         self.state = Some(state);
         self.msg = msg;
         self.scope = scope;
@@ -206,7 +232,12 @@ impl Ceremony {
             return None;
         }
         self.sent_msg = true;
-        Some(json!({ "type": "pake-msg", "v": 2, "msg": b64_encode(&self.msg) }))
+        Some(json!({
+            "type": "pake-msg", "v": 2,
+            "msg": b64_encode(&self.msg),
+            "np": self.nameplate,
+            "direct": true,
+        }))
     }
 
     /// The opaque `signal` payload carrying our key-confirmation MAC, IF K is
@@ -227,6 +258,7 @@ impl Ceremony {
             "mac": b64_encode(&mac),
             "caps": self.caps.clone(),
             "scope": self.scope,
+            "np": self.nameplate,
         }))
     }
 
@@ -238,6 +270,12 @@ impl Ceremony {
     /// Borrow K if derived (for sealing identity-expose).
     pub fn k(&self) -> Option<&Vec<u8>> {
         self.k.as_ref()
+    }
+
+    /// Whether the peer can take a direct QUIC connection. False for a
+    /// browser: callers must then keep the WebRTC link instead of promoting.
+    pub fn peer_supports_direct(&self) -> bool {
+        self.peer_direct
     }
 
     /// Scope byte (mandatory, no default).
@@ -255,6 +293,11 @@ impl Ceremony {
     /// fingerprints to verify against (the caller supplies the link's current
     /// fingerprints). On a verified confirm the secret is derived.
     pub fn on_signal(&mut self, data: &Value, fps: Option<(&str, &str)>) -> Inbound {
+        if matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm"))
+            && data["direct"].as_bool() == Some(true)
+        {
+            self.peer_direct = true;
+        }
         match data["type"].as_str() {
             Some("pake-msg") => {
                 if self.k.is_none() {
@@ -506,4 +549,46 @@ mod tests {
         assert!(b.secret().is_none());
     }
 
+    // Two concurrent codes on one device share a room. Every payload names its
+    // nameplate, so a peer can tell another code's ceremony from its own
+    // without running it (the concurrent-send defect: a receiver of code 1
+    // handshook with code 2's sender, which then refused its own transfer).
+    #[test]
+    fn payloads_name_their_nameplate() {
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut b = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let a_msg = a.take_msg_payload().unwrap();
+        let b_msg = b.take_msg_payload().unwrap();
+        assert_eq!(addressed_to(&a_msg, "314"), Some(true));
+        assert_eq!(addressed_to(&a_msg, "2718"), Some(false));
+        assert_eq!(addressed_to(&json!({"type": "pake-msg"}), "314"), None);
+        b.on_signal(&a_msg, None);
+        a.on_signal(&b_msg, None);
+        let conf = a.take_confirm_payload("SHA-256 A", "SHA-256 B").unwrap();
+        assert_eq!(addressed_to(&conf, "314"), Some(true));
+        assert_eq!(addressed_to(&conf, "999"), Some(false));
+        // A restart on a fresh nameplate re-tags.
+        let mut c = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        c.restart("brave-otter", "4242");
+        let c_msg = c.take_msg_payload().unwrap();
+        assert_eq!(addressed_to(&c_msg, "4242"), Some(true));
+        assert_eq!(addressed_to(&c_msg, "314"), Some(false));
+    }
+
+    /// Two CLIs tell each other they can go direct; a browser's payloads carry
+    /// no `direct` field, so a CLI facing one keeps the WebRTC link.
+    #[test]
+    fn only_a_peer_that_says_so_is_promoted_to_direct() {
+        let (a, b) = run_pair("brave-otter", "brave-otter", "314");
+        assert!(a.peer_supports_direct() && b.peer_supports_direct());
+
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut cli = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut browser_side = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut from_browser = browser_side.take_msg_payload().unwrap();
+        from_browser.as_object_mut().unwrap().remove("direct");
+        assert!(matches!(cli.on_signal(&from_browser, None), Inbound::Consumed));
+        assert!(!cli.peer_supports_direct());
+    }
 }

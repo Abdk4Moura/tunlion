@@ -10,7 +10,7 @@
 set -euo pipefail
 
 ROOT="${1:-$HOME/.filament-jobrunner}"
-SERVER="${FILJOB_SERVER:-https://api.filament.autumated.com}"
+SERVER="${FILJOB_SERVER:-https://api.tunlion.autumated.com}"
 mkdir -p "$ROOT/host" "$ROOT/host-dout"
 
 gen() { openssl rand -hex 32; }

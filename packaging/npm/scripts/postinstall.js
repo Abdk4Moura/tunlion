@@ -68,18 +68,12 @@ async function main() {
     console.error('Install another way: https://tunlion.autumated.com  or  cargo install filament-cli')
     process.exit(1)
   }
-  // Pre-rename releases ship `filament-<target>`; everything from the first
-  // post-rename release ships `tunlion-<target>`. Try the new name first and
-  // fall back, so `npm i -g` works against both and there is no window where
-  // the published package cannot install.
   const asset = `tunlion-${tgt.t}.${tgt.ext}`
-  const legacyAsset = `filament-${tgt.t}.${tgt.ext}`
   const base = `https://github.com/${REPO}/releases/download/${TAG}`
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tunlion-'))
   try {
     const sums = await get(`${base}/SHA256SUMS`)
-    // Pick whichever asset this release actually published.
-    let name = sums.toString('utf8').includes(asset) ? asset : legacyAsset
+    const name = asset
     const bin = await get(`${base}/${name}`)
 
     const got = crypto.createHash('sha256').update(bin).digest('hex').toLowerCase()
@@ -97,11 +91,7 @@ async function main() {
 
     const vendor = path.join(__dirname, '..', 'vendor')
     fs.mkdirSync(vendor, { recursive: true })
-    const legacyBin = process.platform === 'win32' ? 'filament.exe' : 'filament'
-    const inner = fs.existsSync(path.join(tmp, binaryName()))
-      ? binaryName()
-      : legacyBin
-    fs.copyFileSync(path.join(tmp, inner), binaryPath())
+    fs.copyFileSync(path.join(tmp, binaryName()), binaryPath())
     if (process.platform !== 'win32') fs.chmodSync(binaryPath(), 0o755)
     console.log(`tunlion: installed ${TAG} for ${tgt.t}`)
   } catch (e) {

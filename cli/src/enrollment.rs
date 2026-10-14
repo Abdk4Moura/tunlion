@@ -381,10 +381,16 @@ pub(crate) async fn enroll_cmd(
                     "device_pub": hex::encode(device_pub),
                 })).await;
                 if !json_output {
+                    // The inviting device by name, never its signaling id
+                    // (the lab read "sent enrollment request to lP0Pn2H9kZSCcpZ0AAXj").
+                    let to = conn
+                        .display_name_of(&pid)
+                        .map(|n| format!("'{n}'"))
+                        .unwrap_or_else(|| "the inviting device".to_string());
+                    ui::debug(&format!("enrollment request sent on pid {pid}"));
                     ui::say(&format!(
-                        "  {} sent enrollment request to {}",
+                        "  {} sent enrollment request to {to}",
                         ui::paint(ui::Tone::Dim, "->"),
-                        pid
                     ));
                 }
             }

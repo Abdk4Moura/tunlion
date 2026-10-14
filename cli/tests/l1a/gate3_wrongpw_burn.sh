@@ -13,7 +13,7 @@ T=${T:-/tmp/l1a-gate3}
 rm -rf "$T/g3"; mkdir -p "$T/g3/cfgA" "$T/g3/cfgB" "$T/g3/cfgC"
 
 # Creator mints a code.
-FILAMENT_CONFIG_DIR=$T/g3/cfgA FILAMENT_PAIR_GRACE_SECS=20 \
+TUNLION_CONFIG_DIR=$T/g3/cfgA TUNLION_PAIR_GRACE_SECS=20 \
   "$BIN" --server "$SERVER" pair --name x </dev/null >"$T/g3/creator.log" 2>&1 &
 CRE=$!
 CODE=""
@@ -30,7 +30,7 @@ echo "minted: $CODE  (nameplate $NAMEPLATE)"
 # clears the strength floor, so the REFUSAL is the key-confirmation failure and
 # not a too-weak rejection).
 WRONG="tidy-walrus-$NAMEPLATE"
-FILAMENT_CONFIG_DIR=$T/g3/cfgB FILAMENT_PAIR_GRACE_SECS=20 \
+TUNLION_CONFIG_DIR=$T/g3/cfgB TUNLION_PAIR_GRACE_SECS=20 \
   "$BIN" --server "$SERVER" pair "$WRONG" --name y </dev/null >"$T/g3/claimer.log" 2>&1 &
 CLA=$!
 
@@ -50,7 +50,7 @@ STORED_B=$(cat "$T/g3/cfgB/devices.json" 2>/dev/null | grep -c '"secret"')
 REFUSED=$(grep -ciE 'REFUSED|confirmation failed|tamper|wrong code|disconnected|could not connect' "$T/g3/claimer.log")
 
 # 3) Nameplate is BURNED: a fresh claim of the same nameplate finds nothing.
-FILAMENT_CONFIG_DIR=$T/g3/cfgC \
+TUNLION_CONFIG_DIR=$T/g3/cfgC \
   "$BIN" --server "$SERVER" pair "good-otter-$NAMEPLATE" --name z </dev/null >"$T/g3/reclaim.log" 2>&1 &
 RC=$!
 for i in $(seq 1 20); do kill -0 $RC 2>/dev/null || break; sleep 0.5; done

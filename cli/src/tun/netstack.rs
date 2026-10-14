@@ -130,6 +130,20 @@ impl AsyncWrite for NetstackStream {
     }
 }
 
+/// Dropping a stream closes it, as dropping a kernel `TcpStream` does. Without
+/// this a dropped stream left its socket ESTABLISHED forever and the far end
+/// never saw a FIN: `expose` drops the overlay connection when nothing listens
+/// behind the port, so a SOCKS client through the proxy was told "granted" and
+/// then held with 0 bytes until its own timeout.
+impl Drop for NetstackStream {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.out.st.lock() {
+            st.closed = true;
+        }
+        self.wake.notify_one();
+    }
+}
+
 /// The overlay source address of an accepted connection, which may be IPv4 or IPv6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OverlayAddr {
@@ -712,6 +726,17 @@ async fn poll_loop(
                 }
             }
 
+            // The peer's FIN, with every byte before it delivered to the pipe:
+            // the reader sees EOF now. A half-closed socket (CLOSE-WAIT) is
+            // still active, so the reap below never fired for it and the
+            // reader of a stream the peer had closed waited forever.
+            if rec.established && !s.may_recv() {
+                let open = !rec.inp.st.lock().unwrap().closed;
+                if open {
+                    mark_closed(&rec.inp);
+                }
+            }
+
             // Lifecycle: a closed/reset socket EOFs the app pipes and is reaped.
             if !s.is_active() && rec.established {
                 mark_closed(&rec.inp);
@@ -892,7 +917,7 @@ mod tests {
     async fn netstack_answers_icmpv6_echo() {
         let me: Ipv6Addr = "fdf1:1af7:c30d:1a1::2".parse().unwrap();
         let peer: Ipv6Addr = "fdf1:1af7:c30d:1a1::99".parse().unwrap();
-        let tun = NetstackTun::open("filament0", &format!("{me}/128"), 1280).unwrap();
+        let tun = NetstackTun::open("tunlion0", &format!("{me}/128"), 1280).unwrap();
         tun.send(&build_echo_request(peer, me)).await.unwrap();
         let mut rbuf = vec![0u8; 1500];
         let n = tokio::time::timeout(Duration::from_secs(2), tun.recv(&mut rbuf))
@@ -910,7 +935,7 @@ mod tests {
     async fn netstack_survives_malformed_injection() {
         let me: Ipv6Addr = "fdf1:1af7:c30d:1a1::2".parse().unwrap();
         let peer: Ipv6Addr = "fdf1:1af7:c30d:1a1::99".parse().unwrap();
-        let tun = NetstackTun::open("filament0", &format!("{me}/128"), 1280).unwrap();
+        let tun = NetstackTun::open("tunlion0", &format!("{me}/128"), 1280).unwrap();
         for i in 0..200u32 {
             let len = (i as usize * 7) % 2000;
             let mut junk = vec![0u8; len];
@@ -938,8 +963,8 @@ mod tests {
     async fn two_netstacks_dial_listen_roundtrip() {
         let a_addr: Ipv6Addr = "fdf1:1af7:c30d:aaa::1".parse().unwrap();
         let b_addr: Ipv6Addr = "fdf1:1af7:c30d:bbb::1".parse().unwrap();
-        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
-        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        let a = Arc::new(NetstackTun::open("tunlion0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("tunlion0", &format!("{b_addr}/128"), 1280).unwrap());
 
         // Wire the "datagram plane": each node's outbound packets become the other's
         // inbound. (In production l3.rs routes by dest IP to the peer's transport.)
@@ -1002,6 +1027,34 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// B: a stream DROPPED without a shutdown (what `expose` does when nothing
+    /// listens behind the port) closes, so the dialer reads EOF promptly. It
+    /// used to stay established forever.
+    #[tokio::test]
+    async fn a_dropped_stream_closes_and_the_dialer_reads_eof() {
+        let a_addr: Ipv6Addr = "fdf1:1af7:c30d:aab::1".parse().unwrap();
+        let b_addr: Ipv6Addr = "fdf1:1af7:c30d:bbc::1".parse().unwrap();
+        let a = Arc::new(NetstackTun::open("tunlion0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("tunlion0", &format!("{b_addr}/128"), 1280).unwrap());
+        cross_wire(a.clone(), b.clone(), 0);
+        let listener = b.listen(9100).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (s, _src) = listener.accept_v6().await.unwrap();
+            drop(s);
+        });
+        let mut client = tokio::time::timeout(Duration::from_secs(3), a.dial(b_addr, 9100))
+            .await
+            .expect("dial timed out")
+            .expect("dial failed");
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+            .await
+            .expect("a dropped peer stream never closed: the dialer is held open")
+            .unwrap();
+        assert_eq!(n, 0, "EOF, not data");
+        server.await.unwrap();
+    }
+
     /// Cross-wire two stacks' datagram planes, optionally DROPPING every `drop_nth`
     /// packet each direction to model a lossy overlay. `drop_nth == 0` = lossless.
     fn cross_wire(a: Arc<NetstackTun>, b: Arc<NetstackTun>, drop_nth: u64) {
@@ -1034,8 +1087,8 @@ mod tests {
     async fn netstack_transfers_intact_through_packet_loss() {
         let a_addr: Ipv6Addr = "fdf1:1af7:c30d:a11::1".parse().unwrap();
         let b_addr: Ipv6Addr = "fdf1:1af7:c30d:b22::1".parse().unwrap();
-        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
-        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        let a = Arc::new(NetstackTun::open("tunlion0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("tunlion0", &format!("{b_addr}/128"), 1280).unwrap());
         cross_wire(a.clone(), b.clone(), 7); // drop ~1 in 7 packets each way
 
         let listener = b.listen(9100).await.unwrap();
@@ -1080,8 +1133,8 @@ mod tests {
     async fn netstack_serves_many_concurrent_connections() {
         let a_addr: Ipv6Addr = "fdf1:1af7:c30d:c33::1".parse().unwrap();
         let b_addr: Ipv6Addr = "fdf1:1af7:c30d:d44::1".parse().unwrap();
-        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
-        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        let a = Arc::new(NetstackTun::open("tunlion0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("tunlion0", &format!("{b_addr}/128"), 1280).unwrap());
         cross_wire(a.clone(), b.clone(), 0); // lossless
 
         const N: u32 = 12;
@@ -1162,7 +1215,7 @@ mod tests {
         let peer: Ipv6Addr = "fdf1:1af7:c30d:d01::99".parse().unwrap();
 
         let tun = NetstackTun::open_dual(
-            "filament0",
+            "tunlion0",
             &format!("{me6}/128"),
             Some("10.0.0.1/24"),
             1280,
@@ -1215,11 +1268,11 @@ mod tests {
         let peer4: Ipv4Addr = "10.0.42.99".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 
@@ -1285,11 +1338,11 @@ mod tests {
         let b4: Ipv4Addr = "10.0.50.2".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 
@@ -1349,11 +1402,11 @@ mod tests {
         let b4: Ipv4Addr = "10.0.80.2".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 
@@ -1449,11 +1502,11 @@ mod tests {
         let b4: Ipv4Addr = "10.0.81.2".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 
@@ -1506,11 +1559,11 @@ mod tests {
         let b4: Ipv4Addr = "10.0.82.2".parse().unwrap();
 
         let a = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
                 .unwrap(),
         );
         let b = Arc::new(
-            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+            NetstackTun::open_dual("tunlion0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
                 .unwrap(),
         );
 

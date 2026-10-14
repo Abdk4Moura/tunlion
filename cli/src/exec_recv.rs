@@ -581,6 +581,7 @@ pub(crate) async fn authorize_exec(
                 r.as_deref(),
                 dev.clone(),
             )
+            .with_reinvite_for(inputs.idev.as_ref())
         })
 }
 
@@ -677,8 +678,13 @@ pub(crate) async fn serve_exec(
     // Backstop for a task that ends abnormally (panic, abort): the leader
     // dies with it rather than outliving the daemon's record of it.
     cmd.kill_on_drop(true);
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
+    // The leader's pid is its group id (own_process_group). Recorded before
+    // the child can run any of the program and kept until this function
+    // returns, so a daemon that dies at any point after the fork has its
+    // leftovers ended by the next one (kill_leftover_groups).
+    let spawned = crate::platform::spawn_recorded(&mut cmd, ServedGroup::record);
+    let (mut child, _served) = match spawned {
+        Ok(spawned) => spawned,
         Err(e) => {
             let _ = t
                 .send_control(
@@ -689,11 +695,7 @@ pub(crate) async fn serve_exec(
         }
     };
     crate::platform::contain_with_daemon(&child);
-    // The leader's pid is its group id (own_process_group).
     let pgid = child.id();
-    // Recorded until this function returns, so a daemon that dies before then
-    // has its leftovers ended by the next one (kill_leftover_groups).
-    let _served = pgid.map(ServedGroup::record);
     let _ = t
         .send_control(&json!({ "type": "exec-open-ack", "sid": sid, "out": sid, "err": err_sid }))
         .await;
@@ -982,7 +984,9 @@ pub(crate) async fn serve_exec(
                 // loses the live exec: kill the child and close with the
                 // revoked reason, so the initiator surfaces nonzero with a
                 // reason instead of hanging or rendering a clean exit.
-                let cert_gone = crate::cert_revoked_for(authz.idev.as_ref());
+                // Revocation and the delegated deadline, from the one live
+                // re-check every serving loop shares.
+                let cut = crate::identity_state::live_session_cut(authz.idev.as_ref());
                 let grant_gone = match authz.dev_name.as_deref() {
                     Some(n) => {
                         crate::device_capability_denied(n, "shell")
@@ -1001,8 +1005,19 @@ pub(crate) async fn serve_exec(
                 // budget) ends it too; unresolvable identity is no opinion.
                 let lapsed =
                     matches!(crate::identity_state::peer_liveness_alive(authz.idev.as_ref()), Some(false));
-                if cert_gone || grant_gone || ceiling_gone || lapsed {
-                    crate::ui::critical("exec: peer access revoked, closing live session");
+                if cut.is_some() || grant_gone || ceiling_gone || lapsed {
+                    // The close names the cause: an expiry must read as one
+                    // (the initiator exits 4 and prints the re-invite), not as
+                    // a revocation the owner never made.
+                    let reason = match cut {
+                        Some(c) => c.reason_for(authz.idev.as_ref()),
+                        None => crate::capability::REVOKED_REASON.to_string(),
+                    };
+                    if matches!(cut, Some(crate::identity_state::LiveCut::Expired(_))) {
+                        crate::ui::critical("exec: peer access expired, closing live session");
+                    } else {
+                        crate::ui::critical("exec: peer access revoked, closing live session");
+                    }
                     // Revocation is immediate: the whole tree, no grace.
                     end_session_tree(
                         &mut child,
@@ -1013,13 +1028,17 @@ pub(crate) async fn serve_exec(
                         "peer access revoked",
                     )
                     .await;
-                    let _ = t
-                        .send_control(&json!({
-                            "type": "l2-close",
-                            "sid": sid,
-                            "err": crate::capability::REVOKED_REASON,
-                        }))
-                        .await;
+                    let mut close = json!({
+                        "type": "l2-close",
+                        "sid": sid,
+                        "err": reason,
+                    });
+                    if let Some(crate::identity_state::LiveCut::Expired(at)) = cut {
+                        crate::refusal::Refusal::expired(at, authz.dev_name.clone(), None)
+                            .with_reinvite_for(authz.idev.as_ref())
+                            .annotate(&mut close);
+                    }
+                    let _ = t.send_control(&close).await;
                     mux.drop_stream(sid).await;
                     mux.drop_stream(err_sid).await;
                     return;

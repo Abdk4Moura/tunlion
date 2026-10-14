@@ -179,7 +179,7 @@ pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
 /// Restores the pre-U1 precondition for scripts that want to fail fast: with
 /// this set (any value but empty or `0`), a verb that needs an identity bails
 /// with the old "run `tunlion init` first" instead of minting one.
-pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "FILAMENT_NO_IMPLICIT_INIT";
+pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "TUNLION_NO_IMPLICIT_INIT";
 
 /// Whether the opt-out above is set (any value except empty and `0`).
 ///
@@ -198,6 +198,59 @@ pub(crate) fn implicit_init_disabled() -> bool {
 /// this device the owner, `join` makes it a member of someone else's mesh.
 pub(crate) const NO_IDENTITY_MSG: &str =
     "no identity yet; run `tunlion init` or `tunlion join <invitation>`";
+
+/// `add` on a device with no identity. `add` offers THIS device's identity to
+/// another, so it needs one, and the one it used to mint on the spot ("created
+/// your identity at ...") came with no recovery phrase, while `init` insists on
+/// one. So `add` refuses (exit 9) and names the ceremony that does it right.
+pub(crate) const ADD_NEEDS_INIT_MSG: &str =
+    "no identity yet: `tunlion add` offers this device's identity, and it has none. \
+     Run `tunlion init` first (it creates the identity and shows its recovery phrase), then add again. \
+     To accept a code or an invitation you were given instead, run `tunlion join <code-or-file>`";
+
+/// [`ADD_NEEDS_INIT_MSG`] as the exit-9 error, or None when there is an identity.
+pub(crate) fn add_needs_init() -> Option<anyhow::Error> {
+    (!has_identity()).then(|| {
+        crate::exit_codes::err(crate::exit_codes::ExitKind::NoIdentity, ADD_NEEDS_INIT_MSG)
+    })
+}
+
+/// `up` on a device with no identity AND nothing paired: such a daemon serves
+/// no one, and `up --detach` used to exit 0 and run while `--help` says 9 is
+/// "no identity". A device with no identity that HAS code-paired devices is
+/// the legitimate receive-only daemon (gates 7/14, C12 live pairing, and every
+/// gate that pairs by secret), so that one still runs.
+pub(crate) const UP_NEEDS_IDENTITY_MSG: &str =
+    "no identity yet, and no paired devices: a daemon here would serve no one. \
+     Run `tunlion init` (makes this your first device) or `tunlion join <code-or-invitation>` first, then `tunlion up`";
+
+/// Pure: may `up` start? `devices_json` is the device store's text, if any.
+pub(crate) fn up_refused_for_identity(has_identity: bool, devices_json: Option<&str>) -> bool {
+    if has_identity {
+        return false;
+    }
+    match devices_json {
+        None => true,
+        // An unreadable store is not "nothing paired": leave it to the
+        // corrupt-state handling that names the file.
+        Some(raw) => serde_json::from_str::<Vec<Value>>(raw).is_ok_and(|a| a.is_empty()),
+    }
+}
+
+/// [`UP_NEEDS_IDENTITY_MSG`] as the exit-9 error when `up` would serve no one.
+pub(crate) fn up_needs_identity() -> Option<anyhow::Error> {
+    // A config directory that cannot even be made (a path past PATH_MAX, a
+    // HOME that does not exist) is the real cause, and the daemon lock below
+    // names it precisely (hostile-env gates L and H): no opinion here.
+    let dir = settings::config_dir();
+    if !dir.is_dir() && crate::platform::create_private_dir_all(&dir).is_err() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(crate::devices_store::devices_path()).ok();
+    up_refused_for_identity(has_identity(), raw.as_deref()).then(|| {
+        crate::exit_codes::err(crate::exit_codes::ExitKind::NoIdentity, UP_NEEDS_IDENTITY_MSG)
+    })
+}
 
 /// Does this device have an identity: an owner key, or a joined certificate?
 /// Reads only. `join` refuses a device for which this is true, which is why
@@ -661,7 +714,7 @@ pub(crate) async fn init_experience(
     }
 
     if caps.json {
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
@@ -718,7 +771,7 @@ fn offer_l3_grant(caps: &UiCapability) {
         .unwrap_or_default()
         .is_empty();
     let userspace = settings::get_str("l3-mode", None).as_deref() == Some("userspace")
-        || std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1");
+        || std::env::var("TUNLION_L3_USERSPACE").as_deref() == Ok("1");
     if !l3_on || userspace {
         return;
     }
@@ -781,6 +834,132 @@ pub(crate) fn join_refusal_already_joined() -> String {
     )
 }
 
+/// What the person handed `join`: the one accept entry takes a code, an
+/// invitation, or the path to an invitation file, and works out which.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JoinInput {
+    /// A pairing code (normalized): the code ceremony, as `join <code>`.
+    Code(String),
+    /// A path to an invitation file.
+    File(PathBuf),
+    /// Invitation material itself (pasted).
+    Invitation(String),
+    /// A one-time TRANSFER code: that is `receive`, not `join`.
+    TransferCode(String),
+    /// None of those.
+    Unknown,
+}
+
+/// Classify what was typed or pasted at the accept prompt. Pure: the file
+/// test is injected. Order matters: an invitation is recognized by its
+/// prefix before anything normalizes it, and a path that exists wins over a
+/// code-shaped name, the same rule `join <arg>` applies.
+pub(crate) fn classify_join_input(raw: &str, is_file: &dyn Fn(&str) -> bool) -> JoinInput {
+    let t = raw.trim();
+    if t.is_empty() {
+        return JoinInput::Unknown;
+    }
+    if t.starts_with(crate::file_io::INVITE_PREFIX) {
+        return JoinInput::Invitation(t.to_string());
+    }
+    if is_file(t) {
+        return JoinInput::File(PathBuf::from(t));
+    }
+    let code = crate::pake::norm_code(t);
+    let code = code.trim_matches('-');
+    if crate::token_is_pairing_code(code) {
+        return JoinInput::Code(code.to_string());
+    }
+    if crate::regex_lite_code(code) {
+        return JoinInput::TransferCode(code.to_string());
+    }
+    JoinInput::Unknown
+}
+
+/// `join <arg>` where <arg> names a file that is not there: the refusal, or
+/// None when <arg> may be a code (or a file was also given another way). A
+/// code is letters, digits and dashes, so anything with a path separator or a
+/// dot is a file name, never a code. Pure.
+pub(crate) fn join_missing_file_msg(arg: &str, other_source: bool) -> Option<String> {
+    let looks_like_path = arg.contains('/') || arg.contains('\\') || arg.contains('.');
+    if other_source || !looks_like_path || std::path::Path::new(arg).exists() {
+        return None;
+    }
+    Some(format!(
+        "no invitation file at '{arg}'. Check the path, or copy the file here first; a pairing code looks like brave-otter-3141"
+    ))
+}
+
+/// The refusal for an accept input that is none of the things `join` takes.
+pub(crate) fn join_input_not_recognized() -> String {
+    "that is not a pairing code, an invitation, or a file that exists. A pairing code looks like \
+     brave-otter-3141 (run `tunlion join brave-otter-3141`); an invitation starts with \
+     `filament-invite:` (run `tunlion join` and paste it, or `tunlion join <file>`)"
+        .to_string()
+}
+
+/// The refusal for a transfer code given to `join`.
+pub(crate) fn join_transfer_code_msg(code: &str) -> String {
+    format!(
+        "'{code}' is a one-time transfer code (from `tunlion send`), not a pairing code. To receive the transfer:  tunlion receive {code}"
+    )
+}
+
+/// The one accept prompt at a terminal. Invitation material may be pasted, so
+/// it is read on the alternate screen and cleared from the terminal after.
+fn prompt_accept_input() -> Result<Zeroizing<String>> {
+    use crossterm::{execute, terminal};
+    let mut err = std::io::stderr();
+    execute!(
+        err,
+        terminal::EnterAlternateScreen,
+        terminal::Clear(terminal::ClearType::All)
+    )?;
+    eprintln!(
+        "  Type the pairing code you were given, or paste the invitation, or give the path to\n  \
+         the invitation file. A pasted invitation is cleared from this terminal after reading."
+    );
+    let result = prompt_line("\n  code or invitation: ");
+    let _ = execute!(err, terminal::LeaveAlternateScreen);
+    Ok(Zeroizing::new(result?))
+}
+
+/// `join` with nothing on the command line, at a terminal: ask once, then run
+/// whichever ceremony the answer belongs to. The guided menu's single accept
+/// entry ("I have a code or an invitation") lands here.
+pub(crate) async fn join_guided(
+    caps: &UiCapability,
+    server: &str,
+    relay: bool,
+    name: Option<String>,
+    to: Option<String>,
+) -> Result<()> {
+    let raw = prompt_accept_input()?;
+    match classify_join_input(raw.as_str(), &|p| std::path::Path::new(p).is_file()) {
+        JoinInput::Code(code) => {
+            ui::say(&ui::paint(
+                ui::Tone::Dim,
+                &format!("  that is a pairing code; accepting it as  tunlion join {code}"),
+            ));
+            crate::pair_cmd::pair_cmd(server, Some(code), name, None, relay, false, Vec::new(), None, false)
+                .await
+        }
+        JoinInput::File(path) => join_cmd(caps, server, relay, Some(path), None, name, to, None).await,
+        JoinInput::Invitation(material) => {
+            join_cmd(caps, server, relay, None, None, name, to, Some(Zeroizing::new(material))).await
+        }
+        JoinInput::TransferCode(code) => Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            join_transfer_code_msg(&code),
+        )),
+        JoinInput::Unknown => Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            join_input_not_recognized(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn join_cmd(
     caps: &UiCapability,
     server: &str,
@@ -789,6 +968,8 @@ pub(crate) async fn join_cmd(
     invite_fd: Option<i32>,
     name: Option<String>,
     to: Option<String>,
+    // Invitation material already read (the guided accept prompt).
+    material: Option<Zeroizing<String>>,
 ) -> Result<()> {
     if let Some(existing) = identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
         bail!("{}", join_refusal_with_identity(&existing.fingerprint()));
@@ -796,27 +977,27 @@ pub(crate) async fn join_cmd(
     if local_device_cert_path().exists() {
         bail!("{}", join_refusal_already_joined());
     }
-    let invitation = Zeroizing::new(if let Some(path) = invite_file.as_deref() {
-        read_owner_only_file(path)?
-    } else if let Some(fd) = invite_fd {
-        read_owner_only_fd(fd)?
-    } else if caps.interactive {
-        use crossterm::{execute, terminal};
-        let mut err = std::io::stderr();
-        execute!(
-            err,
-            terminal::EnterAlternateScreen,
-            terminal::Clear(terminal::ClearType::All)
-        )?;
-        eprintln!("  Paste the invitation. It is cleared from this terminal after reading.");
-        let result = prompt_line("\n  invitation: ");
-        let _ = execute!(err, terminal::LeaveAlternateScreen);
-        result?
+    let invitation = if let Some(m) = material {
+        m
     } else {
+        Zeroizing::new(if let Some(path) = invite_file.as_deref() {
+            read_owner_only_file(path)?
+        } else if let Some(fd) = invite_fd {
+            read_owner_only_fd(fd)?
+        } else {
+            bail!(
+                "non-interactive join requires a code (`join <code>`), --invite-file <path>, or --invite-fd <fd>"
+            );
+        })
+    };
+    // A CODE where an invitation was expected (saved to a file, or handed
+    // over a descriptor): it is not a malformed invitation, it is the other
+    // way in. Say exactly what to run rather than "unknown format".
+    if let JoinInput::Code(code) = classify_join_input(invitation.as_str(), &|_| false) {
         bail!(
-            "non-interactive join requires a code (`join <code>`), --invite-file <path>, or --invite-fd <fd>"
+            "that holds a pairing code ({code}), not an invitation. Accept it with:  tunlion join {code}"
         );
-    });
+    }
     let inv = parse_invitation(invitation.as_str())?;
     if inv.expires <= identity::now_secs() {
         bail!("this invitation has expired");
@@ -973,6 +1154,57 @@ mod recovery_qr_tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(got, "bf1a055f157070e84038dd122108ee8f7c68d621bd4118125f40fa1632e0495c");
+    }
+}
+
+#[cfg(test)]
+mod join_input_tests {
+    use super::{classify_join_input, JoinInput};
+    use std::path::PathBuf;
+
+    /// Eval item 1: the one accept prompt tells a code from an invitation
+    /// from a file, so nobody has to know which reader to open.
+    #[test]
+    fn the_accept_prompt_tells_code_invitation_and_file_apart() {
+        let none = |_: &str| false;
+        assert_eq!(
+            classify_join_input("comic-otter-1950", &none),
+            JoinInput::Code("comic-otter-1950".into())
+        );
+        // As a person types it: spaces, capitals, stray whitespace.
+        assert_eq!(
+            classify_join_input("  Comic Otter 1950\n", &none),
+            JoinInput::Code("comic-otter-1950".into())
+        );
+        assert_eq!(
+            classify_join_input("filament-invite:v2:AbC_d-0", &none),
+            JoinInput::Invitation("filament-invite:v2:AbC_d-0".into())
+        );
+        let file = |p: &str| p == "invite.txt";
+        assert_eq!(classify_join_input("invite.txt", &file), JoinInput::File(PathBuf::from("invite.txt")));
+        assert_eq!(
+            classify_join_input("brave-otter-314", &none),
+            JoinInput::TransferCode("brave-otter-314".into())
+        );
+        assert_eq!(classify_join_input("hello", &none), JoinInput::Unknown);
+        assert_eq!(classify_join_input("", &none), JoinInput::Unknown);
+        // A transfer code is sent to the verb that takes it.
+        assert!(super::join_transfer_code_msg("brave-otter-314").contains("tunlion receive brave-otter-314"));
+    }
+
+    /// Launch matrix: `join inv.txt` with no such file answered "that code
+    /// doesn't look right". A name with a dot or a slash is a file, never a
+    /// code, so a missing one is reported as a missing file.
+    #[test]
+    fn a_missing_invitation_file_is_reported_as_missing_not_as_a_bad_code() {
+        let msg = super::join_missing_file_msg("no-such-dir/inv.txt", false).expect("missing file refused");
+        assert!(msg.contains("no invitation file at 'no-such-dir/inv.txt'"), "{msg}");
+        assert!(super::join_missing_file_msg("inv-missing.txt", false).is_some());
+        // Codes, including a browser's three-digit one, still reach the ceremony.
+        assert_eq!(super::join_missing_file_msg("brave-otter-3141", false), None);
+        assert_eq!(super::join_missing_file_msg("fond-llama-112", false), None);
+        // A file given another way is not second-guessed.
+        assert_eq!(super::join_missing_file_msg("inv.txt", true), None);
     }
 }
 
@@ -1165,5 +1397,37 @@ mod init_refusal_tests {
         assert!(nothing(false, 0), "keyless and empty answers like `id` (exit 9)");
         assert!(!nothing(false, 2), "a keyless device that paired by code lists them");
         assert!(!nothing(true, 0), "an identity with no devices is an empty list, exit 0");
+    }
+}
+
+#[cfg(test)]
+mod rc_identity_gate_tests {
+    use super::{up_refused_for_identity, ADD_NEEDS_INIT_MSG, UP_NEEDS_IDENTITY_MSG};
+
+    /// RC lab item 5: `up` with no identity and nothing paired is refused;
+    /// the receive-only daemon of a code-paired device still runs.
+    #[test]
+    fn up_is_refused_only_when_it_would_serve_no_one() {
+        assert!(up_refused_for_identity(false, None));
+        assert!(up_refused_for_identity(false, Some("[]")));
+        assert!(!up_refused_for_identity(false, Some(r#"[{"name":"boxA","secret":"ab"}]"#)));
+        assert!(!up_refused_for_identity(true, None));
+        assert!(!up_refused_for_identity(false, Some("not json")), "a corrupt store is reported elsewhere");
+        assert!(UP_NEEDS_IDENTITY_MSG.contains("tunlion init"));
+    }
+
+    /// RC lab item 6: the refusal names init (the ceremony with the recovery
+    /// phrase), and classifies as exit 9 by its text too.
+    #[test]
+    fn add_without_identity_names_init_and_is_exit_9() {
+        assert!(ADD_NEEDS_INIT_MSG.contains("tunlion init"));
+        assert_eq!(
+            crate::exit_codes::classify_text(ADD_NEEDS_INIT_MSG),
+            crate::exit_codes::ExitKind::NoIdentity
+        );
+        assert_eq!(
+            crate::exit_codes::classify_text(UP_NEEDS_IDENTITY_MSG),
+            crate::exit_codes::ExitKind::NoIdentity
+        );
     }
 }

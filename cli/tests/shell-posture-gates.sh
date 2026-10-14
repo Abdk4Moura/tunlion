@@ -3,7 +3,7 @@
 # handing that device a shell. The operator ran the security verb, saw a success
 # line, and lost nothing.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./shell-posture-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./shell-posture-gates.sh
 #
 # The subject is a VOUCH-SHAPED record: a petname holding a secret with no
 # certificate and no enrollment ceiling. That shape matters, and is why the test
@@ -28,10 +28,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8114
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-shell-posture.XXXXXX")"
 DA="$WORK/A"
 DEV=vouched
@@ -53,17 +53,16 @@ seed_vouched_record() {
 # Re-grant before each case: a revoke clears the cap, and gate B/C must revoke a
 # cap that is actually present or they would pass for the wrong reason.
 #
-# That premise was never checked: the grant's output went to /dev/null. It is
-# checked now, and it FAILS: `grant` refuses a vouch-shaped record ("peer
-# identity for 'vouched' is not available ... the grant requires a known user
-# key to target"), so no cap was ever present and every revoke below removes a
-# grant that does not exist, while still printing "revoked 'shell' from
-# 'vouched'". The setup slot below records that as a tracked KNOWN-RED rather
-# than letting B and C keep passing on a false premise in silence.
+# That premise was never checked: the grant's output went to /dev/null. When it
+# was checked it FAILED: `grant` wrote the pairing permission and then refused
+# the vouch-shaped record ("peer identity for 'vouched' is not available"),
+# exit 1. A device with no certified identity (a vouched record, a browser) now
+# gets the pairing permission and exit 0, which is what the setup slot below
+# asserts.
 GRANT_OK=""
 grant_shell() {
   local out rc
-  out="$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant "$DEV" shell --yes 2>&1)"; rc=$?
+  out="$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant "$DEV" shell --yes 2>&1)"; rc=$?
   echo "## grant $DEV shell rc=$rc"
   if [ "$rc" != "0" ]; then printf '%s\n' "$out" | sed 's/^/    /'; fi
   if [ -z "$GRANT_OK" ]; then
@@ -77,16 +76,13 @@ grant_shell() {
   fi
 }
 
-# Tracked, not silent: the slot prints KNOWN-RED while grant refuses this record
-# shape, and fails the run the moment it starts passing so the entry is removed
-# with evidence (see declare_known_red_summary in lib/fixture.sh).
-KNOWN_RED_ALLOW=(
-  "setup-grant: grant $DEV shell succeeded|setup-grant: grant $DEV shell FAILED"
-)
+# The setup-grant slot was a tracked KNOWN-RED until grant stopped failing on
+# a device with no certified identity; the list only shrinks, and is empty.
+KNOWN_RED_ALLOW=()
 
 stop_daemon() {
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
-  pkill -f "FILAMENT_CONFIG_DIR=$DA" >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
+  pkill -f "TUNLION_CONFIG_DIR=$DA" >/dev/null 2>&1
   for p in "${FIX_PIDS[@]:-}"; do
     if ps -o args= -p "$p" 2>/dev/null | grep -q ' up '; then kill "$p" 2>/dev/null; fi
   done
@@ -99,7 +95,7 @@ stop_daemon() {
 # was serving, so of course nothing warned.
 start_daemon() {
   local label="$1"; shift
-  env FILAMENT_CONFIG_DIR="$DA" FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/drop" "$@" \
+  env TUNLION_CONFIG_DIR="$DA" TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/drop" "$@" \
     >"$WORK/up-$label.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 5
@@ -112,7 +108,7 @@ start_daemon() {
 }
 
 revoke_shell_output() {
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke "$DEV" shell --yes 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke "$DEV" shell --yes 2>&1
 }
 
 CAUTION='still has shell access'
@@ -157,7 +153,7 @@ elif [ "$remedy" != "tunlion devices forget $DEV -y" ]; then
 else
   # Run it as printed: drop the leading program name, keep every word after it.
   read -r -a remedy_args <<<"${remedy#tunlion }"
-  outR="$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" "${remedy_args[@]}" 2>&1)"; rcR=$?
+  outR="$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" "${remedy_args[@]}" 2>&1)"; rcR=$?
   echo "## ran remedy (rc $rcR):"; printf '%s\n' "$outR" | sed 's/^/   /'
   if [ "$rcR" != "0" ]; then
     bad "gateA: the printed remedy '$remedy' failed when typed (rc $rcR)"

@@ -92,13 +92,13 @@ pub const ROUTE_RELAY: &str = "relay";
 /// sits well above a slow-but-moving link's inter-chunk gap on a bad mobile
 /// uplink (the threshold is on *time since the last byte*, never on throughput,
 /// so a slow link that still advances resets it) and well below human patience.
-/// Overridable via `FILAMENT_STALL_MS`, mirroring the `FILAMENT_ADOPT_ACTIVE_MS`
-/// / `FILAMENT_REJOIN_SECS` knob style.
+/// Overridable via `TUNLION_STALL_MS`, mirroring the `TUNLION_ADOPT_ACTIVE_MS`
+/// / `TUNLION_REJOIN_SECS` knob style.
 pub const STALL_MS_DEFAULT: u64 = 6_000;
 
-/// Read the configured stall threshold (`FILAMENT_STALL_MS`, default 6 s).
+/// Read the configured stall threshold (`TUNLION_STALL_MS`, default 6 s).
 pub fn stall_ms() -> u64 {
-    std::env::var("FILAMENT_STALL_MS")
+    std::env::var("TUNLION_STALL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -117,13 +117,13 @@ pub fn stall_ms() -> u64 {
 /// link moves its first data byte (`Transport::has_flowed`) we give it this much
 /// larger grace; once bytes flow, the tight `stall_ms` applies. Each fresh
 /// transport (e.g. after a repair) re-earns the grace. Overridable via
-/// `FILAMENT_ESTABLISH_GRACE_MS`.
+/// `TUNLION_ESTABLISH_GRACE_MS`.
 pub const ESTABLISH_GRACE_MS_DEFAULT: u64 = 45_000;
 
-/// Read the before-first-byte establishment grace (`FILAMENT_ESTABLISH_GRACE_MS`,
+/// Read the before-first-byte establishment grace (`TUNLION_ESTABLISH_GRACE_MS`,
 /// default 45 s). Never below `stall_ms()` (a smaller grace would defeat itself).
 pub fn establish_grace_ms() -> u64 {
-    std::env::var("FILAMENT_ESTABLISH_GRACE_MS")
+    std::env::var("TUNLION_ESTABLISH_GRACE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -138,18 +138,18 @@ pub fn establish_grace_ms() -> u64 {
 /// at the receiver.  Defaults to `min(max(1, available_parallelism - 1), 4)` —
 /// i.e. one less than the CPU count, at least 1, capped at 4 (diminishing
 /// returns beyond 4 for a single flow over the same bottleneck).  Overridable
-/// via `FILAMENT_DIRECT_STREAMS`; setting it to 1 gives today's single-stream
+/// via `TUNLION_DIRECT_STREAMS`; setting it to 1 gives today's single-stream
 /// behaviour.
 /// Default K=1 (single-stream) — K>1 is disabled by default until the
-/// cross-machine primary-death bug is fixed. Set FILAMENT_DIRECT_STREAMS=n
+/// cross-machine primary-death bug is fixed. Set TUNLION_DIRECT_STREAMS=n
 /// to override. Once fixed, this reverts to 0 (auto-calc = min(cpus-1,4)).
 pub const DIRECT_STREAMS_DEFAULT: usize = 1; // K=1 single-stream (safe default, no striping risk)
 
 /// Read the configured number of direct-QUIC worker streams
-/// (`FILAMENT_DIRECT_STREAMS`). Defaults to 1 (single-stream safe default).
-/// Set `FILAMENT_DIRECT_STREAMS=n` to enable K>1 mesh streaming.
+/// (`TUNLION_DIRECT_STREAMS`). Defaults to 1 (single-stream safe default).
+/// Set `TUNLION_DIRECT_STREAMS=n` to enable K>1 mesh streaming.
 pub fn direct_streams() -> usize {
-    std::env::var("FILAMENT_DIRECT_STREAMS")
+    std::env::var("TUNLION_DIRECT_STREAMS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
@@ -164,12 +164,12 @@ pub fn direct_streams() -> usize {
 /// so the silence climbs past this and trips the re-announce. Well above the 5 s
 /// sync cadence (so a single slow ack never false-trips) and well below the
 /// minute-scale rediscovery latency the supervisor's cadence imposed.
-/// Overridable via `FILAMENT_SIGNALING_SILENCE_MS`.
+/// Overridable via `TUNLION_SIGNALING_SILENCE_MS`.
 pub const SIGNALING_SILENCE_MS_DEFAULT: u64 = 15_000;
 
-/// Read the configured signaling-silence threshold (`FILAMENT_SIGNALING_SILENCE_MS`).
+/// Read the configured signaling-silence threshold (`TUNLION_SIGNALING_SILENCE_MS`).
 pub fn signaling_silence_ms() -> u64 {
-    std::env::var("FILAMENT_SIGNALING_SILENCE_MS")
+    std::env::var("TUNLION_SIGNALING_SILENCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -189,13 +189,13 @@ pub fn signaling_silence_ms() -> u64 {
 ///
 /// The session kind decides the default (set on `Conn::warm_standby` at
 /// construction). This knob is the explicit override:
-///   `FILAMENT_WARM_STANDBY=1` forces it ON  (e.g. a sustained transfer standing
+///   `TUNLION_WARM_STANDBY=1` forces it ON  (e.g. a sustained transfer standing
 ///                                            in for an interactive session in a
 ///                                            test / power-user case),
-///   `FILAMENT_WARM_STANDBY=0` forces it OFF (kill switch / A-B baseline).
+///   `TUNLION_WARM_STANDBY=0` forces it OFF (kill switch / A-B baseline).
 /// Returns `None` when unset, so the session-kind default stands.
 pub fn warm_standby_override() -> Option<bool> {
-    match std::env::var("FILAMENT_WARM_STANDBY").ok().as_deref() {
+    match std::env::var("TUNLION_WARM_STANDBY").ok().as_deref() {
         Some("1") | Some("true") | Some("on") => Some(true),
         Some("0") | Some("false") | Some("off") => Some(false),
         _ => None,
@@ -212,12 +212,12 @@ pub fn warm_standby_override() -> Option<bool> {
 // upgrades back when one is confirmed STABLE (verify-before-upgrade). Relay
 // becomes a way-station, not a destination.
 
-/// Is the relay->direct upgrade prober ENABLED? (`FILAMENT_UPGRADE_PROBE=0`
+/// Is the relay->direct upgrade prober ENABLED? (`TUNLION_UPGRADE_PROBE=0`
 /// disables it, the kill switch the resilience plan calls for. Default ON.)
 /// A no-op under `--no-relay` (that path never reaches relay) regardless of
 /// this knob, the caller also gates on `relay_forbidden()`.
 pub fn upgrade_prober_enabled() -> bool {
-    match std::env::var("FILAMENT_UPGRADE_PROBE").ok().as_deref() {
+    match std::env::var("TUNLION_UPGRADE_PROBE").ok().as_deref() {
         Some("0") | Some("false") | Some("off") => false,
         _ => true,
     }
@@ -225,10 +225,10 @@ pub fn upgrade_prober_enabled() -> bool {
 
 /// FIRST direct re-probe delay after a peer falls to relay (ms). Soon, because
 /// the cause is often transient (a momentary NAT/path hiccup that heals in
-/// seconds). `FILAMENT_UPGRADE_FIRST_MS`, default ~5 s.
+/// seconds). `TUNLION_UPGRADE_FIRST_MS`, default ~5 s.
 pub const UPGRADE_FIRST_MS_DEFAULT: u64 = 5_000;
 pub fn upgrade_first_ms() -> u64 {
-    std::env::var("FILAMENT_UPGRADE_FIRST_MS")
+    std::env::var("TUNLION_UPGRADE_FIRST_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -237,12 +237,12 @@ pub fn upgrade_first_ms() -> u64 {
 
 /// STEADY re-probe cadence once direct keeps failing (ms). Backs off from the
 /// eager first probe to a calm cadence so a symmetric-NAT peer that will NEVER
-/// get direct doesn't get hammered (CPU/battery). `FILAMENT_UPGRADE_STEADY_MS`,
+/// get direct doesn't get hammered (CPU/battery). `TUNLION_UPGRADE_STEADY_MS`,
 /// default ~25 s. The schedule is: first probe at `first_ms`, then each failed
 /// probe doubles the interval toward this cap.
 pub const UPGRADE_STEADY_MS_DEFAULT: u64 = 25_000;
 pub fn upgrade_steady_ms() -> u64 {
-    std::env::var("FILAMENT_UPGRADE_STEADY_MS")
+    std::env::var("TUNLION_UPGRADE_STEADY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -252,11 +252,11 @@ pub fn upgrade_steady_ms() -> u64 {
 /// VERIFY-before-upgrade window (ms): once a direct standby CONNECTS alongside
 /// the live relay link, it must move real data CONTINUOUSLY for at least this
 /// long before we cut over. Prevents thrash on a flaky direct path that
-/// connects then immediately re-stalls. `FILAMENT_UPGRADE_VERIFY_MS`, default
+/// connects then immediately re-stalls. `TUNLION_UPGRADE_VERIFY_MS`, default
 /// ~2.5 s of sustained progress.
 pub const UPGRADE_VERIFY_MS_DEFAULT: u64 = 2_500;
 pub fn upgrade_verify_ms() -> u64 {
-    std::env::var("FILAMENT_UPGRADE_VERIFY_MS")
+    std::env::var("TUNLION_UPGRADE_VERIFY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -266,10 +266,10 @@ pub fn upgrade_verify_ms() -> u64 {
 /// VERIFY-before-upgrade idle guard (ms): during the verify window, if the
 /// direct standby goes idle for this long it is judged regressed and DISCARDED
 /// (we stay on relay). Tighter than `stall_ms` so a flaky standby fails fast.
-/// `FILAMENT_UPGRADE_VERIFY_IDLE_MS`, default ~1.2 s.
+/// `TUNLION_UPGRADE_VERIFY_IDLE_MS`, default ~1.2 s.
 pub const UPGRADE_VERIFY_IDLE_MS_DEFAULT: u64 = 1_200;
 pub fn upgrade_verify_idle_ms() -> u64 {
-    std::env::var("FILAMENT_UPGRADE_VERIFY_IDLE_MS")
+    std::env::var("TUNLION_UPGRADE_VERIFY_IDLE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -308,7 +308,7 @@ pub enum Ev {
     /// (peer sid, ...), every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).
     ChannelReady(String, Arc<dyn Transport>),
-    /// rung-1 direct path (FILAMENT_DIRECT): an AUTHENTICATED QUIC transport for
+    /// rung-1 direct path (TUNLION_DIRECT): an AUTHENTICATED QUIC transport for
     /// (peer sid) won the simultaneous-open race and passed the pair-secret MAC.
     /// Handled like ChannelReady but the link is pre-trusted (the MAC already
     /// proved the secret, stronger than the post-DC pair-proof), so the
@@ -689,7 +689,7 @@ impl Transport for DataChannelTransport {
     }
 
     async fn send_frame(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()> {
-        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
         let t_frame = if trace { Some(std::time::Instant::now()) } else { None };
         let mut framed = Vec::with_capacity(4 + 8 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
@@ -895,11 +895,11 @@ impl Transport for DataChannelTransport {
 /// to win the race outright. Comfortably above a healthy resolver's answer
 /// (single-digit to low-hundreds ms) and well below the ~5 s cold stall, so a
 /// healthy box always uses fresh DNS and only a stalling resolver falls back to
-/// the cache. Overridable via `FILAMENT_DNS_RACE_MS`.
+/// the cache. Overridable via `TUNLION_DNS_RACE_MS`.
 const DNS_RACE_MS_DEFAULT: u64 = 700;
 
 fn dns_race_ms() -> u64 {
-    std::env::var("FILAMENT_DNS_RACE_MS")
+    std::env::var("TUNLION_DNS_RACE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -909,11 +909,11 @@ fn dns_race_ms() -> u64 {
 /// Hard cap on the fresh OS resolution itself, so our own pre-resolve can never
 /// hang the process even when the cache is empty (first ever connect from a box
 /// with the cold-resolver stall). Above the observed worst case (~7.4 s) with
-/// headroom. Overridable via `FILAMENT_DNS_TIMEOUT_MS`.
+/// headroom. Overridable via `TUNLION_DNS_TIMEOUT_MS`.
 const DNS_TIMEOUT_MS_DEFAULT: u64 = 9_000;
 
 fn dns_timeout_ms() -> u64 {
-    std::env::var("FILAMENT_DNS_TIMEOUT_MS")
+    std::env::var("TUNLION_DNS_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -1078,7 +1078,7 @@ pub(crate) async fn resolve_warm(host: &str, port: u16) -> Vec<SocketAddr> {
 
 /// Steer CONTROL-PLANE calls (config/signaling) at targets the host can actually
 /// reach, then order IPv4 first. Many hosts have NO route to public IPv6 - a home
-/// network with v4-only internet, or any overlay node whose `filament0` ULA nudges
+/// network with v4-only internet, or any overlay node whose `tunlion0` ULA nudges
 /// the stack into "thinking" it has v6 - so a v6 target dead-ends the connect with
 /// ENETUNREACH (the "Network unreachable (os error 101)" a v4-only box hit). We DROP
 /// any address the host has no source route to (a route lookup via `source_ip_for`,
@@ -1438,7 +1438,7 @@ impl Peer {
         // runners cannot bind multicast sockets for mDNS resolution, and a
         // stuck mDNS gather blocks ALL ICE candidate gathering.
         #[cfg(feature = "test-hooks")]
-        if std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false) {
             se.set_ip_filter(Box::new(|ip: std::net::IpAddr| ip.is_loopback()));
             // THE FILTER ALONE YIELDS ZERO HOST CANDIDATES. webrtc-rs excludes
             // loopback from host gathering unless told otherwise (default off,
@@ -1984,6 +1984,23 @@ pub fn is_own_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The route a person reads for a direct-QUIC link pinned to `remote`, in the
+/// same words [`Peer::route`] uses for a WebRTC one: "direct over lo" when the
+/// peer is this host, else "direct over <interface>". The link's own label
+/// ("direct-quic") is an internal name: printed as the route, it left a
+/// same-host code transfer saying neither local nor direct-over-anything on
+/// either end, once code transfers moved to QUIC after the ceremony.
+pub fn direct_route_label(remote: std::net::SocketAddr) -> String {
+    let ip = remote.ip();
+    if ip.is_loopback() || is_own_addr(&ip.to_string()) {
+        return "direct over lo".into();
+    }
+    match source_ip_for(remote) {
+        Some(local) => format!("direct over {}", resolve_iface_name(&local.to_string())),
+        None => "direct".into(),
+    }
+}
+
 /// The local source IP the kernel would use to reach `remote`. Same no-packets
 /// UDP-connect trick as `is_own_addr`: after `connect()`, `local_addr()` reports
 /// the source the routing table picked. Lets `tunlion ping` name the outbound
@@ -2090,7 +2107,11 @@ async fn wire_channel(
             }
 
             // Our read loop: text -> Control, binary -> [u32 sid][payload].
-            {
+            //
+            // BUILT here, SPAWNED last (after ChannelReady is queued, below). A
+            // future does nothing until it is spawned, so this only fixes WHEN
+            // reading starts. See `announce_then_read` for why that matters.
+            let reader = {
                 let raw = raw.clone();
                 let tx = tx.clone();
                 let closed = closed.clone();
@@ -2100,7 +2121,7 @@ async fn wire_channel(
                 let last_heard = last_heard.clone();
                 let first_data = first_data.clone();
                 let peer_id = peer_id.clone();
-                tokio::spawn(async move {
+                async move {
                     let mut buf = vec![0u8; READ_BUF];
                     loop {
                         let read = raw.read_data_channel(&mut buf).await;
@@ -2157,9 +2178,10 @@ async fn wire_channel(
                             }
                         }
                     }
-                });
-            }
+                }
+            };
 
+            let mut ready = None;
             if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                 // Relay/DataChannel links have NO QUIC keepalive, so an idle one
                 // on a container/DERP path is silently evicted in ~10s, after which
@@ -2222,15 +2244,119 @@ async fn wire_channel(
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
                     });
-                let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
+                ready = Some(Ev::ChannelReady(peer_id.clone(), transport));
             }
+            announce_then_read(&tx, ready, reader);
         })
     }));
+}
+
+/// Queue the channel's `ChannelReady`, THEN start the task that reads it.
+///
+/// Both go into the same unbounded FIFO, so this order is what guarantees a
+/// consumer sees `ChannelReady` for a peer before any `Control` from it. The
+/// reader used to be spawned first. A peer that writes the moment ITS side
+/// opens (the joiner sends `identity-auth-key-enroll-request` from its own
+/// ChannelReady) has that frame buffered by the time ours opens, so the reader
+/// could queue it before ChannelReady was sent. The daemon then handled the
+/// request on a link with no transport attached yet, `transport_of` was None,
+/// and the request was dropped without a word: `tunlion join` printed "sent
+/// enrollment request" and waited out its 60s deadline. That is the shape of
+/// both CI wedges seen (`join --name delta` in revocation-live, `join --name
+/// bravo` in forward-refusal): owner shows the link up, no challenge ever sent.
+///
+/// Reading later loses nothing: unread frames stay buffered in the SCTP
+/// stream until the reader takes them. `ready` is None when the link was
+/// closed while opening; the reader still runs so the channel is drained and
+/// marked dead, and it forwards nothing for a closed link.
+fn announce_then_read<F>(tx: &mpsc::UnboundedSender<Ev>, ready: Option<Ev>, reader: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Some(ev) = ready {
+        let _ = tx.send(ev);
+    }
+    tokio::spawn(reader);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubTransport;
+
+    #[async_trait]
+    impl Transport for StubTransport {
+        async fn send_control(&self, _msg: &Value) -> Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The join hang: a frame the peer wrote the instant ITS side opened is
+    /// already buffered when ours opens, so our reader forwards it at once. The
+    /// consumer must still see ChannelReady first, or it handles the frame on a
+    /// link with no transport and drops it (the enrolment request, lost without
+    /// a word, left `tunlion join` waiting out its deadline). The reader here
+    /// does exactly that, forwarding on its first poll from another worker
+    /// thread, and the check runs many times because the old order lost only
+    /// a race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn channel_ready_is_queued_before_any_control_from_the_peer() {
+        for round in 0..200 {
+            let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+            let reader_tx = tx.clone();
+            let reader = async move {
+                let _ = reader_tx.send(Ev::Control(
+                    "peer".into(),
+                    json!({ "type": "identity-auth-key-enroll-request" }),
+                ));
+            };
+            let transport: Arc<dyn Transport> = Arc::new(StubTransport);
+            announce_then_read(
+                &tx,
+                Some(Ev::ChannelReady("peer".into(), transport)),
+                reader,
+            );
+            let first = rx.recv().await.expect("an event");
+            assert!(
+                matches!(first, Ev::ChannelReady(ref p, _) if p == "peer"),
+                "round {round}: a Control from the peer was queued before its ChannelReady"
+            );
+            let second = rx.recv().await.expect("the reader's frame");
+            assert!(
+                matches!(second, Ev::Control(ref p, _) if p == "peer"),
+                "round {round}: the buffered frame must still be delivered, after ChannelReady"
+            );
+        }
+    }
+
+    /// A link closed while opening announces nothing, but its reader still runs
+    /// (it drains the channel and marks it dead), so nothing is leaked or stuck.
+    #[tokio::test]
+    async fn a_closed_channel_announces_nothing_but_still_reads() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let (ran_tx, ran_rx) = tokio::sync::oneshot::channel::<()>();
+        announce_then_read(&tx, None, async move {
+            let _ = ran_tx.send(());
+        });
+        tokio::time::timeout(Duration::from_secs(5), ran_rx)
+            .await
+            .expect("the reader must run even when nothing is announced")
+            .expect("reader signalled");
+        assert!(rx.try_recv().is_err(), "a closed channel must not announce ChannelReady");
+    }
 
     #[test]
     fn c3_defers_once_for_ice_to_pc_handoff_only() {
@@ -2325,8 +2451,8 @@ mod tests {
     #[test]
     fn host_port_parses_scheme_defaults_and_explicit() {
         assert_eq!(
-            host_port_from_url("https://api.filament.autumated.com"),
-            Some(("api.filament.autumated.com".to_string(), 443))
+            host_port_from_url("https://api.tunlion.autumated.com"),
+            Some(("api.tunlion.autumated.com".to_string(), 443))
         );
         assert_eq!(
             host_port_from_url("http://example.com/api/config?x=1"),
@@ -2362,10 +2488,10 @@ mod tests {
     #[test]
     fn cached_addrs_select_host_and_apply_port() {
         let doc = json!({
-            "api.filament.autumated.com": ["104.21.73.85", "172.67.142.8"],
+            "api.tunlion.autumated.com": ["104.21.73.85", "172.67.142.8"],
             "other.example": ["10.0.0.1"]
         });
-        let mut got = cached_addrs_from_doc(&doc, "api.filament.autumated.com", 443);
+        let mut got = cached_addrs_from_doc(&doc, "api.tunlion.autumated.com", 443);
         got.sort();
         assert_eq!(got.len(), 2);
         assert!(got.contains(&"104.21.73.85:443".parse::<SocketAddr>().unwrap()));
@@ -2399,5 +2525,18 @@ mod tests {
         assert!(roster_from_ack(&[json!({"peers": "oops"})]).is_empty());
         // No payload values at all.
         assert!(roster_from_ack(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod direct_route_label_tests {
+    use super::direct_route_label;
+
+    /// A same-host direct-QUIC link reads as the same-host WebRTC route does,
+    /// never as the internal "direct-quic" label (gates.sh gate 1).
+    #[test]
+    fn a_same_host_direct_link_is_direct_over_lo() {
+        assert_eq!(direct_route_label("127.0.0.1:52986".parse().unwrap()), "direct over lo");
+        assert_eq!(direct_route_label("[::1]:4000".parse().unwrap()), "direct over lo");
     }
 }

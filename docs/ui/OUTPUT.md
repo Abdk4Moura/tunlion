@@ -360,13 +360,13 @@ Rules that go with them:
   `logs -f`); "no log yet" and "detached" stay on stderr. `-n`/`--lines` is
   `--tail`.
 - **`reach` confirms liveness.** A warm link is reported only after the peer
-  answers a `reach-ping` on it (1.5 s, FILAMENT_REACH_PING_MS); a peer stopped
+  answers a `reach-ping` on it (1.5 s, TUNLION_REACH_PING_MS); a peer stopped
   or killed keeps its link "alive" locally until QUIC's idle timeout, so with
   no answer reach falls through to the full probe and reports offline, exit 6.
 - **`send` exit codes:** an unreadable local file is 2 (nothing contacted); a
   known device that never appears on the server is offline, 6, after 10 s
-  (FILAMENT_SEND_OFFLINE_SECS) instead of the whole `--timeout`; no peer within
-  `--timeout` (default 60, FILAMENT_SEND_TIMEOUT as the fallback, 0 = no limit)
+  (TUNLION_SEND_OFFLINE_SECS) instead of the whole `--timeout`; no peer within
+  `--timeout` (default 60, TUNLION_SEND_TIMEOUT as the fallback, 0 = no limit)
   is 6; bytes sent but never acknowledged whole is 8.
 - **Transfer history is structured on both ends.** `status --json` `recent` is
   a list of objects `{time, direction, peer, file, stored, bytes, sha256, ok}`
@@ -383,7 +383,8 @@ Rules that go with them:
   shown under `-v`.
 - **`send --json`** prints one result object: `ok`, `verb`, `peer`, `bytes`
   (total), `files` (each with `file`, `bytes`, `sha256`, `delivered`,
-  `declined`), `file` and `sha256` at the top when exactly one file was sent,
+  `declined` (a person said no), `refused` (the receiver refused it for a
+  reason of its own: disk full, bad name, ...)), `file` and `sha256` at the top when exactly one file was sent,
   and `error` on failure. `stored_name` (top level for one file, and per file)
   is the name the receiver stored it under, from an additive field on its
   delivery-ack; null from an older receiver. A send whose files were all
@@ -414,12 +415,14 @@ Rules that go with them:
   `{code, exit, reason, message}` on failure. `--json` with `-o -` is refused
   (both write to stdout).
 - **A corrupt state file is an error, never an empty store.** When
-  `devices.json`, `revoked-keys.json`, `used-invitations.json`, `peerconf` or
-  `config` does not parse, every command (except `reset`, `down`, `logs`,
+  `devices.json`, `revoked-keys.json`, `used-invitations.json`, `caps.json`,
+  `peerconf` or `config` does not parse, or exists but is empty (tunlion never
+  writes an empty one, so an empty file is a truncation), every command (except `reset`, `down`, `logs`,
   `config`, `completions`, `man`, `update`) exits 2 naming the file and the
   parse error, and no write replaces it. Every write first keeps the previous
   good file as `<name>.bak`, and the error names that copy when it exists. A
-  corrupt `devices.json` used to list no devices with exit 0.
+  corrupt or empty `devices.json` used to list no devices with exit 0. In
+  `--json` the error's `code` is `corrupt_state` (exit 2).
 - **`devices --json` rows carry `status`**, the human row's word for the same
   value: `"online"` (`online: true`), `"idle"` (`online: false`: no answering
   link right now), or null.

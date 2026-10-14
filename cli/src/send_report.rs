@@ -11,7 +11,7 @@
 //! ```json
 //! {"ok": true, "verb": "send", "peer": "laptop",
 //!  "file": "a.txt", "bytes": 12, "sha256": "…",
-//!  "files": [{"file": "a.txt", "bytes": 12, "sha256": "…", "delivered": true, "declined": false}]}
+//!  "files": [{"file": "a.txt", "bytes": 12, "sha256": "…", "delivered": true, "declined": false, "refused": false}]}
 //! ```
 //!
 //! `file` and `sha256` are top-level when exactly one file was sent; `bytes`
@@ -29,6 +29,11 @@
 //! or `declined` when a person (or an older receiver) said no without one.
 //! When the send failed because of refusals, `error.message` carries their
 //! sentences too, so a script reading only the top level still learns why.
+//!
+//! `declined` is true only when a person said no (reason `declined`);
+//! `refused` is true when the receiver refused it for a reason of its own
+//! (`no_space`, `read_only`, ...). A full disk used to report
+//! `"declined": true`, which reads as someone saying no.
 
 use crate::exit_codes::{self, ExitKind};
 use crate::ui;
@@ -37,6 +42,7 @@ use filament_transfer::Outgoing;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FileReport {
@@ -44,7 +50,10 @@ pub(crate) struct FileReport {
     pub(crate) bytes: u64,
     pub(crate) sha256: Option<String>,
     pub(crate) delivered: bool,
+    /// A person said no (refusal reason `declined`).
     pub(crate) declined: bool,
+    /// The receiver refused it for a reason of its own (disk, name, ...).
+    pub(crate) refused: bool,
     /// The receiver's final name for it, when its ack said so.
     pub(crate) stored_name: Option<String>,
     /// Why it was not delivered: (reason token, sentence). Set for a declined
@@ -162,22 +171,37 @@ fn stored_for(id: &str) -> Option<String> {
 pub(crate) fn record(out: &[Outgoing]) {
     let files = out
         .iter()
-        .map(|o| FileReport {
-            file: o.name.clone(),
-            bytes: o.size,
-            sha256: o.full.clone(),
-            delivered: o.done && !o.declined,
-            declined: o.declined,
-            stored_name: stored_for(&o.id),
-            refusal: o.declined.then(|| {
+        .map(|o| {
+            let refusal = o.declined.then(|| {
                 refused_for(&o.id).unwrap_or_else(|| {
                     ("declined".to_string(), "the receiver declined it".to_string())
                 })
-            }),
+            });
+            let (declined, refused) = refusal_kind(refusal.as_ref());
+            FileReport {
+                file: o.name.clone(),
+                bytes: o.size,
+                sha256: o.full.clone(),
+                delivered: o.done && !o.declined,
+                declined,
+                refused,
+                stored_name: stored_for(&o.id),
+                refusal,
+            }
         })
         .collect();
     if let Ok(mut last) = LAST.lock() {
         *last = files;
+    }
+}
+
+/// (declined, refused) for a file's refusal: declined only when a person said
+/// no (reason `declined`), refused for the receiver's own reasons. Pure.
+pub(crate) fn refusal_kind(refusal: Option<&(String, String)>) -> (bool, bool) {
+    match refusal {
+        None => (false, false),
+        Some((reason, _)) if reason == "declined" => (true, false),
+        Some(_) => (false, true),
     }
 }
 
@@ -207,12 +231,58 @@ fn take() -> Vec<FileReport> {
     LAST.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default()
 }
 
-/// The sender's half of the transfer history: one record per file this send
-/// offered, `ok` when the receiver acknowledged it whole. Called once the verb
-/// returns, success or failure; the report stays for `emit`.
-pub(crate) fn persist_history(peer: Option<&str>) {
+/// The sources this send was given, for the history of a send that ends
+/// before offering anything.
+static SOURCES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// A send is running whose outcome belongs in the history.
+static HISTORY_ARMED: AtomicBool = AtomicBool::new(false);
+/// Its outcome was written: once, whichever exit wrote it.
+static HISTORY_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Start a send whose outcome the history must record, however it ends.
+pub(crate) fn arm_history(peer: Option<&str>, sources: Vec<String>) {
+    set_peer(peer);
+    if let Ok(mut s) = SOURCES.lock() {
+        *s = sources;
+    }
+    HISTORY_ARMED.store(true, Ordering::SeqCst);
+}
+
+/// Record this send's outcome in the history, ONCE, from whichever exit gets
+/// there first: the verb returning (success or error), or an interrupt, which
+/// leaves through `exit_codes::interrupted_exit` and never returns. The lab
+/// counted 4 delivered and 3 failed sends and `status` listed 5: an
+/// interrupted send exited without writing anything, and a failed one wrote
+/// "(not delivered)" with no reason. `err` is why it failed, when it did.
+pub(crate) fn persist_outcome(err: Option<&str>) {
+    if !HISTORY_ARMED.load(Ordering::SeqCst) || HISTORY_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let peer = PEER.lock().ok().and_then(|p| p.clone());
     let files = LAST.lock().map(|l| l.clone()).unwrap_or_default();
-    crate::transfer_history::append(&history_records(&files, peer));
+    if files.is_empty() {
+        if let Some(e) = err {
+            let sources = SOURCES.lock().map(|s| s.clone()).unwrap_or_default();
+            crate::transfer_history::append_unoffered(peer.as_deref(), &sources, e);
+        }
+        return;
+    }
+    crate::transfer_history::append_values(outcome_values(&files, peer.as_deref(), err));
+}
+
+/// History rows for these files, a failed one carrying the send's error.
+/// Pure.
+pub(crate) fn outcome_values(files: &[FileReport], peer: Option<&str>, err: Option<&str>) -> Vec<Value> {
+    history_records(files, peer)
+        .iter()
+        .map(|r| {
+            let mut v = r.to_json();
+            if let (false, Some(e)) = (r.ok, err) {
+                v["error"] = json!(e);
+            }
+            v
+        })
+        .collect()
 }
 
 /// What the history calls each source a send was given: `-` is stdin (under
@@ -231,17 +301,6 @@ pub(crate) fn source_labels(paths: &[String], name: Option<&str>) -> Vec<String>
             }
         })
         .collect()
-}
-
-/// A send that failed before it offered any file (nothing reached
-/// `record`) still belongs in the history: one failed record per source,
-/// with the reason. Called after `persist_history`, only on failure.
-pub(crate) fn persist_unoffered(peer: Option<&str>, sources: &[String], err: &anyhow::Error) {
-    let offered = LAST.lock().map(|l| !l.is_empty()).unwrap_or(true);
-    if offered {
-        return;
-    }
-    crate::transfer_history::append_unoffered(peer, sources, &format!("{err:#}"));
 }
 
 /// History records for these files. Pure.
@@ -290,6 +349,7 @@ pub(crate) fn result_object(files: &[FileReport], peer: Option<&str>, res: &Resu
             "sha256": f.sha256,
             "delivered": f.delivered,
             "declined": f.declined,
+            "refused": f.refused,
             "stored_name": f.stored_name,
             "refusal": refusal_json(f),
         })).collect::<Vec<_>>(),
@@ -367,7 +427,7 @@ pub(crate) fn emit(res: Result<()>, peer: Option<&str>) -> Result<()> {
             // The envelope above is the answer on stdout; the reason still goes
             // to stderr for a log, in the usual form.
             let kind = exit_codes::classify(&e);
-            ui::critical(&format!("Error: {}", exit_codes::human_message(&e)));
+            ui::critical(&format!("{} {}", ui::error_label(), exit_codes::human_message(&e)));
             Err(exit_codes::reported(kind))
         }
     }
@@ -396,6 +456,24 @@ mod tests {
         assert_eq!(source_labels(&paths, Some("log.txt")), ["log.txt", "a.txt"]);
     }
 
+    /// Every send outcome is a history row, and a failed one says why: the
+    /// lab's 4 delivered + 3 failed sends showed 5 rows, one "(not delivered)".
+    #[test]
+    fn a_failed_send_is_recorded_with_its_reason() {
+        let mut lost = one("b.txt", 5);
+        lost.delivered = false;
+        let rows = outcome_values(&[one("a.txt", 3), lost], Some("laptop"), Some("transfer REFUSED: x"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["ok"], json!(true));
+        assert!(rows[0].get("error").is_none(), "{}", rows[0]);
+        assert_eq!(rows[1]["ok"], json!(false));
+        assert_eq!(rows[1]["error"], json!("transfer REFUSED: x"));
+        assert!(crate::transfer_history::human_line(&rows[1]).contains("(failed: transfer REFUSED: x)"));
+        // Success: no error on any row.
+        let ok = outcome_values(&[one("a.txt", 3)], None, None);
+        assert!(ok[0].get("error").is_none());
+    }
+
     fn one(name: &str, bytes: u64) -> FileReport {
         FileReport {
             file: name.into(),
@@ -403,6 +481,7 @@ mod tests {
             sha256: Some("ab".repeat(32)),
             delivered: true,
             declined: false,
+            refused: false,
             stored_name: None,
             refusal: None,
         }
@@ -418,11 +497,14 @@ mod tests {
         note_refused("t-refused-1", Some("no_space"), why);
         let mut f = one("big.bin", 3_000_000);
         f.delivered = false;
-        f.declined = true;
         f.refusal = refused_for("t-refused-1");
+        (f.declined, f.refused) = refusal_kind(f.refusal.as_ref());
+        assert!(f.refused && !f.declined, "a full disk is a refusal, not a person saying no");
         let res: Result<()> = Err(exit_codes::reported(ExitKind::Denied));
         let v = result_object(&[f.clone()], Some("beta"), &res);
         assert_eq!(v["files"][0]["refusal"]["reason"], json!("no_space"));
+        assert_eq!(v["files"][0]["declined"], json!(false));
+        assert_eq!(v["files"][0]["refused"], json!(true));
         assert_eq!(v["files"][0]["refusal"]["message"], json!(why));
         assert_eq!(v["refusal"]["reason"], json!("no_space"), "single file: at the top too");
         assert_eq!(v["error"]["code"], json!("denied"));
@@ -441,17 +523,18 @@ mod tests {
     fn a_plain_decline_and_a_hostile_token_have_safe_reasons() {
         note_refused("t-refused-2", None, "the receiver declined it");
         assert_eq!(refused_for("t-refused-2").unwrap().0, "declined");
+        assert_eq!(refusal_kind(refused_for("t-refused-2").as_ref()), (true, false), "a person said no");
         assert_eq!(reason_token("NAME_TOO_LONG"), "name_too_long");
         assert_eq!(reason_token("inbox_missing"), "inbox_missing");
         assert_eq!(reason_token("\u{1b}[31mx"), "io");
         assert_eq!(reason_token(""), "io");
         // Two different reasons: per file, and no single top-level reason.
         let mut a = one("a", 1);
-        a.declined = true;
+        a.refused = true;
         a.delivered = false;
         a.refusal = Some(("no_space".into(), "no room for a".into()));
         let mut b = one("b", 1);
-        b.declined = true;
+        b.refused = true;
         b.delivered = false;
         b.refusal = Some(("name_too_long".into(), "bad name b".into()));
         let v = result_object(&[a, b], None, &Err(incomplete(0, 2)));

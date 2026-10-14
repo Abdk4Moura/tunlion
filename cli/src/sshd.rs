@@ -2,17 +2,13 @@ use anyhow::{bail, Result};
 use std::path::Path;
 
 const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
-// PROTOCOL LITERAL: frozen, do not rename. This line is written into
-// /etc/ssh/sshd_config and is how this code later recognises its OWN block, so
-// it is on-disk format, not prose: a renamed marker stops matching the blocks
-// released builds wrote, and every upgraded daemon appends a duplicate.
-const FILAMENT_MARKER: &str = "# Added by filament for L3 overlay access";
-/// The text an unreleased build wrote for a short while after the rename.
-/// Read only, never written: recognised so such a block is not duplicated.
-const FILAMENT_MARKER_RENAMED: &str = "# Added by tunlion for L3 overlay access";
+// This line is written into /etc/ssh/sshd_config and is how this code later
+// recognises its OWN block, so it is on-disk format, not prose. It names
+// tunlion so a block another tool wrote is never mistaken for ours.
+const TUNLION_MARKER: &str = "# Added by tunlion for L3 overlay access";
 
 fn has_overlay_marker(text: &str) -> bool {
-    text.contains(FILAMENT_MARKER) || text.contains(FILAMENT_MARKER_RENAMED)
+    text.contains(TUNLION_MARKER)
 }
 
 /// Configure sshd to listen on the L3 overlay addresses AND localhost.
@@ -38,7 +34,7 @@ pub fn configure_sshd_overlay(v6: &str, v4: &str) -> Result<()> {
     
     // Build the entries to append — overlay addresses AND localhost.
     let entries = format!(
-        "\n{FILAMENT_MARKER}\nListenAddress {v6}\nListenAddress {v4}\nListenAddress 127.0.0.1\nListenAddress ::1\n"
+        "\n{TUNLION_MARKER}\nListenAddress {v6}\nListenAddress {v4}\nListenAddress 127.0.0.1\nListenAddress ::1\n"
     );
     
     // Append to config
@@ -115,33 +111,30 @@ pub fn is_configured() -> bool {
     has_overlay_marker(&content)
 }
 
-// PROTOCOL LITERAL: frozen, do not rename. Written into sshd_config and used
-// to recognise this code's own Match block (see FILAMENT_MARKER above).
-const SSHD_CA_MARKER: &str = "# Added by filament for SSH certificates (shell --ssh)";
-/// The text an unreleased build wrote for a short while after the rename.
-/// Read only, never written: recognised so such a block is not duplicated.
-const SSHD_CA_MARKER_RENAMED: &str = "# Added by tunlion for SSH certificates (shell --ssh)";
+// Written into sshd_config and used to recognise this code's own Match block
+// (see TUNLION_MARKER above).
+const SSHD_CA_MARKER: &str = "# Added by tunlion for SSH certificates (shell --ssh)";
 
 fn has_our_marker(text: &str) -> bool {
-    text.contains(SSHD_CA_MARKER) || text.contains(SSHD_CA_MARKER_RENAMED)
+    text.contains(SSHD_CA_MARKER)
 }
 /// Default location of the CA public key the TrustedUserCAKeys line points at.
 /// (The operator places the daemon's CA pub here out of band.)
-pub const SSHD_CA_PUB_DEFAULT: &str = "/etc/ssh/filament_ca.pub";
+pub const SSHD_CA_PUB_DEFAULT: &str = "/etc/ssh/tunlion_ca.pub";
 const SSHD_CONFIG_DEFAULT: &str = "/etc/ssh/sshd_config";
-const SSHD_PRINCIPALS_BASE_DEFAULT: &str = "/etc/ssh/filament_principals";
+const SSHD_PRINCIPALS_BASE_DEFAULT: &str = "/etc/ssh/tunlion_principals";
 
 /// sshd_config path: env-overridable so e2e exercises the real writer
 /// against temp files instead of the live config.
 pub fn sshd_config_path() -> std::path::PathBuf {
-    std::env::var("FILAMENT_SSH_SSHD_CONFIG")
+    std::env::var("TUNLION_SSH_SSHD_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(SSHD_CONFIG_DEFAULT))
 }
 
 /// Principals base dir (per-user files under it): env-overridable likewise.
 pub fn principals_base_dir() -> std::path::PathBuf {
-    std::env::var("FILAMENT_SSH_PRINCIPALS_DIR")
+    std::env::var("TUNLION_SSH_PRINCIPALS_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(SSHD_PRINCIPALS_BASE_DEFAULT))
 }
@@ -149,7 +142,7 @@ pub fn principals_base_dir() -> std::path::PathBuf {
 /// Trust-anchor path (where TrustedUserCAKeys points): env-overridable so
 /// e2e asserts the product copy without touching /etc/ssh.
 pub fn ca_pub_anchor_path() -> std::path::PathBuf {
-    std::env::var("FILAMENT_SSH_CA_PUB_ANCHOR")
+    std::env::var("TUNLION_SSH_CA_PUB_ANCHOR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(SSHD_CA_PUB_DEFAULT))
 }
@@ -385,7 +378,7 @@ pub async fn arm_ssh_ca_for_serving() {
         // PER-USER TRUST IS SUFFICIENT, SO DO NOT TOUCH /etc/ssh AT ALL.
         //
         // The system-wide route below copies THIS daemon's CA over the one
-        // shared file sshd trusts, /etc/ssh/filament_ca.pub, unconditionally.
+        // shared file sshd trusts, /etc/ssh/tunlion_ca.pub, unconditionally.
         // So any second daemon running as root -- a test, a second instance, a
         // reinstall with a fresh config -- silently took over root ssh trust
         // from the first, and broke the first one's --ssh. This happened on a
@@ -530,13 +523,13 @@ mod tests {
     #[test]
     fn ca_block_is_a_daemon_user_match_with_both_lines() {
         let block = render_sshd_ca_block(
-            Path::new("/etc/ssh/filament_ca.pub"),
-            "filament",
-            Path::new("/etc/ssh/filament_principals/%u"),
+            Path::new("/etc/ssh/tunlion_ca.pub"),
+            "tunlion",
+            Path::new("/etc/ssh/tunlion_principals/%u"),
         );
         assert_eq!(
             block,
-            "\n# Added by filament for SSH certificates (shell --ssh)\nMatch User filament\n    TrustedUserCAKeys /etc/ssh/filament_ca.pub\n    AuthorizedPrincipalsFile /etc/ssh/filament_principals/%u\n"
+            "\n# Added by tunlion for SSH certificates (shell --ssh)\nMatch User tunlion\n    TrustedUserCAKeys /etc/ssh/tunlion_ca.pub\n    AuthorizedPrincipalsFile /etc/ssh/tunlion_principals/%u\n"
         );
     }
 
@@ -691,10 +684,9 @@ mod tests {
         assert!(!t && !p, "keys without our marker must not count");
     }
 
-    /// The markers are on-disk format shared with every released build. These
-    /// are the exact bytes 0.8.5 wrote; a rename must not change them.
-    /// Pinned by SHA-256 of the original literal (`printf '%s' '<marker>' |
-    /// sha256sum`), which a find-and-replace cannot keep in step.
+    /// The markers are on-disk format: the exact bytes this code writes and
+    /// later matches. Pinned by SHA-256 of the literal (`printf '%s'
+    /// '<marker>' | sha256sum`), which a find-and-replace cannot keep in step.
     #[test]
     fn sshd_markers_are_the_released_on_disk_text() {
         use sha2::{Digest, Sha256};
@@ -702,32 +694,34 @@ mod tests {
             Sha256::digest(s.as_bytes()).as_slice().iter().map(|b| format!("{b:02x}")).collect()
         };
         assert_eq!(
-            hex(FILAMENT_MARKER),
-            "072be630f0cd7592c35bb3af561091a846108a2d39868b3d0a11708be91f5426",
+            hex(TUNLION_MARKER),
+            "6f096f540a621f72a935a518f38cca69b107e38d21e3b2176ead8957085cf3a3",
             "the overlay marker is frozen on-disk text"
         );
         assert_eq!(
             hex(SSHD_CA_MARKER),
-            "288b19dcd13e623275ac2b76145844d4e82fcba1af3cac6f61b43cf16e855416",
+            "1797448a2913995e0a48a6231c11a69741ee38cb3863bfce0c1040c230ec9a6c",
             "the CA marker is frozen on-disk text"
         );
     }
 
     #[test]
-    fn blocks_written_under_either_marker_are_recognised() {
-        // Released builds wrote the filament text; main briefly wrote the
-        // tunlion text. Both must count as ours, or an upgraded daemon appends
-        // a second identical block.
-        for marker in [SSHD_CA_MARKER, SSHD_CA_MARKER_RENAMED] {
-            let block = format!(
-                "{marker}\nMatch User root\n    TrustedUserCAKeys /etc/ssh/x.pub\n    AuthorizedPrincipalsFile /etc/ssh/p/root\n"
-            );
-            assert!(has_our_marker(&block), "{marker}");
-            assert_eq!(sshd_ca_status(&block), (true, true), "{marker}");
-        }
-        for marker in [FILAMENT_MARKER, FILAMENT_MARKER_RENAMED] {
-            assert!(has_overlay_marker(&format!("{marker}\nListenAddress ::1\n")), "{marker}");
-        }
+    fn only_blocks_written_under_our_marker_are_recognised() {
+        // Our own blocks count as ours, or an upgraded daemon appends a second
+        // identical block. A block filament wrote (the two tools can share one
+        // sshd_config) must never count as ours.
+        let block = format!(
+            "{SSHD_CA_MARKER}\nMatch User root\n    TrustedUserCAKeys /etc/ssh/x.pub\n    AuthorizedPrincipalsFile /etc/ssh/p/root\n"
+        );
+        assert!(has_our_marker(&block));
+        assert_eq!(sshd_ca_status(&block), (true, true));
+        assert!(has_overlay_marker(&format!("{TUNLION_MARKER}\nListenAddress ::1\n")));
+        let filament_ca = "# Added by filament for SSH certificates (shell --ssh)\nMatch User root\n    TrustedUserCAKeys /etc/ssh/x.pub\n    AuthorizedPrincipalsFile /etc/ssh/p/root\n";
+        assert!(!has_our_marker(filament_ca), "filament's CA block is not ours");
+        assert!(
+            !has_overlay_marker("# Added by filament for L3 overlay access\nListenAddress ::1\n"),
+            "filament's overlay block is not ours"
+        );
         assert!(!has_our_marker("Match User root\n    TrustedUserCAKeys /etc/ssh/someone-elses.pub\n"));
         assert!(!has_overlay_marker("ListenAddress ::1\n"));
     }
