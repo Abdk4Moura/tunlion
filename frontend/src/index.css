@@ -1,25 +1,30 @@
-/* Tunlion: global shell styles (ported from the design handoff host).
-   The UI itself is inline-styled in ui/Tunlion.jsx; this file only carries the
-   page reset, the keyframes the component references, and scrollbars. */
+/* Tunlion: global shell styles. The UI is inline-styled from the tokens in
+   ui/theme.js; this file carries only the page reset, focus rings, the two
+   mark animations, and scrollbars. */
 
 /* App shell: lock the page so a touch never pans or rubber-bands the document.
-   overscroll-behavior:none kills the bounce/pull-to-refresh that, on mobile,
-   reads as "panning an oversized image". height:100% + overflow:hidden keep the
-   document exactly one viewport tall; the terminal overlay then sizes itself to
-   the VISUAL viewport in JS (see Tunlion.jsx) so nothing taller than what is
-   actually visible can be panned into view. This is the app shell, not the
-   marketing/content pages, so locking page scroll here does not affect reading. */
-html, body { margin: 0; height: 100%; background: #0A0B0C; overflow: hidden; overscroll-behavior: none; }
+   The terminal overlay sizes itself to the VISUAL viewport in JS (Tunlion.jsx),
+   so nothing taller than what is visible can be panned into view. App.jsx sets
+   the page background to the current theme. */
+html, body { margin: 0; height: 100%; background: #141412; overflow: hidden; overscroll-behavior: none; }
 * { box-sizing: border-box; }
 #root { position: fixed; inset: 0; }
 
-/* progress-bar shimmer + the blinking "tunlion tip" caret */
-@keyframes filShimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
-@keyframes filBlink { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0.15; } }
-.fil-caret { animation: filBlink 1.1s steps(1) infinite; }
-@media (prefers-reduced-motion: reduce) { .fil-caret { animation: none; } }
+/* Focus: a clear 2 px ring in the current ink colour on keyboard focus only.
+   --tl-ring is set on the app root per theme. */
+.tl-focus:focus { outline: none; }
+.tl-focus:focus-visible, .tl-input:focus-visible { outline: 2px solid var(--tl-ring, #f2efe6); outline-offset: 2px; }
+.tl-input:focus { outline: 2px solid var(--tl-ring, #f2efe6); outline-offset: 2px; }
+
+/* The mark's two motions, from the logo work. Pulse: waiting on the other side.
+   Knock: something waits on you. Never both on one element. */
+.tl-pulse { animation: tlp 5s infinite; animation-delay: -2.4s; transform-box: fill-box; transform-origin: 50% 100%; }
+@keyframes tlp { 0%, 56.25% { transform: scaleY(1) } 57.8125% { transform: scaleY(.45) } 59.375%, 75% { transform: scaleY(1) } 76.5625% { transform: scaleY(.45) } 78.125%, 81.25% { transform: scaleY(1) } 82.8125% { transform: scaleY(.45) } 84.375%, 100% { transform: scaleY(1) } }
+.tl-knock { animation: tlk 5s infinite; animation-delay: -3s; transform-box: fill-box; transform-origin: 50% 100%; }
+@keyframes tlk { 0%, 68.75% { transform: translateY(0) } 70.3% { transform: translateY(-12%) } 71.875%, 75% { transform: translateY(0) } 76.5% { transform: translateY(-12%) } 78.125%, 81.25% { transform: translateY(0) } 82.8% { transform: translateY(-12%) } 84.375%, 100% { transform: translateY(0) } }
+@media (prefers-reduced-motion: reduce) { .tl-pulse, .tl-knock { animation: none; } }
 
 /* scrollbars */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
-::-webkit-scrollbar-thumb { background: rgba(127,127,127,.28); }
+::-webkit-scrollbar-thumb { background: rgba(127,127,127,.28); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }

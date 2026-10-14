@@ -36,7 +36,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   mount-windows:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: mount (windows, WinFsp)
     runs-on: windows-latest
     timeout-minutes: 20
@@ -65,6 +71,8 @@ jobs:
   # honestly give: macFUSE's headers install there, but its kernel extension
   # cannot load, so the adapter is checked, not mounted.
   mount-macos:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: mount (macos, check)
     runs-on: macos-latest
     timeout-minutes: 30

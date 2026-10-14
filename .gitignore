@@ -56,3 +56,7 @@ target-hooks/
 filament-invite-*.txt
 tunlion-invite-*.txt
 *-invite*.txt
+frontend/tests/.browser-ui-bundle.js
+frontend/tests/.browser-ui-bundle.css
+frontend/tests/.browser-ui-shots/
+frontend/tests/filament_pake_bg-*.wasm

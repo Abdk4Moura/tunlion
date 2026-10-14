@@ -510,86 +510,7 @@ pub(crate) fn link_petname(l: &Link) -> Option<&str> {
         .or(l.expected_secret.as_ref().map(|(n, _)| n.as_str()))
 }
 
-/// One link as warm-hold sees it.
-pub(crate) struct WarmLinkView<'a> {
-    pub(crate) pid: &'a str,
-    /// `link_petname`: the device it is bound to, when known.
-    pub(crate) petname: Option<&'a str>,
-    /// The name the link was born with (a display name for a WebRTC link,
-    /// the petname for a direct one).
-    pub(crate) name: &'a str,
-    /// `Conn::has_live_transport`: serving, or still making progress.
-    pub(crate) live: bool,
-}
-
-/// One roster entry (a sid we saw on signaling) as warm-hold sees it.
-pub(crate) struct WarmRosterView<'a> {
-    pub(crate) pid: &'a str,
-    /// The DISPLAY name the sid announced.
-    pub(crate) name: Option<&'a str>,
-    /// The pair channel it was met on, for a channel-introduced entry.
-    pub(crate) channel: Option<&'a str>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum WarmDecision {
-    /// A live link to the device exists: leave it alone.
-    Skip { pid: String },
-    /// No live link: dial this present sid.
-    Establish { pid: String },
-    /// No live link and no present sid to dial.
-    Absent,
-}
-
-/// What warm-hold should do for `peer` this tick. Pure, so the rule is
-/// testable without a network.
-///
-/// `peer` is a warm-tier key. For a paired device (`channel` is its pair
-/// channel) the device is identified by that channel and by the petname
-/// links carry, never by the display name a sid announces: two devices may
-/// share a display name and one device changes sids. Only a key that is not a
-/// paired device falls back to matching display name or sid.
-///
-/// Skip if ANY link to the device is live, whatever its kind (direct,
-/// WebRTC, relay) or the name it was born with. Otherwise dial one of the
-/// sids actually present for it; `rotation` (the peer's consecutive failure
-/// count) walks through them when there are several, so one stale sid cannot
-/// absorb every attempt.
-pub(crate) fn warm_decide(
-    peer: &str,
-    channel: Option<&str>,
-    links: &[WarmLinkView<'_>],
-    roster: &[WarmRosterView<'_>],
-    rotation: usize,
-) -> WarmDecision {
-    let is_peer = |s: &str| s.eq_ignore_ascii_case(peer);
-    let mut sids: Vec<&str> = roster
-        .iter()
-        .filter(|r| match channel {
-            Some(ch) => r.channel == Some(ch),
-            None => r.name.is_some_and(is_peer) || is_peer(r.pid),
-        })
-        .map(|r| r.pid)
-        .collect();
-    sids.sort_unstable();
-    sids.dedup();
-    let belongs = |l: &WarmLinkView<'_>| {
-        l.petname.is_some_and(is_peer)
-            || sids.contains(&l.pid)
-            || (channel.is_none() && (is_peer(l.name) || is_peer(l.pid)))
-    };
-    if let Some(l) = links.iter().filter(|l| l.live && belongs(*l)).min_by_key(|l| l.pid) {
-        return WarmDecision::Skip {
-            pid: l.pid.to_string(),
-        };
-    }
-    if sids.is_empty() {
-        return WarmDecision::Absent;
-    }
-    WarmDecision::Establish {
-        pid: sids[rotation % sids.len()].to_string(),
-    }
-}
+pub(crate) use crate::link_manager::{WarmDecision, WarmLinkView, WarmRosterView, warm_decide};
 
 #[derive(Default)]
 pub(crate) struct WarmHold {
@@ -4079,29 +4000,33 @@ impl Conn {
         let Some(up) = self.resil.upgrade_probe.get_mut(pid) else {
             return;
         };
-        let started = match up.verify_started {
-            Some(t) => t,
-            None => {
+        use crate::link_manager::{VerifyAction, decide_upgrade_verify};
+        let elapsed_ms = up.verify_started.map(|t| t.elapsed().as_millis() as u64);
+        match decide_upgrade_verify(elapsed_ms, beat_ok, idle, verify_idle_ms, verify_ms) {
+            VerifyAction::StartWindow => {
                 up.verify_started = Some(Instant::now());
                 up.verify_last_idle = idle;
                 return;
             }
-        };
-        // Regressed: control send failed OR the path went idle past the guard.
-        // Discard the standby, stay on relay, back off (the no-flap guard).
-        if !beat_ok || idle >= verify_idle_ms {
-            // DEBUG, resilience internal (no-flap guard rejecting a standby).
-            ui::debug(&ui::paint(
-                ui::Tone::Warn,
-                "  direct path connected but didn't hold, staying on relay (no flap)",
-            ));
-            self.direct_pending.remove(pid);
-            self.mark_probe_failed(pid);
-            return;
+            // Regressed: control send failed OR the path went idle past the guard.
+            // Discard the standby, stay on relay, back off (the no-flap guard).
+            VerifyAction::Discard => {
+                // DEBUG, resilience internal (no-flap guard rejecting a standby).
+                ui::debug(&ui::paint(
+                    ui::Tone::Warn,
+                    "  direct path connected but didn't hold, staying on relay (no flap)",
+                ));
+                self.direct_pending.remove(pid);
+                self.mark_probe_failed(pid);
+                return;
+            }
+            VerifyAction::Wait | VerifyAction::Upgrade => {}
         }
         up.verify_last_idle = up.verify_last_idle.min(idle);
         // Sustained: moved data continuously for the whole verify window → upgrade.
-        if started.elapsed() >= Duration::from_millis(verify_ms) {
+        if decide_upgrade_verify(elapsed_ms, beat_ok, idle, verify_idle_ms, verify_ms)
+            == VerifyAction::Upgrade
+        {
             let t = standby;
             let route = self
                 .resil

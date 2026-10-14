@@ -804,7 +804,9 @@ async fn handle_pty_open(
         let _ = t
             .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
             .await;
-        sess.attach(t.clone(), sid);
+        // How much output the client already has, so only the missed part is
+        // replayed (absent from older clients and the browser: replay all).
+        sess.attach(t.clone(), sid, v["resume_from"].as_u64());
         sess.resize(cols, rows);
         pty_bindings
             .entry(pid.clone())

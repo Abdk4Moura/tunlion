@@ -344,6 +344,7 @@
         "cli/tests/l2-revoke-gates.sh",
         "cli/tests/mount-revoke-gates.sh",
         "cli/tests/net-blockers-gates.sh",
+        "cli/tests/pty-resume-gates.sh",
         "cli/tests/pty-revoke-gates.sh",
         "cli/tests/reenrol-advice-gates.sh",
         "cli/tests/revocation-live-gates.sh",
@@ -420,6 +421,17 @@
       "disposition": "support",
       "invoked_by": [
         "cli/tests/natprobe-test.sh"
+      ]
+    },
+    {
+      "path": "cli/tests/pty-resume-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/pty-resume-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
       ]
     },
     {
@@ -678,6 +690,17 @@
       "path": "proofs/fleet_automesh_model.py",
       "disposition": "required",
       "entrypoint": "python3 proofs/fleet_automesh_model.py",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "model-checker"
+        }
+      ]
+    },
+    {
+      "path": "proofs/link_manager_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/link_manager_model.py",
       "matrix": [
         {
           "platform": "portable",

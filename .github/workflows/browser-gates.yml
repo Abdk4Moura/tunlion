@@ -78,6 +78,15 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/pake-ux.spec.cjs
 
+      # The new screens: one code box (Receive first), buttons only for access
+      # held, keyboard reach and focus rings, the phone full-bleed shell, and a
+      # code in the link's #fragment. Harness for the screens, the real built
+      # app for the fragment.
+      - name: browser-ui
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/browser-ui.spec.cjs
+
       # Screenshots are the evidence a browser actually rendered, rather than the
       # harness reporting on itself. Keep them when a gate fails.
       #

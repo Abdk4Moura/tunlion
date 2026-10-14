@@ -7,7 +7,13 @@ on:
     branches: [main, feat/capability-layer]
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   ratchet:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,8 +1,12 @@
-/* Tunlion: polished "Terminal" presentation component.
-   Ported from the Claude Design handoff (Variant A · Terminal). Presentation
-   only: driven by `state` + callbacks whose names match useTunlion(). An
-   optional `ui` prop carries display options (theme/accent/density/columns/font);
-   omit it for sensible defaults (dark / green / airy). */
+/* Tunlion: the browser UI.
+   Presentation only: driven by `state` + callbacks whose names match
+   useTunlion(). An optional `ui` prop carries the theme ('light' | 'dark') and
+   the theme toggle; with no theme given it follows the system setting.
+
+   Layout follows the "tunlion browser" design: a header with Home and Devices,
+   one code box, a drop zone, the people and devices here now, transfers, and a
+   device list. Only what today's protocol does is shown. Nothing here fakes the
+   redesign's later pieces (one-time shell, asks, end times, cut off). */
 
 import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
@@ -10,6 +14,7 @@ import WebTerminal from './WebTerminal.jsx'
 import DeviceSheet from './DeviceSheet.jsx'
 import CommandPalette from './CommandPalette.jsx'
 import DiagPanel from './DiagPanel.jsx'
+import { makeTheme, terminalTheme, systemMode, FONT_SANS, FONT_MONO } from './theme.js'
 import { pakeReady, previewCustomCode } from '../lib/pairing.js'
 import { mintNameplate } from '../lib/words.js'
 
@@ -18,11 +23,11 @@ import { mintNameplate } from '../lib/words.js'
 // property is gone, so it must be LOUD and HONEST wherever it appears. The exact
 // words are chosen to neither over-claim ("insecure/exposed", false, it's
 // encrypted) nor under-claim ("direct/private", false, there IS a middleman on
-// the wire). Single source of truth so the tile, sheet and top bar all agree.
+// the wire). Single source of truth so the row, sheet and header all agree.
 const RELAY_EXPLAINER =
   'On relay: routed through a TURN server, not a direct link. Still end-to-end encrypted; the relay forwards bytes it can’t read.'
 
-// ---- data helpers (inlined from the handoff's data.js) --------------------
+// ---- data helpers -----------------------------------------------------------
 function formatBytes(n) {
   if (n == null) return '-'
   if (n < 1024) return n + ' B'
@@ -37,58 +42,39 @@ function formatBytes(n) {
 
 function fileTag(t) {
   const ext = (t.name.split('.').pop() || '').toUpperCase()
-  return ext.length <= 4 ? ext : (t.mime.split('/').pop() || 'FILE').toUpperCase()
+  return ext.length <= 4 ? ext : ((t.mime || '').split('/').pop() || 'FILE').toUpperCase()
 }
 
 const STATUS_LABEL = {
   offered: 'offered',
-  transferring: 'transferring',
+  transferring: 'sending',
   paused: 'paused',
-  complete: 'complete',
+  complete: 'done',
   declined: 'declined',
   failed: 'failed',
 }
-const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away, be right back' }
+const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away, back soon' }
 
-// ---- theme system ----------------------------------------------------------
-const MONOS = {
-  jetbrains: "'JetBrains Mono',ui-monospace,monospace",
-  plex: "'IBM Plex Mono',ui-monospace,monospace",
-  space: "'Space Mono',ui-monospace,monospace",
+function peerName(p) {
+  return p.known || p.verified || p.name
 }
 
-const ACCENTS = {
-  green: { d: '#7CF6C8', l: '#0C8A60' },
-  cyan: { d: '#5BE7FF', l: '#0B7C93' },
-  amber: { d: '#FFC857', l: '#9A6B00' },
-  magenta: { d: '#FF8AD6', l: '#A11890' },
-}
-
-function makeTheme(mode, accent) {
-  if (mode === 'light') {
-    return {
-      mode, accent,
-      bg: '#F1EFE9', panel: '#FAF8F3', panel2: '#F5F2EB',
-      line: '#DEDACF', lineSoft: '#E9E5DB', grid: '#E7E3D9',
-      text: '#191A1B', sub: '#54574F', dim: '#7C7E74', faint: '#AAA89C',
-      ok: '#0C8A60', warn: '#9A6B00', bad: '#C0322B', recv: '#1F5FC0',
-      onAccent: '#0B1116',
-    }
-  }
-  return {
-    mode, accent,
-    bg: '#0A0B0C', panel: '#0F1113', panel2: '#0C0E10',
-    line: '#1E2227', lineSoft: '#15181C', grid: '#121417',
-    text: '#D9DEE3', sub: '#9AA1A8', dim: '#666C73', faint: '#3C424A',
-    ok: '#7CF6C8', warn: '#FFC857', bad: '#E5484D', recv: '#5B9DFF',
-    onAccent: '#06120D',
-  }
-}
-
-const DENS = {
-  airy: { pad: 24, gap: 14, tilePad: 16, rowPad: 14, name: 14, dispName: 15 },
-  cozy: { pad: 18, gap: 12, tilePad: 13, rowPad: 12, name: 13.5, dispName: 14 },
-  compact: { pad: 13, gap: 9, tilePad: 10, rowPad: 10, name: 13, dispName: 13 },
+// Turn the hook's pairStatus into the design's failure text (B7): what happened,
+// then one next action. Anything not recognised is shown as the hook wrote it.
+function codeFeedback(ps) {
+  if (!ps) return null
+  if (ps === 'pairing') return { tone: 'wait', text: 'Checking the code…' }
+  if (ps === 'paired') return { tone: 'ok', text: 'Code accepted. Both sides proved they hold the same code.' }
+  if (ps === 'connected') return { tone: 'ok', text: 'Code accepted. Waiting for the file.' }
+  const s = String(ps)
+  if (/key confirmation failed/i.test(s)) return { tone: 'bad', text: "That code didn't match. Check the words and try again.", action: 'Try again' }
+  if (/did not work|expired|already used/i.test(s)) return { tone: 'bad', text: "That code didn't work. It may be mistyped, already used (codes work once), or expired. Ask for a new one.", action: 'Enter another code' }
+  if (/left before/i.test(s)) return { tone: 'bad', text: 'The other device left before you connected. Ask for a new code.', action: 'Enter another code' }
+  if (/did not finish/i.test(s)) return { tone: 'bad', text: "The other device didn't finish. Nothing was kept. Ask for a new code.", action: 'Enter another code' }
+  if (/too many attempts/i.test(s)) return { tone: 'bad', text: 'Too many tries. Wait a moment, then try again.', action: 'Try again' }
+  if (/missing its number|full code|not valid/i.test(s)) return { tone: 'bad', text: 'That is not a full code. A code is words and a number, like brave-otter-3141.', action: 'Try again' }
+  if (/older version/i.test(s)) return { tone: 'bad', text: 'The other device runs an older tunlion and cannot connect securely. Update it. Nothing was kept.' }
+  return { tone: 'bad', text: s.charAt(0).toUpperCase() + s.slice(1) }
 }
 
 function useCopied() {
@@ -103,277 +89,115 @@ function useCopied() {
   return [hit, fire]
 }
 
-function StatusDot({ color, glow }) {
-  return <span style={{ width: 7, height: 7, background: color, display: 'block', boxShadow: glow ? '0 0 7px ' + color : 'none' }} />
+// ---- atoms ------------------------------------------------------------------
+
+// The tunlion mark: an arch with the accent block inside. anim 'pulse' means
+// waiting on the other side; 'knock' means something waits on you. Both stop
+// under prefers-reduced-motion (index.css).
+function Mark({ T, size = 24, anim }) {
+  const small = size < 24
+  const cls = anim === 'knock' ? 'tl-knock' : anim === 'pulse' ? 'tl-pulse' : undefined
+  return (
+    <svg width={size} height={size} viewBox="0 0 80 80" style={{ display: 'block', flexShrink: 0 }} aria-hidden="true">
+      {small
+        ? <path d="M10 80 V26 Q10 8 28 8 H52 Q70 8 70 26 V80" fill="none" stroke={T.ink} strokeWidth="16" />
+        : <path d="M12 74 V24 Q12 10 26 10 H54 Q68 10 68 24 V74" fill="none" stroke={T.ink} strokeWidth="10" />}
+      {small
+        ? <rect className={cls} x="31" y="42" width="18" height="38" fill={T.acc} />
+        : <rect className={cls} x="33" y="46" width="14" height="28" fill={T.acc} />}
+    </svg>
+  )
+}
+
+function Btn({ children, kind = 'sec', onClick, small, full, disabled, T, narrow, title, ariaLabel, testid, type }) {
+  const base = {
+    font: '600 14px ' + FONT_SANS, minHeight: small && !narrow ? 36 : 44, padding: small ? '0 12px' : '0 18px',
+    borderRadius: 7, cursor: disabled ? 'default' : 'pointer', display: 'inline-flex', alignItems: 'center',
+    justifyContent: 'center', gap: 8, width: full ? '100%' : 'auto', opacity: disabled ? 0.45 : 1, whiteSpace: 'nowrap',
+  }
+  const k = {
+    pri: { background: T.ink, color: T.inv, border: '1.5px solid ' + T.ink },
+    sec: { background: 'transparent', color: T.ink, border: '1.5px solid ' + T.ink },
+    ghost: { background: 'transparent', color: T.sub, border: '1.5px solid transparent' },
+    dan: { background: 'transparent', color: T.bad, border: '1.5px solid ' + T.bad },
+  }[kind]
+  return (
+    <button type={type || 'button'} onClick={disabled ? undefined : onClick} disabled={disabled} title={title} aria-label={ariaLabel}
+      data-testid={testid} className="tl-focus" style={{ ...base, ...k }}>{children}</button>
+  )
+}
+
+function Tag({ children, tone = 'n', T }) {
+  const c = { n: [T.soft, T.sub], ok: [T.okBg, T.ok], bad: [T.badBg, T.bad] }[tone]
+  return (
+    <span style={{ font: "600 10.5px/1 " + FONT_MONO, letterSpacing: '.06em', textTransform: 'uppercase', padding: '5px 7px', borderRadius: 4, background: c[0], color: c[1], whiteSpace: 'nowrap' }}>{children}</span>
+  )
+}
+
+function Section({ children, T, right }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12, margin: '6px 0 2px' }}>
+      <h2 style={{ margin: 0, font: '600 11px ' + FONT_MONO, letterSpacing: '.1em', textTransform: 'uppercase', color: T.sub }}>{children}</h2>
+      {right}
+    </div>
+  )
+}
+
+function Notice({ children, action, onAction, tone = 'bad', T, narrow }) {
+  return (
+    <div role={tone === 'bad' ? 'alert' : 'status'} style={{
+      display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: '12px 14px', borderRadius: 7,
+      border: '1.5px solid ' + (tone === 'bad' ? T.bad : T.rule), color: tone === 'bad' ? T.bad : T.ink, fontSize: 14.5, background: T.surf,
+    }}>
+      <span style={{ flex: 1, minWidth: 200, lineHeight: 1.45 }}>{children}</span>
+      {action && <Btn small T={T} narrow={narrow} onClick={onAction}>{action}</Btn>}
+    </div>
+  )
 }
 
 function routeMeta(route, T) {
-  if (route === 'local') return { label: 'LAN', color: T.ok, tip: 'Direct link: bytes go straight between you, no middleman.' }
-  if (route === 'direct') return { label: 'P2P', color: T.recv, tip: 'Direct link: bytes go straight between you, no middleman.' }
+  if (route === 'local') return { label: 'LAN', tone: 'ok', tip: 'Direct link on your network: bytes go straight between you, no middleman.' }
+  if (route === 'direct') return { label: 'direct', tone: 'ok', tip: 'Direct link: bytes go straight between you, no middleman.' }
   // relayed is the ONLY route with a middleman on the wire; it gets the loud
   // amber ⚠ treatment + the honest explainer (it is still E2E-encrypted).
-  if (route === 'relayed') return { label: 'RELAY', color: T.warn, relay: true, tip: RELAY_EXPLAINER }
+  if (route === 'relayed') return { label: 'RELAY', relay: true, tip: RELAY_EXPLAINER }
   return null
 }
 
 function RouteBadge({ route, T }) {
   const m = routeMeta(route, T)
   if (!m) return null
-  const premium = route === 'local'
-  // Relay: LOUD. Amber ⚠ chip, amber border + amber tint, NOT calm. The honest
+  // Relay: LOUD. Amber ⚠ chip with an amber border, never calm. The honest
   // explainer rides in the title (hover/tap) and is repeated in the device sheet.
   if (m.relay) {
     return (
       <span data-testid="route-relay" title={m.tip} style={{
-        display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 9.5, letterSpacing: '.08em',
-        padding: '2px 6px', border: '1px solid ' + T.warn,
-        background: T.mode === 'light' ? 'rgba(154,107,0,.12)' : 'rgba(255,200,87,.14)',
+        display: 'inline-flex', alignItems: 'center', gap: 4, font: '700 11px/1 ' + FONT_MONO, letterSpacing: '.06em',
+        padding: '5px 7px', borderRadius: 4, border: '1.5px solid ' + T.warn, background: T.warnBg,
         color: T.warn, cursor: 'help', whiteSpace: 'nowrap',
       }}>
         <span aria-hidden="true">⚠</span>{m.label}
       </span>
     )
   }
-  return (
-    <span title={m.tip} style={{
-      display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 9.5, letterSpacing: '.08em',
-      padding: '2px 5px', border: '1px solid ' + (premium ? m.color : T.line),
-      background: premium ? (T.mode === 'light' ? 'rgba(12,138,96,.10)' : 'rgba(124,246,200,.12)') : 'transparent',
-      color: premium ? m.color : T.sub, cursor: 'default', whiteSpace: 'nowrap',
-    }}>
-      <span style={{ width: 12, height: 2, background: m.color, display: 'block', boxShadow: premium ? '0 0 6px ' + m.color : 'none' }} />{m.label}
-    </span>
-  )
-}
-
-function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D, accent }) {
-  const ready = peer.status === 'ready'
-  const [over, setOver] = useState(false)
-  const [hov, setHov] = useState(false)
-  const inp = useRef(null)
-  const tileRef = useRef(null)
-  // 'away' (C21): the peer announced a benign absence (e.g. it is choosing a
-  // file on a phone), amber, calm, explicitly not an error.
-  const sc = ready ? T.ok : peer.status === 'connecting' || peer.status === 'away' ? T.warn : T.bad
-  // C12: a remembered device, here because of the PAIRING, not the room.
-  // Dashed accent border + chip distinguish it; the hint line says why.
-  const known = !!peer.known
-  // Prefer OUR local petname for a remembered/verified device over the name the
-  // peer announces (e.g. show "my-laptop", not the broadcast "root@do-vm").
-  // Strangers/unknown peers keep their announced name.
-  const displayName = peer.known || peer.verified || peer.name
-  // SHELL badge: this device ADVERTISED a terminal (peer.shell, from the CLI's
-  // `caps` message: `up --shell` / TUNLION_L2). Pure presentation; it makes
-  // "this device is a machine" visible at rest. The actual Open-terminal action
-  // lives in the DeviceSheet, gated server-side on top of this hint.
-  const isMachine = !!peer.shell
-  // tile-interaction-v2: the trigger DIVERGES per form factor; the substance
-  // (DeviceSheet, action set, sessions) stays shared.
-  //   - DESKTOP: single-click STILL sends (zero regression); double-click sends
-  //     too (reinforcement); right-click + a hover action bar open the sheet.
-  //   - MOBILE: tapping a KNOWN tile opens the sheet (the whole tile is the
-  //     trigger, no 24px ⋯); a STRANGER tile taps straight to the picker since
-  //     the sheet would offer nothing but Send.
-  // canSheet gates the sheet trigger (right-click / ⋯ / mobile tap) to remembered
-  // devices, exactly as model H did with showMore.
-  const canSheet = ready && known && onOpenSheet
-  // The hovered `›_` open-terminal chip, only when the device advertises a shell.
-  const canTerminal = ready && known && isMachine && onOpenTerminal
-  // The model-H top-right ⋯ flex-item is gone on BOTH form factors: on mobile the
-  // whole tile opens the sheet; on desktop the hover action bar's `⋯ more` chip
-  // (plus right-click) carries it. Matches the v2 mocks (no static ⋯ on a tile).
-  const openSheet = () => onOpenSheet && onOpenSheet(peer, tileRef.current ? tileRef.current.getBoundingClientRect() : null)
-  const openTerminal = () => onOpenTerminal && onOpenTerminal(peer)
-  // Mobile: known → sheet; stranger → picker. Desktop: always send (picker).
-  const onTileClick = () => {
-    if (!ready) return
-    if (narrow && canSheet) { openSheet(); return }
-    if (inp.current) inp.current.click()
-  }
-  // Desktop hover bar replaces the hint line (swap, never stack); see below.
-  const showHoverBar = !narrow && hov && ready && (canTerminal || canSheet)
-  return (
-    <div
-      ref={tileRef}
-      data-testid="peer-tile"
-      data-route={peer.route || ''}
-      onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
-      onClick={onTileClick}
-      onDoubleClick={() => { if (!narrow && ready && inp.current) inp.current.click() }}
-      onContextMenu={(e) => { if (canSheet) { e.preventDefault(); openSheet() } }}
-      onDragOver={(e) => { if (ready) { e.preventDefault(); setOver(true) } }}
-      onDragLeave={() => setOver(false)}
-      onDrop={(e) => { e.preventDefault(); setOver(false); if (ready && e.dataTransfer.files.length) onSendFiles(peer.id, e.dataTransfer.files) }}
-      title={known ? 'Remembered device: you two reconnect automatically, in any room. No shared room or code needed.' : undefined}
-      style={{
-        position: 'relative', aspectRatio: '1 / 1', minWidth: 0,
-        background: over ? (T.mode === 'light' ? '#EAF7F1' : '#0E1A16') : T.panel,
-        border: over ? '1px solid ' + accent : hov && ready ? '1px solid ' + T.text : known ? '1px dashed ' + accent : '1px solid ' + T.line,
-        padding: D.tilePad, display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
-        cursor: ready ? 'pointer' : 'default', opacity: ready ? 1 : 0.4,
-        transition: 'border-color .12s, background .12s, transform .12s',
-        transform: hov && ready ? 'translateY(-2px)' : 'none',
-      }}
-    >
-      <input ref={inp} type="file" multiple style={{ display: 'none' }}
-        onChange={(e) => { if (e.target.files.length) onSendFiles(peer.id, e.target.files); e.target.value = '' }} />
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, flexWrap: 'wrap' }}>
-        <span style={{ width: 14, height: 14, background: peer.color, display: 'block', flexShrink: 0 }} />
-        {/* badge group: sizes to its content. The status dot + ⋯ trigger sit to
-            its right; on a very narrow tile the whole row wraps rather than
-            clipping the discoverability-critical SHELL chip. marginLeft:auto
-            keeps the dot + ⋯ flush-right when there's spare width. */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flexShrink: 1 }}>
-          {/* Relay honesty: when a peer is on relay its ⚠ chip is the SINGLE
-              most important top-row marker (silent relay breaks the no-middleman
-              promise) so it renders FIRST and never flex-shrinks. On a narrow
-              tile REMEMBERED/SHELL clip before the safety-critical relay chip. */}
-          {peer.route === 'relayed' && <RouteBadge route="relayed" T={T} />}
-          {known && (
-            <span style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px dashed ' + accent, padding: '2px 5px', whiteSpace: 'nowrap', flexShrink: 1, minWidth: 0, overflow: 'hidden' }}>
-              REMEMBERED
-            </span>
-          )}
-          {isMachine && (
-            <span title="this device offers a terminal" style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px solid ' + accent, padding: '2px 5px', whiteSpace: 'nowrap', flexShrink: 0 }}>
-              SHELL
-            </span>
-          )}
-          {/* Non-relay route badge is the lowest-priority top-row marker (also in
-              the device sheet), dropped when BOTH identity chips are present so a
-              narrow tile keeps REMEMBERED + SHELL visible. */}
-          {peer.route && peer.route !== 'relayed' && !(known && isMachine) && <RouteBadge route={peer.route} T={T} />}
-        </div>
-        {/* status dot stays OUTSIDE the badge group so it's always visible;
-            marginLeft:auto floats it to the right edge. The model-H top-right ⋯
-            trigger is gone (v2): mobile opens the sheet from the whole tile,
-            desktop from the hover action bar / right-click. */}
-        <span style={{ flexShrink: 0, display: 'flex', marginLeft: 'auto' }}><StatusDot color={sc} glow={ready} /></span>
-      </div>
-      <div>
-        <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
-        <div style={{ fontSize: 10.5, display: 'flex', justifyContent: 'space-between', color: T.dim }}>
-          {/* Relay honesty: the status line ALSO says "· via relay" in amber, so
-              the warning survives even if the top-row ⚠ chip is scrolled past. */}
-          <span style={{ color: sc, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {PEER_STATUS_LABEL[peer.status]}
-            {peer.route === 'relayed' && <span style={{ color: T.warn }}> · via relay</span>}
-          </span>
-          <span style={{ flexShrink: 0 }}>{peer.lastSeen}</span>
-        </div>
-        {/* Hint line OR (desktop hover) the inline action bar, a SWAP, never a
-            stack: exactly one of the two renders in this slot, so the bar
-            occupies the hint's space and there is no overlap (the historical
-            layout bug came from stacking a second element over the hint). */}
-        {showHoverBar ? (
-          <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 6, minHeight: 15 }}>
-            {canTerminal && (
-              <button
-                onClick={(e) => { e.stopPropagation(); openTerminal() }}
-                onDoubleClick={(e) => e.stopPropagation()}
-                title={`open a terminal on ${displayName}`}
-                aria-label={`open a terminal on ${displayName}`}
-                style={{
-                  font: 'inherit', fontSize: 10.5, fontWeight: 700, letterSpacing: '.04em',
-                  padding: '3px 8px', cursor: 'pointer', whiteSpace: 'nowrap',
-                  color: accent, background: 'transparent', border: '1px solid ' + accent,
-                }}
-              >›_</button>
-            )}
-            {canSheet && (
-              <button
-                onClick={(e) => { e.stopPropagation(); openSheet() }}
-                onDoubleClick={(e) => e.stopPropagation()}
-                title={`device actions for ${displayName}`}
-                aria-label={`device actions for ${displayName}`}
-                style={{
-                  font: 'inherit', fontSize: 10.5, letterSpacing: '.04em',
-                  padding: '3px 8px', cursor: 'pointer', whiteSpace: 'nowrap',
-                  color: T.sub, background: 'transparent', border: '1px solid ' + T.line,
-                }}
-              >⋯ more</button>
-            )}
-          </div>
-        ) : (
-          <div style={{ fontSize: 10, color: ready ? (hov ? accent : T.faint) : T.faint, marginTop: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', transition: 'color .12s', minHeight: 15 }}>
-            {ready
-              ? (over ? 'release to send' : narrow ? (known ? 'tap → actions' : 'tap · drop to send') : hov ? '↳ drop or click to send' : known ? 'remembered · click to send' : 'click · drop to send')
-              : known ? 'remembered · reaches you in any room' : '-'}
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-function Bar({ p, color, T, animate }) {
-  return (
-    <div style={{ height: 4, background: T.lineSoft, position: 'relative', overflow: 'hidden' }}>
-      <div style={{ position: 'absolute', inset: 0, width: Math.max(0, Math.min(1, p)) * 100 + '%', background: color, transition: 'width .3s linear',
-        backgroundImage: animate ? 'linear-gradient(90deg,' + color + ' 0 60%,rgba(255,255,255,.45) 80%,' + color + ' 100%)' : 'none',
-        backgroundSize: '200% 100%', animation: animate ? 'filShimmer 1.4s linear infinite' : 'none' }} />
-    </div>
-  )
-}
-
-function TransferRow({ t, onAccept, onDecline, onSave, onClear, T, D, accent }) {
-  const recv = t.direction === 'receive'
-  const sc = t.status === 'complete' ? T.ok : t.status === 'failed' ? T.bad : t.status === 'declined' ? T.dim : T.warn
-  const btn = (label, fn, tone) => (
-    <button onClick={fn} style={{
-      font: 'inherit', fontSize: 11, padding: '5px 11px', cursor: 'pointer', background: 'transparent',
-      color: tone, border: '1px solid ' + tone, transition: 'background .1s,color .1s',
-    }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = tone; e.currentTarget.style.color = T.mode === 'light' ? '#fff' : T.onAccent }}
-      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = tone }}
-    >{label}</button>
-  )
-  const active = t.status === 'transferring'
-  return (
-    <div style={{ borderBottom: '1px solid ' + T.lineSoft, padding: D.rowPad + 'px 0' }}>
-      <div style={{ display: 'flex', gap: 10, alignItems: 'baseline' }}>
-        <span style={{ color: recv ? T.recv : T.ok, fontSize: 13, width: 10 }}>{recv ? '↓' : '↑'}</span>
-        <span style={{ flex: 1, fontSize: 13, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{t.name}</span>
-        <span style={{ fontSize: 11, color: T.dim, whiteSpace: 'nowrap' }}>{formatBytes(t.size)}</span>
-      </div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '8px 0 9px', fontSize: 10.5, color: T.dim }}>
-        <span style={{ color: T.faint, border: '1px solid ' + T.line, padding: '1px 5px' }}>{fileTag(t)}</span>
-        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{recv ? 'from ' : 'to '}{t.peerName}</span>
-        <span style={{ marginLeft: 'auto', color: sc, whiteSpace: 'nowrap' }}>{STATUS_LABEL[t.status]}{active ? ' ' + Math.round(t.progress * 100) + '%' : ''}</span>
-      </div>
-      {(active || t.status === 'failed' || t.status === 'paused') && <Bar p={t.progress} color={t.status === 'failed' ? T.bad : accent} T={T} animate={active} />}
-      <div style={{ display: 'flex', gap: 8, marginTop: active || t.status === 'failed' || t.status === 'paused' ? 11 : 0, flexWrap: 'wrap' }}>
-        {recv && t.status === 'offered' && (<>{btn('accept', () => onAccept(t.id), T.ok)}{btn('decline', () => onDecline(t.id), T.bad)}</>)}
-        {recv && t.status === 'complete' && btn('save', () => onSave(t.id), accent)}
-        {!recv && t.status === 'offered' && <span style={{ fontSize: 11, color: T.dim }}>waiting for accept…</span>}
-        {t.status === 'paused' && <span style={{ fontSize: 11, color: T.dim }}>paused, resumes on reconnect</span>}
-        {(t.status === 'complete' || t.status === 'declined' || t.status === 'failed' || t.status === 'paused') && btn('clear', () => onClear(t.id), T.dim)}
-      </div>
-    </div>
-  )
-}
-
-function Pill({ children, T }) {
-  return <span style={{ fontSize: 10.5, color: T.dim, border: '1px solid ' + T.line, padding: '2px 7px', whiteSpace: 'nowrap' }}>{children}</span>
+  return <span title={m.tip}><Tag tone={m.tone} T={T}>{m.label}</Tag></span>
 }
 
 // Global relay-honesty indicator (transport-resilience P1, §3.3). Appears ONLY
 // when ≥1 connected peer is on relay, so the user is never unaware even if the
-// relayed tile is scrolled off. Hidden entirely when everything is direct.
-// Loud amber ⚠, on-theme (reuses T.warn), with the same honest explainer.
+// relayed row is scrolled off. Hidden entirely when everything is direct.
 function RelayBanner({ peers, T }) {
   const relayed = (peers || []).filter((p) => p.route === 'relayed')
   const n = relayed.length
   if (n === 0) return null
-  const names = relayed.map((p) => p.known || p.verified || p.name).join(', ')
+  const names = relayed.map(peerName).join(', ')
   return (
     <span
       data-testid="relay-banner"
       title={RELAY_EXPLAINER + (names ? '\n\nOn relay: ' + names : '')}
       style={{
-        display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, letterSpacing: '.02em',
-        padding: '4px 9px', border: '1px solid ' + T.warn, color: T.warn,
-        background: T.mode === 'light' ? 'rgba(154,107,0,.10)' : 'rgba(255,200,87,.12)',
+        display: 'inline-flex', alignItems: 'center', gap: 6, font: '700 12px ' + FONT_SANS,
+        padding: '6px 10px', borderRadius: 6, border: '1.5px solid ' + T.warn, color: T.warn, background: T.warnBg,
         cursor: 'help', whiteSpace: 'nowrap',
       }}
     >
@@ -388,9 +212,8 @@ function LanChip({ localHelper, T }) {
   const n = (localHelper.peers || []).length
   const names = (localHelper.peers || []).map((p) => p.name + ' · ' + p.addr).join('\n')
   return (
-    <span title={names} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, fontSize: 11, color: T.dim, whiteSpace: 'nowrap', cursor: 'default' }}>
-      <span style={{ color: T.ok, fontSize: 12 }}>◇</span>
-      <span><span style={{ color: T.sub }}>{n} on your LAN</span> · offline-ready</span>
+    <span title={names} style={{ fontSize: 13, color: T.sub, whiteSpace: 'nowrap' }}>
+      {n} on your network · works offline
     </span>
   )
 }
@@ -402,14 +225,13 @@ function LanChip({ localHelper, T }) {
 // alphanumeric in the formatted string, and (4) restore the caret there in a
 // layout effect (before paint). Counting alphanumerics, not raw offset, makes
 // collapse/strip/paste/backspace all caret-stable regardless of length change.
-function CodeInput({ value, onChange, format, onSubmit, onCancel, autoFocus, placeholder, accent, T }) {
-  const ref = useRef(null)
+function CodeInput({ id, value, onChange, format, onSubmit, onCancel, autoFocus, placeholder, invalid, describedBy, inputRef, T, big }) {
+  const own = useRef(null)
+  const ref = inputRef || own
   const caretRef = useRef(null)
 
   // Restore the caret AFTER React commits the new (formatted) value but BEFORE
   // the browser paints, so the user never sees it flicker to the end.
-  // useLayoutEffect (not useEffect) is load-bearing here: it runs before paint,
-  // so on a mid-string edit the caret never visibly snaps to the end and back.
   useLayoutEffect(() => {
     if (caretRef.current != null && ref.current) {
       const pos = caretRef.current
@@ -449,20 +271,26 @@ function CodeInput({ value, onChange, format, onSubmit, onCancel, autoFocus, pla
   }
 
   return (
-    <input ref={ref} autoFocus={autoFocus} value={value} onChange={handleChange}
-      onKeyDown={(e) => { if (e.key === 'Enter') onSubmit(); if (e.key === 'Escape') onCancel() }}
-      placeholder={placeholder} style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
-        background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+    <input ref={ref} id={id} autoFocus={autoFocus} value={value} onChange={handleChange}
+      onKeyDown={(e) => { if (e.key === 'Enter') onSubmit(); if (e.key === 'Escape' && onCancel) onCancel() }}
+      placeholder={placeholder} spellCheck="false" autoComplete="off" autoCapitalize="characters"
+      aria-invalid={invalid ? 'true' : undefined} aria-describedby={describedBy}
+      className="tl-input"
+      style={{
+        flex: 1, minWidth: 0, minHeight: big ? 54 : 46, borderRadius: 7, padding: '0 14px',
+        font: (big ? '500 18px ' : '500 15px ') + FONT_MONO, letterSpacing: '.04em', textTransform: 'uppercase',
+        background: T.surf, color: T.ink, border: '1.5px solid ' + (invalid ? T.bad : T.ink),
+      }} />
   )
 }
 
-// STEERING: "choose your own code" entry. The user types words (and optionally a
+// "Choose your own code" entry. The user types words (and optionally a
 // number); we show a LIVE normalized preview (the shared WASM normCode/splitCode,
 // so it matches what SPAKE2 hashes), auto-append a dimmed connect number when
 // they typed none, and gate Create on the >= 2-word strength floor, a gentle
 // nudge, never a hard block on typing. On Create we hand the RAW typed string to
 // onGenerateCode (the hook re-parses it with the same shared split).
-function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
+function CustomCodeEntry({ onCreate, onCancel, T, narrow }) {
   const [typed, setTyped] = useState('')
   const [ready, setReady] = useState(false)
   // A stable machine-assigned number for the preview (so it doesn't reshuffle on
@@ -473,7 +301,6 @@ function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
   useEffect(() => { pakeReady().then(() => setReady(true)).catch(() => setReady(true)) }, [])
 
   const format = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
-  // Live preview via the shared split (only once WASM is ready).
   let pv = null
   if (ready && typed.trim()) {
     try { pv = previewCustomCode(typed, autoNpRef.current) } catch { pv = null }
@@ -482,66 +309,54 @@ function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
   const doCreate = () => { if (canCreate) onCreate(typed) }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <span style={{ fontSize: 9.5, letterSpacing: '.14em', color: T.dim }}>CHOOSE YOUR OWN · TWO WORDS OR MORE</span>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <CodeInput autoFocus value={typed} onChange={setTyped} format={format}
-          onSubmit={doCreate} onCancel={onCancel}
-          placeholder="GIGANTIC ELEMENT" accent={accent} T={T} />
-        <button onClick={doCreate} disabled={!canCreate} data-testid="custom-create" style={{
-          font: 'inherit', fontSize: 11, padding: '7px 12px', whiteSpace: 'nowrap',
-          cursor: canCreate ? 'pointer' : 'not-allowed', opacity: canCreate ? 1 : 0.45,
-          background: canCreate ? accent : 'transparent', color: canCreate ? T.onAccent : T.text,
-          border: '1px solid ' + (canCreate ? accent : T.line) }}>create</button>
-        <button onClick={onCancel} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer',
-          background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>cancel</button>
+    <div style={{ display: 'grid', gap: 8 }}>
+      <label htmlFor="tl-custom-code" style={{ fontWeight: 600, fontSize: 15 }}>Choose your own words</label>
+      <div style={{ display: 'flex', gap: 10, flexDirection: narrow ? 'column' : 'row' }}>
+        <CodeInput id="tl-custom-code" autoFocus value={typed} onChange={setTyped} format={format}
+          onSubmit={doCreate} onCancel={onCancel} placeholder="TWO WORDS OR MORE" T={T} describedBy="tl-custom-help" />
+        <span style={{ display: 'flex', gap: 8 }}>
+          <Btn kind="pri" T={T} narrow={narrow} onClick={doCreate} disabled={!canCreate} testid="custom-create">Create</Btn>
+          <Btn T={T} narrow={narrow} onClick={onCancel}>Cancel</Btn>
+        </span>
       </div>
-      {/* Live normalized preview (what SPAKE2 will hash) + auto-number note. */}
       {pv && pv.full && (
-        <div data-testid="custom-preview" style={{ fontSize: 13, letterSpacing: '.06em', color: T.text }}>
+        <div data-testid="custom-preview" style={{ font: '500 15px ' + FONT_MONO, letterSpacing: '.04em', color: T.ink }}>
           {pv.password}
-          <span style={{ color: pv.autoAssigned ? T.dim : T.text }}>-{pv.nameplate}</span>
-          {pv.autoAssigned && <span style={{ fontSize: 10.5, color: T.dim }}>  (number added for you)</span>}
+          <span style={{ color: pv.autoAssigned ? T.sub : T.ink }}>-{pv.nameplate}</span>
+          {pv.autoAssigned && <span style={{ fontSize: 13, color: T.sub, fontFamily: FONT_SANS }}>  (number added for you)</span>}
         </div>
       )}
-      {/* Steering nudge: weak or blocked input. */}
-      {pv && typed.trim() && !pv.strongEnough && (
-        <div data-testid="custom-nudge" style={{ fontSize: 11, lineHeight: 1.4, color: '#e0564f' }}>
-          {pv.blockedReason || 'use at least two words, e.g. gigantic-element (easier to say, harder to guess)'}
-        </div>
-      )}
+      <div id="tl-custom-help" data-testid={pv && typed.trim() && !pv.strongEnough ? 'custom-nudge' : undefined}
+        style={{ fontSize: 13, lineHeight: 1.45, color: pv && typed.trim() && !pv.strongEnough ? T.bad : T.sub }}>
+        {pv && typed.trim() && !pv.strongEnough
+          ? (pv.blockedReason || 'Use at least two words, like gigantic-element. Easier to say, harder to guess.')
+          : 'Two words or more. A number is added if you leave it out.'}
+      </div>
     </div>
   )
 }
 
-function DiscoveryBar({ state, onPairWithCode, onReceiveWithCode, onGenerateCode, onUseAutoRoom, onCopyRoomLink, openEntryNonce, T, D, accent }) {
-  const scope = state.roomScope || 'link'
-  const [copied, fireCopy] = useCopied()
-  // L1-a: the code input serves two verbs now, `null` (closed), `'pair'`
-  // (remember the device), or `'receive'` (claim + ephemeral-PAKE + download a
-  // file, secret discarded). `entering` stays a derived boolean for the existing
-  // layout branches; the verb decides which hook action the submit calls.
-  const [entryMode, setEntryMode] = useState(null)
-  const entering = entryMode !== null
-  const setEntering = (on) => setEntryMode(on ? 'pair' : null)
-  const [customizing, setCustomizing] = useState(false) // "choose your own code"
-  const [code, setCode] = useState('')
+// The one code box. Today's protocol cannot tell from a code what it offers
+// (that is the redesign's offer-in-code), and claiming a code burns it, so the
+// box asks once what the code is for instead of guessing: receive a file, or
+// remember a device. Receive is the default, since most codes people are handed
+// are file codes.
+function CodeBox({ state, onPairWithCode, onReceiveWithCode, initialCode, openEntryNonce, T, narrow }) {
+  const [code, setCode] = useState(initialCode || '')
+  const [mode, setMode] = useState('receive')
+  const [submitted, setSubmitted] = useState(false)
+  const inputRef = useRef(null)
+  const id = 'tl-code-' + (narrow ? 'n' : 'w')
 
-  // Hand the typed custom string to generateCode (the hook re-parses it with the
-  // shared split). Close the entry once minting begins.
-  const createCustom = (typed) => { setCustomizing(false); onGenerateCode(typed) }
+  // The command palette's "Pair with code" raises this nonce: focus the box in
+  // remember mode (skip the initial 0 so we don't steal focus on mount).
+  useEffect(() => {
+    if (!openEntryNonce) return
+    setMode('pair')
+    try { inputRef.current && inputRef.current.focus() } catch (e) {}
+  }, [openEntryNonce])
 
-  // The command palette's "Pair with code" raises this nonce; open our code
-  // input in response (skip the initial 0 so we don't auto-open on mount).
-  useEffect(() => { if (openEntryNonce) setEntering(true) }, [openEntryNonce])
-
-  const ghostBtn = (label, fn, primary) => (
-    <button onClick={fn} style={{
-      font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', whiteSpace: 'nowrap',
-      background: primary ? accent : 'transparent', color: primary ? T.onAccent : T.text,
-      border: '1px solid ' + (primary ? accent : T.line),
-    }}>{label}</button>
-  )
+  useEffect(() => { if (initialCode) setCode(initialCode) }, [initialCode])
 
   // Auto-dash: the user types/pastes "grand hawk ruby 8045" or "GRANDHAWKRUBY8045"
   // and sees dashes either way. Uppercase, collapse any run of spaces/dashes to a
@@ -549,222 +364,263 @@ function DiscoveryBar({ state, onPairWithCode, onReceiveWithCode, onGenerateCode
   // canonicalizes via normCode (WASM) before SPAKE2.
   const formatCode = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
 
-  // Keep the input open after submitting a code so the user sees the result
-  // (success/failure) and can correct a mistyped code in place; closing the
-  // box on submit is why pairing failures used to vanish silently.
-  const submitCode = () => {
+  // Keep the box filled after submitting so the person sees the result and can
+  // fix a mistyped code in place.
+  const submit = () => {
     const c = code.trim()
-    if (!c) return
-    if (entryMode === 'receive') onReceiveWithCode(c)
+    if (!c) { try { inputRef.current && inputRef.current.focus() } catch (e) {} ; return }
+    setSubmitted(true)
+    if (mode === 'receive') onReceiveWithCode(c)
     else onPairWithCode(c)
   }
 
-  // Surface pairing feedback (set by the hook). 'pairing'/'paired' are neutral;
-  // anything else is a user-facing error/refusal shown in the accent-warning hue.
+  // Show the hook's status when this box started the attempt, or when it is an
+  // outcome worth seeing anyway. A 'pairing' left over from an earlier minted
+  // code (the person pressed Done) is not news, so it stays hidden.
   const ps = state.pairStatus
-  const pairMsg = ps && ps !== 'paired'
-    ? (
-      <div style={{ fontSize: 11, lineHeight: 1.4, color: ps === 'pairing' ? T.dim : '#e0564f' }}>
-        {ps === 'pairing' ? 'pairing…' : ps}
-      </div>
-    )
-    : null
-
-  const wrap = {
-    border: '1px solid ' + T.line, background: T.panel, padding: '12px ' + D.tilePad + 'px',
-    marginBottom: 16, display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', minHeight: 56,
+  const fb = ps && (submitted || ps !== 'pairing') ? codeFeedback(ps) : null
+  const invalid = fb && fb.tone === 'bad'
+  const retry = () => {
+    if (fb && fb.action === 'Enter another code') setCode('')
+    setSubmitted(false)
+    try { inputRef.current && inputRef.current.focus() } catch (e) {}
   }
 
-  if (scope === 'code') {
-    return (
-      <div style={{ ...wrap, flexDirection: 'column', flexWrap: 'nowrap', alignItems: 'stretch', gap: 10 }}>
-        <span style={{ fontSize: 9.5, letterSpacing: '.14em', color: T.dim, whiteSpace: 'nowrap' }}>ONE-TIME CODE · SAY IT ALOUD · WORKS ONCE</span>
-        <span style={{ width: '100%', flexShrink: 0, fontSize: 'clamp(26px,3.2vw,38px)', lineHeight: 1.1, letterSpacing: '.14em', color: T.text, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{state.roomCode}</span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <LanChip localHelper={state.localHelper} T={T} />
-          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <button onClick={() => fireCopy(() => { try { navigator.clipboard.writeText(state.roomCode) } catch (e) {} })} style={{
-              font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', whiteSpace: 'nowrap',
-              background: copied ? accent : 'transparent', color: copied ? T.onAccent : accent, border: '1px solid ' + accent }}>{copied ? 'copied ✓' : 'copy code'}</button>
-            {ghostBtn('← back to nearby', onUseAutoRoom)}
-          </div>
-        </div>
-      </div>
-    )
-  }
+  const modeBtn = (k, label) => (
+    <button type="button" role="radio" aria-checked={mode === k} onClick={() => setMode(k)} className="tl-focus"
+      style={{
+        flex: 1, minHeight: 44, font: '500 14px ' + FONT_SANS, border: 0, borderLeft: k === 'pair' ? '1px solid ' + T.ink : 0,
+        background: mode === k ? T.ink : 'transparent', color: mode === k ? T.inv : T.ink, cursor: 'pointer', padding: '0 10px',
+      }}>{label}</button>
+  )
 
-  if (scope === 'pair') {
-    // The private room exists as soon as the server matched the code, before
-    // the two ends have proven they hold the same code. Say "paired" only once
-    // the ceremony succeeded; while it runs, say so; if it failed, say why.
-    const done = ps === 'paired' || ps === 'connected'
-    const failed = ps && !done && ps !== 'pairing'
-    return (
-      <div style={{ ...wrap, flexDirection: failed ? 'column' : 'row', alignItems: failed ? 'stretch' : 'center' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
-          <span data-testid="pair-state" style={{ fontSize: 13, color: failed ? '#e0564f' : T.text, whiteSpace: 'nowrap' }}>
-            {done ? 'Paired privately' : failed ? 'Pairing failed' : 'Checking the code…'}
-          </span>
-          {done && <Pill T={T}>one-time code · burned</Pill>}
-          <LanChip localHelper={state.localHelper} T={T} />
-          <span style={{ marginLeft: 'auto' }}>{ghostBtn('← back to nearby', onUseAutoRoom)}</span>
-        </div>
-        {failed && <div data-testid="pair-error" style={{ fontSize: 11, lineHeight: 1.4, color: '#e0564f' }}>{ps}</div>}
+  return (
+    <div style={{ display: 'grid', gap: 10 }} data-testid={`code-entry-${mode}`}>
+      <label htmlFor={id} style={{ fontWeight: 600, fontSize: 15 }}>Enter a code</label>
+      <div style={{ display: 'flex', gap: 10, flexDirection: narrow ? 'column' : 'row' }}>
+        <CodeInput id={id} inputRef={inputRef} value={code} onChange={(v) => { setCode(v); if (submitted) setSubmitted(false) }} format={formatCode}
+          onSubmit={submit} placeholder="WORDS-AND-NUMBER" invalid={invalid} describedBy={id + '-help'} T={T} big />
+        <Btn kind="pri" T={T} narrow={narrow} onClick={submit} testid="code-connect">Connect</Btn>
       </div>
-    )
-  }
-
-  if (scope === 'link') {
-    return (
-      <div style={{ ...wrap, flexDirection: 'column', flexWrap: 'nowrap', alignItems: 'stretch', gap: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 12, color: T.sub, whiteSpace: 'nowrap' }}>Share room link</span>
-          <span style={{ flex: 1, minWidth: 160, fontSize: 11, color: accent, border: '1px solid ' + T.line, padding: '7px 10px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: T.bg }}>{state.roomUrl}</span>
-          <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', whiteSpace: 'nowrap', background: 'transparent', color: accent, border: '1px solid ' + accent }}>{copied ? 'copied ✓' : 'copy link'}</button>
-          <LanChip localHelper={state.localHelper} T={T} />
-        </div>
-        {/* Codes work from ANY room (minting is additive: the claimer joins
-            THIS room) so the affordance belongs here too, not just in auto. */}
-        {customizing ? (
-          <CustomCodeEntry onCreate={createCustom} onCancel={() => setCustomizing(false)} accent={accent} T={T} />
-        ) : entering ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }} data-testid={`code-entry-${entryMode}`}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
-                onSubmit={submitCode} onCancel={() => { setEntryMode(null); setCode('') }}
-                placeholder="ENTER CODE" accent={accent} T={T} />
-              {ghostBtn(entryMode === 'receive' ? 'receive' : 'pair', submitCode, true)}
-              {ghostBtn('cancel', () => { setEntryMode(null); setCode('') })}
-            </div>
-            {pairMsg}
-          </div>
+      <div role="radiogroup" aria-label="What is the code for?" style={{ display: 'flex', border: '1.5px solid ' + T.ink, borderRadius: 7, overflow: 'hidden', maxWidth: narrow ? 'none' : 420 }}>
+        {modeBtn('receive', 'Receive a file')}
+        {modeBtn('pair', 'Remember a device')}
+      </div>
+      <div id={id + '-help'} aria-live="polite">
+        {fb ? (
+          fb.tone === 'bad'
+            ? (
+              <div role="alert" style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', fontSize: 14, color: T.bad, lineHeight: 1.45 }}>
+                <span data-testid="pair-error" style={{ flex: 1, minWidth: 200 }}>{fb.text}</span>
+                {fb.action && <Btn small T={T} narrow={narrow} onClick={retry}>{fb.action}</Btn>}
+              </div>
+            )
+            : (
+              <div data-testid="pair-state" style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 14, color: fb.tone === 'ok' ? T.ok : T.ink }}>
+                {fb.tone === 'wait' && <Mark T={T} size={20} anim="pulse" />}
+                <span>{fb.text}</span>
+              </div>
+            )
         ) : (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            {ghostBtn('receive with code', () => setEntryMode('receive'))}
-            {ghostBtn('pair with code', () => setEntryMode('pair'))}
-            {ghostBtn('create code', onGenerateCode, true)}
-            {ghostBtn('choose your own', () => setCustomizing(true))}
-          </div>
+          <span style={{ fontSize: 13, color: T.sub, lineHeight: 1.45 }}>
+            {mode === 'receive'
+              ? 'For a code from tunlion send, or from someone sending you a file here.'
+              : 'For a code from tunlion add on one of your computers. You choose whether to remember it.'}
+          </span>
         )}
       </div>
-    )
-  }
+    </div>
+  )
+}
 
-  // scope === "auto"
+// The minted code, shown big while it waits to be claimed.
+function CodeCard({ code, onDone, T, narrow, toast }) {
+  const lower = String(code || '').toLowerCase()
+  const link = (typeof window !== 'undefined' ? window.location.origin : 'https://tunlion.autumated.com') + '/#' + lower
+  const copy = (text, msg) => {
+    try {
+      navigator.clipboard.writeText(text).then(() => toast(msg), () => toast('Copy did not work here. Select the code and copy it.'))
+    } catch (e) { toast('Copy did not work here. Select the code and copy it.') }
+  }
   return (
-    <div style={{ ...wrap, flexDirection: 'column', flexWrap: 'nowrap', alignItems: 'stretch', gap: 12 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 13, color: T.text, whiteSpace: 'nowrap' }}>People near you</span>
-        {state.network && <Pill T={T}>{state.network}</Pill>}
-        <div style={{ marginLeft: 'auto' }}><LanChip localHelper={state.localHelper} T={T} /></div>
+    <div style={{ display: 'grid', gap: 12, padding: 16, borderRadius: 9, border: '1.5px solid ' + T.ink, background: T.surf }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <Mark T={T} size={22} anim="pulse" />
+        <span style={{ fontWeight: 600, fontSize: 15 }}>Waiting for the other device</span>
       </div>
-      {customizing ? (
-        <CustomCodeEntry onCreate={createCustom} onCancel={() => setCustomizing(false)} accent={accent} T={T} />
-      ) : entering ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }} data-testid={`code-entry-${entryMode}`}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
-              onSubmit={submitCode} onCancel={() => { setEntryMode(null); setCode('') }}
-              placeholder="ENTER CODE" accent={accent} T={T} />
-            {ghostBtn(entryMode === 'receive' ? 'receive' : 'pair', submitCode, true)}
-            {ghostBtn('cancel', () => { setEntryMode(null); setCode('') })}
-          </div>
-          {pairMsg}
-        </div>
-      ) : (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          {ghostBtn('receive with code', () => setEntryMode('receive'))}
-          {ghostBtn('pair with code', () => setEntryMode('pair'))}
-          {ghostBtn('create code', onGenerateCode, true)}
-          {ghostBtn('choose your own', () => setCustomizing(true))}
-        </div>
+      <span data-testid="room-code" style={{ font: '600 ' + (narrow ? 22 : 28) + 'px ' + FONT_MONO, letterSpacing: '.02em', wordBreak: 'break-all', userSelect: 'all' }}>{lower}</span>
+      <span style={{ fontSize: 13.5, color: T.sub, lineHeight: 1.45 }}>
+        Say it aloud or send the link. They enter it on tunlion.autumated.com, then you can swap files. The code works once.
+      </span>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+        <Btn small T={T} narrow={narrow} onClick={() => copy(lower, 'Code copied')}>Copy code</Btn>
+        <Btn small T={T} narrow={narrow} onClick={() => copy(link, 'Link copied. The code is after the #, so it never reaches a server.')}>Copy link</Btn>
+        <Btn small kind="ghost" T={T} narrow={narrow} onClick={onDone}>Done</Btn>
+      </div>
+    </div>
+  )
+}
+
+// One person or device in the room. A row, not a tile: name, status, route, and
+// buttons only for what this browser can do with it now.
+function PeerRow({ peer, onSendFiles, onOpenSheet, onOpenTerminal, staged, onSendStaged, T, narrow }) {
+  const ready = peer.status === 'ready'
+  const [over, setOver] = useState(false)
+  const inp = useRef(null)
+  const rowRef = useRef(null)
+  const known = !!peer.known
+  const displayName = peerName(peer)
+  const canSheet = ready && known && onOpenSheet
+  const canTerminal = ready && known && !!peer.shell && onOpenTerminal
+  const statusColor = ready ? T.ok : peer.status === 'connecting' || peer.status === 'away' ? T.warn : T.bad
+  const openSheet = () => onOpenSheet && onOpenSheet(peer, rowRef.current ? rowRef.current.getBoundingClientRect() : null)
+  const primary = () => {
+    if (!ready) return
+    if (canSheet) { openSheet(); return }
+    if (inp.current) inp.current.click()
+  }
+  return (
+    <div
+      ref={rowRef}
+      data-testid="peer-tile"
+      data-route={peer.route || ''}
+      role="button"
+      tabIndex={0}
+      aria-label={`${displayName}, ${PEER_STATUS_LABEL[peer.status] || peer.status}${peer.route === 'relayed' ? ', on relay' : ''}`}
+      className="tl-focus"
+      onClick={primary}
+      onKeyDown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); primary() } }}
+      onContextMenu={(e) => { if (canSheet) { e.preventDefault(); openSheet() } }}
+      onDragOver={(e) => { if (ready) { e.preventDefault(); setOver(true) } }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(e) => { e.preventDefault(); setOver(false); if (ready && e.dataTransfer.files.length) onSendFiles(peer.id, e.dataTransfer.files) }}
+      title={known ? 'Remembered: you two reconnect automatically, in any room, with no code.' : undefined}
+      style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '12px 14px', minHeight: 56,
+        borderRadius: 8, border: '1.5px solid ' + (over ? T.ink : T.rule), background: over ? T.soft : T.surf,
+        cursor: ready ? 'pointer' : 'default', opacity: ready ? 1 : 0.6, flexWrap: narrow ? 'wrap' : 'nowrap',
+      }}
+    >
+      <input ref={inp} type="file" multiple style={{ display: 'none' }} tabIndex={-1} aria-hidden="true"
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => { if (e.target.files.length) onSendFiles(peer.id, e.target.files); e.target.value = '' }} />
+      <span style={{ display: 'grid', gap: 3, minWidth: 0, flex: 1 }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flexWrap: 'wrap' }}>
+          <b style={{ fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%' }}>{displayName}</b>
+          {/* Relay honesty: when a peer is on relay its ⚠ chip is the most
+              important marker, so it comes first and never shrinks away. */}
+          {peer.route === 'relayed' && <RouteBadge route="relayed" T={T} />}
+          {known && <Tag T={T}>remembered</Tag>}
+          {peer.route && peer.route !== 'relayed' && <RouteBadge route={peer.route} T={T} />}
+        </span>
+        <span style={{ fontSize: 13, color: T.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <span style={{ color: statusColor }}>{PEER_STATUS_LABEL[peer.status] || peer.status}</span>
+          {/* the status line ALSO says "· via relay", so the warning survives
+              even if the chip is scrolled past or cut off */}
+          {peer.route === 'relayed' && <span style={{ color: T.warn }}> · via relay</span>}
+          {peer.lastSeen ? <span> · {peer.lastSeen}</span> : null}
+        </span>
+      </span>
+      {ready && (
+        <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
+          {staged && staged.length > 0 && (
+            <Btn small kind="pri" T={T} narrow={narrow} onClick={() => onSendStaged(peer.id)} ariaLabel={`send the picked file to ${displayName}`}>Send here</Btn>
+          )}
+          {canTerminal && (
+            <Btn small T={T} narrow={narrow} onClick={() => onOpenTerminal(peer)} ariaLabel={`open a shell on ${displayName}`} title={`open a shell on ${displayName}`}>Shell</Btn>
+          )}
+          {!(staged && staged.length) && (
+            <Btn small T={T} narrow={narrow} onClick={() => inp.current && inp.current.click()} ariaLabel={`send files to ${displayName}`}>Send files</Btn>
+          )}
+        </span>
       )}
     </div>
   )
 }
 
-// L1-a (PAKE v2): mirrors the C27 keep banner, but the device NAME is editable
-// before remembering. Holds the draft name in its own state (a hook can't live
-// in the parent's .map), seeded from the peer's display name; the human can edit
-// or decline. Accept stores under the chosen name (local-only, no wire ack).
-function PakeKeepBanner({ k, onAcceptPakeKeep, onDeclinePakeKeep, T, D, accent }) {
-  const [name, setName] = useState(k.name || 'device')
-  const accept = () => onAcceptPakeKeep?.(k.peerId, name)
+function Bar({ p, color, T }) {
   return (
-    <div style={{
-      border: '1px solid ' + accent, background: T.panel, padding: '10px ' + D.tilePad + 'px',
-      marginBottom: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
-    }}>
-      <span style={{ fontSize: 12, color: T.text, whiteSpace: 'nowrap' }}>Paired ✓ &nbsp;Remember</span>
-      <input value={name} onChange={(e) => setName(e.target.value)}
-        onKeyDown={(e) => { if (e.key === 'Enter') accept() }}
-        placeholder="device" style={{
-          font: 'inherit', fontSize: 12, padding: '6px 9px', flex: 1, minWidth: 120,
-          background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
-      <span style={{ fontSize: 12, color: T.text, whiteSpace: 'nowrap' }}>as a device? You'd reconnect automatically, no codes.</span>
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-        <button onClick={accept} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: accent, color: T.onAccent, border: '1px solid ' + accent }}>remember</button>
-        <button onClick={() => onDeclinePakeKeep?.(k.peerId)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>not now</button>
-      </span>
+    <div style={{ height: 8, borderRadius: 4, background: T.soft, overflow: 'hidden' }}>
+      <div style={{ width: Math.max(0, Math.min(1, p)) * 100 + '%', height: '100%', background: color, transition: 'width .3s linear' }} />
     </div>
   )
 }
 
-// Shell-surfacing Phase 2: the SESSIONS strip (idea E). A slim bar that only
-// renders when ≥1 terminal session is open or backgrounded (free to the 90% who
-// never open a shell). One chip per session: click to switch/reopen, ✕ to close
-// (which tears down its PTY). Desktop: a thin bar atop the peers column; mobile:
-// a pill row under the tab strip. `narrow` picks the spacing/size.
-function SessionsStrip({ sessions, activeId, onSwitch, onClose, narrow, T, accent }) {
+function TransferRow({ t, onAccept, onDecline, onSave, onClear, T, narrow }) {
+  const recv = t.direction === 'receive'
+  const sc = t.status === 'complete' ? T.ok : t.status === 'failed' ? T.bad : T.sub
+  const active = t.status === 'transferring'
+  return (
+    <div style={{ padding: '13px 0', borderBottom: '1px solid ' + T.rule, display: 'grid', gap: 8 }}>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'baseline' }}>
+        <span aria-hidden="true" style={{ color: T.sub, width: 14 }}>{recv ? '↓' : '↑'}</span>
+        <span style={{ flex: 1, fontSize: 15, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{t.name}</span>
+        <span style={{ fontSize: 13, color: T.sub, whiteSpace: 'nowrap' }}>{formatBytes(t.size)}</span>
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, color: T.sub }}>
+        <Tag T={T}>{fileTag(t)}</Tag>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{recv ? 'from ' : 'to '}{t.peerName}</span>
+        <span style={{ marginLeft: 'auto', color: sc, whiteSpace: 'nowrap' }}>{STATUS_LABEL[t.status] || t.status}{active ? ' ' + Math.round(t.progress * 100) + '%' : ''}</span>
+      </div>
+      {(active || t.status === 'failed' || t.status === 'paused') && <Bar p={t.progress} color={t.status === 'failed' ? T.bad : T.ink} T={T} />}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+        {recv && t.status === 'offered' && (<><Btn small kind="pri" T={T} narrow={narrow} onClick={() => onAccept(t.id)}>Accept</Btn><Btn small T={T} narrow={narrow} onClick={() => onDecline(t.id)}>Decline</Btn></>)}
+        {recv && t.status === 'complete' && <Btn small kind="pri" T={T} narrow={narrow} onClick={() => onSave(t.id)}>Save</Btn>}
+        {!recv && t.status === 'offered' && <span style={{ fontSize: 13, color: T.sub }}>Waiting for them to accept…</span>}
+        {t.status === 'paused' && <span style={{ fontSize: 13, color: T.sub }}>Paused. It resumes when you reconnect.</span>}
+        {(t.status === 'complete' || t.status === 'declined' || t.status === 'failed' || t.status === 'paused') && <Btn small kind="ghost" T={T} narrow={narrow} onClick={() => onClear(t.id)}>Clear</Btn>}
+      </div>
+    </div>
+  )
+}
+
+// L1-a (PAKE v2): after a code pairing, ask before remembering, with the name
+// editable. Holds the draft name in its own state, seeded from the peer's
+// display name. Accept stores under the chosen name (local-only, no wire ack).
+function PakeKeepBanner({ k, onAcceptPakeKeep, onDeclinePakeKeep, T, narrow }) {
+  const [name, setName] = useState(k.name || 'device')
+  const accept = () => onAcceptPakeKeep?.(k.peerId, name)
+  const id = 'tl-keep-' + k.peerId
+  return (
+    <div role="region" aria-label="Remember this device?" style={{ display: 'grid', gap: 10, padding: '14px 16px', borderRadius: 8, background: T.soft, border: '1.5px solid ' + T.ink }}>
+      <span style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 15 }}>
+        <Mark T={T} size={20} anim="knock" />
+        <span><b>Paired.</b> Remember this device? You would reconnect automatically, with no code.</span>
+      </span>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <label htmlFor={id} style={{ fontSize: 14, color: T.sub }}>Name</label>
+        <input id={id} value={name} onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') accept() }}
+          placeholder="device" className="tl-input"
+          style={{ font: '500 15px ' + FONT_SANS, minHeight: 44, padding: '0 12px', flex: 1, minWidth: 140, borderRadius: 7, background: T.surf, color: T.ink, border: '1.5px solid ' + T.ink }} />
+        <span style={{ display: 'flex', gap: 8 }}>
+          <Btn kind="pri" small T={T} narrow={narrow} onClick={accept}>Remember</Btn>
+          <Btn small T={T} narrow={narrow} onClick={() => onDeclinePakeKeep?.(k.peerId)}>Not now</Btn>
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// Shell sessions: a slim row that only renders when ≥1 terminal is open or
+// backgrounded. One chip per session: click to switch back, ✕ to close (which
+// tears down its PTY).
+function SessionsStrip({ sessions, activeId, onSwitch, onClose, T, narrow }) {
   if (!sessions.length) return null
   return (
-    <div
-      data-testid="sessions-strip"
-      style={{
-        flexShrink: 0, display: 'flex', alignItems: 'center', gap: narrow ? 6 : 8,
-        padding: narrow ? '8px 0 2px' : '0 0 12px', overflowX: 'auto',
-        WebkitOverflowScrolling: 'touch',
-      }}
-    >
-      <span style={{ fontSize: 9.5, letterSpacing: '.14em', color: T.dim, whiteSpace: 'nowrap', flexShrink: 0 }}>
-        SESSIONS
-      </span>
+    <div data-testid="sessions-strip" style={{ display: 'flex', alignItems: 'center', gap: 8, overflowX: 'auto', WebkitOverflowScrolling: 'touch', paddingBottom: 2 }}>
+      <span style={{ font: '600 11px ' + FONT_MONO, letterSpacing: '.1em', textTransform: 'uppercase', color: T.sub, flexShrink: 0 }}>Open shells</span>
       {sessions.map((s) => {
         const active = s.id === activeId
-        const name = s.peer.known || s.peer.verified || s.peer.name
+        const name = peerName(s.peer)
         return (
-          <span
-            key={s.id}
-            data-testid="session-chip"
-            data-session-active={active ? '1' : '0'}
-            onClick={() => onSwitch(s.id)}
-            title={active ? `${name} (showing)` : `switch to ${name}`}
-            style={{
-              flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 7,
-              cursor: 'pointer', whiteSpace: 'nowrap', userSelect: 'none',
-              padding: '5px 7px 5px 9px', fontSize: 11.5,
-              border: '1px solid ' + (active ? accent : T.line),
-              background: active ? (T.mode === 'light' ? 'rgba(12,138,96,.10)' : 'rgba(124,246,200,.10)') : T.panel,
-              color: active ? accent : T.sub,
-              transition: 'border-color .12s, color .12s, background .12s',
-            }}
-          >
-            <span style={{ width: 7, height: 7, background: active ? accent : T.dim, display: 'block', flexShrink: 0, boxShadow: active ? '0 0 7px ' + accent : 'none' }} />
-            <span style={{ maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</span>
-            <button
-              data-testid="session-close"
-              onClick={(e) => { e.stopPropagation(); onClose(s.id) }}
-              title={`close terminal on ${name}`}
-              aria-label={`close terminal on ${name}`}
-              style={{
-                flexShrink: 0, width: 18, height: 18, lineHeight: '16px', padding: 0,
-                cursor: 'pointer', font: 'inherit', fontSize: 13,
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                border: '1px solid transparent', background: 'transparent', color: T.dim,
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.color = T.bad; e.currentTarget.style.borderColor = T.bad }}
-              onMouseLeave={(e) => { e.currentTarget.style.color = T.dim; e.currentTarget.style.borderColor = 'transparent' }}
-            >✕</button>
+          <span key={s.id} data-testid="session-chip" data-session-active={active ? '1' : '0'}
+            style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', borderRadius: 7, border: '1.5px solid ' + T.ink, background: active ? T.ink : T.surf, color: active ? T.inv : T.ink }}>
+            <button type="button" onClick={() => onSwitch(s.id)} className="tl-focus" title={`show the shell on ${name}`}
+              style={{ font: '600 14px ' + FONT_SANS, minHeight: narrow ? 44 : 36, padding: '0 6px 0 12px', border: 0, background: 'none', color: 'inherit', cursor: 'pointer', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</button>
+            <button type="button" data-testid="session-close" onClick={() => onClose(s.id)} className="tl-focus"
+              aria-label={`close the shell on ${name}`} title={`close the shell on ${name}`}
+              style={{ minWidth: narrow ? 44 : 32, minHeight: narrow ? 44 : 36, border: 0, background: 'none', color: 'inherit', cursor: 'pointer', fontSize: 15 }}>✕</button>
           </span>
         )
       })}
@@ -773,14 +629,11 @@ function SessionsStrip({ sessions, activeId, onSwitch, onClose, narrow, T, accen
 }
 
 // Track the VISUAL viewport (the actually-visible region), not the layout
-// viewport. On mobile the layout viewport (window.innerHeight) is taller than
-// what is on screen whenever the URL bar is showing or the soft keyboard is up,
-// so a position:fixed; inset:0 box (which sizes to the LAYOUT viewport) hangs
-// below the fold and the browser lets you PAN the whole fixed surface to reach
-// it: the "scroll like an image" symptom. Pinning the terminal overlay to these
-// numbers makes it exactly fill what is visible, so nothing pans. width/height
-// are the visible size; left/top are visualViewport.offsetLeft/Top so the box
-// follows the visible region (e.g. when a pinch leaves the page mid-zoom).
+// viewport. On mobile the layout viewport is taller than what is on screen
+// whenever the URL bar is showing or the soft keyboard is up, so a fixed inset:0
+// box hangs below the fold and can be panned. Pinning the terminal overlay to
+// these numbers makes it exactly fill what is visible, so nothing pans, and the
+// key bar at its bottom sits right above the keyboard.
 function useVisualViewport() {
   const read = () => {
     const vv = (typeof window !== 'undefined') && window.visualViewport
@@ -806,12 +659,9 @@ function useVisualViewport() {
   return vp
 }
 
-// Scope pinch-zoom suppression to the shell-terminal view ONLY. When a terminal
-// session is on screen we swap the viewport meta to disallow user scaling, so a
-// pinch can no longer turn the terminal into a zoomable/pannable image (the core
-// "scroll like an image" symptom on real phones). On close we RESTORE the
-// original meta, so accessibility zoom on the marketing/content pages is never
-// broken. No-ops where there is no meta tag.
+// Suppress pinch-zoom only while a shell is on screen (so a pinch cannot turn
+// the terminal into a pannable image), and restore the page's viewport meta on
+// close so accessibility zoom elsewhere is never broken.
 function useLockZoomWhile(active) {
   useEffect(() => {
     if (!active) return
@@ -823,40 +673,61 @@ function useLockZoomWhile(active) {
   }, [active])
 }
 
+// One toast at a time: a new one replaces the old. On phones it sits above the
+// bottom nav so it never covers the nav or the button that raised it.
+function useToast() {
+  const [toast, setToast] = useState(null)
+  const timer = useRef(null)
+  const show = useCallback((msg) => {
+    if (timer.current) clearTimeout(timer.current)
+    const id = Date.now() + Math.random()
+    setToast({ msg, id })
+    timer.current = setTimeout(() => setToast((t) => (t && t.id === id ? null : t)), 3200)
+  }, [])
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current) }, [])
+  return [toast, show]
+}
+
 export default function Tunlion(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
     onPairWithCode, onReceiveWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
-    onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, onRenameDevice, ui = {} } = props
-  const mode = ui.theme === 'light' ? 'light' : 'dark'
-  const accentSet = ACCENTS[ui.accent] || ACCENTS.green
-  const accent = accentSet[mode === 'light' ? 'l' : 'd']
-  const T = makeTheme(mode, accent)
-  const D = DENS[ui.density] || DENS.airy
-  const font = MONOS[ui.font] || ui.font || MONOS.jetbrains
-  const cols = ui.columns && ui.columns !== 'auto' ? 'repeat(' + ui.columns + ',minmax(0,1fr))' : 'repeat(auto-fill,minmax(150px,1fr))'
-
-  const [copied, fireCopy] = useCopied()
-  const hasPeers = state.peers.length > 0
+    onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, onRenameDevice, initialCode, ui = {} } = props
+  const mode = ui.theme === 'light' || ui.theme === 'dark' ? ui.theme : systemMode()
+  const T = makeTheme(mode)
+  const TT = terminalTheme()
+  const peers = state.peers || []
+  const transfers = state.transfers || []
+  const knownDevices = state.knownDevices || []
   const onToggleTheme = ui.onToggleTheme
 
+  const [toast, showToast] = useToast()
+  const [screen, setScreen] = useState('home')
+
   // Responsive: measure our own width so the same component works on desktop
-  // and inside a phone frame. ui.forceMobile lets a host pin the mobile layout.
+  // and inside a phone frame. ui.forceMobile lets a host pin the phone layout.
   const rootRef = useRef(null)
   const [narrow, setNarrow] = useState(!!ui.forceMobile)
-  const [tab, setTab] = useState('peers')
-  // Shell-surfacing Phase 2: a LIST of open terminal sessions (was a single
-  // shellPeer). Each session's WebTerminal stays MOUNTED for its lifetime,
-  // backgrounding only hides the overlay (activeSessionId = null), it does NOT
-  // unmount (unmount → link.closePty() kills the PTY). Only an explicit close
-  // unmounts a session, tearing down its PTY. Scrollback survives backgrounding
-  // because the instance is never remounted.
+  useEffect(() => {
+    if (ui.forceMobile) { setNarrow(true); return }
+    const el = rootRef.current
+    if (!el) return
+    const measure = () => setNarrow(el.clientWidth < 720)
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [ui.forceMobile])
+
+  // Shell sessions: a LIST of open terminals. Each session's WebTerminal stays
+  // MOUNTED for its lifetime; hiding only hides the overlay (activeSessionId =
+  // null), it does NOT unmount (unmount → link.closePty() kills the PTY). Only an
+  // explicit close unmounts a session. Scrollback survives hiding.
   const [sessions, setSessions] = useState([]) // [{ id, peer }]
   const [activeSessionId, setActiveSessionId] = useState(null)
   const sessionSeq = useRef(0)
-
   const openSession = useCallback((peer) => {
     setSessions((prev) => {
-      // One session per peer: re-focus an existing one instead of duplicating.
       const existing = prev.find((s) => s.peer.id === peer.id)
       if (existing) { setActiveSessionId(existing.id); return prev }
       const id = 'sess-' + (++sessionSeq.current)
@@ -871,26 +742,21 @@ export default function Tunlion(props) {
     setActiveSessionId((cur) => (cur === id ? null : cur))
   }, [])
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null
-  // Pin the terminal overlay to the visual viewport and suppress pinch-zoom only
-  // while a session is actually on screen (mobile "scroll like an image" fix).
   const vp = useVisualViewport()
   useLockZoomWhile(!!activeSession)
-  // model H: the per-device actions sheet. { peer, rect }: rect anchors the
-  // desktop popover near the invoking tile (null = a sensible default position).
+
+  // The per-device sheet. { peer, rect }: rect anchors the desktop popover.
   const [sheet, setSheet] = useState(null)
   const openSheet = useCallback((peer, rect) => setSheet({ peer, rect }), [])
   const closeSheet = useCallback(() => setSheet(null), [])
-  // Idea C: the ⌘K / Ctrl+K command palette. A global hotkey toggles it; the
-  // overlay itself owns navigation/close. Opening the palette dismisses the
-  // sheet so the two surfaces never stack.
+
+  // ⌘K / Ctrl+K command palette. Opening it dismisses the sheet.
   const [paletteOpen, setPaletteOpen] = useState(false)
   const openPalette = useCallback(() => { setSheet(null); setPaletteOpen(true) }, [])
   const closePalette = useCallback(() => setPaletteOpen(false), [])
-  // The palette's "Pair with code" has no inline field; it asks the always-
-  // visible DiscoveryBar to open ITS code input (which owns the cursor-safe
-  // entry). A monotonic nonce is the signal; the bar opens on each new value.
+  // The palette's "Pair with code" asks the code box to focus in remember mode.
   const [pairEntryNonce, setPairEntryNonce] = useState(0)
-  const requestPairEntry = useCallback(() => { closePalette(); setPairEntryNonce((n) => n + 1) }, [closePalette])
+  const requestPairEntry = useCallback(() => { closePalette(); setScreen('home'); setPairEntryNonce((n) => n + 1) }, [closePalette])
   useEffect(() => {
     const onKey = (e) => {
       if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
@@ -902,156 +768,286 @@ export default function Tunlion(props) {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
   // Keep the open sheet's peer fresh as the roster updates (status/route/shell).
-  const sheetPeer = sheet ? (state.peers.find((p) => p.id === sheet.peer.id) || sheet.peer) : null
-  useEffect(() => {
-    if (ui.forceMobile) {
-      setNarrow(true)
+  const sheetPeer = sheet ? (peers.find((p) => p.id === sheet.peer.id) || sheet.peer) : null
+
+  // Files picked from the drop zone before choosing who gets them.
+  const [staged, setStaged] = useState([])
+  const pickRef = useRef(null)
+  const [dropOver, setDropOver] = useState(false)
+  const readyPeers = peers.filter((p) => p.status === 'ready')
+  const stageFiles = (files) => {
+    const list = Array.from(files || [])
+    if (!list.length) return
+    if (readyPeers.length === 1) {
+      onSendFiles(readyPeers[0].id, list)
+      showToast(`Sending to ${peerName(readyPeers[0])}`)
       return
     }
-    const el = rootRef.current
-    if (!el) return
-    const measure = () => setNarrow(el.clientWidth < 720)
-    measure()
-    if (typeof ResizeObserver === 'undefined') return
-    const ro = new ResizeObserver(measure)
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [ui.forceMobile])
-
-  // ⌘K affordance: discoverable on mobile (no hardware shortcut) and a hint on
-  // desktop. Opens the same palette the hotkey toggles.
-  const paletteBtn = (
-    <button
-      onClick={openPalette}
-      data-testid="cmd-open"
-      title="Quick launcher (⌘K)"
-      aria-label="Open command palette"
-      style={{
-        font: 'inherit', fontSize: 11, padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
-        display: 'flex', alignItems: 'center', gap: 5,
-        background: 'transparent', color: T.sub, border: '1px solid ' + T.line,
-      }}
-    >
-      <span style={{ color: accent, fontWeight: 700 }}>⌘K</span>
-    </button>
-  )
-
-  const themeBtn = onToggleTheme && (
-    <button onClick={onToggleTheme} title="Toggle theme" style={{ font: 'inherit', fontSize: 11, padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
-      background: 'transparent', color: T.sub, border: '1px solid ' + T.line }}>
-      {mode === 'light' ? '◑ dark' : '◐ light'}
-    </button>
-  )
-
-  const copyBtn = (label) => (
-    <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '6px 12px', cursor: 'pointer', whiteSpace: 'nowrap',
-      background: copied ? accent : 'transparent', color: copied ? T.onAccent : accent, border: '1px solid ' + accent, transition: 'background .12s,color .12s' }}>
-      {copied ? 'copied ✓' : label}
-    </button>
-  )
-
-  const emptyPeers = (
-    <div style={{ border: '1px dashed ' + T.line, padding: narrow ? 20 : 28, color: T.dim, maxWidth: 560 }}>
-      <div style={{ color: T.text, fontSize: 15, marginBottom: 8 }}>No threads yet</div>
-      <div style={{ fontSize: 12, lineHeight: 1.6, marginBottom: 18 }}>Share the room link to spin up a thread. Anyone who opens it joins room {state.roomId} and appears here.</div>
-      <div style={{ display: 'flex', gap: 8 }}>
-        <span style={{ flex: 1, fontSize: 11, color: accent, border: '1px solid ' + T.line, padding: '9px 11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: T.panel }}>{state.roomUrl}</span>
-        <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '0 14px', cursor: 'pointer', background: 'transparent', color: accent, border: '1px solid ' + accent }}>{copied ? 'copied ✓' : 'copy'}</button>
-      </div>
-    </div>
-  )
-
-  const peerGrid = (gridCols) =>
-    hasPeers ? (
-      <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: D.gap }}>
-        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} onOpenSheet={openSheet} onOpenTerminal={openSession} narrow={narrow} T={T} D={D} accent={accent} />)}
-      </div>
-    ) : (
-      emptyPeers
-    )
-
-  const transfersList =
-    state.transfers.length === 0 ? (
-      <div style={{ fontSize: 12, color: T.faint, padding: '24px 0' }}>No transfers yet.</div>
-    ) : (
-      state.transfers.map((t) => <TransferRow key={t.id} t={t} onAccept={onAccept} onDecline={onDecline} onSave={onSave} onClear={onClear} T={T} D={D} accent={accent} />)
-    )
-
-  // C27: remembering is a trust grant; surface each pair-keep offer as an
-  // explicit question; the answer flows back so a declined sender forgets too.
-  const keepBanners = (state.pendingKeeps || []).map((k) => (
-    <div key={k.peerId} style={{
-      border: '1px solid ' + accent, background: T.panel, padding: '10px ' + D.tilePad + 'px',
-      marginBottom: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
-    }}>
-      <span style={{ fontSize: 12, color: T.text }}>
-        <b>{k.name}</b> asks to be remembered on this device, you'd reconnect automatically, no codes
-      </span>
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-        <button onClick={() => onAcceptKeep?.(k.peerId)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: accent, color: T.onAccent, border: '1px solid ' + accent }}>remember</button>
-        <button onClick={() => onDeclineKeep?.(k.peerId)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>not now</button>
-      </span>
-    </div>
-  ))
-
-  // L1-a: v2 PAKE pairings completed: K is agreed, now ask before remembering
-  // (with an editable name). Kept separate from v1 keepBanners on purpose.
-  const pakeKeepBanners = (state.pendingPakeKeep || []).map((k) => (
-    <PakeKeepBanner key={k.peerId} k={k} onAcceptPakeKeep={onAcceptPakeKeep} onDeclinePakeKeep={onDeclinePakeKeep} T={T} D={D} accent={accent} />
-  ))
-
-  const discovery = (
-    <>
-      {keepBanners}
-      {pakeKeepBanners}
-      <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onReceiveWithCode={onReceiveWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
-        onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} openEntryNonce={pairEntryNonce} T={T} D={D} accent={accent} />
-    </>
-  )
-
-  const rootStyle = {
-    position: 'absolute', inset: 0, background: T.bg, color: T.text, font: '13px ' + font,
-    display: 'flex', flexDirection: 'column', overflow: 'hidden',
-    backgroundImage: 'linear-gradient(' + T.grid + ' 1px,transparent 1px),linear-gradient(90deg,' + T.grid + ' 1px,transparent 1px)',
-    backgroundSize: '34px 34px',
+    setStaged(list)
+  }
+  const sendStaged = (peerId) => {
+    if (!staged.length) return
+    onSendFiles(peerId, staged)
+    const p = peers.find((x) => x.id === peerId)
+    showToast(p ? `Sending to ${peerName(p)}` : 'Sending')
+    setStaged([])
   }
 
-  // web-shell: terminals render as a full-window overlay (portal to body) so it
-  // works in both the desktop and mobile layouts from one place. Disclosure
-  // stays intact; a session only exists once a shell button is clicked.
-  //
-  // Shell-surfacing Phase 2: EVERY open session's WebTerminal is mounted here at
-  // once; only the active one is visible (the rest are display:none). This is
-  // load-bearing: keeping a backgrounded session mounted preserves its live PTY
-  // (unmount calls link.closePty()) and its scrollback. The whole portal only
-  // exists while ≥1 session is open; when none is active the overlay is hidden
-  // (pointerEvents:none) but the sessions stay mounted underneath.
+  const [customizing, setCustomizing] = useState(false)
+  const createCustom = (typed) => { setCustomizing(false); onGenerateCode && onGenerateCode(typed) }
+
+  const scope = state.roomScope || 'auto'
+  const waiting = scope === 'code' || state.pairStatus === 'pairing' || peers.some((p) => p.status === 'connecting')
+  const asks = (state.pendingKeeps || []).length + (state.pendingPakeKeep || []).length
+
+  // ---- header ---------------------------------------------------------------
+  const navItems = [['home', 'Home'], ['devices', 'Devices']]
+  const navBtn = ([k, label]) => {
+    const cur = screen === k
+    return (
+      <button key={k} type="button" onClick={() => setScreen(k)} aria-current={cur ? 'page' : undefined} className="tl-focus"
+        style={{
+          border: 0, background: 'none', cursor: 'pointer', font: (cur ? '600 ' : '500 ') + (narrow ? 13 : 14) + 'px ' + FONT_SANS,
+          color: cur ? T.ink : T.sub, padding: narrow ? '4px 0' : '8px 10px', display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center', gap: 3, flex: narrow ? 1 : 'none', minHeight: 44, borderRadius: 6,
+        }}>
+        {narrow && <span aria-hidden="true" style={{ width: 22, height: 3, borderRadius: 2, background: cur ? T.ink : 'transparent' }} />}
+        <span>{label}{k === 'devices' && knownDevices.length > 0 && <span style={{ marginLeft: 6, font: '600 11px ' + FONT_MONO, color: T.sub }}>{knownDevices.length}</span>}</span>
+      </button>
+    )
+  }
+  const header = (
+    <header style={{ display: 'flex', alignItems: 'center', gap: narrow ? 10 : 16, padding: narrow ? '8px 16px' : '12px 24px', borderBottom: '1px solid ' + T.rule, flexShrink: 0, background: T.bg }}>
+      <button type="button" onClick={() => setScreen('home')} aria-label="tunlion home" className="tl-focus"
+        style={{ display: 'flex', alignItems: 'center', gap: 9, border: 0, background: 'none', cursor: 'pointer', padding: 0, color: T.ink, minHeight: 44 }}>
+        <Mark T={T} size={narrow ? 24 : 26} anim={waiting ? 'pulse' : undefined} />
+        <span style={{ font: '600 20px/1 ' + FONT_SANS, letterSpacing: '-.025em' }}>tunlion</span>
+      </button>
+      {!narrow && <nav aria-label="Main" style={{ display: 'flex', gap: 4, marginLeft: 12 }}>{navItems.map(navBtn)}</nav>}
+      <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <RelayBanner peers={peers} T={T} />
+        {!narrow && (
+          <span role="status" style={{ fontSize: 13, color: state.connected ? T.sub : T.bad, whiteSpace: 'nowrap' }}>
+            {state.connected ? 'online' : 'offline, reconnecting'}
+          </span>
+        )}
+        <button type="button" onClick={openPalette} data-testid="cmd-open" title="Quick launcher (Ctrl+K)" aria-label="Open the quick launcher" className="tl-focus"
+          style={{ minHeight: 44, minWidth: 44, border: '1px solid ' + T.rule, background: 'none', color: T.sub, borderRadius: 6, padding: '0 10px', font: '500 13px ' + FONT_MONO, cursor: 'pointer' }}>⌘K</button>
+        {onToggleTheme && (
+          <button type="button" onClick={onToggleTheme} className="tl-focus" aria-label={mode === 'light' ? 'Switch to dark theme' : 'Switch to light theme'}
+            style={{ minHeight: 44, minWidth: 44, border: '1px solid ' + T.rule, background: 'none', color: T.sub, borderRadius: 6, padding: '0 10px', font: '500 13px ' + FONT_MONO, cursor: 'pointer' }}>
+            {mode === 'light' ? 'Dark' : 'Light'}
+          </button>
+        )}
+      </span>
+    </header>
+  )
+
+  // ---- pieces of Home -------------------------------------------------------
+  const keepBanners = (state.pendingKeeps || []).map((k) => (
+    <div key={k.peerId} role="region" aria-label="Remember this device?" style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderRadius: 8, background: T.soft, border: '1.5px solid ' + T.ink, flexWrap: 'wrap' }}>
+      <Mark T={T} size={20} anim="knock" />
+      <span style={{ flex: 1, minWidth: 200, fontSize: 15 }}><b>{k.name}</b> asks to be remembered on this browser. You would reconnect automatically, with no code.</span>
+      <span style={{ display: 'flex', gap: 8 }}>
+        <Btn kind="pri" small T={T} narrow={narrow} onClick={() => onAcceptKeep?.(k.peerId)}>Remember</Btn>
+        <Btn small T={T} narrow={narrow} onClick={() => onDeclineKeep?.(k.peerId)}>Not now</Btn>
+      </span>
+    </div>
+  ))
+  const pakeKeepBanners = (state.pendingPakeKeep || []).map((k) => (
+    <PakeKeepBanner key={k.peerId} k={k} onAcceptPakeKeep={onAcceptPakeKeep} onDeclinePakeKeep={onDeclinePakeKeep} T={T} narrow={narrow} />
+  ))
+
+  const sessionChips = sessions.map((s) => ({
+    id: s.id,
+    peer:
+      (s.peer.uid && peers.find((p) => p.uid && p.uid === s.peer.uid)) ||
+      peers.find((p) => p.id === s.peer.id) ||
+      s.peer,
+  }))
+
+  const dropZone = (
+    <button type="button" onClick={() => pickRef.current && pickRef.current.click()} className="tl-focus"
+      onDragOver={(e) => { e.preventDefault(); setDropOver(true) }}
+      onDragLeave={() => setDropOver(false)}
+      onDrop={(e) => { e.preventDefault(); setDropOver(false); stageFiles(e.dataTransfer.files) }}
+      style={{
+        font: 'inherit', background: dropOver ? T.soft : 'transparent', width: '100%', border: '1.5px dashed ' + (dropOver ? T.ink : T.sub), borderRadius: 9,
+        minHeight: narrow ? 96 : 116, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 4,
+        cursor: 'pointer', color: T.sub, fontSize: 14, textAlign: 'center', padding: 12,
+      }}>
+      <span style={{ color: T.ink, fontWeight: 600, fontSize: 15 }}>Drop a file to send</span>
+      <span>or {narrow ? 'tap' : 'click'} to pick one</span>
+    </button>
+  )
+
+  const stagedCard = staged.length > 0 && (
+    <div role="status" style={{ display: 'grid', gap: 10, padding: '12px 14px', borderRadius: 8, border: '1.5px solid ' + T.ink, background: T.surf }}>
+      <span style={{ fontSize: 15 }}>
+        <b>{staged.length === 1 ? staged[0].name : staged.length + ' files'}</b>
+        <span style={{ color: T.sub }}> · {formatBytes(staged.reduce((n, f) => n + (f.size || 0), 0))} ready to send</span>
+      </span>
+      <span style={{ fontSize: 14, color: T.sub, lineHeight: 1.45 }}>
+        {readyPeers.length
+          ? 'Choose who gets it below: Send here.'
+          : 'Nobody is here yet. Create a code, give it to the other person, and send once they appear below.'}
+      </span>
+      <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {!readyPeers.length && scope !== 'code' && <Btn small kind="pri" T={T} narrow={narrow} onClick={() => onGenerateCode && onGenerateCode()}>Create a code</Btn>}
+        <Btn small kind="ghost" T={T} narrow={narrow} onClick={() => setStaged([])}>Clear</Btn>
+      </span>
+    </div>
+  )
+
+  // Where this browser is: the room it joined, and how others reach it.
+  const roomLine = (() => {
+    if (scope === 'pair') {
+      const ps = state.pairStatus
+      const done = ps === 'paired' || ps === 'connected'
+      return done ? 'Connected privately with a one-time code. The code is used up.' : 'Private room for a one-time code.'
+    }
+    if (scope === 'link') return 'Anyone who opens this room link joins you here.'
+    return state.network ? `People near you on the same network (${state.network}) show up here.` : 'People near you show up here.'
+  })()
+
+  const roomBlock = (
+    <div style={{ display: 'grid', gap: 10 }}>
+      <Section T={T} right={<LanChip localHelper={state.localHelper} T={T} />}>Here now · {peers.length}</Section>
+      <span style={{ fontSize: 13.5, color: T.sub, lineHeight: 1.45 }}>{roomLine}</span>
+      {scope === 'link' && state.roomUrl && (
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span style={{ flex: 1, minWidth: 180, font: '500 13px ' + FONT_MONO, color: T.ink, border: '1px solid ' + T.rule, borderRadius: 6, padding: '10px 12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: T.surf }}>{state.roomUrl}</span>
+          <Btn small T={T} narrow={narrow} onClick={() => { onCopyRoomLink && onCopyRoomLink(); showToast('Room link copied') }}>Copy room link</Btn>
+        </div>
+      )}
+      {(scope === 'pair' || scope === 'link') && onUseAutoRoom && (
+        <div><Btn small kind="ghost" T={T} narrow={narrow} onClick={onUseAutoRoom}>Back to people near you</Btn></div>
+      )}
+      {peers.length ? (
+        <div style={{ display: 'grid', gap: 8 }}>
+          {peers.map((p) => (
+            <PeerRow key={p.id} peer={p} onSendFiles={onSendFiles} onOpenSheet={openSheet} onOpenTerminal={openSession}
+              staged={staged} onSendStaged={sendStaged} T={T} narrow={narrow} />
+          ))}
+        </div>
+      ) : (
+        <div style={{ fontSize: 14, color: T.sub, padding: '14px 16px', borderRadius: 8, border: '1px dashed ' + T.rule }}>
+          Nobody here yet. Enter a code above, create one, or open tunlion on another device on this network.
+        </div>
+      )}
+    </div>
+  )
+
+  const transfersBlock = transfers.length > 0 && (
+    <div>
+      <Section T={T}>Transfers · {transfers.length}</Section>
+      {transfers.map((t) => <TransferRow key={t.id} t={t} onAccept={onAccept} onDecline={onDecline} onSave={onSave} onClear={onClear} T={T} narrow={narrow} />)}
+    </div>
+  )
+
+  const page = (children) => (
+    <div style={{ padding: narrow ? '18px 16px 28px' : '32px 40px 40px', maxWidth: 720, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>{children}</div>
+  )
+
+  const home = page(
+    <>
+      <div style={{ display: 'grid', gap: 6 }}>
+        <h1 style={{ margin: 0, fontSize: narrow ? 24 : 30, lineHeight: 1.15, letterSpacing: '-.015em', fontWeight: 600, textWrap: 'balance' }}>
+          {knownDevices.length ? 'Welcome back' : 'Connect to a device'}
+        </h1>
+        <p style={{ margin: 0, fontSize: 15, lineHeight: 1.5, color: T.sub }}>Enter a code from another device, or drop a file to send. Nothing to install, nothing uploaded.</p>
+      </div>
+      {keepBanners}
+      {pakeKeepBanners}
+      <SessionsStrip sessions={sessionChips} activeId={activeSessionId} onSwitch={switchSession} onClose={closeSession} T={T} narrow={narrow} />
+      {scope === 'code' && state.roomCode
+        ? <CodeCard code={state.roomCode} onDone={onUseAutoRoom || (() => {})} T={T} narrow={narrow} toast={showToast} />
+        : <CodeBox state={state} onPairWithCode={onPairWithCode || (() => {})} onReceiveWithCode={onReceiveWithCode || (() => {})}
+            initialCode={initialCode} openEntryNonce={pairEntryNonce} T={T} narrow={narrow} />}
+      <input ref={pickRef} type="file" multiple style={{ display: 'none' }} tabIndex={-1} aria-hidden="true"
+        onChange={(e) => { stageFiles(e.target.files); e.target.value = '' }} />
+      {dropZone}
+      {stagedCard}
+      {scope !== 'code' && !(staged.length > 0 && !readyPeers.length) && (customizing
+        ? <CustomCodeEntry onCreate={createCustom} onCancel={() => setCustomizing(false)} T={T} narrow={narrow} />
+        : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <Btn T={T} narrow={narrow} onClick={() => onGenerateCode && onGenerateCode()} testid="create-code">Create a code</Btn>
+            <Btn kind="ghost" T={T} narrow={narrow} onClick={() => setCustomizing(true)}>Choose your own words</Btn>
+            <span style={{ fontSize: 13.5, color: T.sub, flexBasis: narrow ? '100%' : 'auto' }}>so someone in another browser can connect to this one and swap files</span>
+          </div>
+        ))}
+      {roomBlock}
+      {transfersBlock}
+    </>,
+  )
+
+  // ---- Devices --------------------------------------------------------------
+  const deviceRows = knownDevices.map((d) => {
+    const live = peers.find((p) => p.known === d.name)
+    const online = !!live && live.status === 'ready'
+    const peerForSheet = live || { id: 'known:' + d.name, name: d.name, known: d.name, status: 'failed' }
+    const caps = Array.isArray(d.caps) ? d.caps : ['transfer']
+    const what = caps.map((c) => (c === 'transfer' ? 'files' : c)).join(', ')
+    return (
+      <div key={d.name} data-testid="device-row" role="button" tabIndex={0} className="tl-focus"
+        aria-label={`${d.name}, ${online ? 'online' : 'offline'}`}
+        onClick={() => openSheet(peerForSheet, null)}
+        onKeyDown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); openSheet(peerForSheet, null) } }}
+        style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '13px 0', minHeight: 56, borderBottom: '1px solid ' + T.rule, cursor: 'pointer' }}>
+        <span style={{ display: 'grid', gap: 3, minWidth: 0 }}>
+          <b style={{ fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.name}</b>
+          <span style={{ fontSize: 13, color: T.sub }}>remembered · {what}{d.addedAt ? ' · since ' + new Date(d.addedAt).toLocaleDateString() : ''}</span>
+        </span>
+        <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
+          {online && live.shell && <Btn small T={T} narrow={narrow} onClick={() => openSession(live)} ariaLabel={`open a shell on ${d.name}`}>Shell</Btn>}
+          {online ? (live.route === 'relayed' ? <RouteBadge route="relayed" T={T} /> : <Tag tone="ok" T={T}>{live.route === 'local' ? 'LAN' : 'online'}</Tag>) : <Tag T={T}>offline</Tag>}
+        </span>
+      </div>
+    )
+  })
+  const devices = page(
+    <>
+      <h1 style={{ margin: 0, fontSize: narrow ? 24 : 30, lineHeight: 1.15, letterSpacing: '-.015em', fontWeight: 600 }}>Devices</h1>
+      {knownDevices.length ? (
+        <div>
+          <Section T={T}>Remembered on this browser</Section>
+          {deviceRows}
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gap: 12 }}>
+          <p style={{ margin: 0, fontSize: 15, lineHeight: 1.5, color: T.sub }}>No devices yet. On one of your computers run <code style={{ fontFamily: FONT_MONO }}>tunlion add</code>, enter the code it shows on Home with Remember a device, then choose Remember.</p>
+          <div><Btn T={T} narrow={narrow} onClick={() => setScreen('home')}>Enter a code</Btn></div>
+        </div>
+      )}
+      <p style={{ margin: 0, fontSize: 13, lineHeight: 1.5, color: T.sub }}>
+        Remembered devices are stored only in this browser. Clearing site data forgets them. What each device lets this browser do is decided on that device.
+      </p>
+    </>,
+  )
+
+  // ---- overlays -------------------------------------------------------------
+  // Terminals render as a full-window overlay (portal to body) pinned to the
+  // visual viewport, so on a phone the shell takes the whole screen (no header,
+  // no nav) and its key bar sits right above the soft keyboard. EVERY open
+  // session's WebTerminal is mounted at once; only the active one is visible.
+  // Keeping a hidden session mounted preserves its live PTY and scrollback.
   const terminalOverlay = sessions.length
     ? createPortal(
         <div data-testid="terminal-overlay" style={{
-          // Pinned to the VISUAL viewport (not inset:0, which is the LAYOUT
-          // viewport): left/top track the visible region's offset and width/
-          // height are exactly the visible size, so on mobile the box never
-          // extends below the fold (no pannable surface) and follows the screen
-          // when the URL bar / soft keyboard changes the visible height.
-          // overflow:hidden so no descendant can introduce a pannable overflow,
-          // and touchAction:none + overscrollBehavior:none so a touch that is not
-          // consumed by the terminal cannot pan or bounce this overlay either.
-          position: 'fixed', zIndex: 4000, background: T.bg,
+          position: 'fixed', zIndex: 4000, background: TT.bg,
           left: vp.left, top: vp.top, width: vp.width, height: vp.height,
           overflow: 'hidden', touchAction: 'none', overscrollBehavior: 'none',
           display: activeSession ? 'block' : 'none',
         }}>
           {sessions.map((s) => {
             const visible = s.id === activeSessionId
-            // Keep peer metadata (name/route) fresh as the roster updates. Match
-            // by stable uid first (the sid changes across a reconnect), then id.
             const peer =
-              (s.peer.uid && state.peers.find((p) => p.uid === s.peer.uid)) ||
-              state.peers.find((p) => p.id === s.peer.id) ||
+              (s.peer.uid && peers.find((p) => p.uid === s.peer.uid)) ||
+              peers.find((p) => p.id === s.peer.id) ||
               s.peer
-            // #4: resolve the CURRENT link by stable uid so a reconnect (new sid)
-            // still hands WebTerminal a live link to reattach over; fall back to id.
+            // Resolve the CURRENT link by stable uid so a reconnect (new sid)
+            // still hands WebTerminal a live link to reattach over.
             const link =
               (peer.uid && state.getLinkByUid && state.getLinkByUid(peer.uid)) ||
               (state.getLink && state.getLink(peer.id)) ||
@@ -1060,17 +1056,18 @@ export default function Tunlion(props) {
               <div key={s.id} data-testid="session-pane" data-session-pane-id={s.id}
                 style={{ position: 'absolute', inset: 0, display: visible ? 'block' : 'none' }}>
                 {link
-                  ? <WebTerminal link={link} peerName={peer.name} route={peer.route}
-                      T={T} accent={accent} font={font} instanceId={s.id} hidden={!visible}
-                      viewportPinned
+                  ? <WebTerminal link={link} peerName={peerName(peer)} route={peer.route} relation={peer.known ? 'remembered' : 'this session'}
+                      relayExplainer={RELAY_EXPLAINER}
+                      T={TT} accent={TT.acc} font={FONT_MONO} uiFont={FONT_SANS} instanceId={s.id} hidden={!visible}
+                      viewportPinned narrow={narrow}
                       onBackground={backgroundSession} onClose={() => closeSession(s.id)} />
                   : (
-                    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: T.dim, fontFamily: font }}>
-                      <div style={{ textAlign: 'center' }}>
-                        <div>not connected to {peer.name}</div>
-                        <div style={{ marginTop: 12, display: 'flex', gap: 8, justifyContent: 'center' }}>
-                          <button onClick={backgroundSession} style={{ padding: '7px 14px', cursor: 'pointer', font: 'inherit', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>hide</button>
-                          <button onClick={() => closeSession(s.id)} style={{ padding: '7px 14px', cursor: 'pointer', font: 'inherit', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>close</button>
+                    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: TT.ink, fontFamily: FONT_SANS, padding: 20 }}>
+                      <div style={{ textAlign: 'center', display: 'grid', gap: 14 }}>
+                        <div style={{ fontSize: 15 }}>{peerName(peer)} isn't reachable. It may be off, or tunlion isn't running there.</div>
+                        <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+                          <Btn T={TT} narrow={narrow} onClick={backgroundSession}>Hide</Btn>
+                          <Btn T={TT} narrow={narrow} onClick={() => closeSession(s.id)}>Close</Btn>
                         </div>
                       </div>
                     </div>
@@ -1083,34 +1080,6 @@ export default function Tunlion(props) {
       )
     : null
 
-  // Live peer metadata for the chips (status/name updates as the roster changes).
-  // M5: prefer the STABLE uid. After a mobile reconnect the device's sid changes,
-  // so resolving by s.peer.id (the old sid) returns nothing and the chip freezes
-  // on stale info. Match by uid first (survives the reconnect), then fall back to
-  // the old sid, then to the captured peer snapshot.
-  const sessionChips = sessions.map((s) => ({
-    id: s.id,
-    peer:
-      (s.peer.uid && state.peers.find((p) => p.uid && p.uid === s.peer.uid)) ||
-      state.peers.find((p) => p.id === s.peer.id) ||
-      s.peer,
-  }))
-  const sessionsStrip = (
-    <SessionsStrip
-      sessions={sessionChips}
-      activeId={activeSessionId}
-      onSwitch={switchSession}
-      onClose={closeSession}
-      narrow={narrow}
-      T={T}
-      accent={accent}
-    />
-  )
-
-  // model H: the per-device actions sheet, a bottom sheet on mobile, an anchored
-  // popover on desktop. `Open terminal` here closes the sheet and opens the same
-  // WebTerminal overlay as before (setShellPeer), so the terminal path is
-  // unchanged. It itself portals to body, so render it from either layout.
   const deviceSheet = sheetPeer ? (
     <DeviceSheet
       peer={sheetPeer}
@@ -1118,9 +1087,9 @@ export default function Tunlion(props) {
       narrow={narrow}
       sendFirst={narrow}
       T={T}
-      D={D}
-      accent={accent}
-      font={font}
+      D={{ dispName: 17 }}
+      accent={T.ink}
+      font={FONT_SANS}
       onOpenShell={openSession}
       onSendFiles={onSendFiles}
       onForget={onForgetDevice}
@@ -1129,18 +1098,15 @@ export default function Tunlion(props) {
     />
   ) : null
 
-  // Idea C: the command palette overlay. Reuses the very handlers the tiles and
-  // discovery bar drive: a device row routes through openSheet/openSession; the
-  // globals call the pairing actions. It portals to body, so render once.
   const commandPalette = (
     <CommandPalette
       open={paletteOpen}
       onClose={closePalette}
-      peers={state.peers}
+      peers={peers}
       T={T}
-      D={D}
-      accent={accent}
-      font={font}
+      D={{ pad: 18, gap: 12, tilePad: 13, rowPad: 12, name: 14, dispName: 15 }}
+      accent={T.ink}
+      font={FONT_SANS}
       narrow={narrow}
       onOpenShell={openSession}
       onSendFiles={onSendFiles}
@@ -1150,129 +1116,42 @@ export default function Tunlion(props) {
     />
   )
 
-  // Link-diagnostics export affordance (telemetry capture). Portals to body, so
-  // it floats over either layout. Default-on / ?diag=1; renders nothing when
-  // capture is disabled. Lets a mobile user export the timeline after a blip.
-  const diagPanel = <DiagPanel T={T} accent={accent} font={font} />
+  // Link-diagnostics export (telemetry capture); renders nothing when off.
+  const diagPanel = <DiagPanel T={T} accent={T.ink} font={FONT_MONO} />
 
-  // ── Mobile layout ──────────────────────────────────────────────
-  if (narrow) {
-    const tabBtn = (k, n) => (
-      <button onClick={() => setTab(k)} style={{ flex: 1, padding: '13px 8px', cursor: 'pointer', font: 'inherit', fontSize: 12,
-        letterSpacing: '.08em', textTransform: 'uppercase', background: tab === k ? T.panel : 'transparent',
-        color: tab === k ? T.text : T.dim, border: 'none', borderBottom: '2px solid ' + (tab === k ? accent : 'transparent'),
-        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7 }}>
-        {k}<span style={{ color: tab === k ? accent : T.faint }}>{n}</span>
-      </button>
-    )
-    return (
-      <div ref={rootRef} style={rootStyle}>
-        {terminalOverlay}
-        {deviceSheet}
-        {commandPalette}
-        {diagPanel}
-        {/* stacked top bar */}
-        <div style={{ flexShrink: 0, borderBottom: '1px solid ' + T.line, background: T.bg, padding: '11px 16px', display: 'flex', flexDirection: 'column', gap: 9 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 16, letterSpacing: '.01em', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span className="fil-caret" style={{ width: 9, height: 15, background: accent, display: 'inline-block', boxShadow: '0 0 10px ' + accent + '88' }} />
-              tunlion
-            </span>
-            <Pill T={T}>{state.roomId}</Pill>
-            <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <RelayBanner peers={state.peers} T={T} />
-              {paletteBtn}
-              <StatusDot color={state.connected ? T.ok : T.bad} glow={state.connected} />
-              {themeBtn}
-            </span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            {state.me && (
-              <>
-                <span style={{ width: 11, height: 11, background: state.me.color, display: 'block' }} />
-                <span style={{ fontSize: 12 }}>{state.me.name}</span>
-                <Pill T={T}>{state.signalingKind}</Pill>
-              </>
-            )}
-            <span style={{ marginLeft: 'auto' }}>{copyBtn('copy link')}</span>
-          </div>
-        </div>
-        {/* scroll body */}
-        <div style={{ flex: 1, overflow: 'auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-          <div style={{ padding: '16px 16px 0' }}>{discovery}</div>
-          <div style={{ position: 'sticky', top: 0, zIndex: 2, display: 'flex', background: T.bg, borderBottom: '1px solid ' + T.line, flexShrink: 0 }}>
-            {tabBtn('peers', state.peers.length)}
-            {tabBtn('transfers', state.transfers.length)}
-          </div>
-          <div style={{ padding: '0 16px', background: T.bg }}>{sessionsStrip}</div>
-          <div style={{ padding: 16 }}>
-            {tab === 'peers' ? (
-              <>
-                <div style={{ fontSize: 11, color: T.faint, marginBottom: 12 }}>tap a tile for actions</div>
-                {peerGrid('repeat(2,minmax(0,1fr))')}
-              </>
-            ) : (
-              transfersList
-            )}
-          </div>
-        </div>
-      </div>
-    )
-  }
+  const toastEl = toast && (
+    <div role="status" aria-live="polite" style={{
+      position: 'absolute', left: '50%', bottom: narrow ? 84 : 24, transform: 'translateX(-50%)', zIndex: 50,
+      background: T.ink, color: T.inv, padding: '11px 16px', borderRadius: 8, fontSize: 14, maxWidth: '88%',
+      boxShadow: '0 10px 30px -10px rgba(0,0,0,.4)', textAlign: 'center', pointerEvents: 'none',
+    }}>{toast.msg}</div>
+  )
 
-  // ── Desktop layout ─────────────────────────────────────────────
   return (
-    <div ref={rootRef} style={rootStyle}>
+    <div ref={rootRef} data-theme={mode} style={{
+      position: 'absolute', inset: 0, background: T.bg, color: T.ink, font: '15px/1.45 ' + FONT_SANS,
+      display: 'flex', flexDirection: 'column', overflow: 'hidden', ['--tl-ring']: T.ink,
+    }}>
       {terminalOverlay}
       {deviceSheet}
       {commandPalette}
-        {diagPanel}
-      {/* top bar */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '0 ' + D.pad + 'px', height: 58, flexShrink: 0,
-        borderBottom: '1px solid ' + T.line, background: T.bg }}>
-        <span style={{ fontSize: 16, letterSpacing: '.01em', display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span className="fil-caret" style={{ width: 10, height: 16, background: accent, display: 'inline-block', boxShadow: '0 0 10px ' + accent + '88' }} />
-          tunlion
-        </span>
-        <Pill T={T}>room {state.roomId}</Pill>
-        <span style={{ fontSize: 11, color: state.connected ? T.ok : T.bad, display: 'flex', alignItems: 'center', gap: 6 }}>
-          <StatusDot color={state.connected ? T.ok : T.bad} glow={state.connected} />{state.connected ? 'online' : 'offline'}
-        </span>
-        <RelayBanner peers={state.peers} T={T} />
-
-        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-          {state.me && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ width: 12, height: 12, background: state.me.color, display: 'block' }} />
-              <span style={{ fontSize: 12 }}>{state.me.name}</span>
-              <Pill T={T}>{state.signalingKind}</Pill>
-            </div>
-          )}
-          {paletteBtn}
-          {copyBtn('copy room link')}
-          {themeBtn}
-        </div>
-      </div>
-
-      {/* body */}
-      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        {/* peers */}
-        <div style={{ flex: '1 1 62%', padding: D.pad, borderRight: '1px solid ' + T.line, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          {sessionsStrip}
-          {discovery}
-          <div style={{ fontSize: 11, color: T.dim, marginBottom: 14, display: 'flex', justifyContent: 'space-between', flexShrink: 0 }}>
-            <span style={{ letterSpacing: '.06em' }}>PEERS · {state.peers.length}</span>
-            <span style={{ color: T.faint }}>click a tile or drop files to send</span>
-          </div>
-          <div style={{ overflow: 'auto', minHeight: 0 }}>{peerGrid(cols)}</div>
-        </div>
-
-        {/* transfers */}
-        <div style={{ flex: '1 1 38%', minWidth: 300, padding: D.pad + 'px ' + D.pad + 'px 0', background: T.panel, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-          <div style={{ fontSize: 11, color: T.dim, marginBottom: 6, letterSpacing: '.06em', flexShrink: 0 }}>TRANSFERS · {state.transfers.length}</div>
-          <div style={{ overflow: 'auto', minHeight: 0, paddingBottom: D.pad }}>{transfersList}</div>
-        </div>
-      </div>
+      {diagPanel}
+      {header}
+      <main style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+        {screen === 'devices' ? devices : home}
+      </main>
+      {narrow && (
+        <nav aria-label="Main" style={{ display: 'flex', borderTop: '1px solid ' + T.rule, padding: '2px 8px', paddingBottom: 'max(8px, env(safe-area-inset-bottom))', flexShrink: 0, background: T.bg }}>
+          {navItems.map(navBtn)}
+        </nav>
+      )}
+      {toastEl}
+      {asks > 0 && screen !== 'home' && (
+        <button type="button" onClick={() => setScreen('home')} className="tl-focus"
+          style={{ position: 'absolute', right: 16, top: narrow ? 64 : 76, zIndex: 40, display: 'flex', alignItems: 'center', gap: 8, minHeight: 44, padding: '0 12px', borderRadius: 8, border: '1.5px solid ' + T.ink, background: T.surf, color: T.ink, font: '600 14px ' + FONT_SANS, cursor: 'pointer' }}>
+          <Mark T={T} size={18} anim="knock" />{asks === 1 ? 'A device asks to be remembered' : asks + ' devices ask to be remembered'}
+        </button>
+      )}
     </div>
   )
 }

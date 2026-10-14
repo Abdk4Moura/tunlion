@@ -84,6 +84,7 @@ mod reset_hints;
 // under the `protocol::` name so every call site reads unchanged.
 use filament_proto as protocol;
 mod resilience;
+mod link_manager;
 mod session;
 /// Receive-file leaf helpers (assembly, resume, whole-file verification).
 /// Daemon control-socket + warm-reuse handlers, lifted out of this file.

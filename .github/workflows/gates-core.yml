@@ -48,7 +48,13 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   ratchet:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: deterministic core ratchet
     runs-on: ubuntu-latest
     # The suite genuinely takes this long: the CI attempt at 45 was cut off

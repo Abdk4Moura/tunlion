@@ -55,6 +55,7 @@ on:
       - 'cli/src/**'
       - 'cli/tests/*revoke-gates.sh'
       - 'cli/tests/ssh-ca-gates.sh'
+      - 'cli/tests/pty-resume-gates.sh'
       - 'cli/tests/exec-gates.sh'
       - 'cli/tests/sync-gates.sh'
       - 'cli/tests/fleet-cert-gates.sh'
@@ -77,7 +78,13 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   revoke-gates:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: revoke gates (ubuntu)
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -154,6 +161,9 @@ jobs:
             # so a tracked failure can never make the total look short.
             [cli/tests/fleet-cert-gates.sh]=23
             [cli/tests/pty-revoke-gates.sh]=3
+            # R1/R2 (a shell outlives its link, output intact), X1/X2 (a session
+            # name never crosses devices), V1/V2 (revoke ends a DETACHED shell).
+            [cli/tests/pty-resume-gates.sh]=6
             [cli/tests/mount-revoke-gates.sh]=4
             # 4: gate C (the revoked forward exits 4 and says why) joined A, A2, B.
             [cli/tests/l2-revoke-gates.sh]=4
@@ -178,6 +188,7 @@ jobs:
                    cli/tests/sync-gates.sh \
                    cli/tests/fleet-cert-gates.sh \
                    cli/tests/pty-revoke-gates.sh \
+                   cli/tests/pty-resume-gates.sh \
                    cli/tests/mount-revoke-gates.sh \
                    cli/tests/l2-revoke-gates.sh \
                    cli/tests/shell-posture-gates.sh \
