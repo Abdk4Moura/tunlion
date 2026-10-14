@@ -8,7 +8,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/../frontend/src/pake"
 
-cargo build --manifest-path "$HERE/Cargo.toml" --release --target wasm32-unknown-unknown
+# --lib: the module is the library. The GATE4 parity bins under src/bin are
+# native-only tools and are not part of what the browser loads.
+cargo build --manifest-path "$HERE/Cargo.toml" --release --lib --target wasm32-unknown-unknown
 mkdir -p "$OUT"
 wasm-bindgen --target web --out-dir "$OUT" \
   "$HERE/target/wasm32-unknown-unknown/release/filament_pake.wasm"
