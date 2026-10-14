@@ -1415,62 +1415,7 @@ pub(crate) async fn async_main() -> Result<()> {
                         // device the human list showed online and a send
                         // reached. null when no daemon answers: then nothing
                         // here can know, as the human row omits it (#217).
-                        let warm = answering_links(ctl::try_list_warm().await).await;
-                        let online: std::collections::HashMap<String, Option<bool>> =
-                            device_entries(warm.as_ref())
-                                .into_iter()
-                                .map(|e| (e.name, e.online))
-                                .collect();
-                        let records: Vec<Value> = std::fs::read_to_string(crate::devices_store::devices_path())
-                            .ok()
-                            .and_then(|raw| serde_json::from_str(&raw).ok())
-                            .unwrap_or_default();
-                        let now = identity::now_secs();
-                        let arr: Vec<Value> = all
-                            .iter()
-                            .map(|(n, s)| {
-                                let (last_seen, v6, v4) =
-                                    devices_info(n).unwrap_or((0, None, None));
-                                let addr = v6.clone().or_else(|| v4.clone()).unwrap_or_default();
-                                let mesh = format!("{n}.mesh");
-                                // What the gate enforces now: state, effective
-                                // caps, cert expiry and the access deadline.
-                                let access = records
-                                    .iter()
-                                    .find(|r| r["name"].as_str() == Some(n.as_str()))
-                                    .map(|r| crate::device_caps::device_access_json(r, now))
-                                    .unwrap_or_else(|| json!({ "state": "active", "effectiveCaps": effective_device_caps(n) }));
-                                // `caps` IS the effective set: empty once the
-                                // device expired, lapsed or was revoked.
-                                let caps = access["effectiveCaps"].clone();
-                                json!({
-                                    "name": n,
-                                    "channel": channel_of(s),
-                                    "caps": caps,
-                                    "grantedCaps": access["grantedCaps"].clone(),
-                                    "state": access["state"].clone(),
-                                    "certExpires": access["certExpires"].clone(),
-                                    "accessUntil": access["accessUntil"].clone(),
-                                    "invitationEnds": access["invitationEnds"].clone(),
-                                    "lastSeen": last_seen,
-                                    "address": addr,
-                                    "mesh": mesh,
-                                    // Live, not remembered: the daemon holds a
-                                    // link to it AND the device answered a
-                                    // liveness ping on that link just now.
-                                    "online": online.get(n).copied().flatten(),
-                                    // The human row's word for the same
-                                    // value: "idle" is online:false (no
-                                    // answering link right now), not a
-                                    // second opinion.
-                                    "status": match online.get(n).copied().flatten() {
-                                        Some(true) => json!("online"),
-                                        Some(false) => json!("idle"),
-                                        None => Value::Null,
-                                    },
-                                })
-                            })
-                            .collect();
+                        let arr = devices_json_rows(&all).await;
                         // The envelope every other --json verb uses
                         // (docs/agent-output-audit.md section 4): the array
                         // is `data.devices`, unchanged one level down.
@@ -2567,6 +2512,7 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         Cmd::Requests { action } => requests_cmd(action).await,
         Cmd::Skill { action } => crate::skill::skill_cmd(action, ui_caps.json || cli.json),
+        Cmd::Dashboard { no_open, port } => crate::dashboard::dashboard_cmd(no_open, port, &server).await,
         Cmd::Backup {
             peer,
             source,
@@ -2591,4 +2537,67 @@ fn add_code_needs_people(named: Option<&str>) -> anyhow::Error {
     let (message, _) = fleet_ui::pair_ui::err_add_code_noninteractive(named);
     ui::critical(&message);
     crate::exit_codes::reported(crate::exit_codes::ExitKind::Usage)
+}
+
+/// The rows of `devices --json` (`data.devices`), one per stored device: what
+/// the gate enforces now, liveness from the daemon's answering links, and the
+/// address. Shared by `devices --json` and the dashboard so both say the same.
+pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
+    let warm = answering_links(ctl::try_list_warm().await).await;
+    let online: std::collections::HashMap<String, Option<bool>> =
+        device_entries(warm.as_ref())
+            .into_iter()
+            .map(|e| (e.name, e.online))
+            .collect();
+    let records: Vec<Value> = std::fs::read_to_string(crate::devices_store::devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let now = identity::now_secs();
+    let arr: Vec<Value> = all
+        .iter()
+        .map(|(n, s)| {
+            let (last_seen, v6, v4) =
+                devices_info(n).unwrap_or((0, None, None));
+            let addr = v6.clone().or_else(|| v4.clone()).unwrap_or_default();
+            let mesh = format!("{n}.mesh");
+            // What the gate enforces now: state, effective
+            // caps, cert expiry and the access deadline.
+            let access = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(n.as_str()))
+                .map(|r| crate::device_caps::device_access_json(r, now))
+                .unwrap_or_else(|| json!({ "state": "active", "effectiveCaps": effective_device_caps(n) }));
+            // `caps` IS the effective set: empty once the
+            // device expired, lapsed or was revoked.
+            let caps = access["effectiveCaps"].clone();
+            json!({
+                "name": n,
+                "channel": channel_of(s),
+                "caps": caps,
+                "grantedCaps": access["grantedCaps"].clone(),
+                "state": access["state"].clone(),
+                "certExpires": access["certExpires"].clone(),
+                "accessUntil": access["accessUntil"].clone(),
+                "invitationEnds": access["invitationEnds"].clone(),
+                "lastSeen": last_seen,
+                "address": addr,
+                "mesh": mesh,
+                // Live, not remembered: the daemon holds a
+                // link to it AND the device answered a
+                // liveness ping on that link just now.
+                "online": online.get(n).copied().flatten(),
+                // The human row's word for the same
+                // value: "idle" is online:false (no
+                // answering link right now), not a
+                // second opinion.
+                "status": match online.get(n).copied().flatten() {
+                    Some(true) => json!("online"),
+                    Some(false) => json!("idle"),
+                    None => Value::Null,
+                },
+            })
+        })
+        .collect();
+    arr
 }

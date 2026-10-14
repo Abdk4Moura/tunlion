@@ -345,7 +345,7 @@ fn when(ts: u64, now: u64) -> String {
     format!("{} ({rel})", format_approval_expiry(ts))
 }
 
-fn to_json(d: &DevicePerms) -> Value {
+pub(crate) fn to_json(d: &DevicePerms) -> Value {
     json!({
         "name": d.name,
         "fingerprint": d.fingerprint,
