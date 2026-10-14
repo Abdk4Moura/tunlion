@@ -5263,3 +5263,13 @@ fn a_barred_device_is_named_for_why_and_live_devices_are_not_barred() {
     assert!(e.contains("expired") && e.contains("tunlion add --for guest2"), "{e}");
     assert!(!e.contains("approve"), "an expired device is never told to approve: {e}");
 }
+
+/// The browser's wasm PAKE binds `pake::BROWSER_SCOPE` into its confirmation
+/// MAC; every CLI code flow (send/receive by code, pair by code) binds
+/// `IntroScope::Device`. If the two ever differ, every browser handshake with
+/// this CLI fails key confirmation, which is how the browser broke silently
+/// from 2026-07-26 until this test existed.
+#[test]
+fn browser_pake_scope_matches_the_cli_code_flows() {
+    assert_eq!(crate::pake::BROWSER_SCOPE, identity::IntroScope::Device.to_byte());
+}

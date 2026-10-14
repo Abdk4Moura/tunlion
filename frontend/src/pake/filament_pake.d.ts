@@ -67,17 +67,17 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_pakesession_free: (a: number, b: number) => void;
+    readonly pakesession_new: (a: number, b: number, c: number, d: number) => number;
+    readonly pakesession_message: (a: number) => [number, number];
+    readonly pakesession_finish: (a: number, b: number, c: number) => number;
+    readonly pakesession_ourConfirm: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
+    readonly pakesession_verifyPeerConfirm: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
+    readonly pakesession_secret: (a: number) => [number, number];
     readonly canonicalCaps: (a: number, b: number) => [number, number];
     readonly ctEq: (a: number, b: number, c: number, d: number) => number;
     readonly normCode: (a: number, b: number) => [number, number];
-    readonly pakesession_finish: (a: number, b: number, c: number) => number;
-    readonly pakesession_message: (a: number) => [number, number];
-    readonly pakesession_new: (a: number, b: number, c: number, d: number) => number;
-    readonly pakesession_ourConfirm: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
-    readonly pakesession_secret: (a: number) => [number, number];
-    readonly pakesession_verifyPeerConfirm: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
-    readonly splitChosenCode: (a: number, b: number) => [number, number];
     readonly splitCode: (a: number, b: number) => [number, number];
+    readonly splitChosenCode: (a: number, b: number) => [number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

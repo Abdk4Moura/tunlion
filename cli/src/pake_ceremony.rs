@@ -135,6 +135,13 @@ pub struct Ceremony {
     /// already crosses the server (pair-create / pair-claim); it is routing, not
     /// a secret, and changing it cannot make a ceremony agree (SPAKE2 binds it).
     nameplate: String,
+    /// The peer said it can take a direct QUIC connection (`"direct": true` on
+    /// its PAKE payloads). A browser cannot, and never says so. Promoting a
+    /// browser to direct QUIC tears down the WebRTC link it is using, and the
+    /// re-established link never came back, so a code transfer to a browser
+    /// stalled forever after "authenticated". Only routing, not a secret: a
+    /// server that strips it just keeps the transfer on WebRTC.
+    peer_direct: bool,
 }
 
 /// Is this PAKE payload for the ceremony on `nameplate`? `Some(true)` when the
@@ -170,6 +177,7 @@ impl Ceremony {
             sent_msg: false,
             sent_confirm: false,
             nameplate: nameplate.to_string(),
+            peer_direct: false,
         }
     }
 
@@ -228,6 +236,7 @@ impl Ceremony {
             "type": "pake-msg", "v": 2,
             "msg": b64_encode(&self.msg),
             "np": self.nameplate,
+            "direct": true,
         }))
     }
 
@@ -263,6 +272,12 @@ impl Ceremony {
         self.k.as_ref()
     }
 
+    /// Whether the peer can take a direct QUIC connection. False for a
+    /// browser: callers must then keep the WebRTC link instead of promoting.
+    pub fn peer_supports_direct(&self) -> bool {
+        self.peer_direct
+    }
+
     /// Scope byte (mandatory, no default).
     pub fn scope(&self) -> u8 {
         self.scope
@@ -278,6 +293,11 @@ impl Ceremony {
     /// fingerprints to verify against (the caller supplies the link's current
     /// fingerprints). On a verified confirm the secret is derived.
     pub fn on_signal(&mut self, data: &Value, fps: Option<(&str, &str)>) -> Inbound {
+        if matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm"))
+            && data["direct"].as_bool() == Some(true)
+        {
+            self.peer_direct = true;
+        }
         match data["type"].as_str() {
             Some("pake-msg") => {
                 if self.k.is_none() {
@@ -554,5 +574,21 @@ mod tests {
         let c_msg = c.take_msg_payload().unwrap();
         assert_eq!(addressed_to(&c_msg, "4242"), Some(true));
         assert_eq!(addressed_to(&c_msg, "314"), Some(false));
+    }
+
+    /// Two CLIs tell each other they can go direct; a browser's payloads carry
+    /// no `direct` field, so a CLI facing one keeps the WebRTC link.
+    #[test]
+    fn only_a_peer_that_says_so_is_promoted_to_direct() {
+        let (a, b) = run_pair("brave-otter", "brave-otter", "314");
+        assert!(a.peer_supports_direct() && b.peer_supports_direct());
+
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut cli = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut browser_side = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut from_browser = browser_side.take_msg_payload().unwrap();
+        from_browser.as_object_mut().unwrap().remove("direct");
+        assert!(matches!(cli.on_signal(&from_browser, None), Inbound::Consumed));
+        assert!(!cli.peer_supports_direct());
     }
 }

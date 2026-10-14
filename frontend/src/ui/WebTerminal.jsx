@@ -493,7 +493,17 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
           guarded('onPtyData.syncBar', () => syncBar())
         })
       }
-      l.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n') }
+      l.onPtyClose = (refusal) => {
+        setStatus('closed')
+        if (!refusal) { term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n'); return }
+        // Refused by the device: say why, and the one command that fixes it
+        // when it is a missing grant (the CLI's remedy for the same codes).
+        const where = peerName ? `'${peerName}'` : 'that device'
+        const me = refusal.as || 'this-browser'
+        const grant = { 'shell-off': 1, 'not-granted': 1, 'tunnel-off': 1, revoked: 1 }[refusal.code]
+        term.write(`\r\n\x1b[31mshell refused: ${refusal.err}\x1b[0m\r\n`)
+        if (grant) term.write(`\x1b[90mto allow it, run this on ${where}:\x1b[0m\r\n  tunlion grant ${me} shell\r\n`)
+      }
       l.onPtyReady = () => {
         setStatus('ready')
         // The PTY is live (fresh or reattached): make sure its window size matches

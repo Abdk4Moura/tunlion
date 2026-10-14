@@ -53,13 +53,12 @@ seed_vouched_record() {
 # Re-grant before each case: a revoke clears the cap, and gate B/C must revoke a
 # cap that is actually present or they would pass for the wrong reason.
 #
-# That premise was never checked: the grant's output went to /dev/null. It is
-# checked now, and it FAILS: `grant` refuses a vouch-shaped record ("peer
-# identity for 'vouched' is not available ... the grant requires a known user
-# key to target"), so no cap was ever present and every revoke below removes a
-# grant that does not exist, while still printing "revoked 'shell' from
-# 'vouched'". The setup slot below records that as a tracked KNOWN-RED rather
-# than letting B and C keep passing on a false premise in silence.
+# That premise was never checked: the grant's output went to /dev/null. When it
+# was checked it FAILED: `grant` wrote the pairing permission and then refused
+# the vouch-shaped record ("peer identity for 'vouched' is not available"),
+# exit 1. A device with no certified identity (a vouched record, a browser) now
+# gets the pairing permission and exit 0, which is what the setup slot below
+# asserts.
 GRANT_OK=""
 grant_shell() {
   local out rc
@@ -77,12 +76,9 @@ grant_shell() {
   fi
 }
 
-# Tracked, not silent: the slot prints KNOWN-RED while grant refuses this record
-# shape, and fails the run the moment it starts passing so the entry is removed
-# with evidence (see declare_known_red_summary in lib/fixture.sh).
-KNOWN_RED_ALLOW=(
-  "setup-grant: grant $DEV shell succeeded|setup-grant: grant $DEV shell FAILED"
-)
+# The setup-grant slot was a tracked KNOWN-RED until grant stopped failing on
+# a device with no certified identity; the list only shrinks, and is empty.
+KNOWN_RED_ALLOW=()
 
 stop_daemon() {
   env TUNLION_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1

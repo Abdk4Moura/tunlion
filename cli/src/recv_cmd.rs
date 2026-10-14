@@ -4338,10 +4338,12 @@ pub(crate) async fn recv_cmd(
                     let mut secret_opt: Option<String> = None;
                     let mut is_abort = false;
                     let mut abort_why = String::new();
+                    let mut peer_direct = false;
                     if let Some(cer) = st.recv_cers.get_mut(&from) {
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
                                 secret_opt = cer.secret().cloned();
+                                peer_direct = cer.peer_supports_direct();
                             }
                             PakeInbound::Abort(why) => {
                                 is_abort = true;
@@ -4358,7 +4360,13 @@ pub(crate) async fn recv_cmd(
                         ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
                         // Option A: start the direct-QUIC race. start_direct owns
                         // replacement after all fallible setup and pending registration.
-                        let promo = conn.start_direct_promote(&from, &from, &sec).await;
+                        // A browser sender cannot take direct QUIC:
+                        // promoting it would drop the WebRTC link it is on.
+                        let promo = if peer_direct {
+                            conn.start_direct_promote(&from, &from, &sec).await
+                        } else {
+                            crate::conn::Promotion::Retained
+                        };
                         conn.bind_active(&from);
                         // A retained link is unannounced here too, and this loop's
                         // ChannelReady arm sends `caps` and the signed L3 announce,
