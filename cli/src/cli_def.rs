@@ -329,7 +329,9 @@ pub(crate) enum Cmd {
         /// Read the invitation from an already-open file descriptor.
         #[arg(long, value_name = "FD", conflicts_with = "invite_file")]
         invite_fd: Option<i32>,
-        /// Proposed name for this device (default: hostname).
+        /// With an invitation file: the name proposed for this device (default:
+        /// hostname). With a code: what to call the device that showed the code
+        /// (default: the name it announces); that device names this one.
         #[arg(long)]
         name: Option<String>,
         /// Owner device display name when several owners are present.
