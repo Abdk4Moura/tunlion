@@ -657,6 +657,38 @@ pub(crate) fn stdout_put(
     s.put(pos, data).map(|()| 1)
 }
 
+/// What the whole-file check needs from an `IncomingFile`, as owned handles, so
+/// it can run in its own task instead of holding up the receiver's event loop.
+/// A multi-gigabyte file takes seconds to sync and re-hash; done inline, every
+/// other request to this daemon (a shell, an exec, a new link) waited for it.
+// `id` and `name` are read only by the test-hooks corruption injector.
+#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+pub(crate) struct VerifyJob {
+    id: String,
+    name: String,
+    size: u64,
+    full: Option<String>,
+    file: Arc<std::fs::File>,
+    received: Arc<AtomicU64>,
+    ranges: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    part_path: PathBuf,
+}
+
+impl IncomingFile {
+    pub(crate) fn verify_job(&self) -> VerifyJob {
+        VerifyJob {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            size: self.size,
+            full: self.full.clone(),
+            file: self.file.clone(),
+            received: self.received.clone(),
+            ranges: self.ranges.clone(),
+            part_path: self.part_path.clone(),
+        }
+    }
+}
+
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
 /// compare against the digest the sender offered (`inc.full`, guaranteed Some by
 /// the caller). Flushes first so every buffered byte is on disk. This is the
@@ -670,7 +702,7 @@ pub(crate) fn stdout_put(
 /// exactly once (the re-fetch then succeeds), proving auto-recovery.
 /// Recompute the whole-file sha256 and compare against the sender's offered
 /// digest. Flushes (syncs) first. This is the receiver-side core of P4 integrity.
-pub(crate) async fn verify_incoming(inc: &IncomingFile) -> protocol::VerifyResult {
+pub(crate) async fn verify_job_run(inc: VerifyJob) -> protocol::VerifyResult {
     let want = match &inc.full {
         Some(w) => w.clone(),
         None => return protocol::VerifyResult::Match,

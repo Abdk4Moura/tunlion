@@ -42,7 +42,7 @@ use crate::{
     respond_to_identity_challenge, safe_create_part, safe_incoming_name, safe_resume_part,
     save_requests, sdnotify, session, settings, shell_argv, shutdown, spawn_session_pumps, sshd,
     sshd_listening, sshkeys, store_provisional_identity, subnet_forward, sweep_completed_streams,
-    test_hooks, ui, verify_incoming, with_devices_mut,
+    test_hooks, ui, with_devices_mut,
 };
 // Unix-only daemon-control names, gated exactly like their definitions in
 // daemon_ctl.rs. Call sites stay byte-identical to the monolith.
@@ -250,6 +250,40 @@ async fn retire_link_streams(
             }
         }
     }
+}
+
+/// The receiver's whole-file check for `(pid, sid)`, without blocking the
+/// event loop. The first call starts it in its own task and returns `None`
+/// (the caller parks the file in `by_sid` and moves on); the task stores the
+/// verdict and posts `Ev::MaybeComplete`, and the call that handles that
+/// returns `Some(verdict)`. A call while it is still running returns `None`
+/// again without starting a second one.
+fn start_or_take_verify(
+    st: &mut crate::shared_defs::RecvState,
+    pid: &str,
+    sid: u32,
+    inc: &crate::recv_files::IncomingFile,
+    tx: &tokio::sync::mpsc::UnboundedSender<Ev>,
+) -> Option<protocol::VerifyResult> {
+    let key = (pid.to_string(), sid);
+    if let Some(slot) = st.verifying.get(&key) {
+        let done = slot.lock().unwrap().take();
+        if done.is_some() {
+            st.verifying.remove(&key);
+        }
+        return done;
+    }
+    let slot = Arc::new(Mutex::new(None));
+    st.verifying.insert(key, slot.clone());
+    let job = inc.verify_job();
+    let tx = tx.clone();
+    let pid = pid.to_string();
+    tokio::spawn(async move {
+        let verdict = crate::recv_files::verify_job_run(job).await;
+        *slot.lock().unwrap() = Some(verdict);
+        let _ = tx.send(Ev::MaybeComplete(pid, sid));
+    });
+    None
 }
 
 fn log_ctl_rx<'a>(pid: &str, ty: Option<&'a str>) -> Option<&'a str> {
@@ -1130,6 +1164,7 @@ pub(crate) async fn recv_cmd(
     let mut st = RecvState {
         by_sid: HashMap::new(),
         verify_fails: HashMap::new(),
+        verifying: HashMap::new(),
         completed: 0usize,
         ever_received: false,
         pending: Default::default(),
@@ -7806,12 +7841,14 @@ pub(crate) async fn recv_cmd(
                         Some(i) => i,
                         None => continue,
                     };
-                    let f = inc.file.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = f.sync_all();
-                    })
-                    .await;
+                    // The sync for a file on disk happens with the whole-file
+                    // check, off the event loop (see `start_or_take_verify`).
                     if to_stdout {
+                        let f = inc.file.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = f.sync_all();
+                        })
+                        .await;
                         stdout_delivered(&inc, &conn, &pid, sid).await?;
                         st.completed += 1;
                         continue;
@@ -7830,7 +7867,15 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     if inc.full.is_some() {
-                        let verdict = verify_incoming(&inc).await;
+                        // Off the event loop: start the check and come back on
+                        // the MaybeComplete it posts, so nothing else waits.
+                        let verdict = match start_or_take_verify(&mut st, &pid, sid, &inc, &tx) {
+                            Some(v) => v,
+                            None => {
+                                st.by_sid.insert((pid.clone(), sid), inc);
+                                continue;
+                            }
+                        };
                         match verdict {
                             protocol::VerifyResult::Match => {
                                 st.verify_fails.remove(&id);
@@ -8009,7 +8054,15 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     if inc.full.is_some() {
-                        let verdict = verify_incoming(&inc).await;
+                        // Off the event loop: start the check and come back on
+                        // the MaybeComplete it posts, so nothing else waits.
+                        let verdict = match start_or_take_verify(&mut st, &pid, sid, &inc, &tx) {
+                            Some(v) => v,
+                            None => {
+                                st.by_sid.insert((pid.clone(), sid), inc);
+                                continue;
+                            }
+                        };
                         match verdict {
                             protocol::VerifyResult::Match => {
                                 st.verify_fails.remove(&id);

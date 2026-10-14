@@ -264,6 +264,10 @@ pub(crate) struct RecvState {
     // unrecoverable corruption fails CLEARLY after a few rounds rather than
     // looping forever. Keyed by transfer id.
     pub(crate) verify_fails: HashMap<String, u32>,
+    // Whole-file checks running in their own task, keyed like `by_sid`. The
+    // slot fills with the verdict and an `Ev::MaybeComplete` brings the file
+    // back to the event loop, which never waits on the sync and re-hash.
+    pub(crate) verifying: HashMap<(String, u32), Arc<Mutex<Option<crate::protocol::VerifyResult>>>>,
     pub(crate) completed: usize,
     pub(crate) ever_received: bool,
     // C22: offers awaiting consent, exactly ONE stdin owner (the reader
