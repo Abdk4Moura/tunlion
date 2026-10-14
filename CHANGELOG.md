@@ -6,6 +6,66 @@ the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.9.0]
+
+### Added
+
+- `tunlion dashboard`: a page for the device it runs on, opened in your browser.
+  It lists devices and people with their access and end dates, creates pairing
+  codes (with a QR code) and invitations from templates, grants and removes
+  access, cuts devices off (with Undo), and shows pending requests, an exposure
+  view and history. It listens on localhost only, signs in with a one-time
+  secret in the link, checks Host and Origin on every request, refuses other
+  local users, and closes when the background service stops.
+- `tunlion demo`: an offline guided tour of ten common tasks. You type each
+  command (or press Enter) and see what it does; nothing touches the network or
+  your identity. `--auto` plays it without input.
+- `tunlion skill install` (and `show`, `uninstall`): installs an agent skill
+  file that lists the exact command for each task and what each exit code means.
+- Shells survive a dropped connection: the session reattaches on the new link
+  and only the output you missed is replayed, in the CLI and in the browser
+  ("reconnecting" while it happens). A detached shell is kept for up to 10
+  minutes, never past the device's access, and ends at once on revoke or expiry.
+  `TUNLION_SHELL_SESSION=<name>` picks a named detached shell back up from the
+  same device.
+- The web app has the new design: one code box, a devices list with buttons only
+  for access you have, a full-screen shell on phones with a key bar, light and
+  dark themes, keyboard access throughout, and links that carry the code after
+  `#` so it never reaches a server.
+- `join <file>` accepts an invitation file; the guided menu has
+  "I have a code or an invitation".
+
+### Changed
+
+- CLI output uses the new palette, readable on light and dark terminals, with a
+  waiting animation; piped output is always plain text.
+- The default server is `api.tunlion.autumated.com`.
+- Exit codes are distinct and documented in every command's help: 2 usage,
+  3 unknown device, 4 denied, 6 unreachable, 7 network, 8 partial, 9 not set up,
+  130 interrupted (including Ctrl-C at a prompt), 143 terminated.
+- `ephemeral` is removed; use `join <file>`.
+
+### Fixed
+
+- The browser works with the CLI again: receiving by code, pairing and the web
+  shell had been broken since late July (a handshake check, link promotion and
+  the message header had drifted). Codes made in the browser can be claimed from
+  the CLI.
+- The web app no longer reloads itself on a first visit, which lost a code from
+  the link and could interrupt whatever the visitor was doing.
+- Several code transfers can run at once from one machine.
+- Joining no longer hangs when both sides wait for the other to speak first.
+- `receive` in a terminal returns as soon as the files are in.
+- A missing invitation file is reported as missing.
+- Direct links report their route as "direct".
+- The daemon closes its links when it exits.
+
+### Security
+
+- Invitation end times are enforced on every path: commands, shells, forwards,
+  mounts, transfers, mesh traffic and renewal. A session that is open when the
+  invitation ends is cut, and every later attempt is refused.
+
 ### Breaking
 
 - **tunlion no longer shares anything local with filament.** Both tools can be
