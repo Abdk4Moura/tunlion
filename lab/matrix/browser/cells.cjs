@@ -146,7 +146,9 @@ async function pairWithVpsIn(x, via) {
     // The browser creates the code in "Remember a device" mode; the CLI joins it.
     const code = await createCode(x.p, 'Remember a device'); say('code', code); assert(code, 'page shows a code');
     vps(`(timeout 90 tunlion join ${code} > join.out 2>&1; echo "EXIT=$?" >> join.out) & sleep 1`);
-    assert(await remember(x.p), 'page offers Remember and it was chosen');
+    const offered = await remember(x.p).catch(() => false);
+    if (!offered) { await shot(x.p, `no-remember-${x.kind}`); say('join.out:', vps('sleep 5; cat join.out')); }
+    assert(offered, 'page offers Remember and it was chosen');
     let out = ''; for (let i = 0; i < 60 && !/EXIT=/.test(out); i++) { await x.p.waitForTimeout(1000); out = vps('cat join.out'); }
     say(out); assert(/EXIT=0/.test(out), 'CLI `join <browser code>` exited 0');
   }
@@ -216,16 +218,22 @@ async function pairWithVpsIn(x, via) {
     assert(/vps/.test(await body(p)), 'vps is listed under Devices after reload');
     assert(await waitOnline(p, 'vps'), 'vps comes ONLINE after reload');
     const f = path.join(OUT, 'ev', 'to-vps.bin'); fs.writeFileSync(f, crypto.randomBytes(300000));
-    await pickFile(p, p.getByRole('button', { name: /send files to/i }).first(), f);
+    await p.getByRole('button', { name: 'Home', exact: true }).click(); await p.waitForTimeout(1500);
+    await pickFile(p, p.getByRole('button', { name: /^send files to vps$/i }).first(), f);
     let got = ''; for (let i = 0; i < 40 && !got; i++) { await p.waitForTimeout(1000); got = tryVps('sha256sum Tunlion/to-vps.bin 2>/dev/null | cut -c1-64').out.trim(); }
     assert(got === sha(f), 'vps inbox has the exact bytes');
   });
 
-  const openShell = async (p) => {
+  const openShell = async (p, ms = 45000) => {
     await waitOnline(p, 'vps', 60000);
     const btn = p.getByRole('button', { name: /open a shell on/i });
+    const t = Date.now();
+    while (!(await btn.count()) && Date.now() - t < ms) await p.waitForTimeout(2000);
     if (!(await btn.count())) return false;
-    await btn.first().click(); await p.waitForTimeout(6000); return true;
+    await btn.first().click();
+    // Wait for the prompt, not a fixed time.
+    for (let i = 0; i < 20 && !/\$\s*$/m.test(await term(p)); i++) await p.waitForTimeout(1000);
+    return true;
   };
 
   await cell('B07', 'browser-cli', 'shell: refused before grant, works after (desktop)', async () => {

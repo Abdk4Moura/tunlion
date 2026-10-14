@@ -57,7 +57,8 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
   const ctx = await b.newContext({ viewport: { width: 1280, height: 860 } });
   const p = await ctx.newPage();
   const errs = []; p.on('pageerror', e => errs.push(String(e)));
-  const nav = (name) => p.getByRole('button', { name, exact: true }).first().click();
+  // Nav buttons carry a count badge ("Asks 1"), so match the label at the start.
+  const nav = (name) => p.getByRole('button', { name: new RegExp(`^${name}\\b`) }).first().click();
 
   await cell('D01', 'sign in once with the printed link; a second use is refused', async () => {
     say('url', url ? url.replace(/k=[0-9a-f]+/, 'k=<secret>') : 'none'); assert(url, 'dashboard printed a link');
