@@ -323,11 +323,12 @@ pub(crate) async fn next_ev(
                 .rejoin_window
                 .saturating_sub(since.elapsed())
                 .as_secs();
-            ui::sticky(&ui::paint(
-                ui::Tone::Dim,
-                &format!(
-                    "  {} holding the line, {left}s for them to come back (Ctrl-C to stop)",
-                    ui::spinner_frame()
+            ui::sticky(&format!(
+                "  {} {}",
+                ui::pulse(),
+                ui::paint(
+                    ui::Tone::Dim,
+                    &format!("holding the line, {left}s for them to come back (Ctrl-C to stop)")
                 ),
             ));
         }

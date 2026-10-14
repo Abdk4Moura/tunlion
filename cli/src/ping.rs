@@ -271,7 +271,7 @@ pub(crate) fn cold_failure_kind(error: Option<&str>) -> ExitKind {
 /// (docs/ui/OUTPUT.md), so it goes through `ui::critical`.
 fn emit_probe(p: &Probe, json_out: bool) {
     if json_out {
-        println!("{}", probe_envelope(p));
+        crate::outln!("{}", probe_envelope(p));
     } else {
         ui::critical(&format!("  {}", ui::paint(probe_tone(p), &probe_line(p))));
     }

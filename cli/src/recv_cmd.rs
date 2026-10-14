@@ -3711,7 +3711,7 @@ pub(crate) async fn recv_cmd(
                             paired,
                         );
                         ui::say(&q); // permanent: a new question fronted (C25)
-                        ui::sticky(&q);
+                        ui::sticky_ask(&q);
                         st.question_shown = Instant::now();
                     }
                 } else {
@@ -7382,7 +7382,7 @@ pub(crate) async fn recv_cmd(
                                 // sticky as the live answer tail.
                                 let q = offer_question(&sender_name, &name, size, paired);
                                 ui::say(&q);
-                                ui::sticky(&q);
+                                ui::sticky_ask(&q);
                                 st.question_shown = Instant::now();
                             }
                             continue; // decision arrives later via StdinLine
@@ -8377,7 +8377,7 @@ pub(crate) async fn recv_cmd(
                             ui::say(&q); // a NEW question fronted, permanent line (C25)
                             st.question_shown = Instant::now();
                         }
-                        ui::sticky(&q);
+                        ui::sticky_ask(&q);
                     } else {
                         st.question_open
                             .store(false, std::sync::atomic::Ordering::Relaxed);

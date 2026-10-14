@@ -263,15 +263,12 @@ impl Drop for RawGuard {
     }
 }
 
-/// ANSI color for a level, respecting the existing ui caps/no-color story.
-fn level_color(level: Level) -> Option<&'static str> {
-    if !ui::caps().color {
-        return None;
-    }
-    Some(match level {
-        Level::Empty => "\x1b[2m",       // dim
-        Level::Incomplete => "\x1b[33m", // amber/yellow
-        Level::Ready => "\x1b[32m",      // green
+/// The color for a level, from the design palette (nothing when color is off).
+fn level_color(level: Level) -> String {
+    ui::tone_code(match level {
+        Level::Empty => ui::Tone::Dim,
+        Level::Incomplete => ui::Tone::Warn,
+        Level::Ready => ui::Tone::Ok,
     })
 }
 
@@ -282,12 +279,10 @@ fn level_color(level: Level) -> Option<&'static str> {
 /// consistently on every terminal.
 fn render(prompt: &str, buf: &str, j: &Judgment) {
     let mut err = std::io::stderr();
-    let reset = if ui::caps().color { "\x1b[0m" } else { "" };
-    let color = level_color(j.level).unwrap_or("");
+    let reset = ui::tone_reset();
+    let color = level_color(j.level);
     let preview = match &j.preview {
-        Some(p) => {
-            if ui::caps().color { format!("  \x1b[2m{p}{reset}") } else { format!("  {p}") }
-        }
+        Some(p) => format!("  {}", ui::paint(ui::Tone::Dim, p)),
         None => String::new(),
     };
     // Clear the whole line, then draw: prompt+buffer, a gap, the colored steer
@@ -330,7 +325,6 @@ const VIEWPORT: usize = 7;
 
 fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints: &[(char, &str)]) {
     let mut err = std::io::stderr();
-    let color = ui::caps().color;
     // Header + items + (a hint line, when there are hints). The cursor rewind
     // must count exactly what was drawn or the redraw walks up the scrollback.
     // A viewport, so a long list does not scroll the terminal away. The window
@@ -342,17 +336,17 @@ fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints
     if redraw {
         let _ = write!(err, "\x1b[{drawn}A");
     }
-    let _ = write!(err, "\r\x1b[2K{header}\r\n");
-    let dim = if color { "\x1b[2m" } else { "" };
-    let reset0 = if color { "\x1b[0m" } else { "" };
+    let _ = write!(err, "\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header));
+    let dim = ui::tone_code(ui::Tone::Dim);
+    let reset0 = ui::tone_reset();
     if above > 0 {
         let _ = write!(err, "\r\x1b[2K  {dim}\u{2191} {above} more{reset0}\r\n");
     }
     for (i, it) in items.iter().enumerate().skip(first).take(view) {
         let (mark, c, r) = if i == sel {
-            ("\u{276f}", if color { "\x1b[36m" } else { "" }, if color { "\x1b[0m" } else { "" })
+            ("\u{276f}", ui::tone_code(ui::Tone::Brand), ui::tone_reset())
         } else {
-            (" ", "", "")
+            (" ", String::new(), "")
         };
         let _ = write!(err, "\r\x1b[2K  {c}{mark} {it}{r}\r\n");
     }
@@ -364,8 +358,7 @@ fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints
     // a choice with the same weight as the real ones. A hint is present without
     // competing, and the list stays about the actual decision.
     if !hints.is_empty() {
-        let dim = if color { "\x1b[2m" } else { "" };
-        let reset = if color { "\x1b[0m" } else { "" };
+        let reset = ui::tone_reset();
         let mut line = String::from("  \u{2191}\u{2193} move \u{b7} \u{23ce} select");
         for (k, label) in hints {
             line.push_str(&format!(" \u{b7} {k} {label}"));

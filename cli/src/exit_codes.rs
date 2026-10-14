@@ -667,10 +667,10 @@ pub(crate) fn report(e: &anyhow::Error) -> i32 {
         ui::json_out(&v);
     }
     if network {
-        ui::critical(&format!("Error: {NETWORK_LINE}"));
+        ui::critical(&format!("{} {NETWORK_LINE}", ui::error_label()));
         ui::debug(&format!("  cause: {raw}"));
     } else {
-        ui::critical(&format!("Error: {}", error_with_causes(e)));
+        ui::critical(&format!("{} {}", ui::error_label(), error_with_causes(e)));
     }
     kind.code()
 }

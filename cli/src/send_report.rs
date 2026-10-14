@@ -427,7 +427,7 @@ pub(crate) fn emit(res: Result<()>, peer: Option<&str>) -> Result<()> {
             // The envelope above is the answer on stdout; the reason still goes
             // to stderr for a log, in the usual form.
             let kind = exit_codes::classify(&e);
-            ui::critical(&format!("Error: {}", exit_codes::human_message(&e)));
+            ui::critical(&format!("{} {}", ui::error_label(), exit_codes::human_message(&e)));
             Err(exit_codes::reported(kind))
         }
     }

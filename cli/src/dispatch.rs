@@ -825,7 +825,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 };
                 if json_output {
-                    println!(
+                    crate::outln!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
                             "ok": true,
@@ -841,24 +841,24 @@ pub(crate) async fn async_main() -> Result<()> {
                         }))?
                     );
                 } else {
-                    println!("  {}", ui::paint(ui::Tone::Bold, &name));
-                    println!("  channel:  {}", &channel[..12.min(channel.len())]);
+                    crate::outln!("  {}", ui::paint(ui::Tone::Bold, &name));
+                    crate::outln!("  channel:  {}", &channel[..12.min(channel.len())]);
                     // Show overlay addresses if we have them.
                     if let Some(v6) = &stored_v6 {
                         let v4_str = stored_v4
                             .as_ref()
                             .map(|a| format!(" / {a}"))
                             .unwrap_or_default();
-                        println!("  overlay:  {v6}{v4_str}");
-                        println!("  mesh:     {name}.mesh");
+                        crate::outln!("  overlay:  {v6}{v4_str}");
+                        crate::outln!("  mesh:     {name}.mesh");
                         if let Some(p) = crate::proxy_state::current() {
                             ui::say(&crate::proxy_state::mesh_hint(&p));
                         }
                     }
                     // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
                     // (what THIS machine authorized the peer to do), NOT what the peer offers.
-                    println!("  granted:  {}", capability_list_summary(&caps));
-                    println!("  last seen: {last_seen_str}");
+                    crate::outln!("  granted:  {}", capability_list_summary(&caps));
+                    crate::outln!("  last seen: {last_seen_str}");
                 }
             } else {
                 // Show this machine's address.
@@ -866,7 +866,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
                 let mesh_name = l3::sanitize_host(&my_name);
                 if json_output {
-                    println!(
+                    crate::outln!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
                             "ok": true,
@@ -878,11 +878,11 @@ pub(crate) async fn async_main() -> Result<()> {
                         }))?
                     );
                 } else if v4 {
-                    println!("{}", id.addr_v4());
+                    crate::outln!("{}", id.addr_v4());
                 } else {
-                    println!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
-                    println!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
-                    println!("  mesh:     {mesh_name}.mesh");
+                    crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
+                    crate::outln!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
+                    crate::outln!("  mesh:     {mesh_name}.mesh");
                     if let Some(p) = crate::proxy_state::current() {
                         ui::say(&crate::proxy_state::mesh_hint(&p));
                     }
@@ -912,7 +912,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                             .take(8)
                                             .collect::<String>();
                                         if ui_caps.json {
-                                            println!(
+                                            crate::outln!(
                                                 "{}",
                                                 serde_json::to_string_pretty(&json!({
                                                     "ok": true,
@@ -926,11 +926,11 @@ pub(crate) async fn async_main() -> Result<()> {
                                                 }))?
                                             );
                                         } else {
-                                            println!(
+                                            crate::outln!(
                                                 "  identity:          {}",
                                                 ui::paint(ui::Tone::Bold, &fingerprint)
                                             );
-                                            println!(
+                                            crate::outln!(
                                                 "  role:              joined device (no owner signing key)"
                                             );
                                             // #275: this printed the raw epoch, on the one
@@ -939,7 +939,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                             // `device_countdown`, the same helper `devices`
                                             // renders from, so the two cannot drift and #236's
                                             // wording rules (nothing renews) apply here too.
-                                            println!(
+                                            crate::outln!(
                                                 "  local certificate: {}  ({})",
                                                 device_countdown(
                                                     fleet_ui::devices::DeviceTier::Fleet,
@@ -954,7 +954,7 @@ pub(crate) async fn async_main() -> Result<()> {
                             }
                             if local_device_cert_path().exists() {
                                 if ui_caps.json {
-                                    println!(
+                                    crate::outln!(
                                         "{}",
                                         serde_json::to_string_pretty(&json!({
                                             "ok": true,
@@ -987,7 +987,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                         })
                                     })
                                     .collect::<Vec<_>>();
-                                println!(
+                                crate::outln!(
                                     "{}",
                                     serde_json::to_string_pretty(&json!({
                                         "ok": true,
@@ -1003,11 +1003,11 @@ pub(crate) async fn async_main() -> Result<()> {
                                 );
                                 return Ok(());
                             }
-                            println!(
+                            crate::outln!(
                                 "  user fingerprint: {}",
                                 ui::paint(ui::Tone::Bold, &uk.fingerprint())
                             );
-                            println!(
+                            crate::outln!(
                                 "  public key:       {}",
                                 ui::paint(ui::Tone::Dim, &uk.public_key_hex())
                             );
@@ -1020,7 +1020,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                         cert.expires.saturating_sub(identity::now_secs()),
                                     )
                                 };
-                                println!(
+                                crate::outln!(
                                     "  {} {}",
                                     ui::paint(ui::Tone::Bold, &name),
                                     ui::paint(ui::Tone::Dim, &format!("(valid {exp})"))
@@ -1028,7 +1028,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                 found += 1;
                             }
                             if found == 0 {
-                                println!(
+                                crate::outln!(
                                     "  {}",
                                     ui::paint(
                                         ui::Tone::Warn,
@@ -1050,13 +1050,13 @@ pub(crate) async fn async_main() -> Result<()> {
             match (key, value) {
                 (Some(k), Some(v)) => {
                     config_set(&k, &v)?;
-                    println!("{k} = {v}");
+                    crate::outln!("{k} = {v}");
                 }
-                (Some(k), None) => println!("{}", config_get(&k).unwrap_or_default()),
+                (Some(k), None) => crate::outln!("{}", config_get(&k).unwrap_or_default()),
                 (None, _) => {
                     for k in ["name", "server", "dir"] {
                         if let Some(v) = config_get(k) {
-                            println!("{k} {v}");
+                            crate::outln!("{k} {v}");
                         }
                     }
                 }
@@ -1496,7 +1496,7 @@ pub(crate) async fn async_main() -> Result<()> {
                             pending_request_count(pending.as_ref()),
                             roster_heading,
                         );
-                        println!("{rendered}");
+                        crate::outln!("{rendered}");
                         // Read only: a device with no identity is told how to
                         // get one, and nothing is minted by looking.
                         if !crate::identity_flow::has_identity() {
@@ -1527,7 +1527,7 @@ pub(crate) async fn async_main() -> Result<()> {
                         "forget {name} (delete its record; its key stays refused)"
                     ))?;
                     let report = crate::fleet_support::forget_device(&name, identity::now_secs())?;
-                    println!("{report}");
+                    crate::outln!("{report}");
                     // Its pending access requests cannot be approved into
                     // anything any more; drop them with the record.
                     crate::withdraw_requests_for(&name);
@@ -1546,7 +1546,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     // Rename in place on the raw record so caps/v2 fields ride
                     // along (remove+store dropped the renamed device's caps).
                     crate::fleet_support::rename_device(&old, &new)?;
-                    println!(
+                    crate::outln!(
                         "renamed '{old}' -> '{new}' (local alias only, the secret, and the other side, are unchanged)"
                     );
                 }
@@ -1560,7 +1560,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     ui_caps.confirm(&format!("durably revoke {name} (it will stop being recognized and cannot rejoin until restored)"))?;
                     set_device_revoked(&name, true)?;
                     crate::withdraw_requests_for(&name);
-                    println!(
+                    crate::outln!(
                         "revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `tunlion devices restore {name}` can)"
                     );
                     let answer = crate::revocation_live::tell_daemon().await;
@@ -1580,7 +1580,7 @@ pub(crate) async fn async_main() -> Result<()> {
                         set_device_revoked(&name, false)?;
                     }
                     let lifted = crate::fleet_support::lift_key_revocations_named(&name)?;
-                    println!(
+                    crate::outln!(
                         "{}",
                         crate::fleet_support::restore_report(&name, record, revoked, &lifted)
                     );
@@ -1611,7 +1611,7 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Man { page } => {
             if let Some(p) = page {
                 if p == "routing" {
-                    println!("{}", include_str!("../docs/tunlion-routing.md"));
+                    crate::outln!("{}", include_str!("../docs/tunlion-routing.md"));
                     return Ok(());
                 }
                 // Unknown page: print clear message instead of falling through to roff
@@ -1957,7 +1957,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 store.push(op.to_json());
                 let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
                     .context("save cap store")?;
-                println!("granted '{capability}' to tag '{t}'.");
+                crate::outln!("granted '{capability}' to tag '{t}'.");
                 return Ok(());
             }
             // grant_operands returns a device whenever there is no --tag.
@@ -2242,7 +2242,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     if names.is_empty() { device.clone() } else { names.join(", ") }
                 ));
             }
-            println!(
+            crate::outln!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
                     "OWNER-EQUIVALENT: they can act as you through `tunlion shell`, `tunlion exec` and `tunlion shell --ssh` (for ssh, their key is installed on first connect)."
@@ -2285,7 +2285,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     bail!("device '{device}' certificate is not chained to this user identity");
                 }
                 set_device_cert_revoked(&device, true)?;
-                println!(
+                crate::outln!(
                     "revoked fleet certificate from '{device}'; the device is denied by the local capability gate"
                 );
                 let answer = crate::revocation_live::tell_daemon().await;
@@ -2426,11 +2426,11 @@ pub(crate) async fn async_main() -> Result<()> {
             }
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
-                println!(
+                crate::outln!(
                     "revoked 'shell' from '{device}' and removed its tunlion-managed authorized_keys block."
                 );
             } else {
-                println!("revoked '{capability}' from '{device}'.");
+                crate::outln!("revoked '{capability}' from '{device}'.");
             }
             if capability == "shell" && crate::daemon_alive().is_some() {
                 ui::say(&ui::paint(
