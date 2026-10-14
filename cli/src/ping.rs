@@ -655,7 +655,8 @@ mod tests {
             "path": { "remote": "203.0.113.7:41641", "relay": false },
         });
         let p = probe_from_warm(&v);
-        assert_eq!(probe_line(&p), "pong via 203.0.113.7:41641 (direct-quic) 9 ms");
+        // The person reads "direct"; the envelope keeps the link's own token.
+        assert_eq!(probe_line(&p), "pong via 203.0.113.7:41641 (direct) 9 ms");
         assert_eq!(
             probe_envelope(&p),
             json!({"ok": true, "verb": "reach", "data": {
