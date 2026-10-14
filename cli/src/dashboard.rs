@@ -391,6 +391,161 @@ async fn state_json() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// A spoken pairing code: `add --word <words>` run as a child that waits for the
+// other side to claim it. One at a time; the page polls it.
+
+#[derive(Default)]
+pub(crate) struct CodeJob {
+    name: String,
+    kind: String,
+    code: Option<String>,
+    done: Option<(i32, String)>,
+    pid: Option<u32>,
+}
+
+pub(crate) type Codes = Arc<Mutex<Option<CodeJob>>>;
+
+/// argv for a pairing code (`person` pairs only; `device` enrols into your
+/// devices and needs the owner key, as `add --for device` does).
+pub(crate) fn code_argv(a: &Value, words: &str) -> Result<Vec<String>, String> {
+    let s = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let kind = s("kind");
+    if !matches!(kind.as_str(), "person" | "device") {
+        return Err("Pick who it is for: a person or one of your devices.".to_string());
+    }
+    let name = s("name");
+    if !valid_new_name(&name) {
+        return Err("Give it a short name: letters, digits, dot, dash.".to_string());
+    }
+    Ok(vec!["add".into(), "--for".into(), kind, "--name".into(), name, "--word".into(), words.to_string()])
+}
+
+fn qr_cells(text: &str) -> Value {
+    match qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M) {
+        Ok(c) => {
+            let w = c.width();
+            let cells: String = (0..w * w).map(|i| if c[(i % w, i / w)] == qrcode::Color::Dark { '1' } else { '0' }).collect();
+            json!({ "width": w, "cells": cells })
+        }
+        Err(_) => Value::Null,
+    }
+}
+
+async fn start_code(codes: &Codes, a: &Value) -> Resp {
+    {
+        let g = codes.lock().unwrap();
+        if let Some(j) = g.as_ref() {
+            if j.done.is_none() {
+                return Resp::json(400, json!({"ok": false, "error": format!("A code for {} is still open. Cancel it first.", j.name)}));
+            }
+        }
+    }
+    let words = filament_pair::words::mint_words();
+    let argv = match code_argv(a, &words) {
+        Ok(v) => v,
+        Err(msg) => return Resp::json(400, json!({"ok": false, "error": msg})),
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return Resp::json(200, json!({"ok": false, "message": format!("cannot find the tunlion binary: {e}")})),
+    };
+    let log = crate::settings::config_dir().join(format!("dashboard-code-{}.log", random_hex(6)));
+    let Ok(out) = std::fs::File::create(&log) else {
+        return Resp::json(200, json!({"ok": false, "message": "could not write in the config dir"}));
+    };
+    let err = match out.try_clone() { Ok(f) => f, Err(_) => return Resp::json(200, json!({"ok": false})) };
+    let child = tokio::process::Command::new(exe)
+        .args(&argv)
+        .env("TUNLION_NONINTERACTIVE", "1")
+        .env("TUNLION_COLOR", "never")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return Resp::json(200, json!({"ok": false, "message": format!("could not run tunlion: {e}")})),
+    };
+    let name = argv[4].clone();
+    let kind = argv[2].clone();
+    *codes.lock().unwrap() = Some(CodeJob { name: name.clone(), kind, code: None, done: None, pid: child.id() });
+    // The full code is the words plus a number the ceremony picks: read it
+    // from what `add` prints.
+    let mut code = None;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if let Some(i) = text.find(&format!("{words}-")) {
+            let rest: String = text[i + words.len() + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if rest.len() >= 3 {
+                code = Some(format!("{words}-{rest}"));
+                break;
+            }
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+    }
+    let codes2 = codes.clone();
+    if let Some(c) = &code {
+        if let Some(j) = codes.lock().unwrap().as_mut() {
+            j.code = Some(c.clone());
+        }
+    }
+    tokio::spawn(async move {
+        let status = tokio::time::timeout(Duration::from_secs(11 * 60), child.wait()).await;
+        let rc = match status {
+            Ok(Ok(s)) => s.code().unwrap_or(1),
+            _ => {
+                let _ = child.kill().await;
+                1
+            }
+        };
+        let said = clean_text(&std::fs::read_to_string(&log).unwrap_or_default());
+        let _ = std::fs::remove_file(&log);
+        if let Some(j) = codes2.lock().unwrap().as_mut() {
+            if j.done.is_none() {
+                j.done = Some((rc, said));
+            }
+        }
+    });
+    match code {
+        Some(c) => Resp::json(200, json!({"ok": true, "code": c, "name": name, "qr": qr_cells(&c)})),
+        None => Resp::json(200, json!({"ok": false, "message": "tunlion did not show a code"})),
+    }
+}
+
+fn code_status(codes: &Codes) -> Value {
+    match codes.lock().unwrap().as_ref() {
+        None => json!({"ok": true, "active": false}),
+        Some(j) => json!({
+            "ok": true,
+            "active": j.done.is_none(),
+            "name": j.name,
+            "kind": j.kind,
+            "code": j.code,
+            "qr": j.code.as_deref().map(qr_cells),
+            "done": j.done.as_ref().map(|(rc, said)| json!({"ok": *rc == 0, "exit": rc, "message": said})),
+        }),
+    }
+}
+
+fn cancel_code(codes: &Codes) {
+    let mut g = codes.lock().unwrap();
+    if let Some(j) = g.as_mut() {
+        if j.done.is_none() {
+            #[cfg(unix)]
+            if let Some(pid) = j.pid {
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            }
+            j.done = Some((130, "Cancelled. The code no longer works.".to_string()));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP: one request per connection, small and bounded.
 
 struct Resp {
@@ -511,7 +666,7 @@ fn my_uid() -> Option<u32> {
     None
 }
 
-async fn handle(mut stream: TcpStream, gate: Arc<Mutex<Gate>>) {
+async fn handle(mut stream: TcpStream, gate: Arc<Mutex<Gate>>, codes: Codes) {
     // Another local user is refused before anything is read.
     if let (Ok(peer), Ok(local), Some(me)) = (stream.peer_addr(), stream.local_addr(), my_uid()) {
         if let Some(uid) = peer_uid(peer, local) {
@@ -525,11 +680,11 @@ async fn handle(mut stream: TcpStream, gate: Arc<Mutex<Gate>>) {
         write_resp(&mut stream, Resp::json(400, json!({"ok": false, "error": "bad request"}))).await;
         return;
     };
-    let resp = route(req, &gate).await;
+    let resp = route(req, &gate, &codes).await;
     write_resp(&mut stream, resp).await;
 }
 
-async fn route(req: Req, gate: &Arc<Mutex<Gate>>) -> Resp {
+async fn route(req: Req, gate: &Arc<Mutex<Gate>>, codes: &Codes) -> Resp {
     if let Err(r) = gate.lock().unwrap().check_site(&req) {
         return Resp::refuse(r);
     }
@@ -556,13 +711,13 @@ async fn route(req: Req, gate: &Arc<Mutex<Gate>>) -> Resp {
             if !gate.lock().unwrap().has_session(&req) {
                 return Resp::refuse(Refusal::NoSession);
             }
-            api(&req, p).await
+            api(&req, p, codes).await
         }
         _ => Resp::json(404, json!({"ok": false, "error": "not found"})),
     }
 }
 
-async fn api(req: &Req, path: &str) -> Resp {
+async fn api(req: &Req, path: &str, codes: &Codes) -> Resp {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     match (req.method.as_str(), path) {
         ("GET", "/api/state") => Resp::json(200, state_json().await),
@@ -575,6 +730,12 @@ async fn api(req: &Req, path: &str) -> Resp {
                 }
                 Err(msg) => Resp::json(400, json!({"ok": false, "error": msg})),
             }
+        }
+        ("POST", "/api/code") => start_code(codes, &body).await,
+        ("GET", "/api/code") => Resp::json(200, code_status(codes)),
+        ("POST", "/api/code/cancel") => {
+            cancel_code(codes);
+            Resp::json(200, code_status(codes))
         }
         ("POST", "/api/invite") => {
             // A fresh owner-only path in the config dir: `add --out` refuses
@@ -629,6 +790,7 @@ pub(crate) async fn dashboard_cmd(no_open: bool, port: Option<u16>) -> Result<()
     let port = listener.local_addr()?.port();
     let secret = random_hex(32);
     let gate = Arc::new(Mutex::new(Gate::new(port, secret.clone())));
+    let codes: Codes = Arc::new(Mutex::new(None));
     let url = format!("http://127.0.0.1:{port}/#k={secret}");
     let opened = !no_open && open_browser(&url);
     crate::ui::say(&format!(
@@ -653,8 +815,7 @@ pub(crate) async fn dashboard_cmd(no_open: bool, port: Option<u16>) -> Result<()
     let serve = async {
         loop {
             let Ok((stream, _)) = listener.accept().await else { continue };
-            let gate = gate.clone();
-            tokio::spawn(handle(stream, gate));
+            tokio::spawn(handle(stream, gate.clone(), codes.clone()));
         }
     };
     tokio::select! {
@@ -760,6 +921,14 @@ mod tests {
         assert!(invite_argv(&json!({"kind": "person", "name": "-x", "expires": "3d"}), out).is_err());
         assert!(invite_argv(&json!({"kind": "person", "name": "dana", "expires": "0d"}), out).is_err());
         assert!(invite_argv(&json!({"kind": "person", "name": "dana", "expires": "3d", "allow": ["a,b"]}), out).is_err());
+    }
+
+    #[test]
+    fn codes_are_shaped() {
+        let a = code_argv(&json!({"kind": "person", "name": "dana"}), "brave-otter").unwrap();
+        assert_eq!(a, ["add", "--for", "person", "--name", "dana", "--word", "brave-otter"]);
+        assert!(code_argv(&json!({"kind": "runner", "name": "dana"}), "w").is_err());
+        assert!(code_argv(&json!({"kind": "device", "name": "--yes"}), "w").is_err());
     }
 
     #[test]

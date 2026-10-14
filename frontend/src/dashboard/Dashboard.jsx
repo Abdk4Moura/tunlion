@@ -1,6 +1,6 @@
 import React from 'react'
 import { Ctx, useT, useThemeMode, useNarrow, Mark, Btn, Tag, Section, Card, Line, Row, Seg, Check, Applied, Title, Page, FONT_SANS, FONT_MONO } from './ui.jsx'
-import { signIn, getState, act, invite } from './api.js'
+import { signIn, getState, act, invite, startCode, cancelCode, codeStatus } from './api.js'
 import { rows as toRows, exposure as toExposure, history as toHistory, utc, ago, capWord, GRANTABLE } from './model.js'
 
 const NAV = [['overview', 'Overview'], ['devices', 'Devices and people'], ['codes', 'Codes and invitations'], ['asks', 'Asks'], ['exposure', 'Exposure'], ['history', 'History']]
@@ -276,7 +276,9 @@ function Device({ A, sel }) {
               return (
                 <Row key={c}>
                   <span style={{ display: 'grid', gap: 2 }}><span style={{ fontSize: 15, color: row ? T.ink : T.sub }}>{capWord(c)}</span>{row && <span style={{ fontSize: 12.5, color: T.sub }}>{row.source}{row.valid_until ? ' · until ' + utc(row.valid_until) : ' · no end time'}</span>}</span>
-                  {row
+                  {row && /ceiling/.test(row.source || '')
+                    ? <span style={{ fontSize: 12.5, color: T.sub, maxWidth: 230, textAlign: 'right' }}>Came with its invitation. Cut it off to take this away.</span>
+                    : row
                     ? <Btn kind="ghost" small label={`Remove ${capWord(c)}`} onClick={() => revokeCap(c, row.valid_until)}>Remove</Btn>
                     : confirm === c
                       ? <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}><span style={{ fontSize: 12.5, color: T.bad, maxWidth: 260 }}>A shell lets {r.name} do anything you can on {me}.</span><Btn kind="dan" small onClick={() => { setConfirm(null); grant(c) }}>Allow shell</Btn><Btn kind="ghost" small onClick={() => setConfirm(null)}>Keep off</Btn></span>
@@ -386,12 +388,85 @@ function Codes({ A }) {
           {err && <div role="alert" style={{ color: T.bad, fontSize: 14, whiteSpace: 'pre-line' }}>{err}</div>}
           <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
             <Btn kind="pri" testid="make-invite" disabled={!f.name || A.busy} onClick={make}>Make the invitation</Btn>
-            <span style={{ fontSize: 13, color: T.sub, flex: 1, minWidth: 220 }}>{me} is the device it opens, so {me} makes it. To read a code out loud instead, run <code>tunlion add {f.name || '<name>'}</code> in a terminal.</span>
+            <span style={{ fontSize: 13, color: T.sub, flex: 1, minWidth: 220 }}>{me} is the device it opens, so {me} makes it. To read a code out loud instead, use the card below.</span>
           </div>
         </div>
       </Card>
+      <SpokenCode A={A} />
       <Card><Section>Open invitations</Section><div style={{ fontSize: 14, color: T.sub, padding: '8px 0' }}>Invitations are not listed yet. Each one works once and expires by itself.</div></Card>
     </Page>
+  )
+}
+
+function QR({ qr, size = 168 }) {
+  const { T } = useT()
+  if (!qr || !qr.width) return null
+  const w = qr.width, q = 2, n = w + 2 * q
+  const rects = []
+  for (let i = 0; i < w * w; i++) if (qr.cells[i] === '1') rects.push(<rect key={i} x={(i % w) + q} y={Math.floor(i / w) + q} width="1" height="1" />)
+  return (
+    <svg role="img" aria-label="QR code of the pairing code" width={size} height={size} viewBox={`0 0 ${n} ${n}`} shapeRendering="crispEdges" style={{ background: '#ffffff', borderRadius: 6, flexShrink: 0 }}>
+      <g fill="#000000">{rects}</g>
+    </svg>
+  )
+}
+
+function SpokenCode({ A }) {
+  const { T, narrow } = useT()
+  const me = A.state.me.name
+  const owner = A.state.me.owner
+  const [kind, setKind] = React.useState('person')
+  const [name, setName] = React.useState('')
+  const [job, setJob] = React.useState(null)
+  const [err, setErr] = React.useState(null)
+  React.useEffect(() => { codeStatus().then((j) => { if (j && j.code) setJob(j) }) }, [])
+  React.useEffect(() => {
+    if (!job || (job.done && !job.active)) return
+    const id = setInterval(async () => {
+      const j = await codeStatus()
+      if (j && j.ok) { setJob(j); if (j.done) A.refresh() }
+    }, 1500)
+    return () => clearInterval(id)
+  }, [job && job.code, job && job.done])
+  const show = async () => {
+    setErr(null)
+    const r = await startCode({ kind, name })
+    if (r.ok) setJob({ active: true, code: r.code, name: r.name, qr: r.qr, kind })
+    else setErr(r.error || r.message || 'That did not work.')
+  }
+  if (job && job.code) {
+    const done = job.done
+    return (
+      <Card testid="spoken-code">
+        <Section>Code for {job.name}</Section>
+        <div style={{ display: 'flex', gap: 20, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
+          {!done && <QR qr={job.qr} />}
+          <div style={{ display: 'grid', gap: 10, minWidth: 220, flex: 1 }}>
+            {!done && <div data-testid="code" style={{ font: `600 ${narrow ? 20 : 26}px ${FONT_MONO}`, letterSpacing: '.02em', overflowWrap: 'anywhere' }}>{job.code}</div>}
+            {!done && <div style={{ fontSize: 13.5, color: T.sub, lineHeight: 1.5 }}>Read it out or let them scan it. On their side: <code>tunlion join {job.code}</code>, or in a browser at tunlion.autumated.com choose "Remember a device" and type it. One claim, expires in 10 minutes.</div>}
+            {!done && <span style={{ display: 'inline-flex', gap: 8, alignItems: 'center', fontSize: 14 }}><Mark size={16} anim="pulse" />Waiting for them to type it</span>}
+            {done && (done.ok
+              ? <><Applied>{job.name} is in</Applied><span style={{ fontSize: 14, color: T.sub }}>Paired with {me}. It now appears under Devices and people.</span></>
+              : <div role="alert" style={{ fontSize: 14, color: T.bad, whiteSpace: 'pre-line' }}>{done.message || 'The code was not used.'}</div>)}
+            <div style={{ display: 'flex', gap: 10 }}>
+              {!done ? <Btn kind="ghost" onClick={async () => setJob(await cancelCode())}>Cancel this code</Btn> : <Btn onClick={() => setJob(null)}>Another code</Btn>}
+            </div>
+          </div>
+        </div>
+      </Card>
+    )
+  }
+  return (
+    <Card>
+      <Section>Read out a code now · you are both here</Section>
+      <div style={{ display: 'grid', gap: 14, marginTop: 8 }}>
+        <div style={{ display: 'grid', gap: 6 }}><span style={{ fontSize: 13.5, fontWeight: 600 }}>Who it is for</span><Seg label="Who the code is for" value={kind} onChange={setKind} options={[['person', 'A person'], ...(owner ? [['device', 'One of my devices']] : [])]} /></div>
+        <label style={{ display: 'grid', gap: 6, fontSize: 13.5, fontWeight: 600 }}>Name<input className="tl-input" value={name} onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, ''))} placeholder={kind === 'device' ? 'phone' : 'dana'} style={{ minHeight: 44, borderRadius: 7, border: '1.5px solid ' + T.ink, background: T.surf, color: T.ink, padding: '0 10px', font: '14px ' + FONT_SANS, maxWidth: 320 }} /></label>
+        <div style={{ fontSize: 14 }}>{kind === 'device' ? `It joins your devices with files and folders, as tunlion add --for device does. Shell stays off.` : `You remember each other. They can send files to ${me}; nothing else until you allow it.`}</div>
+        {err && <div role="alert" style={{ color: T.bad, fontSize: 14, whiteSpace: 'pre-line' }}>{err}</div>}
+        <div><Btn kind="pri" testid="show-code" disabled={!name || A.busy} onClick={show}>Show a code</Btn></div>
+      </div>
+    </Card>
   )
 }
 

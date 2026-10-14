@@ -17,7 +17,11 @@
 #   I  an invitation made through the dashboard comes back once and leaves no
 #      file behind; the person who joins with it appears as a device.
 #   G  grant and revoke through the dashboard change what the gate allows,
-#      exactly as `tunlion grant`/`revoke` do.
+#      exactly as `tunlion grant`/`revoke` do; a grant past an invitation's
+#      ceiling, and a revoke of a cap that came with it, are refused with the
+#      CLI's own advice.
+#   C  a pairing code shown by the dashboard (with its QR) pairs whoever types
+#      it, and the dashboard sees the pairing finish.
 #   X  the dashboard closes when the background service it started beside
 #      stops.
 set -uo pipefail
@@ -106,7 +110,7 @@ if [ "$w1" = 400 ] && [ "$w2" = 400 ] && [ "$w3" = 400 ]; then ok "W: unknown de
 
 # ---------------------------------------------------------------------- I --
 say "I: an invitation comes back once, leaves no file, and the joiner appears"
-i1=$(code -X POST -H "$ORIGIN" -H "$CK" -H 'Content-Type: application/json' --data '{"kind":"person","name":"dana","allow":["transfer"],"expires":"3d"}' "$B/api/invite")
+i1=$(code -X POST -H "$ORIGIN" -H "$CK" -H 'Content-Type: application/json' --data '{"kind":"person","name":"dana","allow":["transfer","shell"],"expires":"3d"}' "$B/api/invite")
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); open(sys.argv[2],"w").write(d.get("invitation") or ""); print("ok" if d.get("ok") else d)' "$WORK/body" "$WORK/dana.invite" >"$WORK/i.out"
 chmod 600 "$WORK/dana.invite"
 left=$(ls "$DA" | grep -c '^dashboard-invite-' || true)
@@ -124,18 +128,51 @@ else
 fi
 
 # ---------------------------------------------------------------------- G --
-say "G: grant and revoke through the dashboard change what the gate allows"
-eff() { env TUNLION_CONFIG_DIR="$DA" "$BIN" devices --caps dana --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]["devices"][0]; print(any(c["action"]=="shell" and c["effective"] for c in d["caps"]))'; }
-g0=$(eff)
-g1=$(act '{"verb":"grant","device":"dana","cap":"shell"}'); g1b=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ok"])' "$WORK/body")
-ga=$(eff)
-g2=$(act '{"verb":"revoke-cap","device":"dana","cap":"shell"}'); g2b=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ok"])' "$WORK/body")
-gb=$(eff)
-echo "## shell before=$g0, grant $g1/$g1b -> $ga, revoke $g2/$g2b -> $gb"
-if [ "$g0" = False ] && [ "$g1b" = True ] && [ "$ga" = True ] && [ "$g2b" = True ] && [ "$gb" = False ]; then
-  ok "G: grant made shell effective for dana and revoke removed it"
+say "G: grant and revoke through the dashboard change what the gate allows; a ceiling holds"
+# kim pairs by code (no invitation, so no ceiling): grant and revoke are plain
+# cap-store writes, exactly as `tunlion grant`/`revoke` make them.
+DK="$WORK/k"; mkdir -p "$DK"
+timeout 120 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --name kim --word gigantic-element </dev/null >"$WORK/k-add.log" 2>&1 &
+KA=$!; FIX_PIDS+=($KA)
+KC=""
+for _ in $(seq 1 60); do KC=$(grep -oiE 'gigantic-element-[0-9]{3,5}' "$WORK/k-add.log" | head -1); [ -n "$KC" ] && break; sleep 0.3; done
+[ -n "$KC" ] && timeout 90 env TUNLION_CONFIG_DIR="$DK" "$BIN" --server "$SERVER" join "$KC" --name alpha </dev/null >"$WORK/k-join.log" 2>&1
+wait $KA; kpair=$?
+capsof() { env TUNLION_CONFIG_DIR="$DA" "$BIN" devices --json 2>/dev/null | python3 -c 'import json,sys; print(" ".join(next((d["caps"] for d in json.load(sys.stdin)["data"]["devices"] if d["name"]==sys.argv[1]), ["absent"])))' "$1"; }
+okf() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ok"])' "$WORK/body"; }
+msgf() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("message",""))' "$WORK/body"; }
+k0=$(capsof kim)
+act '{"verb":"grant","device":"kim","cap":"shell"}' >/dev/null; k1b=$(okf); k1=$(capsof kim)
+act '{"verb":"revoke-cap","device":"kim","cap":"shell"}' >/dev/null; k2b=$(okf); k2=$(capsof kim)
+# dana joined with an invitation whose ceiling is transfer and shell.
+act '{"verb":"grant","device":"dana","cap":"mount"}' >/dev/null; d1b=$(okf); d1m=$(msgf)
+act '{"verb":"revoke-cap","device":"dana","cap":"shell"}' >/dev/null; d2b=$(okf); d2m=$(msgf)
+echo "## kim pair rc=$kpair caps '$k0' -> grant $k1b '$k1' -> revoke $k2b '$k2'"
+echo "## dana grant mount (past its ceiling) ok=$d1b; revoke shell (from its ceiling) ok=$d2b"
+if [ "$kpair" = 0 ] && [ "$k1b" = True ] && echo " $k1 " | grep -q ' shell ' && [ "$k2b" = True ] && ! echo " $k2 " | grep -q ' shell ' \
+   && [ "$d1b" = False ] && echo "$d1m" | grep -q "cannot widen a ceiling" \
+   && [ "$d2b" = False ] && echo "$d2m" | grep -q -- "--certificate"; then
+  ok "G: grant and revoke changed kim's caps; a grant past dana's ceiling and a revoke of a ceiling cap were refused with the CLI's own advice"
 else
-  bad "G grant/revoke ($g0 -> $ga -> $gb)"; cat "$WORK/body"
+  bad "G grant/revoke"; echo "$d1m"; echo "$d2m"; tail -n 5 "$WORK/k-add.log" "$WORK/k-join.log"
+fi
+
+# ---------------------------------------------------------------------- C --
+say "C: a code shown by the dashboard pairs whoever types it"
+c1=$(code -X POST -H "$ORIGIN" -H "$CK" -H 'Content-Type: application/json' --data '{"kind":"person","name":"lee"}' "$B/api/code")
+CODE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("code") or "")' "$WORK/body")
+QRW=$(python3 -c 'import json,sys; q=json.load(open(sys.argv[1])).get("qr") or {}; print(q.get("width",0))' "$WORK/body")
+DL="$WORK/l"; mkdir -p "$DL"
+[ -n "$CODE" ] && timeout 90 env TUNLION_CONFIG_DIR="$DL" "$BIN" --server "$SERVER" join "$CODE" --name alpha </dev/null >"$WORK/l-join.log" 2>&1
+lj=$?
+cdone=""
+for _ in $(seq 1 40); do code -H "$CK" "$B/api/code" >/dev/null; cdone=$(python3 -c 'import json,sys; d=(json.load(open(sys.argv[1])).get("done") or {}); print(d.get("ok",""))' "$WORK/body"); [ -n "$cdone" ] && break; sleep 0.5; done
+lee=$(capsof lee)
+echo "## code -> $c1 '$CODE' (qr width $QRW), join rc=$lj, dashboard says done ok=$cdone, lee caps '$lee'"
+if [ "$c1" = 200 ] && echo "$CODE" | grep -qE '^[a-z]+-[a-z]+-[0-9]{3,5}$' && [ "$QRW" -gt 20 ] && [ "$lj" = 0 ] && [ "$cdone" = True ] && [ "$lee" != absent ]; then
+  ok "C: the dashboard's code (with its QR) paired lee, and the dashboard saw it finish"
+else
+  bad "C spoken code"; tail -n 8 "$WORK/l-join.log"; cat "$WORK/body"
 fi
 
 # ---------------------------------------------------------------------- X --

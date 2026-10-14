@@ -60,7 +60,8 @@ export function exposure(state, rs, done) {
   for (const r of rs) {
     if (r.group === 'gone') continue
     const shell = r.live.find((c) => c.action === 'shell')
-    if (shell && !shell.valid_until && !r.until) out.push({ id: 'sh-' + r.name, risk: 'high', name: r.name, title: `${r.name} can open a shell on ${state.me.name}, with no end time`, sub: r.line, fix: 'Remove shell', act: { verb: 'revoke-cap', device: r.name, cap: 'shell' } })
+    const fromCeiling = shell && /ceiling/.test(shell.source || '')
+    if (shell && !shell.valid_until && !r.until) out.push({ id: 'sh-' + r.name, risk: 'high', name: r.name, title: `${r.name} can open a shell on ${state.me.name}, with no end time`, sub: r.line, ...(fromCeiling ? { fix: 'Review', open: r.name } : { fix: 'Remove shell', act: { verb: 'revoke-cap', device: r.name, cap: 'shell' } }) })
   }
   for (const r of rs) {
     if (r.group === 'gone' || !r.caps.length) continue
@@ -72,7 +73,7 @@ export function exposure(state, rs, done) {
   }
   for (const r of rs) {
     const shell = r.live.find((c) => c.action === 'shell')
-    if (r.group !== 'gone' && shell && (shell.valid_until || r.until)) out.push({ id: 'she-' + r.name, risk: 'low', name: r.name, title: `${r.name} can open a shell on ${state.me.name} until ${utc(shell.valid_until || r.until)}`, sub: r.line, fix: 'Remove shell', act: { verb: 'revoke-cap', device: r.name, cap: 'shell' } })
+    if (r.group !== 'gone' && shell && (shell.valid_until || r.until)) out.push({ id: 'she-' + r.name, risk: 'low', name: r.name, title: `${r.name} can open a shell on ${state.me.name} until ${utc(shell.valid_until || r.until)}`, sub: r.line, ...(/ceiling/.test(shell.source || '') ? { fix: 'Review', open: r.name } : { fix: 'Remove shell', act: { verb: 'revoke-cap', device: r.name, cap: 'shell' } }) })
   }
   for (const r of rs) {
     if (r.group === 'remembered' && r.caps.length) out.push({ id: 'p-' + r.name, risk: 'low', name: r.name, title: `${r.name} has access here`, sub: r.line, fix: 'Review', open: r.name })

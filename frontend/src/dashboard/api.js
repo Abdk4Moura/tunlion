@@ -42,3 +42,9 @@ async function post(path, body) {
 
 export const act = (verb, args) => post('/api/act', { verb, ...args })
 export const invite = (args) => post('/api/invite', args)
+export const startCode = (args) => post('/api/code', args)
+export const cancelCode = () => post('/api/code/cancel', {})
+export async function codeStatus() {
+  const r = await fetch('/api/code', { credentials: 'same-origin' })
+  return r.json().catch(() => ({ ok: false }))
+}

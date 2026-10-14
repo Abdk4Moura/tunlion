@@ -83,8 +83,8 @@
 #                              Origin, its link works once for an HttpOnly
 #                              SameSite cookie, actions take only stored
 #                              devices, an invitation comes back once, grant
-#                              and revoke change the gate, and it closes when
-#                              the daemon stops
+#                              and revoke change the gate, a code it shows
+#                              pairs, and it closes when the daemon stops
 #   concurrent-code-gates.sh   two concurrent `send --code` from one device
 #                              each pair only with their own code's receiver
 #                              (and an unclaimed third keeps waiting, then
@@ -248,8 +248,8 @@ jobs:
             [cli/tests/rc-polish-gates.sh]=6
             # 7: C1 C2 C3 C4 C5 H J (fix/concurrent-code-sends, the RC lab pass).
             [cli/tests/concurrent-code-gates.sh]=7
-            # 8: H O S A W I G X (feat/dashboard).
-            [cli/tests/dashboard-gates.sh]=8
+            # 9: H O S A W I G C X (feat/dashboard).
+            [cli/tests/dashboard-gates.sh]=9
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
