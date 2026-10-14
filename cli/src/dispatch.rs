@@ -2074,11 +2074,28 @@ pub(crate) async fn async_main() -> Result<()> {
                     "a user-wide grant (--user) is an owner-signed grant to a user key, and this device holds no owner signing key. Run it on the owner's machine, or grant to the device:\n  tunlion grant {device} {spec}"
                 );
             }
+            // A device with no certified identity (a browser, which pairs by
+            // code and holds only the pairing secret) cannot be the target of an
+            // owner-signed grant. Its pairing permission below is what the gate
+            // honours for it. This used to write that permission, which took
+            // effect, and THEN fail with "identity not available" (exit 1), so
+            // a grant that worked reported that it had not.
+            let signing_key =
+                crate::identity::UserKey::load(&crate::platform::PlatformKeyStore).ok().flatten();
+            let peer_cert = device_cert_for(&device);
+            if signing_key.is_some() && peer_cert.is_none() && user {
+                bail!(
+                    "'{device}' has no certified identity (a browser, or a device paired by code only), so there is no user key to grant to. Grant to the device instead:\n  tunlion grant {device} {spec}"
+                );
+            }
             device_set_cap(&device, &capability, true, None)?;
+            if signing_key.is_some() && peer_cert.is_none() {
+                ui::say(&format!(
+                    "'{device}' has no certified identity (a browser, or a device paired by code only), so this is a pairing permission, not an owner-signed grant. It takes effect now; `tunlion revoke {device} {capability}` removes it."
+                ));
+            }
             // If identity layer is active, also issue an owner-signed CapOp
-            if let Ok(Some(user_key)) =
-                crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
-            {
+            if let (Some(user_key), Some(peer_cert)) = (signing_key, peer_cert) {
                 let config_dir = crate::settings::config_dir();
                 let mut store = crate::capability::load_cap_store(&config_dir);
 
@@ -2133,11 +2150,6 @@ pub(crate) async fn async_main() -> Result<()> {
                 // and for a device of my own fleet that user is ME: `grant
                 // laptop shell` granted shell to the whole fleet under
                 // authoritative evaluation. See device_caps::GrantScope.
-                let Some(peer_cert) = device_cert_for(&device) else {
-                    return Err(anyhow!(
-                        "peer identity for '{device}' is not available. Pair with the peer first so their identity can be certified; the grant requires a known device key to target"
-                    ));
-                };
                 if peer_cert.verify(crate::identity::now_secs()).is_err() {
                     return Err(anyhow!(
                         "peer identity cert for '{device}' is expired; re-pair to refresh it"
