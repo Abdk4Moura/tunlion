@@ -1037,7 +1037,8 @@ pub(crate) async fn demo_cmd(opts: Opts) -> Result<()> {
     match played {
         Ok(Ok(())) | Ok(Err(Stop::Eof)) | Ok(Err(Stop::Skip)) => Ok(()),
         Ok(Err(Stop::Interrupt)) => {
-            println!();
+            // End the tour's last line; it is the tour's own stdout, not a log.
+            let _ = writeln!(std::io::stdout());
             std::process::exit(crate::exit_codes::INTERRUPTED)
         }
         Err(e) => Err(anyhow::anyhow!("the demo stopped unexpectedly: {e}")),
