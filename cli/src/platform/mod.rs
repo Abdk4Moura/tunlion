@@ -1917,6 +1917,53 @@ pub const DETACHED_CHILD_ENV: &str = "TUNLION_DETACHED_CHILD";
 /// resolves where there is no such request to wait for (Windows has no
 /// SIGTERM; a console close arrives as Ctrl-C/Ctrl-Break there). Installing
 /// the handler replaces SIGTERM's default action, so the caller must exit.
+/// Open `url` in the user's browser. False when there is no way to (no
+/// desktop session) or the opener failed; the caller then prints the link.
+pub fn open_in_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(url).status();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).status();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return false;
+        }
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    };
+    matches!(r, Ok(s) if s.success())
+}
+
+/// The uid that owns the client end of a loopback TCP connection to us, when
+/// the platform can say (Linux, from /proc/net/tcp). None when it cannot.
+pub fn loopback_peer_uid(peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let hexaddr = |a: std::net::SocketAddr| match a.ip() {
+            std::net::IpAddr::V4(v) => Some(format!("{:08X}:{:04X}", u32::from_le_bytes(v.octets()), a.port())),
+            _ => None,
+        };
+        let (want_local, want_rem) = (hexaddr(peer)?, hexaddr(local)?);
+        let raw = std::fs::read_to_string("/proc/net/tcp").ok()?;
+        for line in raw.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() > 7 && f[1] == want_local && f[2] == want_rem {
+                return f[7].parse().ok();
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (peer, local);
+        None
+    }
+}
+
 pub async fn terminate_requested() {
     #[cfg(unix)]
     {

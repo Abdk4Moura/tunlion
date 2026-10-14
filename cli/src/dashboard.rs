@@ -410,7 +410,7 @@ pub(crate) struct CodeJob {
     kind: String,
     code: Option<String>,
     done: Option<(i32, String)>,
-    pid: Option<u32>,
+    cancel: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub(crate) type Codes = Arc<Mutex<Option<CodeJob>>>;
@@ -477,7 +477,8 @@ async fn start_code(codes: &Codes, a: &Value) -> Resp {
     };
     let name = argv[4].clone();
     let kind = argv[2].clone();
-    *codes.lock().unwrap() = Some(CodeJob { name: name.clone(), kind, code: None, done: None, pid: child.id() });
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    *codes.lock().unwrap() = Some(CodeJob { name: name.clone(), kind, code: None, done: None, cancel: Some(cancel.clone()) });
     // The full code is the words plus a number the ceremony picks: read it
     // from what `add` prints.
     let mut code = None;
@@ -502,12 +503,17 @@ async fn start_code(codes: &Codes, a: &Value) -> Resp {
         }
     }
     tokio::spawn(async move {
-        let status = tokio::time::timeout(Duration::from_secs(11 * 60), child.wait()).await;
-        let rc = match status {
-            Ok(Ok(s)) => s.code().unwrap_or(1),
-            _ => {
+        let rc = tokio::select! {
+            status = tokio::time::timeout(Duration::from_secs(11 * 60), child.wait()) => match status {
+                Ok(Ok(s)) => s.code().unwrap_or(1),
+                _ => {
+                    let _ = child.kill().await;
+                    1
+                }
+            },
+            _ = cancel.notified() => {
                 let _ = child.kill().await;
-                1
+                130
             }
         };
         let said = clean_text(&std::fs::read_to_string(&log).unwrap_or_default());
@@ -543,9 +549,8 @@ fn cancel_code(codes: &Codes) {
     let mut g = codes.lock().unwrap();
     if let Some(j) = g.as_mut() {
         if j.done.is_none() {
-            #[cfg(unix)]
-            if let Some(pid) = j.pid {
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            if let Some(c) = &j.cancel {
+                c.notify_one();
             }
             j.done = Some((130, "Cancelled. The code no longer works.".to_string()));
         }
@@ -643,40 +648,11 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
     }
 }
 
-/// Linux: the uid owning the client end of a loopback connection, from
-/// /proc/net/tcp. None when it cannot be told.
-#[cfg(target_os = "linux")]
-fn peer_uid(peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<u32> {
-    let want_local = format!("{:08X}:{:04X}", u32::from_le_bytes(match peer.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => return None }), peer.port());
-    let want_rem = format!("{:08X}:{:04X}", u32::from_le_bytes(match local.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => return None }), local.port());
-    let raw = std::fs::read_to_string("/proc/net/tcp").ok()?;
-    for line in raw.lines().skip(1) {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() > 7 && f[1] == want_local && f[2] == want_rem {
-            return f[7].parse().ok();
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(_peer: std::net::SocketAddr, _local: std::net::SocketAddr) -> Option<u32> {
-    None
-}
-
-#[cfg(unix)]
-fn my_uid() -> Option<u32> {
-    Some(unsafe { libc::getuid() })
-}
-#[cfg(not(unix))]
-fn my_uid() -> Option<u32> {
-    None
-}
-
 async fn handle(mut stream: TcpStream, gate: Arc<Mutex<Gate>>, codes: Codes) {
     // Another local user is refused before anything is read.
-    if let (Ok(peer), Ok(local), Some(me)) = (stream.peer_addr(), stream.local_addr(), my_uid()) {
-        if let Some(uid) = peer_uid(peer, local) {
+    if let (Ok(peer), Ok(local)) = (stream.peer_addr(), stream.local_addr()) {
+        let me = crate::platform::fs_at::current_uid();
+        if let Some(uid) = crate::platform::loopback_peer_uid(peer, local) {
             if uid != me {
                 write_resp(&mut stream, Resp::json(403, json!({"ok": false, "error": "This dashboard belongs to another user."}))).await;
                 return;
@@ -765,25 +741,6 @@ async fn api(req: &Req, path: &str, codes: &Codes) -> Resp {
     }
 }
 
-fn open_browser(url: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    let r = std::process::Command::new("open").arg(url).status();
-    #[cfg(target_os = "windows")]
-    let r = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).status();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let r = {
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            return false;
-        }
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-    };
-    matches!(r, Ok(s) if s.success())
-}
-
 pub(crate) async fn dashboard_cmd(no_open: bool, port: Option<u16>, server: &str) -> Result<()> {
     let _ = SERVER.set(server.to_string());
     if !crate::identity_flow::has_identity() && crate::devices_store::devices_load().is_empty() {
@@ -800,7 +757,7 @@ pub(crate) async fn dashboard_cmd(no_open: bool, port: Option<u16>, server: &str
     let gate = Arc::new(Mutex::new(Gate::new(port, secret.clone())));
     let codes: Codes = Arc::new(Mutex::new(None));
     let url = format!("http://127.0.0.1:{port}/#k={secret}");
-    let opened = !no_open && open_browser(&url);
+    let opened = !no_open && crate::platform::open_in_browser(&url);
     crate::ui::say(&format!(
         "  dashboard for {} {}\n  {url}\n  the link works once and only from this user on this machine. Ctrl-C stops it.",
         crate::display_name(),
