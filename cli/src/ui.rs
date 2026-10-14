@@ -401,17 +401,16 @@ pub fn strip_ansi(s: &str) -> String {
 /// (`tunlion devices | less`, `> file`) the escapes are removed here: a pipe
 /// always reads plain text.
 pub fn out_line(s: &str) {
-    if stdout_color() {
-        println!("{s}");
-    } else {
-        println!("{}", strip_ansi(s));
-    }
+    // println! (not writeln!) on purpose: a closed pipe must take the same
+    // path as every other stdout write (see exit_quietly_on_broken_pipe).
+    let line = if stdout_color() { s.to_string() } else { strip_ansi(s) };
+    println!("{line}");
 }
 
 /// `println!` for human output on stdout, through `ui::out_line`.
 #[macro_export]
 macro_rules! outln {
-    () => { println!() };
+    () => { $crate::ui::out_line("") };
     ($($t:tt)*) => { $crate::ui::out_line(&format!($($t)*)) };
 }
 
