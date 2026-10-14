@@ -750,9 +750,12 @@ fn mouse_mode_changes(data: &[u8]) -> (Vec<u16>, Vec<u16>) {
 }
 
 /// A detached session (channel dropped, nobody reattached) is reaped after this.
-/// Long enough to ride out a mobile network handoff / tab suspend, short enough
-/// that a closed laptop does not leave a root shell alive for hours.
-pub const SESSION_DETACHED_IDLE: Duration = Duration::from_secs(180);
+/// Long enough to ride out a mobile network handoff, a tab suspend or a laptop
+/// lid closed for a coffee, short enough that a closed laptop does not leave a
+/// shell alive for hours. It never outlives the peer's access: the revocation
+/// ticker below ends a detached session the moment its access expires or is
+/// cut, whatever is left of this window.
+pub const SESSION_DETACHED_IDLE: Duration = Duration::from_secs(600);
 
 /// Hard lifetime cap on ANY persistent PTY session, attached or not. A backstop
 /// so a wedged or forgotten session cannot live forever.
@@ -770,6 +773,11 @@ enum SessionCmd {
     Attach {
         transport: Arc<dyn Transport>,
         sid: u32,
+        /// How many bytes of this session's output the client already has. The
+        /// replay starts there, so a reattach shows only what was missed instead
+        /// of the whole buffer again. `None` (a client that does not count, or a
+        /// first attach) replays the whole buffer, as before.
+        resume_from: Option<u64>,
     },
     Detach,
     End,
@@ -800,9 +808,11 @@ impl PtySessionHandle {
     pub fn resize(&self, cols: u16, rows: u16) {
         let _ = self.resize_tx.send((cols, rows));
     }
-    /// Rebind output to a new link (transport + sid) and replay the buffer.
-    pub fn attach(&self, transport: Arc<dyn Transport>, sid: u32) {
-        let _ = self.cmd_tx.send(SessionCmd::Attach { transport, sid });
+    /// Rebind output to a new link (transport + sid) and replay what the client
+    /// missed: everything after `resume_from` bytes, or the whole buffer when the
+    /// client did not say.
+    pub fn attach(&self, transport: Arc<dyn Transport>, sid: u32, resume_from: Option<u64>) {
+        let _ = self.cmd_tx.send(SessionCmd::Attach { transport, sid, resume_from });
     }
     /// Drop the current binding; output accrues in the ring until the next attach
     /// or the detached-idle reaper fires.
@@ -976,6 +986,10 @@ pub async fn spawn_pty_session(
         let _guard = pty_guard; // freed when the task ends (any exit path)
         let mut bind: Option<OutBind> = Some(OutBind { transport, sid });
         let mut ring: VecDeque<u8> = VecDeque::new();
+        // Total bytes of output this session has produced (everything that went
+        // through the ring, including the reattach mode heal). The ring holds
+        // the last `ring.len()` of them, so it starts at `out_total - ring.len()`.
+        let mut out_total: u64 = 0;
         let started = Instant::now();
         let mut detached_since: Option<Instant> = None;
         let mut active_mouse_modes: Vec<u16> = Vec::new();
@@ -1000,6 +1014,7 @@ pub async fn spawn_pty_session(
                         }
                         active_mouse_modes.retain(|m| !resets.contains(m));
                         push_ring(&mut ring, &bytes, SESSION_BUFFER_CAP);
+                        out_total += bytes.len() as u64;
                         if let Some(b) = &bind {
                             for chunk in bytes.chunks(b.transport.max_payload().max(1)) {
                                 if b.transport.send_frame(b.sid, 0, chunk).await.is_err() {
@@ -1015,10 +1030,12 @@ pub async fn spawn_pty_session(
                     None => break, // shell exited
                 },
                 cmd = cmd_rx.recv() => match cmd {
-                    Some(SessionCmd::Attach { transport, sid }) => {
-                        // Replay the buffered output to the freshly attached link
-                        // so the user sees the shell exactly as it stands now.
-                        let snapshot: Vec<u8> = ring.iter().copied().collect();
+                    Some(SessionCmd::Attach { transport, sid, resume_from }) => {
+                        // Replay the buffered output the client has not seen to
+                        // the freshly attached link, so the user sees the shell
+                        // exactly as it stands now without repeating anything.
+                        let skip = replay_skip(out_total, ring.len(), resume_from);
+                        let snapshot: Vec<u8> = ring.iter().skip(skip).copied().collect();
                         let mp = transport.max_payload().max(1);
                         let mut ok = true;
                         for chunk in snapshot.chunks(mp) {
@@ -1031,17 +1048,19 @@ pub async fn spawn_pty_session(
                         // restore any modes the live PTY app had active so
                         // the wheel still scrolls after a reconnect.
                         if ok {
-                            // Always flush stuck modes first (safety net)
-                            if transport.send_frame(sid, 0, PTY_REATTACH_RESET).await.is_err() {
-                                ok = false;
-                            }
-                            // Re-enable modes the PTY app had on before detach
+                            // Always flush stuck modes first (safety net), then
+                            // re-enable modes the PTY app had on before detach.
+                            // The heal goes through the ring like any output, so
+                            // it has a place in the byte count a later reattach
+                            // resumes from.
+                            let mut heal = PTY_REATTACH_RESET.to_vec();
                             for m in &active_mouse_modes {
-                                let seq = format!("\x1b[?{m}h");
-                                if ok && transport.send_frame(sid, 0, seq.as_bytes()).await.is_err() {
-                                    ok = false;
-                                    break;
-                                }
+                                heal.extend_from_slice(format!("\x1b[?{m}h").as_bytes());
+                            }
+                            push_ring(&mut ring, &heal, SESSION_BUFFER_CAP);
+                            out_total += heal.len() as u64;
+                            if transport.send_frame(sid, 0, &heal).await.is_err() {
+                                ok = false;
                             }
                         }
                         if ok {
@@ -1127,6 +1146,20 @@ pub async fn spawn_pty_session(
 
     sessions.insert(session_id, handle.clone()).await;
     Some(handle)
+}
+
+/// How many bytes at the front of the replay ring a reattach skips. The ring
+/// holds the last `ring_len` of `out_total` bytes produced. A client that says it
+/// already has `resume_from` bytes gets only what follows; a client that says
+/// nothing, claims bytes that were never produced, or has fallen behind what the
+/// ring still holds gets the whole ring (the old behaviour: some repetition is
+/// better than a gap). Pure.
+pub(crate) fn replay_skip(out_total: u64, ring_len: usize, resume_from: Option<u64>) -> usize {
+    let ring_start = out_total.saturating_sub(ring_len as u64);
+    match resume_from {
+        Some(n) if n >= ring_start && n <= out_total => (n - ring_start) as usize,
+        _ => 0,
+    }
 }
 
 /// Append `bytes` to the replay ring, evicting from the front so it never exceeds
@@ -2764,6 +2797,7 @@ async fn pump_warm_pty_stdio(
     sock: tokio::net::UnixStream,
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
+    received: &mut u64,
 ) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(sock);
     if let Some(buf) = pending.take() {
@@ -2779,7 +2813,11 @@ async fn pump_warm_pty_stdio(
         tokio::select! {
             r = rd.read(&mut buf) => match r {
                 Ok(0) | Err(_) => break, // remote half closed: warm session over
-                Ok(n) => { stdout.write_all(&buf[..n]).await?; stdout.flush().await?; }
+                Ok(n) => {
+                    stdout.write_all(&buf[..n]).await?;
+                    stdout.flush().await?;
+                    *received += n as u64;
+                }
             },
             chunk = stdin_rx.recv() => match chunk {
                 Some(c) if c.is_empty() => { let _ = wr.shutdown().await; } // fd0 EOF
@@ -3156,6 +3194,7 @@ async fn pty_attach_once(
     raw: &mut Option<RawGuard>,
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
+    received: &mut u64,
 ) -> Result<PtyOutcome> {
     // Bound the connect so an unreachable peer fails with a clear message
     // instead of hanging forever. Override with TUNLION_CONNECT_SECS.
@@ -3224,6 +3263,11 @@ async fn pty_attach_once(
                 "type": "pty-open", "sid": sid, "session": session_id,
                 "cols": cols, "rows": rows, "term": term, "resume": resume,
             });
+            // A reattach says how much output it already has, so the acceptor
+            // replays only what was missed.
+            if resume {
+                ctl["resume_from"] = json!(*received);
+            }
             if !cmd.is_empty() {
                 ctl["cmd"] = json!(cmd);
             }
@@ -3336,6 +3380,7 @@ async fn pty_attach_once(
                 Some(Some(bytes)) => {
                     stdout.write_all(&bytes).await?;
                     stdout.flush().await?;
+                    *received += bytes.len() as u64;
                 }
                 // Pipe closed: clean exit (l2-close, link still alive), a mid-session
                 // denial (l2-close{err}, the revoke case), or a drop.
@@ -3412,6 +3457,7 @@ async fn try_warm_pty(
     raw: &mut Option<RawGuard>,
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
+    received: &mut u64,
 ) -> Option<Result<()>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     // `Err(Some(reason))` means the DAEMON answered. A `refused:` reason is the
@@ -3454,7 +3500,7 @@ async fn try_warm_pty(
                 }
             }
         });
-        let r = pump_warm_pty_stdio(sock, stdin_rx, pending).await;
+        let r = pump_warm_pty_stdio(sock, stdin_rx, pending, received).await;
         winch.abort();
         Some(r)
     } else {
@@ -3484,7 +3530,14 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Random, per-invocation, in-memory only: distinct runs never collide; only
     // THIS process's reconnects reattach (see the user's "same client" concern).
-    let session_id = crate::fresh_secret();
+    // TUNLION_SHELL_SESSION names the session instead, so a later run on THIS
+    // device can pick a detached shell back up. The acceptor scopes every
+    // session id to the device that proved itself on the link, so a name is
+    // never a way into another device's shell.
+    let session_id = std::env::var("TUNLION_SHELL_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty() && s.len() <= 64)
+        .unwrap_or_else(crate::fresh_secret);
     let term = std::env::var("TERM")
         .ok()
         .filter(|s| !s.is_empty())
@@ -3547,6 +3600,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     //   so the next attach can tell the two apart locally. Bigger than a ctl op,
     //   and worth knowing before someone builds a probe that cannot answer.
     let mut warm_ended = false;
+    // Bytes of this session's output already written to the terminal, across
+    // every attach (warm or cold). A reattach sends it so the acceptor replays
+    // only what this terminal has not shown yet.
+    let mut received: u64 = 0;
 
     #[cfg(unix)]
     if !relay && (interactive || !one_shot.is_empty()) {
@@ -3559,6 +3616,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
             &mut raw,
             &mut stdin_rx,
             &mut pending,
+            &mut received,
         )
         .await
         {
@@ -3595,6 +3653,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
             &mut raw,
             &mut stdin_rx,
             &mut pending,
+            &mut received,
         )
         .await
         {
@@ -3740,9 +3799,11 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                     std::process::exit(6);
                 }
                 // A reconnect attempt failed. Keep trying until the acceptor would
-                // have reaped the detached session (SESSION_DETACHED_IDLE = 180s);
-                // stop a bit under that so we don't reattach into a fresh shell.
-                if last_up.elapsed() > Duration::from_secs(150) {
+                // have reaped the detached session (SESSION_DETACHED_IDLE); stop a
+                // bit under that so we don't reattach into a fresh shell. A peer
+                // on an older build with a shorter window answers the resume with
+                // "no such session", which ends cleanly.
+                if last_up.elapsed() > SESSION_DETACHED_IDLE.saturating_sub(Duration::from_secs(30)) {
                     eprint!(
                         "\r\n\x1b[2m[tunlion: session expired, reconnect window passed]\x1b[0m\r\n"
                     );
@@ -6751,7 +6812,7 @@ mod h1_tests {
             .get_live("sess-x")
             .await
             .expect("session still live for reattach");
-        live.attach(tb.clone(), sid_b);
+        live.attach(tb.clone(), sid_b, None);
         tokio::time::sleep(Duration::from_millis(150)).await;
         let b_replay = String::from_utf8_lossy(&tb.bytes_for(sid_b)).to_string();
         assert!(
@@ -6775,6 +6836,74 @@ mod h1_tests {
             sessions.get_live("sess-x").await.is_none(),
             "ended session must leave the store"
         );
+    }
+
+    /// A reattach that says how much output it already has gets only what it
+    /// missed: nothing it already showed comes back a second time, and output
+    /// produced while detached is not lost.
+    #[tokio::test]
+    async fn reattach_with_resume_from_replays_only_what_was_missed() {
+        let _slot_guard = PTY_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !std::path::Path::new("/bin/cat").exists() {
+            return;
+        }
+        let sessions = PtySessions::new();
+        let ta = CapTransport::new();
+        let sid_a = L2_SID_BASE | 11;
+        let guard = PtyGuard::try_acquire().expect("slot");
+        let sess = spawn_pty_session(
+            sessions.clone(),
+            "sess-resume".to_string(),
+            ta.clone(),
+            sid_a,
+            80,
+            24,
+            "xterm-256color",
+            vec!["/bin/cat".to_string()],
+            guard,
+            None,
+            false,
+        )
+        .await
+        .expect("spawn");
+
+        sess.feed_input(b"seen-on-a\n".to_vec());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let seen = ta.bytes_for(sid_a);
+        assert!(String::from_utf8_lossy(&seen).contains("seen-on-a"));
+
+        // Drop, then produce output nobody is attached to see.
+        sess.detach();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sess.feed_input(b"while-away\n".to_vec());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Reattach saying "I have everything link A showed".
+        let tb = CapTransport::new();
+        let sid_b = L2_SID_BASE | 12;
+        let live = sessions.get_live("sess-resume").await.expect("live");
+        live.attach(tb.clone(), sid_b, Some(seen.len() as u64));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let b = String::from_utf8_lossy(&tb.bytes_for(sid_b)).to_string();
+        assert!(!b.contains("seen-on-a"), "already-shown output was replayed again: {b:?}");
+        assert!(b.contains("while-away"), "output produced while detached was lost: {b:?}");
+
+        live.end();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    #[test]
+    fn replay_skip_resumes_exactly_or_falls_back_to_the_whole_ring() {
+        // 100 bytes produced, the ring holds the last 40 (bytes 60..100).
+        assert_eq!(replay_skip(100, 40, Some(100)), 40, "up to date: replay nothing");
+        assert_eq!(replay_skip(100, 40, Some(75)), 15, "replay bytes 75..100");
+        assert_eq!(replay_skip(100, 40, Some(60)), 0, "exactly the ring start");
+        assert_eq!(replay_skip(100, 40, Some(59)), 0, "behind the ring: whole ring");
+        assert_eq!(replay_skip(100, 40, Some(101)), 0, "claims unproduced bytes: whole ring");
+        assert_eq!(replay_skip(100, 40, None), 0, "client did not say: whole ring");
+        assert_eq!(replay_skip(10, 10, Some(4)), 4, "ring holds everything");
     }
 
     /// The retry hint must be a command the CLI ACCEPTS, not just one containing
