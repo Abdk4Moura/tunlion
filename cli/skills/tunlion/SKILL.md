@@ -22,7 +22,8 @@ the exit codes that command can return.
    confirmation (`down`, `reset`, `revoke`, `devices forget`, `devices revoke`,
    `expose --off`) fail unless you pass `-y`. Pass `-y` only when the user asked for that exact
    action. `reset` wipes this machine's identity: never run it unless the user
-   explicitly asked.
+   explicitly asked. `tunlion demo` is a tour for people at a terminal; do not
+   run it.
 4. Device names come from `tunlion devices --json` (the list is under
    `data.devices`). Never invent one.
 5. Never put invitation material on the command line. Write it to a file and

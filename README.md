@@ -45,6 +45,8 @@ tunlion add --name phone            # remember a device (no file needed)
 tunlion up --install                # receive in the background (always-on service)
 ```
 
+New to it? `tunlion demo` is a guided tour you follow in your terminal: real commands, simulated peers, nothing leaves your machine.
+
 - **The other end can be a browser** — your wife's phone with nothing installed opens a URL and taps accept.
 - **Speakable one-time codes** burn on first use — an overheard code is worthless.
 - **Resumable**: transfers survive process restarts and verify by content hash.
