@@ -161,6 +161,18 @@ async function pairWithVpsIn(x, via) {
   lab(`~/matrix/box.sh up ${VPS}`);
   vps(`tunlion init --name vps --no-background --recovery-file ~/.recovery -y >/dev/null && tunlion up --detach >/dev/null && echo ok`);
   let paired = null;
+  // A device paired by a separate CLI process is picked up by the running
+  // daemon on its next tick (about 20 s), so a fresh pairing reads OFFLINE
+  // until then. Wait for ONLINE (bounded) before using it.
+  const waitOnline = async (p, name, ms = 60000) => {
+    await p.getByRole('button', { name: /^Devices/ }).first().click();
+    const t = Date.now();
+    while (Date.now() - t < ms) {
+      if (new RegExp(`${name}[\\s\\S]{0,120}?ONLINE`).test(await body(p))) return true;
+      await p.waitForTimeout(2000);
+    }
+    return false;
+  };
 
   await cell('B01', 'browser-cli', 'receive by code (desktop)', () => receiveFromCli('desktop'));
   await cell('B02', 'browser-cli', 'receive by code (phone)', () => receiveFromCli('phone'));
@@ -202,6 +214,7 @@ async function pairWithVpsIn(x, via) {
     await p.getByRole('button', { name: 'Devices' }).click(); await p.waitForTimeout(3000);
     await shot(p, 'b06-devices');
     assert(/vps/.test(await body(p)), 'vps is listed under Devices after reload');
+    assert(await waitOnline(p, 'vps'), 'vps comes ONLINE after reload');
     const f = path.join(OUT, 'ev', 'to-vps.bin'); fs.writeFileSync(f, crypto.randomBytes(300000));
     await pickFile(p, p.getByRole('button', { name: /send files to/i }).first(), f);
     let got = ''; for (let i = 0; i < 40 && !got; i++) { await p.waitForTimeout(1000); got = tryVps('sha256sum Tunlion/to-vps.bin 2>/dev/null | cut -c1-64').out.trim(); }
@@ -209,7 +222,7 @@ async function pairWithVpsIn(x, via) {
   });
 
   const openShell = async (p) => {
-    await p.getByRole('button', { name: 'Devices' }).click(); await p.waitForTimeout(2500);
+    await waitOnline(p, 'vps', 60000);
     const btn = p.getByRole('button', { name: /open a shell on/i });
     if (!(await btn.count())) return false;
     await btn.first().click(); await p.waitForTimeout(6000); return true;
@@ -317,8 +330,10 @@ async function pairWithVpsIn(x, via) {
       assert(await remember(A.p), 'A offers Remember and it was chosen');
       await remember(B.p);
       await home(A.p); await home(B.p); await A.p.waitForTimeout(8000);
-      await A.p.getByRole('button', { name: 'Devices' }).click(); await A.p.waitForTimeout(3000);
-      await shot(A.p, 'bb2-devices-after-reload');
+      const bname = await selfName(B.p);
+      const up = await waitOnline(A.p, bname);
+      await shot(A.p, 'bb2-devices-after-reload'); say('B is', bname);
+      assert(up, 'B comes ONLINE on A after both reload');
       const f = path.join(OUT, 'ev', 'bb2.bin'); fs.writeFileSync(f, crypto.randomBytes(120000));
       await pickFile(A.p, sendTo(A.p, await selfName(B.p)), f);
       assert(await waitText(B.p, /bb2\.bin[\s\S]*(done|complete)/i, 40000), 'B shows done after reload');

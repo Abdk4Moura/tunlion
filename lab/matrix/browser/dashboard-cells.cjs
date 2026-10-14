@@ -46,7 +46,7 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
   lab(`docker exec -u0 ${DASH} mkdir -p /run/sshd; test -f ~/.ssh/mxdash || ssh-keygen -q -t ed25519 -f ~/.ssh/mxdash -N ''`);
   const pub = lab('cat ~/.ssh/mxdash.pub').trim();
   dash(`mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '${pub}' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys; test -f hk || ssh-keygen -q -t ed25519 -f hk -N ''; /usr/sbin/sshd -p 2222 -h $PWD/hk -o PidFile=$PWD/sshd.pid 2>/dev/null; echo sshd`);
-  const ip = lab(`docker inspect -f '{{.NetworkSettings.IPAddress}}' ${DASH}`).trim();
+  const ip = lab(`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${DASH}`).trim();
   // A control socket, so the tunnel is closed by name of socket, never by pkill.
   lab(`ssh -S ~/.ssh/mxdash.sock -O exit x 2>/dev/null; ssh -M -S ~/.ssh/mxdash.sock -i ~/.ssh/mxdash -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ExitOnForwardFailure=yes -fN -L 127.0.0.1:${PORT}:127.0.0.1:${PORT} -p 2222 sam@${ip} && echo tunnel`);
   const fwd = cp.spawn('gh', ['codespace', 'ssh', '-c', process.env.CODESPACE, '--', '-N', '-o', 'ExitOnForwardFailure=yes', '-L', `${PORT}:127.0.0.1:${PORT}`], { stdio: 'ignore' });
@@ -85,21 +85,6 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
     assert(await p.getByRole('button', { name: /dinv/ }).count() > 0, 'the new device is listed in the dashboard');
   });
 
-  await cell('D03', 'grant shell (confirmed), then remove it', async () => {
-    await nav('Devices and people');
-    await p.getByRole('button', { name: /dinv/ }).first().click();
-    await p.getByRole('heading', { name: 'dinv', exact: true }).waitFor();
-    await p.getByRole('button', { name: 'Allow shell' }).first().click();
-    assert(await p.getByText(/A shell lets dinv do anything you can/).count() > 0, 'a warning comes before granting shell');
-    await p.getByRole('button', { name: 'Allow shell' }).last().click();
-    await p.getByText(/Applied on dash/).first().waitFor({ timeout: 15000 });
-    let c = caps('dinv'); say(c); assert(/shell\s+self\s+\S.*yes/.test(c), 'the CLI shows shell granted to dinv');
-    await shot(p, 'd03-granted');
-    await p.getByRole('button', { name: 'Remove shell' }).first().click();
-    await p.waitForTimeout(3000);
-    c = caps('dinv'); say(c); assert(!/shell\s+self\s+\S.*yes/.test(c), 'the CLI shows shell removed');
-  });
-
   await cell('D04', 'cut off, then restore', async () => {
     await nav('Devices and people');
     await p.getByRole('button', { name: /dinv/ }).first().click();
@@ -127,12 +112,30 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
     assert(inNow, 'the dashboard says it is in');
   });
 
+  await cell('D03', 'grant shell (confirmed), then remove it (device paired by code)', async () => {
+    await nav('Devices and people');
+    await p.getByRole('button', { name: /dcode/ }).first().click();
+    await p.getByRole('heading', { name: 'dcode', exact: true }).waitFor();
+    await p.getByRole('button', { name: 'Allow shell' }).first().click();
+    assert(await p.getByText(/A shell lets dcode do anything you can/).count() > 0, 'a warning comes before granting shell');
+    await p.getByRole('button', { name: 'Allow shell' }).last().click();
+    await p.getByText(/Applied on dash/).first().waitFor({ timeout: 15000 });
+    let c = caps('dcode'); say(c); assert(/shell\s+self\s+\S.*yes/.test(c), 'the CLI shows shell granted to dcode');
+    await shot(p, 'd03-granted');
+    await p.getByRole('button', { name: 'Remove shell' }).first().click();
+    await p.waitForTimeout(3000);
+    c = caps('dcode'); say(c); assert(!/shell\s+self\s+\S.*yes/.test(c), 'the CLI shows shell removed');
+  });
+
   await cell('D06', 'approve an ask from the Asks screen', async () => {
     // A paired device without shell asks by being refused.
     const r = tryDc(`tunlion exec dash -- true; echo EXIT=$?`); say(r.out);
     assert(/EXIT=4/.test(r.out), 'exec without shell is refused (exit 4)');
+    say('requests on dash:', dash('tunlion requests 2>&1'));
     await nav('Asks'); await p.waitForTimeout(3000);
     await p.reload(); await p.waitForTimeout(3000); await nav('Asks');
+    const st = await p.evaluate(async () => { const r = await fetch('/api/state'); const j = await r.json(); return JSON.stringify({ requests: j.requests, asks: j.asks, daemon: j.daemon }).slice(0, 600); });
+    say('state:', st); await shot(p, 'd06-asks');
     const ask = p.getByTestId('ask-accept').first();
     await ask.waitFor({ timeout: 20000 });
     await shot(p, 'd06-ask');
