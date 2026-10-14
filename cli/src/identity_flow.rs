@@ -239,6 +239,13 @@ pub(crate) fn up_refused_for_identity(has_identity: bool, devices_json: Option<&
 
 /// [`UP_NEEDS_IDENTITY_MSG`] as the exit-9 error when `up` would serve no one.
 pub(crate) fn up_needs_identity() -> Option<anyhow::Error> {
+    // A config directory that cannot even be made (a path past PATH_MAX, a
+    // HOME that does not exist) is the real cause, and the daemon lock below
+    // names it precisely (hostile-env gates L and H): no opinion here.
+    let dir = settings::config_dir();
+    if !dir.is_dir() && crate::platform::create_private_dir_all(&dir).is_err() {
+        return None;
+    }
     let raw = std::fs::read_to_string(crate::devices_store::devices_path()).ok();
     up_refused_for_identity(has_identity(), raw.as_deref()).then(|| {
         crate::exit_codes::err(crate::exit_codes::ExitKind::NoIdentity, UP_NEEDS_IDENTITY_MSG)

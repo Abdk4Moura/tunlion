@@ -73,7 +73,7 @@ if [ "$rn1" = 9 ] && [ "$rn2" = 9 ] && grep -q "tunlion init" "$WORK/n1.log" && 
    && [ ! -e "$DN/up.pid" ] && [ "$rn3" = 0 ] && [ -n "$PPID3" ]; then
   ok "N: up and up --detach with no identity and nothing paired exit 9 naming init; a code-paired device's up --detach still runs"
 else
-  bad "N up without identity (rc $rn1/$rn2, control $rn3)"; cat "$WORK/n1.log" "$WORK/n2.log"; tail -5 "$WORK/n3.log"
+  bad "N up without identity (rc $rn1/$rn2, control $rn3)"; cat "$WORK/n1.log" "$WORK/n2.log"; tail -n 5 "$WORK/n3.log"
 fi
 
 # ---------------------------------------------------------------------- A --
@@ -144,7 +144,7 @@ if [ "$rpair" = 0 ] && [ "$rr" = 0 ] && [ -f "$WORK/r-drop/r.txt" ] \
    && ! grep -q "known device" "$WORK/r-recv.log" && ! grep -q "kdev" "$WORK/r-recv.log" && [ -z "$SID" ]; then
   ok "R: the code receive dialed no known device, named no one but its sender, and printed no raw id"
 else
-  bad "R code receive with a known device online (pair $rpair, rc $rr)"; tail -5 "$WORK/r-add.log" "$WORK/k-join.log"
+  bad "R code receive with a known device online (pair $rpair, rc $rr)"; tail -n 5 "$WORK/r-add.log" "$WORK/k-join.log"
 fi
 
 # ---------------------------------------------------------------------- S --

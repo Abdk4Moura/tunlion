@@ -4680,12 +4680,32 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                 }
+                // Name the peer once, and only by a name. A second link to the
+                // same sender (a candidate or a re-dial) announced itself again,
+                // and a link not yet named by proof announced its raw signaling
+                // id: the lab read "ok w1-a" then "ok DrUEPIADYWGghg6rAAVO".
+                let announce = conn.link(&pid).and_then(|l| {
+                    let label = l.label().to_string();
+                    let raw = crate::conn::label_is_raw_id(&label, &pid, l.uid.as_deref())
+                        || conn.links.keys().any(|k| k == &label);
+                    let dup = conn.links.iter().any(|(k, o)| {
+                        k != &pid && o.presence == Presence::Ready && o.label() == label
+                    });
+                    if (raw && !ui::enabled(ui::Level::Debug)) || dup {
+                        ui::debug(&format!("link ready: {label} (pid {pid}), not announced"));
+                        None
+                    } else {
+                        Some(label)
+                    }
+                });
                 if let Some(l) = conn.link_mut(&pid) {
-                    ui::say(&format!(
-                        "  {} {}",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, l.label())
-                    ));
+                    if let Some(label) = &announce {
+                        ui::say(&format!(
+                            "  {} {}",
+                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            ui::paint(ui::Tone::Bold, label)
+                        ));
+                    }
                     l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
                     let is_direct = l.direct;
