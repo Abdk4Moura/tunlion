@@ -439,6 +439,17 @@ pub(crate) fn device_was_introduced(name: &str) -> bool {
         .is_some_and(|d| d.get("introducedBy").is_some_and(|v| !v.is_null()))
 }
 
+/// Record what the owner invited this device as (`person`). Display only: the
+/// signed ceiling, not this field, bounds what the device may do.
+pub(crate) fn devices_mark_invited_as(name: &str, kind: &str) -> Result<()> {
+    with_devices_mut(|arr| {
+        if let Some(rec) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
+            rec["invitedAs"] = json!(kind);
+        }
+        Ok(())
+    })
+}
+
 pub(crate) fn devices_upsert_atomic(
     name: &str,
     secret: Option<&str>,

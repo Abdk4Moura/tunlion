@@ -405,12 +405,17 @@ pub(crate) fn own_access_expired_label(expired_at: u64) -> String {
 /// still files as FLEET here; the caps view says "cert expired" beside it
 /// rather than silently re-tiering (docs/design-relationship-ux.md §2.2 is
 /// the planned change, not this).
+/// A record the owner invited as a PERSON (`add --for person`) holds an
+/// owner-signed certificate like a device's, and is still someone else's: it
+/// files as EXTERNAL, never as one of the owner's devices.
 pub(crate) fn tier_for(
     cert: Option<&identity::DeviceCert>,
     same_owner: Option<&[u8; 32]>,
+    invited_as_person: bool,
 ) -> fleet_ui::devices::DeviceTier {
     match cert {
         None => fleet_ui::devices::DeviceTier::NeedsReview,
+        Some(_) if invited_as_person => fleet_ui::devices::DeviceTier::External,
         Some(cert) if same_owner == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
         Some(_) => fleet_ui::devices::DeviceTier::External,
     }
@@ -445,7 +450,11 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
         .filter_map(|r| r["name"].as_str().map(str::to_string))
         .map(|name| {
             let cert = device_cert_for(&name);
-            let tier = tier_for(cert.as_ref(), same_owner.as_ref());
+            let invited_as_person = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(name.as_str()))
+                .is_some_and(|r| r["invitedAs"].as_str() == Some("person"));
+            let tier = tier_for(cert.as_ref(), same_owner.as_ref(), invited_as_person);
             let caps = effective_device_caps(&name);
             let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
             let address = stored_v6.or(stored_v4);
@@ -602,5 +611,23 @@ mod roster_row_label_tests {
         assert!(roster_row_label("P9-B", "p9-b").contains("previous identity"));
         assert_eq!(roster_row_label("alpha", "p9-b"), "known via owner");
         assert_eq!(roster_row_label("alpha", ""), "known via owner");
+    }
+}
+
+#[cfg(test)]
+mod person_tier_tests {
+    use super::tier_for;
+    use crate::fleet_ui::devices::DeviceTier;
+
+    /// Launch matrix: a person admitted by `add --for person` holds an
+    /// owner-signed certificate exactly like a device, and `devices` filed them
+    /// under FLEET, "your devices". The invited kind decides.
+    #[test]
+    fn a_person_invited_by_the_owner_is_external_not_fleet() {
+        let owner = [7u8; 32];
+        let cert = crate::identity::DeviceCert { device_pub: [1u8; 32], user_pub: owner, expires: u64::MAX, issued: 0, sig: [0u8; 64] };
+        assert_eq!(tier_for(Some(&cert), Some(&owner), false), DeviceTier::Fleet);
+        assert_eq!(tier_for(Some(&cert), Some(&owner), true), DeviceTier::External);
+        assert_eq!(tier_for(None, Some(&owner), true), DeviceTier::NeedsReview);
     }
 }

@@ -29,6 +29,11 @@ struct ArmedEntry {
     /// secret, not signed: it decides only what THIS store calls the device
     /// that enrols with this key.
     name: Option<String>,
+    /// What the owner invited: `person` or `device` (`add --for ...`). Not
+    /// secret, not signed: like `name`, it decides only how THIS store files
+    /// the device that enrols with this key. The signed ceiling still bounds
+    /// what it may do.
+    kind: Option<String>,
 }
 
 fn load() -> Vec<ArmedEntry> {
@@ -43,7 +48,8 @@ fn load() -> Vec<ArmedEntry> {
             let key_id = e["key_id"].as_str()?.to_string();
             let expires = e["expires"].as_u64()?;
             let name = e["name"].as_str().map(str::to_string);
-            Some(ArmedEntry { key_id, expires, name })
+            let kind = e["kind"].as_str().map(str::to_string);
+            Some(ArmedEntry { key_id, expires, name, kind })
         })
         .collect()
 }
@@ -51,9 +57,15 @@ fn load() -> Vec<ArmedEntry> {
 fn save(entries: &[ArmedEntry]) {
     let arr: Vec<serde_json::Value> = entries
         .iter()
-        .map(|e| match &e.name {
-            Some(n) => json!({ "key_id": e.key_id, "expires": e.expires, "name": n }),
-            None => json!({ "key_id": e.key_id, "expires": e.expires }),
+        .map(|e| {
+            let mut v = json!({ "key_id": e.key_id, "expires": e.expires });
+            if let Some(n) = &e.name {
+                v["name"] = json!(n);
+            }
+            if let Some(k) = &e.kind {
+                v["kind"] = json!(k);
+            }
+            v
         })
         .collect();
     let Ok(body) = serde_json::to_string_pretty(&arr) else { return };
@@ -65,11 +77,23 @@ fn save(entries: &[ArmedEntry]) {
 /// Record that an auth key is outstanding until `expires_at` (absolute unix
 /// seconds). Dedupes by key_id. The mint writes this directly; the daemon's
 /// per-tick arm-gate reads it.
-pub fn arm(key_id: String, expires_at: u64, name: Option<String>) {
+pub fn arm(key_id: String, expires_at: u64, name: Option<String>, kind: Option<String>) {
     let mut entries = load();
     entries.retain(|e| e.key_id != key_id);
-    entries.push(ArmedEntry { key_id, expires: expires_at, name });
+    entries.push(ArmedEntry { key_id, expires: expires_at, name, kind });
     save(&entries);
+}
+
+/// What the owner invited with this key (`person`, `device`), while the key is
+/// outstanding. A person's invitation enrols them with an owner-signed
+/// certificate like a device's, so without this the owner's `devices` filed
+/// a guest under FLEET, "your devices".
+pub fn invitee_kind(key_id: &str) -> Option<String> {
+    let now = crate::capability::now_secs();
+    load()
+        .into_iter()
+        .find(|e| e.key_id == key_id && e.expires > now)
+        .and_then(|e| e.kind)
 }
 
 /// The name the owner chose for whoever enrols with this key, while the key
@@ -114,13 +138,17 @@ mod invitee_name_tests {
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let later = crate::capability::now_secs() + 600;
-        super::arm("aa".repeat(32), later, Some("beta".into()));
-        super::arm("bb".repeat(32), later, None);
-        super::arm("cc".repeat(32), 1, Some("gone".into()));
+        super::arm("aa".repeat(32), later, Some("beta".into()), Some("person".into()));
+        super::arm("bb".repeat(32), later, None, None);
+        super::arm("cc".repeat(32), 1, Some("gone".into()), Some("person".into()));
         assert_eq!(super::invitee_name(&"aa".repeat(32)).as_deref(), Some("beta"));
         assert_eq!(super::invitee_name(&"bb".repeat(32)), None, "unnamed invitation");
         assert_eq!(super::invitee_name(&"cc".repeat(32)), None, "an expired key names nobody");
         assert_eq!(super::invitee_name(&"dd".repeat(32)), None);
+        // The invited kind rides the same way, and an expired key says nothing.
+        assert_eq!(super::invitee_kind(&"aa".repeat(32)).as_deref(), Some("person"));
+        assert_eq!(super::invitee_kind(&"bb".repeat(32)), None);
+        assert_eq!(super::invitee_kind(&"cc".repeat(32)), None);
         unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
