@@ -276,6 +276,7 @@ mod sshd;
 mod sshkeys;
 mod local;
 mod ui;
+mod style;
 mod fleet_ui;
 
 use anyhow::{bail, Result};

@@ -3654,7 +3654,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 last_up = std::time::Instant::now();
                 backoff = Duration::from_millis(300);
                 role = "reconnect";
-                eprint!("\r\n\x1b[2m[tunlion: link dropped, reconnecting...]\x1b[0m\r\n");
+                eprint!("\r\n{}\r\n", crate::ui::paint(crate::ui::Tone::Dim, "[tunlion: link dropped, reconnecting...]"));
                 continue;
             }
             Err(e) => {
@@ -3744,7 +3744,8 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 // stop a bit under that so we don't reattach into a fresh shell.
                 if last_up.elapsed() > Duration::from_secs(150) {
                     eprint!(
-                        "\r\n\x1b[2m[tunlion: session expired, reconnect window passed]\x1b[0m\r\n"
+                        "\r\n{}\r\n",
+                        crate::ui::paint(crate::ui::Tone::Dim, "[tunlion: session expired, reconnect window passed]")
                     );
                     return Ok(());
                 }

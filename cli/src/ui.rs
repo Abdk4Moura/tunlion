@@ -98,8 +98,14 @@ pub struct Caps {
     /// `ESC[2K` landed there as literal noise on every progress tick.
     pub live: bool,
     pub color: bool,
-    pub truecolor: bool,
     pub unicode: bool,
+    /// How many colors the terminal shows (see `style::depth_from`).
+    pub depth: crate::style::Depth,
+    /// The terminal's background when known, so the palette can pick the
+    /// tuning that reads best on it (see `style::bg_from`).
+    pub bg: crate::style::Bg,
+    /// `TUNLION_REDUCED_MOTION`: the pulse and knock stay still.
+    pub reduced_motion: bool,
 }
 
 pub fn caps() -> &'static Caps {
@@ -112,14 +118,13 @@ pub fn caps() -> &'static Caps {
             Ok("never") => false,
             _ => tty && std::env::var_os("NO_COLOR").is_none() && term != "dumb",
         };
-        let truecolor = color
-            && std::env::var("COLORTERM")
-                .map(|v| v.contains("truecolor") || v.contains("24bit"))
-                .unwrap_or(false);
         let var = |k: &str| std::env::var(k).ok();
         let unicode = unicode_from(var("LC_ALL"), var("LC_CTYPE"), var("LANG"), &term);
         let live = live_from(tty, &term);
-        Caps { tty, live, color, truecolor, unicode }
+        let depth = crate::style::depth_from(var("COLORTERM").as_deref(), &term);
+        let bg = crate::style::bg_from(var("TUNLION_THEME").as_deref(), var("COLORFGBG").as_deref());
+        let reduced_motion = crate::style::reduced_motion_from(var("TUNLION_REDUCED_MOTION").as_deref());
+        Caps { tty, live, color, unicode, depth, bg, reduced_motion }
     })
 }
 
@@ -289,8 +294,11 @@ fn decorate(line: &str) -> String {
 
 #[derive(Clone, Copy)]
 pub enum Tone {
-    /// the brand: tunlion green (#7CF6C8)
+    /// The brand: the warm accent of the tunnel mark, bold. Commands to type,
+    /// codes, section headings.
     Brand,
+    /// The same accent without the weight: progress fill, the active choice.
+    Accent,
     Ok,
     Err,
     Warn,
@@ -298,15 +306,17 @@ pub enum Tone {
     Bold,
 }
 
-fn ansi_code(tone: Tone, truecolor: bool) -> &'static str {
+/// The escape that starts `tone`, from the design palette (`style`).
+fn ansi_code(tone: Tone, depth: crate::style::Depth, bg: crate::style::Bg) -> String {
+    use crate::style::{sgr, Role};
     match tone {
-        Tone::Brand if truecolor => "\x1b[1;38;2;124;246;200m",
-        Tone::Brand => "\x1b[1;92m",
-        Tone::Ok => "\x1b[32m",
-        Tone::Err => "\x1b[31m",
-        Tone::Warn => "\x1b[33m",
-        Tone::Dim => "\x1b[2m",
-        Tone::Bold => "\x1b[1m",
+        Tone::Brand => sgr(Role::Accent, true, depth, bg),
+        Tone::Accent => sgr(Role::Accent, false, depth, bg),
+        Tone::Ok => sgr(Role::Ok, false, depth, bg),
+        Tone::Err => sgr(Role::Bad, false, depth, bg),
+        Tone::Warn => sgr(Role::Warn, false, depth, bg),
+        Tone::Dim => sgr(Role::Sub, false, depth, bg),
+        Tone::Bold => sgr(Role::Strong, false, depth, bg),
     }
 }
 
@@ -315,7 +325,33 @@ pub fn paint(tone: Tone, s: &str) -> String {
     if !c.color {
         return s.to_string();
     }
-    format!("{}{s}\x1b[0m", ansi_code(tone, c.truecolor))
+    format!("{}{s}\x1b[0m", ansi_code(tone, c.depth, c.bg))
+}
+
+/// The escape that starts `tone` on stderr, or nothing when color is off.
+/// For renderers that write their own lines (pickers, the code entry).
+pub fn tone_code(tone: Tone) -> String {
+    let c = caps();
+    if c.color { ansi_code(tone, c.depth, c.bg) } else { String::new() }
+}
+
+/// The escape that ends a `tone_code` span, or nothing when color is off.
+pub fn tone_reset() -> &'static str {
+    if caps().color { "\x1b[0m" } else { "" }
+}
+
+/// A heading of `/`-separated parts (`TUNLION  /  3 DEVICES  /  AVAILABLE`,
+/// `FLEET  /  your devices`): the first part in `lead`, the separators faint,
+/// the rest in `rest`. The text is unchanged, so a pipe reads it as before.
+pub fn header(lead: Tone, rest: Tone, s: &str) -> String {
+    const SEP: &str = "  /  ";
+    let mut parts = s.split(SEP);
+    let mut out = paint(lead, parts.next().unwrap_or(""));
+    for p in parts {
+        out.push_str(&paint(Tone::Dim, SEP));
+        out.push_str(&paint(rest, p));
+    }
+    out
 }
 
 /// Color decision for STDOUT specifically (the `set`/`get` readout surface).
@@ -339,16 +375,15 @@ pub fn paint_when(color: bool, tone: Tone, s: &str) -> String {
     if !color {
         return s.to_string();
     }
-    let truecolor = std::env::var("COLORTERM")
-        .map(|v| v.contains("truecolor") || v.contains("24bit"))
-        .unwrap_or(false);
-    format!("{}{s}\x1b[0m", ansi_code(tone, truecolor))
+    // Depth and background are properties of the terminal, not the stream, so
+    // the stderr-scoped caps give the right answer for stdout too.
+    let c = caps();
+    format!("{}{s}\x1b[0m", ansi_code(tone, c.depth, c.bg))
 }
 
 pub fn glyph_ok() -> &'static str {
     if caps().unicode { "✓" } else { "ok" }
 }
-#[allow(dead_code)] // part of the glyph set; error paths adopt it next
 pub fn glyph_err() -> &'static str {
     if caps().unicode { "✗" } else { "x" }
 }
@@ -610,7 +645,7 @@ pub fn critical(line: &str) {
 /// pipe). Steps are pre-formatted by the caller, so a step may embed a command in
 /// the brand accent, e.g. `paint(Tone::Brand, "tunlion pty box")`.
 pub fn problem(headline: &str, detail: &str, steps: &[String]) {
-    critical(&format!("{} {}", paint(Tone::Err, "✗"), paint(Tone::Bold, headline)));
+    critical(&format!("{} {}", paint(Tone::Err, glyph_err()), paint(Tone::Bold, headline)));
     if !detail.is_empty() {
         critical(&format!("  {detail}"));
     }
@@ -681,7 +716,7 @@ pub fn status(line: &str) {
 /// bare eprint would land inside whatever transient line is on screen).
 pub fn answer_echo(c: char) {
     clear_live();
-    err_write(&format!("  {} {}\n", paint(Tone::Dim, "↳"), paint(Tone::Bold, &c.to_string())));
+    err_write(&format!("  {} {}\n", paint(Tone::Dim, glyph_echo()), paint(Tone::Bold, &c.to_string())));
 }
 
 /// A status line that survives interleaved say()s until cleared, for open
@@ -704,6 +739,13 @@ pub fn sticky(line: &str) {
     status(line);
 }
 
+/// A sticky line for a question that waits on the user: the knock in front of
+/// it says "your move". Live terminals only, like `sticky`; the permanent copy
+/// of the question is printed with `say` and stays unmarked.
+pub fn sticky_ask(line: &str) {
+    sticky(&format!("  {} {}", knock(), line.trim_start()));
+}
+
 pub fn clear_sticky() {
     let had = STICKY.lock().map(|mut s| s.take().is_some()).unwrap_or(false);
     if had && caps().live {
@@ -711,11 +753,30 @@ pub fn clear_sticky() {
     }
 }
 
+/// Milliseconds since the process started: the clock both motifs run on.
+fn motion_ms() -> u128 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// The waiting indicator: the design's pulse (the cursor squashes on a `|..||`
+/// rhythm), for a wait on the OTHER side. Callers redraw it every ~120 ms.
 pub fn spinner_frame() -> char {
-    const U: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
-    const A: [char; 4] = ['|', '/', '-', '\\'];
-    let t = (Instant::now().elapsed().as_millis() / 80) as usize; // monotonic-ish
-    if caps().unicode { U[t % 8] } else { A[t % 4] }
+    let c = caps();
+    crate::style::pulse_frame(motion_ms(), c.unicode, c.reduced_motion)
+}
+
+/// The pulse, painted in the accent: ready to put at the front of a status line.
+pub fn pulse() -> String {
+    paint(Tone::Accent, &spinner_frame().to_string())
+}
+
+/// The design's knock (three hops of the cursor), painted in the accent: for a
+/// line where something waits on YOU (a question, an approval). Static lines
+/// get the resting frame; a redrawn line animates.
+pub fn knock() -> String {
+    let c = caps();
+    paint(Tone::Accent, &crate::style::knock_frame(motion_ms(), c.unicode, c.reduced_motion).to_string())
 }
 
 // ------------------------------------------------------------- progress bar --
@@ -741,7 +802,7 @@ impl Progress {
         }
     }
 
-    /// Thin filament-style bar: done in brand green (━), boundary ╸, rest dim.
+    /// Thin bar: done in the accent (━), boundary ╸, rest dim.
     pub fn tick(&mut self, bytes: u64) {
         let now = Instant::now();
         if now.duration_since(self.last_draw).as_millis() < 100 {
@@ -763,7 +824,7 @@ impl Progress {
             let done = "━".repeat(filled.min(width));
             let edge = if filled < width { "╸" } else { "" };
             let rest = "─".repeat(width - filled - if filled < width { 1 } else { 0 });
-            format!("{}{}{}", paint(Tone::Brand, &done), paint(Tone::Brand, edge), paint(Tone::Dim, &rest))
+            format!("{}{}{}", paint(Tone::Accent, &done), paint(Tone::Accent, edge), paint(Tone::Dim, &rest))
         } else {
             let done = "=".repeat(filled.min(width));
             let rest = "-".repeat(width - filled);

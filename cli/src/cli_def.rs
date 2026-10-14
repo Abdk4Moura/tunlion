@@ -89,6 +89,23 @@ EXIT CODES
   With --json, a failure is one JSON object on stdout (an interrupt too):
   {\"ok\":false,\"error\":{\"code\":\"unknown_device\",\"exit\":3,\"message\":\"...\"}}";
 
+/// Help colors from the design palette: headings and usage in the accent,
+/// flags in bold, placeholders faint. Clap prints these only to a terminal
+/// and honours NO_COLOR, so piped help stays plain. 256-color index 166 is
+/// the accent (see `style.rs`); a 16-color terminal maps it to its nearest.
+const HELP_STYLES: clap::builder::styling::Styles = {
+    use clap::builder::styling::{Ansi256Color, AnsiColor, Color, Style, Styles};
+    let accent = Style::new().bold().fg_color(Some(Color::Ansi256(Ansi256Color(166))));
+    Styles::styled()
+        .header(accent)
+        .usage(accent)
+        .literal(Style::new().bold())
+        .placeholder(Style::new().dimmed())
+        .error(Style::new().bold().fg_color(Some(Color::Ansi(AnsiColor::Red))))
+        .valid(Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green))))
+        .invalid(Style::new().bold().fg_color(Some(Color::Ansi(AnsiColor::Yellow))))
+};
+
 #[derive(Parser)]
 // Custom help template: clap has no native grouping for SUBCOMMANDS
 // (next_help_heading groups args, not subcommands), so we omit the auto
@@ -101,6 +118,7 @@ EXIT CODES
     version = VERSION,
     about = "One thread across your devices, end-to-end encrypted: send, receive, mount files, and open an authorized shell without an account or cloud upload.",
     after_help = EXAMPLES,
+    styles = HELP_STYLES,
     help_template = "{about-with-newline}\n{usage-heading} {usage}\n\n{after-help}\n\nOptions:\n{options}"
 )]
 pub(crate) struct Cli {

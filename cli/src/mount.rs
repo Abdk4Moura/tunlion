@@ -476,11 +476,15 @@ pub fn list_cmd() -> Result<()> {
         if is_ok { healthy += 1; } else { unhealthy += 1; }
 
         if is_tty {
-            let color = if is_ok { "\x1b[32m" } else { "\x1b[31m" };
-            let reset = "\x1b[0m";
+            let tone = if is_ok { crate::ui::Tone::Ok } else { crate::ui::Tone::Err };
+            let c = crate::ui::stdout_color();
             println!(
-                "{color}{}{reset}  {color}{}{reset}  {}:{} -> {}",
-                status_str, entry.id, entry.peer, entry.remote, entry.local
+                "{}  {}  {}:{} -> {}",
+                crate::ui::paint_when(c, tone, &status_str),
+                crate::ui::paint_when(c, tone, &entry.id),
+                entry.peer,
+                entry.remote,
+                entry.local
             );
         } else {
             println!(
@@ -541,12 +545,12 @@ pub fn check_cmd(target: &str) -> Result<()> {
             let is_tty = std::io::stdout().is_terminal();
 
             if is_tty {
-                let (color, label) = match status {
-                    MountStatus::Healthy => ("\x1b[32m", "HEALTHY"),
-                    _ => ("\x1b[31m", "UNHEALTHY"),
+                let (tone, label) = match status {
+                    MountStatus::Healthy => (crate::ui::Tone::Ok, "HEALTHY"),
+                    _ => (crate::ui::Tone::Err, "UNHEALTHY"),
                 };
-                let reset = "\x1b[0m";
-                println!("{color}[{label}]{reset} {} ({})", entry.id, entry.local);
+                let tag = crate::ui::paint_when(crate::ui::stdout_color(), tone, &format!("[{label}]"));
+                println!("{tag} {} ({})", entry.id, entry.local);
                 println!("  peer:   {}:{}", entry.peer, entry.remote);
                 println!("  status: {status}");
                 println!("  since:  {}", entry.created);
@@ -828,24 +832,29 @@ fn render_mount_ui(
 
     // Filter line
     if filter_active {
-        let _ = write!(out, "\r\x1b[2K  \x1b[33m>\x1b[0m {filter}\x1b[37m_\x1b[0m\r\n");
+        let _ = write!(
+            out,
+            "\r\x1b[2K  {} {filter}{}\r\n",
+            crate::ui::paint(crate::ui::Tone::Brand, ">"),
+            crate::ui::paint(crate::ui::Tone::Dim, "_")
+        );
     } else {
         let _ = write!(out, "\r\x1b[2K\r\n");
     }
 
     // Items
     if items.is_empty() {
-        let _ = write!(out, "\r\x1b[2K  \x1b[2m(no matches)\x1b[0m\r\n");
+        let _ = write!(out, "\r\x1b[2K  {}\r\n", crate::ui::paint(crate::ui::Tone::Dim, "(no matches)"));
     } else {
         for (i, (name, _item_type)) in items.iter().enumerate() {
             let (mark, c, r) = if i == sel {
                 if color {
-                    ("\u{276f}", "\x1b[1;36m", "\x1b[0m")
+                    ("\u{276f}", crate::ui::tone_code(crate::ui::Tone::Brand), crate::ui::tone_reset())
                 } else {
-                    (">", "", "")
+                    (">", String::new(), "")
                 }
             } else {
-                (" ", "", "")
+                (" ", String::new(), "")
             };
             let _ = write!(out, "\r\x1b[2K  {c}{mark} {}{r}\r\n", name);
         }
@@ -910,12 +919,12 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
 
     if items.is_empty() {
         drop(_guard);
-        println!("\x1b[33mNo devices paired and no mounts configured.\x1b[0m");
+        println!("{}", crate::ui::paint_when(crate::ui::stdout_color(), crate::ui::Tone::Warn, "No devices paired and no mounts configured."));
         println!("Add a device first: tunlion add");
         return Ok(());
     }
 
-    let header = "  \x1b[2mMount from device, profile, or manage mount (up/down, enter, esc)\x1b[0m";
+    let header = format!("  {}", crate::ui::paint(crate::ui::Tone::Dim, "Mount from device, profile, or manage mount (up/down, enter, esc)"));
     let mut sel = 0usize;
     let mut filter = String::new();
     let mut filter_active = false;
@@ -931,7 +940,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
 
         // Render
         let display: Vec<(String, String)> = filtered.iter().map(|(_, n, t)| (n.clone(), t.clone())).collect();
-        prev_lines = render_mount_ui(header, &display, sel, &filter, filter_active, prev_lines);
+        prev_lines = render_mount_ui(&header, &display, sel, &filter, filter_active, prev_lines);
 
         // Read event
         let ev = event::read()?;
@@ -943,7 +952,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
         match k.code {
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 drop(_guard);
-                println!("\r\x1b[2K\x1b[2mCancelled.\x1b[0m");
+                println!("\r\x1b[2K{}", crate::ui::paint_when(crate::ui::stdout_color(), crate::ui::Tone::Dim, "Cancelled."));
                 return Ok(());
             }
             KeyCode::Esc => {
@@ -953,7 +962,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                     sel = 0;
                 } else {
                     drop(_guard);
-                    println!("\r\x1b[2K\x1b[2mCancelled.\x1b[0m");
+                    println!("\r\x1b[2K{}", crate::ui::paint_when(crate::ui::stdout_color(), crate::ui::Tone::Dim, "Cancelled."));
                     return Ok(());
                 }
             }
@@ -968,7 +977,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
 
                 if item_type == "device" {
                     println!();
-                    print!("  Remote path on \x1b[1m{name}\x1b[0m: ");
+                    print!("  Remote path on {}: ", crate::ui::paint_when(crate::ui::stdout_color(), crate::ui::Tone::Bold, &name));
                     std::io::stdout().flush()?;
                     let mut remote = String::new();
                     std::io::stdin().read_line(&mut remote)?;
@@ -981,7 +990,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| name.clone());
-                    print!("  Local mount point [\x1b[2m{default_local}\x1b[0m]: ");
+                    print!("  Local mount point [{}]: ", crate::ui::paint_when(crate::ui::stdout_color(), crate::ui::Tone::Dim, &default_local));
                     std::io::stdout().flush()?;
                     let mut local = String::new();
                     std::io::stdin().read_line(&mut local)?;
@@ -1002,7 +1011,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                     return mount_cmd(server, &name, &remote, Some(local), false, None, relay, false, false).await;
                 } else if item_type == "profile" {
                     println!();
-                    println!("  \x1b[1mApplying profile: {name}\x1b[0m");
+                    println!("  {}", crate::ui::paint_when(crate::ui::stdout_color(), crate::ui::Tone::Bold, &format!("Applying profile: {name}")));
                     return apply_profile_cmd(&name, server, relay).await;
                 } else {
                     // Active mount - show info
@@ -1010,7 +1019,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                     // Find the mount entry
                     if let Some(entry) = mounts.iter().find(|m| name.starts_with(&m.peer)) {
                         println!("  Mount: {}:{} -> {}", entry.peer, entry.remote, entry.local);
-                        println!("  \x1b[2mCommands:\x1b[0m");
+                        println!("  {}", crate::ui::paint_when(crate::ui::stdout_color(), crate::ui::Tone::Dim, "Commands:"));
                         println!("    tunlion mount --check {}", entry.local);
                         println!("    tunlion mount --off {}", entry.local);
                     }
