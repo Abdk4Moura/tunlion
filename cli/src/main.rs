@@ -247,7 +247,6 @@ use recv_files::unique_path;
 use recv_files::full_hash;
 use recv_files::{
     IncomingFile, finalize_incoming, safe_create_part, safe_resume_part,
-    verify_incoming,
 };
 /// Connection state lifted out of this file (slice 1a of the decomposition):
 /// the peer-link record, presence, the resilience/warm-hold bookkeeping, and
