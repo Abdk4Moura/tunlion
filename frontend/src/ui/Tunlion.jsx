@@ -990,7 +990,11 @@ export default function Tunlion(props) {
     const live = peers.find((p) => p.known === d.name)
     const online = !!live && live.status === 'ready'
     const peerForSheet = live || { id: 'known:' + d.name, name: d.name, known: d.name, status: 'failed' }
-    const caps = Array.isArray(d.caps) ? d.caps : ['transfer']
+    // The stored record holds what was agreed at pairing; a shell the device
+    // granted later is only known live (its caps advert). Show both, so the row
+    // does not read "files" beside a Shell button.
+    const stored = Array.isArray(d.caps) ? d.caps : ['transfer']
+    const caps = live && live.shell && !stored.includes('shell') ? [...stored, 'shell'] : stored
     const what = caps.map((c) => (c === 'transfer' ? 'files' : c)).join(', ')
     return (
       <div key={d.name} data-testid="device-row" role="button" tabIndex={0} className="tl-focus"

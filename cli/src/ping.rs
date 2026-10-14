@@ -54,11 +54,12 @@ pub fn probe_line(p: &Probe) -> String {
             addr,
             rtt_ms,
         } => {
+            let route = shown_route(route);
             let via = match (relayed, addr) {
                 (true, Some(a)) => format!("relay({a})"),
                 (true, None) => "relay".to_string(),
                 (false, Some(a)) => format!("{a} ({route})"),
-                (false, None) => route.clone(),
+                (false, None) => route,
             };
             match rtt_ms {
                 Some(ms) => format!("pong via {via} {ms} ms"),
@@ -66,6 +67,17 @@ pub fn probe_line(p: &Probe) -> String {
             }
         }
         Probe::NoLink => "no warm link to this peer".to_string(),
+    }
+}
+
+/// The words a person reads for a link's route. The direct links carry internal
+/// labels (`direct-quic`, `holepunched`) that every other route surface already
+/// translates; `reach` printed them raw. `--json` keeps the token.
+fn shown_route(route: &str) -> String {
+    match route {
+        "direct-quic" => "direct".to_string(),
+        "holepunched" => "direct, hole-punched".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -561,10 +573,12 @@ mod tests {
     fn probe_line_renders_direct_relay_and_the_no_answer_cases() {
         assert_eq!(
             probe_line(&warm(false, "direct-quic", Some("203.0.113.7:41641"), Some(9))),
-            "pong via 203.0.113.7:41641 (direct-quic) 9 ms"
+            "pong via 203.0.113.7:41641 (direct) 9 ms"
         );
-        // No address on the link: the route label still carries the answer.
-        assert_eq!(probe_line(&warm(false, "holepunched", None, Some(12))), "pong via holepunched 12 ms");
+        // No address on the link: the route label still carries the answer,
+        // in words a person reads, never the internal label.
+        assert_eq!(probe_line(&warm(false, "holepunched", None, Some(12))), "pong via direct, hole-punched 12 ms");
+        assert!(!probe_line(&warm(false, "direct-quic", None, Some(3))).contains("quic"));
         assert_eq!(
             probe_line(&warm(true, "relay", Some("198.51.100.4:3478"), Some(41))),
             "pong via relay(198.51.100.4:3478) 41 ms"
