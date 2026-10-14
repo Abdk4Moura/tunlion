@@ -599,10 +599,12 @@ and resumes on the new link with its state intact (see session resume, Phase 1).
 | [ Remember web-vps ]                       9:58 left      |
 | You would keep: shell on web-vps until Thu 13 Nov         |
 | 18:00 UTC. web-vps gets nothing on this browser.          |
-|                                                           |
-| [ Make it one of my devices ]   (only if the code allowed)|
 +-----------------------------------------------------------+
 ```
+
+The browser never offers "Make it one of my devices" in v1: making another device
+yours needs an owner device, so that stays `tunlion add <device>` on a computer
+(T5, T6).
 
 If the click is inside the ceiling, the card turns into the B2 row. If not, it
 says "Asked web-vps. Its owner accepts there: tunlion requests." and the row shows
@@ -624,7 +626,6 @@ says "Asked web-vps. Its owner accepts there: tunlion requests." and the row sho
 |    files    no    [ Allow ]                               |
 |                                                           |
 | Ends    Thu 13 Nov 18:00 UTC      [ Set end time ]        |
-| [ Make it one of my devices ]                             |
 | [ Cut off ]   [ Forget ]                                  |
 +-----------------------------------------------------------+
 ```
@@ -635,6 +636,9 @@ says "Asked web-vps. Its owner accepts there: tunlion requests." and the row sho
   (T13); a later time or "never" widens this browser's access to web-vps, so it
   sends an ask and the row shows "Asked" (T14). There is no "Now" choice; ending
   access now is Cut off.
+- When this browser is a member of alex's devices, its page for that membership
+  offers **Leave alex's devices** (T7, narrowing, no consent). Mesh-derived access
+  goes; explicitly remembered access stays.
 - **Cut off** and **Forget** are one click each. Cut off shows "web-vps cut off.
   Undo restores access." for 10 seconds, then Restore. Undo brings back access,
   not a session that was closed. While a session with that device is open in this
