@@ -101,7 +101,7 @@ impl Refusal {
         match self {
             Refusal::BadHost => "This dashboard only answers at its own address.",
             Refusal::BadOrigin => "Requests from other sites are refused.",
-            Refusal::NoSession => "Not signed in. Run tunlion dashboard again to open a new link.",
+            Refusal::NoSession => "Not signed in. Run `tunlion dashboard` again to open a new link.",
             Refusal::BadSecret(m) => m,
         }
     }
@@ -154,14 +154,14 @@ impl Gate {
     /// Trade the one-time secret for a session token.
     pub(crate) fn redeem(&mut self, offered: &str, token: String) -> Result<String, Refusal> {
         if self.bad_secrets >= MAX_BAD_SECRETS {
-            return Err(Refusal::BadSecret("Too many wrong links. Run tunlion dashboard again."));
+            return Err(Refusal::BadSecret("Too many wrong links. Run `tunlion dashboard` again."));
         }
         if self.secret_used {
-            return Err(Refusal::BadSecret("This link was already used. Run tunlion dashboard again for a new one."));
+            return Err(Refusal::BadSecret("This link was already used. Run `tunlion dashboard` again for a new one."));
         }
         if !ct_eq(offered.as_bytes(), self.secret.as_bytes()) {
             self.bad_secrets += 1;
-            return Err(Refusal::BadSecret("That link is not this dashboard's. Run tunlion dashboard again."));
+            return Err(Refusal::BadSecret("That link is not this dashboard's. Run `tunlion dashboard` again."));
         }
         self.secret_used = true;
         self.sessions.push(token.clone());
@@ -291,7 +291,7 @@ pub(crate) fn invite_argv(a: &Value, out: &std::path::Path) -> Result<Vec<String
 async fn run_self(argv: &[String]) -> (i32, String) {
     let mut cmd = match self_command() {
         Ok(c) => c,
-        Err(e) => return (1, format!("cannot find the tunlion binary: {e}")),
+        Err(e) => return (1, format!("cannot find this program on disk: {e}")),
     };
     let child = cmd
         .args(argv)
@@ -306,8 +306,8 @@ async fn run_self(argv: &[String]) -> (i32, String) {
             said.push_str(&String::from_utf8_lossy(&out.stdout));
             (out.status.code().unwrap_or(1), clean_text(&said))
         }
-        Ok(Err(e)) => (1, format!("could not run tunlion: {e}")),
-        Err(_) => (1, "tunlion did not finish within 60 seconds".to_string()),
+        Ok(Err(e)) => (1, format!("could not start the command: {e}")),
+        Err(_) => (1, "the command did not finish within 60 seconds".to_string()),
     }
 }
 
@@ -457,7 +457,7 @@ async fn start_code(codes: &Codes, a: &Value) -> Resp {
     };
     let mut cmd = match self_command() {
         Ok(c) => c,
-        Err(e) => return Resp::json(200, json!({"ok": false, "message": format!("cannot find the tunlion binary: {e}")})),
+        Err(e) => return Resp::json(200, json!({"ok": false, "message": format!("cannot find this program on disk: {e}")})),
     };
     let log = crate::settings::config_dir().join(format!("dashboard-code-{}.log", random_hex(6)));
     let Ok(out) = std::fs::File::create(&log) else {
@@ -473,7 +473,7 @@ async fn start_code(codes: &Codes, a: &Value) -> Resp {
         .spawn();
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => return Resp::json(200, json!({"ok": false, "message": format!("could not run tunlion: {e}")})),
+        Err(e) => return Resp::json(200, json!({"ok": false, "message": format!("could not start the command: {e}")})),
     };
     let name = argv[4].clone();
     let kind = argv[2].clone();
@@ -520,7 +520,7 @@ async fn start_code(codes: &Codes, a: &Value) -> Resp {
     });
     match code {
         Some(c) => Resp::json(200, json!({"ok": true, "code": c, "name": name, "qr": qr_cells(&c)})),
-        None => Resp::json(200, json!({"ok": false, "message": "tunlion did not show a code"})),
+        None => Resp::json(200, json!({"ok": false, "message": "no code was shown"})),
     }
 }
 

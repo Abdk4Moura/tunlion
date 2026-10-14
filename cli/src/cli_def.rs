@@ -43,6 +43,7 @@ COMMANDS
   Devices
     devices                list your known devices
     requests               approve or deny access others asked for
+    dashboard              devices, people, codes and asks in your browser
     grant / revoke         give or take a capability on a device
     add --for runner       a temporary key for a CI or borrowed box; it runs `tunlion join <file>`
     status                 what the daemon is doing / recently received
