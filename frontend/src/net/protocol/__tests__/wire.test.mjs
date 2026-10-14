@@ -3,7 +3,7 @@
 // These pin the byte-level behavior the consolidation rewrite must preserve.
 import {
   SID_BYTES, HEADER_BYTES, MSG, frame, parseFrame, isCloseFrame, highHalfSid,
-  encodeControl, decodeControl,
+  encodeControl, decodeControl, ptyOpenMsg,
 } from '../wire.js'
 
 let ok = true
@@ -64,6 +64,18 @@ eq('MSG.PAIR_PROOF', MSG.PAIR_PROOF, 'pair-proof')
   const msg = { type: MSG.PTY_OPEN, sid: 0x80000001, cols: 80, rows: 24, session: 'pty-abc' }
   eq('encode/decode control round-trip', decodeControl(encodeControl(msg)), msg)
 }
+
+// --- pty-open: resume_from rides only on a reattach (the CLI's field name) ---
+eq('first open carries no resume_from',
+  ptyOpenMsg(0x80000001, 80, 24, 's1'),
+  { type: 'pty-open', sid: 0x80000001, cols: 80, rows: 24, session: 's1' })
+eq('a reattach carries the byte count',
+  ptyOpenMsg(0x80000002, 80, 24, 's1', 1234).resume_from, 1234)
+eq('a reattach with nothing shown yet still says 0',
+  ptyOpenMsg(0x80000002, 80, 24, 's1', 0).resume_from, 0)
+eq('junk is never sent as a count',
+  ['x', NaN, -1, Infinity, null].map((v) => 'resume_from' in ptyOpenMsg(1, 1, 1, 's', v)),
+  [false, false, false, false, false])
 
 console.log(ok ? 'WIRE TESTS PASS' : 'WIRE TESTS FAIL')
 process.exit(ok ? 0 : 1)

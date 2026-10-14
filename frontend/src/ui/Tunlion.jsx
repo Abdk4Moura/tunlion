@@ -724,6 +724,8 @@ export default function Tunlion(props) {
   // null), it does NOT unmount (unmount → link.closePty() kills the PTY). Only an
   // explicit close unmounts a session. Scrollback survives hiding.
   const [sessions, setSessions] = useState([]) // [{ id, peer }]
+  // Sessions that have had a live link at least once (see the terminal overlay).
+  const linkedSessions = useRef(new Set())
   const [activeSessionId, setActiveSessionId] = useState(null)
   const sessionSeq = useRef(0)
   const openSession = useCallback((peer) => {
@@ -738,6 +740,7 @@ export default function Tunlion(props) {
   const backgroundSession = useCallback(() => setActiveSessionId(null), [])
   const switchSession = useCallback((id) => setActiveSessionId(id), [])
   const closeSession = useCallback((id) => {
+    linkedSessions.current.delete(id)
     setSessions((prev) => prev.filter((s) => s.id !== id))
     setActiveSessionId((cur) => (cur === id ? null : cur))
   }, [])
@@ -1052,10 +1055,17 @@ export default function Tunlion(props) {
               (peer.uid && state.getLinkByUid && state.getLinkByUid(peer.uid)) ||
               (state.getLink && state.getLink(peer.id)) ||
               null
+            // A session that has had a link keeps its terminal mounted while the
+            // device is briefly unreachable: the remote shell is still running,
+            // the terminal says "reconnecting", and the next link reattaches with
+            // nothing lost. Only a session that never connected gets the
+            // "isn't reachable" panel.
+            if (link) linkedSessions.current.add(s.id)
+            const keepMounted = !!link || linkedSessions.current.has(s.id)
             return (
               <div key={s.id} data-testid="session-pane" data-session-pane-id={s.id}
                 style={{ position: 'absolute', inset: 0, display: visible ? 'block' : 'none' }}>
-                {link
+                {keepMounted
                   ? <WebTerminal link={link} peerName={peerName(peer)} route={peer.route} relation={peer.known ? 'remembered' : 'this session'}
                       relayExplainer={RELAY_EXPLAINER}
                       T={TT} accent={TT.acc} font={FONT_MONO} uiFont={FONT_SANS} instanceId={s.id} hidden={!visible}
