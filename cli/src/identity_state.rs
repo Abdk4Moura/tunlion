@@ -125,6 +125,9 @@ pub(crate) fn owner_signed_cap_ops() -> Vec<Value> {
             // so a relayed tombstone would sit beside the grant it should have
             // beaten and change nothing.
             e.get("type").and_then(|v| v.as_str()) != Some(crate::capability::CAP_TOMBSTONE_TYPE)
+                // A grant narrowed in place by a newer per-permission op no
+                // longer matches its signature; a receiver would drop it.
+                && e.get("narrowed").and_then(|v| v.as_bool()) != Some(true)
                 && crate::capability::CapOp::from_json(e)
                     .map(|op| op.grantor == owner)
                     .unwrap_or(false)
