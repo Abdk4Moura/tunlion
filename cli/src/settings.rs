@@ -155,7 +155,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOrPeer,
             env: None,
             daemon: false,
-            help: "Deny-list (open set): interfaces or subnets never to use. Complements only/include — setting either replaces the membership config.",
+            help: "Deny-list (open set): interfaces or subnets never to use. Complements only/include; setting either replaces the membership config.",
         },
         Setting {
             key: "only",
@@ -166,7 +166,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOrPeer,
             env: None,
             daemon: false,
-            help: "Allow-list (closed set): only these interfaces or subnets are eligible. Complements avoid — setting either replaces the membership config.",
+            help: "Allow-list (closed set): only these interfaces or subnets are eligible. Complements avoid; setting either replaces the membership config.",
         },
         // Subnet routing. Two settings because advertising and accepting are
         // different trust decisions made by different people: the router's owner

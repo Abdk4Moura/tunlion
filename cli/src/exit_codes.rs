@@ -547,6 +547,8 @@ pub(crate) fn report_interrupted(code: i32) {
 /// Exit for an interrupt: the `--json` failure object first, then the code.
 /// Every interrupt exit goes through here so none of them leaves stdout empty.
 pub(crate) fn interrupted_exit(code: i32) -> ! {
+    // An interrupted send is still a send outcome: the history records it.
+    crate::send_report::persist_outcome(Some(&format!("interrupted ({}) before it finished", signal_name(code))));
     report_interrupted(code);
     std::process::exit(code)
 }

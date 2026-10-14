@@ -222,8 +222,11 @@ pub enum Outcome {
     /// The user pressed Enter on an EMPTY buffer (a deliberate "use the default",
     /// auto-mint for create, local-network for recv/send).
     Empty,
-    /// Esc / Ctrl-C, the user backed out entirely.
+    /// Esc (or Ctrl-D on an empty buffer), the user backed out entirely.
     Cancelled,
+    /// Ctrl-C. Raw mode turns it into a key, so no SIGINT arrives; the caller
+    /// must still exit as an interrupt (130), as the shell would report it.
+    Interrupted,
 }
 
 // --------------------------------------------------------------------------
@@ -469,11 +472,11 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
         }
         match code {
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(Outcome::Cancelled);
+                return Ok(Outcome::Interrupted);
             }
             KeyCode::Char('\u{3}') => {
                 // #203: the lone 0x03 byte in raw mode.
-                return Ok(Outcome::Cancelled);
+                return Ok(Outcome::Interrupted);
             }
             KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl-D on empty = cancel (EOF-like); otherwise ignore.

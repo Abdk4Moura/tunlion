@@ -622,3 +622,52 @@ fn sigterm_ends_a_waiting_receive_in_a_terminal_with_143() {
     assert_eq!(rc, Some(143), "SIGTERM did not end the waiting receive with 143 within 8s; screen:\n{}", tail(&t.text()));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent-code lab pass: the guided code prompt of a bare `receive`.
+// No network is reached before the prompt, so these need no backend.
+// ---------------------------------------------------------------------------
+
+/// Ctrl-C at the guided code prompt is an interrupt: exit 130, as a shell
+/// reports one. It exited 1 with "Error: cancelled", because raw mode turns
+/// Ctrl-C into a key and the prompt treated it like Esc.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_at_the_receive_code_prompt_exits_130() {
+    let (mut t, exe) = fresh_term("recv-prompt-int");
+    let at = t.text().len();
+    t.send(&format!("\"{exe}\" --server http://127.0.0.1:9 receive; echo RC=$?\r"));
+    assert!(
+        t.wait_for_from(at, "enter a code", 30),
+        "receive never offered its code entry; screen:\n{}",
+        tail(&t.text())
+    );
+    t.settle(300, 3);
+    t.send("\u{3}");
+    let rc = rc_after(&t, at, 8);
+    assert_eq!(rc, Some(130), "Ctrl-C at the code prompt did not exit 130; screen:\n{}", tail(&t.text()));
+    assert!(!t.text()[at..].contains("Error: cancelled"), "an interrupt reported as a cancel:\n{}", tail(&t.text()));
+}
+
+/// `receive --room X` already says where to meet: no code prompt. It opened
+/// "enter a code ... or press enter to use the local network" anyway.
+#[cfg(unix)]
+#[test]
+fn receive_with_an_explicit_room_skips_the_code_prompt() {
+    let (mut t, exe) = fresh_term("recv-room");
+    let at = t.text().len();
+    t.send(&format!("\"{exe}\" --server http://127.0.0.1:9 receive --room lab-room-7; echo RC=$?\r"));
+    // The review screen is the first thing it asks now.
+    assert!(
+        t.wait_for_from(at, "Press Enter to wait", 30),
+        "receive --room never reached its review; screen:\n{}",
+        tail(&t.text())
+    );
+    assert!(
+        !t.text()[at..].contains("enter a code"),
+        "receive --room still opened the code prompt:\n{}",
+        tail(&t.text())
+    );
+    t.send("cancel\r");
+    assert!(rc_after(&t, at, 8).is_some(), "receive --room did not end on cancel; screen:\n{}", tail(&t.text()));
+}

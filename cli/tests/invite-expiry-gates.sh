@@ -43,6 +43,8 @@
 #   X10 owner and guest device lists say the access expired, no capability
 #       badge, no "EXTERNAL" relabel of the owner (RC lab item 8)
 #   X11 exec and forward give the same remedy for the expiry (RC lab item 9)
+#   X12 exec, forward and send print the SAME re-invite line, with --allow
+#       and --expires (concurrent-code lab pass)
 #
 # The invitation lives EXP seconds. That is longer than the ~20 s the defect
 # needs, because the positive controls must all finish inside it on a shared CI
@@ -385,6 +387,23 @@ if [ "$same_steps" = "1" ]; then
 else
   cat "$WORK/X3.err" "$WORK/X5.err"
   bad "gateX11: exec and forward remedy the same expiry differently"
+fi
+
+# =================================================================== GATE X12 ==
+# Concurrent-code lab pass: exec's expiry remedy was `add --for guest --allow
+# transfer,shell --expires 2m ...` and send's `add --for guest --out
+# guest-invite.txt --yes`. Every path now builds it from the same data (the
+# owner's record, carried in the reason), so the add line is ONE line.
+say "X12: exec, forward and send print the same re-invite, with its caps and lifetime"
+ADD_X3=$(grep -o "tunlion add --for .*" "$WORK/X3.err" | head -1)
+ADD_X5=$(grep -o "tunlion add --for .*" "$WORK/X5.err" | head -1)
+ADD_X6=$(grep -o "tunlion add --for .*" "$WORK/X6.out" | head -1)
+echo "## exec:    $ADD_X3"; echo "## forward: $ADD_X5"; echo "## send:    $ADD_X6"
+if [ -n "$ADD_X3" ] && [ "$ADD_X3" = "$ADD_X5" ] && [ "$ADD_X3" = "$ADD_X6" ] \
+   && echo "$ADD_X3" | grep -q -- "--allow " && echo "$ADD_X3" | grep -q -- "--expires "; then
+  ok "gateX12: exec, forward and send give one re-invite line, with --allow and --expires"
+else
+  bad "gateX12: the expiry's re-invite differs between exec, forward and send"
 fi
 
 declare_known_red_summary

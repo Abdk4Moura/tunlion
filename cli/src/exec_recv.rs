@@ -1010,7 +1010,7 @@ pub(crate) async fn serve_exec(
                     // (the initiator exits 4 and prints the re-invite), not as
                     // a revocation the owner never made.
                     let reason = match cut {
-                        Some(c) => c.reason(),
+                        Some(c) => c.reason_for(authz.idev.as_ref()),
                         None => crate::capability::REVOKED_REASON.to_string(),
                     };
                     if matches!(cut, Some(crate::identity_state::LiveCut::Expired(_))) {

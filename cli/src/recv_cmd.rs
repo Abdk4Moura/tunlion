@@ -935,6 +935,33 @@ pub(crate) fn offer_has_consent(
     }
 }
 
+/// Why a code receive ended with no sender authenticated. "Older version" was
+/// said for every expiry, including when other codes' senders sharing the room
+/// ran their (current) ceremonies at us. Say it only when no peer ran one. Pure.
+pub(crate) fn recv_pake_expired_message(any_pake_heard: bool, budget_secs: u64) -> String {
+    if any_pake_heard {
+        format!(
+            "no device in the sender's room completed the encrypted handshake for this code within {budget_secs}s: \
+             the code may be mistyped, or its sender stopped waiting. Nothing was received; ask for a FRESH code."
+        )
+    } else {
+        "the other device uses an older version and can't send securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was received.".to_string()
+    }
+}
+
+#[cfg(test)]
+mod pake_expired_tests {
+    use super::recv_pake_expired_message;
+
+    #[test]
+    fn older_version_only_when_no_peer_ran_a_ceremony() {
+        assert!(recv_pake_expired_message(false, 60).contains("older version"));
+        let m = recv_pake_expired_message(true, 60);
+        assert!(!m.contains("older version"), "{m}");
+        assert!(m.contains("60s") && m.contains("FRESH code"), "{m}");
+    }
+}
+
 #[cfg(test)]
 mod offer_consent_tests {
     use super::offer_has_consent;
@@ -995,7 +1022,9 @@ pub(crate) async fn recv_cmd(
     // offer: type a code to connect to a specific person, or press Enter on an
     // empty buffer to use the local network (today's default). When the gate is
     // closed we fall straight through to the auto-room default below.
-    if !daemon && code.is_none() && interactive_allowed() {
+    // An explicit --room (or --to) already says where to meet: asking for a
+    // code there contradicted the flag the user typed.
+    if !daemon && code.is_none() && room.is_none() && to.is_none() && interactive_allowed() {
         ui::say(&ui::paint(
             ui::Tone::Dim,
             "  enter a code to connect to a specific person, or press enter to use the local network",
@@ -1004,6 +1033,10 @@ pub(crate) async fn recv_cmd(
             codeentry::Outcome::Submitted(c) | codeentry::Outcome::Claim(c) => code = Some(c),
             codeentry::Outcome::Empty => { /* fall through to the local-network auto room */ }
             codeentry::Outcome::Cancelled => return Err(cancelled()),
+            // Ctrl-C is an interrupt, not a choice: 130, as a shell reports it.
+            codeentry::Outcome::Interrupted => {
+                crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+            }
         }
     }
     if opened_flow {
@@ -1184,6 +1217,9 @@ pub(crate) async fn recv_cmd(
     // budgets only drop individual mis-latch candidates; this is the backstop for
     // a genuinely absent / old sender. Armed on the first candidate channel.
     let mut recv_pake_overall_deadline: Option<Instant> = None;
+    // Did ANY peer send PAKE traffic? A peer that runs a ceremony is a current
+    // build, so the "older version" message is only true when none did.
+    let mut recv_pake_heard = false;
     // Memory bound: a crowded room cannot blow us up. We mint at most this many
     // concurrent candidate ceremonies; further candidates are ignored (the real
     // sender is, in practice, among the first to share the room with the claimer).
@@ -1279,7 +1315,7 @@ pub(crate) async fn recv_cmd(
             if crate::armed::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
             } else {
-                ui::debug("enrollment closed (no armed keys — mint or arm an auth-key to open)");
+                ui::debug("enrollment closed (no armed keys: mint or arm an auth-key to open)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             let mut c = chans;
@@ -2723,9 +2759,7 @@ pub(crate) async fn recv_cmd(
         if recv_code_path && !recv_pake_done {
             if let Some(dl) = recv_pake_overall_deadline {
                 if Instant::now() > dl {
-                    bail!(
-                        "the other device uses an older version and can't send securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was received."
-                    );
+                    bail!(recv_pake_expired_message(recv_pake_heard, recv_pake_budget.as_secs()));
                 }
             }
         }
@@ -4251,6 +4285,22 @@ pub(crate) async fn recv_cmd(
                     if recv_pake_done {
                         continue;
                     }
+                    // A sender of ANOTHER code on the same device shares this
+                    // room and may run its ceremony at us. It names its own
+                    // nameplate: not ours to run, and not a reason to fail.
+                    // Any PAKE traffic still proves that peer is a current build.
+                    recv_pake_heard = true;
+                    let ours_np = recv_pake_template.as_ref().map(|(_, np)| np.as_str()).unwrap_or("");
+                    if crate::pake_ceremony::addressed_to(&data, ours_np) == Some(false) {
+                        st.recv_cers.remove(&from);
+                        st.recv_deadlines.remove(&from);
+                        st.recv_pending_offers.remove(&from);
+                        recv_pending_direct.remove(&from);
+                        ui::debug(&format!(
+                            "recv: {from} runs another code's ceremony; not our sender"
+                        ));
+                        continue;
+                    }
                     // Mint this peer's ceremony on first sight (bounded), or route
                     // into its existing one. If the peer was already dropped (budget
                     // expired) or we are at the candidate cap, ignore its traffic.
@@ -4803,9 +4853,12 @@ pub(crate) async fn recv_cmd(
                             );
                             st.recv_deadlines
                                 .insert(pid.clone(), Instant::now() + recv_pake_budget);
+                            // Once per receive, not once per candidate in the room.
+                            if recv_pake_overall_deadline.is_none() {
+                                ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
+                            }
                             recv_pake_overall_deadline
                                 .get_or_insert_with(|| Instant::now() + recv_pake_budget);
-                            ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
                         }
                     }
                 }

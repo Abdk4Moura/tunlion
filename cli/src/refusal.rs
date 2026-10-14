@@ -76,6 +76,49 @@ pub(crate) fn expires_text(secs: u64) -> String {
     }
 }
 
+/// What an expiry reason carries about the invitation, appended by the
+/// acceptor (`capability::expired_reason_for`): ` (it allowed transfer,shell
+/// for 4m)`. Read back by [`reinvite_from_reason`]. Pure.
+pub(crate) fn reinvite_suffix(r: &Reinvite) -> String {
+    format!(" (it allowed {} for {})", r.ceiling.join(","), expires_text(r.lifetime))
+}
+
+/// A capability word that may be printed inside a command. Peer-supplied.
+fn cap_word_ok(c: &str) -> bool {
+    !c.is_empty()
+        && c.len() <= 32
+        && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == ':' || ch == '.' || ch == '/')
+}
+
+/// An [`expires_text`] value back to seconds. Pure.
+fn expires_secs(t: &str) -> Option<u64> {
+    let unit = t.chars().last()?;
+    let n: u64 = t[..t.len() - unit.len_utf8()].parse().ok()?;
+    let mul = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        _ => return None,
+    };
+    (n > 0).then(|| n.saturating_mul(mul))
+}
+
+/// The re-invite an expiry REASON carries ([`reinvite_suffix`]), so a path
+/// that only has the reason string (a warm-link refusal, a mount error, a
+/// file-decline) builds the same remedy as one that got the frame fields.
+/// Pure; anything malformed is no re-invite, never a command fragment.
+pub(crate) fn reinvite_from_reason(reason: &str) -> Option<Reinvite> {
+    let start = reason.rfind(" (it allowed ")? + " (it allowed ".len();
+    let body = reason[start..].strip_suffix(')')?;
+    let (caps, life) = body.rsplit_once(" for ")?;
+    let ceiling: Vec<String> = caps.split(',').map(str::to_string).collect();
+    if ceiling.iter().any(|c| !cap_word_ok(c)) {
+        return None;
+    }
+    Some(Reinvite { ceiling, lifetime: expires_secs(life)? })
+}
+
 /// The re-invite from a refusal frame, when the acceptor sent one. Pure.
 pub(crate) fn reinvite_from_frame(v: &Value) -> Option<Reinvite> {
     let ceiling: Vec<String> = v["ceiling"]
@@ -83,7 +126,7 @@ pub(crate) fn reinvite_from_frame(v: &Value) -> Option<Reinvite> {
         .iter()
         .filter_map(|c| c.as_str())
         // Peer-supplied and printed as a command: capability words only.
-        .filter(|c| !c.is_empty() && c.len() <= 32 && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == ':' || ch == '.' || ch == '/'))
+        .filter(|c| cap_word_ok(c))
         .map(str::to_string)
         .collect();
     let lifetime = v["lifetime"].as_u64()?;
@@ -352,8 +395,15 @@ pub(crate) fn word(s: &str) -> String {
 /// The command is always one the CLI accepts (see the parse test below).
 /// `me` is the name `peer` knows this device by (the acceptor's `as`), else
 /// this device's own display name, which is what a pairing files it under.
+#[cfg(test)]
 pub(crate) fn remedy(code: Code, peer: &str, me: &str) -> (String, Option<String>) {
     remedy_with(code, peer, me, None)
+}
+
+/// [`remedy`], with the re-invite read from the refusal's reason string: the
+/// one form every path has, so every path gives the same remedy.
+pub(crate) fn remedy_from_reason(code: Code, peer: &str, me: &str, reason: &str) -> (String, Option<String>) {
+    remedy_with(code, peer, me, reinvite_from_reason(reason).as_ref())
 }
 
 /// [`remedy`], with what the acceptor said about an ended invitation.
@@ -547,7 +597,10 @@ pub(crate) fn explain_with(
         .map(str::to_string)
         .or_else(|| name_from_reason(&reason))
         .unwrap_or(fallback);
-    match remedy_with(code, peer, &me, reinvite) {
+    // The frame's fields when it had them, else what the reason carries:
+    // the same acceptor record either way.
+    let reinvite = reinvite.cloned().or_else(|| reinvite_from_reason(&reason));
+    match remedy_with(code, peer, &me, reinvite.as_ref()) {
         (text, Some(cmd)) => format!("{head}\n  {text}\n    {cmd}"),
         (text, None) => format!("{head}\n  {text}"),
     }
@@ -762,6 +815,34 @@ mod tests {
             assert!(crate::Cli::try_parse_from(&argv).is_ok(), "step does not parse: {y}");
         }
         assert!(!without.contains("fresh invitation."), "{without}");
+    }
+
+    /// Lab pass: exec's expiry refusal said `add --for guest --allow
+    /// transfer,shell --expires 2m ...` while send's said `add --for guest
+    /// --out guest-invite.txt --yes`. The reason string now carries the
+    /// re-invite, so a path holding only the reason (send's file-decline,
+    /// forward, mount) prints exactly what exec prints from the frame.
+    #[test]
+    fn every_expiry_path_builds_the_same_remedy_from_the_reason() {
+        let inv = Reinvite { ceiling: vec!["transfer".into(), "shell".into()], lifetime: 120 };
+        let reason = format!("{}{}", crate::capability::expired_reason(1_760_384_363), reinvite_suffix(&inv));
+        assert_eq!(reinvite_from_reason(&reason), Some(inv.clone()));
+        assert_eq!(code_from_reason(&reason), Some(Code::Expired));
+        assert_eq!(crate::capability::expired_at_from_reason(&reason), Some(1_760_384_363));
+        // exec: the frame's fields. send/forward/mount: the reason alone.
+        let mut f = Refusal::expired(1_760_384_363, Some("guest".into()), Some(inv.clone())).close_frame(3);
+        f["err"] = serde_json::json!(reason.clone());
+        let by_frame = explain_frame("exec", "owner", &f, "err");
+        let by_reason = explain("send", "owner", &reason, None, Some("guest"));
+        let adds = |m: &str| m.lines().find(|l| l.contains("tunlion add ")).map(|l| l.trim().to_string());
+        assert_eq!(adds(&by_frame), adds(&by_reason), "{by_frame}\n---\n{by_reason}");
+        assert!(adds(&by_reason).unwrap().contains("--allow transfer,shell --expires 2m"), "{by_reason}");
+        let (text, _) = remedy_from_reason(Code::Expired, "owner", "guest", &reason);
+        assert!(text.contains("--allow transfer,shell --expires 2m"), "{text}");
+        // Hostile or malformed suffixes are no re-invite, never a fragment.
+        assert_eq!(reinvite_from_reason("access expired at x (it allowed shell; rm -rf / for 2m)"), None);
+        assert_eq!(reinvite_from_reason("access expired at x (it allowed shell for soon)"), None);
+        assert_eq!(reinvite_from_reason(&crate::capability::expired_reason(1)), None);
     }
 
     #[test]

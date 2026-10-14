@@ -42,6 +42,7 @@ use filament_transfer::Outgoing;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FileReport {
@@ -230,12 +231,58 @@ fn take() -> Vec<FileReport> {
     LAST.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default()
 }
 
-/// The sender's half of the transfer history: one record per file this send
-/// offered, `ok` when the receiver acknowledged it whole. Called once the verb
-/// returns, success or failure; the report stays for `emit`.
-pub(crate) fn persist_history(peer: Option<&str>) {
+/// The sources this send was given, for the history of a send that ends
+/// before offering anything.
+static SOURCES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// A send is running whose outcome belongs in the history.
+static HISTORY_ARMED: AtomicBool = AtomicBool::new(false);
+/// Its outcome was written: once, whichever exit wrote it.
+static HISTORY_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Start a send whose outcome the history must record, however it ends.
+pub(crate) fn arm_history(peer: Option<&str>, sources: Vec<String>) {
+    set_peer(peer);
+    if let Ok(mut s) = SOURCES.lock() {
+        *s = sources;
+    }
+    HISTORY_ARMED.store(true, Ordering::SeqCst);
+}
+
+/// Record this send's outcome in the history, ONCE, from whichever exit gets
+/// there first: the verb returning (success or error), or an interrupt, which
+/// leaves through `exit_codes::interrupted_exit` and never returns. The lab
+/// counted 4 delivered and 3 failed sends and `status` listed 5: an
+/// interrupted send exited without writing anything, and a failed one wrote
+/// "(not delivered)" with no reason. `err` is why it failed, when it did.
+pub(crate) fn persist_outcome(err: Option<&str>) {
+    if !HISTORY_ARMED.load(Ordering::SeqCst) || HISTORY_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let peer = PEER.lock().ok().and_then(|p| p.clone());
     let files = LAST.lock().map(|l| l.clone()).unwrap_or_default();
-    crate::transfer_history::append(&history_records(&files, peer));
+    if files.is_empty() {
+        if let Some(e) = err {
+            let sources = SOURCES.lock().map(|s| s.clone()).unwrap_or_default();
+            crate::transfer_history::append_unoffered(peer.as_deref(), &sources, e);
+        }
+        return;
+    }
+    crate::transfer_history::append_values(outcome_values(&files, peer.as_deref(), err));
+}
+
+/// History rows for these files, a failed one carrying the send's error.
+/// Pure.
+pub(crate) fn outcome_values(files: &[FileReport], peer: Option<&str>, err: Option<&str>) -> Vec<Value> {
+    history_records(files, peer)
+        .iter()
+        .map(|r| {
+            let mut v = r.to_json();
+            if let (false, Some(e)) = (r.ok, err) {
+                v["error"] = json!(e);
+            }
+            v
+        })
+        .collect()
 }
 
 /// What the history calls each source a send was given: `-` is stdin (under
@@ -254,17 +301,6 @@ pub(crate) fn source_labels(paths: &[String], name: Option<&str>) -> Vec<String>
             }
         })
         .collect()
-}
-
-/// A send that failed before it offered any file (nothing reached
-/// `record`) still belongs in the history: one failed record per source,
-/// with the reason. Called after `persist_history`, only on failure.
-pub(crate) fn persist_unoffered(peer: Option<&str>, sources: &[String], err: &anyhow::Error) {
-    let offered = LAST.lock().map(|l| !l.is_empty()).unwrap_or(true);
-    if offered {
-        return;
-    }
-    crate::transfer_history::append_unoffered(peer, sources, &format!("{err:#}"));
 }
 
 /// History records for these files. Pure.
@@ -418,6 +454,24 @@ mod tests {
         let paths = vec!["-".to_string(), "/tmp/dir/a.txt".to_string()];
         assert_eq!(source_labels(&paths, None), ["stdin", "a.txt"]);
         assert_eq!(source_labels(&paths, Some("log.txt")), ["log.txt", "a.txt"]);
+    }
+
+    /// Every send outcome is a history row, and a failed one says why: the
+    /// lab's 4 delivered + 3 failed sends showed 5 rows, one "(not delivered)".
+    #[test]
+    fn a_failed_send_is_recorded_with_its_reason() {
+        let mut lost = one("b.txt", 5);
+        lost.delivered = false;
+        let rows = outcome_values(&[one("a.txt", 3), lost], Some("laptop"), Some("transfer REFUSED: x"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["ok"], json!(true));
+        assert!(rows[0].get("error").is_none(), "{}", rows[0]);
+        assert_eq!(rows[1]["ok"], json!(false));
+        assert_eq!(rows[1]["error"], json!("transfer REFUSED: x"));
+        assert!(crate::transfer_history::human_line(&rows[1]).contains("(failed: transfer REFUSED: x)"));
+        // Success: no error on any row.
+        let ok = outcome_values(&[one("a.txt", 3)], None, None);
+        assert!(ok[0].get("error").is_none());
     }
 
     fn one(name: &str, bytes: u64) -> FileReport {

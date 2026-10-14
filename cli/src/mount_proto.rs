@@ -723,7 +723,7 @@ pub fn spawn_mount_server(
                 // read-heavy mount does not re-read the device store per operation
                 // (#235).
                 if let Some(cut) = recheck.cut(idev.as_ref()) {
-                    let cut_reason = cut.reason();
+                    let cut_reason = cut.reason_for(idev.as_ref());
                     crate::ui::critical(&format!(
                         "mount: peer {}, closing the live session (sid {sid})",
                         match cut {

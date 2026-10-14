@@ -58,7 +58,9 @@ export class PakePairing {
   sendOurMessage() {
     if (this.sentMsg) return
     const msg = this.session.message()
-    this.sendSignal({ type: 'pake-msg', v: 2, msg: b64(msg) })
+    // `np` names whose ceremony this is: concurrent codes from one device
+    // share a room, and a peer of another code must not answer or fail it.
+    this.sendSignal({ type: 'pake-msg', v: 2, msg: b64(msg), np: this.nameplate })
     this.sentMsg = true
   }
 
@@ -69,7 +71,7 @@ export class PakePairing {
     if (!fps) return
     const mac = this.session.ourConfirm(fps.mine, fps.theirs, this.capsCanon)
     if (!mac) return
-    this.sendSignal({ type: 'pake-confirm', v: 2, mac: b64(mac), caps: this.caps })
+    this.sendSignal({ type: 'pake-confirm', v: 2, mac: b64(mac), caps: this.caps, np: this.nameplate })
     this.sentConfirm = true
     // A confirm from the peer may have arrived first; process it now.
     if (this._pendingConfirmMac) this._verify(this._pendingConfirmMac)

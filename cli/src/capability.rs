@@ -59,6 +59,20 @@ pub fn expired_reason(at: u64) -> String {
     format!("{EXPIRED_PREFIX} at {when}: the invitation that admitted this device has ended")
 }
 
+/// [`expired_reason`], plus what the invitation allowed and for how long when
+/// this (the acceptor's) store has the device's record. EVERY refusal path
+/// carries this reason string (a warm-link "refused:", an l2-close, a mount
+/// error, a file-decline), so the initiator's remedy is built from the same
+/// data on every path: exec used to print `--allow transfer,shell --expires
+/// 2m` while send printed a bare `add --for guest --out ... --yes`.
+pub fn expired_reason_for(at: u64, device_pub: Option<&[u8; 32]>) -> String {
+    let mut r = expired_reason(at);
+    if let Some(ri) = device_pub.and_then(crate::identity_state::reinvite_for) {
+        r.push_str(&crate::refusal::reinvite_suffix(&ri));
+    }
+    r
+}
+
 /// The expiry time named in an [`expired_reason`], when it parses. Pure.
 pub fn expired_at_from_reason(reason: &str) -> Option<u64> {
     let rest = reason.trim().strip_prefix(EXPIRED_PREFIX)?.trim_start().strip_prefix("at ")?;
@@ -607,7 +621,7 @@ pub fn cap_gate_effective(
         if let Some(exp) = cert_expires {
             if now_secs() >= exp {
                 return GateDecision::Deny {
-                    cap_reason: Some(expired_reason(exp)),
+                    cap_reason: Some(expired_reason_for(exp, device_pub)),
                 };
             }
         }

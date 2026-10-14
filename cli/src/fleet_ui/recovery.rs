@@ -23,7 +23,7 @@ pub fn render_init_phrase(words: &[&str]) -> String {
         .collect();
 
     format!(
-        "{ok} Identity created. This is you — devices come and go, this is what they trust.\n\n\
+        "{ok} Identity created. This is you: devices come and go, this is what they trust.\n\n\
          {prompt}\n\
          {warn}\n\n\
          {words}\n\n\
@@ -67,7 +67,7 @@ pub fn render_post_ack_nudge() -> String {
 pub fn render_restore_header() -> String {
     format!(
         "{}",
-        ui::paint(Tone::Brand, "  tunlion id recover — recover your identity from your 12 words")
+        ui::paint(Tone::Brand, "  tunlion id recover: recover your identity from your 12 words")
     )
 }
 
@@ -99,7 +99,7 @@ pub fn render_lost_response() -> String {
          {rotate}",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
         pending = ui::paint(Tone::Dim, "  7-day pending window: if an old device is still out there, it can object."),
-        rotate = ui::paint(Tone::Dim, "  Bring any old primary online to confirm instantly.\n  ↳ tunlion identity rotate   (optional — replaces the old key sooner)"),
+        rotate = ui::paint(Tone::Dim, "  Bring any old primary online to confirm instantly.\n  ↳ tunlion identity rotate   (optional: replaces the old key sooner)"),
     )
 }
 
@@ -115,7 +115,7 @@ pub fn render_stolen_response() -> String {
          {rotate}\n\n\
          {guardians}",
         warn = ui::paint(Tone::Warn, ui::glyph_warn()),
-        line1 = "    Your 12 words rebuild your identity — but they do NOT disable a key a thief",
+        line1 = "    Your 12 words rebuild your identity, but they do NOT disable a key a thief",
         line2 = "    already holds. There is no server to phone; no global kill-switch exists (by design).",
         what_do = ui::paint(Tone::Bold, "    What you CAN do right now:"),
         revoke = format!(
@@ -140,12 +140,12 @@ pub fn render_posture_choice() -> String {
         accept = format!(
             "     {} {}",
             ui::paint(Tone::Dim, "(o)"),
-            ui::paint(Tone::Dim, "Accept the race     backup-only — simplest, and a stolen key races you until expiry")
+            ui::paint(Tone::Dim, "Accept the race     backup-only: simplest, and a stolen key races you until expiry")
         ),
         guardian = format!(
             "     {} {}",
             ui::paint(Tone::Dim, "( )"),
-            ui::paint(Tone::Bold, "Add guardians       3-of-5 people co-sign recovery/revocation — wins the theft race")
+            ui::paint(Tone::Bold, "Add guardians       3-of-5 people co-sign recovery/revocation: wins the theft race")
         ),
     )
 }
@@ -154,7 +154,7 @@ pub fn render_posture_choice() -> String {
 pub fn render_guardians_header() -> String {
     format!(
         "{}",
-        ui::paint(Tone::Brand, "  tunlion identity guardians — people who can co-sign your recovery")
+        ui::paint(Tone::Brand, "  tunlion identity guardians: people who can co-sign your recovery")
     )
 }
 
@@ -163,7 +163,7 @@ pub fn render_guardians_installed(guardians: &[(&str, &str)], threshold: &str) -
     let count = guardians.len();
     let mut lines = vec![
         format!(
-            "  {} Installed  ({} — tolerates {} offline)",
+            "  {} Installed  ({}, tolerates {} offline)",
             ui::paint(Tone::Brand, ui::glyph_fleet()),
             threshold,
             count.saturating_sub(threshold.split('-').next().unwrap_or("3").parse::<usize>().unwrap_or(3))
@@ -180,7 +180,7 @@ pub fn render_guardians_installed(guardians: &[(&str, &str)], threshold: &str) -
     }
 
     lines.push(String::new());
-    lines.push(ui::paint(Tone::Dim, "  Installing a guardian: one confirm, reversible anytime — they hold no power"));
+    lines.push(ui::paint(Tone::Dim, "  Installing a guardian: one confirm, reversible anytime; they hold no power"));
     lines.push(ui::paint(Tone::Dim, "  until 3 of them together co-sign a recovery. No single guardian can act alone."));
 
     lines.join("\n")
@@ -191,7 +191,7 @@ pub fn render_guardian_recovery_requested(started: &str, activates: &str) -> Str
     format!(
         "{warn} A recovery for YOUR identity was requested from a new device.\n\
          Started: {started} · Activates: {activates} (7-day hold) unless you cancel.\n\
-         Not you?  tunlion identity freeze   — stops it cold; the new device gets nothing.\n\
+         Not you?  `tunlion identity freeze` stops it cold; the new device gets nothing.\n\
          It's you? Ask your guardians to co-sign, or bring an old primary online.",
         warn = ui::paint(Tone::Warn, ui::glyph_warn()),
     )
@@ -201,7 +201,7 @@ pub fn render_guardian_recovery_requested(started: &str, activates: &str) -> Str
 pub fn render_guardian_removed(name: &str, new_threshold: &str) -> String {
     format!(
         "{ok} Removed {name} as a guardian. Your threshold is now {new_threshold}.\n\
-         {warn} Below your target of 3-of-5 — add one to restore your margin.",
+         {warn} Below your target of 3-of-5: add one to restore your margin.",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
         warn = ui::paint(Tone::Warn, ui::glyph_warn()),
     )

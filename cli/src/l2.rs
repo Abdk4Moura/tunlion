@@ -608,7 +608,7 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             crate::ui::critical("l2: peer access expired, closing the live stream")
                         }
                     }
-                    revoked_reason = Some(cut.reason());
+                    revoked_reason = Some(cut.reason_for(idev.as_ref()));
                     if let Some(r) = reader.take() { r.abort(); }
                     writer.abort();
                     read_result = None;
@@ -1090,7 +1090,7 @@ pub async fn spawn_pty_session(
                     let cut = crate::identity_state::live_session_cut(idev.as_ref());
                     if cut.is_some() || ceiling_gone || lapsed {
                         let reason = match cut {
-                            Some(c) => c.reason(),
+                            Some(c) => c.reason_for(idev.as_ref()),
                             None => crate::capability::REVOKED_REASON.to_string(),
                         };
                         if matches!(cut, Some(crate::identity_state::LiveCut::Expired(_))) {
@@ -2498,7 +2498,7 @@ pub(crate) fn forward_unreachable_line(peer: &str, secs: u64) -> String {
 fn forward_refusal_fix(peer: &str, reason: &str) -> Option<(String, Option<String>)> {
     let code = crate::refusal::code_from_reason(reason)?;
     let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
-    Some(crate::refusal::remedy(code, peer, &me))
+    Some(crate::refusal::remedy_from_reason(code, peer, &me, reason))
 }
 
 /// G: `forward` rides the shell grant, so a device without one was refused
@@ -3614,7 +3614,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                     Some(code) => {
                         let me = crate::refusal::name_from_reason(&reason)
                             .unwrap_or_else(crate::display_name);
-                        let (text, cmd) = crate::refusal::remedy(code, peer, &me);
+                        let (text, cmd) = crate::refusal::remedy_from_reason(code, peer, &me, &reason);
                         match cmd {
                             Some(c) => format!(
                                 "{text} {}",
@@ -5968,7 +5968,7 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
         &format!("tunlion shell --ssh: no sshd on '{peer}'"),
         &format!(
             "'{peer}' is reachable, but nothing is listening on localhost:{rport} for ssh. \
-             (sshd may be bound to a non-localhost address like the mesh ULA — \
+             (sshd may be bound to a non-localhost address like the mesh ULA; \
              `tunlion shell --ssh` connects to localhost:{rport} on the peer.)",
         ),
         &[

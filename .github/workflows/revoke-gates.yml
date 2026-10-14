@@ -166,10 +166,11 @@ jobs:
             # RUNNING daemon, no restart) + 4 invitation-burn (S2: a used
             # invitation stays used across forget and restart, new key or same).
             [cli/tests/revocation-live-gates.sh]=15
-            # 16 = X0 premise + 3 positives (exec, send, forward --stdio) + the
+            # 17 = X0 premise + 3 positives (exec, send, forward --stdio) + the
             # C0 alive-before-the-end control + X1..X8 after the end + X9..X11
-            # (requests, device lists, one remedy: fix/rc-polish).
-            [cli/tests/invite-expiry-gates.sh]=16
+            # (requests, device lists, one remedy: fix/rc-polish) + X12 (exec,
+            # forward and send print one re-invite line: fix/concurrent-code-sends).
+            [cli/tests/invite-expiry-gates.sh]=17
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \

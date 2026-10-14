@@ -99,7 +99,7 @@ pub(crate) fn append(records: &[Record]) {
 }
 
 /// Append already-shaped records, keeping the newest [`MAX_RECORDS`].
-fn append_values(values: Vec<Value>) {
+pub(crate) fn append_values(values: Vec<Value>) {
     if values.is_empty() {
         return;
     }

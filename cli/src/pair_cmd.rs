@@ -363,6 +363,9 @@ pub(crate) async fn pair_cmd(
                     // previewed nameplate so an empty (auto-words) create reuses it.
                     codeentry::Outcome::Empty => preview_nameplate = Some(auto_np),
                     codeentry::Outcome::Cancelled => return Err(cancelled()),
+                    codeentry::Outcome::Interrupted => {
+                        crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+                    }
                 }
             }
             // Malformed positional -> banner + prefilled CLAIM entry.
@@ -374,6 +377,9 @@ pub(crate) async fn pair_cmd(
                     // Empty submit on a claim-fix means "give up on this code".
                     codeentry::Outcome::Empty => return Err(cancelled()),
                     codeentry::Outcome::Cancelled => return Err(cancelled()),
+                    codeentry::Outcome::Interrupted => {
+                        crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+                    }
                 }
             }
             // A well-formed positional -> no prompt, proceed as today.

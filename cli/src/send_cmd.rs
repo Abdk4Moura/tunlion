@@ -683,6 +683,9 @@ pub(crate) async fn send_cmd(
             .unwrap_or(60),
     );
     let mut pake_deadline: Option<Instant> = None;
+    // Every peer that sent us PAKE traffic, ours or not. A peer that ran ANY
+    // ceremony is a current build, so "older version" is only true when none did.
+    let mut pake_heard: HashSet<String> = HashSet::new();
     // C30 phase 3: link mini-sync, pings out, divergence corrections in.
     let mut last_state_ping = Instant::now();
     let mut reproved: std::collections::HashSet<String> = Default::default();
@@ -989,10 +992,25 @@ pub(crate) async fn send_cmd(
         if !pake_done {
             if let Some(dl) = pake_deadline {
                 if Instant::now() > dl {
-                    ui::clear_sticky();
-                    bail!(
-                        "the other device uses an older version and can't receive securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was sent."
-                    );
+                    match pake_expiry(pake_peer.is_some(), !pake_heard.is_empty()) {
+                        PakeExpiry::Unfinished => {
+                            ui::clear_sticky();
+                            bail!(
+                                "the receiver that claimed this code started the encrypted handshake but did not finish it within {}s. Nothing was sent; ask for a FRESH code.",
+                                pake_budget.as_secs()
+                            );
+                        }
+                        PakeExpiry::OlderPeer => {
+                            ui::clear_sticky();
+                            bail!(
+                                "the other device uses an older version and can't receive securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was sent."
+                            );
+                        }
+                        // Only other codes' receivers spoke: they are new
+                        // builds, not ours. Keep waiting for our own claimer,
+                        // bounded by the code's establishment window.
+                        PakeExpiry::KeepWaiting => pake_deadline = None,
+                    }
                 }
             }
         }
@@ -1008,7 +1026,10 @@ pub(crate) async fn send_cmd(
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
-            if conn.to_filter.is_none() && conn.active.is_none() {
+            if conn.to_filter.is_none()
+                && conn.active.is_none()
+                && (!use_code || pake_peer.as_deref() == Some(pid.as_str()))
+            {
                 conn.active = Some(pid.clone());
             }
         }
@@ -1088,7 +1109,7 @@ pub(crate) async fn send_cmd(
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
-                        conn.maybe_adopt(p, code_used).await?;
+                        conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done)).await?;
                     }
                 }
                 // C30 (dissolves the C28 belt): fresh sid = everything
@@ -1105,7 +1126,7 @@ pub(crate) async fn send_cmd(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt_from(p, code_used, AdoptSource::Digest)
+                        conn.maybe_adopt_from(p, adopt_wants_active(code_used, use_code, pake_done), AdoptSource::Digest)
                             .await?;
                     }
                     if let Some((name, secret)) = &known_target {
@@ -1245,7 +1266,7 @@ pub(crate) async fn send_cmd(
                 code_used = true;
             }
             Ev::PeerJoined(v) => {
-                conn.maybe_adopt(&v, code_used).await?;
+                conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done)).await?;
             }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
@@ -1386,7 +1407,34 @@ pub(crate) async fn send_cmd(
                     Some("pake-msg") | Some("pake-confirm")
                 ) {
                     if let Some(cer) = send_cer.as_mut() {
-                        pake_peer.get_or_insert(from.clone());
+                        // Concurrent code sends on one device share the auto
+                        // room, so a receiver claiming ANOTHER code meets this
+                        // sender too and runs its ceremony at us. That peer is
+                        // not ours: it must never feed our one ceremony, never
+                        // take the slot, and never fail this transfer. Only the
+                        // claimer of OUR nameplate may (see `pake_partner`).
+                        pake_heard.insert(from.clone());
+                        match pake_partner(
+                            pake_peer.as_deref(),
+                            &from,
+                            data["type"].as_str() == Some("pake-msg"),
+                            crate::pake_ceremony::addressed_to(&data, &send_nameplate),
+                            code_used,
+                        ) {
+                            PakePartner::Ours => {}
+                            PakePartner::Latch => {
+                                pake_peer = Some(from.clone());
+                                // The budget runs for THIS peer's ceremony.
+                                pake_deadline = Some(Instant::now() + pake_budget);
+                                ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
+                            }
+                            PakePartner::NotOurs => {
+                                ui::debug(&format!(
+                                    "send: PAKE from {from} is not for this code's ceremony; ignored"
+                                ));
+                                continue;
+                            }
+                        }
                         let fps = match conn.link(&from) {
                             Some(l) => match &l.peer {
                                 Some(p) => p.fingerprints().await,
@@ -1411,9 +1459,16 @@ pub(crate) async fn send_cmd(
                                         //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
                                         let promo =
                                             conn.start_direct_promote(&from, &from, &sec).await;
-                                        if conn.active.is_none() {
-                                            conn.active = Some(from.clone());
+                                        // THE AUTHENTICATED PEER IS THE TARGET, and
+                                        // only it: bind the slot to it (a rejoin on a
+                                        // fresh sid keeps it by uid; nobody else can
+                                        // take it), as the receiver does.
+                                        if let Some(old) = conn.active.clone().filter(|a| a != &from) {
+                                            ui::debug(&format!(
+                                                "send: {from} authenticated this code; releasing the slot held by {old}"
+                                            ));
                                         }
+                                        conn.bind_active(&from);
                                         // Offers were deferred pending this confirm, and
                                         // the ChannelReady handler ignores a non-active
                                         // pid, so this must follow the claim above.
@@ -1506,6 +1561,13 @@ pub(crate) async fn send_cmd(
                         conn.active = Some(pid.clone());
                     }
                 }
+                // Code path: a channel came up after our code was claimed.
+                // Bound how long it may take for SOMEONE to run our ceremony,
+                // so a receiver too old to run it fails loudly. Which peer it
+                // is gets settled by the ceremony, not by this channel.
+                if use_code && !pake_done && code_used && pake_deadline.is_none() {
+                    pake_deadline = Some(Instant::now() + pake_budget);
+                }
                 // Responder links stop here: connected, polite, idle. Only
                 // the active target gets announcements + offers.
                 if !conn.is_active(&pid) {
@@ -1542,12 +1604,18 @@ pub(crate) async fn send_cmd(
                         fleet_session::Action::Idle => {}
                     }
                 }
+                // By name only: a link built from a bare signal is filed under
+                // its signaling id, and the lab read "ok FfcE6CxL__13XT3tAAXB".
+                let shown = conn.display_name_of(&pid);
                 if let Some(l) = conn.link(&pid) {
-                    ui::say(&format!(
-                        "  {} {}",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, l.label())
-                    ));
+                    match &shown {
+                        Some(n) => ui::say(&format!(
+                            "  {} {}",
+                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            ui::paint(ui::Tone::Bold, n)
+                        )),
+                        None => ui::debug(&format!("link ready: pid {pid}, no name to show")),
+                    }
                     let is_direct = l.direct;
                     let direct_route = l.direct_route;
                     if let Some(p) = l.peer.clone() {
@@ -1589,10 +1657,10 @@ pub(crate) async fn send_cmd(
                     // loop) drives the ceremony; on confirm the Signal handler
                     // sets `pake_done` and re-emits ChannelReady to fall through
                     // here and offer. The secret is DISCARDED after auth.
+                    // The partner is chosen by the ceremony (the Signal arm),
+                    // never by whichever channel came up first: in a shared
+                    // room that was another code's receiver.
                     if use_code && !is_direct && !pake_done {
-                        pake_peer.get_or_insert(pid.clone());
-                        pake_deadline.get_or_insert_with(|| Instant::now() + pake_budget);
-                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
                         continue; // offers/remember wait for PAKE confirm
                     }
                     // Same rule for a FLEET target, for the same reason: the link
@@ -3136,7 +3204,7 @@ pub(crate) fn final_refusal_remedy(peer: &str, reason: &str) -> Option<String> {
         return None;
     }
     let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
-    Some(match crate::refusal::remedy(code, peer, &me) {
+    Some(match crate::refusal::remedy_from_reason(code, peer, &me, reason) {
         (text, Some(cmd)) => format!("  {text}\n    {cmd}"),
         (text, None) => format!("  {text}"),
     })
@@ -3151,6 +3219,80 @@ pub(crate) fn unrecognized_message(peer: &str, reason: Option<&str>) -> String {
     format!(
         "'{peer}' refused this send: {reason}. Only the owner of '{peer}' can let this device back in, by pairing or enrolling it again. Nothing was sent."
     )
+}
+
+/// Who may run this send's code ceremony. Decided per PAKE message.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PakePartner {
+    /// From the peer already running our ceremony: feed it.
+    Ours,
+    /// The first peer to open OUR ceremony: it becomes the partner.
+    Latch,
+    /// Anyone else: ignore it entirely. It may not feed, latch or abort.
+    NotOurs,
+}
+
+/// Concurrent `send --code` on one device share the sender's auto room (the
+/// server moves a claimer into its creator's CURRENT room), so a receiver that
+/// claimed another code meets this sender as well and runs its ceremony here.
+/// The sender used to latch whoever spoke first and abort the whole transfer on
+/// that peer's (necessarily) failed confirmation: code 2's sender refused its
+/// own, never-claimed code, and code 1's sender could lock onto code 2's
+/// receiver. A message is ours when it names our nameplate (`np`), or, from a
+/// build that names none, once our code has actually been claimed. Only a
+/// `pake-msg` opens a ceremony; a confirm cannot come first. Pure.
+pub(crate) fn pake_partner(
+    latched: Option<&str>,
+    from: &str,
+    is_msg: bool,
+    addressed: Option<bool>,
+    code_claimed: bool,
+) -> PakePartner {
+    match latched {
+        Some(p) if p == from => PakePartner::Ours,
+        Some(_) => PakePartner::NotOurs,
+        None => {
+            let ours = match addressed {
+                Some(mine) => mine,
+                None => code_claimed,
+            };
+            if ours && is_msg {
+                PakePartner::Latch
+            } else {
+                PakePartner::NotOurs
+            }
+        }
+    }
+}
+
+/// What the code ceremony's budget running out means.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PakeExpiry {
+    /// Our claimer started the ceremony and did not finish it.
+    Unfinished,
+    /// A peer connected after the claim and NOBODY ran a ceremony at all: the
+    /// only case where "the other device is older" is actually true.
+    OlderPeer,
+    /// Only other codes' receivers spoke. Not a failure of this transfer.
+    KeepWaiting,
+}
+
+/// "Older version" was the message for every expiry, including a receiver of
+/// another code that ran a ceremony against us (a current build by
+/// definition). Say it only when no peer ran one. Pure.
+pub(crate) fn pake_expiry(partner_latched: bool, any_pake_heard: bool) -> PakeExpiry {
+    match (partner_latched, any_pake_heard) {
+        (true, _) => PakeExpiry::Unfinished,
+        (false, false) => PakeExpiry::OlderPeer,
+        (false, true) => PakeExpiry::KeepWaiting,
+    }
+}
+
+/// May an adopted room peer take the transfer slot? On the code path, no peer
+/// is the target until it authenticated (the slot is bound at confirm); after
+/// that the binding admits only the authenticated peer's rejoin. Pure.
+pub(crate) fn adopt_wants_active(code_claimed: bool, use_code: bool, pake_done: bool) -> bool {
+    code_claimed && (!use_code || pake_done)
 }
 
 /// What to check when nobody connected, worded for who we were waiting for.
@@ -3345,8 +3487,51 @@ impl Drop for SendSpan {
 
 #[cfg(test)]
 mod code_window_tests {
-    use super::{code_establish_window, code_expiry_secs, code_expiry_words};
+    use super::{
+        adopt_wants_active, code_establish_window, code_expiry_secs, code_expiry_words, pake_expiry,
+        pake_partner, PakeExpiry, PakePartner,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn another_codes_receiver_never_runs_this_ceremony() {
+        // Run B: code 2's sender, never claimed, met code 1's receiver in the
+        // shared room. Tagged with code 1's nameplate: not ours.
+        assert_eq!(pake_partner(None, "r1", true, Some(false), false), PakePartner::NotOurs);
+        // Even after our code is claimed, a message for another nameplate is
+        // not ours (Run A: code 1's sender latched code 2's receiver).
+        assert_eq!(pake_partner(None, "r2", true, Some(false), true), PakePartner::NotOurs);
+        // Our claimer's tagged message opens the ceremony.
+        assert_eq!(pake_partner(None, "r1", true, Some(true), true), PakePartner::Latch);
+        assert_eq!(pake_partner(None, "r1", true, Some(true), false), PakePartner::Latch);
+        // An untagged build counts only once our code was claimed.
+        assert_eq!(pake_partner(None, "r1", true, None, false), PakePartner::NotOurs);
+        assert_eq!(pake_partner(None, "r1", true, None, true), PakePartner::Latch);
+        // A confirm cannot open a ceremony.
+        assert_eq!(pake_partner(None, "r1", false, Some(true), true), PakePartner::NotOurs);
+        // Once latched: only that peer, and nobody else, even with our tag.
+        assert_eq!(pake_partner(Some("r1"), "r1", false, Some(true), true), PakePartner::Ours);
+        assert_eq!(pake_partner(Some("r1"), "r2", true, Some(true), true), PakePartner::NotOurs);
+    }
+
+    #[test]
+    fn older_version_only_when_nobody_ran_a_ceremony() {
+        assert_eq!(pake_expiry(false, false), PakeExpiry::OlderPeer);
+        assert_eq!(pake_expiry(false, true), PakeExpiry::KeepWaiting);
+        assert_eq!(pake_expiry(true, true), PakeExpiry::Unfinished);
+        assert_eq!(pake_expiry(true, false), PakeExpiry::Unfinished);
+    }
+
+    #[test]
+    fn a_code_send_binds_the_slot_only_after_authentication() {
+        // Room send (no code): the first peer may take the slot, as before.
+        assert!(adopt_wants_active(true, false, false));
+        // Code send: nobody before the ceremony confirms, claimed or not.
+        assert!(!adopt_wants_active(true, true, false));
+        assert!(!adopt_wants_active(false, true, false));
+        // After it: the (bound) authenticated peer may come back.
+        assert!(adopt_wants_active(true, true, true));
+    }
 
     /// A code send advertised "expires in 10 min" and gave up after 60 s.
     #[test]

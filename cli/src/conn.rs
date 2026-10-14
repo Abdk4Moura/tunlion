@@ -1363,6 +1363,26 @@ impl Conn {
     pub(crate) fn link(&self, pid: &str) -> Option<&Link> {
         self.links.get(pid)
     }
+
+    /// A NAME for this peer to show a person, never its signaling id: the
+    /// link's label, else the name the server listed it under, when either is
+    /// a name rather than an id. `None` when nothing but an id is known (a link
+    /// built from a bare signal is filed under its id). DISPLAY only.
+    pub(crate) fn display_name_of(&self, pid: &str) -> Option<String> {
+        let uid = self.links.get(pid).and_then(|l| l.uid.clone()).or_else(|| {
+            self.roster.get(pid).and_then(|r| r["uid"].as_str().map(String::from))
+        });
+        let named = |n: &str| {
+            (!n.is_empty()
+                && !label_is_raw_id(n, pid, uid.as_deref())
+                && !self.links.contains_key(n))
+            .then(|| n.to_string())
+        };
+        self.links
+            .get(pid)
+            .and_then(|l| named(l.label()))
+            .or_else(|| self.roster.get(pid).and_then(|r| r["name"].as_str()).and_then(named))
+    }
     pub(crate) fn link_mut(&mut self, pid: &str) -> Option<&mut Link> {
         self.links.get_mut(pid)
     }

@@ -558,6 +558,16 @@ impl LiveCut {
             LiveCut::Expired(at) => crate::capability::expired_reason(at),
         }
     }
+
+    /// [`LiveCut::reason`] with what the device's invitation allowed, read
+    /// from this store, so a mid-session cut gives the same remedy as a
+    /// refusal at open (`capability::expired_reason_for`).
+    pub(crate) fn reason_for(self, idev: Option<&[u8; 32]>) -> String {
+        match self {
+            LiveCut::Revoked => self.reason(),
+            LiveCut::Expired(at) => crate::capability::expired_reason_for(at, idev),
+        }
+    }
 }
 
 /// The one live re-check every serving loop asks. Revocation first (it is the

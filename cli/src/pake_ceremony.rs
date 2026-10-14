@@ -128,6 +128,21 @@ pub struct Ceremony {
     aborted: Option<String>,
     sent_msg: bool,
     sent_confirm: bool,
+    /// The public routing nameplate this ceremony is for. Carried (as `np`) on
+    /// every payload so a peer can tell whose ceremony a message belongs to:
+    /// two concurrent `send --code` on one device share the sender's auto room,
+    /// and a receiver claiming one code meets BOTH senders there. The nameplate
+    /// already crosses the server (pair-create / pair-claim); it is routing, not
+    /// a secret, and changing it cannot make a ceremony agree (SPAKE2 binds it).
+    nameplate: String,
+}
+
+/// Is this PAKE payload for the ceremony on `nameplate`? `Some(true)` when the
+/// payload names our nameplate, `Some(false)` when it names a DIFFERENT one
+/// (another code's ceremony sharing the room: never ours to answer or to fail
+/// on), `None` when it names none (a build that predates the tag). Pure.
+pub fn addressed_to(data: &Value, nameplate: &str) -> Option<bool> {
+    data["np"].as_str().map(|np| np == nameplate)
 }
 
 impl Ceremony {
@@ -154,6 +169,7 @@ impl Ceremony {
             aborted: None,
             sent_msg: false,
             sent_confirm: false,
+            nameplate: nameplate.to_string(),
         }
     }
 
@@ -163,6 +179,7 @@ impl Ceremony {
     /// Scope is preserved (same introduction).
     pub fn restart(&mut self, password: &str, nameplate: &str) {
         let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
+        self.nameplate = nameplate.to_string();
         self.state = Some(state);
         self.msg = msg;
         self.k = None;
@@ -177,6 +194,7 @@ impl Ceremony {
     #[cfg(test)]
     pub fn restart_with_scope(&mut self, password: &str, nameplate: &str, scope: u8) {
         let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
+        self.nameplate = nameplate.to_string();
         self.state = Some(state);
         self.msg = msg;
         self.scope = scope;
@@ -206,7 +224,11 @@ impl Ceremony {
             return None;
         }
         self.sent_msg = true;
-        Some(json!({ "type": "pake-msg", "v": 2, "msg": b64_encode(&self.msg) }))
+        Some(json!({
+            "type": "pake-msg", "v": 2,
+            "msg": b64_encode(&self.msg),
+            "np": self.nameplate,
+        }))
     }
 
     /// The opaque `signal` payload carrying our key-confirmation MAC, IF K is
@@ -227,6 +249,7 @@ impl Ceremony {
             "mac": b64_encode(&mac),
             "caps": self.caps.clone(),
             "scope": self.scope,
+            "np": self.nameplate,
         }))
     }
 
@@ -506,4 +529,30 @@ mod tests {
         assert!(b.secret().is_none());
     }
 
+    // Two concurrent codes on one device share a room. Every payload names its
+    // nameplate, so a peer can tell another code's ceremony from its own
+    // without running it (the concurrent-send defect: a receiver of code 1
+    // handshook with code 2's sender, which then refused its own transfer).
+    #[test]
+    fn payloads_name_their_nameplate() {
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut b = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let a_msg = a.take_msg_payload().unwrap();
+        let b_msg = b.take_msg_payload().unwrap();
+        assert_eq!(addressed_to(&a_msg, "314"), Some(true));
+        assert_eq!(addressed_to(&a_msg, "2718"), Some(false));
+        assert_eq!(addressed_to(&json!({"type": "pake-msg"}), "314"), None);
+        b.on_signal(&a_msg, None);
+        a.on_signal(&b_msg, None);
+        let conf = a.take_confirm_payload("SHA-256 A", "SHA-256 B").unwrap();
+        assert_eq!(addressed_to(&conf, "314"), Some(true));
+        assert_eq!(addressed_to(&conf, "999"), Some(false));
+        // A restart on a fresh nameplate re-tags.
+        let mut c = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        c.restart("brave-otter", "4242");
+        let c_msg = c.take_msg_payload().unwrap();
+        assert_eq!(addressed_to(&c_msg, "4242"), Some(true));
+        assert_eq!(addressed_to(&c_msg, "314"), Some(false));
+    }
 }
