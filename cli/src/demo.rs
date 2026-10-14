@@ -568,7 +568,7 @@ impl<W: Write> Player<W> {
     fn banner(&mut self) {
         let s = self.style;
         let (top, side) = if s.unicode { ("╭───╮", "│") } else { (".---.", "|") };
-        let b = self.paint(Tone::Accent, block(s.unicode, Motion::Rest));
+        let b = self.paint(Tone::Accent, &block(s.unicode, Motion::Rest));
         self.line("");
         self.line(&format!("  {top}"));
         let title = self.paint(Tone::Strong, "tunlion demo");
@@ -644,7 +644,7 @@ impl<W: Write> Player<W> {
     fn prompt(&self, on: &str, frame: Motion) -> String {
         format!(
             "{} {} $ ",
-            self.paint(Tone::Accent, block(self.style.unicode, frame)),
+            self.paint(Tone::Accent, &block(self.style.unicode, frame)),
             self.paint(Tone::Quiet, on)
         )
     }
@@ -799,7 +799,7 @@ impl<W: Write> Player<W> {
     fn wait(&mut self, label: &str, ms: u32) -> Result<(), Stop> {
         let scaled = if self.speed <= 0.0 { 0.0 } else { ms as f64 / self.speed };
         if !self.style.motion || self.fast || scaled < 1.0 {
-            let l = format!("  {} {}", self.paint(Tone::Accent, block(self.style.unicode, Motion::Rest)), self.paint(Tone::Quiet, label));
+            let l = format!("  {} {}", self.paint(Tone::Accent, &block(self.style.unicode, Motion::Rest)), self.paint(Tone::Quiet, label));
             self.line(&l);
             return self.pause(ms);
         }
@@ -807,7 +807,7 @@ impl<W: Write> Player<W> {
         let total = Duration::from_secs_f64(scaled / 1000.0);
         while start.elapsed() < total {
             let f = Motion::Pulse(start.elapsed().as_millis());
-            let l = format!("  {} {}", self.paint(Tone::Accent, block(self.style.unicode, f)), self.paint(Tone::Quiet, label));
+            let l = format!("  {} {}", self.paint(Tone::Accent, &block(self.style.unicode, f)), self.paint(Tone::Quiet, label));
             self.redraw(&l);
             self.pause_raw(40)?;
             if self.fast {
