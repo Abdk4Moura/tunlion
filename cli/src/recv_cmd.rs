@@ -640,7 +640,40 @@ fn serving_off_refusal(conn: &Conn, pid: &str, off: crate::refusal::Code) -> cra
             == crate::pair_cmd::GrantVsCeiling::OutsideCeiling
     });
     let code = if outside { crate::refusal::Code::Ceiling } else { off };
+    // A proven device asking for a shell on a machine that serves none is
+    // exactly what the owner's Asks list is for. Only the gate path used to
+    // record it, and that path is not reached while serving is off (plain
+    // `tunlion up`, the default), so the ask was refused and forgotten: the
+    // owner never saw it (launch matrix D06).
+    if let Some(peer) = serving_off_ask(&code, who.as_deref()) {
+        enqueue_if_requestable(peer, "shell");
+    }
     crate::refusal::Refusal::new(code, who)
+}
+
+/// The device whose refused shell open becomes an ask, if any. Pure. Only a
+/// proven device, and only when granting could change the answer: a ceiling
+/// refusal cannot be lifted by a grant, so it asks nothing.
+fn serving_off_ask<'a>(code: &crate::refusal::Code, who: Option<&'a str>) -> Option<&'a str> {
+    match code {
+        crate::refusal::Code::ShellOff => who.filter(|w| !w.is_empty()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod serving_off_ask_tests {
+    use super::serving_off_ask;
+    use crate::refusal::Code;
+
+    #[test]
+    fn a_proven_device_refused_while_serving_is_off_becomes_an_ask() {
+        assert_eq!(serving_off_ask(&Code::ShellOff, Some("dcode")), Some("dcode"));
+        // Unproven: nobody to ask on behalf of.
+        assert_eq!(serving_off_ask(&Code::ShellOff, None), None);
+        // A ceiling refusal cannot be granted away, so it is not an ask.
+        assert_eq!(serving_off_ask(&Code::Ceiling, Some("dinv")), None);
+    }
 }
 
 /// Accept one `pty-open` frame: validate, shell-gate, attach or spawn,
