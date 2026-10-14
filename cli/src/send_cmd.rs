@@ -1457,8 +1457,13 @@ pub(crate) async fn send_cmd(
                                         // If direct wins: transfer rides QUIC (130+ MB/s).
                                         // If direct fails: expired_direct → establish → WebRTC fallback
                                         //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
-                                        let promo =
-                                            conn.start_direct_promote(&from, &from, &sec).await;
+                                        // A browser cannot take direct QUIC: promoting
+                                        // it would drop the WebRTC link it is on.
+                                        let promo = if cer.peer_supports_direct() {
+                                            conn.start_direct_promote(&from, &from, &sec).await
+                                        } else {
+                                            crate::conn::Promotion::Retained
+                                        };
                                         // THE AUTHENTICATED PEER IS THE TARGET: it
                                         // takes the slot, which no peer was given
                                         // before this point on the code path. Not
