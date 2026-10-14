@@ -494,6 +494,7 @@ fn rc_after(t: &Term, from: usize, secs: u64) -> Option<i32> {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: a debug establish is too slow for the exit bound; runs in test.yml's cargo test --release")]
 fn receive_by_code_in_a_terminal_exits_right_after_done() {
     let Some(b) = backend() else { return };
     let exe = env!("CARGO_BIN_EXE_tunlion");
@@ -565,6 +566,7 @@ fn receive_by_code_in_a_terminal_exits_right_after_done() {
 /// ends it at once with 130.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: a debug establish is too slow for the exit bound; runs in test.yml's cargo test --release")]
 fn ctrl_c_ends_a_waiting_receive_in_a_terminal_with_130() {
     let Some(b) = backend() else { return };
     let exe = env!("CARGO_BIN_EXE_tunlion");
@@ -587,6 +589,7 @@ fn ctrl_c_ends_a_waiting_receive_in_a_terminal_with_130() {
 /// used to report 130, the SIGINT code, for a SIGTERM).
 #[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: a debug establish is too slow for the exit bound; runs in test.yml's cargo test --release")]
 fn sigterm_ends_a_waiting_receive_in_a_terminal_with_143() {
     let Some(b) = backend() else { return };
     let exe = env!("CARGO_BIN_EXE_tunlion");
