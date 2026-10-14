@@ -1459,16 +1459,19 @@ pub(crate) async fn send_cmd(
                                         //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
                                         let promo =
                                             conn.start_direct_promote(&from, &from, &sec).await;
-                                        // THE AUTHENTICATED PEER IS THE TARGET, and
-                                        // only it: bind the slot to it (a rejoin on a
-                                        // fresh sid keeps it by uid; nobody else can
-                                        // take it), as the receiver does.
+                                        // THE AUTHENTICATED PEER IS THE TARGET: it
+                                        // takes the slot, which no peer was given
+                                        // before this point on the code path. Not
+                                        // `bind_active`: after a hard-killed
+                                        // receiver, a replacement that kept the
+                                        // partial must still be able to take the
+                                        // slot over and resume (gates.sh gate 2).
                                         if let Some(old) = conn.active.clone().filter(|a| a != &from) {
                                             ui::debug(&format!(
                                                 "send: {from} authenticated this code; releasing the slot held by {old}"
                                             ));
                                         }
-                                        conn.bind_active(&from);
+                                        conn.active = Some(from.clone());
                                         // Offers were deferred pending this confirm, and
                                         // the ChannelReady handler ignores a non-active
                                         // pid, so this must follow the claim above.
@@ -3289,8 +3292,9 @@ pub(crate) fn pake_expiry(partner_latched: bool, any_pake_heard: bool) -> PakeEx
 }
 
 /// May an adopted room peer take the transfer slot? On the code path, no peer
-/// is the target until it authenticated (the slot is bound at confirm); after
-/// that the binding admits only the authenticated peer's rejoin. Pure.
+/// is the target until one authenticated (it takes the slot at confirm); after
+/// that the slot behaves as a room send's does (a rejoin, or a replacement
+/// receiver resuming a killed one's partial). Pure.
 pub(crate) fn adopt_wants_active(code_claimed: bool, use_code: bool, pake_done: bool) -> bool {
     code_claimed && (!use_code || pake_done)
 }
@@ -3529,7 +3533,7 @@ mod code_window_tests {
         // Code send: nobody before the ceremony confirms, claimed or not.
         assert!(!adopt_wants_active(true, true, false));
         assert!(!adopt_wants_active(false, true, false));
-        // After it: the (bound) authenticated peer may come back.
+        // After it: a rejoining or replacement receiver may take it over.
         assert!(adopt_wants_active(true, true, true));
     }
 
