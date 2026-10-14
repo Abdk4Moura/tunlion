@@ -105,7 +105,7 @@ sealed delivery**, and (c) **claim-link keys** for non-users.
 
 ### 1.2 Deny-by-default capabilities (the ACL substrate)
 
-- `cli/src/main.rs` — device records in `~/.config/filament/devices.json` carry
+- `cli/src/main.rs` — device records in `~/.config/tunlion/devices.json` carry
   `{name, secret, v:2, caps:[...], addedAt}` (`devices_store_v2()`). First pairing
   grants **only** `["transfer"]` (`pair_v2_caps()`, mirrored in
   `frontend/src/lib/pairing.js` as `PAIR_V2_CAPS`). `device_allows(name, cap)` is
@@ -115,13 +115,13 @@ sealed delivery**, and (c) **claim-link keys** for non-users.
   flag (`runuser -l <user>`, drops the PTY to a non-root account) gate the
   web-shell; enforcement at accept time is `shell_policy.auto_allows(n) ||
   device_allows(n, "shell")`. `cli/src/sshkeys.rs` installs/strips a
-  filament-managed `authorized_keys` block per grant. **This is the enterprise ACL
+  tunlion-managed `authorized_keys` block per grant. **This is the enterprise ACL
   engine already** — §5 puts an admin control plane in front of it.
 
 ### 1.3 Self-host + relay knobs (the perimeter substrate)
 
-- `cli/src/main.rs` — `--server` / `FILAMENT_SERVER` (default
-  `https://api.filament.autumated.com`) points the client at any signaling
+- `cli/src/main.rs` — `--server` / `TUNLION_SERVER` (default
+  `https://api.tunlion.autumated.com`) points the client at any signaling
   endpoint. The server (`backend/app.py`, `backend/signaling.py`) is a **dumb
   pipe**: it tracks room membership and relays opaque signal blobs, *never file
   bytes*. It already has the right shape to extend: `pair_create(code, sid,
@@ -341,7 +341,7 @@ Tunlion's audit events:
 
 ### 5.4 Perimeter control
 
-- **Self-hosted signaling** (`--server`/`FILAMENT_SERVER`, §1.3) +
+- **Self-hosted signaling** (`--server`/`TUNLION_SERVER`, §1.3) +
   **self-hosted store** (§3.2.3) + **self-hosted TURN** (`backend/config.py`),
   so no control, rendezvous, or stored blob leaves the org's network. This is the
   Headscale value proposition — run the official clients against infrastructure you
@@ -402,7 +402,7 @@ casual, no-account, pair-and-go path is provably untouched. Per feature:
 | **Send-to-anyone (claim link)** | Additive. When the recipient isn't a paired peer, the UI offers *"get a link to share."* The sender gets a URL; the recipient opens it in any browser, zero install. | Naive: require the recipient to install tunlion or sign up. Avoided: link mode is browser-only, account-free; the WASM decryptor is already in the frontend. |
 | **SSO enrollment** | An enrolled employee sees *"join via <company>"* once, through their normal company login. Thereafter it is the same pair-and-go tunlion. They never see ACLs, audit config, or store settings. | Naive: surface org policy/ACLs to the end user. Avoided: all governance is in the admin plane; the device just consults policy silently at connect time. |
 | **Enterprise audit / ACL / DLP** | Invisible to the end user unless an admin enabled the inspection escape hatch (§5.6), in which case the *honest UX* tells them — which is a feature, not friction. | Naive: per-send consent dialogs. Avoided: ACLs enforce silently (deny-by-default already does); only the rare content-inspection case surfaces, and it *should*. |
-| **`--no-relay` / self-host** | A personal user never sets these. They are admin/power-user flags with safe defaults (relay allowed for reliability, hosted server default). | Naive: ask every user to choose a server. Avoided: `FILAMENT_SERVER` has a working default; orgs override it via MDM, not the user. |
+| **`--no-relay` / self-host** | A personal user never sets these. They are admin/power-user flags with safe defaults (relay allowed for reliability, hosted server default). | Naive: ask every user to choose a server. Avoided: `TUNLION_SERVER` has a working default; orgs override it via MDM, not the user. |
 
 **Gate statement.** No feature in this doc adds a step, an account, a login, or a
 config to the default P2P flow. Async is one optional tap that appears only when

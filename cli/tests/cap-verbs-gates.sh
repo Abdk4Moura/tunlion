@@ -2,7 +2,7 @@
 # grant / revoke / devices honesty for delegated (ceiling-bounded) devices.
 # Standalone, hermetic, fixture port 8104 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./cap-verbs-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./cap-verbs-gates.sh
 #
 # A delegated device's authority comes from the enrollment ceiling on its fleet
 # certificate, never from the grant store, so `grant`/`revoke` cannot bind for it.
@@ -16,14 +16,16 @@
 #      refusal names `revoke <device> --certificate`.
 #   C  devices shows the ceiling — the row and the --json caps field list the
 #      ceiling, never a shell the verb claimed to grant.
+#   D  an already-covered grant is an idempotent success (exit 0), and A's
+#      refusal is exit 4 (denied), not the catch-all 1.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8104
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-cap-verbs.XXXXXX")"
 
 PASS=0; FAIL=0; FAILED=""
@@ -46,9 +48,9 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat
 [ -x "$BIN" ] || { echo "build first: (cd $CLI_DIR && cargo build --release)"; exit 2; }
 
 DA="$WORK/A"; mkdir -p "$DA"
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" init --name alpha --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1 \
+env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name alpha --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1 \
   || { echo "init failed"; exit 2; }
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 2
 
@@ -56,8 +58,8 @@ sleep 2
 enroll() {  # $1 = device name, $2 = extra add flags (e.g. "--allow shell")
   local name="$1"; shift
   local ddir="$WORK/$name"; mkdir -p "$ddir"
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes >/dev/null 2>&1
-  env FILAMENT_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive >"$WORK/$name-join.log" 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive >"$WORK/$name-join.log" 2>&1
   sleep 2
 }
 
@@ -65,22 +67,24 @@ enroll() {  # $1 = device name, $2 = extra add flags (e.g. "--allow shell")
 # #226: grant a capability outside the ceiling must refuse.
 say A
 enroll foxtrot
-OUTA=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant foxtrot shell 2>&1)
+OUTA=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant foxtrot shell 2>&1)
 rcA=$?
 echo "## (grant shell) rc=$rcA"
 echo "$OUTA" | sed 's/^/    /'
-if [ "$rcA" != "0" ] && echo "$OUTA" | grep -q "outside foxtrot's invitation ceiling" \
+# Exit 4, the documented "denied": the request was decided against, which the
+# catch-all 1 did not say.
+if [ "$rcA" = "4" ] && echo "$OUTA" | grep -q "outside foxtrot's invitation ceiling" \
    && echo "$OUTA" | grep -q "cannot widen"; then
-  ok "gateA: grant outside the ceiling REFUSED (names ceiling + cannot widen)"
+  ok "gateA: grant outside the ceiling REFUSED with exit 4 (names ceiling + cannot widen)"
 else
-  bad "gateA: grant outside the ceiling NOT refused (rc=$rcA)"
+  bad "gateA: grant outside the ceiling NOT refused as denied (rc=$rcA, want 4)"
 fi
 
 # ===================================================================== GATE B ==
 # #228: revoke a capability inside the ceiling must refuse, naming --certificate.
 say B
 enroll golf --allow mount
-OUTB=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke golf mount --yes 2>&1)
+OUTB=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke golf mount --yes 2>&1)
 rcB=$?
 echo "## (revoke mount) rc=$rcB"
 echo "$OUTB" | sed 's/^/    /'
@@ -94,10 +98,13 @@ fi
 # ===================================================================== GATE C ==
 # devices renders the ceiling, never an inert grant.
 say C
-JSON=$(env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices --json 2>/dev/null)
+JSON=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" devices --json 2>/dev/null)
 echo "$JSON" | python3 -c "
 import sys, json
-rows = {d['name']: d['caps'] for d in json.loads(sys.stdin.read())}
+doc = json.loads(sys.stdin.read())
+if doc.get('ok') is not True or doc.get('verb') != 'devices':
+    print('## devices --json is not the ok envelope:', doc); sys.exit(1)
+rows = {d['name']: d['caps'] for d in doc['data']['devices']}
 foxtrot = rows.get('foxtrot', [])
 if 'shell' in foxtrot:
     print('## foxtrot caps include shell (WRONG):', foxtrot); sys.exit(1)
@@ -110,6 +117,21 @@ if [ "$rcC" = "0" ]; then
   ok "gateC: devices --json shows the ceiling (transfer, mount), no inert shell"
 else
   bad "gateC: devices --json does NOT show the enforcement-honoured ceiling"
+fi
+
+# ===================================================================== GATE D ==
+# A grant the ceiling already holds is the state asked for: exit 0, said so,
+# and nothing else changes. It exited 1 ("no grant is needed"), so a script
+# that grants idempotently failed on its second run.
+say D
+OUTD=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant golf mount 2>&1)
+rcD=$?
+echo "## (grant mount, inside golf's ceiling) rc=$rcD"
+echo "$OUTD" | sed 's/^/    /'
+if [ "$rcD" = "0" ] && echo "$OUTD" | grep -q "already granted to 'golf'"; then
+  ok "gateD: a grant the ceiling already holds is an idempotent success (rc 0, says so)"
+else
+  bad "gateD: an already-covered grant did not succeed idempotently (rc=$rcD)"
 fi
 
 # ========================================================================= sum =

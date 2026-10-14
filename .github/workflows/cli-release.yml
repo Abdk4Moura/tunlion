@@ -9,7 +9,9 @@
 # tap, and the winget manifests all consume these exact artifact names:
 #     tunlion-<target>.tar.gz   (unix)   /  tunlion-<target>.zip (windows)
 #     SHA256SUMS
-# Ledger C16 / gap G-e: docs/cli-resilience.md.
+#
+# Nothing is published under a filament-* name. filament is a separate
+# product, and its 0.8.x `update` must never pick up a tunlion build.
 
 name: cli-release
 
@@ -57,8 +59,8 @@ jobs:
         working-directory: cli
         shell: bash
         run: |
-          export FILAMENT_BUILD_SHA="${GITHUB_SHA::7}"
-          export FILAMENT_BUILD_DATE="$(date -u +%Y-%m-%d)"
+          export TUNLION_BUILD_SHA="${GITHUB_SHA::7}"
+          export TUNLION_BUILD_DATE="$(date -u +%Y-%m-%d)"
           # Statically link the MSVC CRT so the Windows binary is self-contained
           # and doesn't need the VC++ Redistributable (no VCRUNTIME140.dll at
           # runtime), mirroring the fully-static musl Linux build.
@@ -74,7 +76,7 @@ jobs:
           # Per-chunk/per-frame profiling logging must stay compile-stripped (behind
           # the `debug-logs` feature) and MUST NOT ship in a default release build.
           # If any marker is present, a dev-debug log leaked - fail the release.
-          if strings "$BIN" | grep -nE 'FILAMENT_TRACE_THROUGHPUT|\[TRACE stream_one|\[TRACE recv|\[TRACE direct|\[TRACE dc'; then
+          if strings "$BIN" | grep -nE 'TUNLION_TRACE_THROUGHPUT|\[TRACE stream_one|\[TRACE recv|\[TRACE direct|\[TRACE dc'; then
             echo "::error::dev-debug profiling logging leaked into the release binary"; exit 1
           fi
           echo "release binary clean of dev-debug profiling logging"
@@ -220,7 +222,7 @@ jobs:
           body_path: release-notes.md
           # A tag with a hyphen (cli-v0.2.1-beta.1) is a PRERELEASE: GitHub
           # hides it from /releases/latest, and the installer + self-update
-          # skip it unless explicitly opted in (FILAMENT_CHANNEL=beta /
+          # skip it unless explicitly opted in (TUNLION_CHANNEL=beta /
           # `tunlion update --beta`).
           prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') }}
           files: |

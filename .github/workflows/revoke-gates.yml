@@ -29,6 +29,19 @@
 # tells you when the far side says no. There was no gate for it at all, which is
 # why #268 had to be found by hand across two machines.
 #
+# Also carries revocation-live-gates: a forget must end access in the daemon
+# that is ALREADY RUNNING (no restart between the forget and the check), and a
+# used invitation must stay used across a forget and an owner restart. Both were
+# found by hand on the launch candidate because every earlier forget gate
+# restarted a daemon in between, which is exactly what hid them.
+#
+# Also carries invite-expiry-gates: an invitation's --expires is the end of the
+# device's access on every path. It holds an exec and a forward stream open
+# across the end, then asserts they are cut and that new exec, forward,
+# forward --stdio and send are refused with exit 4 naming the expiry. Found on
+# a real two-machine run, where renewal and a proof re-drive carried a guest
+# minutes past its invitation and forward ignored the end entirely.
+#
 # Linux only, deliberately. The mount arm needs FUSE, and the point here is to
 # run the guarantee somewhere real rather than to matrix it.
 
@@ -42,11 +55,14 @@ on:
       - 'cli/src/**'
       - 'cli/tests/*revoke-gates.sh'
       - 'cli/tests/ssh-ca-gates.sh'
+      - 'cli/tests/pty-resume-gates.sh'
       - 'cli/tests/exec-gates.sh'
       - 'cli/tests/sync-gates.sh'
       - 'cli/tests/fleet-cert-gates.sh'
       - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/forward-refusal-gates.sh'
+      - 'cli/tests/revocation-live-gates.sh'
+      - 'cli/tests/invite-expiry-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -62,15 +78,31 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   revoke-gates:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: revoke gates (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
       - name: Run sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Fall back to uncached builds if the cache backend is down
+        shell: bash
+        run: |
+          # The Actions cache backend can refuse service ("Egress is over the
+          # account limit"), and with RUSTC_WRAPPER=sccache every compile then
+          # fails. A slower uncached build beats a red job that tested nothing.
+          if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
+            echo "::warning::sccache unavailable; building without it"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -107,7 +139,7 @@ jobs:
       # lines is what makes "green" mean "the gates ran AND passed".
       - name: Run revocation gates
         env:
-          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/tunlion
+          TUNLION_BIN: ${{ github.workspace }}/cli/target/release/tunlion
         run: |
           set -uo pipefail
           # Full paths, not bare names under a working-directory. The registry
@@ -116,19 +148,39 @@ jobs:
           # gates while leaving them indistinguishable from unwired ones. Wiring
           # that a machine cannot see is the thing #249 exists to catch.
           declare -A EXPECT=(
-            [cli/tests/ssh-ca-gates.sh]=6
-            [cli/tests/exec-gates.sh]=13
-            [cli/tests/sync-gates.sh]=17
-            # 23 = 22 gate slots + the RECON (post-restart link re-establishment)
-            # verdict. AUTH-A keeps its slot while it is KNOWN-RED: the count
-            # below includes KNOWN-RED lines, so a tracked failure can never make
-            # the total look short and can never be silently dropped.
+            [cli/tests/ssh-ca-gates.sh]=8
+            # 21: Q1/Q2 (a SIGKILLed serving daemon leaves nothing running) and R
+            # (a forgotten device is refused as unrecognized) joined the 18.
+            [cli/tests/exec-gates.sh]=21
+            [cli/tests/sync-gates.sh]=18
+            # 23 gate slots (FORGET-REFUSED, from #385, is the 23rd). This was 24 while gateRECON existed, but RECON read
+            # AUTH-A's own exec result and printed a second PASS for it, so one
+            # observation counted twice; it was removed and its honest-vs-silent
+            # classification moved into AUTH-A's failure message. A gate that is
+            # KNOWN-RED keeps its slot: the count below includes KNOWN-RED lines,
+            # so a tracked failure can never make the total look short.
             [cli/tests/fleet-cert-gates.sh]=23
             [cli/tests/pty-revoke-gates.sh]=3
+            # R1/R2 (a shell outlives its link, output intact), X1/X2 (a session
+            # name never crosses devices), V1/V2 (revoke ends a DETACHED shell).
+            [cli/tests/pty-resume-gates.sh]=6
             [cli/tests/mount-revoke-gates.sh]=4
-            [cli/tests/l2-revoke-gates.sh]=3
-            [cli/tests/shell-posture-gates.sh]=3
-            [cli/tests/forward-refusal-gates.sh]=5
+            # 4: gate C (the revoked forward exits 4 and says why) joined A, A2, B.
+            [cli/tests/l2-revoke-gates.sh]=4
+            # 4 = gates A/B/C + the setup-grant slot. The grant those gates
+            # depend on was never checked and in fact fails for the vouched
+            # record; the slot reports it (KNOWN-RED today, counted here).
+            [cli/tests/shell-posture-gates.sh]=4
+            [cli/tests/forward-refusal-gates.sh]=6
+            # 15 = 3 enrolment + 8 live-forget (S1: forget applied by the
+            # RUNNING daemon, no restart) + 4 invitation-burn (S2: a used
+            # invitation stays used across forget and restart, new key or same).
+            [cli/tests/revocation-live-gates.sh]=15
+            # 17 = X0 premise + 3 positives (exec, send, forward --stdio) + the
+            # C0 alive-before-the-end control + X1..X8 after the end + X9..X11
+            # (requests, device lists, one remedy: fix/rc-polish) + X12 (exec,
+            # forward and send print one re-invite line: fix/concurrent-code-sends).
+            [cli/tests/invite-expiry-gates.sh]=17
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
@@ -136,10 +188,13 @@ jobs:
                    cli/tests/sync-gates.sh \
                    cli/tests/fleet-cert-gates.sh \
                    cli/tests/pty-revoke-gates.sh \
+                   cli/tests/pty-resume-gates.sh \
                    cli/tests/mount-revoke-gates.sh \
                    cli/tests/l2-revoke-gates.sh \
                    cli/tests/shell-posture-gates.sh \
-                   cli/tests/forward-refusal-gates.sh; do
+                   cli/tests/forward-refusal-gates.sh \
+                   cli/tests/revocation-live-gates.sh \
+                   cli/tests/invite-expiry-gates.sh; do
             echo "::group::$g"
             # Label the tree the gates actually run against: CI checks out
             # GitHub's MERGE ref (pull/N/merge) by default, so "CI ran sha X"
@@ -155,12 +210,20 @@ jobs:
             # failing status while suppressing errexit; `|| true` on the
             # count does the same for grep's exit 1 on zero matches.
             code=0
-            out="$(bash "$g" 2>&1)" || code=$?
+            # A PER-GATE BOUND, the same one gate-suite.yml carries. Without it
+            # one hanging gate consumed the whole job budget and hid every
+            # revocation gate after it in the loop, and the job died at its
+            # timeout naming nothing. The slowest script here (fleet-cert) runs
+            # in about 90s, so 300s is generous and still leaves the later
+            # gates time to run after a hang.
+            out="$(timeout 300 bash "$g" 2>&1)" || code=$?
             echo "$out"
             echo "::endgroup::"
             got=$(printf '%s\n' "$out" | grep -cE '^(PASS|KNOWN-RED):' || true)
             want=${EXPECT[$g]}
-            if [ "$code" -ne 0 ]; then
+            if [ "$code" -eq 124 ]; then
+              echo "::error::$g HUNG: killed by the 300s per-gate timeout, so the output above is partial and every gate after it in this suite still ran"; rc=1
+            elif [ "$code" -ne 0 ]; then
               echo "::error::$g exited $code"; rc=1
             elif [ "$got" -ne "$want" ]; then
               echo "::error::$g passed $got gates but $want were expected; a gate did not run"; rc=1

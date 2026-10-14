@@ -55,6 +55,25 @@ So: **prefer mechanisms with one implementation over abstractions with N.** A
 file, a timer, the existing store. An adapter you do not need cannot have a
 Windows branch somebody forgot.
 
+## Modes of what peers write here
+
+What a peer sends lands with explicit modes, never whatever the umask leaves
+(under umask 0 that used to mean a world-writable inbox):
+
+| What | Unix mode | Where it is set |
+|---|---|---|
+| the inbox (drop dir, `~/Tunlion` by default) | 0700 when tunlion creates it | `platform::create_inbox_dir` |
+| directories under it (received or synced content) | 0755 masked by the umask | `platform::create_content_dirs` |
+| a partial (`.part`) and its sidecars | 0600 | `recv_files::safe_create_part`, `create_new_private` |
+| a finished file | 0644 masked by the umask | `platform::publish_received_file` |
+
+The inbox is owner-only because peers write into it: nobody else on the machine
+should be able to plant, swap or read what arrives. Content inside it keeps the
+ordinary modes a download has, so a file moved out of the inbox behaves like
+any other; the 0700 inbox above it is what keeps it private while it is there.
+An inbox that already exists is left as its owner set it. Windows: the profile's
+inherited ACL is already owner-only, so there is nothing to set.
+
 ## What is legitimately platform-specific
 
 Not every `cfg` is a mistake. `mount_proto.rs` has 47 and most are irreducible:

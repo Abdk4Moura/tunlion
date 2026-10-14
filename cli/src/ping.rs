@@ -13,6 +13,7 @@
 // Color is restrained: one accent (Brand mint = warm), amber only for the relay
 // caveat, green for a good pong, red for unreachable, dim for metadata.
 
+use crate::exit_codes::{self, ExitKind};
 use crate::ui::{self, Tone};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -111,7 +112,17 @@ fn probe_envelope(p: &Probe) -> Value {
     })
 }
 
-pub async fn ping_cmd(server: &str, peer: &str, count: u32, json_out: bool, relay: bool) -> Result<()> {
+/// `reach <device>`. Exit 0 when the peer answered (warm link, or a cold probe
+/// that established), 6 (`ExitKind::Unreachable`) when it did not, 7 when the
+/// tunlion server itself could not be reached. `timeout` bounds the cold probe.
+pub async fn ping_cmd(
+    server: &str,
+    peer: &str,
+    count: u32,
+    json_out: bool,
+    relay: bool,
+    timeout: Option<u64>,
+) -> Result<()> {
     let count = count.max(1);
 
     // Warm path: ask a local `up` daemon about its held link. Synchronous and
@@ -122,7 +133,7 @@ pub async fn ping_cmd(server: &str, peer: &str, count: u32, json_out: bool, rela
     let warm: Option<Value> = None;
 
     if json_out {
-        return ping_json(server, peer, relay, warm).await;
+        return ping_json(server, peer, relay, warm, timeout).await;
     }
 
     ui::say(&format!(
@@ -146,10 +157,14 @@ pub async fn ping_cmd(server: &str, peer: &str, count: u32, json_out: bool, rela
                 print_warm_line(&v);
             }
             print_warm_verdict(peer, &v);
+            Ok(())
         }
-        None => print_cold(server, peer, relay).await,
+        None => match print_cold(server, peer, relay, timeout).await {
+            None => Ok(()),
+            // The lines above already said why; exit with the kind, quietly.
+            Some(kind) => Err(exit_codes::reported(kind)),
+        },
     }
-    Ok(())
 }
 
 /// `reach <device> --until-direct`: print one line per probe and stop as soon as
@@ -181,8 +196,7 @@ pub async fn reach_until_direct(
         ));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_s);
-    let mut saw_link = false;
-    loop {
+    let last = loop {
         let p = match crate::ctl::try_ping(peer).await {
             Some(v) => probe_from_warm(&v),
             None => Probe::NoLink,
@@ -191,27 +205,65 @@ pub async fn reach_until_direct(
         if p.is_direct() {
             return Ok(());
         }
-        saw_link |= matches!(p, Probe::Warm { .. });
         if std::time::Instant::now() >= deadline {
-            break;
+            break p;
         }
         // Ctrl-C ends the watch here, between lines, so no half-written
         // line and no orphaned probe.
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            _ = tokio::signal::ctrl_c() => std::process::exit(130),
+            _ = tokio::signal::ctrl_c() => crate::exit_codes::interrupted_exit(130),
         }
-    }
+    };
+    let kind = until_direct_verdict(&last);
+    // The answer is the exit code whatever happens to the output: decide it
+    // first, so a reader that closed the pipe does not turn it into 0.
+    ui::exit_code_on_closed_pipe(kind.code());
     if !json_out {
-        let verdict = if saw_link {
-            format!("still on relay after {timeout_s}s")
-        } else {
-            format!("no link to {peer} after {timeout_s}s")
+        let verdict = match kind {
+            ExitKind::StillRelayed => format!("still on relay after {timeout_s}s"),
+            _ => format!("no link to {peer} after {timeout_s}s (offline, or not running `tunlion up`)"),
         };
         ui::critical(&format!("  {}", ui::paint(Tone::Warn, &verdict)));
     }
-    std::process::exit(5)
+    Err(exit_codes::reported(kind))
+}
 
+/// How a `--until-direct` watch that timed out ends, from the LAST probe: a
+/// link still up but relayed is exit 5 (the documented meaning); no link at
+/// all means the peer is gone, which is exit 6 like every other unreachable
+/// peer. Both used to be 5, so a script could not tell "keep waiting" from
+/// "it is offline".
+pub(crate) fn until_direct_verdict(last: &Probe) -> ExitKind {
+    match last {
+        Probe::Warm { .. } => ExitKind::StillRelayed,
+        Probe::NoLink => ExitKind::Unreachable,
+    }
+}
+
+/// The exit kind for a probe outcome that did not establish. A probe that
+/// failed in the signaling phase never reached the tunlion server, whatever
+/// its error text says: that is 7, not the peer's 6 (a blackholed --server
+/// said failed_phase "signaling" and exited 6).
+pub(crate) fn probe_outcome_kind(o: &crate::l2::ProbeOutcome) -> ExitKind {
+    cold_kind(o.failed_phase.map(|p| p.label()), o.error.as_deref())
+}
+
+/// [`probe_outcome_kind`] from the outcome's phase label and error. Pure.
+pub(crate) fn cold_kind(phase: Option<&str>, error: Option<&str>) -> ExitKind {
+    if phase == Some("signaling") {
+        return ExitKind::Network;
+    }
+    cold_failure_kind(error)
+}
+
+/// The exit kind for a cold probe that did not establish: the tunlion server
+/// when that is what failed, otherwise the peer.
+pub(crate) fn cold_failure_kind(error: Option<&str>) -> ExitKind {
+    match error.map(exit_codes::classify_text) {
+        Some(ExitKind::Network) => ExitKind::Network,
+        _ => ExitKind::Unreachable,
+    }
 }
 
 /// One probe, for whichever audience asked: the envelope on stdout under
@@ -219,7 +271,7 @@ pub async fn reach_until_direct(
 /// (docs/ui/OUTPUT.md), so it goes through `ui::critical`.
 fn emit_probe(p: &Probe, json_out: bool) {
     if json_out {
-        println!("{}", probe_envelope(p));
+        crate::outln!("{}", probe_envelope(p));
     } else {
         ui::critical(&format!("  {}", ui::paint(probe_tone(p), &probe_line(p))));
     }
@@ -285,27 +337,47 @@ fn print_warm_verdict(peer: &str, v: &Value) {
     let route = v["route"].as_str().unwrap_or("?");
     if is_relay(route) {
         ui::say(&format!("  {}", ui::paint(Tone::Warn, "⚠ on relay, no direct path · still end-to-end encrypted")));
-        ui::say(&format!("  {}", ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} will be instant, over the relay"))));
-    } else {
-        ui::say(&format!("  {}", ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} will be instant (warm direct link)"))));
     }
+    ui::say(&format!("  {}", ui::paint(Tone::Dim, &warm_verdict_line(peer, is_relay(route)))));
+}
+
+/// What a warm link buys, without promising what this device may not do. A
+/// held link makes every verb start at once, but whether `shell`/`exec`/ssh
+/// are ALLOWED is the peer's grant, which this side does not hold: `reach`
+/// used to say "ssh/pty to beta will be instant" to a device beta then
+/// refused. So the shell verbs are named with their condition.
+fn warm_verdict_line(peer: &str, relayed: bool) -> String {
+    let how = if relayed {
+        "over the relay"
+    } else {
+        "warm direct link"
+    };
+    format!(
+        "─ {how}: transfers to {peer} start at once; so do shell, exec and ssh where {peer} has granted this device shell"
+    )
 }
 
 /// No live link held locally: measure what a fresh connect would cost (the honest
 /// number (that IS what ssh/pty would pay), via the same establish-then-drop
 /// probe `tunlion doctor` uses.
-async fn print_cold(server: &str, peer: &str, relay: bool) {
-    match crate::l2::establish_probe(server, peer, relay).await {
+async fn print_cold(server: &str, peer: &str, relay: bool, timeout: Option<u64>) -> Option<ExitKind> {
+    match crate::l2::establish_probe_within(server, peer, relay, timeout).await {
         Ok(o) if o.established => {
             ui::critical(&format!(
                 "  {}   {}",
                 ui::paint(Tone::Warn, "○ cold"),
                 ui::paint(Tone::Dim, &format!("no warm link · would connect in ~{}", fmt_ms(o.total_ms)))
             ));
-            ui::say(&format!(
-                "  {}",
-                ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} would establish a fresh link; run `tunlion up` to keep it warm"))
-            ));
+            // "run `tunlion up`" only when no daemon runs: with one up, the
+            // advice was to start what was already running. A running daemon
+            // just has no link to this peer yet.
+            let advice = if crate::daemon_alive().is_some() {
+                format!("─ ssh/pty to {peer} would establish a fresh link; the running daemon holds no link to it yet")
+            } else {
+                format!("─ ssh/pty to {peer} would establish a fresh link; run `tunlion up` to keep it warm")
+            };
+            ui::say(&format!("  {}", ui::paint(Tone::Dim, &advice)));
+            None
         }
         Ok(o) => {
             let phase = o.failed_phase.map(|p| p.label()).unwrap_or("establishing");
@@ -314,44 +386,172 @@ async fn print_cold(server: &str, peer: &str, relay: bool) {
                 ui::paint(Tone::Err, "✗ unreachable"),
                 ui::paint(Tone::Dim, &format!("gave up at the {phase} phase (~{})", fmt_ms(o.total_ms)))
             ));
-            ui::say(&format!(
-                "  {}",
-                ui::paint(Tone::Dim, &format!("─ {peer} may be offline, or not running `tunlion up` / `--shell`"))
-            ));
+            let kind = probe_outcome_kind(&o);
+            if kind == ExitKind::Network {
+                ui::say(&format!("  {}", ui::paint(Tone::Dim, exit_codes::NETWORK_LINE)));
+            } else {
+                ui::say(&format!(
+                    "  {}",
+                    ui::paint(Tone::Dim, &format!("─ {peer} may be offline, or not running `tunlion up` / `--shell`"))
+                ));
+            }
+            Some(kind)
         }
         Err(e) => {
             ui::critical(&format!(
                 "  {}   {}",
                 ui::paint(Tone::Err, "✗ unreachable"),
-                ui::paint(Tone::Dim, &e.to_string())
+                ui::paint(Tone::Dim, &exit_codes::human_message(&e))
             ));
+            ui::debug(&format!("  cause: {e:#}"));
+            Some(exit_codes::classify(&e))
         }
     }
 }
 
-/// Machine-readable output: the warm facts verbatim, or the cold probe result.
-async fn ping_json(server: &str, peer: &str, relay: bool, warm: Option<Value>) -> Result<()> {
-    let out = if let Some(v) = warm {
-        v
-    } else {
-        match crate::l2::establish_probe(server, peer, relay).await {
-            Ok(o) => json!({
-                "ok": true,
-                "warm": false,
-                "established": o.established,
-                "total_ms": o.total_ms,
-                "failed_phase": o.failed_phase.map(|p| p.label()),
-            }),
-            Err(e) => json!({ "ok": false, "warm": false, "error": e.to_string() }),
-        }
+/// Machine-readable output. ONE shape for both paths, and the same envelope
+/// `--until-direct` emits per probe: `ok`, `verb`, and
+/// `data: {route, direct, rtt_ms, addr}`. The flat fields scripts already read
+/// (`warm`, `route`, `established`, `total_ms`, `failed_phase`, and the warm
+/// daemon's own reply fields) are kept alongside.
+///
+/// `ok` is the ANSWER, not the invocation: true only when the peer was
+/// reached. It used to be true for an offline peer (`established: false,
+/// ok: true`, exit 0), which is the opposite of what a script asked.
+async fn ping_json(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    warm: Option<Value>,
+    timeout: Option<u64>,
+) -> Result<()> {
+    let (out, kind) = match warm {
+        Some(v) => (reach_json_warm(v), None),
+        None => match crate::l2::establish_probe_within(server, peer, relay, timeout).await {
+            Ok(o) => {
+                let kind = (!o.established).then(|| probe_outcome_kind(&o));
+                (
+                    reach_json_cold(
+                        o.established,
+                        o.total_ms,
+                        o.failed_phase.map(|p| p.label()),
+                        o.error.as_deref(),
+                        kind,
+                        o.path.as_ref().map(|p| p.to_json()).as_ref(),
+                    ),
+                    kind,
+                )
+            }
+            Err(e) => {
+                let kind = exit_codes::classify(&e);
+                let message = exit_codes::human_message(&e);
+                (reach_json_cold(false, 0, None, Some(&message), Some(kind), None), Some(kind))
+            }
+        },
     };
-    println!("{}", serde_json::to_string(&out)?);
-    Ok(())
+    ui::json_out(&out);
+    match kind {
+        None => Ok(()),
+        Some(k) => Err(exit_codes::reported(k)),
+    }
+}
+
+/// A warm daemon reply, wrapped in the reach envelope. Pure.
+pub(crate) fn reach_json_warm(mut v: Value) -> Value {
+    let env = probe_envelope(&probe_from_warm(&v));
+    v["ok"] = json!(true);
+    v["verb"] = json!("reach");
+    v["warm"] = json!(true);
+    v["data"] = env["data"].clone();
+    v
+}
+
+/// A cold probe's result in the reach envelope. Pure.
+///
+/// No warm link means the probe established a fresh link and dropped it (the
+/// human line: "cold, would connect in ~N ms"). The JSON says the same thing:
+/// `warm: false`, `link: "cold"`, `connect_ms` the measured establish time, and
+/// `data` filled from the path the probe link actually took. It used to carry
+/// `data: {route: null, direct: false, addr: null}` next to `established:
+/// true`, which read as "connected, but over nothing, and not directly".
+/// `rtt_ms` stays null: a cold probe measures an establish, not a round trip,
+/// and inventing one from the establish time would be a different number under
+/// the same name. `path` is `PathInfo::to_json` of the probe's link.
+pub(crate) fn reach_json_cold(
+    established: bool,
+    total_ms: u64,
+    failed_phase: Option<&str>,
+    error: Option<&str>,
+    kind: Option<ExitKind>,
+    path: Option<&Value>,
+) -> Value {
+    let data = match path.filter(|_| established) {
+        Some(p) => {
+            let relayed = p["relay"].as_bool().unwrap_or(false);
+            let route = if relayed {
+                "relay".to_string()
+            } else {
+                p["class"]
+                    .as_str()
+                    .map(|c| format!("direct ({})", short_class(c)))
+                    .unwrap_or_else(|| "direct".to_string())
+            };
+            json!({
+                "route": route,
+                "direct": !relayed,
+                "rtt_ms": Value::Null,
+                "addr": p["remote"].clone(),
+                "connect_ms": total_ms,
+            })
+        }
+        None => json!({
+            "route": Value::Null,
+            "direct": false,
+            "rtt_ms": Value::Null,
+            "addr": Value::Null,
+            "connect_ms": if established { json!(total_ms) } else { Value::Null },
+        }),
+    };
+    let mut v = json!({
+        "ok": established,
+        "verb": "reach",
+        "warm": false,
+        "link": if established { "cold" } else { "none" },
+        "established": established,
+        "connect_ms": if established { json!(total_ms) } else { Value::Null },
+        "total_ms": total_ms,
+        "failed_phase": failed_phase,
+        "data": data,
+    });
+    if established {
+        v["path"] = path.cloned().unwrap_or(Value::Null);
+    }
+    if let Some(k) = kind.filter(|_| !established) {
+        let message = if k == ExitKind::Network {
+            exit_codes::NETWORK_LINE.to_string()
+        } else {
+            error.unwrap_or("the peer did not answer").to_string()
+        };
+        v["error"] = json!({ "code": k.token(), "exit": k.code(), "message": message });
+    }
+    v
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E3: `reach` told a device with no shell grant on beta that "ssh/pty to
+    /// beta will be instant". It cannot know the grant, so it says the
+    /// condition instead of the promise.
+    #[test]
+    fn warm_verdict_never_promises_a_shell_it_was_not_granted() {
+        for relayed in [false, true] {
+            let line = warm_verdict_line("beta", relayed);
+            assert!(!line.contains("will be instant"), "{line}");
+            assert!(line.contains("where beta has granted this device shell"), "{line}");
+        }
+    }
 
     fn warm(relayed: bool, route: &str, addr: Option<&str>, rtt: Option<u64>) -> Probe {
         Probe::Warm { relayed, route: route.into(), addr: addr.map(str::to_string), rtt_ms: rtt }
@@ -373,6 +573,57 @@ mod tests {
         // own ICE state, and it is what decides the word "relay".
         assert_eq!(probe_line(&warm(true, "direct over eth0", None, None)), "pong via relay");
         assert_eq!(probe_line(&Probe::NoLink), "no warm link to this peer");
+    }
+
+    #[test]
+    fn until_direct_tells_offline_from_still_relayed() {
+        assert_eq!(until_direct_verdict(&warm(true, "relay", None, Some(40))), ExitKind::StillRelayed);
+        assert_eq!(until_direct_verdict(&Probe::NoLink), ExitKind::Unreachable);
+        assert_eq!(ExitKind::StillRelayed.code(), 5, "the documented --until-direct code");
+        assert_ne!(ExitKind::Unreachable.code(), 5, "offline must not look like 'still relayed'");
+    }
+
+    #[test]
+    fn an_offline_peer_is_not_ok_in_reach_json() {
+        let kind = cold_failure_kind(Some("presence: peer never appeared"));
+        assert_eq!(kind, ExitKind::Unreachable);
+        let v = reach_json_cold(false, 30_000, Some("presence"), Some("peer never appeared"), Some(kind), None);
+        assert_eq!(v["ok"], json!(false), "offline is not ok");
+        assert_eq!(v["established"], json!(false));
+        assert_eq!(v["failed_phase"], json!("presence"));
+        assert_eq!(v["verb"], json!("reach"));
+        assert_eq!(v["data"]["direct"], json!(false));
+        assert_eq!(v["error"]["exit"], json!(6));
+        let up = reach_json_cold(true, 900, None, None, None, None);
+        assert_eq!(up["ok"], json!(true));
+        assert!(up.get("error").is_none());
+    }
+
+    #[test]
+    fn a_dead_server_is_a_network_failure_not_an_offline_peer() {
+        let raw = "signaling connect to https://x: failed to lookup address information: Try again";
+        assert_eq!(cold_failure_kind(Some(raw)), ExitKind::Network);
+        assert_eq!(cold_kind(Some("signaling"), Some("timed out")), ExitKind::Network);
+        assert_eq!(cold_kind(Some("presence"), Some("timed out")), ExitKind::Unreachable);
+        let v = reach_json_cold(false, 0, None, Some(raw), Some(ExitKind::Network), None);
+        assert_eq!(v["error"]["message"], json!(exit_codes::NETWORK_LINE));
+    }
+
+    #[test]
+    fn warm_and_cold_json_share_the_envelope() {
+        let w = reach_json_warm(json!({
+            "ok": true, "warm": true, "route": "direct-quic", "rtt_ms": 9,
+            "path": { "remote": "203.0.113.7:41641", "relay": false },
+        }));
+        let c = reach_json_cold(true, 900, None, None, None, None);
+        for v in [&w, &c] {
+            assert_eq!(v["verb"], json!("reach"));
+            assert!(v["ok"].is_boolean());
+            assert!(v["data"].get("direct").is_some());
+            assert!(v.get("warm").is_some(), "the flat field scripts read is kept");
+        }
+        assert_eq!(w["route"], json!("direct-quic"), "warm keeps the daemon's flat route");
+        assert_eq!(w["data"]["direct"], json!(true));
     }
 
     #[test]
@@ -404,5 +655,38 @@ mod tests {
         assert!(!p.is_direct());
         assert_eq!(probe_line(&p), "pong via relay(198.51.100.4:3478) 41 ms");
         assert_eq!(probe_envelope(&p)["data"]["direct"], json!(false));
+    }
+
+    /// J2: with no daemon the cold probe established in ~858 ms and the JSON
+    /// said `established: true` with `data` all null and `direct: false`,
+    /// while the human line said "cold, would connect in ~858ms". The JSON
+    /// must say what the human line says: a cold link, its connect time, and
+    /// the path the probe actually took.
+    #[test]
+    fn a_cold_probe_reports_the_path_it_took_and_its_connect_time() {
+        let path = json!({ "class": "private (RFC1918)", "remote": "192.168.1.9:41641", "relay": false });
+        let v = reach_json_cold(true, 858, None, None, None, Some(&path));
+        assert_eq!(v["ok"], json!(true), "it connected: ok, exit 0");
+        assert_eq!(v["warm"], json!(false));
+        assert_eq!(v["link"], json!("cold"));
+        assert_eq!(v["connect_ms"], json!(858));
+        assert_eq!(v["data"]["connect_ms"], json!(858));
+        assert_eq!(v["data"]["direct"], json!(true));
+        assert_eq!(v["data"]["route"], json!("direct (private)"));
+        assert_eq!(v["data"]["addr"], json!("192.168.1.9:41641"));
+        assert_eq!(v["data"]["rtt_ms"], Value::Null, "an establish time is not an RTT");
+        let relayed = json!({ "remote": "198.51.100.4:3478", "relay": true });
+        let r = reach_json_cold(true, 1200, None, None, None, Some(&relayed));
+        assert_eq!(r["data"]["direct"], json!(false));
+        assert_eq!(r["data"]["route"], json!("relay"));
+        // A failed probe has no link and no connect time.
+        let f = reach_json_cold(false, 30_000, Some("presence"), None, Some(ExitKind::Unreachable), Some(&path));
+        assert_eq!(f["link"], json!("none"));
+        assert_eq!(f["connect_ms"], Value::Null);
+        assert_eq!(f["data"]["addr"], Value::Null, "a path from a failed probe is not reported");
+        // ok is exactly "exit code is 0".
+        for x in [&v, &r, &f] {
+            assert_eq!(x["ok"].as_bool().unwrap(), x.get("error").is_none());
+        }
     }
 }

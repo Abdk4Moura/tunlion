@@ -6,7 +6,7 @@
 - `pair --word` split fix (keeps both words; one shared `split_chosen_code` used by
   CLI and browser).
 - Interactive, color-coded CLI code entry for `pair`/`recv`/`send` (no flags),
-  script-safe gate (`--no-interactive` / `FILAMENT_NONINTERACTIVE` / non-TTY).
+  script-safe gate (`--no-interactive` / `TUNLION_NONINTERACTIVE` / non-TTY).
 - CLI guided-entry redraw fixed: single in-place line, consistent on every shell
   (was walking down one line per keystroke on your shell).
 - Frontend hardening: a stale/old server now shows a clear message instead of the

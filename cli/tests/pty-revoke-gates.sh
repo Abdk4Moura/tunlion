@@ -3,7 +3,7 @@
 # shell, and the denial must reach the initiator as a nonzero exit with a reason,
 # never as a clean exit or a hang. Standalone, hermetic, fixture port 8113 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./pty-revoke-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./pty-revoke-gates.sh
 #
 # The discriminator is a streaming counter, not a single post-revoke command: a
 # fresh TICK-N proves continuous data-plane liveness (not a buffer replay).
@@ -11,14 +11,16 @@
 # Gates:
 #   A  the live shell streams before the revoke          (positive control)
 #   A2 a healthy shell survives its own recheck           (no-revoke control)
-#   B  after the revoke the shell exits nonzero with "access revoked" on stderr
+#   B  after the revoke the shell exits nonzero with "device revoked" on stderr (the
+#      wording the gate refuses a revoked device with at open; it read
+#      "access revoked" here, two words for one cause)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8113
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-pty-revoke.XXXXXX")"
 DA="$WORK/A"
 GRACE=12   # > REVOKE_RECHECK, with slack for a slow box
@@ -32,7 +34,7 @@ start_acceptor "$DA"
 enroll_delegate bravo --allow shell
 
 shell_tick() {
-  env FILAMENT_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" shell alpha -- \
+  env TUNLION_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" shell alpha -- \
     'for i in $(seq 1 60); do echo TICK-$i; sleep 1; done'
 }
 
@@ -67,19 +69,34 @@ fi
 # reason reaches the initiator's stderr. Exit 0 is the #223 false success; a
 # still-running process is a wedge (the terminal stopped but cannot be reaped).
 say B
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+revoke_rc=$?
+echo "## revoke exit code: $revoke_rc"
 sleep "$GRACE"
+# Bound the wait BEFORE taking it. A bare `wait` on a wedged shell blocks until
+# the shell's own 60s loop ends (or forever, if the session is truly stuck), so
+# the wedge branch below was unreachable: the gate either hung or, once the loop
+# ran out, saw an exit it had not earned within GRACE. Liveness is judged at
+# exactly GRACE seconds, and a still-running shell is killed so `wait` returns.
+wedged=0
+if kill -0 "$SHELL_PID" 2>/dev/null; then
+  wedged=1
+  kill "$SHELL_PID" 2>/dev/null
+fi
 wait "$SHELL_PID" 2>/dev/null; rc=$?
-echo "## shell exit code after revoke: $rc"
+echo "## shell exit code after revoke: $rc (wedged at ${GRACE}s: $wedged)"
 echo "## tail: $(tail -4 "$WORK/pty.out" | tr '\n' ' ')"
-if [ "$rc" = "0" ]; then
+if [ "$revoke_rc" != "0" ]; then
+  bad "gateB: the revoke itself failed (rc $revoke_rc), so nothing below measures revocation"
+  sed 's/^/   revoke| /' "$WORK/revoke.out" | tail -5
+elif [ "$wedged" = "1" ]; then
+  bad "gateB: shell did NOT exit (wedged) within ${GRACE}s of the revoke"
+elif [ "$rc" = "0" ]; then
   bad "gateB: the revoked shell exited 0 (false success)"
-elif grep -q "access revoked" "$WORK/pty.err"; then
-  ok "gateB: revoked shell exited nonzero with 'access revoked' on stderr"
-elif ! kill -0 "$SHELL_PID" 2>/dev/null; then
-  bad "gateB: shell exited nonzero but no reason reached the initiator"
+elif grep -q "device revoked" "$WORK/pty.err"; then
+  ok "gateB: revoked shell exited nonzero with 'device revoked' on stderr within ${GRACE}s"
 else
-  bad "gateB: shell did NOT exit (wedged) within ${GRACE}s"
+  bad "gateB: shell exited nonzero but no reason reached the initiator"
 fi
 
 echo

@@ -40,15 +40,15 @@ done
 echo
 echo "=== ONE-SHOT CLI (peak RSS)"
 for c in "--version" "devices" ""; do
-  r=$(FILAMENT_CONFIG_DIR="$CFG" /usr/bin/time -f '%M' "$BIN" $c 2>&1 >/dev/null | tail -1)
+  r=$(TUNLION_CONFIG_DIR="$CFG" /usr/bin/time -f '%M' "$BIN" $c 2>&1 >/dev/null | tail -1)
   printf '  %-20s %s KB\n' "tunlion ${c:-<bare>}" "$r"
 done
 printf '  %-20s %s KB\n' "/bin/true (floor)" "$(/usr/bin/time -f '%M' /bin/true 2>&1 >/dev/null | tail -1)"
 
 echo
 echo "=== DAEMON AT IDLE  (the number that decides if this fits on a small box)"
-FILAMENT_CONFIG_DIR="$CFG" "$BIN" init --yes --name footprint --recovery-file "$CFG/rec" >/dev/null 2>&1
-FILAMENT_CONFIG_DIR="$CFG" setsid nohup "$BIN" up >"$CFG/up.log" 2>&1 &
+TUNLION_CONFIG_DIR="$CFG" "$BIN" init --yes --name footprint --recovery-file "$CFG/rec" >/dev/null 2>&1
+TUNLION_CONFIG_DIR="$CFG" setsid nohup "$BIN" up >"$CFG/up.log" 2>&1 &
 sleep 25
 P=""
 for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do

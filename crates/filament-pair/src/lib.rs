@@ -40,6 +40,7 @@ pub fn os_rng() -> impl RngCore + CryptoRng {
 
 /// Domain-separation prefix for the SPAKE2 identity. BOTH peers bind to the
 /// nameplate so a code is domain-separated (spec §3.1).
+// PROTOCOL LITERAL: frozen, do not rename (this and the two below).
 const IDENTITY_PREFIX: &[u8] = b"filament-pair-pake-v1:";
 /// HKDF info that turns K into the pinned device secret (spec §5.1).
 const SECRET_INFO: &[u8] = b"filament-pair-pake-v1:pinned-secret";
@@ -87,6 +88,13 @@ pub fn start_with_rng<R: RngCore + CryptoRng>(
 pub fn finish(state: Spake2<Ed25519Group>, peer_msg: &[u8]) -> Option<Vec<u8>> {
     state.finish(peer_msg).ok()
 }
+
+/// Introduction scope the browser binds into its confirmation MAC (the wasm
+/// bindings pass it on every call). Every code flow the browser takes part in,
+/// receive by code and pair by code, is Device-scoped on the CLI side
+/// (`IntroScope::Device`, 0x01), and the MAC verifies only when both ends bind
+/// the same byte. A CLI test pins the two together.
+pub const BROWSER_SCOPE: u8 = 0x01;
 
 /// §4 key-confirmation MAC. Folds the SORTED DTLS fingerprints (so a DTLS-layer
 /// MITM is detected, §5.2) AND the agreed capability set (so a server that
@@ -340,14 +348,14 @@ mod wasm {
         /// symmetric role derivation so the browser can't get it wrong.
         #[wasm_bindgen(js_name = ourConfirm)]
         pub fn our_confirm_js(&self, my_fp: &str, their_fp: &str, caps: &str) -> Option<Vec<u8>> {
-            self.k.as_ref().map(|k| super::our_confirm(k, my_fp, their_fp, caps))
+            self.k.as_ref().map(|k| super::our_confirm(k, my_fp, their_fp, caps, BROWSER_SCOPE))
         }
 
         /// Verify the peer's confirmation MAC under our K. true == confirmed.
         #[wasm_bindgen(js_name = verifyPeerConfirm)]
         pub fn verify_peer_confirm_js(&self, my_fp: &str, their_fp: &str, caps: &str, received: &[u8]) -> bool {
             match self.k.as_ref() {
-                Some(k) => super::verify_peer_confirm(k, my_fp, their_fp, caps, received),
+                Some(k) => super::verify_peer_confirm(k, my_fp, their_fp, caps, BROWSER_SCOPE, received),
                 None => false,
             }
         }
@@ -614,5 +622,31 @@ mod tests {
         );
         assert_eq!(canonical_caps(&[]), "");
         assert_eq!(canonical_caps(&["transfer".into(), "transfer".into()]), "transfer");
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+    /// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+    ///
+    /// Each digest was computed from the ORIGINAL (pre-rename) literal with
+    /// `printf '%s' '<literal>' | sha256sum` (a trailing `\0` is part of the
+    /// bytes). A digest cannot be satisfied by a find-and-replace: if a rename
+    /// touches one of these literals this test fails, and the literal is what
+    /// must be put back.
+    #[test]
+    fn pake_domains_are_frozen() {
+        use sha2_pake::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("IDENTITY_PREFIX", super::IDENTITY_PREFIX,
+             "ab5c7de260f7f33548fbd03ff9bbfe0ae467a610b4eb6786eefaa467750b4dba"),
+            ("SECRET_INFO", super::SECRET_INFO,
+             "f7d0f437a6bff77a7af64c8afa44e39fcb3bdf3c215d7a253255adf408e3e0f4"),
+            ("CONFIRM_LABEL", super::CONFIRM_LABEL,
+             "a9740f19c0c906245e0c79b0fba39f660eaa980ddde5ad33a0bda6a86b96e869"),
+        ] {
+            let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
+        }
     }
 }

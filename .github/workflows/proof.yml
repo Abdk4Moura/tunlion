@@ -50,6 +50,8 @@ jobs:
         run: python3 proofs/fleet_automesh_model.py
       - name: Model-check stall ladder (calibration and recovery boundary)
         run: python3 proofs/stall_ladder_model.py
+      - name: Link manager model (placement + upgrade verify)
+        run: python3 proofs/link_manager_model.py
       - name: Model-check capability ledger (CONTRACT.md laws L1-L13)
         run: python3 proofs/capability_ledger_model.py
       - name: Capability-ledger model catches a broken law (mutation self-test)

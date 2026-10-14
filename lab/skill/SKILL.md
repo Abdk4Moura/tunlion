@@ -32,7 +32,7 @@ Full reference: `/root/stunning-tribble/lab/README.md`. Resources:
   networking, the running `tunlion up` daemon, the installed
   `~/.local/bin/tunlion`, `~/.config/tunlion`, the live site, or the live T4.
 - The `tunlion` link uses the **locally-built** `cli/target/release/tunlion`
-  and **isolated** `FILAMENT_CONFIG_DIR` identities only.
+  and **isolated** `TUNLION_CONFIG_DIR` identities only.
 - Always `lab down` (or `lab down --all`) when finished — teardown is leak-free
   and idempotent.
 

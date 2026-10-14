@@ -17,6 +17,7 @@
 // It is purely additive: it changes no wire framing or control messages.
 
 use crate::diag::{self, Phase};
+use crate::exit_codes::{self, ExitKind};
 use crate::ui::{self, Tone};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -37,9 +38,10 @@ pub async fn doctor_cmd(
     repeat: Option<u32>,
     json_out: bool,
     relay: bool,
+    timeout: Option<u64>,
 ) -> Result<()> {
     match device {
-        Some(dev) => probe_mode(server, &dev, watch, repeat, json_out, relay).await,
+        Some(dev) => probe_mode(server, &dev, watch, repeat, json_out, relay, timeout).await,
         None => preflight_mode(server, json_out).await,
     }
 }
@@ -53,19 +55,26 @@ async fn probe_mode(
     repeat: Option<u32>,
     json_out: bool,
     relay: bool,
+    timeout: Option<u64>,
 ) -> Result<()> {
     // Resolve the run count: --repeat wins; else --watch => WATCH_DEFAULT_REPEAT;
     // else a single probe.
     let runs = repeat.filter(|n| *n > 0).unwrap_or(if watch { WATCH_DEFAULT_REPEAT } else { 1 });
 
     if runs == 1 {
-        let outcome = crate::l2::establish_probe(server, device, relay).await?;
+        // Say what is happening before the wait: a probe to an offline or reset
+        // device sat silent for its whole 30 s bound, then printed FAILED.
+        if !json_out {
+            ui::say(&probe_progress_line(device, crate::l2::doctor_probe_secs(timeout)));
+        }
+        let outcome = crate::l2::establish_probe_within(server, device, relay, timeout).await?;
         if json_out {
-            println!("{}", single_json(device, &outcome).to_string());
+            ui::json_out(&single_json(device, &outcome));
         } else {
             print_ladder(device, &outcome);
+            print_reset_hint(device, &outcome);
         }
-        return Ok(());
+        return probe_result(std::slice::from_ref(&outcome));
     }
 
     // Repeat: collect outcomes, then print (or emit) a distribution summary.
@@ -74,7 +83,7 @@ async fn probe_mode(
         if !json_out {
             ui::say(&format!("tunlion doctor: probe {}/{} to '{device}'...", i + 1, runs));
         }
-        let outcome = crate::l2::establish_probe(server, device, relay).await?;
+        let outcome = crate::l2::establish_probe_within(server, device, relay, timeout).await?;
         if !json_out {
             // A compact per-run line so the user sees progress, with its verdict.
             let v = verdict(&outcome);
@@ -89,11 +98,63 @@ async fn probe_mode(
     }
 
     if json_out {
-        println!("{}", repeat_json(device, &outcomes).to_string());
+        ui::json_out(&repeat_json(device, &outcomes));
     } else {
         print_distribution(device, &outcomes);
+        if let Some(failed) = outcomes.iter().find(|o| !o.established) {
+            print_reset_hint(device, failed);
+        }
     }
-    Ok(())
+    probe_result(&outcomes)
+}
+
+/// The line doctor prints before a probe: who, and the longest it will wait.
+fn probe_progress_line(device: &str, secs: u64) -> String {
+    format!(
+        "tunlion doctor: probing '{device}' (signaling, presence, establishing; gives up after {secs}s)..."
+    )
+}
+
+/// A probe that never saw the device on the server gets the same reset hint
+/// `send` gives: a device that was reset runs `up` under a NEW key the old
+/// record can never find, so "presence FAILED" alone sent people to check a
+/// machine that was running fine.
+fn print_reset_hint(device: &str, o: &crate::l2::ProbeOutcome) {
+    let names: Vec<String> = crate::devices_store::devices_load()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    if let Some(hint) = reset_hint_for(device, o, &names) {
+        ui::say(&format!("  {hint}"));
+    }
+}
+
+/// Pure half of `print_reset_hint`: the hint when the probe died before the
+/// device appeared (signaling up, presence never satisfied), else None.
+fn reset_hint_for(device: &str, o: &crate::l2::ProbeOutcome, names: &[String]) -> Option<String> {
+    if o.established || o.failed_phase != Some(Phase::Presence) {
+        return None;
+    }
+    let successor = crate::reset_hints::successor_of(device, names.iter().map(String::as_str));
+    Some(crate::reset_hints::offline_hint(device, successor.as_deref()))
+}
+
+/// The process result for a set of probes. `doctor <device>` used to exit 0
+/// whatever it found, so `doctor laptop && deploy` deployed to an offline
+/// laptop. Every probe must establish: one that did not is exit 6 (the peer),
+/// or 7 when what failed was reaching the tunlion server. The report was
+/// already printed, so the error carries only the code.
+fn probe_result(outcomes: &[crate::l2::ProbeOutcome]) -> Result<()> {
+    match probe_failure_kind(outcomes) {
+        None => Ok(()),
+        Some(kind) => Err(exit_codes::reported(kind)),
+    }
+}
+
+/// Pure half of `probe_result`: `None` when every probe established.
+fn probe_failure_kind(outcomes: &[crate::l2::ProbeOutcome]) -> Option<ExitKind> {
+    let failed = outcomes.iter().find(|o| !o.established)?;
+    Some(crate::ping::probe_outcome_kind(failed))
 }
 
 /// A computed verdict for one probe: the headline phase + a human line.
@@ -145,9 +206,9 @@ fn verdict(o: &crate::l2::ProbeOutcome) -> Verdict {
 /// Render one probe's phase ladder + verdict to stdout (the house style: an
 /// aligned, colored listing like `tunlion devices`).
 fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
-    println!();
-    println!("{}", ui::paint(Tone::Bold, &format!("tunlion doctor: probe to '{device}'")));
-    println!();
+    crate::outln!();
+    crate::outln!("{}", ui::paint(Tone::Bold, &format!("tunlion doctor: probe to '{device}'")));
+    crate::outln!();
     // Column widths: phase label (longest is "establishing" = 12) + time.
     for t in &o.timings {
         let status = if t.over_budget {
@@ -155,7 +216,7 @@ fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
         } else {
             ui::paint(Tone::Ok, "ok")
         };
-        println!("  {:<13} {:>6}  {}", t.phase.label(), fmt_ms(t.dur_ms), status);
+        crate::outln!("  {:<13} {:>6}  {}", t.phase.label(), fmt_ms(t.dur_ms), status);
     }
     // If it never established, show the phase it died in as a failed rung.
     if !o.established {
@@ -163,20 +224,20 @@ fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
             // Only add a rung if it isn't already the last recorded phase.
             let already = o.timings.last().map(|t| t.phase == p).unwrap_or(false);
             if !already {
-                println!("  {:<13} {:>6}  {}", p.label(), "-", ui::paint(Tone::Err, "FAILED"));
+                crate::outln!("  {:<13} {:>6}  {}", p.label(), "-", ui::paint(Tone::Err, "FAILED"));
             }
         }
     }
     // The path the link actually took: same fine detail as `tunlion ping` so the
     // diagnosis names the interface + endpoints, not just the timings.
     if let Some(p) = &o.path {
-        println!("  {:<13} {:>6}  {}", "path", "", fmt_path(p));
+        crate::outln!("  {:<13} {:>6}  {}", "path", "", fmt_path(p));
     }
-    println!();
+    crate::outln!();
     let v = verdict(o);
     let tone = if v.healthy { Tone::Ok } else { Tone::Err };
-    println!("  {} {}", ui::paint(Tone::Bold, "verdict:"), ui::paint(tone, &v.line));
-    println!();
+    crate::outln!("  {} {}", ui::paint(Tone::Bold, "verdict:"), ui::paint(tone, &v.line));
+    crate::outln!();
 }
 
 /// Render a `PathInfo` to one elegant line: interface · class, the endpoints
@@ -219,23 +280,23 @@ fn fmt_path(p: &crate::net::PathInfo) -> String {
 /// rate per phase, and the overall established rate.
 fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
     let n = outcomes.len();
-    println!();
-    println!(
+    crate::outln!();
+    crate::outln!(
         "{}",
         ui::paint(Tone::Bold, &format!("tunlion doctor: {n} probes to '{device}'"))
     );
-    println!();
+    crate::outln!();
 
     let established = outcomes.iter().filter(|o| o.established).count();
     let est_tone = if established == n { Tone::Ok } else { Tone::Warn };
-    println!(
+    crate::outln!(
         "  established: {}",
         ui::paint(est_tone, &format!("{established} of {n}"))
     );
-    println!();
+    crate::outln!();
 
     // Per-phase distribution across all probes that recorded that phase.
-    println!("  {:<13} {:>7} {:>7} {:>7}   {}", "phase", "min", "median", "max", "over budget");
+    crate::outln!("  {:<13} {:>7} {:>7} {:>7}   {}", "phase", "min", "median", "max", "over budget");
     for phase in PHASES {
         let mut durs: Vec<u64> = outcomes
             .iter()
@@ -255,7 +316,7 @@ fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
         let seen = durs.len();
         let over_str = format!("{over} of {seen} over budget");
         let over_tone = if over == 0 { Tone::Ok } else { Tone::Warn };
-        println!(
+        crate::outln!(
             "  {:<13} {:>7} {:>7} {:>7}   {}",
             phase.label(),
             fmt_ms(durs[0]),
@@ -264,7 +325,7 @@ fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
             ui::paint(over_tone, &over_str),
         );
     }
-    println!();
+    crate::outln!();
 
     // The headline: how often did it stall ANYWHERE (over budget or failed)?
     let unhealthy = outcomes.iter().filter(|o| !verdict(o).healthy).count();
@@ -276,8 +337,8 @@ fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
             &format!("{unhealthy} of {n} probes stalled or failed (the intermittent case)"),
         )
     };
-    println!("  {} {line}", ui::paint(Tone::Bold, "verdict:"));
-    println!();
+    crate::outln!("  {} {line}", ui::paint(Tone::Bold, "verdict:"));
+    crate::outln!();
 }
 
 /// The phases in ladder order (for the distribution table). Up is the steady
@@ -293,13 +354,18 @@ const PHASES: &[Phase] = &[
 fn single_json(device: &str, o: &crate::l2::ProbeOutcome) -> Value {
     let v = verdict(o);
     json!({
-        "kind": "filament-doctor-probe",
+        // `ok` is the answer: the peer was reached. Exit code agrees (6 if not).
+        "ok": o.established,
+        "kind": "tunlion-doctor-probe",
         "device": device,
         "established": o.established,
         "total_ms": o.total_ms,
         "phases": o.timings.iter().map(timing_json).collect::<Vec<_>>(),
         "failed_phase": o.failed_phase.map(|p| p.label()),
-        "error": o.error,
+        // The shared failure object (null when the probe established).
+        "error": (!o.established).then(|| {
+            verb_error(crate::ping::probe_outcome_kind(o), o.error.as_deref())
+        }),
         "path": o.path.as_ref().map(|p| p.to_json()),
         "verdict": {
             "healthy": v.healthy,
@@ -339,8 +405,14 @@ fn repeat_json(device: &str, outcomes: &[crate::l2::ProbeOutcome]) -> Value {
         }));
     }
     let unhealthy = outcomes.iter().filter(|o| !verdict(o).healthy).count();
+    let error = outcomes.iter().find(|o| !o.established).map(|o| {
+        verb_error(crate::ping::probe_outcome_kind(o), o.error.as_deref())
+    });
     json!({
-        "kind": "filament-doctor-repeat",
+        // Every run established, the same rule the exit code applies.
+        "ok": established == n,
+        "error": error,
+        "kind": "tunlion-doctor-repeat",
         "device": device,
         "runs": n,
         "established": established,
@@ -371,25 +443,31 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     let history = diag::summarize(HISTORY_LIMIT);
     // Local file read (fast, no IO worth joining): sshd CA trust presence.
     let sshca = crate::sshd::check_sshd_ca();
+    // The RUNNING daemon, not just a fresh connection from here: a daemon stuck
+    // re-dialing the server passed every check above while no peer could reach
+    // it. See daemon_health.
+    let daemon = crate::daemon_health::inspect().await;
 
     if json_out {
-        println!("{}", preflight_json(server, &sig, &ice, &ifaces, &history, &sshca).to_string());
-        return Ok(());
+        let mut v = preflight_json(server, &sig, &ice, &ifaces, &history, &sshca);
+        v["daemon"] = daemon.to_json();
+        ui::json_out(&v);
+        return preflight_result(&sig);
     }
 
-    println!();
-    println!("{}", ui::paint(Tone::Bold, "tunlion doctor: environment preflight"));
-    println!();
+    crate::outln!();
+    crate::outln!("{}", ui::paint(Tone::Bold, "tunlion doctor: environment preflight"));
+    crate::outln!();
 
     // Signaling.
     match &sig {
-        Ok(ms) => println!(
+        Ok(ms) => crate::outln!(
             "  {:<13} {}  {}",
             "signaling",
             ui::paint(Tone::Ok, "reachable"),
             ui::paint(Tone::Dim, &format!("{server} ({} round trip)", fmt_ms(*ms))),
         ),
-        Err(e) => println!(
+        Err(e) => crate::outln!(
             "  {:<13} {}  {}",
             "signaling",
             ui::paint(Tone::Err, "UNREACHABLE"),
@@ -397,21 +475,49 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
         ),
     }
 
+    // The running daemon (its own signaling link, not this probe's).
+    let (tone, word, detail) = daemon.row();
+    ui::say(&format!(
+        "  {:<13} {}  {}",
+        "daemon",
+        ui::paint(tone, word),
+        ui::paint(Tone::Dim, &detail),
+    ));
+    // The running daemon's inbox: deleted under it, every file sent was
+    // refused with a bare "No such file or directory".
+    if crate::daemon_alive().is_some() {
+        let inbox = crate::recv_files::inbox_to_check(true);
+        match crate::recv_files::inbox_problem(&inbox) {
+            None => ui::say(&format!(
+                "  {:<13} {}  {}",
+                "inbox",
+                ui::paint(Tone::Ok, "ok"),
+                ui::paint(Tone::Dim, &inbox.display().to_string()),
+            )),
+            Some(problem) => ui::say(&format!(
+                "  {:<13} {}  {}",
+                "inbox",
+                ui::paint(Tone::Warn, "MISSING"),
+                ui::paint(Tone::Dim, &problem),
+            )),
+        }
+    }
+
     // ICE / STUN.
     match &ice {
-        IceResult::Ok { srflx, class, ms } => println!(
+        IceResult::Ok { srflx, class, ms } => crate::outln!(
             "  {:<13} {}  {}",
             "ice/stun",
             ui::paint(Tone::Ok, "works"),
             ui::paint(Tone::Dim, &format!("srflx {srflx} ({class}, {} round trip)", fmt_ms(*ms))),
         ),
-        IceResult::NoServer => println!(
+        IceResult::NoServer => crate::outln!(
             "  {:<13} {}  {}",
             "ice/stun",
             ui::paint(Tone::Warn, "no STUN server"),
             ui::paint(Tone::Dim, "config advertises no stun: url; direct path limited"),
         ),
-        IceResult::Failed(e) => println!(
+        IceResult::Failed(e) => crate::outln!(
             "  {:<13} {}  {}",
             "ice/stun",
             ui::paint(Tone::Warn, "FAILED"),
@@ -422,11 +528,11 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     // SSH CA trust (sshd side of `shell --ssh`). Human-facing row, so
     // ui::say (not bare println!: the print ratchet counts those).
     match &sshca {
-        Ok(()) => ui::say(&format!(
+        Ok(how) => ui::say(&format!(
             "  {:<13} {}  {}",
             "sshd-ca",
             ui::paint(Tone::Ok, "trusted CA configured"),
-            ui::paint(Tone::Dim, "TrustedUserCAKeys + principals present"),
+            ui::paint(Tone::Dim, how),
         )),
         Err(e) => ui::say(&format!(
             "  {:<13} {}  {}",
@@ -437,12 +543,12 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     }
 
     // Interfaces.
-    println!("  {:<13} {}", "interfaces", iface_summary(&ifaces));
+    crate::outln!("  {:<13} {}", "interfaces", iface_summary(&ifaces));
     if ifaces.iter().any(|i| i.vpn) {
         let mut names: Vec<&str> = ifaces.iter().filter(|i| i.vpn).map(|i| i.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        println!(
+        crate::outln!(
             "  {:<13} {}",
             "",
             ui::paint(
@@ -453,36 +559,48 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     }
 
     // History.
-    println!();
-    println!("{}", ui::paint(Tone::Bold, "history (recent connect spans)"));
-    println!();
+    crate::outln!();
+    crate::outln!("{}", ui::paint(Tone::Bold, "history (recent connect spans)"));
+    crate::outln!();
     print_history(&history);
-    println!();
-    Ok(())
+    crate::outln!();
+    if !crate::identity_flow::has_identity() {
+        ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
+    }
+    preflight_result(&sig)
+}
+
+/// The preflight is healthy when the tunlion server answered; without it
+/// nothing else works, so that is exit 7 rather than 0.
+fn preflight_result(sig: &std::result::Result<u64, String>) -> Result<()> {
+    match sig {
+        Ok(_) => Ok(()),
+        Err(_) => Err(exit_codes::reported(ExitKind::Network)),
+    }
 }
 
 fn print_history(h: &diag::Summary) {
     if h.considered == 0 {
-        println!("  {}", ui::paint(Tone::Dim, "no recorded connect attempts yet (run `tunlion doctor <device>` or connect once)"));
+        crate::outln!("  {}", ui::paint(Tone::Dim, "no recorded connect attempts yet (send, shell, exec and forward to a known device record them; `tunlion doctor <device>` measures one now)"));
         return;
     }
-    println!("  attempts     {}", h.considered);
-    println!("  succeeded    {}", ui::paint(Tone::Ok, &format!("{} of {}", h.ups, h.considered)));
+    crate::outln!("  attempts     {}", h.considered);
+    crate::outln!("  succeeded    {}", ui::paint(Tone::Ok, &format!("{} of {}", h.ups, h.considered)));
     if h.fails > 0 {
-        println!("  failed       {}", ui::paint(Tone::Warn, &format!("{} of {}", h.fails, h.considered)));
+        crate::outln!("  failed       {}", ui::paint(Tone::Warn, &format!("{} of {}", h.fails, h.considered)));
     }
     if let Some(m) = h.median_total_ms {
-        println!("  median total {}", fmt_ms(m));
+        crate::outln!("  median total {}", fmt_ms(m));
     }
     match &h.worst_phase {
-        Some((p, c)) => println!(
+        Some((p, c)) => crate::outln!(
             "  worst phase  {}",
             ui::paint(Tone::Warn, &format!("{} (over budget in {} of {} spans)", p.label(), c, h.considered)),
         ),
-        None => println!("  worst phase  {}", ui::paint(Tone::Ok, "none over budget")),
+        None => crate::outln!("  worst phase  {}", ui::paint(Tone::Ok, "none over budget")),
     }
     let stall_tone = if h.spans_with_stall == 0 { Tone::Ok } else { Tone::Warn };
-    println!(
+    crate::outln!(
         "  stall rate   {}",
         ui::paint(stall_tone, &format!("{} of {} spans stalled", h.spans_with_stall, h.considered)),
     );
@@ -553,12 +671,12 @@ async fn check_stun(server: &str) -> IceResult {
 }
 
 /// Resolve the first `stun:`/`stuns:` url to an IPv4 socket address. Honors a
-/// `FILAMENT_STUN` override (host:port) first, mirroring stun_server_addr. Used
+/// `TUNLION_STUN` override (host:port) first, mirroring stun_server_addr. Used
 /// so the doctor's binding learns an IPv4 srflx (the parser + class are v4).
 fn resolve_stun_v4(stun_urls: &[String]) -> Option<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
     let mut hostports: Vec<String> = Vec::new();
-    if let Ok(v) = std::env::var("FILAMENT_STUN") {
+    if let Ok(v) = std::env::var("TUNLION_STUN") {
         hostports.push(v.trim().to_string());
     }
     for url in stun_urls {
@@ -709,7 +827,7 @@ fn preflight_json(
     ice: &IceResult,
     ifaces: &[Iface],
     history: &diag::Summary,
-    sshca: &std::result::Result<(), String>,
+    sshca: &std::result::Result<String, String>,
 ) -> Value {
     let sig_json = match sig {
         Ok(ms) => json!({ "reachable": true, "round_trip_ms": ms }),
@@ -721,11 +839,18 @@ fn preflight_json(
         IceResult::Failed(e) => json!({ "works": false, "error": e }),
     };
     let sshca_json = match sshca {
-        Ok(()) => json!({ "configured": true }),
+        Ok(how) => json!({ "configured": true, "detail": how }),
         Err(e) => json!({ "configured": false, "detail": e }),
     };
-    json!({
-        "kind": "filament-doctor-preflight",
+    let identity = crate::status_cmd::identity_fields();
+    let mut v = json!({
+        // Healthy means the tunlion server answered (the exit code agrees).
+        "ok": sig.is_ok(),
+        // Read only, and the same two fields `status --json` carries: the
+        // owner fingerprint (or null) and the role.
+        "identity": identity.0,
+        "role": identity.1,
+        "kind": "tunlion-doctor-preflight",
         "server": server,
         "signaling": sig_json,
         "ice": ice_json,
@@ -739,7 +864,26 @@ fn preflight_json(
             "worst_phase": history.worst_phase.map(|(p, c)| json!({ "phase": p.label(), "count": c })),
             "spans_with_stall": history.spans_with_stall,
         },
-    })
+    });
+    if let Err(e) = sig {
+        v["error"] = verb_error(ExitKind::Network, Some(e));
+    }
+    v
+}
+
+/// The `error` object every verb's `--json` failure carries:
+/// `{"code","exit","message"}`, plus `detail` with the raw cause when there is
+/// one. `doctor` used to put a bare string here.
+fn verb_error(kind: ExitKind, raw: Option<&str>) -> Value {
+    let message = match kind {
+        ExitKind::Network => exit_codes::NETWORK_LINE.to_string(),
+        _ => raw.unwrap_or("the peer did not answer").to_string(),
+    };
+    let mut e = json!({ "code": kind.token(), "exit": kind.code(), "message": message });
+    if let Some(d) = raw.filter(|d| *d != e["message"].as_str().unwrap_or_default()) {
+        e["detail"] = json!(d);
+    }
+    e
 }
 
 // ----------------------------------------------------------------- helpers ----
@@ -766,6 +910,75 @@ mod tests {
 
     fn t(phase: Phase, dur_ms: u64) -> PhaseTiming {
         PhaseTiming { phase, dur_ms, over_budget: diag::over_budget(phase, dur_ms) }
+    }
+
+    fn offline(error: &str) -> ProbeOutcome {
+        ProbeOutcome {
+            timings: vec![t(Phase::Signaling, 300)],
+            total_ms: 30_000,
+            established: false,
+            failed_phase: Some(Phase::Presence),
+            error: Some(error.to_string()),
+            path: None,
+        }
+    }
+
+    /// A probe that never saw the device names the reset possibility and, when
+    /// the device re-paired under a suffixed name, the successor; a probe that
+    /// failed later (it was present) or succeeded says nothing about resets.
+    #[test]
+    fn a_presence_failure_carries_the_reset_hint() {
+        let names = vec!["p9-b".to_string(), "p9-b-2".to_string()];
+        let o = offline("establishment timed out after 30s");
+        let hint = reset_hint_for("p9-b", &o, &names).expect("presence failure hints");
+        assert!(hint.contains("p9-b-2") && hint.contains("tunlion devices forget p9-b"), "{hint}");
+        let alone = reset_hint_for("p9-b", &o, &["p9-b".to_string()]).unwrap();
+        assert!(alone.contains("reset"), "{alone}");
+        let mut later = offline("l2 open refused");
+        later.failed_phase = Some(Phase::L2Open);
+        assert_eq!(reset_hint_for("p9-b", &later, &names), None);
+        assert!(probe_progress_line("p9-b", 30).contains("30s"));
+    }
+
+    /// The reported defect: `doctor <offline> --json` said ok and exited 0.
+    #[test]
+    fn an_offline_peer_is_not_ok_and_exits_unreachable() {
+        let o = offline("establishment timed out after 30s");
+        assert_eq!(single_json("laptop", &o)["ok"], json!(false));
+        assert_eq!(probe_failure_kind(std::slice::from_ref(&o)), Some(ExitKind::Unreachable));
+        let net = offline("signaling connect to https://x: dns error");
+        assert_eq!(probe_failure_kind(&[net]), Some(ExitKind::Network));
+        let mut up = offline("");
+        up.established = true;
+        up.error = None;
+        assert_eq!(single_json("laptop", &up)["ok"], json!(true));
+        assert_eq!(probe_failure_kind(std::slice::from_ref(&up)), None);
+        // One failed run in a --repeat is not healthy.
+        let v = repeat_json("laptop", &[up, offline("timed out")]);
+        assert_eq!(v["ok"], json!(false));
+    }
+
+    /// A doctor failure carries the same `error` object as every other verb:
+    /// `{"code","exit","message"}`, never a bare string.
+    #[test]
+    fn the_json_error_has_the_shared_shape() {
+        let o = offline("establishment timed out after 30s");
+        let e = &single_json("laptop", &o)["error"];
+        assert_eq!(e["code"], json!("unreachable"));
+        assert_eq!(e["exit"], json!(6));
+        assert_eq!(e["message"], json!("establishment timed out after 30s"));
+        let net = offline("signaling connect to https://x: dns error");
+        let e = &single_json("laptop", &net)["error"];
+        assert_eq!(e["code"], json!("network"));
+        assert_eq!(e["exit"], json!(7));
+        assert_eq!(e["message"], json!(exit_codes::NETWORK_LINE));
+        assert_eq!(e["detail"], json!("signaling connect to https://x: dns error"));
+        let mut up = offline("");
+        up.established = true;
+        up.error = None;
+        assert_eq!(single_json("laptop", &up)["error"], Value::Null);
+        let v = repeat_json("laptop", &[up, o]);
+        assert_eq!(v["error"]["exit"], json!(6));
     }
 
     #[test]

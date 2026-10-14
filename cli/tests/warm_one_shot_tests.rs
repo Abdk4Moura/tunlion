@@ -14,7 +14,7 @@ fn filament_bin() -> std::path::PathBuf {
     path
 }
 
-/// Test that one-shot pty respects FILAMENT_CONNECT_SECS environment variable.
+/// Test that one-shot pty respects TUNLION_CONNECT_SECS environment variable.
 /// This tests the cold path timeout (when warm link is unavailable).
 #[test]
 fn one_shot_pty_timeout_respects_env_var() {
@@ -23,8 +23,8 @@ fn one_shot_pty_timeout_respects_env_var() {
 
     let start = std::time::Instant::now();
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-timeout"))
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-timeout"))
         .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")
@@ -62,8 +62,8 @@ fn one_shot_pty_instant_eof_cold_path() {
 
     let start = std::time::Instant::now();
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-eof"))
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-eof"))
         .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")
@@ -109,8 +109,8 @@ fn one_shot_pty_stdin_forwarding() {
     // Pipe stdin with data - the command should fail (unreachable peer),
     // but the structure should accept stdin input
     let output = Command::new(&bin)
-        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
-        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-stdin"))
+        .env("TUNLION_CONNECT_SECS", connect_secs.to_string())
+        .env("TUNLION_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-stdin"))
         .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")

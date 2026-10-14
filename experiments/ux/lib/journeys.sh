@@ -147,7 +147,7 @@ case_maya_send_big_file() {
   echo "[case] $id: browser drag → home desktop is BYTE-CORRECT ($got)"
 
   # ---- RESILIENCE LEG: inject a mid-transfer STALL on the direct-QUIC path ---
-  # the data-path-freeze fault (FILAMENT_TEST_FREEZE_AFTER_BYTES): the first
+  # the data-path-freeze fault (TUNLION_TEST_FREEZE_AFTER_BYTES): the first
   # transport goes dark after N bytes; the bytes-moved watchdog DETECTS it and the
   # correction ladder repairs the link in place — the transfer completes byte-exact
   # with no user action. "Survived bad café wifi without Maya doing anything."
@@ -172,9 +172,9 @@ journey_freeze_heal() {
   acfg=$(pipe_cfg "${id}-fa"); bcfg=$(pipe_cfg "${id}-fb")
   # pair A<->B over a one-time code (the known-device direct prerequisite).
   local W="jrn-$$-$RANDOM"
-  FILAMENT_CONFIG_DIR="$acfg" "$FILAMENT_BIN" send "$payload" --word "$W" --remember boxB --server "$PIPE_SERVER" >"$PIPE_WORK/$id-freeze-pa.log" 2>&1 &
+  TUNLION_CONFIG_DIR="$acfg" "$TUNLION_BIN" send "$payload" --word "$W" --remember boxB --server "$PIPE_SERVER" >"$PIPE_WORK/$id-freeze-pa.log" 2>&1 &
   local SP=$!; pipe_track "$SP"; sleep 3
-  FILAMENT_CONFIG_DIR="$bcfg" timeout -k 5 60 "$FILAMENT_BIN" recv "$W" -y --remember boxA --dir "$bcfg" --server "$PIPE_SERVER" >"$PIPE_WORK/$id-freeze-pb.log" 2>&1
+  TUNLION_CONFIG_DIR="$bcfg" timeout -k 5 60 "$TUNLION_BIN" recv "$W" -y --remember boxA --dir "$bcfg" --server "$PIPE_SERVER" >"$PIPE_WORK/$id-freeze-pb.log" 2>&1
   wait $SP 2>/dev/null
   [ -s "$acfg/devices.json" ] && [ -s "$bcfg/devices.json" ] || { echo "[freeze] pairing setup failed" >&2; return 1; }
 
@@ -182,13 +182,13 @@ journey_freeze_heal() {
   for try in 1 2 3 4 5 6; do
     local dg="$PIPE_WORK/$id-freeze-drop"; rm -rf "$dg"; mkdir -p "$dg"
     local ulog="$PIPE_WORK/$id-freeze-up.log" slog="$PIPE_WORK/$id-freeze-send.log"
-    FILAMENT_CONFIG_DIR="$bcfg" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 FILAMENT_STALL_MS="$stall_ms" \
-      timeout -k 5 90 "$FILAMENT_BIN" up --dir "$dg" --server "$PIPE_SERVER" >"$ulog" 2>&1 &
+    TUNLION_CONFIG_DIR="$bcfg" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 TUNLION_STALL_MS="$stall_ms" \
+      timeout -k 5 90 "$TUNLION_BIN" up --dir "$dg" --server "$PIPE_SERVER" >"$ulog" 2>&1 &
     local UP=$!; pipe_track "$UP"; sleep 3
     local rc=0
-    FILAMENT_CONFIG_DIR="$acfg" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 FILAMENT_STALL_MS="$stall_ms" \
-      FILAMENT_TEST_FREEZE_AFTER_BYTES="$freeze_at" \
-      timeout -k 5 90 "$FILAMENT_BIN" send "$payload" --to boxB --server "$PIPE_SERVER" >"$slog" 2>&1 || rc=1
+    TUNLION_CONFIG_DIR="$acfg" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 TUNLION_STALL_MS="$stall_ms" \
+      TUNLION_TEST_FREEZE_AFTER_BYTES="$freeze_at" \
+      timeout -k 5 90 "$TUNLION_BIN" send "$payload" --to boxB --server "$PIPE_SERVER" >"$slog" 2>&1 || rc=1
     sleep 1; kill "$UP" 2>/dev/null; wait "$UP" 2>/dev/null
     grep -q "data-path FREEZE engaged" "$slog" 2>/dev/null || { echo "[freeze] try $try: freeze didn't arm (establishment flake) — retrying" >&2; continue; }
     local got; got=$(ls -t "$dg" 2>/dev/null | head -1)
@@ -226,7 +226,7 @@ case_maya_phone_to_laptop() {
   # CODE-FREE send: omitting --word/--to joins the SAME /api/room auto-room the
   # browser is in (the proven scenario-08 path) — the laptop sees the offer.
   sleep 6
-  FILAMENT_CONFIG_DIR="$pcfg" timeout -k 5 90 "$FILAMENT_BIN" send "$payload" --name "$pname" --server "$PIPE_SERVER" >"$PIPE_WORK/$id-phone.log" 2>&1 &
+  TUNLION_CONFIG_DIR="$pcfg" timeout -k 5 90 "$TUNLION_BIN" send "$payload" --name "$pname" --server "$PIPE_SERVER" >"$PIPE_WORK/$id-phone.log" 2>&1 &
   local SP=$!; pipe_track "$SP"
   wait $DRV; local drv_rc=$?
   kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null
@@ -250,7 +250,7 @@ case_maya_gpu_render() {
   local rl="$REPO_ROOT/runner/run_local_test.sh"
   [ -x "$rl" ] || { emit "$id" FAIL "run_local_test.sh missing"; return 1; }
   local log="$PIPE_WORK/$id.log"
-  FILJOB_BIN="$FILAMENT_BIN" timeout -k 10 "${RUNNER_TIMEOUT:-360}" bash "$rl" >"$log" 2>&1
+  FILJOB_BIN="$TUNLION_BIN" timeout -k 10 "${RUNNER_TIMEOUT:-360}" bash "$rl" >"$log" 2>&1
   local rc=$?
   if [ "$rc" -eq 0 ]; then
     emit "$id" PASS "ERGO[submit · render on the home box · artifact returns] — Maya submitted a render to the home box (loopback runner): the job ran and the finished out.mp4 came back, sha-verified"

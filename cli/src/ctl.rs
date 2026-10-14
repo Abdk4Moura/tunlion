@@ -26,30 +26,40 @@
 
 use std::path::PathBuf;
 
-/// `{config_dir}/control.sock`, honoring FILAMENT_CONFIG_DIR (hermetic tests),
-/// else `~/.config/filament`. Mirrors `devices_path()` / `pidfile()`. Portable
+/// `{config_dir}/control.sock`, honoring TUNLION_CONFIG_DIR (hermetic tests),
+/// else `~/.config/tunlion`. Mirrors `devices_path()` / `pidfile()`. Portable
 /// (just path math); only used on unix where the socket is actually bound.
+///
+/// When that path is too long for a unix socket (a deep HOME or
+/// TUNLION_CONFIG_DIR), a short per-user directory is used instead; see
+/// `platform::control_socket_path`. Daemon and clients both resolve it here.
 pub fn control_sock_path() -> PathBuf {
-    crate::platform::Paths::config_path("control.sock")
+    crate::platform::control_socket_path(
+        &crate::platform::Paths::config_path("control.sock"),
+        &crate::platform::Paths::config_dir(),
+    )
 }
 
 /// True if the warm-reuse fast path is disabled by the operator. An escape hatch
 /// so a user can force every session back onto a fresh establish for debugging.
 pub fn reuse_disabled() -> bool {
-    std::env::var("FILAMENT_NO_WARM_REUSE").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_NO_WARM_REUSE").map(|v| v == "1").unwrap_or(false)
 }
 
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, send_reply, serve_at, try_approve_request, try_bootstrap,
-    try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_ping, try_pty_reason, try_reconfigure, try_reload,
-    try_reload_expose, try_resize, try_unmount, try_wake, Req, ReqKind,
+    daemon_present, daemon_responds, forward_probe, send_reply, serve_at, try_approve_request,
+    try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
+    try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
+    try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
+    try_revocation_sync, try_unmount, try_wake, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-    daemon_present, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
-    try_list_pending, try_list_warm, try_ping, try_wake,
+    daemon_present, daemon_responds, forward_probe, try_approve_request, try_cap_status,
+    try_deny_request, try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping,
+    try_reconfigure, try_revocation_sync, try_wake,
     Req,
 };
 
@@ -107,18 +117,32 @@ mod imp {
     /// asserted). Returns the bridged socket, or `None` if there is no daemon / the
     /// peer is unknown / L3 is down, so the caller can report a clean failure.
     pub async fn try_dial(peer: &str, port: u16) -> Option<UnixStream> {
+        try_dial_reason(peer, port).await.ok()
+    }
+
+    /// Like `try_dial`, but reports WHY the daemon said no: `Err(Some(reason))`
+    /// is the daemon's answer (unknown peer, the dial refused or timed out),
+    /// `Err(None)` means there was no daemon to ask. The proxy needs the
+    /// difference to pick the right SOCKS reply instead of hanging.
+    pub async fn try_dial_reason(
+        peer: &str,
+        port: u16,
+    ) -> std::result::Result<UnixStream, Option<String>> {
         if reuse_disabled() {
-            return None;
+            return Err(None);
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
         let req = json!({ "op": "dial", "peer": peer, "port": port });
-        let mut line = serde_json::to_vec(&req).ok()?;
+        let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
         line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = read_line(&mut s, 4096).await.ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(s)
+        s.write_all(&line).await.map_err(|_| None)?;
+        s.flush().await.map_err(|_| None)?;
+        let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
+        let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
+        if v["ok"].as_bool() == Some(true) {
+            return Ok(s);
+        }
+        Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
     }
 
     /// Try to open an L2 stream to `peer:rport` THROUGH a local daemon's warm
@@ -147,6 +171,42 @@ mod imp {
             Some(s)
         } else {
             None
+        }
+    }
+
+    /// Like `try_open`, but reports WHY the daemon said no, as `try_pty_reason`
+    /// does: `Err(Some("refused: ..."))` is the PEER's answer and definitive.
+    pub async fn try_open_reason(
+        peer: &str,
+        rport: u16,
+    ) -> std::result::Result<UnixStream, Option<String>> {
+        if reuse_disabled() {
+            return Err(None);
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
+        let req = json!({ "op": "open", "peer": peer, "rport": rport });
+        let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
+        line.push(b'\n');
+        s.write_all(&line).await.map_err(|_| None)?;
+        s.flush().await.map_err(|_| None)?;
+        let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
+        let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
+        if v["ok"].as_bool() == Some(true) {
+            return Ok(s);
+        }
+        Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
+    }
+
+    /// One probe open of `peer`:`rport` through the daemon's warm link, closed
+    /// at once. `Some(Ok)` = the peer accepted, `Some(Err(reason))` = the peer
+    /// refused, `None` = no warm path to ask through (unknown).
+    pub async fn forward_probe(peer: &str, rport: u16) -> Option<std::result::Result<(), String>> {
+        match try_open_reason(peer, rport).await {
+            Ok(_sock) => Some(Ok(())), // dropping it closes the bridged stream
+            Err(Some(r)) if r.starts_with("refused:") => {
+                Some(Err(r.trim_start_matches("refused:").trim().to_string()))
+            }
+            Err(_) => None,
         }
     }
 
@@ -332,6 +392,25 @@ mod imp {
         serde_json::from_str(&reply).ok()
     }
 
+    /// Tell the running daemon the device store changed by a forget or a
+    /// revoke, and wait for it to apply that: re-read the store, close every
+    /// link the change ends, drop the forgotten channels. Replies
+    /// `{"ok":true,"closed":<n>}` once done; `None` when no daemon answered.
+    /// The daemon would notice the change on its own within a few seconds;
+    /// asking is what lets the command say "in effect now" and mean it.
+    pub async fn try_revocation_sync() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut line = serde_json::to_vec(&json!({ "op": "revocation-sync" })).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), read_line(&mut s, 1024))
+            .await
+            .ok()?
+            .ok()?;
+        serde_json::from_str(&reply).ok()
+    }
+
     /// Ask a running `up` daemon to RELOAD onto a freshly `tunlion update`d binary
     /// with no manual restart and no sudo. The daemon gracefully shuts down (the
     /// same path a `systemctl restart` / SIGTERM takes, which cleanly closes the
@@ -423,6 +502,24 @@ mod imp {
             .ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
         (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
+    /// Does the daemon ANSWER on its control socket within `wait`? A live pid
+    /// is not an answer: a SIGSTOPped daemon keeps its pid (and the kernel even
+    /// accepts the connect into the listen backlog), and `status` reported it
+    /// "up". `Some(false)` covers both a missing socket and a silent one.
+    pub async fn daemon_responds(wait: std::time::Duration) -> Option<bool> {
+        let probe = async {
+            let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+            let mut line = serde_json::to_vec(&json!({ "op": "cap-status" })).ok()?;
+            line.push(b'\n');
+            s.write_all(&line).await.ok()?;
+            s.flush().await.ok()?;
+            let reply = read_line(&mut s, 4096).await.ok()?;
+            // Any well-formed reply is an answer, even a refusal.
+            serde_json::from_str::<Value>(&reply).ok().map(|_| true)
+        };
+        Some(matches!(tokio::time::timeout(wait, probe).await, Ok(Some(true))))
     }
 
     /// Ask the daemon for its live capability shadow counters (synchronous).
@@ -582,6 +679,10 @@ mod imp {
         /// carries no state, so a platform without a control socket loses nothing
         /// but the speed-up. Answered INLINE with `{"ok":true}`.
         Wake,
+        /// A forget or revoke changed the device store: re-read it now, close
+        /// the links it ends, and reply `{"ok":true,"closed":<n>}` once done
+        /// (see revocation_live.rs). Handled inline in the daemon loop.
+        RevocationSync,
         /// Gracefully restart to pick up an updated binary (`tunlion update`).
         /// Handled INLINE: if supervised (systemd), reply then self-SIGTERM so the
         /// supervisor restarts us cleanly; otherwise decline (don't exit into down).
@@ -669,11 +770,13 @@ mod imp {
     /// up" must not print it until this fires, or a sibling process races the
     /// bind.
     pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>, ready: Option<tokio::sync::oneshot::Sender<()>>) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        // A private directory (0700, ours, not writable by anyone else) before
+        // anything is bound in it: the short fallback lives under /tmp.
+        crate::platform::prepare_socket_dir(&path)
+            .map_err(|e| anyhow!("cannot prepare the control socket directory for {}: {e}", path.display()))?;
         let _ = std::fs::remove_file(&path); // clear a stale leftover
-        let listener = UnixListener::bind(&path)?;
+        let listener = UnixListener::bind(&path)
+            .map_err(|e| anyhow!("cannot bind the control socket {} ({} bytes): {e}", path.display(), path.as_os_str().len()))?;
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -741,6 +844,7 @@ mod imp {
                     }
                     Some("reload-expose") => ReqKind::ReloadExpose,
                     Some("wake") => ReqKind::Wake,
+                    Some("revocation-sync") => ReqKind::RevocationSync,
                     Some("reload") => ReqKind::Reload,
                     Some("mount") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
@@ -790,7 +894,34 @@ mod imp {
 
         #[test]
         fn control_sock_path_ends_with_socket_name() {
-            assert!(control_sock_path().ends_with("control.sock"));
+            // Whatever the test environment's config dir, the resolved path is a
+            // bindable socket path: under the limit, and named `.sock`.
+            let p = control_sock_path();
+            assert!(p.as_os_str().len() < crate::platform::SOCKET_PATH_MAX, "{}", p.display());
+            assert_eq!(p.extension().and_then(|e| e.to_str()), Some("sock"), "{}", p.display());
+            // A short config dir keeps the socket where it always was.
+            let short = std::path::Path::new("/home/u/.config/tunlion");
+            assert_eq!(
+                crate::platform::control_socket_path(&short.join("control.sock"), short),
+                short.join("control.sock")
+            );
+        }
+
+        #[test]
+        fn an_overlong_config_dir_gets_a_short_private_socket_path() {
+            // The first-time-user sandbox that found this was 110 bytes deep.
+            let deep = std::path::PathBuf::from(format!("/home/u/{}/tunlion", "d".repeat(120)));
+            let a = crate::platform::control_socket_path(&deep.join("control.sock"), &deep);
+            assert!(a.as_os_str().len() < crate::platform::SOCKET_PATH_MAX, "{}", a.display());
+            assert!(
+                a.parent().and_then(|d| d.file_name()).is_some_and(|n| n.to_string_lossy().starts_with("tunlion-")),
+                "{}",
+                a.display()
+            );
+            // Deterministic (daemon and client must meet) and per-config.
+            assert_eq!(a, crate::platform::control_socket_path(&deep.join("control.sock"), &deep));
+            let other = std::path::PathBuf::from(format!("/home/v/{}/tunlion", "d".repeat(120)));
+            assert_ne!(a, crate::platform::control_socket_path(&other.join("control.sock"), &other));
         }
 
         #[tokio::test]
@@ -892,6 +1023,21 @@ mod stub {
     /// Keeping the type lets the daemon loop and handler compile unchanged.
     pub enum Req {}
 
+    impl Req {
+        /// Uninhabited here, so this is never called; it exists so the daemon
+        /// loop's reply to a parked revocation-sync compiles on every target.
+        pub async fn reply(self, _v: &Value) {
+            match self {}
+        }
+    }
+
+    /// No control socket here, so no daemon can be asked to apply a
+    /// revocation now; `None` makes the command say it applies within a few
+    /// seconds (the daemon's own store scan) or at the next start.
+    pub async fn try_revocation_sync() -> Option<Value> {
+        None
+    }
+
     /// No control socket on this platform, so there is never a warm daemon link
     /// to ping. Callers (`ping`, `forward`) treat `None` as "no daemon" and fall
     /// back to a fresh establish. Present so the `via_daemon`-gated call sites —
@@ -926,6 +1072,19 @@ mod stub {
         false
     }
 
+    /// No control socket here, so whether the daemon answers is unknown, which
+    /// is not the same as "it does not": `status` says nothing rather than guess.
+    pub async fn daemon_responds(_wait: std::time::Duration) -> Option<bool> {
+        None
+    }
+
+    /// No control socket here, so a setting cannot be pushed into a running
+    /// daemon; the honest answer is "on the next start", which is what a
+    /// `live: false` reply says.
+    pub async fn try_reconfigure(_key: &str) -> Option<Value> {
+        Some(serde_json::json!({ "ok": true, "live": false }))
+    }
+
     /// No control socket here, so no daemon can broker a rendezvous. `None`
     /// means the caller finds the peer itself, which is the pre-existing path.
     pub async fn try_fleet_rendezvous(_name: &str) -> Option<String> {
@@ -933,6 +1092,14 @@ mod stub {
     }
 
     pub async fn try_list_warm() -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so no daemon to probe a forward through.
+    pub async fn forward_probe(
+        _peer: &str,
+        _rport: u16,
+    ) -> Option<std::result::Result<(), String>> {
         None
     }
 

@@ -4,7 +4,7 @@
 //!
 //! Two macOS specifics are hidden here so `l3.rs` stays portable:
 //! - utun devices are kernel-named `utunN` and cannot be renamed, so the requested
-//!   name (`filament0`) is ignored and the real name is reported by `name()`.
+//!   name (`tunlion0`) is ignored and the real name is reported by `name()`.
 //! - each packet on a utun carries a 4-byte address-family header; `recv`/`send`
 //!   strip/prepend it with readv/writev so callers exchange bare IP packets.
 //!
@@ -254,6 +254,18 @@ pub fn ensure_net_admin_for_l3() -> bool {
     }
     eprintln!("  L3 on macOS needs root to create a utun device; run the daemon with sudo.");
     false
+}
+
+/// No one-time grant exists on macOS (utun needs the daemon itself to run as
+/// root), so there is nothing to offer at `init`.
+pub fn l3_grant_pending() -> Option<String> {
+    None
+}
+
+/// Nothing on macOS blocks the kernel overlay in a way a grant could not
+/// address; the daemon's own privilege decides it.
+pub fn l3_blocker() -> Option<String> {
+    None
 }
 
 /// The macOS daemon runs as root (utun requires it), so /etc/hosts is already

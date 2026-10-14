@@ -56,6 +56,353 @@ pub(crate) fn fleet_certificate_warning_for(
     ))
 }
 
+/// What `devices forget` must do with a record so that what it prints is true.
+///
+/// Forgetting deletes the pair secret, which ends a PAIRED device's access. It
+/// does not end a CERTIFIED one's: fleet-hello admits any valid certificate
+/// chained to our owner key unless something marks that key revoked. The record
+/// used to be the only such mark, so forgetting a live certificate holder
+/// printed "it can no longer find or auto-connect to this machine" while fleet
+/// auto-mesh let it straight back in. That was first fixed by REFUSING the
+/// forget, which made the name unusable for the certificate's whole life: a
+/// device that was reset and re-joined sat beside its stale record as
+/// `<name>-2`, every printed re-link chain began with a forget that refused,
+/// and `rename` then said the name was taken.
+///
+/// The revocation now lives apart from the name, in `revoked-keys.json`, keyed
+/// by the DEVICE KEY and kept until that key's certificate expires
+/// (`device_key_revoked`, consulted by `device_cert_revoked`). So forgetting a
+/// live certificate holder records its key as revoked first and then drops the
+/// record, and a revoked record can be forgotten with its revocation kept. The
+/// security property is unchanged where it matters (that key is denied until
+/// its certificate could no longer pass anyway) and stronger where forget used
+/// to refuse: the device is cut off, not merely left in place.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ForgetVerdict {
+    /// No live fleet certificate from our owner: removing the record ends it.
+    Remove,
+    /// A live certificate, not revoked: revoke its key, then remove the record.
+    RevokeThenRemove { days_left: u64 },
+    /// A live certificate, already revoked: carry the revocation over to the
+    /// key list, then remove the record.
+    KeepRevocationThenRemove { days_left: u64 },
+}
+
+pub(crate) fn forget_verdict(
+    cert: Option<&identity::DeviceCert>,
+    revoked: bool,
+    owner_pub: Option<[u8; 32]>,
+    now: u64,
+) -> ForgetVerdict {
+    let (Some(cert), Some(owner)) = (cert, owner_pub) else {
+        return ForgetVerdict::Remove;
+    };
+    // Same liveness test as `fleet_certificate_warning_for`: a certificate
+    // from another owner, or an expired one, cannot pass fleet-hello.
+    if cert.user_pub != owner || cert.expires <= now {
+        return ForgetVerdict::Remove;
+    }
+    let days_left = cert.expires.saturating_sub(now).div_ceil(86_400);
+    if revoked {
+        ForgetVerdict::KeepRevocationThenRemove { days_left }
+    } else {
+        ForgetVerdict::RevokeThenRemove { days_left }
+    }
+}
+
+/// What `devices forget` prints once it has done what the verdict says. Pure.
+pub(crate) fn forget_report(name: &str, verdict: &ForgetVerdict) -> String {
+    match verdict {
+        ForgetVerdict::Remove => {
+            format!("forgot '{name}', it can no longer find or auto-connect to this machine")
+        }
+        ForgetVerdict::RevokeThenRemove { days_left } => format!(
+            "forgot '{name}' and revoked its fleet certificate (valid for {days_left} more day(s)): \
+             that device key is refused here until the certificate expires, so it cannot reconnect \
+             through fleet auto-mesh. The name '{name}' is free now."
+        ),
+        ForgetVerdict::KeepRevocationThenRemove { days_left } => format!(
+            "forgot '{name}'; its revocation stays in force for that device key until its certificate \
+             expires in {days_left} day(s). The name '{name}' is free now."
+        ),
+    }
+}
+
+/// The file that holds revocations by device key, apart from any name.
+pub(crate) const KEY_REVOCATIONS_FILE: &str = "revoked-keys.json";
+
+fn key_revocations_path() -> PathBuf {
+    crate::platform::Paths::config_path(KEY_REVOCATIONS_FILE)
+}
+
+/// The key revocations at `path`. Ok(empty) when the file is absent; Err when
+/// it exists but cannot be read or parsed, which callers treat as "revoked"
+/// (fail closed, the rule `device_cert_revoked` applies to devices.json: a
+/// corrupt store must not silently un-revoke every key in it).
+pub(crate) fn load_key_revocations_at(path: &Path) -> std::result::Result<Vec<Value>, ()> {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(()),
+        Ok(_) => {}
+    }
+    let raw = std::fs::read_to_string(path).map_err(|_| ())?;
+    serde_json::from_str::<Vec<Value>>(&raw).map_err(|_| ())
+}
+
+/// Is `device_pub` named by a revocation that is still in force at `now`? An
+/// entry ends when the certificate it revoked expires: past that point the
+/// certificate cannot pass fleet-hello anyway, which is the same horizon the
+/// record-based revocation always had. Pure.
+pub(crate) fn key_revocation_in_force(entries: &[Value], device_pub: &[u8; 32], now: u64) -> bool {
+    let key = hex::encode(device_pub);
+    entries.iter().any(|e| {
+        e["devicePub"].as_str() == Some(key.as_str())
+            && e["certExpires"].as_u64().map_or(true, |exp| exp > now)
+    })
+}
+
+/// Is this device key revoked by a revocation kept apart from any record?
+pub(crate) fn device_key_revoked(device_pub: &[u8; 32], now: u64) -> bool {
+    match load_key_revocations_at(&key_revocations_path()) {
+        Ok(entries) => key_revocation_in_force(&entries, device_pub, now),
+        Err(()) => true,
+    }
+}
+
+/// Record `cert`'s key as revoked until the certificate expires, pruning
+/// entries that have run out. `name` is kept for the reader only; nothing
+/// matches on it.
+pub(crate) fn record_key_revocation_at(
+    path: &Path,
+    cert: &identity::DeviceCert,
+    name: &str,
+    now: u64,
+) -> Result<()> {
+    let mut entries = load_key_revocations_at(path).map_err(|()| {
+        anyhow::anyhow!(
+            "{} exists but cannot be read; fix or remove it before forgetting a certified device",
+            path.display()
+        )
+    })?;
+    let key = hex::encode(cert.device_pub);
+    entries.retain(|e| {
+        e["devicePub"].as_str() != Some(key.as_str())
+            && e["certExpires"].as_u64().map_or(true, |exp| exp > now)
+    });
+    entries.push(json!({
+        "devicePub": key,
+        "userPub": hex::encode(cert.user_pub),
+        "certExpires": cert.expires,
+        "revokedAt": now,
+        "name": name,
+    }));
+    crate::state_files::keep_backup(path);
+    crate::platform::SecretFile::write_str(path, &serde_json::to_string_pretty(&entries)?)?;
+    Ok(())
+}
+
+/// The key revocation in force for `device_pub` at `now`, as (the name it was
+/// recorded under, when). Pure over `entries`.
+pub(crate) fn key_revocation_for(entries: &[Value], device_pub: &[u8; 32], now: u64) -> Option<(String, u64)> {
+    let key = hex::encode(device_pub);
+    entries
+        .iter()
+        .find(|e| {
+            e["devicePub"].as_str() == Some(key.as_str())
+                && e["certExpires"].as_u64().map_or(true, |exp| exp > now)
+        })
+        .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e["revokedAt"].as_u64().unwrap_or(0)))
+}
+
+/// Remove every entry for `device_pub` (or, with `by_name`, every entry
+/// recorded under that name) from `path`. Returns what was lifted as
+/// (name, revokedAt, devicePub hex). An explicit owner action is the only
+/// caller: a fresh `add` of that device, or `devices restore <name>`.
+pub(crate) fn lift_key_revocations_at(
+    path: &Path,
+    device_pub: Option<&[u8; 32]>,
+    by_name: Option<&str>,
+) -> Result<Vec<(String, u64, String)>> {
+    let entries = load_key_revocations_at(path).map_err(|()| {
+        anyhow::anyhow!("{} exists but cannot be read; fix or remove it first", path.display())
+    })?;
+    let key = device_pub.map(hex::encode);
+    let matches = |e: &Value| {
+        key.as_deref().is_some_and(|k| e["devicePub"].as_str() == Some(k))
+            || by_name.is_some_and(|n| e["name"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(n)))
+    };
+    let lifted: Vec<(String, u64, String)> = entries
+        .iter()
+        .filter(|e| matches(e))
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap_or("").to_string(),
+                e["revokedAt"].as_u64().unwrap_or(0),
+                e["devicePub"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    if lifted.is_empty() {
+        return Ok(lifted);
+    }
+    let kept: Vec<Value> = entries.into_iter().filter(|e| !matches(e)).collect();
+    crate::state_files::keep_backup(path);
+    crate::platform::SecretFile::write_str(path, &serde_json::to_string_pretty(&kept)?)?;
+    Ok(lifted)
+}
+
+/// Lift the block a `forget` left on `device_pub`, for an explicit re-add.
+pub(crate) fn lift_key_revocation(device_pub: &[u8; 32]) -> Result<Vec<(String, u64, String)>> {
+    lift_key_revocations_at(&key_revocations_path(), Some(device_pub), None)
+}
+
+/// Lift the blocks recorded under `name`, for `devices restore` of a device
+/// that was forgotten (and so has no record left to restore).
+pub(crate) fn lift_key_revocations_named(name: &str) -> Result<Vec<(String, u64, String)>> {
+    lift_key_revocations_at(&key_revocations_path(), None, Some(name))
+}
+
+/// A date for a revocation line. Pure.
+pub(crate) fn revoked_on(at: u64) -> String {
+    chrono::DateTime::from_timestamp(at as i64, 0)
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "an earlier date".to_string())
+}
+
+/// What a fresh add of a previously forgotten device says. Pure.
+pub(crate) fn readmit_line(name: &str, forgotten_at: u64) -> String {
+    format!(
+        "{name} was forgotten on {}; this pairing re-admits it (your explicit add lifts the block on its key)",
+        revoked_on(forgotten_at)
+    )
+}
+
+/// What `devices restore <name>` reports. Pure. `record`: a record by that
+/// name exists; `revoked`: it was revoked and is now restored; `lifted`: key
+/// blocks a forget had left under that name, now lifted.
+pub(crate) fn restore_report(name: &str, record: bool, revoked: bool, lifted: &[(String, u64, String)]) -> String {
+    match (record, revoked, lifted.is_empty()) {
+        (true, true, _) => format!("restored '{name}'; it is recognized again under its prior record"),
+        (true, false, true) => format!("'{name}' is not revoked; there was nothing to restore"),
+        (true, false, false) => format!(
+            "'{name}' is not revoked; lifted the block an earlier forget left on its old key"
+        ),
+        (false, _, false) => format!(
+            "lifted the block on '{name}' (forgotten on {}). It has no record here any more, so it cannot connect yet: \
+             re-add it with  tunlion add {name}  (and `tunlion join <code>` on it)",
+            revoked_on(lifted[0].1)
+        ),
+        (false, _, true) => format!("no device named '{name}', and no forgotten device by that name"),
+    }
+}
+
+#[cfg(test)]
+mod key_revocation_lift_tests {
+    use super::*;
+
+    /// Eval item 2: `devices forget u2-a`, then `add u2-a` + `join` printed
+    /// "joined your fleet" while every send was declined "device revoked",
+    /// because the forget's key block outlived the re-add. An explicit re-add
+    /// lifts exactly that key's block, and restore can lift it by name.
+    #[test]
+    fn an_explicit_readd_lifts_the_forget_block_on_that_key_only() {
+        let dir = std::env::temp_dir().join(format!("tunlion-lift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(KEY_REVOCATIONS_FILE);
+        let cert = |d: u8| identity::DeviceCert {
+            device_pub: [d; 32],
+            user_pub: [9; 32],
+            expires: 10_000,
+            issued: 0,
+            sig: [0; 64],
+        };
+        record_key_revocation_at(&path, &cert(1), "u2-a", 100).unwrap();
+        record_key_revocation_at(&path, &cert(2), "u2-b", 100).unwrap();
+        let entries = load_key_revocations_at(&path).unwrap();
+        assert_eq!(key_revocation_for(&entries, &[1; 32], 200), Some(("u2-a".to_string(), 100)));
+        assert!(key_revocation_in_force(&entries, &[1; 32], 200));
+
+        let lifted = lift_key_revocations_at(&path, Some(&[1; 32]), None).unwrap();
+        assert_eq!(lifted.len(), 1);
+        let entries = load_key_revocations_at(&path).unwrap();
+        assert!(!key_revocation_in_force(&entries, &[1; 32], 200), "the re-added key is admitted");
+        assert!(key_revocation_in_force(&entries, &[2; 32], 200), "another forgotten key stays blocked");
+
+        // `devices restore u2-b`: the forgotten device has no record, so the
+        // block is found by the name it was recorded under.
+        let lifted = lift_key_revocations_at(&path, None, Some("U2-B")).unwrap();
+        assert_eq!(lifted.len(), 1);
+        assert!(!key_revocation_in_force(&load_key_revocations_at(&path).unwrap(), &[2; 32], 200));
+        assert!(lift_key_revocations_at(&path, None, Some("nobody")).unwrap().is_empty());
+
+        assert!(readmit_line("u2-a", 0).contains("this pairing re-admits it"));
+        let one = vec![("u2-b".to_string(), 100u64, "02".repeat(32))];
+        assert!(restore_report("u2-b", false, false, &one).contains("tunlion add u2-b"));
+        assert!(restore_report("x", true, true, &[]).starts_with("restored"));
+        assert!(restore_report("x", true, false, &[]).contains("nothing to restore"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `devices forget <name>`: carry out the verdict, revocation FIRST, so a
+/// failure to record it leaves the record (and with it the revocation or the
+/// live certificate) exactly where it was. Returns the line to print.
+pub(crate) fn forget_device(name: &str, now: u64) -> Result<String> {
+    if !crate::device_record_exists(name) {
+        anyhow::bail!("no device named '{name}', see `tunlion devices`");
+    }
+    let was_revoked = std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .unwrap_or_default()
+        .iter()
+        .any(|d| d["name"].as_str() == Some(name) && crate::device_view::record_is_revoked(d));
+    let cert = device_cert_for(name);
+    let verdict = forget_verdict(cert.as_ref(), was_revoked, fleet::my_owner_pub(), now);
+    if let (ForgetVerdict::RevokeThenRemove { .. } | ForgetVerdict::KeepRevocationThenRemove { .. }, Some(cert)) =
+        (&verdict, cert.as_ref())
+    {
+        record_key_revocation_at(&key_revocations_path(), cert, name, now)?;
+    }
+    // The grants go too. They live in caps.json keyed by the device KEY, not
+    // in the record, so removing the record used to leave a forgotten key
+    // holding `shell` for whoever could present it next. Revoked before the
+    // record goes, so a failure leaves everything where it was.
+    if let Some(cert) = cert.as_ref() {
+        crate::device_caps::revoke_device_grants(cert, now)
+            .map_err(|e| anyhow::anyhow!("could not revoke the grants held by '{name}': {e}"))?;
+    }
+    // And the shell key that grant installed for `shell --ssh`, by name, while
+    // the name still means this device. Only touched when its block is there.
+    let ak = std::fs::read_to_string(crate::sshkeys::authorized_keys_path()).unwrap_or_default();
+    if crate::sshkeys::has_block(&ak, name) {
+        crate::sshkeys::remove_authorized_key(name)?;
+    }
+    crate::device_caps::devices_remove(name)?;
+    Ok(forget_report(name, &verdict))
+}
+
+/// `devices rename <old> <new>`: in place on the raw record, so caps and v2
+/// fields ride along. A name held by another record is refused; forgetting
+/// that record frees it (`forget_device`). Shared by dispatch and the tests
+/// that run the printed re-link chains.
+pub(crate) fn rename_device(old: &str, new: &str) -> Result<()> {
+    crate::devices_store::with_devices_mut(|arr| {
+        if !arr.iter().any(|d| d["name"].as_str() == Some(old)) {
+            anyhow::bail!("no device named '{old}', see `tunlion devices`");
+        }
+        if arr.iter().any(|d| d["name"].as_str() == Some(new)) {
+            anyhow::bail!("'{new}' already exists, forget it first or pick another name");
+        }
+        for d in arr.iter_mut() {
+            if d["name"].as_str() == Some(old) {
+                d["name"] = json!(new);
+            }
+        }
+        Ok(())
+    })
+}
 /// Local-only fleet certificate revocation marker. This deliberately lives
 /// beside the device record: no CRL or network dependency is introduced.
 ///
@@ -187,7 +534,7 @@ pub(crate) fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
 
 /// The read-only SHARE ROOT a same-owner fleet device may mount without an
 /// explicit grant. Config value `share` (a directory path); default a dedicated
-/// `~/filament-share`, never home. A mount whose requested root escapes this dir
+/// `~/tunlion-share`, never home. A mount whose requested root escapes this dir
 /// is out of scope (the deliberate tier) and needs an explicit grant.
 ///
 /// COMPOSITION INVARIANT (load-bearing — do not break in a refactor): the
@@ -196,14 +543,14 @@ pub(crate) fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
 /// (write, auto-trusted) could place a file — or, absent plain-file-only write
 /// hardening, a symlink — that the read-only `mount` default then serves,
 /// turning two individually-correct defaults into arbitrary filesystem read.
-/// The defaults (`~/Tunlion` vs `~/filament-share`) are disjoint by
+/// The defaults (`~/Tunlion` vs `~/tunlion-share`) are disjoint by
 /// construction; a user who points `dir` and `share` at overlapping paths
 /// re-opens this, so the mount server must additionally refuse to traverse
 /// out of the share root at open time (see the beneath-root hardening).
 pub(crate) fn fleet_share_root() -> PathBuf {
     config_get("share")
         .map(PathBuf::from)
-        .unwrap_or_else(|| platform::Paths::home_dir().join("filament-share"))
+        .unwrap_or_else(|| platform::Paths::home_dir().join("tunlion-share"))
 }
 
 /// Apply a `tunlion set <key>` change to the LIVE daemon state, the heart of
@@ -226,7 +573,7 @@ pub(crate) async fn apply_reconfigure(
             let nd = settings::get_str("drop-dir", None)
                 .map(PathBuf::from)
                 .unwrap_or_else(default_drop_dir);
-            let _ = std::fs::create_dir_all(&nd);
+            let _ = crate::platform::create_inbox_dir(&nd);
             *dir = nd;
             true
         }

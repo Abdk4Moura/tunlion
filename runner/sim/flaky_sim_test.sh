@@ -22,7 +22,7 @@
 # A background "flapper" then keeps randomly dropping the link for the whole run, so
 # the eventual success is "despite induced drops", not just one scripted outage.
 #
-# LOCAL ONLY: isolated FILAMENT_CONFIG_DIRs + the locally-built binary + a local
+# LOCAL ONLY: isolated TUNLION_CONFIG_DIRs + the locally-built binary + a local
 # backend on its own port. Never touches the user's daemon or ~/.local/bin/tunlion.
 #
 # Usage:  runner/sim/flaky_sim_test.sh            # full flaky run
@@ -138,7 +138,7 @@ cp "$RUNNER/watcher.py"      "$BOX_JOBS/watcher.py"
 # SUPERVISED box-din acceptor: tunlion's socket.io is reconnect(false), so a
 # severed `up` zombies out and the host can't rediscover it. up_supervisor.sh
 # recycles it on a cadence so a fresh, re-announcing acceptor is always present.
-FILAMENT_CONFIG_DIR="$BOX_DIN_CFG" HOME="$BOX_DIN_CFG" PATH="$(dirname "$BIN"):$PATH" \
+TUNLION_CONFIG_DIR="$BOX_DIN_CFG" HOME="$BOX_DIN_CFG" PATH="$(dirname "$BIN"):$PATH" \
   bash "$RUNNER/up_supervisor.sh" --cadence "${FILJOB_SIM_DIN_CADENCE:-90}" --log "$WORK/box_din.log" -- \
   "$BIN" up --server "$SERVER" --name-as filjob-box-din --dir "$BOX_INBOX" \
   >"$WORK/box_din_sup.log" 2>&1 &
@@ -146,7 +146,7 @@ PIDS+=("$!")
 
 # watcher: short reship gap so re-ship reacts fast; long deadline; send waits for
 # peer (FILJOB_SEND_TIMEOUT_S=0). DIRECT route (no TURN locally).
-FILJOB_ROOT="$BOX_JOBS" FILJOB_SERVER="$SERVER" FILAMENT_BIN="$BIN" \
+FILJOB_ROOT="$BOX_JOBS" FILJOB_SERVER="$SERVER" TUNLION_BIN="$BIN" \
   FILJOB_BOX_DOUT_CFG="$BOX_DOUT_CFG" FILJOB_HOST_DOUT_PEER="host-out" \
   PATH="$(dirname "$BIN"):$PATH" \
   "$PY" "$BOX_JOBS/watcher.py" --no-relay --poll 1.0 --settle 0.5 \

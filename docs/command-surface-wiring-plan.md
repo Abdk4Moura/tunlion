@@ -248,7 +248,7 @@ enum Cmd {
         #[arg(long, value_name = "BIND", conflicts_with = "connect")] listen: Option<String>,
         #[arg(long, value_name = "HOST:PORT")] connect: Option<String>,
         #[arg(long)] psk: String,
-        #[arg(long, default_value = "filament0")] dev: String,
+        #[arg(long, default_value = "tunlion0")] dev: String,
         #[arg(long, default_value_t = 1280)] mtu: u32,
     },
 }
@@ -294,7 +294,7 @@ enum NetAction {
         #[arg(long, value_name = "BIND", conflicts_with = "connect")] listen: Option<String>,
         #[arg(long, value_name = "HOST:PORT")] connect: Option<String>,
         #[arg(long)] psk: String,
-        #[arg(long, default_value = "filament0")] dev: String,
+        #[arg(long, default_value = "tunlion0")] dev: String,
         #[arg(long, default_value_t = 1280)] mtu: u32,
     },
 }
@@ -317,7 +317,7 @@ note: `tunlion netcat` is now `tunlion reach`. Same behavior.
 ↳ tunlion reach laptop:5432
 ```
 
-**Rules:** stderr only (stdout stays script-clean), once per invocation, suppressible with `FILAMENT_NO_DEPRECATION=1`, never changes exit code or output, `--json` consumers never see it. Aliases live the whole 0.x line; earliest removal is a 1.0 major with a migration note.
+**Rules:** stderr only (stdout stays script-clean), once per invocation, suppressible with `TUNLION_NO_DEPRECATION=1`, never changes exit code or output, `--json` consumers never see it. Aliases live the whole 0.x line; earliest removal is a 1.0 major with a migration note.
 
 **Alias map:**
 

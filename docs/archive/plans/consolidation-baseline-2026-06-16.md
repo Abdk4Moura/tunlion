@@ -2,7 +2,7 @@
 
 Measured on this host BEFORE any refactor slice, so "no regression" is checkable.
 Run the L2/ssh/transport/gates suites with the venv:
-`FILAMENT_TEST_VENV=/root/.claude/jobs/330c2366/tmp/venv/bin/python` (gates.sh +
+`TUNLION_TEST_VENV=/root/.claude/jobs/330c2366/tmp/venv/bin/python` (gates.sh +
 l2/ssh default to it already; transport-gates needs it exported).
 
 | Check | Command | Baseline |

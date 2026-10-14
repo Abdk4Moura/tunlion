@@ -2,7 +2,7 @@
 # Local loopback e2e for the FILE-DRIVEN tunlion job runner.
 #
 # Boots an ISOLATED tunlion topology on THIS host (separate built binary +
-# separate FILAMENT_CONFIG_DIRs + a local signaling backend) and runs the full
+# separate TUNLION_CONFIG_DIRs + a local signaling backend) and runs the full
 # file-driven submit -> watcher-runs-job -> await(results) loop against it. Never
 # touches the user's live `up --shell` daemon or the installed ~/.local/bin/tunlion.
 #
@@ -70,7 +70,7 @@ trap cleanup EXIT
 
 echo "[test] binary:  $BIN"
 echo "[test] work:    $WORK"
-# The local test drives env-gated test hooks (FILAMENT_TEST_*), which now ship
+# The local test drives env-gated test hooks (TUNLION_TEST_*), which now ship
 # ONLY in a `--features test-hooks` build (stripped from default/release).
 # Auto-build that binary unless an explicit FILJOB_BIN was provided.
 if [ -z "${FILJOB_BIN:-}" ]; then
@@ -106,7 +106,7 @@ echo "[test] backend healthy"
 # --- box din acceptor ----------------------------------------------------------
 # din: a single `up` as the inbound file sink on the din channel (its own config
 # dir so it subscribes to ONLY the din channel). DIRECT route locally.
-FILAMENT_CONFIG_DIR="$BOX_DIN_CFG" HOME="$BOX_DIN_CFG" PATH="$(dirname "$BIN"):$PATH" \
+TUNLION_CONFIG_DIR="$BOX_DIN_CFG" HOME="$BOX_DIN_CFG" PATH="$(dirname "$BIN"):$PATH" \
   "$BIN" up --server "$SERVER" --name-as filjob-box-din --dir "$BOX_INBOX" \
   >"$WORK/box_din.log" 2>&1 &
 PIDS+=("$!")
@@ -115,7 +115,7 @@ PIDS+=("$!")
 # stage the box-side python where the watcher expects to import box_executor.
 cp "$HERE/box_executor.py" "$BOX_JOBS/box_executor.py"
 cp "$HERE/watcher.py"      "$BOX_JOBS/watcher.py"
-FILJOB_ROOT="$BOX_JOBS" FILJOB_SERVER="$SERVER" FILAMENT_BIN="$BIN" \
+FILJOB_ROOT="$BOX_JOBS" FILJOB_SERVER="$SERVER" TUNLION_BIN="$BIN" \
   FILJOB_BOX_DOUT_CFG="$BOX_DOUT_CFG" FILJOB_HOST_DOUT_PEER="host-out" \
   PATH="$(dirname "$BIN"):$PATH" \
   "$PY" "$BOX_JOBS/watcher.py" --no-relay --poll 1.0 --settle 0.5 \

@@ -40,6 +40,45 @@ pub(crate) fn effective_device_caps(name: &str) -> Vec<String> {
     }
 }
 
+/// A device's access as the gate enforces it NOW, for `devices --json`:
+/// `(state, effective caps, cert expiry, access deadline)`. `state` is
+/// `revoked`, `expired` (its invitation ended), `lapsed` (marked lapsed by the
+/// sweep or a depart), or `active`; the effective caps are empty for any but
+/// `active`, because past those states the gate refuses every action. `caps`
+/// beside it used to list the ceiling forever, so an owner read
+/// ["transfer","shell"] for a guest the gate had stopped serving.
+pub(crate) fn device_access_json(record: &Value, now: u64) -> Value {
+    let name = record["name"].as_str().unwrap_or("");
+    let granted = effective_device_caps(name);
+    let cert = crate::identity::DeviceCert::from_json(&record["deviceCert"]);
+    let delegated = crate::identity_state::delegated_access_from_record(record);
+    let revoked = record["certRevoked"].as_bool() == Some(true)
+        || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED);
+    let lapsed = record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_LAPSED);
+    let state = if revoked {
+        "revoked"
+    } else if delegated.as_ref().is_some_and(|a| a.expired(now)) {
+        if lapsed && record["principalExpires"].as_u64().is_some_and(|e| e > now) {
+            "lapsed"
+        } else {
+            "expired"
+        }
+    } else if lapsed {
+        "lapsed"
+    } else {
+        "active"
+    };
+    let effective: Vec<String> = if state == "active" { granted.clone() } else { Vec::new() };
+    json!({
+        "state": state,
+        "effectiveCaps": effective,
+        "grantedCaps": granted,
+        "certExpires": cert.as_ref().map(|c| c.expires),
+        "accessUntil": delegated.as_ref().map(|a| a.deadline),
+        "invitationEnds": record["principalExpires"].as_u64(),
+    })
+}
+
 /// Path-explicit core of `device_caps` (testable without touching the global
 /// config-dir env var).
 #[allow(dead_code)]
@@ -236,8 +275,254 @@ pub(crate) fn mark_bounded_cap_source(name: &str, capability: &str, source: &str
     })
 }
 
+/// Which key an owner-signed grant names.
+///
+/// `Device` is the default and the only scope `tunlion grant <device>` used to
+/// MEAN: the grant names the device's own key (target kind 0x01), so it reaches
+/// exactly the device the operator typed. The writers used to sign every grant
+/// to the peer's USER key (0x00), and a user-targeted grant matches every device
+/// that user has certified. For a device of my own fleet that user key is MINE,
+/// so `grant laptop shell` granted shell to the whole fleet under authoritative
+/// evaluation and `revoke laptop shell` took it from all of them.
+///
+/// `User` is the documented per-person wildcard (docs/design-groups-tags-caps.md
+/// 4.1: grant `User(Alice)` and every device Alice owns inherits it). It stays
+/// available, but only when asked for by name (`--user`), never as the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantScope {
+    Device,
+    User,
+}
+
+impl GrantScope {
+    /// The (target kind, target key) an op for this certified peer names.
+    pub(crate) fn target(self, cert: &crate::identity::DeviceCert) -> (u8, [u8; 32]) {
+        let t = match self {
+            GrantScope::Device => crate::capability::CapTarget::Device(cert.device_pub),
+            GrantScope::User => crate::capability::CapTarget::User(cert.user_pub),
+        };
+        (t.kind_byte(), t.target_bytes())
+    }
+}
+
+/// Make sure the owner's "self" header exists, creating the genesis header when
+/// it does not, and return it.
+pub(crate) fn ensure_self_header(
+    store: &mut Vec<Value>,
+    user_key: &crate::identity::UserKey,
+) -> Result<crate::capability::CapHeader> {
+    let pk = user_key.public_key_bytes();
+    let existing = store
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        })
+        .and_then(crate::capability::CapHeader::from_json);
+    if let Some(h) = existing {
+        return Ok(h);
+    }
+    let mut hdr = crate::capability::CapHeader {
+        resource: crate::capability::self_resource_id(&pk),
+        epoch: 0,
+        owner_pub: pk,
+        nonce: crate::capability::self_resource_nonce(),
+        floors: vec![],
+        issued_at: crate::capability::now_secs(),
+        prev_owner_pub: None,
+        prev_header_hash: None,
+        sig: [0; 64],
+    };
+    hdr.sig = crate::capability::sign_cap_header(&hdr, user_key.keypair());
+    let mut value = hdr.to_json();
+    value["resource"] = json!("self");
+    store.push(value);
+    crate::capability::CapHeader::from_json(store.last().expect("just pushed"))
+        .ok_or_else(|| anyhow::anyhow!("capability store header did not round-trip"))
+}
+
+/// Mint one owner-signed op for (target, resource) at a version strictly above
+/// everything the store has recorded for that key, revoke tombstones included,
+/// so a regrant after a revoke lands above the tombstone instead of being
+/// refused by it.
+pub(crate) fn sign_next_cap_op(
+    store: &[Value],
+    user_key: &crate::identity::UserKey,
+    kind: crate::capability::CapOpKind,
+    (target_kind, target): (u8, [u8; 32]),
+    resource: &str,
+    permissions: Vec<String>,
+    expires: u64,
+) -> crate::capability::CapOp {
+    let pk = user_key.public_key_bytes();
+    let latest = crate::capability::latest_op_version(store, &pk, resource, target_kind, &target);
+    let mut op = crate::capability::CapOp {
+        op: kind,
+        grantor: pk,
+        target_kind,
+        target,
+        resource: resource.to_string(),
+        permissions,
+        expires,
+        issued_at: crate::capability::now_secs(),
+        version: crate::capability::hlc_next(latest, crate::capability::now_ms()),
+        sig: [0; 64],
+    };
+    op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
+    op
+}
+
+/// Does a live user-wide grant (target kind 0x00, the peer's user key) from
+/// `grantor` carry `capability` for this peer? Such a grant authorizes the
+/// device whatever happens to its own device-targeted grant, so a per-device
+/// revoke has to know about it.
+pub(crate) fn user_wide_grant_covers(
+    store: &[Value],
+    grantor: &[u8; 32],
+    cert: &crate::identity::DeviceCert,
+    capability: &str,
+) -> bool {
+    let (kind, target) = GrantScope::User.target(cert);
+    let (grantor_hex, target_hex) = (hex::encode(grantor), hex::encode(target));
+    let now = crate::capability::now_secs();
+    store.iter().any(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
+            && e["grantor"].as_str() == Some(grantor_hex.as_str())
+            && e["resource"].as_str() == Some("self")
+            && e["targetKind"].as_u64().unwrap_or(0) == kind as u64
+            && e["target"].as_str() == Some(target_hex.as_str())
+            && crate::capability::grant_active(e["expires"].as_u64().unwrap_or(0), now)
+            && e["permissions"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|c| c.as_str() == Some(capability)))
+    })
+}
+
+/// The owner-signed Revoke ops `tunlion revoke <device> <cap>` applies, and
+/// whether a user-wide grant had to be taken with it.
+///
+/// The first op names the same key the grant named (`scope`). When revoking a
+/// DEVICE grant and a live user-wide grant still carries the capability for
+/// this peer, a second op revokes that too: otherwise the device keeps the
+/// capability through its user key and the revoke reports success while
+/// changing nothing. A revoke errs toward removing access.
+pub(crate) fn signed_revoke_ops(
+    store: &[Value],
+    user_key: &crate::identity::UserKey,
+    cert: &crate::identity::DeviceCert,
+    capability: &str,
+    scope: GrantScope,
+) -> (Vec<crate::capability::CapOp>, bool) {
+    let expires = crate::capability::now_secs().saturating_add(90 * 24 * 3600);
+    let revoke = |target| {
+        sign_next_cap_op(
+            store,
+            user_key,
+            crate::capability::CapOpKind::Revoke,
+            target,
+            "self",
+            vec![capability.to_string()],
+            expires,
+        )
+    };
+    let mut ops = vec![revoke(scope.target(cert))];
+    let also_user_wide = scope == GrantScope::Device
+        && user_wide_grant_covers(store, &user_key.public_key_bytes(), cert, capability);
+    if also_user_wide {
+        ops.push(revoke(GrantScope::User.target(cert)));
+    }
+    (ops, also_user_wide)
+}
+
+/// Revoke every owner-signed grant that names this certificate's DEVICE key,
+/// on every resource, with a signed Revoke op per resource (`apply_cap_op`
+/// leaves a tombstone at the new version, so the old grant op cannot be
+/// replayed back in). Applied to `store` in place; returns how many resources
+/// were revoked. `devices forget` calls this: the grants live in caps.json,
+/// keyed by key rather than by name, so dropping the record left them behind
+/// for that key. User-wide grants are not touched: they name the user key and
+/// cover that user's other devices too.
+pub(crate) fn revoke_device_grants_in(
+    store: &mut Vec<Value>,
+    user_key: &crate::identity::UserKey,
+    cert: &crate::identity::DeviceCert,
+    now: u64,
+) -> Result<usize> {
+    let (kind, target) = GrantScope::Device.target(cert);
+    let (grantor_hex, target_hex) = (hex::encode(user_key.public_key_bytes()), hex::encode(target));
+    // resource -> every permission granted on it, so each tombstone names
+    // what it took away.
+    let mut resources: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for e in store.iter().filter(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
+            && e["grantor"].as_str() == Some(grantor_hex.as_str())
+            && e["targetKind"].as_u64().unwrap_or(0) == kind as u64
+            && e["target"].as_str() == Some(target_hex.as_str())
+    }) {
+        let Some(resource) = e["resource"].as_str() else {
+            continue;
+        };
+        let perms = resources.entry(resource.to_string()).or_default();
+        for p in e["permissions"].as_array().into_iter().flatten() {
+            if let Some(p) = p.as_str() {
+                if !perms.iter().any(|x| x == p) {
+                    perms.push(p.to_string());
+                }
+            }
+        }
+    }
+    let expires = now.saturating_add(90 * 24 * 3600);
+    let mut revoked = 0;
+    for (resource, perms) in resources {
+        let Some(hdr) = store
+            .iter()
+            .find(|e| {
+                e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                    && e["resource"].as_str() == Some(resource.as_str())
+            })
+            .and_then(crate::capability::CapHeader::from_json)
+        else {
+            continue;
+        };
+        let op = sign_next_cap_op(
+            store,
+            user_key,
+            crate::capability::CapOpKind::Revoke,
+            (kind, target),
+            &resource,
+            perms,
+            expires,
+        );
+        crate::capability::apply_cap_op(store, &hdr, &op, now)?;
+        revoked += 1;
+    }
+    Ok(revoked)
+}
+
+/// [`revoke_device_grants_in`] against caps.json, saved when anything changed.
+/// A device without the owner key holds no grant it could revoke (it cannot
+/// sign one), so there it is a no-op.
+pub(crate) fn revoke_device_grants(cert: &crate::identity::DeviceCert, now: u64) -> Result<usize> {
+    let Some(user_key) = load_owner_key() else {
+        return Ok(0);
+    };
+    let config_dir = crate::settings::config_dir();
+    let mut store = crate::capability::load_cap_store(&config_dir);
+    let n = revoke_device_grants_in(&mut store, &user_key, cert, now)?;
+    if n > 0 {
+        // The returned list feeds the authorized_keys reconcile, which is
+        // keyed by device NAME; the forgotten device's own block is removed
+        // by its caller, by name, since its record is about to go.
+        let _ = crate::capability::save_and_list_revoked(&store, &config_dir)?;
+    }
+    Ok(n)
+}
+
 /// Add the authoritative owner-signed bounded grant when the peer is certified.
 /// Uncertified peers intentionally retain the legacy `capExpires` fallback.
+///
+/// The grant names the DEVICE key (see `GrantScope`): approving one device's
+/// request must not hand the capability to every device its user certified.
 pub(crate) fn issue_signed_bounded_grant(
     device: &str,
     capability: &str,
@@ -255,39 +540,16 @@ pub(crate) fn issue_signed_bounded_grant(
     let config_dir = crate::settings::config_dir();
     let mut store = crate::capability::load_cap_store(&config_dir);
     let pk = user_key.public_key_bytes();
-    if !store.iter().any(|e| {
-        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-            && e["resource"].as_str() == Some("self")
-    }) {
-        let mut hdr = crate::capability::CapHeader {
-            resource: crate::capability::self_resource_id(&pk),
-            epoch: 0,
-            owner_pub: pk,
-            nonce: crate::capability::self_resource_nonce(),
-            floors: vec![],
-            issued_at: crate::capability::now_secs(),
-            prev_owner_pub: None,
-            prev_header_hash: None,
-            sig: [0; 64],
-        };
-        hdr.sig = crate::capability::sign_cap_header(&hdr, user_key.keypair());
-        let mut value = hdr.to_json();
-        value["resource"] = json!("self");
-        store.push(value);
-    }
-    let mut op = crate::capability::CapOp {
-        op: crate::capability::CapOpKind::Grant,
-        grantor: pk,
-        target_kind: 0x00,
-        target: peer_cert.user_pub,
-        resource: "self".into(),
-        permissions: vec![capability.into()],
+    ensure_self_header(&mut store, &user_key)?;
+    let op = sign_next_cap_op(
+        &store,
+        &user_key,
+        crate::capability::CapOpKind::Grant,
+        GrantScope::Device.target(&peer_cert),
+        "self",
+        vec![capability.into()],
         expires,
-        issued_at: crate::capability::now_secs(),
-        version: crate::capability::hlc_next(0, crate::capability::now_ms()),
-        sig: [0; 64],
-    };
-    op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
+    );
     let mut value = op.to_json();
     value["type"] = json!("cap_grant");
     store.push(value);
@@ -299,7 +561,7 @@ pub(crate) fn issue_signed_bounded_grant(
 pub(crate) fn devices_remove(name: &str) -> Result<()> {
     let p = devices_path();
     if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::platform::create_private_dir_all(dir)?;
     }
     // Raw-array filter so the REMAINING devices keep their v2 fields (caps,
     // addedAt). The old tuple round-trip rewrote every survivor as bare

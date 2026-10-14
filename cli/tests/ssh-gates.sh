@@ -12,17 +12,17 @@
 #   B  NEGATIVE no-cap refusal — a paired device WITHOUT the shell cap is REFUSED
 #      the bootstrap (shell-bootstrap-deny); `tunlion ssh` aborts BEFORE invoking
 #      ssh. Zero shell, clear denial.
-#   C  marked + removable — the # BEGIN/END filament-managed block is present
+#   C  marked + removable — the # BEGIN/END tunlion-managed block is present
 #      after grant and GONE after `revoke`.
 #   D  host-key pin is REAL — a second connection with StrictHostKeyChecking=yes
 #      (no accept-new) against the pre-pinned known_hosts succeeds, proving the
 #      pin actually matched (not a silent TOFU).
 #
-# Topology mirrors l2-gates.sh: side B = acceptor (`tunlion up`, FILAMENT_L2=1),
+# Topology mirrors l2-gates.sh: side B = acceptor (`tunlion up`, TUNLION_L2=1),
 # side A = initiator (`tunlion ssh`). Reciprocal pair secret => B trusts A.
 # The acceptor runs with HOME sandboxed to a temp dir so its authorized_keys
 # write never touches the real home; a throwaway sshd reads that sandboxed
-# authorized_keys and serves a hostkey the acceptor reports via FILAMENT_SSH_HOSTKEY.
+# authorized_keys and serves a hostkey the acceptor reports via TUNLION_SSH_HOSTKEY.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -30,7 +30,7 @@ CLI_DIR="$(dirname "$HERE")"
 BIN="$CLI_DIR/target/release/tunlion"
 PORT=8098
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
 WORK="$(mktemp -d /root/.claude/jobs/330c2366/tmp/wt-ssh-gates.XXXXXX 2>/dev/null || mktemp -d /tmp/wt-ssh-gates.XXXXXX)"
 
 PASS=0; FAIL=0; FAILED=""
@@ -63,7 +63,7 @@ SSHD_PORT=9133
 ssh-keygen -q -t ed25519 -f "$SSHD/hostkey" -N ""
 USERNAME=$(id -un)
 # Acceptor's HOME sandbox: sshd reads THIS authorized_keys (the file the acceptor
-# writes the filament-managed block into).
+# writes the tunlion-managed block into).
 BHOME="$WORK/Bhome"; mkdir -p "$BHOME/.ssh"; chmod 700 "$BHOME/.ssh"
 AK="$BHOME/.ssh/authorized_keys"; : > "$AK"; chmod 600 "$AK"
 cat > "$SSHD/sshd_config" <<CFG
@@ -89,11 +89,11 @@ SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
 printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
-# Acceptor (side B): HOME sandboxed; reports the throwaway hostkey; FILAMENT_L2=1.
+# Acceptor (side B): HOME sandboxed; reports the throwaway hostkey; TUNLION_L2=1.
 B_DROP="$WORK/Bdrop"; mkdir -p "$B_DROP"
 start_acceptor() {
-  env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" FILAMENT_L2=1 FILAMENT_NAME=boxB \
-      FILAMENT_SSH_HOSTKEY="$SSHD/hostkey.pub" USER="$USERNAME" \
+  env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxB \
+      TUNLION_SSH_HOSTKEY="$SSHD/hostkey.pub" USER="$USERNAME" \
       "$BIN" up --dir "$B_DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
   pids+=($!)
 }
@@ -103,8 +103,8 @@ sleep 3
 # Initiator env (side A). NO ssh keypair anywhere: config dir has only devices.json,
 # and HOME points at an empty dir with no ~/.ssh — proving zero pre-existing setup.
 AHOME="$WORK/Ahome"; mkdir -p "$AHOME"
-A_ENV=(env HOME="$AHOME" FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA \
-       FILAMENT_SSH_PORT="$SSHD_PORT" FILAMENT_SSH_USER="$USERNAME")
+A_ENV=(env HOME="$AHOME" TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA \
+       TUNLION_SSH_PORT="$SSHD_PORT" TUNLION_SSH_USER="$USERNAME")
 
 # Sanity: the client truly has no ssh key/known_hosts at the start.
 [ ! -e "$AHOME/.ssh" ] && [ ! -e "$DA/ssh" ] || echo "## NOTE: pre-existing ssh material (unexpected)"
@@ -129,7 +129,7 @@ fi
 # ===================================================================== grant ===
 # Acceptor-side consent: grant boxA the shell cap. (Mutates devices.json; the
 # running acceptor reads caps live from disk in the bootstrap arm.)
-env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
 echo "## grant: $(cat "$WORK/grant.log")"
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
@@ -152,11 +152,11 @@ fi
 # ===================================================================== GATE C ==
 # Marked + removable: the managed block is present after grant, gone after revoke.
 say C
-if grep -q "# BEGIN filament-managed boxA" "$AK" && grep -q "# END filament-managed boxA" "$AK"; then
-  env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "$BIN" revoke boxA shell >"$WORK/revoke.log" 2>&1
+if grep -q "# BEGIN tunlion-managed boxA" "$AK" && grep -q "# END tunlion-managed boxA" "$AK"; then
+  env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxA shell >"$WORK/revoke.log" 2>&1
   echo "## revoke: $(cat "$WORK/revoke.log")"
-  if ! grep -q "filament-managed boxA" "$AK"; then
-    ok "gateC: authorized_keys filament-managed block present after grant, removed by revoke"
+  if ! grep -q "tunlion-managed boxA" "$AK"; then
+    ok "gateC: authorized_keys tunlion-managed block present after grant, removed by revoke"
   else
     echo "-- authorized_keys --"; cat "$AK"
     bad "gateC: revoke did not strip the managed block"
@@ -174,7 +174,7 @@ fi
 say D
 KH="$DA/ssh/known_hosts"
 KEY="$DA/ssh/id_ed25519"
-HOST="filament-boxB"
+HOST="tunlion-boxB"
 if [ -f "$KH" ] && grep -q "^$HOST " "$KH"; then
   # Re-install boxA's key directly (gate C just revoked it) so pubkey auth works
   # for this isolated check; we are only testing the HOST-key pin here.

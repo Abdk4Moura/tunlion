@@ -28,7 +28,7 @@ use crate::identity::{MeshRoster, RosterDevice, UserKey};
 /// whose roster expires loses nothing functional. Keep the window small now;
 /// lengthening it later has to be argued for.
 pub fn roster_ttl_secs() -> u64 {
-    std::env::var("FILAMENT_ROSTER_TTL_SECS")
+    std::env::var("TUNLION_ROSTER_TTL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)

@@ -5,7 +5,7 @@
 # revoke intermittently reported success and did not stick. Standalone, hermetic,
 # fixture port 8117 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./devices-write-race-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./devices-write-race-gates.sh
 #
 # Vacuity guard: the race only exists while the daemon's 8s liveness sweep is
 # actually running against a live link. The gate keeps a live shell open for the
@@ -14,10 +14,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8117
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-devices-race.XXXXXX")"
 DA="$WORK/A"
 CYCLES=20
@@ -34,7 +34,7 @@ json_get() { python3 -c "import json,sys; d=json.load(open('$1')); r=[x for x in
 
 # A live shell keeps the link up so the daemon's liveness sweep keeps rewriting
 # devices.json (lastSeen) every 8s, the exact condition under which #238 bites.
-env FILAMENT_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" shell alpha -- \
+env TUNLION_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" shell alpha -- \
   'for i in $(seq 1 120); do echo TICK-$i; sleep 1; done' >"$WORK/pty.out" 2>/dev/null &
 FIX_PIDS+=($!)
 sleep 5
@@ -42,12 +42,12 @@ sleep 5
 LASTSEEN_START=$(json_get "$DA/devices.json" lastSeen)
 MISSES=0
 for i in $(seq 1 "$CYCLES"); do
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
   sleep 1
   if [ "$(json_get "$DA/devices.json" certRevoked)" != "True" ]; then
     MISSES=$((MISSES+1))
   fi
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices restore bravo >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" devices restore bravo >/dev/null 2>&1
   sleep 1
 done
 LASTSEEN_END=$(json_get "$DA/devices.json" lastSeen)

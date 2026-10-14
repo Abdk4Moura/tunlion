@@ -5,8 +5,9 @@
 //! `join_cmd` claims a code, `local_device_cert` and `principal_from_records` read
 //! the resulting local state, and `open_enrollment` is the fleet side of joining.
 //!
-//! Six scattered blocks. NO member is definition-gated: the `#[cfg(l3)]` inside
-//! init_experience is a statement attribute and travels with the body, and
+//! Six scattered blocks. One member is definition-gated, `offer_l3_grant`, and its
+//! only caller is the `#[cfg(l3)]` statement inside init_experience, which travels
+//! with the body; and
 //! dispatch.rs imports init_experience unconditionally. The only gate is on the `l3`
 //! module import, because anyhow::{ Result, bail };
 use crate::UiCapability;
@@ -178,7 +179,7 @@ pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
 /// Restores the pre-U1 precondition for scripts that want to fail fast: with
 /// this set (any value but empty or `0`), a verb that needs an identity bails
 /// with the old "run `tunlion init` first" instead of minting one.
-pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "FILAMENT_NO_IMPLICIT_INIT";
+pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "TUNLION_NO_IMPLICIT_INIT";
 
 /// Whether the opt-out above is set (any value except empty and `0`).
 ///
@@ -192,6 +193,93 @@ pub(crate) fn implicit_init_disabled() -> bool {
     std::env::var_os(NO_IMPLICIT_INIT_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// What every read-only command says on a device with no identity. The two
+/// commands named are the only two ways to get one deliberately; `init` makes
+/// this device the owner, `join` makes it a member of someone else's mesh.
+pub(crate) const NO_IDENTITY_MSG: &str =
+    "no identity yet; run `tunlion init` or `tunlion join <invitation>`";
+
+/// `add` on a device with no identity. `add` offers THIS device's identity to
+/// another, so it needs one, and the one it used to mint on the spot ("created
+/// your identity at ...") came with no recovery phrase, while `init` insists on
+/// one. So `add` refuses (exit 9) and names the ceremony that does it right.
+pub(crate) const ADD_NEEDS_INIT_MSG: &str =
+    "no identity yet: `tunlion add` offers this device's identity, and it has none. \
+     Run `tunlion init` first (it creates the identity and shows its recovery phrase), then add again. \
+     To accept a code or an invitation you were given instead, run `tunlion join <code-or-file>`";
+
+/// [`ADD_NEEDS_INIT_MSG`] as the exit-9 error, or None when there is an identity.
+pub(crate) fn add_needs_init() -> Option<anyhow::Error> {
+    (!has_identity()).then(|| {
+        crate::exit_codes::err(crate::exit_codes::ExitKind::NoIdentity, ADD_NEEDS_INIT_MSG)
+    })
+}
+
+/// `up` on a device with no identity AND nothing paired: such a daemon serves
+/// no one, and `up --detach` used to exit 0 and run while `--help` says 9 is
+/// "no identity". A device with no identity that HAS code-paired devices is
+/// the legitimate receive-only daemon (gates 7/14, C12 live pairing, and every
+/// gate that pairs by secret), so that one still runs.
+pub(crate) const UP_NEEDS_IDENTITY_MSG: &str =
+    "no identity yet, and no paired devices: a daemon here would serve no one. \
+     Run `tunlion init` (makes this your first device) or `tunlion join <code-or-invitation>` first, then `tunlion up`";
+
+/// Pure: may `up` start? `devices_json` is the device store's text, if any.
+pub(crate) fn up_refused_for_identity(has_identity: bool, devices_json: Option<&str>) -> bool {
+    if has_identity {
+        return false;
+    }
+    match devices_json {
+        None => true,
+        // An unreadable store is not "nothing paired": leave it to the
+        // corrupt-state handling that names the file.
+        Some(raw) => serde_json::from_str::<Vec<Value>>(raw).is_ok_and(|a| a.is_empty()),
+    }
+}
+
+/// [`UP_NEEDS_IDENTITY_MSG`] as the exit-9 error when `up` would serve no one.
+pub(crate) fn up_needs_identity() -> Option<anyhow::Error> {
+    // A config directory that cannot even be made (a path past PATH_MAX, a
+    // HOME that does not exist) is the real cause, and the daemon lock below
+    // names it precisely (hostile-env gates L and H): no opinion here.
+    let dir = settings::config_dir();
+    if !dir.is_dir() && crate::platform::create_private_dir_all(&dir).is_err() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(crate::devices_store::devices_path()).ok();
+    up_refused_for_identity(has_identity(), raw.as_deref()).then(|| {
+        crate::exit_codes::err(crate::exit_codes::ExitKind::NoIdentity, UP_NEEDS_IDENTITY_MSG)
+    })
+}
+
+/// Does this device have an identity: an owner key, or a joined certificate?
+/// Reads only. `join` refuses a device for which this is true, which is why
+/// nothing that merely LOOKS at the identity may make it true.
+pub(crate) fn has_identity() -> bool {
+    identity::UserKey::load(&crate::platform::PlatformKeyStore)
+        .ok()
+        .flatten()
+        .is_some()
+        || local_device_cert_path().exists()
+}
+
+/// The read-only answer on a device with no identity: say so, mint nothing,
+/// and fail with `ExitKind::NoIdentity` (exit 9). Under `--json` the answer is
+/// the failure envelope with `"identity": null` (and `"configured": false`,
+/// the field `id --json` has always carried) on stdout.
+pub(crate) fn no_identity(json: bool) -> anyhow::Error {
+    use crate::exit_codes::{ExitKind, json_error, reported};
+    if json {
+        let mut v = json_error(ExitKind::NoIdentity, NO_IDENTITY_MSG, None);
+        v["identity"] = Value::Null;
+        v["configured"] = json!(false);
+        ui::json_out(&v);
+    } else {
+        ui::critical(NO_IDENTITY_MSG);
+    }
+    reported(ExitKind::NoIdentity)
+}
+
 /// The identity, minted on first use (U1). A keypair is not a ceremony: the
 /// bails that read "no identity. Run `tunlion init` first" route through here
 /// and proceed instead. Prints one past-tense line the ONE time the key is
@@ -201,7 +289,10 @@ pub(crate) fn implicit_init_disabled() -> bool {
 ///
 /// WHERE IT IS CALLED, and the rule behind the list: a verb mints only when it
 /// needs the key to do the job it was asked to do. `add --for` and both `grant`
-/// paths sign with it; `id` is the verb whose entire subject is the identity.
+/// paths sign with it. `id` used to mint too, on the theory that the identity
+/// is its whole subject; that made `tunlion id` on a fresh machine create a key
+/// and then `tunlion join` refuse the machine for having one. A command that
+/// only looks never mints: `id` answers `no_identity` (exit 9) instead.
 /// The bare tour screen (`status_cmd::tour_cmd`) does NOT call this and must
 /// not: it is an inspect screen that renders whatever state it finds, so
 /// minting there would make `tunlion` with no arguments write a private key
@@ -250,7 +341,7 @@ pub(crate) fn ensure_user_key_inner() -> Result<(identity::UserKey, bool)> {
     }
     let dir = settings::config_dir();
     if !dir.exists() {
-        std::fs::create_dir_all(&dir)
+        crate::platform::create_private_dir_all(&dir)
             .with_context(|| format!("create config dir {}", dir.display()))?;
         crate::platform::tighten_new_dir(&dir);
     }
@@ -298,10 +389,23 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
             eprintln!("  Anyone who captures this QR can become you.");
             eprintln!(
                 "{}",
-                ui::qr_or_text(&format!("filament-recovery:v1:{phrase}"), 2)
+                ui::qr_or_text(&format!("{RECOVERY_QR_PREFIX}{phrase}"), 2)
             );
             let _ = prompt_line("  Press Enter after saving it somewhere you control: ")?;
         }
+        // The quiz checks the copy the person WROTE DOWN. With all twelve
+        // words still on screen it checked whether they could read, and a
+        // first-time-user test answered it by reading. Wipe the screen (the
+        // alternate screen, so the scrollback never held the words) first.
+        execute!(
+            err,
+            terminal::Clear(terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        )?;
+        ui::critical(&ui::paint(ui::Tone::Brand, "  TUNLION / CHECK YOUR COPY"));
+        ui::critical("");
+        ui::critical("  The words are off the screen. Answer from what you wrote down.");
+        ui::critical("");
         let fourth = prompt_line("  Word 4:  ")?;
         if fourth != words[3] {
             bail!("word 4 did not match; identity was not created");
@@ -316,6 +420,98 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
     result
 }
 
+/// The inbox `init` writes to the config: always an absolute path. A relative
+/// one names a different directory from every working directory the daemon is
+/// started in. `env -u HOME tunlion init` printed "inbox: ./Tunlion" and wrote
+/// `dir ./Tunlion`. A relative `--inbox` is made absolute against the current
+/// directory, which is what the person typing it meant. With no `--inbox` and
+/// no home directory anywhere (HOME unset and none in the password database)
+/// there is no right default, so init refuses, before any key is written, and
+/// says how to choose one. `home_known` is `Paths::home_dir_known().is_some()`.
+pub(crate) fn resolve_init_inbox(flag: Option<PathBuf>, home_known: bool) -> Result<PathBuf> {
+    match flag {
+        Some(p) if p.is_absolute() => Ok(p),
+        Some(p) => Ok(std::env::current_dir()
+            .context("cannot resolve the relative --inbox: the current directory is unreadable")?
+            .join(p)),
+        None if home_known => Ok(default_drop_dir()),
+        None => Err(anyhow::anyhow!(
+            "cannot choose an inbox: HOME is not set and the password database has no home directory for this user. Set HOME, or pass an absolute path with --inbox <dir>",
+        )),
+    }
+}
+
+/// Why `init` must not run here, or None when it may.
+///
+/// Init MINTS an identity. It used to look only for the owner key
+/// (`identity.ed25519`), and a JOINED device has none: it holds a device
+/// certificate (`identity/device-cert.json`) signed by someone else's key. So a
+/// scripted `init --name x --recovery-file f -y` on a joined device, daemon
+/// running, printed "identity created ... Setup complete", made the device an
+/// owner of a new identity and filed its real owner under "other people". It
+/// was never a path-resolution split: both files resolve through the same
+/// `Paths::config_path`. The check looked at half of what "an identity" is.
+///
+/// Replacing an identity is a separate, explicit, destructive act (`reset`),
+/// and `-y` is not consent to it: it only answers init's own prompts. A
+/// running daemon is refused too, the way `reset` refuses one, because it holds
+/// the keys init would write. Pure, so every arm is tested.
+pub(crate) fn init_refusal(
+    daemon_pid: Option<u32>,
+    owner_fp: Option<String>,
+    joined_owner_fp: Option<String>,
+) -> Option<String> {
+    let start_over = "To start over on this device: `tunlion down`, then `tunlion reset` (it wipes this device's identity and pairings), then `tunlion init`";
+    if let Some(fp) = owner_fp {
+        return Some(format!(
+            "this device already has identity {fp}, and init never replaces one; see `tunlion id`. {start_over}"
+        ));
+    }
+    if let Some(fp) = joined_owner_fp {
+        return Some(format!(
+            "this device already joined identity {fp} (it holds a device certificate from that owner), and init never replaces an identity; see `tunlion id`. {start_over}"
+        ));
+    }
+    if let Some(pid) = daemon_pid {
+        return Some(format!(
+            "the tunlion daemon is running (pid {pid}); run `tunlion down` first, then `tunlion init`"
+        ));
+    }
+    None
+}
+
+/// `devices` on a device with no identity and nothing stored answers like `id`
+/// (exit 9, `no_identity`): there is no list to show, so exit 0 with an empty
+/// screen said "fine" where `status` and `id` said "not set up". A keyless
+/// device that paired by code has records, and lists them. Pure.
+pub(crate) fn devices_has_nothing_to_list(has_identity: bool, entries: usize) -> bool {
+    !has_identity && entries == 0
+}
+
+/// The owner fingerprint a joined device's certificate names, when the device
+/// holds one. Presence decides, not validity: an expired certificate, or one
+/// whose device key no longer matches, is still an identity init must not
+/// silently write over. An unreadable one is reported as "unknown".
+fn joined_owner_fingerprint() -> Option<String> {
+    let path = local_device_cert_path();
+    if !path.exists() {
+        return None;
+    }
+    let fp = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        .and_then(|v| identity::DeviceCert::from_json(&v["cert"]))
+        .map(|c| owner_fingerprint_of(&c.user_pub))
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(fp)
+}
+
+/// The 8-hex fingerprint of an owner public key, as `UserKey::fingerprint`
+/// and `id` render it. Pure.
+pub(crate) fn owner_fingerprint_of(user_pub: &[u8; 32]) -> String {
+    hex::encode(user_pub).chars().take(8).collect()
+}
+
 pub(crate) async fn init_experience(
     caps: &UiCapability,
     server: &str,
@@ -328,15 +524,17 @@ pub(crate) async fn init_experience(
     no_background: bool,
 ) -> Result<()> {
     let store = crate::platform::PlatformKeyStore;
+    // Refusals first, before any flag check: init never replaces an identity.
+    if let Some(why) = init_refusal(
+        crate::daemon_alive(),
+        identity::UserKey::load(&store)?.map(|k| k.fingerprint()),
+        joined_owner_fingerprint(),
+    ) {
+        bail!("{why}");
+    }
     if caps.json && background {
         bail!(
             "init --json cannot install a service without mixing service output; run `tunlion up --install` separately"
-        );
-    }
-    if let Some(existing) = identity::UserKey::load(&store)? {
-        bail!(
-            "this device already has identity {}; see `tunlion id`",
-            existing.fingerprint()
         );
     }
     // Non-interactive init names EVERYTHING it needs in one message, so a
@@ -354,7 +552,11 @@ pub(crate) async fn init_experience(
             missing.push("--name <device>");
         }
         if !missing.is_empty() {
-            bail!("non-interactive init needs: {}", missing.join(", "));
+            // A usage error (exit 2): the command line is incomplete.
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::Usage,
+                format!("non-interactive init needs: {}", missing.join(", ")),
+            ));
         }
     }
 
@@ -371,30 +573,98 @@ pub(crate) async fn init_experience(
         }
         None => bail!("non-interactive init requires --name <device>"),
     };
-    let inbox = inbox.unwrap_or_else(default_drop_dir);
+    let inbox = resolve_init_inbox(inbox, crate::platform::Paths::home_dir_known().is_some())?;
     let pending = identity::PendingIdentity::generate()?;
     let phrase = Zeroizing::new(pending.mnemonic().to_string());
     let words = pending.mnemonic().words().collect::<Vec<_>>();
 
-    if let Some(path) = recovery_file.as_deref() {
-        write_owner_only_file(path, phrase.as_str())?;
-    } else if let Some(fd) = recovery_fd {
-        write_owner_only_fd(fd, phrase.as_str())?;
-    } else {
+    // ORDER MATTERS. The identity is persisted (atomically) FIRST and the
+    // recovery phrase written SECOND, and a failed phrase write takes the
+    // identity back out. The reverse order left an orphan phrase file on a
+    // read-only HOME: the phrase was written, the identity commit failed, and the
+    // file on disk recovered an identity that never existed. The interactive path
+    // only shows the phrase (nothing to clean up), so it confirms first as before.
+    let interactive_phrase = recovery_file.is_none() && recovery_fd.is_none();
+    if interactive_phrase {
         confirm_recovery_phrase(&words, phrase.as_str())?;
     }
-
     let user_key = pending.commit(&store)?;
+    if !interactive_phrase {
+        let exported = match (recovery_file.as_deref(), recovery_fd) {
+            (Some(path), _) => write_owner_only_file(path, phrase.as_str()),
+            (None, Some(fd)) => write_owner_only_fd(fd, phrase.as_str()),
+            (None, None) => Ok(()),
+        };
+        if let Err(e) = exported {
+            // No identity without its way back: undo the commit.
+            let key_path = identity::user_key_path(&store);
+            let undone = std::fs::remove_file(&key_path).is_ok();
+            return Err(e.context(if undone {
+                "could not export the recovery phrase, so the identity was NOT created".to_string()
+            } else {
+                format!(
+                    "could not export the recovery phrase, and could not remove the new identity at {}; delete it before running init again",
+                    key_path.display()
+                )
+            }));
+        }
+    }
     config_set("name", &device_name)?;
     config_set("dir", &inbox.display().to_string())?;
-    std::fs::create_dir_all(&inbox)?;
+    crate::platform::create_inbox_dir(&inbox)?;
     certify_local_device(&user_key, &device_name)?;
     ensure_self_genesis_header(&crate::settings::config_dir(), &user_key);
+    // The identity is saved: say so now, and say it is DONE. Everything after
+    // this line is optional, and a first-time user dropped into a password
+    // prompt with no word that setup had finished could not tell which part of
+    // init had failed. Nothing below can undo what is printed here.
+    if !caps.json {
+        ui::say(&format!(
+            "  {} identity created",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok())
+        ));
+        ui::say(&format!(
+            "  {} this device: {}",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            ui::paint(ui::Tone::Bold, &device_name)
+        ));
+        ui::say(&format!(
+            "  {} inbox: {}",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            inbox.display()
+        ));
+        ui::say("");
+        ui::say("  Least privilege by default");
+        ui::say("  + paired devices may send into this inbox");
+        ui::say("  - remote shell is off");
+        ui::say("  - remote writing is off");
+        ui::say("  - local ports are private");
+        ui::say("");
+        // critical, not say: the one line `-q` must not swallow.
+        ui::critical(&format!(
+            "  {} Setup complete.",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok())
+        ));
+        ui::say("");
+    }
+    // Do not offer what this machine cannot do. Asking "stay available in the
+    // background?" and then answering yes with "--install is not supported on
+    // this platform" is the contradiction a first-time user hit on a box with
+    // no service manager. Detect first; where nothing can start tunlion at boot,
+    // point at the thing that does work instead.
+    let host_can_install = crate::platform::ServiceHost::detect().supports_install();
     let start_background = if no_background {
+        false
+    } else if background && !host_can_install {
+        ui::say(&format!(
+            "  {} {}",
+            ui::paint(ui::Tone::Warn, "!"),
+            background_hint(false)
+        ));
         false
     } else if background {
         true
-    } else if caps.interactive {
+    } else if caps.interactive && host_can_install {
         // `-y` means "answer this prompt with its default", and the default is Y.
         // Without it `tunlion init --yes` BLOCKED on a real terminal: the
         // identity was written, then it sat on "Stay available in the
@@ -420,11 +690,16 @@ pub(crate) async fn init_experience(
         false
     };
     if start_background {
+        // No daemon flags are forwarded: the inbox was just written to the
+        // config (`dir` above), which the service reads on every start, so a
+        // later `tunlion set drop-dir` still applies to it.
         up_cmd(
             server,
-            true,
-            false,
-            false,
+            crate::up_logs::UpMode {
+                install: true,
+                ..Default::default()
+            },
+            &crate::up_logs::DaemonOpts::default(),
             Some(inbox.clone()),
             relay,
             false,
@@ -433,17 +708,19 @@ pub(crate) async fn init_experience(
             None,
             false,
             false,
-            false,
         )
         .await
         .context("install always-on receive service")?;
     }
 
     if caps.json {
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "verb": "init",
                 "identity": user_key.fingerprint(),
+                "role": "owner",
                 "device": device_name,
                 "inbox": inbox,
                 "recoveryExported": true,
@@ -452,41 +729,6 @@ pub(crate) async fn init_experience(
         );
         return Ok(());
     }
-    // L3 is default-on (`tun-addr` defaults to "auto"), and a non-root daemon
-    // needs CAP_NET_ADMIN to open the tunnel device. Ask for the one-time grant
-    // HERE, at init, because this is the moment there is a terminal to answer a
-    // sudo prompt; the daemon has none. Declining is not fatal: the overlay
-    // falls back to the userspace netstack, which needs no privilege.
-    #[cfg(l3)]
-    if !settings::get_str("tun-addr", None)
-        .unwrap_or_default()
-        .is_empty()
-        && settings::get_str("l3-mode", None).as_deref() != Some("userspace")
-        && caps.interactive
-    {
-        crate::tun::ensure_net_admin_for_l3();
-    }
-    ui::say(&format!(
-        "  {} identity created",
-        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-    ));
-    ui::say(&format!(
-        "  {} this device: {}",
-        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-        ui::paint(ui::Tone::Bold, &device_name)
-    ));
-    ui::say(&format!(
-        "  {} inbox: {}",
-        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-        inbox.display()
-    ));
-    ui::say("");
-    ui::say("  Least privilege by default");
-    ui::say("  + paired devices may send into this inbox");
-    ui::say("  - remote shell is off");
-    ui::say("  - remote writing is off");
-    ui::say("  - local ports are private");
-    ui::say("");
     if start_background {
         ui::say(&format!(
             "  {} available in the background",
@@ -495,12 +737,229 @@ pub(crate) async fn init_experience(
     } else {
         ui::say(&ui::paint(
             ui::Tone::Dim,
-            "  Stay available: tunlion up --install",
+            &format!("  {}", background_hint(host_can_install)),
         ));
     }
+    // L3 is default-on (`tun-addr` defaults to "auto"), and a non-root daemon
+    // needs a one-time privilege grant to open the tunnel device. This used to
+    // run `sudo setcap` right here, unprompted, so the first thing a new user
+    // met after creating an identity was a password prompt they had not asked
+    // for. It is optional (the overlay falls back to the userspace netstack,
+    // which needs no privilege), so it is now a question, default No, asked
+    // only at a terminal, and a No prints the one command to run later.
+    #[cfg(l3)]
+    offer_l3_grant(caps);
     Ok(())
 }
 
+/// How to keep receiving after this command exits. `--install` only where a
+/// service manager exists to honour it; elsewhere `up --detach`, which works on
+/// every platform but does not survive a reboot.
+pub(crate) fn background_hint(can_install: bool) -> String {
+    if can_install {
+        "Stay available: tunlion up --install".to_string()
+    } else {
+        "No service manager here, so nothing restarts the receiver at boot. To keep receiving in the background: tunlion up --detach".to_string()
+    }
+}
+
+/// The optional kernel-overlay grant, asked for rather than taken. See the call
+/// site in `init_experience` for why.
+#[cfg(l3)]
+fn offer_l3_grant(caps: &UiCapability) {
+    let l3_on = !settings::get_str("tun-addr", None)
+        .unwrap_or_default()
+        .is_empty();
+    let userspace = settings::get_str("l3-mode", None).as_deref() == Some("userspace")
+        || std::env::var("TUNLION_L3_USERSPACE").as_deref() == Ok("1");
+    if !l3_on || userspace {
+        return;
+    }
+    // Something no grant can fix comes first: in a container without
+    // /dev/net/tun, `init` advised `sudo setcap ...`, which cannot help there.
+    if let Some(why) = crate::tun::l3_blocker() {
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            &format!("  Virtual network interface: not available here: {why}."),
+        ));
+        return;
+    }
+    // None: nothing is missing (already granted, or a platform where no
+    // one-time grant applies), so there is nothing to ask.
+    let Some(later) = crate::tun::l3_grant_pending() else {
+        return;
+    };
+    let accepted = caps.interactive
+        && !caps.yes
+        && prompt_line(L3_GRANT_QUESTION)
+            .map(|a| l3_grant_answer_is_yes(&a))
+            .unwrap_or(false);
+    if accepted {
+        crate::tun::ensure_net_admin_for_l3();
+    } else {
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            &format!("  Virtual network interface: off for now. To turn it on later, run:  {later}"),
+        ));
+    }
+}
+
+/// The optional-grant question. Plain words: what it gives, what it costs.
+pub(crate) const L3_GRANT_QUESTION: &str = "  Optional: let tunlion create a virtual network interface so devices get addresses like laptop.mesh. Needs your password once. [y/N]: ";
+
+/// Default No: only an explicit yes grants anything.
+pub(crate) fn l3_grant_answer_is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// What `tunlion reset` destroys, in the words the join refusals use. Kept
+/// next to them so the two refusals cannot drift apart.
+const RESET_DESTROYS: &str = "it permanently deletes this device's identity key, its paired devices, grants and managed ssh keys, and nothing else";
+
+/// `join` on a device that already owns an identity. It used to stop at "join
+/// starts from a clean Tunlion identity", which names no way to get one.
+pub(crate) fn join_refusal_with_identity(fingerprint: &str) -> String {
+    format!(
+        "this device already has identity {fingerprint}, and join enrols a device that has none. \
+         To join anyway, first run `tunlion down` then `tunlion reset` ({RESET_DESTROYS}; \
+         keep the recovery phrase if you may want identity {fingerprint} back), then run join again"
+    )
+}
+
+/// `join` on a device that already joined someone.
+pub(crate) fn join_refusal_already_joined() -> String {
+    format!(
+        "this device has already joined an identity. To join another, first run `tunlion down` \
+         then `tunlion reset` ({RESET_DESTROYS}), then run join again"
+    )
+}
+
+/// What the person handed `join`: the one accept entry takes a code, an
+/// invitation, or the path to an invitation file, and works out which.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JoinInput {
+    /// A pairing code (normalized): the code ceremony, as `join <code>`.
+    Code(String),
+    /// A path to an invitation file.
+    File(PathBuf),
+    /// Invitation material itself (pasted).
+    Invitation(String),
+    /// A one-time TRANSFER code: that is `receive`, not `join`.
+    TransferCode(String),
+    /// None of those.
+    Unknown,
+}
+
+/// Classify what was typed or pasted at the accept prompt. Pure: the file
+/// test is injected. Order matters: an invitation is recognized by its
+/// prefix before anything normalizes it, and a path that exists wins over a
+/// code-shaped name, the same rule `join <arg>` applies.
+pub(crate) fn classify_join_input(raw: &str, is_file: &dyn Fn(&str) -> bool) -> JoinInput {
+    let t = raw.trim();
+    if t.is_empty() {
+        return JoinInput::Unknown;
+    }
+    if t.starts_with(crate::file_io::INVITE_PREFIX) {
+        return JoinInput::Invitation(t.to_string());
+    }
+    if is_file(t) {
+        return JoinInput::File(PathBuf::from(t));
+    }
+    let code = crate::pake::norm_code(t);
+    let code = code.trim_matches('-');
+    if crate::token_is_pairing_code(code) {
+        return JoinInput::Code(code.to_string());
+    }
+    if crate::regex_lite_code(code) {
+        return JoinInput::TransferCode(code.to_string());
+    }
+    JoinInput::Unknown
+}
+
+/// `join <arg>` where <arg> names a file that is not there: the refusal, or
+/// None when <arg> may be a code (or a file was also given another way). A
+/// code is letters, digits and dashes, so anything with a path separator or a
+/// dot is a file name, never a code. Pure.
+pub(crate) fn join_missing_file_msg(arg: &str, other_source: bool) -> Option<String> {
+    let looks_like_path = arg.contains('/') || arg.contains('\\') || arg.contains('.');
+    if other_source || !looks_like_path || std::path::Path::new(arg).exists() {
+        return None;
+    }
+    Some(format!(
+        "no invitation file at '{arg}'. Check the path, or copy the file here first; a pairing code looks like brave-otter-3141"
+    ))
+}
+
+/// The refusal for an accept input that is none of the things `join` takes.
+pub(crate) fn join_input_not_recognized() -> String {
+    "that is not a pairing code, an invitation, or a file that exists. A pairing code looks like \
+     brave-otter-3141 (run `tunlion join brave-otter-3141`); an invitation starts with \
+     `filament-invite:` (run `tunlion join` and paste it, or `tunlion join <file>`)"
+        .to_string()
+}
+
+/// The refusal for a transfer code given to `join`.
+pub(crate) fn join_transfer_code_msg(code: &str) -> String {
+    format!(
+        "'{code}' is a one-time transfer code (from `tunlion send`), not a pairing code. To receive the transfer:  tunlion receive {code}"
+    )
+}
+
+/// The one accept prompt at a terminal. Invitation material may be pasted, so
+/// it is read on the alternate screen and cleared from the terminal after.
+fn prompt_accept_input() -> Result<Zeroizing<String>> {
+    use crossterm::{execute, terminal};
+    let mut err = std::io::stderr();
+    execute!(
+        err,
+        terminal::EnterAlternateScreen,
+        terminal::Clear(terminal::ClearType::All)
+    )?;
+    eprintln!(
+        "  Type the pairing code you were given, or paste the invitation, or give the path to\n  \
+         the invitation file. A pasted invitation is cleared from this terminal after reading."
+    );
+    let result = prompt_line("\n  code or invitation: ");
+    let _ = execute!(err, terminal::LeaveAlternateScreen);
+    Ok(Zeroizing::new(result?))
+}
+
+/// `join` with nothing on the command line, at a terminal: ask once, then run
+/// whichever ceremony the answer belongs to. The guided menu's single accept
+/// entry ("I have a code or an invitation") lands here.
+pub(crate) async fn join_guided(
+    caps: &UiCapability,
+    server: &str,
+    relay: bool,
+    name: Option<String>,
+    to: Option<String>,
+) -> Result<()> {
+    let raw = prompt_accept_input()?;
+    match classify_join_input(raw.as_str(), &|p| std::path::Path::new(p).is_file()) {
+        JoinInput::Code(code) => {
+            ui::say(&ui::paint(
+                ui::Tone::Dim,
+                &format!("  that is a pairing code; accepting it as  tunlion join {code}"),
+            ));
+            crate::pair_cmd::pair_cmd(server, Some(code), name, None, relay, false, Vec::new(), None, false)
+                .await
+        }
+        JoinInput::File(path) => join_cmd(caps, server, relay, Some(path), None, name, to, None).await,
+        JoinInput::Invitation(material) => {
+            join_cmd(caps, server, relay, None, None, name, to, Some(Zeroizing::new(material))).await
+        }
+        JoinInput::TransferCode(code) => Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            join_transfer_code_msg(&code),
+        )),
+        JoinInput::Unknown => Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            join_input_not_recognized(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn join_cmd(
     caps: &UiCapability,
     server: &str,
@@ -509,34 +968,36 @@ pub(crate) async fn join_cmd(
     invite_fd: Option<i32>,
     name: Option<String>,
     to: Option<String>,
+    // Invitation material already read (the guided accept prompt).
+    material: Option<Zeroizing<String>>,
 ) -> Result<()> {
-    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
-        bail!("this device already has an identity; join starts from a clean Tunlion identity");
+    if let Some(existing) = identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
+        bail!("{}", join_refusal_with_identity(&existing.fingerprint()));
     }
     if local_device_cert_path().exists() {
-        bail!("this device has already joined an identity; reset it before joining another");
+        bail!("{}", join_refusal_already_joined());
     }
-    let invitation = Zeroizing::new(if let Some(path) = invite_file.as_deref() {
-        read_owner_only_file(path)?
-    } else if let Some(fd) = invite_fd {
-        read_owner_only_fd(fd)?
-    } else if caps.interactive {
-        use crossterm::{execute, terminal};
-        let mut err = std::io::stderr();
-        execute!(
-            err,
-            terminal::EnterAlternateScreen,
-            terminal::Clear(terminal::ClearType::All)
-        )?;
-        eprintln!("  Paste the invitation. It is cleared from this terminal after reading.");
-        let result = prompt_line("\n  invitation: ");
-        let _ = execute!(err, terminal::LeaveAlternateScreen);
-        result?
+    let invitation = if let Some(m) = material {
+        m
     } else {
+        Zeroizing::new(if let Some(path) = invite_file.as_deref() {
+            read_owner_only_file(path)?
+        } else if let Some(fd) = invite_fd {
+            read_owner_only_fd(fd)?
+        } else {
+            bail!(
+                "non-interactive join requires a code (`join <code>`), --invite-file <path>, or --invite-fd <fd>"
+            );
+        })
+    };
+    // A CODE where an invitation was expected (saved to a file, or handed
+    // over a descriptor): it is not a malformed invitation, it is the other
+    // way in. Say exactly what to run rather than "unknown format".
+    if let JoinInput::Code(code) = classify_join_input(invitation.as_str(), &|_| false) {
         bail!(
-            "non-interactive join requires a code (`join <code>`), --invite-file <path>, or --invite-fd <fd>"
+            "that holds a pairing code ({code}), not an invitation. Accept it with:  tunlion join {code}"
         );
-    });
+    }
     let inv = parse_invitation(invitation.as_str())?;
     if inv.expires <= identity::now_secs() {
         bail!("this invitation has expired");
@@ -624,4 +1085,349 @@ pub(crate) async fn open_enrollment(
             "device_pub": hex::encode(device_pub),
         }))
         .await;
+}
+
+/// PROTOCOL LITERAL: frozen, do not rename. The prefix of the recovery QR
+/// export; released builds printed QRs with exactly this text, and restore
+/// must keep reading them for as long as anyone holds one.
+pub(crate) const RECOVERY_QR_PREFIX: &str = "filament-recovery:v1:";
+
+/// The recovery words inside whatever the user supplied: the bare 12 words,
+/// or the full text of the recovery QR (`filament-recovery:v1:<words>`), which
+/// is what a phone's QR scanner hands back.
+pub(crate) fn recovery_words(input: &str) -> &str {
+    let t = input.trim();
+    t.strip_prefix(RECOVERY_QR_PREFIX).map(str::trim).unwrap_or(t)
+}
+
+#[cfg(test)]
+mod recovery_qr_tests {
+    use super::*;
+
+    const WORDS: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn bare_words_pass_through() {
+        assert_eq!(recovery_words(WORDS), WORDS);
+        assert_eq!(recovery_words(&format!("  {WORDS}\n")), WORDS);
+    }
+
+    #[test]
+    fn the_qr_export_text_restores() {
+        let qr = format!("{RECOVERY_QR_PREFIX}{WORDS}");
+        assert_eq!(recovery_words(&qr), WORDS);
+        assert_eq!(recovery_words(&format!("{qr}\n")), WORDS);
+        // And the stripped words really restore (same identity as the bare
+        // phrase; the golden value lives in filament-id).
+        let dir = std::env::temp_dir().join(format!("recovery-qr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Store(std::path::PathBuf);
+        impl crate::identity::KeyStore for Store {
+            fn write_secret(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+                std::fs::write(path, data)
+            }
+            fn read(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                std::fs::read(path)
+            }
+            fn config_path(&self, relative: &str) -> std::path::PathBuf {
+                self.0.join(relative)
+            }
+        }
+        let key = crate::identity::UserKey::restore(&Store(dir.clone()), recovery_words(&qr)).unwrap();
+        assert_eq!(
+            key.public_key_hex(),
+            "2562276a8902accb0bff0b4f09bc8014bf10639be6734fb4c2ceda9594964205"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pinned by the SHA-256 of the original prefix
+    /// (`printf '%s' 'filament-recovery:v1:' | sha256sum`).
+    #[test]
+    fn recovery_qr_prefix_is_frozen() {
+        use sha2::{Digest, Sha256};
+        let got: String = Sha256::digest(RECOVERY_QR_PREFIX.as_bytes())
+            .as_slice()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(got, "bf1a055f157070e84038dd122108ee8f7c68d621bd4118125f40fa1632e0495c");
+    }
+}
+
+#[cfg(test)]
+mod join_input_tests {
+    use super::{classify_join_input, JoinInput};
+    use std::path::PathBuf;
+
+    /// Eval item 1: the one accept prompt tells a code from an invitation
+    /// from a file, so nobody has to know which reader to open.
+    #[test]
+    fn the_accept_prompt_tells_code_invitation_and_file_apart() {
+        let none = |_: &str| false;
+        assert_eq!(
+            classify_join_input("comic-otter-1950", &none),
+            JoinInput::Code("comic-otter-1950".into())
+        );
+        // As a person types it: spaces, capitals, stray whitespace.
+        assert_eq!(
+            classify_join_input("  Comic Otter 1950\n", &none),
+            JoinInput::Code("comic-otter-1950".into())
+        );
+        assert_eq!(
+            classify_join_input("filament-invite:v2:AbC_d-0", &none),
+            JoinInput::Invitation("filament-invite:v2:AbC_d-0".into())
+        );
+        let file = |p: &str| p == "invite.txt";
+        assert_eq!(classify_join_input("invite.txt", &file), JoinInput::File(PathBuf::from("invite.txt")));
+        assert_eq!(
+            classify_join_input("brave-otter-314", &none),
+            JoinInput::TransferCode("brave-otter-314".into())
+        );
+        assert_eq!(classify_join_input("hello", &none), JoinInput::Unknown);
+        assert_eq!(classify_join_input("", &none), JoinInput::Unknown);
+        // A transfer code is sent to the verb that takes it.
+        assert!(super::join_transfer_code_msg("brave-otter-314").contains("tunlion receive brave-otter-314"));
+    }
+
+    /// Launch matrix: `join inv.txt` with no such file answered "that code
+    /// doesn't look right". A name with a dot or a slash is a file, never a
+    /// code, so a missing one is reported as a missing file.
+    #[test]
+    fn a_missing_invitation_file_is_reported_as_missing_not_as_a_bad_code() {
+        let msg = super::join_missing_file_msg("no-such-dir/inv.txt", false).expect("missing file refused");
+        assert!(msg.contains("no invitation file at 'no-such-dir/inv.txt'"), "{msg}");
+        assert!(super::join_missing_file_msg("inv-missing.txt", false).is_some());
+        // Codes, including a browser's three-digit one, still reach the ceremony.
+        assert_eq!(super::join_missing_file_msg("brave-otter-3141", false), None);
+        assert_eq!(super::join_missing_file_msg("fond-llama-112", false), None);
+        // A file given another way is not second-guessed.
+        assert_eq!(super::join_missing_file_msg("inv.txt", true), None);
+    }
+}
+
+#[cfg(test)]
+mod join_refusal_tests {
+    use super::{join_refusal_already_joined, join_refusal_with_identity};
+
+    /// Both refusals name the command that clears the way, and what it costs.
+    #[test]
+    fn join_refusals_name_reset_and_what_it_destroys() {
+        for msg in [join_refusal_with_identity("420953f3"), join_refusal_already_joined()] {
+            assert!(msg.contains("`tunlion reset`"), "{msg}");
+            assert!(msg.contains("`tunlion down`"), "{msg}");
+            assert!(msg.contains("identity key") && msg.contains("paired devices"), "{msg}");
+        }
+        assert!(join_refusal_with_identity("420953f3").contains("420953f3"));
+    }
+}
+
+#[cfg(test)]
+mod first_run_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Every `tunlion ...` command in `text` (placeholders like `<x>` filled
+    /// with a token) must be accepted by clap: a hint that does not parse is a
+    /// hint that fails the person who follows it.
+    fn assert_commands_parse(text: &str) -> usize {
+        let mut n = 0;
+        for (i, _) in text.match_indices("tunlion ") {
+            let cmd: String = text[i..]
+                .split(['`', ';', ',', '(', ')'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let argv: Vec<String> = cmd
+                .split_whitespace()
+                .take_while(|t| *t != "&&")
+                .map(|t| if t.starts_with('<') { "x".to_string() } else { t.to_string() })
+                .collect();
+            if argv.len() < 2 {
+                continue;
+            }
+            crate::Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("hint `{cmd}` does not parse: {e}"));
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn the_kernel_overlay_grant_is_a_question_whose_default_is_no() {
+        assert!(L3_GRANT_QUESTION.contains("[y/N]"), "default No, visibly");
+        assert!(L3_GRANT_QUESTION.contains("Optional"));
+        assert!(L3_GRANT_QUESTION.contains("password once"));
+        for yes in ["y", "Y", "yes", " YES "] {
+            assert!(l3_grant_answer_is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "N", "sure", "yeah"] {
+            assert!(!l3_grant_answer_is_yes(no), "{no:?} must not grant");
+        }
+    }
+
+    /// The question replaced an unprompted `sudo setcap`. Guard the shape at
+    /// the source: init's body asks before it calls the granting function,
+    /// and the granting call sits behind the answer, never on its own.
+    #[test]
+    fn init_never_runs_the_grant_without_asking() {
+        let src = include_str!("identity_flow.rs");
+        let body = src
+            .split_once("fn offer_l3_grant")
+            .expect("offer_l3_grant must exist")
+            .1;
+        let body = body.split("\n}").next().unwrap_or(body);
+        let ask = body.find("prompt_line(L3_GRANT_QUESTION)").expect("it asks");
+        let grant = body.find("ensure_net_admin_for_l3").expect("it can grant");
+        assert!(ask < grant, "the grant must come after the question");
+        assert!(body.contains("!caps.yes"), "--yes takes the default, which is No");
+        assert!(body.contains("caps.interactive"), "never asked without a terminal");
+        let init = src.split_once("pub(crate) async fn init_experience").unwrap().1;
+        let init = init.split("\n}").next().unwrap();
+        assert!(!init.contains("ensure_net_admin_for_l3"), "init itself must not grant");
+        assert!(init.contains("Setup complete"), "init always says it is done");
+    }
+
+    #[test]
+    fn background_hints_offer_only_what_works_and_parse() {
+        let yes = background_hint(true);
+        let no = background_hint(false);
+        assert!(yes.contains("tunlion up --install"));
+        assert!(no.contains("tunlion up --detach"), "{no}");
+        assert!(!no.contains("--install"), "never offer --install where it cannot work: {no}");
+        assert_eq!(assert_commands_parse(&yes), 1);
+        assert_eq!(assert_commands_parse(&no), 1);
+        let note = crate::add_for::receiver_not_running_note(false);
+        assert!(note.contains("tunlion up --detach") && !note.contains("--install"), "{note}");
+        let note = crate::add_for::receiver_not_running_note(true);
+        assert!(note.contains("tunlion up --install"), "{note}");
+        assert_eq!(assert_commands_parse(&note), 1);
+    }
+
+    #[test]
+    fn the_no_identity_answer_names_two_commands_that_parse() {
+        assert!(NO_IDENTITY_MSG.starts_with("no identity yet"));
+        assert_eq!(assert_commands_parse(NO_IDENTITY_MSG), 2);
+    }
+
+    /// The recovery quiz must not be answerable by reading the screen.
+    #[test]
+    fn the_recovery_quiz_clears_the_words_first() {
+        let src = include_str!("identity_flow.rs");
+        let body = src
+            .split_once("fn confirm_recovery_phrase")
+            .expect("confirm_recovery_phrase must exist")
+            .1;
+        let words_shown = body.find("for (row, chunk) in words.chunks(4)").expect("words are shown");
+        let cleared = body[words_shown..]
+            .find("terminal::Clear(terminal::ClearType::All)")
+            .map(|i| i + words_shown)
+            .expect("the screen is cleared after the words are shown");
+        let quiz = body.find("prompt_line(\"  Word 4:").expect("the quiz asks for word 4");
+        assert!(words_shown < cleared && cleared < quiz, "clear between showing and asking");
+    }
+
+    /// `id` only looks. It used to mint, and `join` then refused the machine.
+    #[test]
+    fn id_never_mints_an_identity() {
+        let src = include_str!("dispatch.rs");
+        let arm = src
+            .split_once("Cmd::Id { action }")
+            .expect("the id arm must exist")
+            .1;
+        let arm = arm.split("\n        Cmd::").next().unwrap_or(arm);
+        assert!(!arm.contains("ensure_user_key"), "`tunlion id` must not create an identity");
+        assert!(arm.contains("no_identity("), "`tunlion id` answers no_identity instead");
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::resolve_init_inbox;
+    use std::path::PathBuf;
+
+    /// `env -u HOME tunlion init` wrote `dir ./Tunlion`. Whatever init
+    /// persists is absolute, and with no home anywhere it refuses instead.
+    #[test]
+    fn init_never_persists_a_relative_inbox() {
+        let abs = std::env::temp_dir().join("inbox-abs");
+        assert_eq!(resolve_init_inbox(Some(abs.clone()), false).unwrap(), abs);
+        let rel = resolve_init_inbox(Some(PathBuf::from("Tunlion")), false).unwrap();
+        assert!(rel.is_absolute(), "{rel:?}");
+        assert_eq!(rel, std::env::current_dir().unwrap().join("Tunlion"));
+        let err = resolve_init_inbox(None, false).unwrap_err().to_string();
+        assert!(err.contains("HOME is not set") && err.contains("--inbox"), "{err}");
+        let _guard = crate::tests::lock_test_config();
+        if crate::platform::Paths::home_dir_known().is_some() {
+            assert!(resolve_init_inbox(None, true).unwrap().is_absolute());
+        }
+    }
+}
+
+#[cfg(test)]
+mod init_refusal_tests {
+    use super::init_refusal;
+
+    #[test]
+    fn init_never_replaces_an_owner_or_a_joined_identity() {
+        let owner = init_refusal(None, Some("6a8879a3".into()), None).expect("owner refused");
+        assert!(owner.contains("6a8879a3") && owner.contains("tunlion reset"), "{owner}");
+        // The finding: a JOINED device has no owner key, only a certificate.
+        let joined = init_refusal(None, None, Some("ecf89133".into())).expect("joined refused");
+        assert!(joined.contains("ecf89133") && joined.contains("joined"), "{joined}");
+        assert!(joined.contains("tunlion down") && joined.contains("tunlion reset"), "{joined}");
+        // An identity outranks the daemon in the message: it is the reason.
+        let both = init_refusal(Some(42), None, Some("ecf89133".into())).unwrap();
+        assert!(both.contains("ecf89133"), "{both}");
+    }
+
+    #[test]
+    fn init_refuses_while_a_daemon_runs_like_reset() {
+        let r = init_refusal(Some(2830), None, None).expect("daemon refused");
+        assert!(r.contains("2830") && r.contains("tunlion down"), "{r}");
+        assert_eq!(init_refusal(None, None, None), None, "a fresh device may init");
+    }
+
+    #[test]
+    fn devices_with_no_identity_and_nothing_stored_is_no_identity() {
+        use super::devices_has_nothing_to_list as nothing;
+        assert!(nothing(false, 0), "keyless and empty answers like `id` (exit 9)");
+        assert!(!nothing(false, 2), "a keyless device that paired by code lists them");
+        assert!(!nothing(true, 0), "an identity with no devices is an empty list, exit 0");
+    }
+}
+
+#[cfg(test)]
+mod rc_identity_gate_tests {
+    use super::{up_refused_for_identity, ADD_NEEDS_INIT_MSG, UP_NEEDS_IDENTITY_MSG};
+
+    /// RC lab item 5: `up` with no identity and nothing paired is refused;
+    /// the receive-only daemon of a code-paired device still runs.
+    #[test]
+    fn up_is_refused_only_when_it_would_serve_no_one() {
+        assert!(up_refused_for_identity(false, None));
+        assert!(up_refused_for_identity(false, Some("[]")));
+        assert!(!up_refused_for_identity(false, Some(r#"[{"name":"boxA","secret":"ab"}]"#)));
+        assert!(!up_refused_for_identity(true, None));
+        assert!(!up_refused_for_identity(false, Some("not json")), "a corrupt store is reported elsewhere");
+        assert!(UP_NEEDS_IDENTITY_MSG.contains("tunlion init"));
+    }
+
+    /// RC lab item 6: the refusal names init (the ceremony with the recovery
+    /// phrase), and classifies as exit 9 by its text too.
+    #[test]
+    fn add_without_identity_names_init_and_is_exit_9() {
+        assert!(ADD_NEEDS_INIT_MSG.contains("tunlion init"));
+        assert_eq!(
+            crate::exit_codes::classify_text(ADD_NEEDS_INIT_MSG),
+            crate::exit_codes::ExitKind::NoIdentity
+        );
+        assert_eq!(
+            crate::exit_codes::classify_text(UP_NEEDS_IDENTITY_MSG),
+            crate::exit_codes::ExitKind::NoIdentity
+        );
+    }
 }

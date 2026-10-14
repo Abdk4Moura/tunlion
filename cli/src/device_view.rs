@@ -11,7 +11,7 @@
 //! The fourteen that other files call are `pub(crate)` here because anyhow::{ Result };
 use crate::delegated_device_state;
 use crate::device_caps::effective_device_caps;
-use crate::devices_store::{devices_load, devices_path, devices_upsert_atomic, with_devices_mut};
+use crate::devices_store::{devices_path, devices_upsert_atomic, with_devices_mut};
 use crate::fleet_ui;
 use crate::identity;
 use crate::load_owner_key;
@@ -23,10 +23,11 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) fn devices_store(name: &str, secret: &str) -> Result<()> {
-    // Delegate to atomic upsert: secret only, preserve cert
-    devices_upsert_atomic(name, Some(secret), None, None, None, None, None, false)?;
-    Ok(())
+/// Store a pair secret received over the network as a NEW record, returning
+/// the name it landed under (suffixed when `name` is taken). Never re-keys an
+/// existing record: see `devices_store::devices_store_new`.
+pub(crate) fn devices_store(name: &str, secret: &str) -> Result<String> {
+    crate::devices_store::devices_store_new(name, secret, None)
 }
 
 /// L1-a (spec §8): store a v2 device record with its agreed capability set.
@@ -34,6 +35,13 @@ pub(crate) fn devices_store(name: &str, secret: &str) -> Result<()> {
 /// grows `v` and `caps` but the existing `{name, secret}` fields are unchanged,
 /// so the reconnect path (`devices_load`, which reads only name+secret) keeps
 /// working byte-for-byte, no regression.
+///
+/// Owner re-pair: the ONLY caller is the owner-run `tunlion add` ceremony
+/// (pair_cmd.rs), where the local user ran the command and the PAKE confirmed
+/// the peer. That is the owner decision that may re-key an existing record of
+/// the same name, so this passes `allow_reanchor`. A secret that arrives over
+/// the network without that decision goes through `devices_store` instead,
+/// which never overwrites.
 pub(crate) fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
     // Delegate to atomic upsert: secret + caps together, preserve cert
     devices_upsert_atomic(
@@ -44,7 +52,7 @@ pub(crate) fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Res
         None,
         None,
         None,
-        false,
+        true,
     )?;
     Ok(())
 }
@@ -113,7 +121,30 @@ pub(crate) fn device_name_for_pub(device_pub: &[u8; 32]) -> Option<String> {
         .and_then(|d| d["name"].as_str().map(str::to_string))
 }
 
+/// Is this device record revoked (the certificate marker, or a durable device
+/// revoke)? The one test `devices`, `send` and `forget` share. Pure.
+pub(crate) fn record_is_revoked(record: &Value) -> bool {
+    record["certRevoked"].as_bool() == Some(true)
+        || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED)
+}
+
+/// Is the stored record named `name` revoked? False when there is no record.
+pub(crate) fn device_record_revoked(name: &str) -> bool {
+    std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .unwrap_or_default()
+        .iter()
+        .any(|d| d["name"].as_str() == Some(name) && record_is_revoked(d))
+}
+
 pub(crate) fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
+    // A revocation kept by KEY, apart from any record: what `devices forget`
+    // leaves behind for a certificate that is still valid. Checked first, so a
+    // forgotten key stays refused whatever the device store holds.
+    if crate::fleet_support::device_key_revoked(device_pub, crate::identity::now_secs()) {
+        return true;
+    }
     let p = devices_path();
     // A GENUINELY ABSENT store means no device records at all: every peer is
     // unknown, not revoked (a fresh init has no devices.json until the first
@@ -232,37 +263,87 @@ pub(crate) fn devices_info(name: &str) -> Option<(u64, Option<String>, Option<St
 /// The tier no longer changes the sentence, because the tier does not change
 /// the fact. If renewal is ever built, this is where the distinction earns its
 /// way back, and not before.
-pub(crate) fn device_countdown(
-    _tier: fleet_ui::devices::DeviceTier,
-    cert: Option<&identity::DeviceCert>,
-) -> String {
-    let Some(cert) = cert else {
-        // #240: was "promote to continue", the SECOND source of that string
-        // after the row flag. No certificate means there is no expiry to count
-        // down to, and nothing is blocked, so the column says what is true and
-        // the tier heading carries the explanation.
+/// What a roster row says about a sibling. A roster entry under THIS
+/// device's own name but another key is this device before a reset: the owner
+/// still lists the old key until it forgets it. It was shown as an ordinary
+/// sibling ("p9-b  known via owner") on p9-b itself. Pure.
+/// Is this roster entry already a row from the local store? By device KEY (a
+/// renamed record is the same device), then by name, case-insensitively as the
+/// store compares names. Reads RAW records. Pure.
+pub(crate) fn roster_entry_listed(records: &[Value], petname: &str, device_pub_hex: Option<&str>) -> bool {
+    records.iter().any(|r| {
+        device_pub_hex.is_some_and(|k| {
+            crate::identity::DeviceCert::from_json(&r["deviceCert"])
+                .is_some_and(|c| hex::encode(c.device_pub).eq_ignore_ascii_case(k))
+        }) || r["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(petname))
+    })
+}
+
+#[cfg(test)]
+mod roster_dedupe_tests {
+    use super::roster_entry_listed;
+    use serde_json::json;
+
+    /// Eval item 7: a fleet sibling indexed WITHOUT a secret was listed twice,
+    /// once from the store and once from the roster.
+    #[test]
+    fn a_secretless_fleet_record_hides_its_roster_twin() {
+        let recs = vec![json!({"name": "u2-a", "caps": []})]; // no secret, as fleet-hello indexes it
+        assert!(roster_entry_listed(&recs, "u2-a", Some(&"cd".repeat(32))));
+        assert!(roster_entry_listed(&recs, "U2-A", None));
+        assert!(!roster_entry_listed(&recs, "u2-b", Some(&"cd".repeat(32))));
+    }
+}
+
+pub(crate) fn roster_row_label(petname: &str, my_name: &str) -> &'static str {
+    if !my_name.is_empty() && petname.eq_ignore_ascii_case(my_name) {
+        "a previous identity of this device (the owner can forget it)"
+    } else {
+        "known via owner"
+    }
+}
+
+/// THE device-expiry sentence. `devices` and `devices --caps` both print it,
+/// so one device never reads "cert expires in 90d" on one screen and "no
+/// expiry" on the other. Pure.
+pub(crate) fn cert_expiry_text(cert_expires: Option<u64>, now: u64) -> String {
+    let Some(expires) = cert_expires else {
         return "no certificate".to_string();
     };
-    let now = identity::now_secs();
-    if cert.expires <= now {
-        let date = chrono::DateTime::from_timestamp(cert.expires as i64, 0)
+    if expires <= now {
+        let date = chrono::DateTime::from_timestamp(expires as i64, 0)
             .map(|at| at.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "expired".to_string());
         return format!("expired {date}");
     }
-    // Round UP to the nearest whole unit, so a cert issued for 90 days reads
-    // "90d", not "129600m" or a seconds figure a few seconds short of the day.
-    let secs = cert.expires - now;
-    let text = if secs >= 86400 {
-        format!("{}d", (secs + 86399) / 86400)
+    format!("cert expires in {}", remaining_span(expires - now))
+}
+
+pub(crate) fn device_countdown(
+    _tier: fleet_ui::devices::DeviceTier,
+    cert: Option<&identity::DeviceCert>,
+) -> String {
+    // #240: no certificate means there is no expiry to count down to, and
+    // nothing is blocked, so the column says what is true ("no certificate").
+    // "cert expires in", the words the delegated rows use for the same clock.
+    cert_expiry_text(cert.map(|c| c.expires), identity::now_secs())
+}
+
+/// A time remaining (`secs` until something expires), rounded UP to the
+/// nearest whole unit, so a cert issued for 90 days reads "90d", not
+/// "129600m" or a figure a few seconds short of the day. EVERY countdown to an
+/// expiry goes through here: `id` floored the same certificate that `devices`
+/// rounded up, and printed "valid 90d" and "valid 89d" seconds apart. Pure.
+pub(crate) fn remaining_span(secs: u64) -> String {
+    if secs >= 86400 {
+        format!("{}d", secs.div_ceil(86400))
     } else if secs >= 3600 {
-        format!("{}h", (secs + 3599) / 3600)
+        format!("{}h", secs.div_ceil(3600))
     } else if secs >= 60 {
-        format!("{}m", (secs + 59) / 60)
+        format!("{}m", secs.div_ceil(60))
     } else {
         format!("{secs}s")
-    };
-    format!("expires in {text}")
+    }
 }
 
 fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> String {
@@ -297,6 +378,26 @@ pub(crate) fn same_owner_key() -> Option<[u8; 32]> {
     load_owner_key()
         .map(|key| key.public_key_bytes())
         .or_else(|| local_device_cert().map(|c| c.user_pub))
+        // Display only: after this device's own access ended its certificate
+        // no longer verifies, and the owner it joined was relabelled
+        // "EXTERNAL / other people". It is still that owner.
+        .or_else(|| own_cert_ignoring_expiry().map(|c| c.user_pub))
+}
+
+/// This device's own certificate as stored, WITHOUT the expiry check: for
+/// saying "your access expired" truthfully, never for authorizing anything.
+pub(crate) fn own_cert_ignoring_expiry() -> Option<identity::DeviceCert> {
+    let raw = std::fs::read_to_string(crate::local_device_cert_path()).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let cert = identity::DeviceCert::from_json(&value["cert"])?;
+    let overlay_pub = crate::overlay::overlay_pubkey_bytes().ok()?;
+    (cert.device_pub == overlay_pub).then_some(cert)
+}
+
+/// The row label for the owner this device joined, once this device's own
+/// access has ended. Pure.
+pub(crate) fn own_access_expired_label(expired_at: u64) -> String {
+    format!("your access expired {}", crate::format_approval_expiry(expired_at))
 }
 
 /// The tier `devices` renders TODAY from a stored certificate. Deliberately
@@ -318,6 +419,13 @@ pub(crate) fn tier_for(
 pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
     let warm_names = warm_device_names(warm);
     let same_owner = same_owner_key();
+    // This device joined someone and its own access has ended: the rows of
+    // that owner's devices say so instead of listing what it may no longer do.
+    let own_ended = if load_owner_key().is_none() {
+        own_cert_ignoring_expiry().filter(|c| c.expires <= identity::now_secs())
+    } else {
+        None
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -326,6 +434,8 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
         .unwrap_or_default();
+    // The roster closure below is `move`; it dedupes against these.
+    let known = records.clone();
 
     // Iterate the RAW records, not devices_load(): that helper requires a pair
     // secret, and a fleet sibling is indexed without one, so listing through it
@@ -365,8 +475,33 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
             // trusted in full rather than scoped. The tier's own design is #191
             // and #195 and is not settled here; this only stops the screen
             // asserting a blocked state and an impossible remedy.
-            let caps_summary = if tier == fleet_ui::devices::DeviceTier::NeedsReview {
-                "uncertified · trusted in full".to_string()
+            // A revoked device has no access, whatever its record still lists:
+            // the row used to read "idle  inbox mount ... revoked", offering
+            // capabilities the gate refuses.
+            let revoked = records.iter().any(|r| {
+                r["name"].as_str() == Some(name.as_str()) && record_is_revoked(r)
+            });
+            // An expired delegated device has no access either: its row used
+            // to sit under FLEET with an "OWNER-EQUIVALENT shell" badge next
+            // to "lapsed", while devices --json said caps [] and the gate
+            // refused it.
+            // Same state word `devices --json` reports.
+            let ended = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(name.as_str()))
+                .map(|r| crate::device_caps::device_access_json(r, now)["state"].as_str().unwrap_or("").to_string())
+                .filter(|st| st == "expired" || st == "lapsed");
+            let own_ended_here = own_ended
+                .as_ref()
+                .filter(|own| cert.as_ref().is_some_and(|c| c.user_pub == own.user_pub));
+            let caps_summary = if revoked {
+                "no access (revoked)".to_string()
+            } else if let Some(own) = own_ended_here {
+                own_access_expired_label(own.expires)
+            } else if let Some(st) = &ended {
+                format!("no access ({st})")
+            } else if tier == fleet_ui::devices::DeviceTier::NeedsReview {
+                format!("uncertified · {}", device_caps_summary(&caps, tier))
             } else {
                 device_caps_summary(&caps, tier)
             };
@@ -397,12 +532,16 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                 .and_then(|r| r["devices"].as_array().cloned())
                 .map(|arr| {
                     let self_pub = crate::overlay::overlay_pubkey_bytes().ok();
+                    let my_name = crate::display_name();
                     arr.into_iter()
                         .filter_map(move |d| {
                             let name = d["petname"].as_str()?.to_string();
-                            // Skip a sibling that is ALREADY in the local store (it has a
-                            // secret and a real channel; the roster adds nothing).
-                            if devices_load().iter().any(|(n, _)| n == &name) {
+                            // Skip a sibling that is ALREADY a row from the local store.
+                            // Against the RAW records: a fleet sibling is indexed
+                            // without a secret, so the old `devices_load()` check
+                            // missed it and the same device was listed twice
+                            // ("[fleet] u2-a" and "[mesh] u2-a known via owner").
+                            if roster_entry_listed(&known, &name, d["device_pub"].as_str()) {
                                 return None;
                             }
                             // Skip MYSELF: the roster lists the owner's devices, and on a
@@ -417,11 +556,12 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                                     }
                                 }
                             }
+                            let caps_summary = roster_row_label(&name, &my_name).to_string();
                             Some(fleet_ui::devices::DeviceEntry {
                                 name,
                                 tier: fleet_ui::devices::DeviceTier::MeshRoster,
                                 online: None, // unknown liveness (#217), never idle/offline
-                                caps_summary: "known via owner".to_string(),
+                                caps_summary,
                                 countdown: String::new(),
                                 last_seen: None,
                             })
@@ -431,4 +571,36 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                 .unwrap_or_default(),
         )
         .collect()
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::remaining_span;
+
+    /// A 90-day certificate reads 90d for its whole first day, whichever
+    /// command shows it; it only reads 89d once less than 89 days remain.
+    #[test]
+    fn a_countdown_rounds_up_and_is_stable_for_seconds() {
+        let ninety = 90 * 86400;
+        assert_eq!(remaining_span(ninety), "90d");
+        assert_eq!(remaining_span(ninety - 5), "90d");
+        assert_eq!(remaining_span(ninety - 86399), "90d");
+        assert_eq!(remaining_span(89 * 86400), "89d");
+        assert_eq!(remaining_span(3600 * 5 - 1), "5h");
+        assert_eq!(remaining_span(61), "2m");
+        assert_eq!(remaining_span(59), "59s");
+    }
+}
+
+#[cfg(test)]
+mod roster_row_label_tests {
+    use super::roster_row_label;
+
+    #[test]
+    fn this_devices_old_key_is_named_as_such() {
+        assert!(roster_row_label("p9-b", "p9-b").contains("previous identity of this device"));
+        assert!(roster_row_label("P9-B", "p9-b").contains("previous identity"));
+        assert_eq!(roster_row_label("alpha", "p9-b"), "known via owner");
+        assert_eq!(roster_row_label("alpha", ""), "known via owner");
+    }
 }

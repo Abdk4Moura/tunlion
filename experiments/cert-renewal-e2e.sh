@@ -33,7 +33,7 @@
 # case that actually matters: a device connected for its whole certificate
 # lifetime must not quietly expire while online.
 set -uo pipefail
-BIN=${FILAMENT_BIN:-/tmp/sr-bin/tunlion}
+BIN=${TUNLION_BIN:-/tmp/sr-bin/tunlion}
 PEER=${PEER:-interserver-0x0}
 LOCAL_BIN=${LOCAL_BIN:-$HOME/.local/bin/tunlion}
 W=/tmp/cr-e2e; RDIR=/tmp/cr-peer; RBIN=/tmp/sr-peer-bin/tunlion
@@ -54,9 +54,9 @@ rsh() {
         | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b\]3008;[^\\]*\\//g; s/\r//g')
   printf '%s\n' "$out" | awk '/__B__/{f=1;next} /__E__/{f=0} f' | grep -vE '^\s*$'
 }
-own() { ip netns exec srr env FILAMENT_CONFIG_DIR="$W/o" "$BIN" "$@"; }
+own() { ip netns exec srr env TUNLION_CONFIG_DIR="$W/o" "$BIN" "$@"; }
 
-# By EXECUTABLE, not config dir: FILAMENT_CONFIG_DIR is an env var and never
+# By EXECUTABLE, not config dir: TUNLION_CONFIG_DIR is an env var and never
 # appears in /proc/<pid>/cmdline, so matching on it kills nothing and leaks
 # daemons across runs.
 kill_local() { for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
@@ -70,7 +70,7 @@ peer_expiry() { rsh "python3 -c \"import json;print(json.load(open('$RDIR/identi
 
 restart_peer() {
   rsh "$KILL_REMOTE; sleep 2
-       setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN up' >>$RDIR/up.log 2>&1 &
+       setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN up' >>$RDIR/up.log 2>&1 &
        echo restarted" 90 >/dev/null
 }
 
@@ -97,7 +97,7 @@ cleanup >/dev/null 2>&1
 rm -rf "$W"; mkdir -p "$W/o"
 say "binary: $("$BIN" --version)  sha $(sha256sum "$BIN" | cut -c1-16)"
 
-say "1. namespaces (each daemon needs its own filament0)"
+say "1. namespaces (each daemon needs its own tunlion0)"
 sysctl -qw net.ipv4.ip_forward=1
 ip netns add srr
 ip link add srr-h type veth peer name srr-n && ip link set srr-n netns srr
@@ -109,7 +109,7 @@ mkdir -p /etc/netns/srr && echo "nameserver 1.1.1.1" > /etc/netns/srr/resolv.con
 iptables -t nat -A POSTROUTING -s 10.77.0.0/24 ! -o srr-h -j MASQUERADE
 iptables -I FORWARD 1 -i srr-h -j ACCEPT
 iptables -I FORWARD 1 -o srr-h -j ACCEPT
-ip netns exec srr getent hosts api.filament.autumated.com >/dev/null 2>&1 \
+ip netns exec srr getent hosts api.tunlion.autumated.com >/dev/null 2>&1 \
   && ok "owner namespace has internet" || { echo "SETUP: no internet in owner ns"; exit 2; }
 rsh "sysctl -qw net.ipv4.ip_forward=1
      ip netns add srp
@@ -123,13 +123,13 @@ rsh "sysctl -qw net.ipv4.ip_forward=1
      iptables -I FORWARD 1 -i srp-h -j ACCEPT
      iptables -I FORWARD 1 -o srp-h -j ACCEPT
      mkdir -p $RDIR" 180 >/dev/null
-RNET=$(rsh "ip netns exec srp getent hosts api.filament.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
+RNET=$(rsh "ip netns exec srp getent hosts api.tunlion.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$RNET" = "OK" ] && ok "joined-device namespace has internet" || { echo "SETUP: no internet in peer ns"; exit 2; }
 
 say "2. owner identity and daemon"
 own init --yes --name "$MYNAME" --recovery-file "$W/rec.txt" 2>&1 | tail -1
 own id >/dev/null 2>&1 || { echo "SETUP: no owner identity"; exit 2; }
-ip netns exec srr env FILAMENT_CONFIG_DIR="$W/o" FILAMENT_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/o.log" 2>&1 &
+ip netns exec srr env TUNLION_CONFIG_DIR="$W/o" TUNLION_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/o.log" 2>&1 &
 for i in $(seq 1 45); do grep -q "L3 overlay" "$W/o.log" 2>/dev/null && break; sleep 2; done
 ok "owner up"
 
@@ -146,7 +146,7 @@ run_arm() {
   [ -s "$W/inv.txt" ] || { bad "no invitation"; return 1; }
   local INV; INV=$(cat "$W/inv.txt")
   rsh "umask 077; printf '%s' '$INV' > $RDIR/inv.txt; chmod 600 $RDIR/inv.txt" 90 >/dev/null
-  rsh "setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR FILAMENT_LOG=debug $RBIN join $RDIR/inv.txt --yes; ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR FILAMENT_LOG=debug $RBIN up' >$RDIR/up.log 2>&1 & echo started" 90 >/dev/null
+  rsh "setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR TUNLION_LOG=debug $RBIN join $RDIR/inv.txt --yes; ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR TUNLION_LOG=debug $RBIN up' >$RDIR/up.log 2>&1 & echo started" 90 >/dev/null
   local J=0 i
   for i in $(seq 1 25); do
     J=$(rsh "grep -c 'joined as' $RDIR/up.log 2>/dev/null || echo 0" 60 | tail -1)

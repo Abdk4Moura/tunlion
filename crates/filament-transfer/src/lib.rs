@@ -85,18 +85,80 @@ pub fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Resu
 
 /// Reduce a remote-supplied filename to a safe single path component.
 ///
-/// Never trust a remote name: basename only, no separators, no control bytes.
+/// Never trust a remote name: basename only, no separators, no control bytes,
+/// and no invisible bidi/format characters. The name is printed to the user
+/// (the accept prompt, decline and completion lines), so U+202E RIGHT-TO-LEFT
+/// OVERRIDE would let `invoice\u{202E}fdp.exe` display as `invoiceexe.pdf`.
 pub fn safe_incoming_name(raw: &str) -> String {
     let base = std::path::Path::new(raw)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".into());
-    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
+        .collect();
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        "file.bin".to_string()
-    } else {
-        cleaned
+        return "file.bin".to_string();
     }
+    // The receiver keeps `<name>.part` and `<name>.part.meta` beside the final
+    // file. A peer naming a file `x.part` or `x.part.meta` would land (on
+    // completion) on top of the in-progress partial or sidecar of `x`. Such a
+    // name gets a trailing `_` so it can never equal another file's partial.
+    // Shortened to what the filesystem accepts (keeping the extension), with
+    // room left for that `_`.
+    let lower = cleaned.to_ascii_lowercase();
+    if lower.ends_with(".part") || lower.ends_with(".part.meta") {
+        return format!("{}_", fit_name(&cleaned, MAX_INCOMING_NAME_BYTES - 1));
+    }
+    fit_name(&cleaned, MAX_INCOMING_NAME_BYTES)
+}
+
+/// Bidi controls and zero-width characters: they change how a name DISPLAYS
+/// without being visible themselves.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'                // ARABIC LETTER MARK
+            | '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM, RLM
+            | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+            | '\u{FEFF}'              // zero-width no-break space / BOM
+    )
+}
+
+/// The longest name, in bytes, a receiver creates for an incoming file.
+///
+/// 255 is the per-component limit on ext4, APFS, tmpfs and (counted in UTF-16
+/// units, which a UTF-8 byte count never undercounts) NTFS. The margin leaves
+/// room for the `.part.meta` sidecar and a `.NNN` collision suffix. A sender
+/// could offer a 250-character name and the receiver failed the create with
+/// ENAMETOOLONG and said nothing, so the sender waited forever.
+pub const MAX_INCOMING_NAME_BYTES: usize = 240;
+
+/// Shorten `name` to at most `max` bytes, keeping its extension and never
+/// splitting a character. A name that already fits is returned unchanged.
+pub fn fit_name(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        return name.to_string();
+    }
+    // The extension is the last `.suffix` when it is short and is not the whole
+    // name (a leading dot is a hidden file, not an extension).
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 && name.len() - i <= 32 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let mut cut = max.saturating_sub(ext.len()).min(stem.len());
+    while cut > 0 && !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = stem[..cut].to_string();
+    if out.is_empty() {
+        out.push_str("file");
+    }
+    out.push_str(ext);
+    out
 }
 
 /// Record `[pos, pos+len)` into a sorted set of disjoint intervals, merging
@@ -142,6 +204,23 @@ pub fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64,
     let delta = new_len.saturating_sub(removed_total);
     let total: u64 = ranges.iter().map(|(s, e)| e - s).sum();
     (delta, total)
+}
+
+/// Upper bound on the disjoint ranges a single incoming file may accumulate.
+/// A well-behaved sender has a handful in flight (one per parallel stream); a
+/// hostile one can send tiny non-adjacent chunks to grow the list (and the
+/// O(n) merge) without bound. 64Ki ranges is ~1 MiB of bookkeeping.
+pub const MAX_RECV_RANGES: usize = 64 * 1024;
+
+/// True iff a chunk of `len` bytes at `pos` lies entirely inside the `size`
+/// the sender offered. Overflow counts as outside. The peer picks both numbers,
+/// so without this a single frame at a huge offset makes a sparse file of any
+/// size on the receiver's disk.
+pub fn chunk_fits_offer(pos: u64, len: usize, size: u64) -> bool {
+    match pos.checked_add(len as u64) {
+        Some(end) => end <= size,
+        None => false,
+    }
 }
 
 /// `record_range` for callers that only want the running total.
@@ -323,6 +402,34 @@ mod tests {
     }
 
     #[test]
+    fn incoming_names_lose_bidi_and_invisible_controls() {
+        assert_eq!(safe_incoming_name("invoice\u{202E}fdp.exe"), "invoicefdp.exe");
+        assert_eq!(safe_incoming_name("a\u{2066}b\u{2069}c\u{200B}.txt"), "abc.txt");
+        assert_eq!(safe_incoming_name("\u{202E}"), "file.bin");
+        assert_eq!(safe_incoming_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_incoming_name("caf\u{e9}.txt"), "caf\u{e9}.txt", "ordinary non-ASCII is kept");
+    }
+
+    #[test]
+    fn incoming_names_cannot_impersonate_a_partial() {
+        assert_eq!(safe_incoming_name("x.part"), "x.part_");
+        assert_eq!(safe_incoming_name("x.PART.meta"), "x.PART.meta_");
+        assert_eq!(safe_incoming_name("x.partial"), "x.partial", "only the exact suffixes");
+        assert_eq!(safe_incoming_name("report.meta"), "report.meta");
+    }
+
+    #[test]
+    fn chunks_must_stay_inside_the_offered_size() {
+        assert!(chunk_fits_offer(0, 100, 100));
+        assert!(chunk_fits_offer(40, 60, 100));
+        assert!(chunk_fits_offer(100, 0, 100));
+        assert!(!chunk_fits_offer(41, 60, 100), "one byte past the end");
+        assert!(!chunk_fits_offer(1 << 40, 1, 100), "far past the end");
+        assert!(!chunk_fits_offer(u64::MAX, 2, u64::MAX), "overflow is outside");
+        assert!(!chunk_fits_offer(0, 1, 0), "nothing fits an empty offer");
+    }
+
+    #[test]
     fn record_range_total_agrees_with_record_range() {
         let mut a = Vec::new();
         let mut b = Vec::new();
@@ -350,6 +457,33 @@ mod tests {
         assert_eq!(safe_incoming_name(".."), "file.bin");
         assert_eq!(safe_incoming_name("."), "file.bin");
         assert_eq!(safe_incoming_name(""), "file.bin");
+    }
+
+    #[test]
+    fn an_overlong_name_is_shortened_keeping_its_extension() {
+        let long = format!("{}.tar.gz", "a".repeat(250));
+        let fit = safe_incoming_name(&long);
+        assert!(fit.len() <= MAX_INCOMING_NAME_BYTES, "{} bytes", fit.len());
+        assert!(fit.ends_with(".gz"), "{fit}");
+        assert!(fit.starts_with("aaaa"), "{fit}");
+        // A name that fits is untouched.
+        assert_eq!(safe_incoming_name("report.pdf"), "report.pdf");
+        // No extension: plain truncation.
+        let bare = "b".repeat(300);
+        assert_eq!(safe_incoming_name(&bare).len(), MAX_INCOMING_NAME_BYTES);
+    }
+
+    #[test]
+    fn shortening_never_splits_a_character() {
+        // 3-byte characters: a byte cut at the limit would land mid-character.
+        let long = format!("{}.txt", "\u{20ac}".repeat(120));
+        let fit = fit_name(&long, 100);
+        assert!(fit.len() <= 100);
+        assert!(fit.ends_with(".txt"));
+        assert!(fit.trim_end_matches(".txt").chars().all(|c| c == '\u{20ac}'));
+        // A hidden file's leading dot is not an extension.
+        let hidden = format!(".{}", "c".repeat(300));
+        assert_eq!(fit_name(&hidden, 50).len(), 50);
     }
 
     // --- positional write -------------------------------------------------

@@ -93,6 +93,10 @@ pub(crate) async fn handle_warm_req(
         // Wake is handled inline in the daemon loop (its whole purpose is to make
         // the loop iterate); answer defensively if it ever reaches here.
         ctl::ReqKind::Wake => req.reply(&json!({ "ok": true })).await,
+        // RevocationSync is handled inline in the daemon loop (it owns the
+        // device list and the links it must close). Never confirm it from here:
+        // `ok:false` makes the caller say the revocation is not yet confirmed.
+        ctl::ReqKind::RevocationSync => req.reply(&json!({ "ok": false })).await,
         // Mount/Unmount/ListMounts/MountHealth are handled inline in the daemon
         // loop (they need access to DaemonMounts); answer defensively if reached.
         ctl::ReqKind::Mount { .. } => req.reject("mount not handled here").await,
@@ -197,7 +201,7 @@ pub(crate) async fn handle_mount(
     let dest = if let Some(d) = crate::l2::l3_dest(&info) {
         d // L3 direct: user@peer.mesh, no ProxyCommand
     } else {
-        // L2 fallback: user@filament-peer with ProxyCommand
+        // L2 fallback: user@tunlion-peer with ProxyCommand
         let exe = std::env::current_exe().unwrap();
         let exe = exe.to_string_lossy();
         let mut proxy = format!("{exe} --server {server}");
@@ -380,6 +384,81 @@ pub(crate) async fn sshd_listening(port: u16) -> bool {
     false
 }
 
+/// Outstanding `reach` liveness probes: nonce -> the waiter. A warm link is
+/// only reported once the PEER answers on it, because a link whose far end
+/// was stopped or killed -9 stays "alive" locally until QUIC's idle timeout
+/// (~22-29 s measured), and reach used to say ok, warm, verified, exit 0 for
+/// that whole window.
+static LIVENESS: std::sync::Mutex<Option<HashMap<u64, tokio::sync::oneshot::Sender<()>>>> =
+    std::sync::Mutex::new(None);
+
+/// The `reach-ping` a daemon sends on a held link; the peer answers with a
+/// `reach-pong` carrying the same `n`. An older peer ignores the unknown type,
+/// so its warm link simply does not confirm and reach falls back to the full
+/// probe, which works with any version.
+// Called only by the unix control socket's warm ping (no control socket
+// elsewhere), so other targets see it unused.
+#[allow(dead_code)]
+pub(crate) fn liveness_ping(n: u64) -> Value {
+    json!({ "type": "reach-ping", "n": n })
+}
+
+/// The answer to a `reach-ping`, echoing its nonce.
+pub(crate) fn liveness_pong(ping: &Value) -> Value {
+    json!({ "type": "reach-pong", "n": ping["n"].clone() })
+}
+
+/// Register a probe; the receiver resolves when its pong arrives.
+// Called only by the unix control socket's warm ping (no control socket
+// elsewhere), so other targets see it unused.
+#[allow(dead_code)]
+pub(crate) fn liveness_register() -> (u64, tokio::sync::oneshot::Receiver<()>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Ok(mut m) = LIVENESS.lock() {
+        m.get_or_insert_with(HashMap::new).insert(n, tx);
+    }
+    (n, rx)
+}
+
+/// A `reach-pong` arrived: wake its waiter (an unknown or late nonce is
+/// ignored).
+pub(crate) fn liveness_answered(pong: &Value) {
+    let Some(n) = pong["n"].as_u64() else { return };
+    let tx = LIVENESS.lock().ok().and_then(|mut m| m.as_mut()?.remove(&n));
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+    }
+}
+
+/// Forget a probe that timed out.
+// Called only by the unix control socket's warm ping (no control socket
+// elsewhere), so other targets see it unused.
+#[allow(dead_code)]
+fn liveness_forget(n: u64) {
+    if let Ok(mut m) = LIVENESS.lock() {
+        if let Some(m) = m.as_mut() {
+            m.remove(&n);
+        }
+    }
+}
+
+/// How long a warm link has to answer `reach-ping` (TUNLION_REACH_PING_MS,
+/// default 1500 ms) before reach treats it as unconfirmed.
+// Called only by the unix control socket's warm ping (no control socket
+// elsewhere), so other targets see it unused.
+#[allow(dead_code)]
+pub(crate) fn liveness_window() -> Duration {
+    let ms = std::env::var("TUNLION_REACH_PING_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1500);
+    Duration::from_millis(ms)
+}
+
 /// Answer a `tunlion reach`: report the daemon's warm link to `peer` (route,
 /// remote address, RTT, verified name). Synchronous - every fact is local (quinn
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
@@ -418,7 +497,7 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     let path = net::describe_path(t.as_ref(), peer_ref.as_deref())
         .await
         .to_json();
-    let reply = json!({
+    let mut reply = json!({
         "ok": true,
         "warm": true,
         "direct": direct,
@@ -428,7 +507,26 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
         "verified": link.and_then(|l| l.verified_name.clone()),
         "path": path,
     });
-    req.reply(&reply).await;
+    // Confirm the far end is there before saying so: one reach-ping round
+    // trip, bounded. Spawned, so the event loop never waits on the peer (F8).
+    let (n, answered) = liveness_register();
+    let sent = t.send_control(&liveness_ping(n)).await.is_ok();
+    let window = liveness_window();
+    tokio::spawn(async move {
+        let t0 = Instant::now();
+        let ok = sent && matches!(tokio::time::timeout(window, answered).await, Ok(Ok(())));
+        if ok {
+            reply["alive_ms"] = json!(t0.elapsed().as_millis() as u64);
+            req.reply(&reply).await;
+        } else {
+            liveness_forget(n);
+            ui::debug(&format!(
+                "reach: warm link to '{peer}' did not answer a liveness ping in {}ms",
+                window.as_millis()
+            ));
+            req.reject("warm link did not answer").await;
+        }
+    });
 }
 
 /// Return only links the daemon already holds. This is deliberately passive:
@@ -441,7 +539,18 @@ pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
         .filter_map(|(pid, link)| {
             let name = link.verified_name.as_deref()?;
             let transport = link.transport.as_ref()?;
-            if !link.trusted || !transport.is_alive() {
+            // `devices` renders "online" from this list, so a link is listed
+            // only while its peer is demonstrably there (peer_present): a relay
+            // link to a stopped or wiped peer stays `is_alive()` and kept being
+            // shown "online, last seen just now".
+            if !link.trusted
+                || !peer_present(
+                    transport.is_alive(),
+                    link.direct,
+                    transport.heard_ms(),
+                    transport.idle_ms(),
+                )
+            {
                 return None;
             }
             Some(json!({
@@ -460,18 +569,7 @@ pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
     req.reply(&json!({ "ok": true, "links": links })).await;
 }
 
-#[cfg(unix)]
-/// A non-direct (relay/WebRTC) link has no QUIC keepalive, so an idle one may be
-/// silently NAT/relay-evicted while `is_alive()`/`is_dead()` still lag (the read
-/// loop hasn't seen the EOF yet). Container/DERP paths evict ~10s; reusing such a
-/// link would open a stream into a black hole and hang. So past this idle window
-/// we refuse to warm-reuse a non-direct link and fall back to a fresh establish
-/// (correct, just not free). Direct links are exempt: the 5s keepalive keeps them
-/// genuinely alive across idle gaps, and their `idle_ms()` is unreliable here
-/// anyway (quinn keepalive frames don't stamp last_activity).
-/// The net.rs 5s relay keepalive keeps idle_ms under this gate on healthy links;
-/// tripping it means the keepalive stopped, so a fresh establish is the right answer.
-const WARM_RELAY_STALE_MS: u64 = 8_000;
+pub(crate) use crate::link_manager::peer_present;
 
 #[cfg(unix)]
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
@@ -480,43 +578,43 @@ const WARM_RELAY_STALE_MS: u64 = 8_000;
 /// eligibility rule lives in exactly one place. A miss means the caller falls
 /// back to a fresh establish, which is correct.
 pub(crate) fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn net::Transport>)> {
-    conn.links
+    use crate::link_manager::{LinkObs, Placement, Work, place};
+    // Eligibility is "do I know WHO this link reaches", because the caller is
+    // asking to route a request AT that peer. `l.trusted` is a narrower thing:
+    // the legacy blanket-trust flag, which a fleet link deliberately never sets
+    // (its identity comes from a verified certificate, and `admit_delegated`
+    // avoids `trusted` precisely so it cannot leak into the legacy_ok gates).
+    // Testing only `trusted` made every fleet sibling ineligible for the warm
+    // path, so `shell`/`open` fell through to a cold dial for a peer we hold no
+    // secret for and reported it as unreachable while a healthy link sat right
+    // there. A Proven identity binding answers the actual question.
+    // NOTE: this decides ROUTING, not permission. What the peer may do to us is
+    // still decided by the capability gate on the receiving side.
+    let links: Vec<LinkObs<'_>> = conn
+        .links
         .iter()
-        .filter(|(_, l)| {
-            // Eligibility here is "do I know WHO this link reaches", because the
-            // caller is asking to route a request AT that peer. `l.trusted` is a
-            // narrower thing: the legacy blanket-trust flag, which a fleet link
-            // deliberately never sets (its identity comes from a verified
-            // certificate, and `admit_delegated` avoids `trusted` precisely so it
-            // cannot leak into the legacy_ok gates). Testing only `trusted` made
-            // every fleet sibling ineligible for the warm path, so `shell`/`open`
-            // fell through to a cold dial for a peer we hold no secret for and
-            // reported it as unreachable while a healthy link sat right there.
-            // A Proven identity binding answers the actual question.
-            // NOTE: this decides ROUTING, not permission. What the peer may do to
-            // us is still decided by the capability gate on the receiving side.
-            let identity_known =
-                l.trusted || l.identity_binding == crate::capability::BindingStrength::Proven;
-            identity_known
-                && l.verified_name
-                    .as_deref()
-                    .map(|n| n.eq_ignore_ascii_case(peer))
-                    .unwrap_or(false)
-                && l.transport
-                    .as_ref()
-                    .map(|t| {
-                        // Alive, AND (direct OR a relay link that hasn't been idle long
-                        // enough to be a silently-evicted zombie).
-                        t.is_alive() && (l.direct || t.idle_ms() < WARM_RELAY_STALE_MS)
-                    })
-                    .unwrap_or(false)
+        .map(|(pid, l)| LinkObs {
+            pid: pid.as_str(),
+            verified_name: l.verified_name.as_deref(),
+            identity_known: l.trusted
+                || l.identity_binding == crate::capability::BindingStrength::Proven,
+            has_transport: l.transport.is_some(),
+            alive: l.transport.as_ref().is_some_and(|t| t.is_alive()),
+            direct: l.direct,
+            idle_ms: l.transport.as_ref().map_or(u64::MAX, |t| t.idle_ms()),
         })
-        .max_by_key(|(_, l)| l.direct as u8)
-        .map(|(pid, l)| (pid.clone(), l.transport.clone().unwrap()))
+        .collect();
+    match place(Work::Interactive, peer, &links) {
+        Placement::Reuse { pid } => {
+            let t = conn.links.get(&pid)?.transport.clone()?;
+            Some((pid, t))
+        }
+        Placement::Establish => None,
+    }
 }
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
-/// is diagnosable (visible at `-v` / FILAMENT_LOG=debug only).
+/// is diagnosable (visible at `-v` / TUNLION_LOG=debug only).
 #[cfg(unix)]
 fn log_warm_miss(conn: &Conn, peer: &str) {
     for (p, l) in conn.links.iter() {
@@ -528,6 +626,25 @@ fn log_warm_miss(conn: &Conn, peer: &str) {
             l.transport.is_some(),
             l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
             l.direct,
+        ));
+    }
+}
+
+/// DEBUG: every link that names `peer`, and which one the warm path chose, so
+/// a slow warm open on a peer with more than one link is diagnosable.
+#[cfg(unix)]
+fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
+    for (p, l) in conn.links.iter() {
+        if !l.verified_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(peer)) {
+            continue;
+        }
+        ui::debug(&format!(
+            "warm-pick '{peer}': pid={p} chosen={} direct={} alive={} age_ms={:?} deferred_left={}",
+            p == chosen,
+            l.direct,
+            l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
+            l.established_at.map(|t| t.elapsed().as_millis()),
+            conn.deferred_left.contains_key(p),
         ));
     }
 }
@@ -550,6 +667,7 @@ async fn handle_warm_open(
         req.reject("no warm link to that peer").await;
         return;
     };
+    log_warm_pick(conn, &peer, &pid);
     // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to.
     let mux = l2_muxes
         .entry(pid.clone())
@@ -568,12 +686,20 @@ async fn handle_warm_open(
     // timeout (the 25s ssh ConnectTimeout we measured). Spawned so the verify wait
     // never blocks the event loop (F8).
     tokio::spawn(async move {
-        match l2::open_stream_verified(&mux, rport, l2::warm_verify_window()).await {
-            Ok((sid, first, rx)) => {
+        match l2::open_stream_verified_reason(&mux, rport, l2::warm_verify_window()).await {
+            l2::WarmOpen::Opened(sid, first, rx) => {
                 let sock = req.accept().await;
                 l2::serve_verified_stream(mux, sid, sock, first, rx).await;
             }
-            Err(e) => {
+            // The peer ANSWERED: the link is healthy, keep it, and relay the
+            // reason so the client can show it (it used to be read as a zombie).
+            l2::WarmOpen::Refused(reason) => {
+                ui::debug(&format!(
+                    "tunlion: warm open to '{peer}':{rport} refused by the peer ({reason})"
+                ));
+                req.reject(&format!("refused: {reason}")).await;
+            }
+            l2::WarmOpen::Dead(e) => {
                 ui::debug(&format!(
                     "tunlion: warm link to '{peer}' is a zombie ({e}); dropping + establishing fresh"
                 ));
@@ -784,4 +910,37 @@ pub(crate) fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
         waiters.retain(|(_, deadline)| *deadline > now);
     }
     pending.retain(|_, waiters| !waiters.is_empty());
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    /// A pong echoing the ping's nonce wakes exactly that probe; a stray or
+    /// late pong wakes nothing.
+    #[tokio::test]
+    async fn a_pong_answers_its_own_ping_only() {
+        let (n, rx) = liveness_register();
+        let (m, mut other) = liveness_register();
+        let ping = liveness_ping(n);
+        assert_eq!(ping["type"], json!("reach-ping"));
+        let pong = liveness_pong(&ping);
+        assert_eq!(pong, json!({ "type": "reach-pong", "n": n }));
+        liveness_answered(&pong);
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx).await.is_ok());
+        assert!(other.try_recv().is_err(), "probe {m} must still be waiting");
+        liveness_answered(&json!({ "type": "reach-pong", "n": 999_999_999u64 }));
+        liveness_answered(&json!({ "type": "reach-pong" }));
+        liveness_forget(m);
+        assert!(liveness_window() >= Duration::from_millis(1));
+    }
+
+    /// No answer means no confirmation: the probe times out, it is never
+    /// reported as alive.
+    #[tokio::test]
+    async fn silence_is_not_alive() {
+        let (n, rx) = liveness_register();
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx).await.is_err());
+        liveness_forget(n);
+    }
 }

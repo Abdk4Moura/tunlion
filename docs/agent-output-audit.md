@@ -163,7 +163,7 @@ Exactly one JSON document on stdout, never interleaved with anything else.
 refinement; `error.exit` repeats the process code. `data` preserves today's shapes
 verbatim one level down: `devices` keeps its array (`dispatch.rs:1037-1044`) as
 `data.devices`, `status` keeps `{running,pid,devices,exposed,recent}`
-(`status_cmd.rs:106-112`) as `data`, `doctor` keeps `kind: "filament-doctor-probe"`
+(`status_cmd.rs:106-112`) as `data`, `doctor` keeps `kind: "tunlion-doctor-probe"`
 (`doctor.rs:293-310`) as `data`. No existing consumer re-learns a field.
 
 Two rules that keep it honest:
@@ -172,8 +172,13 @@ Two rules that keep it honest:
   `doctor.rs:62` and prints prose; `reach --json` prints `{"ok":false,…}` and exits 0
   (`ping.rs:200-204`). Same defect from opposite ends.
 - **`ok` describes the outcome, not the invocation.** `reach --json` on a dead peer is
-  `ok:false`, exit 5. `status --json` with the daemon down is `ok:true`,
-  `data.running:false`, exit 0: status reports, it does not attempt.
+  `ok:false`, exit 5. `status --json` follows the same rule: `ok` is true only when a
+  daemon serves this config directory and answers, and it exits with the code plain
+  `status` does (11 down, 6 running but not answering) with an `error` naming why;
+  `running`/`responding` are still reported. (This audit first proposed `ok:true`, exit 0
+  for a down daemon, "status reports, it does not attempt"; once plain `status` answered
+  with its exit code, that made `--json` and the exit code disagree about the same
+  question, so the JSON follows the code.)
 
 ## 5. Conflicts with the existing contract
 

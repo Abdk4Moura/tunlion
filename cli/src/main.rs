@@ -51,9 +51,10 @@ mod holepunch;
 pub(crate) use filament_id as identity;
 mod interact;
 mod l2;
+mod proxy_state;
 mod mount;
 mod mount_proto;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 mod mount_fuse;
 #[cfg(all(target_os = "windows", feature = "mount-windows"))]
 mod mount_winfsp;
@@ -71,10 +72,19 @@ mod pake_ceremony;
 mod ping;
 mod roster;
 mod sdnotify;
+/// Stopping the daemon for real, and naming who holds its election.
+mod daemon_stop;
+/// What status and doctor say about the running daemon beyond a live pid.
+mod daemon_health;
+/// The daemon's signaling link: re-dial policy, log collapse, reported health.
+mod signaling_health;
+/// What to say when a paired device was reset and came back under a new key.
+mod reset_hints;
 // The wire vocabulary and its pure decisions now live in their own crate. Kept
 // under the `protocol::` name so every call site reads unchanged.
 use filament_proto as protocol;
 mod resilience;
+mod link_manager;
 mod session;
 /// Receive-file leaf helpers (assembly, resume, whole-file verification).
 /// Daemon control-socket + warm-reuse handlers, lifted out of this file.
@@ -100,6 +110,20 @@ mod recv_cmd;
 use recv_cmd::recv_cmd;
 /// `tunlion send`.
 mod send_cmd;
+/// `tunlion send`'s source checks: refuse what cannot be read before offering.
+mod send_source;
+/// `tunlion send --json`: the result object.
+mod send_report;
+/// What a one-shot `tunlion receive` stored or refused, its exit, and `--json`.
+mod recv_report;
+/// Corrupt state files are an error naming the file, never "empty".
+mod state_files;
+mod transfer_history;
+/// What `send` says, and how long it waits, when its receiver goes away.
+mod send_liveness;
+/// What a transfer says about itself when it resumes, streams or loses its
+/// peer: the pure decisions and sentences, kept testable.
+mod transfer_truth;
 /// The CLI dispatch table.
 mod dispatch;
 use dispatch::async_main;
@@ -115,6 +139,8 @@ mod device_perms;
 pub(crate) use device_view::{devices_store, devices_store_v2, device_cert_for, device_cert_valid_for, device_record_exists, device_name_for_pub, device_cert_revoked, devices_find_by_device_pub, devices_sweep_lapsed, devices_touch, devices_info, device_countdown, device_entries};
 #[cfg(test)]
 pub(crate) use device_view::devices_touch_at;
+/// The pure `mount-open` decision inputs (capability + share-root confinement).
+mod mount_gate;
 /// Mount planning/implementation and reset.
 mod mount_cmd;
 pub(crate) use mount_cmd::{reset_cmd, resolve_mount_plan};
@@ -122,6 +148,10 @@ pub(crate) use mount_cmd::{reset_cmd, resolve_mount_plan};
 pub(crate) use mount_cmd::mount_fuse_cmd;
 /// Fleet helpers and mesh housekeeping.
 mod fleet_support;
+/// Forget and revoke, in effect in the running daemon.
+mod revocation_live;
+/// Used invitations, kept on disk apart from any device record.
+mod invite_burn;
 pub(crate) use fleet_support::{apply_reconfigure, ensure_self_genesis_header, fleet_certificate_warning, fleet_identity_pending, fleet_indexed_name, fleet_route_ok, fleet_shaped_link, fleet_share_root, sweep_completed_streams, sweep_lapsed};
 #[cfg(test)]
 pub(crate) use fleet_support::fleet_certificate_warning_for;
@@ -159,6 +189,8 @@ mod shell_support;
 pub(crate) use shell_support::{any_shell_grant, daemon_alive, daemon_running, require_shell_owner_ack, service_manager_for_pid, shell_argv, shell_grant_names, shell_root_note};
 /// The single shell gate shared by pty-open and exec-open.
 mod shell_gate;
+/// Precise shell-class refusal codes and the remedy each one implies.
+mod refusal;
 #[cfg(test)]
 pub(crate) use shell_support::service_manager_for_cgroup;
 /// Hashing, time and randomness primitives.
@@ -171,7 +203,6 @@ pub(crate) use crypto_atoms::{chrono_now, fresh_secret, head_hash, hmac_sha256, 
 pub(crate) use shell_support::shell_grant_names_at;
 #[cfg(test)]
 pub(crate) use shell_support::any_shell_grant_at;
-use enrollment::{enroll_cmd};
 /// `tunlion up --install`: the managed-service unit, per platform.
 mod install_service;
 use install_service::install_system_service;
@@ -246,6 +277,7 @@ mod sshd;
 mod sshkeys;
 mod local;
 mod ui;
+mod style;
 mod fleet_ui;
 
 use anyhow::{bail, Result};
@@ -273,12 +305,20 @@ use zeroize::Zeroizing;
 // files). Loop until the whole buffer lands; return Err on a real failure so the caller
 // can react instead of silently dropping bytes.
 
+/// How long a peer that vanished WITHOUT announcing it (no `brb`) is waited
+/// for. 25 s, the bound a sender already gives a receiver that was killed
+/// mid-transfer: a signaling blip reconnects well inside it, and a process that
+/// was killed is not coming back, so waiting longer only delays the honest
+/// answer (a receiver whose sender was SIGKILLed used to wait ~96 s). A peer
+/// that said `brb` gets its declared window instead (see `on_peer_left`).
+pub(crate) const REJOIN_UNWARNED_DEFAULT: Duration = Duration::from_secs(25);
+
 fn rejoin_unwarned() -> Duration {
-    std::env::var("FILAMENT_REJOIN_SECS") // test knob (gate 15)
+    std::env::var("TUNLION_REJOIN_SECS") // test knob (gate 15)
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(45))
+        .unwrap_or(REJOIN_UNWARNED_DEFAULT)
 }
 
 /// Test/injection hooks, env-gated fault injectors used ONLY by the resilience
@@ -292,18 +332,18 @@ fn rejoin_unwarned() -> Duration {
 mod test_hooks {
     /// gate 17b: connect but never send our SPAKE2 element so the ceremony budget fires.
     pub fn pair_stall() -> bool {
-        std::env::var("FILAMENT_TEST_PAIR_STALL").is_ok()
+        std::env::var("TUNLION_TEST_PAIR_STALL").is_ok()
     }
     /// P1: force every WebRTC link relay-only (models a hard-NAT peer).
     pub fn webrtc_relay_only() -> bool {
-        std::env::var("FILAMENT_TEST_WEBRTC_RELAY_ONLY").map(|v| v == "1").unwrap_or(false)
+        std::env::var("TUNLION_TEST_WEBRTC_RELAY_ONLY").map(|v| v == "1").unwrap_or(false)
     }
     /// L3-over-relay gate: refuse the rung-1 direct-QUIC path even for a daemon.
     /// `direct_ok_for` forces direct ON for any long-lived acceptor (anti-glare),
     /// which is right in production and makes the DataChannel data path
     /// unreachable on a single box, so it cannot otherwise be exercised.
     pub fn no_direct() -> bool {
-        std::env::var("FILAMENT_TEST_NO_DIRECT").map(|v| v == "1").unwrap_or(false)
+        std::env::var("TUNLION_TEST_NO_DIRECT").map(|v| v == "1").unwrap_or(false)
     }
     /// gate 11b: hold each chunk briefly so a transfer is still FLOWING when the
     /// gate's second receiver rejoins.
@@ -315,26 +355,26 @@ mod test_hooks {
     /// the fact. The gate then fails on a FAST machine, which is why it flips run
     /// to run. Same problem, and same remedy, as `pair_stall` for gate 17b.
     pub fn transfer_stall_ms() -> u64 {
-        std::env::var("FILAMENT_TEST_TRANSFER_STALL_MS")
+        std::env::var("TUNLION_TEST_TRANSFER_STALL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     }
     /// gate 18b: revert the mode-B post-completion drop to reconnect-always.
     pub fn disable_modeb_drop() -> bool {
-        std::env::var("FILAMENT_TEST_DISABLE_MODEB_DROP").is_ok()
+        std::env::var("TUNLION_TEST_DISABLE_MODEB_DROP").is_ok()
     }
     /// #28: revert the deferred peer-left drop to unconditional-drop.
     pub fn no_defer() -> bool {
-        std::env::var("FILAMENT_TEST_NO_DEFER").is_ok()
+        std::env::var("TUNLION_TEST_NO_DEFER").is_ok()
     }
     /// #28: synthesize a peer-left for the active sid once N file-data bytes are sent.
     pub fn inject_peer_left_at() -> Option<u64> {
-        std::env::var("FILAMENT_TEST_INJECT_PEER_LEFT").ok().and_then(|v| v.parse::<u64>().ok())
+        std::env::var("TUNLION_TEST_INJECT_PEER_LEFT").ok().and_then(|v| v.parse::<u64>().ok())
     }
     /// signaling-drop gate: revert the daemon acceptor to the no-outer-loop path.
     pub fn no_signaling_reconnect() -> bool {
-        std::env::var("FILAMENT_TEST_NO_SIGNALING_RECONNECT").is_ok()
+        std::env::var("TUNLION_TEST_NO_SIGNALING_RECONNECT").is_ok()
     }
     /// shutdown-hang gate: deterministically reproduce the multi-link shutdown
     /// hang by WEDGING the event loop forever (simulating a peer transport whose
@@ -344,19 +384,19 @@ mod test_hooks {
     /// watchdog is defeated hangs to the systemd timeout, the shipped one exits
     /// within the bounded grace.
     pub fn wedge_loop_on_shutdown() -> bool {
-        std::env::var("FILAMENT_TEST_WEDGE_LOOP").is_ok()
+        std::env::var("TUNLION_TEST_WEDGE_LOOP").is_ok()
     }
     /// warm-standby gate: churn surviving links after completion to force the C4 flap.
     pub fn churn_after_complete() -> bool {
-        std::env::var("FILAMENT_TEST_CHURN_AFTER_COMPLETE").is_ok()
+        std::env::var("TUNLION_TEST_CHURN_AFTER_COMPLETE").is_ok()
     }
     /// gate 18: drop the file-end control frame so the completion sweep must finalize.
     pub fn drop_file_end() -> bool {
-        std::env::var("FILAMENT_TEST_DROP_FILE_END").is_ok()
+        std::env::var("TUNLION_TEST_DROP_FILE_END").is_ok()
     }
     /// gate 18: drop a peer-left event so the quiet-exit fallback is exercised.
     pub fn drop_peer_left() -> bool {
-        std::env::var("FILAMENT_TEST_DROP_PEER_LEFT").is_ok()
+        std::env::var("TUNLION_TEST_DROP_PEER_LEFT").is_ok()
     }
     /// P4 silent-data-loss gate: the receiver finalizes the file INTACT but
     /// suppresses the outbound `delivery-ack`, faithfully simulating an ack that
@@ -365,10 +405,10 @@ mod test_hooks {
     /// false "delivered + verified". Distinct from corrupt-recv (which drives the
     /// re-request loop): here the bytes are whole, only the ack is withheld.
     pub fn suppress_delivery_ack() -> bool {
-        std::env::var("FILAMENT_TEST_SUPPRESS_ACK").is_ok()
+        std::env::var("TUNLION_TEST_SUPPRESS_ACK").is_ok()
     }
 
-    /// BUG-ACKLOSS reproducer (test-only): `FILAMENT_TEST_PREMATURE_CLOSE=1` tears
+    /// BUG-ACKLOSS reproducer (test-only): `TUNLION_TEST_PREMATURE_CLOSE=1` tears
     /// the link DOWN at the exact moment the delivery-ack is due, so the ack never
     /// reaches the sender and the sender's transport observes ApplicationClosed(0,"").
     /// QUIC has no flush-on-close (RFC 9000 s10.2), so this is precisely the
@@ -382,12 +422,12 @@ mod test_hooks {
     /// the second attempt) instead of looping drop -> re-dial -> drop. The latch is
     /// a process-global AtomicBool, mirroring corrupt_once.
     pub fn premature_close_after_ack() -> bool {
-        matches!(std::env::var("FILAMENT_TEST_PREMATURE_CLOSE").as_deref(), Ok("1") | Ok("once"))
+        matches!(std::env::var("TUNLION_TEST_PREMATURE_CLOSE").as_deref(), Ok("1") | Ok("once"))
     }
     static PREMATURE_FIRED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     pub fn premature_close_once() -> bool {
-        std::env::var("FILAMENT_TEST_PREMATURE_CLOSE").as_deref() == Ok("once")
+        std::env::var("TUNLION_TEST_PREMATURE_CLOSE").as_deref() == Ok("once")
     }
     pub fn premature_already_fired() -> bool {
         PREMATURE_FIRED.load(std::sync::atomic::Ordering::SeqCst)
@@ -396,20 +436,41 @@ mod test_hooks {
         PREMATURE_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// truncation/ack gate corruption injector. `FILAMENT_TEST_CORRUPT_RECV=<id>`
+    /// truncation/ack gate corruption injector. `TUNLION_TEST_CORRUPT_RECV=<id>`
     /// flips the last on-disk byte of the matching transfer; `_CORRUPT_ONCE=1`
     /// fires exactly once (proving auto-recovery). The "already fired" latch is a
     /// process-global AtomicBool, no env mutation (the old code did an unsafe
-    /// `set_var` of `FILAMENT_TEST_CORRUPT_FIRED` inside the async runtime).
+    /// `set_var` of `TUNLION_TEST_CORRUPT_FIRED` inside the async runtime).
     static CORRUPT_FIRED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
     /// The configured corrupt-recv target id, if any.
     pub fn corrupt_recv_target() -> Option<String> {
-        std::env::var("FILAMENT_TEST_CORRUPT_RECV").ok()
+        std::env::var("TUNLION_TEST_CORRUPT_RECV").ok()
+    }
+
+    /// daemon-survival gate (14c): `TUNLION_TEST_FAIL_ADOPT=<n>` makes the
+    /// first n peer adoptions fail the way an ICE-config timeout does, so the
+    /// gate can prove a per-peer failure never ends the `up` daemon and that
+    /// the next attempt still connects. The count is a process-global latch.
+    static FAIL_ADOPT_USED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    pub fn fail_adopt() -> bool {
+        let Some(n) = std::env::var("TUNLION_TEST_FAIL_ADOPT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        FAIL_ADOPT_USED
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |used| (used < n).then_some(used + 1),
+            )
+            .is_ok()
     }
     pub fn corrupt_recv_once() -> bool {
-        std::env::var("FILAMENT_TEST_CORRUPT_ONCE").map(|v| v == "1").unwrap_or(false)
+        std::env::var("TUNLION_TEST_CORRUPT_ONCE").map(|v| v == "1").unwrap_or(false)
     }
     pub fn corrupt_already_fired() -> bool {
         CORRUPT_FIRED.load(std::sync::atomic::Ordering::SeqCst)
@@ -441,6 +502,7 @@ mod test_hooks {
     #[inline] pub fn premature_already_fired() -> bool { false }
     #[inline] pub fn premature_mark_fired() {}
     #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
+    #[inline] pub fn fail_adopt() -> bool { false }
 }
 
 
@@ -460,7 +522,7 @@ impl UiCapability {
         let interactive = std::io::stdin().is_terminal()
             && !cli.no_interactive
             && !cli.json
-            && std::env::var_os("FILAMENT_NONINTERACTIVE").is_none();
+            && std::env::var_os("TUNLION_NONINTERACTIVE").is_none();
         let color = match cli.color.as_deref() {
             Some("always") => true,
             Some("never") => false,
@@ -550,7 +612,9 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
         return;
     }
     *shown = true;
-    ui::say(&ui::paint(
+    // Debug-level: this names a BROWSER setting (chrome://flags), and the
+    // terminal-to-terminal case it fired in at normal verbosity has no browser.
+    ui::debug(&ui::paint(
         ui::Tone::Dim,
         "  still can't connect, if both ends are on the SAME machine, a browser's \
          mDNS (.local) ICE candidates can block this; try a different network path, \
@@ -560,7 +624,11 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
 
 /// The clap command surface.
 mod cli_def;
-pub(crate) use cli_def::{Cli, Cmd, DevicesAction, EphemeralAction, IdAction};
+/// The documented exit codes and the one place a failure is reported.
+mod exit_codes;
+pub(crate) use cli_def::{Cli, Cmd, DevicesAction, IdAction};
+mod skill;
+mod dashboard;
 #[cfg(test)]
 pub(crate) use cli_def::EXAMPLES;
 
@@ -645,7 +713,7 @@ pub(crate) fn mk_uid(prefix: &str) -> String {
     // Test hook (gate 11): a pinned uid lets the harness exercise the
     // same-device-rejoined supersede path (C6). The cli-s-/cli-r- role prefix
     // must survive the override or same-role skip (C13) breaks.
-    if let Ok(forced) = std::env::var("FILAMENT_UID") {
+    if let Ok(forced) = std::env::var("TUNLION_UID") {
         return format!("cli-{prefix}-{forced}");
     }
     let nanos = SystemTime::now()
@@ -657,7 +725,7 @@ pub(crate) fn mk_uid(prefix: &str) -> String {
 
 /// Same install (our own daemon / another process of this device)?
 pub(crate) fn is_self_uid(my_uid: &str, peer_uid: Option<&str>) -> bool {
-    if std::env::var("FILAMENT_UID").is_ok() {
+    if std::env::var("TUNLION_UID").is_ok() {
         return false; // test hook pins uids; don't second-guess it
     }
     let id = install_id();
@@ -679,9 +747,7 @@ fn config_get(key: &str) -> Option<String> {
 
 fn config_set(key: &str, value: &str) -> Result<()> {
     let p = config_path();
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
+    crate::state_files::before_write(&p)?;
     let mut lines: Vec<String> = std::fs::read_to_string(&p)
         .unwrap_or_default()
         .lines()
@@ -689,12 +755,14 @@ fn config_set(key: &str, value: &str) -> Result<()> {
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("{key} {value}"));
-    std::fs::write(&p, lines.join("\n") + "\n")?;
+    // Owner-only (0600) in an owner-only directory, whatever the umask, and
+    // atomic. A plain `fs::write` here created `config` 0666 under umask 0000.
+    crate::platform::SecretFile::write_str(&p, &(lines.join("\n") + "\n"))?;
     Ok(())
 }
 
 pub(crate) fn display_name() -> String {
-    if let Ok(n) = std::env::var("FILAMENT_NAME") {
+    if let Ok(n) = std::env::var("TUNLION_NAME") {
         return n;
     }
     if let Some(n) = config_get("name") {
@@ -703,31 +771,44 @@ pub(crate) fn display_name() -> String {
     default_display_name()
 }
 
-/// The computed display name when nothing is configured (user@host). Kept
-/// separate so the settings readout can show the true default.
+/// The computed display name when nothing is configured: the short hostname
+/// (`laptop`, not `kabir@laptop.home.lan`). Kept separate so the settings
+/// readout can show the true default.
 pub(crate) fn default_display_name() -> String {
-    // #183.1: USER and /etc/hostname are UNIX-only. On Windows the platform
-    // provides USERNAME and COMPUTERNAME and no /etc/hostname, so the unix
-    // read would offer every device the literal name "cli".
-    #[cfg(not(target_os = "windows"))]
-    {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        let host = std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "cli".into());
-        format!("{user}@{host}")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-        let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into());
-        format!("{user}@{host}")
-    }
+    short_host_label(&crate::platform::os_hostname().unwrap_or_default())
 }
 
+/// `Kabir-MacBook.local` -> `kabir-macbook`. The first DNS label, lowercased,
+/// with anything outside [a-z0-9-] turned into `-`, so the name works as a
+/// `<name>.mesh` label and reads the same on every peer. Falls back to
+/// "device" when nothing usable is left.
+pub(crate) fn short_host_label(host: &str) -> String {
+    let first = host.trim().split('.').next().unwrap_or("");
+    let mapped: String = first
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }
+        })
+        .collect();
+    let mut label = String::new();
+    for c in mapped.chars() {
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
+    }
+    let label: String = label.trim_end_matches('-').chars().take(63).collect();
+    let label = label.trim_end_matches('-').to_string();
+    if label.is_empty() { "device".to_string() } else { label }
+}
 
 pub(crate) fn human(bytes: u64) -> String {
-    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    // Byte counts and rates for all transfer output, in binary units: the
+    // divisor is 1024, so the labels are the IEC ones. They used to say
+    // KB/MB/GB over the same divisor, which reads as decimal and understated
+    // every size and rate (by about 7% at the GB scale).
     let mut v = bytes as f64;
     let mut i = 0;
     while v >= 1024.0 && i < U.len() - 1 {
@@ -754,8 +835,22 @@ impl PartMeta {
         }
         raw.trim().parse::<u64>().ok().map(|size| PartMeta { size, head: None, full: None })
     }
+    /// Write the sidecar WITHOUT following a symlink at `path`: the download
+    /// dir may be writable by others, and `std::fs::write` through a planted
+    /// `x.part.meta -> ~/.bashrc` would overwrite the link's target. Unlink
+    /// first (removes a link, never its target), then create exclusively, so a
+    /// link re-planted in between makes this fail instead of writing through.
+    /// Created owner-only (0600) regardless of umask: it names the file, its
+    /// size and digests, and sits in a download dir others may read.
     fn store(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, json!({ "size": self.size, "head": self.head, "full": self.full }).to_string())
+        use std::io::Write;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut f = crate::platform::create_new_private(path)?;
+        f.write_all(json!({ "size": self.size, "head": self.head, "full": self.full }).to_string().as_bytes())
     }
 }
 
@@ -775,7 +870,7 @@ impl PartMeta {
 /// acceptor (`l2_enabled`), OR this is the long-lived `up` daemon (`daemon`).
 ///
 /// The daemon case is the anti-glare fix for a PLAIN `tunlion up` (no `--shell`,
-/// no `FILAMENT_L2`): two such daemons that are known devices to each other each
+/// no `TUNLION_L2`): two such daemons that are known devices to each other each
 /// fire a KnownPeer for the other and each tries to be the WebRTC initiator. The
 /// two offers collide (GLARE); the polite side drops and rebuilds as a responder,
 /// the supersede churn loops ("appeared, connecting" repeatedly, "reconnecting...")
@@ -823,22 +918,61 @@ fn direct_ok_for(daemon: bool, l2_enabled: bool) -> bool {
 /// the nonce the PEER chose: they will verify against what they sent. `None`
 /// means the challenge has not completed yet and the caller must simply wait,
 /// which is why every send site is inside an `if let`.
+///
+/// `fps` are this link's DTLS fingerprints (`link_fingerprints`); on a
+/// DataChannel the nonce is folded together with them (`nonce_binding`).
 fn out_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
     theirs: &HashMap<String, Vec<u8>>,
+    fps: Option<&(String, String)>,
 ) -> Option<Vec<u8>> {
-    t.channel_binding().or_else(|| theirs.get(pid).cloned())
+    t.channel_binding()
+        .or_else(|| theirs.get(pid).and_then(|n| nonce_binding(t, fps, n)))
 }
 
 /// The binding to VERIFY an incoming `l3-announce` / `fleet-hello` against: our
-/// own exporter value, or the nonce WE chose and sent to that peer.
+/// own exporter value, or the nonce WE chose and sent to that peer (bound to
+/// the DTLS fingerprints on a DataChannel).
 fn in_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
     ours: &HashMap<String, Vec<u8>>,
+    fps: Option<&(String, String)>,
 ) -> Option<Vec<u8>> {
-    t.channel_binding().or_else(|| ours.get(pid).cloned())
+    t.channel_binding()
+        .or_else(|| ours.get(pid).and_then(|n| nonce_binding(t, fps, n)))
+}
+
+/// Turn a link-challenge nonce into the channel binding for a transport with
+/// no RFC-5705 exporter.
+///
+/// A WebRTC DataChannel: `dtls_channel_binding(fps, nonce)`. A bare nonce there
+/// let a party in two WebRTC sessions relay a sibling's challenge and response
+/// and be admitted as that sibling; the fingerprint pair is what differs
+/// between the two legs (pair-proof binds them for the same reason). `None`
+/// while the fingerprints are unknown: the caller waits, it never falls back
+/// to the bare nonce.
+///
+/// Any other exporter-less transport (the same-host `local-tcp` link) has no
+/// DTLS session to bind to and keeps the bare nonce, as before.
+fn nonce_binding(
+    t: &Arc<dyn Transport>,
+    fps: Option<&(String, String)>,
+    nonce: &[u8],
+) -> Option<Vec<u8>> {
+    if t.as_any().is::<net::DataChannelTransport>() {
+        let (a, b) = fps?;
+        Some(overlay::dtls_channel_binding(a, b, nonce))
+    } else {
+        Some(nonce.to_vec())
+    }
+}
+
+/// This link's DTLS fingerprints (ours, theirs), when it has a WebRTC peer.
+async fn link_fingerprints(conn: &conn::Conn, pid: &str) -> Option<(String, String)> {
+    let peer = conn.link(pid)?.peer.clone()?;
+    peer.fingerprints().await
 }
 
 
@@ -862,7 +996,7 @@ impl RevokeRecheck {
 
     /// The re-check interval. Timer-driven loops (pty, l2) build a ticker at this
     /// cadence and re-ask the verdict directly; the request-shaped mount uses
-    /// [`Self::revoked`] instead.
+    /// [`Self::cut`] instead.
     pub(crate) fn interval(&self) -> std::time::Duration {
         self.interval
     }
@@ -870,12 +1004,14 @@ impl RevokeRecheck {
     /// True when the interval has elapsed AND the peer is now revoked. The
     /// caller re-checks at its natural cadence (per request for mount); the
     /// interval bound inside keeps that cadence cheap.
-    pub(crate) fn revoked(&mut self, idev: Option<&[u8; 32]>) -> bool {
+    /// Why the live session must end now (revoked, or its invitation ended),
+    /// checked at most once per interval. None also while the interval runs.
+    pub(crate) fn cut(&mut self, idev: Option<&[u8; 32]>) -> Option<crate::identity_state::LiveCut> {
         if self.last.elapsed() < self.interval {
-            return false;
+            return None;
         }
         self.last = std::time::Instant::now();
-        cert_revoked_for(idev)
+        crate::identity_state::live_session_cut(idev)
     }
 }
 
@@ -957,6 +1093,7 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
 
 pub(crate) fn channel_of(secret: &str) -> String {
     let mut h = Sha256::new();
+    // PROTOCOL LITERAL: frozen, do not rename (rendezvous channel derivation).
     h.update(b"filament-pair:");
     h.update(secret.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
@@ -973,6 +1110,7 @@ pub(crate) fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str
     let (f_lo, f_hi) = if fp1 < fp2 { (fp1, fp2) } else { (fp2, fp1) };
     hmac_sha256(
         secret.as_bytes(),
+        // PROTOCOL LITERAL: frozen, do not rename (pair proof domain).
         format!("filament-proof2:{prover_uid}|{lo}|{hi}|{f_lo}|{f_hi}").as_bytes(),
     )
 }
@@ -984,10 +1122,36 @@ fn drop_dir(flag: Option<PathBuf>) -> PathBuf {
     flag.or_else(|| config_get("dir").map(PathBuf::from)).unwrap_or_else(default_drop_dir)
 }
 
-/// The built-in drop directory when nothing is configured (~/Tunlion). Shared
-/// with the settings readout so it shows the true default.
+/// The built-in drop directory when nothing is configured. Shared with the
+/// settings readout so it shows the true default.
 pub(crate) fn default_drop_dir() -> PathBuf {
-    platform::Paths::home_dir().join("Tunlion")
+    drop_dir_under(&platform::Paths::home_dir())
+}
+
+/// `~/Tunlion`. Never `~/Filament`, even when it exists: that folder belongs
+/// to filament, which can be installed beside tunlion on the same machine.
+fn drop_dir_under(home: &Path) -> PathBuf {
+    home.join("Tunlion")
+}
+
+#[cfg(test)]
+mod drop_dir_tests {
+    use super::drop_dir_under;
+
+    #[test]
+    fn the_drop_dir_is_tunlion_even_beside_a_filament_folder() {
+        let home = std::env::temp_dir().join(format!("drop-dir-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Tunlion"));
+        // filament's folder present: still ours, never theirs.
+        std::fs::create_dir(home.join("Filament")).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Tunlion"));
+        // Both present: still ours.
+        std::fs::create_dir(home.join("Tunlion")).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Tunlion"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 
@@ -1190,14 +1354,110 @@ fn save_requests(reqs: &[PendingRequest]) {
 fn expire_requests(requests: &mut Vec<PendingRequest>) {
     let now = crate::capability::now_secs();
     let mut changed = false;
+    let store = devices_store_snapshot();
     for r in requests.iter_mut().filter(|r| r.status == "pending") {
         if now.saturating_sub(r.timestamp) > REQUEST_TTL_SECS {
             r.status = "expired".to_string();
+            changed = true;
+        } else if store
+            .as_deref()
+            .and_then(|arr| request_bar_in(arr, &r.peer, now))
+            .is_some()
+        {
+            // The device was revoked, forgotten or ran out of access after it
+            // asked. Approving it now could not let it in, so the request is
+            // not waiting on anyone: withdraw it rather than list it.
+            r.status = REQUEST_WITHDRAWN.to_string();
             changed = true;
         }
     }
     if changed {
         save_requests(requests);
+    }
+}
+
+/// Status of a request withdrawn because its device can no longer be let in.
+pub(crate) const REQUEST_WITHDRAWN: &str = "withdrawn";
+
+/// Why a device can neither file an access request nor have one approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestBar {
+    /// Revoked here (`devices revoke`), or its key is refused (forgotten).
+    Revoked,
+    /// The invitation that admitted it ended at this time.
+    Expired(u64),
+    /// No record of it any more (`devices forget`).
+    Forgotten,
+}
+
+/// The device store as parsed records, or None when it is absent or
+/// unreadable (no opinion: nothing is withdrawn on a store we cannot read).
+fn devices_store_snapshot() -> Option<Vec<Value>> {
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    serde_json::from_str::<Vec<Value>>(&raw).ok()
+}
+
+/// Pure but for the key-revocation file: why `peer` (a device name) is barred
+/// from requests, judged against the device records `arr` at `now`.
+pub(crate) fn request_bar_in(arr: &[Value], peer: &str, now: u64) -> Option<RequestBar> {
+    let Some(record) = arr.iter().find(|d| d["name"].as_str() == Some(peer)) else {
+        return Some(RequestBar::Forgotten);
+    };
+    if record["certRevoked"].as_bool().unwrap_or(false) {
+        return Some(RequestBar::Revoked);
+    }
+    if let Some(key) = record["deviceCert"]["devicePub"]
+        .as_str()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+    {
+        if crate::fleet_support::device_key_revoked(&key, now) {
+            return Some(RequestBar::Revoked);
+        }
+    }
+    match crate::identity_state::delegated_access_from_record(record) {
+        Some(a) if a.expired(now) => Some(RequestBar::Expired(a.deadline)),
+        _ => None,
+    }
+}
+
+/// [`request_bar_in`] against this device's store. None when the store
+/// cannot be read.
+pub(crate) fn request_bar(peer: &str) -> Option<RequestBar> {
+    request_bar_in(&devices_store_snapshot()?, peer, crate::capability::now_secs())
+}
+
+/// Why `requests approve` refuses a barred device, with the one command that
+/// actually restores its access. Pure.
+pub(crate) fn request_bar_refusal(id: u64, peer: &str, bar: RequestBar) -> String {
+    let w = crate::refusal::word(peer);
+    match bar {
+        RequestBar::Revoked => format!(
+            "request {id} is from '{peer}', which is revoked here; approving cannot let it in. \
+             To restore it, run:  tunlion devices restore {w}"
+        ),
+        RequestBar::Expired(at) => format!(
+            "request {id} is from '{peer}', whose access expired {}; approving cannot extend it. \
+             Only a fresh invitation admits it again:  tunlion add --for {w}",
+            format_approval_expiry(at)
+        ),
+        RequestBar::Forgotten => format!(
+            "request {id} is from '{peer}', which is no longer paired here (forgotten); approving cannot let it in. \
+             Pair it again with `tunlion add`"
+        ),
+    }
+}
+
+/// Withdraw every pending request from `peer` (it was revoked or forgotten).
+pub(crate) fn withdraw_requests_for(peer: &str) {
+    let mut requests = load_requests();
+    let mut changed = false;
+    for r in requests.iter_mut().filter(|r| r.status == "pending" && r.peer == peer) {
+        r.status = REQUEST_WITHDRAWN.to_string();
+        changed = true;
+    }
+    if changed {
+        save_requests(&requests);
     }
 }
 
@@ -1213,6 +1473,12 @@ fn enqueue_if_requestable(dev_petname: &str, cap: &str) {
     match cap {
         "shell" | "mount" | "transfer" => {}
         _ => return,
+    }
+    // A revoked, forgotten or expired device's refusals are final: no grant
+    // can let it in, so a request from it only invites an approval that does
+    // nothing (and lets a barred device spam the owner's queue).
+    if request_bar(name).is_some() {
+        return;
     }
     let mut requests = load_requests();
     expire_requests(&mut requests);
@@ -1348,22 +1614,6 @@ fn human_duration(secs: u64) -> String {
 }
 
 
-async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
-    match action {
-        EphemeralAction::Enroll { auth_key_file, to } => {
-            let auth_key = Zeroizing::new(read_owner_only_file(&auth_key_file)?);
-            // #186: the claim token is now the compact v2 invitation.
-            let inv = parse_invitation(auth_key.as_str())?;
-            if inv.expires <= identity::now_secs() {
-                bail!("this invitation has expired");
-            }
-            enroll_cmd(server, inv, to, relay, None, false).await
-        }
-    }
-}
-
-
-
 /// The joined device's owner record: the stored device whose cert chains to our
 /// own joined cert's issuer but is not this machine. `depart` uses it to reach
 /// the owner and ask it to free the slot now.
@@ -1429,9 +1679,28 @@ fn load_delegation(path: &std::path::Path) -> Result<crate::ephemeral::Invitatio
 
 
 
+/// The refusal for a `kill` that did not succeed, or None when it did.
+fn kill_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
+    if status.success() {
+        return None;
+    }
+    Some(format!(
+        "could not stop the daemon (pid {pid}): `kill` failed ({status}), so it is still running. \
+         It is probably owned by another user, for example started with sudo; stop it as that user \
+         (`sudo tunlion down`). The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
+    ))
+}
+
 fn down_cmd() -> Result<()> {
-    match daemon_alive() {
+    // The pidfile names the daemon; a daemon whose pidfile is gone (an older
+    // `down` deleted it while the process lived on) is still found through the
+    // pid it recorded in the election lock it holds.
+    match daemon_alive().or_else(daemon_stop::orphaned_lock_holder) {
         Some(pid) => {
+            // Taken BEFORE signalling, so the wait below can tell this daemon
+            // from an unrelated process that later reuses its pid.
+            let exe = platform::process_exe_path(pid);
+            daemon_stop::mark_down(pid);
             // #191: a managed service restarts a killed process. systemd's
             // Restart=always reacts to an UNEXPECTED exit; a manual
             // `systemctl stop` is authoritative and is not restarted. So stop
@@ -1439,10 +1708,25 @@ fn down_cmd() -> Result<()> {
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
             if !stop_managed_service(pid) {
-                std::process::Command::new("kill").arg(pid.to_string()).status()?;
+                let status = std::process::Command::new("kill").arg(pid.to_string()).status()?;
+                // A failed kill leaves the daemon running. Saying "stopped" and
+                // deleting the pidfile would hide it from `status` and `reset`
+                // while it keeps serving, so keep the pidfile and say why.
+                if let Some(why) = kill_failure(pid, &status) {
+                    bail!("{why}");
+                }
             }
+            // Stopped means GONE. A suspended daemon cannot act on SIGTERM and a
+            // busy one may take a moment; "stopped" used to be printed 6 ms
+            // after the signal while the process lived on, holding the lock the
+            // next `up` then lost to. Wait (bounded), resume, then kill.
+            let how = daemon_stop::await_exit(pid, exe.as_deref())?;
             let _ = std::fs::remove_file(pidfile());
-            ui::say(&format!("  {} stopped (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            ui::say(&format!(
+                "  {} stopped (pid {pid}){}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                how.note()
+            ));
             Ok(())
         }
         None => {
@@ -1462,22 +1746,20 @@ fn down_cmd() -> Result<()> {
 // `tunlion reset`: a conservative clean-slate for the LOCAL machine. It removes
 // only tunlion's OWN state under the config dir (identity/overlay keys, the
 // paired-device store, the capability store, pending consent requests, the
-// managed ssh material) and strips the delimited `# BEGIN/END filament-managed
+// managed ssh material) and strips the delimited `# BEGIN/END tunlion-managed
 // <device>` blocks it installed in ~/.ssh/authorized_keys. It NEVER touches the
 // user's real ssh keys or any authorized_keys lines outside those blocks.
 
-/// Remove `path` if present, pushing a human line into `wiped`. Files and
-/// directories both handled; a missing path is silently skipped (idempotent).
-fn reset_remove(path: &std::path::Path, label: &str, wiped: &mut Vec<String>) {
-    let removed = if path.is_dir() {
-        std::fs::remove_dir_all(path).is_ok()
-    } else if path.exists() {
-        std::fs::remove_file(path).is_ok()
-    } else {
-        false
-    };
-    if removed {
-        wiped.push(format!("{label}  ({})", path.display()));
+/// Remove `path` if present: Ok(true) removed, Ok(false) absent (idempotent),
+/// Err when it exists and could not be removed. The error is the caller's to
+/// report: swallowing it is how `reset` used to print "clean slate" over state
+/// it had failed to delete. A symlink is removed, never followed.
+fn reset_remove(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path).map(|()| true),
+        Ok(_) => std::fs::remove_file(path).map(|()| true),
     }
 }
 
@@ -1570,15 +1852,34 @@ fn peer_authz(conn: &mut Conn, pid: &str) -> PeerAuthz {
     let link = conn.link(pid);
     let idev = link.and_then(|l| l.identity_device_pub);
     let iusr = link.and_then(|l| l.identity_user_pub);
+    let mut expires = link.and_then(|l| l.identity_cert_expires);
+    let mut ak_caps = link
+        .and_then(|l| l.principal_kind.auth_key_caps())
+        .map(|c| c.to_vec());
+    // A DELEGATED device's deadline and ceiling are read FRESH from its record
+    // at every gate, never trusted from what the link cached when its identity
+    // first resolved. The cached copy is how an invited guest kept access past
+    // its invitation end: the link was resolved while the invitation was live,
+    // nothing re-read it, and a later proof re-bound it from the presented
+    // (renewed) certificate. The record is the owner's own statement, kept in
+    // step by renewal, and it carries the invitation end.
+    if let Some(access) = idev.as_ref().and_then(crate::identity_state::delegated_access_for) {
+        expires = Some(access.deadline);
+        if access.expired(crate::identity::now_secs()) {
+            ak_caps = Some(Vec::new());
+        } else if ak_caps.is_none() {
+            // A delegated record never authorizes as an owner device, whatever
+            // the link's principal says.
+            ak_caps = Some(access.ceiling.clone());
+        }
+    }
     PeerAuthz {
         binding: link
             .map(|l| l.identity_binding)
             .unwrap_or(crate::capability::BindingStrength::None),
-        expires: link.and_then(|l| l.identity_cert_expires),
+        expires,
         cert_revoked: cert_revoked_for(idev.as_ref()),
-        ak_caps: link
-            .and_then(|l| l.principal_kind.auth_key_caps())
-            .map(|c| c.to_vec()),
+        ak_caps,
         idev,
         iusr,
     }
@@ -1674,17 +1975,55 @@ fn install_transport_hooks() {
 }
 
 
-fn main() -> Result<()> {
+/// The subcommand named on the command line (aliases resolved), for the
+/// closed-pipe rule: the first argument that names one, as the --json
+/// envelope's verb is found. None for bare `tunlion`, `--help`, `--version`.
+fn verb_on_command_line() -> Option<String> {
+    use clap::CommandFactory;
+    let c = Cli::command();
+    std::env::args().skip(1).find_map(|t| {
+        c.get_subcommands()
+            .find(|sc| sc.get_name() == t || sc.get_all_aliases().any(|a| a == t))
+            .map(|sc| sc.get_name().to_string())
+    })
+}
+
+fn main() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
+    ui::exit_quietly_on_broken_pipe();
+    ui::set_closed_pipe_verb(verb_on_command_line().as_deref());
     let first = std::env::args().nth(1);
     let rt = if is_light_command(first.as_deref()) {
-        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+        tokio::runtime::Builder::new_current_thread().enable_all().build()
     } else {
-        tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()
     };
-    rt.block_on(async_main())
+    let result = match rt {
+        Ok(rt) => {
+            let r = rt.block_on(async_main());
+            // Never let the runtime's drop hold the exit. Dropping a runtime
+            // waits for EVERY blocking-pool task, including an uncancellable
+            // stdin read that nobody will ever satisfy, and by then the
+            // signal tasks are gone, so Ctrl-C and SIGTERM are caught and
+            // ignored. A finished command was observed parked here until
+            // Enter was pressed. Bounded: real blocking work (a final fsync)
+            // still gets its moment.
+            rt.shutdown_timeout(std::time::Duration::from_millis(500));
+            r
+        }
+        Err(e) => Err(e.into()),
+    };
+    // Every failure leaves through here: one report, in the form the caller
+    // asked for, with a code from the documented taxonomy (exit_codes.rs).
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let code = exit_codes::report(&e);
+            std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))
+        }
+    }
 }
 
 
@@ -1845,6 +2184,9 @@ fn peer_entry(name: &str, mark: &str, tone: ui::Tone, note: &str) -> String {
 
 fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
     let sender = if sender.is_empty() { "unknown peer" } else { sender };
+    // The offered name is the peer's raw string: show it the way it would be
+    // saved (no separators, controls, or bidi overrides), never verbatim.
+    let name = safe_incoming_name(name);
     let hint = if paired { " [paired]" } else { "" };
     format!(
         "  {}{} offers {} ({}), accept? [y/N] ",
@@ -1859,3 +2201,6 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 
 #[cfg(test)]
 mod tests;
+/// Security decisions the mutation probe found unpinned.
+#[cfg(test)]
+mod security_pins_tests;

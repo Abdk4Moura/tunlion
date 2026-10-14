@@ -25,6 +25,7 @@ import {
   highHalfSid,
   encodeControl,
   decodeControl,
+  ptyOpenMsg,
 } from '../net/protocol/wire.js'
 // PROTOCOL transfer layer: the file-offer/accept/end/delivery-ack ceremony's
 // message vocabulary + pure decisions, extracted from this file. PeerLink keeps
@@ -72,7 +73,7 @@ const ACK_REPROBE_MS = 5000
 // is set, so they ship in the bundle with zero effect on real users. They exist
 // only to drive the deterministic browser↔CLI integrity e2e:
 //   ?test=fixedid    -> mint a deterministic transfer id so the CLI's
-//                       FILAMENT_TEST_CORRUPT_RECV=<id> hook can target it.
+//                       TUNLION_TEST_CORRUPT_RECV=<id> hook can target it.
 //   ?test=trunconce  -> on the RECEIVER, drop the final chunk before file-end
 //                       exactly once, inducing a truncated receive so the
 //                       whole-file verify + re-request path is exercised live.
@@ -81,7 +82,7 @@ const ACK_REPROBE_MS = 5000
 //                       once (one-shot) while the channel stays open, a
 //                       faithful NAT-rebind black-hole that drives the in-flight
 //                       stall watchdog + correction ladder. Mirrors the Rust
-//                       client's FILAMENT_TEST_FREEZE_AFTER_BYTES. Inert for
+//                       client's TUNLION_TEST_FREEZE_AFTER_BYTES. Inert for
 //                       real users (TEST.freeze is false).
 //   ?test=freezepersist -> P5: like ?test=freeze but PERSISTENT, EVERY
 //                       _streamFile run (not just the first) black-holes after
@@ -91,7 +92,7 @@ const ACK_REPROBE_MS = 5000
 //                       `?healafter=<ms>` (the network "heals") so the P5 upgrade
 //                       prober's re-probe can re-detect a direct route and the
 //                       verify-before-commit path runs live. Mirrors the Rust
-//                       FILAMENT_TEST_FREEZE_PERSIST + FILAMENT_TEST_DIRECT_UNBLOCK_MS.
+//                       TUNLION_TEST_FREEZE_PERSIST + TUNLION_TEST_DIRECT_UNBLOCK_MS.
 //                       Inert for real users.
 function _testFlags() {
   try {
@@ -126,7 +127,7 @@ const TEST = (() => {
 })()
 // P5 test knob: ms after page load before the persistent freeze "heals" (the
 // network recovers and a direct path becomes possible). Mirrors the Rust
-// FILAMENT_TEST_DIRECT_UNBLOCK_MS. Only meaningful with ?test=freezepersist.
+// TUNLION_TEST_DIRECT_UNBLOCK_MS. Only meaningful with ?test=freezepersist.
 const HEAL_AFTER_MS = (() => {
   try {
     const v = parseInt(new URLSearchParams(window.location.search).get('healafter') || '', 10)
@@ -144,7 +145,7 @@ const _bootAt = (() => {
 })()
 
 // P0 test knob: bytes a frozen transfer is allowed to send before the data path
-// goes dark (mirrors FILAMENT_TEST_FREEZE_AFTER_BYTES). Overridable via
+// goes dark (mirrors TUNLION_TEST_FREEZE_AFTER_BYTES). Overridable via
 // ?freezeafter=<bytes>; defaults to a value a multi-chunk file crosses quickly.
 const FREEZE_AFTER_BYTES = (() => {
   try {
@@ -164,7 +165,7 @@ const FREEZE_AFTER_BYTES = (() => {
 // SINCE THE LAST BYTE, never throughput, so a slow-but-moving link never trips.
 const STALL_TICK_MS = 2000
 // Override STALL_MS via ?stallms=<ms> for the A/B baseline (huge => the watchdog
-// is effectively off and a freeze must HANG), mirroring FILAMENT_STALL_MS.
+// is effectively off and a freeze must HANG), mirroring TUNLION_STALL_MS.
 const STALL_MS = (() => {
   try {
     const v = parseInt(new URLSearchParams(window.location.search).get('stallms') || '', 10)
@@ -706,7 +707,8 @@ export class PeerLink {
 
   _onMessage(data) {
     if (typeof data === 'string') return this._onControl(decodeControl(data))
-    // Binary frame: [4-byte sid][payload]; parseFrame returns null for a runt.
+    // Binary frame: [4-byte sid][8-byte offset][payload]; parseFrame returns
+    // null for a runt.
     const f = wireParseFrame(data)
     if (!f) return
     const { sid, payload } = f
@@ -772,14 +774,18 @@ export class PeerLink {
   // output instead of spawning a fresh shell (issue #4). Each open allocates a
   // NEW per-link sid (the old link is gone), but the `session` is what binds the
   // two opens to the same remote PTY.
-  openPty(cols, rows, session) {
+  // `resumeFrom` is how many bytes of this session's output the terminal has
+  // already shown. On a reattach it lets the CLI replay only what was missed
+  // instead of the whole buffer again; omitted on the first open.
+  openPty(cols, rows, session, resumeFrom) {
     this._ptySid = highHalfSid(this._nextSid++)
+    this._ptyOut = 0 // bytes sent on this sid: the frame offset (wire.js)
     this._ptySession = session || null
     // PTY session event: an open is a fresh-or-reattach request carrying the
     // stable session id (the persistence path); the ack ('pty-attach') tells us
     // which it was. Tagged shell:true since a PTY now exists on this link.
     linkdiag.record('pty', { what: 'open', session: this._ptySession }, this._diagMeta())
-    this._control({ type: 'pty-open', sid: this._ptySid, cols, rows, session: this._ptySession })
+    this._control(ptyOpenMsg(this._ptySid, cols, rows, this._ptySession, resumeFrom))
     return this._ptySid
   }
   sendPtyInput(u8) {
@@ -794,7 +800,8 @@ export class PeerLink {
       this._liveness.markFrozenForTest()
       return // drop input on the floor; nothing reaches the wire
     }
-    this.channel.send(wireFrame(this._ptySid, u8))
+    this.channel.send(wireFrame(this._ptySid, u8, this._ptyOut))
+    this._ptyOut += u8.byteLength
   }
   resizePty(cols, rows) {
     if (this._ptySid != null) this._control({ type: 'pty-resize', sid: this._ptySid, cols, rows })
@@ -827,7 +834,13 @@ export class PeerLink {
         this.onPtyReady()
         return
       case 'l2-close':
-        if (msg.sid === this._ptySid) { this.onPtyClose(); this._ptySid = null }
+        // A refused open arrives as an l2-close carrying the CLI's reason
+        // (`err`), its code and the CLI's name for this device (`as`): pass
+        // them on so the terminal can say why instead of "session ended".
+        if (msg.sid === this._ptySid) {
+          this.onPtyClose(msg.err ? { err: msg.err, code: msg.code || null, as: msg.as || null } : null)
+          this._ptySid = null
+        }
         return
       case CTRL.BRB:
         this._awayUntil = Date.now() + Math.min(msg.ttl || 120, 300) * 1000
@@ -1114,8 +1127,9 @@ export class PeerLink {
         await new Promise((res) => this._drainWaiters.push(res))
         if (this._closed || this.channel?.readyState !== 'open') return
       }
-      // Frame: [uint32 sid][payload] (net/protocol/wire.js)
-      const framed = wireFrame(sid, new Uint8Array(buf))
+      // Frame: [uint32 sid][uint64 offset][payload] (net/protocol/wire.js). The
+      // CLI receiver places bytes by this offset.
+      const framed = wireFrame(sid, new Uint8Array(buf), offset)
       // P0 test shim (?test=freeze): after FREEZE_AFTER_BYTES on THIS transfer,
       // make the data-path send a no-op ONCE (one-shot per transfer) while the
       // channel stays open, a faithful NAT-rebind black-hole. The control path

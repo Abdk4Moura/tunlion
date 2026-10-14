@@ -3,7 +3,7 @@
 #
 # Every ledger item that claims VERIFIED is exercised here. Run against a
 # local backend (default http://127.0.0.1:8077, started for you if absent
-# when FILAMENT_TEST_AUTOSTART=1) or any FILAMENT_TEST_SERVER.
+# when TUNLION_TEST_AUTOSTART=1) or any TUNLION_TEST_SERVER.
 #
 #   ./gates.sh              run gates 0-9 (no docker needed)
 #   ./gates.sh --with-relay also run gate 10 (TURN relay via local coturn; docker)
@@ -25,10 +25,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
 # Correctness gates build DEBUG by default (~20s incremental) instead of the LTO
-# release build (~4min) -- these gates verify BEHAVIOUR via the FILAMENT_TEST_*
+# release build (~4min) -- these gates verify BEHAVIOUR via the TUNLION_TEST_*
 # hooks, not throughput, so they don't need release codegen. Set
-# FILAMENT_GATE_RELEASE=1 only when a gate is measuring MB/s.
-if [ -n "${FILAMENT_GATE_RELEASE:-}" ]; then
+# TUNLION_GATE_RELEASE=1 only when a gate is measuring MB/s.
+if [ -n "${TUNLION_GATE_RELEASE:-}" ]; then
   GATE_PROFILE_DIR=release; GATE_BUILD_FLAG=--release
 else
   GATE_PROFILE_DIR=debug; GATE_BUILD_FLAG=
@@ -46,15 +46,15 @@ _target_dir() {
 }
 GATE_TARGET_DIR="${CARGO_TARGET_DIR:-$(_target_dir)}"
 BIN="$GATE_TARGET_DIR/$GATE_PROFILE_DIR/tunlion"
-SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
-WORK="${FILAMENT_TEST_WORK:-$(mktemp -d /tmp/filament-gates.XXXXXX)}"
+SERVER="${TUNLION_TEST_SERVER:-http://127.0.0.1:8077}"
+WORK="${TUNLION_TEST_WORK:-$(mktemp -d /tmp/filament-gates.XXXXXX)}"
 WITH_RELAY=0
 [ "${1:-}" = "--with-relay" ] && WITH_RELAY=1
 
 # Hermetic: never let the operator's real config/devices leak into gates
 # (a configured display name broke --to selection in gate 7 once).
-export FILAMENT_CONFIG_DIR="$WORK/cfg"; mkdir -p "$WORK/cfg"
-unset FILAMENT_NAME 2>/dev/null || true
+export TUNLION_CONFIG_DIR="$WORK/cfg"; mkdir -p "$WORK/cfg"
+unset TUNLION_NAME 2>/dev/null || true
 
 PASS=0; FAIL=0; FAILED_GATES=""
 say()  { printf '\n\033[1m== gate %s ==\033[0m\n' "$*"; }
@@ -90,6 +90,38 @@ wait_for_exit() {
   wait "$pid" 2>/dev/null
   return 124
 }
+# Wait for a process that MUST exit, but never without bound. gate 2 used a
+# bare `wait` on its sender, and when the sender wedged the whole job sat there
+# until the 90-minute ceiling cancelled it, with nothing in the log to say what
+# the process was doing. On the deadline, capture what it is blocked on (state,
+# wait channel per thread, sockets, the tail of its logs) and only then kill it,
+# so a wedge fails THIS gate loudly and the gates after it still run.
+# Returns the exit code, or 124 when it had to be killed.
+bounded_wait() {  # $1 = pid, $2 = seconds, $3 = label, rest = logs to show
+  local p="$1" secs="$2" label="$3" i t f
+  shift 3
+  for i in $(seq 1 $((secs * 2))); do
+    kill -0 "$p" 2>/dev/null || { wait "$p" 2>/dev/null; return $?; }
+    sleep 0.5
+  done
+  echo "===== WEDGE: $label, pid $p still running after ${secs}s"
+  ps -o pid,stat,etimes,wchan:24,args -p "$p" 2>/dev/null | sed 's/^/    /'
+  for t in /proc/"$p"/task/*; do
+    [ -d "$t" ] && printf '    thread %s %s\n' "${t##*/}" "$(cat "$t/wchan" 2>/dev/null)"
+  done | head -20
+  ss -tunap 2>/dev/null | grep -E "pid=$p[,)]" | sed 's/^/    /' | head -20
+  for f in "$@"; do
+    echo "  [${f##*/}]"
+    tail -n 30 "$f" 2>/dev/null | sed 's/^/    /'
+  done
+  # Say so when it was already on its way out: past the bound is still past the
+  # bound, but "exited while being captured" is a slow path, not a hang.
+  kill -0 "$p" 2>/dev/null || echo "  (it exited while the state above was being captured)"
+  echo "===== END WEDGE"
+  kill -9 "$p" 2>/dev/null
+  wait "$p" 2>/dev/null
+  return 124
+}
 # L1-a: a `send --word <phrase>` now mints its OWN numeric nameplate (the phrase
 # is only the SPAKE2 password), so the receiver must claim the FULL minted code,
 # not the spoken phrase. CODE_WORD is a valid 2-word phrase (clears the >=2-word
@@ -113,7 +145,7 @@ trap cleanup EXIT
 # rate-limit pinned sky-high (FIL_CLAIM_LIMIT) — the prod 5/min limit is a
 # security control, but in a test it turns the suite's many rapid claims into
 # a timing-window lottery ('slow-down' flakes). Pinning it makes the claim
-# path deterministic. (Set FILAMENT_TEST_SERVER to point at an external
+# path deterministic. (Set TUNLION_TEST_SERVER to point at an external
 # server and skip the autostart — but then you own the claim limit.)
 # #249: this used to default to a hardcoded venv inside a job directory
 # (/root/.claude/jobs/330c2366/...) that no longer exists. The autostart below is
@@ -124,7 +156,7 @@ trap cleanup EXIT
 # CI. Prefer the override, then a venv if one is present, then whatever python3
 # is on PATH; the backend's deps are ordinary (flask, flask-socketio, eventlet).
 _pick_python() {
-    if [ -n "${FILAMENT_TEST_VENV:-}" ]; then echo "$FILAMENT_TEST_VENV"; return; fi
+    if [ -n "${TUNLION_TEST_VENV:-}" ]; then echo "$TUNLION_TEST_VENV"; return; fi
     for c in "$CLI_DIR/../backend/.venv/bin/python" "$CLI_DIR/../.venv/bin/python"; do
         [ -x "$c" ] && { echo "$c"; return; }
     done
@@ -132,7 +164,7 @@ _pick_python() {
 }
 PYV0="$(_pick_python)"
 OWN_BACKEND=""
-if [ -z "${FILAMENT_TEST_SERVER:-}" ] && [ -x "$PYV0" ]; then
+if [ -z "${TUNLION_TEST_SERVER:-}" ] && [ -x "$PYV0" ]; then
   for pid in $(ss -tlnp 2>/dev/null | grep ":8077 " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
   # FIL_PING_TIMEOUT high: a CPU-starved headless browser stays connected
@@ -149,7 +181,7 @@ curl -fsS "$SERVER/api/health" >/dev/null || {
                         || echo "  autostart was SKIPPED: that interpreter is not executable"
   exit 2
 }
-# These gates drive env-gated test hooks (FILAMENT_TEST_*), which now ship ONLY
+# These gates drive env-gated test hooks (TUNLION_TEST_*), which now ship ONLY
 # in a `--features test-hooks` build (stripped from default/release).
 ( cd "$CLI_DIR" && cargo build $GATE_BUILD_FLAG --features test-hooks -q ) || { echo "build failed"; exit 2; }
 # Assert the binary the gates will EXEC exists, rather than discovering it 31
@@ -194,17 +226,26 @@ fi
 # ---------------------------------------------------------------- gate 1 ----
 say "1: one-time code transfer + code burn"
 D="$WORK/g1"; mkdir -p "$D"
-"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g1-send.log" 2>&1 &
+# -v on both ends: the `route:` line has been a DEBUG line since #66 (it is
+# shown under -v; the relay banner is the part every user sees), so without it
+# the route half of this gate had nothing to read and was red on every run.
+"$BIN" -v send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g1-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g1-send.log") || { bad "code transfer (no code minted)"; tail -n 3 "$WORK/g1-send.log"; }
-if [ -n "${W:-}" ] && timeout 90 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.log" 2>&1 \
+if [ -n "${W:-}" ] && timeout 90 "$BIN" -v receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.log" 2>&1 \
    && wait $SP && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ]; then
   ok "code transfer, hashes match, clean exits"
 else bad "code transfer"; tail -n 3 "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
 # C2: same-machine peers must BOTH report local (is_own_addr handles the
 # multi-homed case), and nothing may misreport relayed.
-if [ "$(grep -hc 'route: local' "$WORK/g1-send.log" "$WORK/g1-recv.log" | paste -sd+ | bc)" -ge 2 ] \
-   && ! grep -hq "route: relayed" "$WORK/g1-send.log" "$WORK/g1-recv.log"; then
+# The labels are the transport's (`Peer::route`, and a direct-QUIC link's own
+# route): a same-host path has been "direct over lo" since v0.4.1 and a relayed
+# one "relay". This gate still grepped "route: local" and "route: relayed", so
+# its first half could not pass and its second could not fail. Now it reads the
+# labels the code prints, and the "not relayed" half also requires that the
+# relay banner (what a user is actually shown) is absent.
+if [ "$(grep -hcE 'route: (local|direct over lo)' "$WORK/g1-send.log" "$WORK/g1-recv.log" | paste -sd+ | bc)" -ge 2 ] \
+   && ! grep -hqE "route: relay|on relay, via a TURN server" "$WORK/g1-send.log" "$WORK/g1-recv.log"; then
   ok "route detection: local on both ends, no false relayed"
 else bad "route detection"; grep -h "route:" "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
 if timeout 30 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-burn.log" 2>&1; then
@@ -216,7 +257,14 @@ fi
 # ---------------------------------------------------------------- gate 2 ----
 say "2: chaos — receiver killed mid-transfer, replacement resumes (C4/C6/C7)"
 D="$WORK/g2"; mkdir -p "$D"
-"$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
+# TUNLION_TEST_TRANSFER_STALL_MS: the kill below has to land MID-transfer.
+# Once two processes of one install stopped falling back to WebRTC after the
+# code ceremony, 80 MB moved over QUIC in about half a second, inside the first
+# 0.5s poll, and the receiver finished before it could be killed (measured:
+# "delivered" at 160 MB/s). 3ms per chunk stretches it to ~5s, the same remedy
+# and the same arithmetic as gate 11b.
+TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g2-send.log") || { bad "kill-resume (no code minted)"; tail -n 3 "$WORK/g2-send.log"; }
 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv1.log" 2>&1 &
@@ -253,11 +301,82 @@ sleep 2
 # offset); -v only makes the proof visible.
 timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
 RC2=$?
-wait $SP; RCS=$?
-if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
+# BOUNDED. This was a bare `wait $SP`, and a sender whose event loop had parked
+# on its dead receiver never exited, so the job hung until it was cancelled at
+# 90 minutes (ten cancelled Gates Core runs on 2026-10-09/10, every one in this
+# gate). The replacement receiver has already finished or timed out here; a
+# sender still running a minute later is wedged.
+bounded_wait $SP 60 "kill-resume sender" "$WORK/g2-send.log" "$WORK/g2-recv2.log"; RCS=$?
+if [ $RCS -eq 124 ]; then
+  bad "kill-resume: sender still running 60s after the replacement receiver finished (wedged, state above)"
+elif [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
    && grep -q "resuming at" "$WORK/g2-recv2.log"; then
   ok "kill-resume: replacement receiver resumed, hash matches"
 else bad "kill-resume"; tail -n 4 "$WORK/g2-send.log" "$WORK/g2-recv2.log"; fi
+
+# --------------------------------------------------------------- gate 2b ----
+# The half of gate 2 that was never asserted: the receiver is killed mid-transfer
+# and NOTHING replaces it. The sender must notice within a bounded time and exit
+# nonzero saying the peer is gone, instead of waiting forever. A receiver killed
+# with SIGKILL never closes its SCTP association, so every write the sender then
+# makes waits for an acknowledgement that cannot come; before the fix one such
+# write parked the sender's whole event loop for the life of the process.
+say "2b: dead receiver: killed mid-transfer, nothing replaces it, the sender gives up honestly"
+D="$WORK/g2b"; mkdir -p "$D"
+# TUNLION_ADOPT_ACTIVE_MS holds the dead link in the sender's link table for
+# 15s after the kill (it is dropped once idle that long), which guarantees the
+# sender's 10s `state` ping is written to the dead channel at least once. That
+# write is exactly what parked the event loop forever; at the default 3s the
+# ping only landed in the window by chance, which is why the hang was
+# intermittent. Pinning it makes this gate fail every time the bug is present.
+# The transfer stall is gate 2's, for gate 2's reason: the kill must land mid-transfer.
+TUNLION_ADOPT_ACTIVE_MS=15000 TUNLION_REJOIN_SECS=10 TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2b-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g2b-send.log") || { bad "dead receiver (no code minted)"; tail -n 3 "$WORK/g2b-send.log"; }
+"$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2b-recv.log" 2>&1 &
+R1=$!; pids+=($R1)
+for _ in $(seq 1 60); do
+  sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((10 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+G2BSZ=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+# SIGKILL, not kill_tree, for the reason gate 2 gives: the premise is an abrupt
+# death, and SIGTERM lets the receiver close cleanly.
+kill -9 $R1 2>/dev/null; wait $R1 2>/dev/null
+T0=$(date +%s)
+# Two honest ways out, and the bound has to cover the slower one. Measured in
+# CI: the rejoin path (15s until the dead link is dropped, then the 10s window)
+# exits in 25-26s; the reconnect path (five attempts at the dead peer, then
+# "lost the receiving peer") took about 90s. 150s is the wedge line.
+bounded_wait $SP 150 "dead-receiver sender" "$WORK/g2b-send.log"; RCS=$?
+T1=$(date +%s)
+# With the exit-code taxonomy present, "the peer is gone" is 6 (unreachable);
+# a build without it can only promise nonzero.
+WANT_RC=nonzero
+"$BIN" --help 2>&1 | grep -q "EXIT CODES" && WANT_RC=6
+if [ "$G2BSZ" -eq 0 ]; then
+  bad "dead receiver: the receiver wrote nothing before it was killed, so nothing was mid-transfer"
+elif [ $RCS -eq 124 ]; then
+  bad "dead receiver: sender still running 150s after its receiver was killed (wedged, state above)"
+elif [ $RCS -eq 0 ]; then
+  bad "dead receiver: sender exited 0 though its receiver died at ${G2BSZ} of $((80 * 1024 * 1024)) bytes"
+elif [ "$WANT_RC" = 6 ] && [ $RCS -ne 6 ]; then
+  bad "dead receiver: sender exited $RCS, not 6 (unreachable)"; tail -n 3 "$WORK/g2b-send.log"
+elif ! grep -qE "unreachable|lost the receiving peer|no usable path" "$WORK/g2b-send.log"; then
+  bad "dead receiver: sender exited $RCS without saying the peer is gone"; tail -n 3 "$WORK/g2b-send.log"
+elif grep -q "waiting up to" "$WORK/g2b-send.log" && ! grep -q "waiting up to 10s" "$WORK/g2b-send.log"; then
+  # The wait it announces must be the one it enforces (TUNLION_REJOIN_SECS=10
+  # here); it printed 120s while waiting 45s, and gave up after ~15s.
+  bad "dead receiver: the sender announced a wait it does not enforce"; grep "waiting up to" "$WORK/g2b-send.log"
+elif grep -q "the other device  disconnected" "$WORK/g2b-send.log"; then
+  bad "dead receiver: the disconnect line printed an empty name"; grep "disconnected" "$WORK/g2b-send.log"
+elif grep -q "did not come back within" "$WORK/g2b-send.log" && ! grep -q "new code" "$WORK/g2b-send.log"; then
+  bad "dead receiver: a code send gave up without saying the code is used up and a new send is needed"; tail -n 2 "$WORK/g2b-send.log"
+else
+  ok "dead receiver: sender gave up in $((T1 - T0))s, exit $RCS, said the peer is gone"
+fi
 
 # ---------------------------------------------------------------- gate 3 ----
 say "3: corruption guard — same name+size, different content restarts (C7)"
@@ -332,17 +451,35 @@ fi
 
 # ---------------------------------------------------------------- gate 7 ----
 say "7: --to peer selection (C13)"
+# PREMISE CHANGED, PROPERTY KEPT. This gate used to run two room receivers
+# named by $USER and `send --to bob`, which picked a peer by DISPLAY NAME in
+# the auto room. #221 made `send --to` name a KNOWN device and refuse anything
+# else up front ("no known device by that name"), deliberately: a name
+# substring in a shared room is not an identity. So the old command was
+# refused before it connected and this gate had been red on every runner since.
+# The property is unchanged: with a bystander receiver present that accepts
+# anything (-y, same auto room), a targeted send lands at the named device and
+# nowhere else. "bob" is now a real paired device (code ceremony, no file)
+# serving its inbox with `up`.
 DA="$WORK/g7-alice"; DB="$WORK/g7-bob"; mkdir -p "$DA" "$DB"
-USER=alice "$BIN" receive -y --to charlie --dir "$DA" --server "$SERVER" >"$WORK/g7-alice.log" 2>&1 &
-RA=$!; pids+=($RA)
-USER=bob timeout 120 "$BIN" receive -y --dir "$DB" --server "$SERVER" >"$WORK/g7-bob.log" 2>&1 &
-RB=$!; pids+=($RB); sleep 3
+C7S="$WORK/g7-cfg-sender"; C7B="$WORK/g7-cfg-bob"; mkdir -p "$C7S" "$C7B"
 G7=0
-timeout 60 "$BIN" send "$SMALL" --to bob --server "$SERVER" >"$WORK/g7-send.log" 2>&1 || G7=1
-sleep 2; kill $RA 2>/dev/null; wait $RB 2>/dev/null
+TUNLION_CONFIG_DIR="$C7S" timeout 90 "$BIN" add --name bob --word "$CODE_WORD" --server "$SERVER" >"$WORK/g7-add.log" 2>&1 &
+P7=$!; pids+=($P7)
+C7=$(wait_code "$WORK/g7-add.log") || { G7=1; echo "  no pairing code from add"; tail -n 3 "$WORK/g7-add.log"; }
+if [ -n "${C7:-}" ]; then
+  TUNLION_CONFIG_DIR="$C7B" timeout 90 "$BIN" join "$C7" --name sender --server "$SERVER" >"$WORK/g7-join.log" 2>&1 || G7=1
+fi
+wait $P7 || G7=1
+USER=alice "$BIN" receive -y --dir "$DA" --server "$SERVER" >"$WORK/g7-alice.log" 2>&1 &
+RA=$!; pids+=($RA)
+TUNLION_CONFIG_DIR="$C7B" timeout 120 "$BIN" up --dir "$DB" --server "$SERVER" >"$WORK/g7-bob.log" 2>&1 &
+RB=$!; pids+=($RB); sleep 3
+TUNLION_CONFIG_DIR="$C7S" timeout 60 "$BIN" send "$SMALL" --to bob --server "$SERVER" >"$WORK/g7-send.log" 2>&1 || G7=1
+sleep 2; kill_tree $RA $RB
 if [ $G7 -eq 0 ] && [ "$(hashof "$DB/small.bin" 2>/dev/null)" = "$H_SMALL" ] && [ ! -e "$DA/small.bin" ]; then
   ok "--to bob delivered to bob only"
-else bad "--to selection"; tail -n 3 "$WORK/g7-send.log"; fi
+else bad "--to selection"; tail -n 3 "$WORK/g7-add.log" "$WORK/g7-join.log" "$WORK/g7-send.log" "$WORK/g7-bob.log"; fi
 
 # ---------------------------------------------------------------- gate 8 ----
 say "8: consent — no tty, no -y declines (C14)"
@@ -358,9 +495,12 @@ kill $R 2>/dev/null
 # "declined", which is precisely the contract #274 called a bug: a script could
 # not tell a delivered transfer from a refused one. Asserting 1 specifically,
 # not merely nonzero, so a `timeout` kill (124) cannot satisfy this gate.
-if [ $G8 -eq 1 ] && grep -q "declined" "$WORK/g8-send.log" \
+# Now 4, not 1: the exit-code taxonomy (cli/src/exit_codes.rs, `tunlion --help`
+# EXIT CODES) gives "every file declined by the peer" the denied code; a partial
+# send (some delivered) is 8.
+if [ $G8 -eq 4 ] && grep -q "declined" "$WORK/g8-send.log" \
    && grep -q "no files delivered" "$WORK/g8-send.log" && [ ! -e "$D/small.bin" ]; then
-  ok "offer declined without consent; sender reported the decline and exited 1"
+  ok "offer declined without consent; sender reported the decline and exited 4 (denied)"
 else bad "consent decline"; tail -n 3 "$WORK/g8-send.log" "$WORK/g8-recv.log"; fi
 
 # ---------------------------------------------------------------- gate 9 ----
@@ -430,7 +570,11 @@ if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1;
   TS=testsecret$RANDOM
   # --allow-loopback-peers: coturn 403s loopback peer addresses by default,
   # and in this hermetic setup BOTH peers are 127.0.0.1. Test-only flag.
-  CT=$(docker run -d --rm --network host coturn/coturn -n \
+  # PINNED. `coturn/coturn` (latest) dropped `--no-dtls`, so the container
+  # printed its usage and exited 255 within a second; -d --rm hid that, and the
+  # gate reported a relay failure that was really "no TURN server". 4.6.2
+  # accepts every flag below.
+  CT=$(docker run -d --rm --network host coturn/coturn:4.6.2 -n \
         --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 --listening-port=3478 \
         --static-auth-secret="$TS" --realm=tunlion.test --no-tls --no-dtls \
         --allow-loopback-peers --cli-password=x 2>/dev/null)
@@ -438,21 +582,30 @@ if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1;
   ( cd "$CLI_DIR/../backend" && PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS" \
       "$VENV_PY" app.py >"$WORK/g10-backend.log" 2>&1 ) &
   BK=$!; pids+=($BK); sleep 4
+  # A TURN server that is not running makes every relay assertion below
+  # meaningless, so say that instead of blaming the product.
+  [ -n "$CT" ] && [ "$(docker inspect -f '{{.State.Running}}' "$CT" 2>/dev/null)" = "true" ] \
+    || echo "  coturn is NOT running (container ${CT:-none}); the relay result below is not a product verdict"
   D="$WORK/g10"; mkdir -p "$D"
-  "$BIN" send "$SMALL" --word "$CODE_WORD" --relay --server http://127.0.0.1:8078 >"$WORK/g10-send.log" 2>&1 &
+  "$BIN" -v send "$SMALL" --word "$CODE_WORD" --relay --server http://127.0.0.1:8078 >"$WORK/g10-send.log" 2>&1 &
   SP=$!; pids+=($SP)
   W=$(wait_code "$WORK/g10-send.log") || { bad "relay (no code minted)"; tail -n 3 "$WORK/g10-send.log"; }
   G10=0
-  timeout 120 "$BIN" receive "$W" -y --relay --dir "$D" --server http://127.0.0.1:8078 >"$WORK/g10-recv.log" 2>&1 || G10=1
+  timeout 120 "$BIN" -v receive "$W" -y --relay --dir "$D" --server http://127.0.0.1:8078 >"$WORK/g10-recv.log" 2>&1 || G10=1
   wait $SP || G10=1
+  [ -n "$CT" ] && docker logs "$CT" >"$WORK/g10-coturn.log" 2>&1
   kill $BK 2>/dev/null; kill_8078; docker stop "$CT" >/dev/null 2>&1
   # relay-only ICE policy guarantees the path; the route line is reporting.
   # Require it on at least one end (a very fast transfer can exit before the
-  # sender's detector fires).
+  # sender's detector fires). The transport labels a relayed path "relay"
+  # (`net::ROUTE_RELAY`); the CLI compared against "relayed", so the relay
+  # banner every user is promised on a relayed transfer never printed. Both
+  # are required now: the -v route line, and the banner at default verbosity.
   if [ $G10 -eq 0 ] && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ] \
-     && grep -hq "route: relayed" "$WORK/g10-send.log" "$WORK/g10-recv.log"; then
+     && grep -hqE "route: relay" "$WORK/g10-send.log" "$WORK/g10-recv.log" \
+     && grep -hq "on relay, via a TURN server" "$WORK/g10-send.log" "$WORK/g10-recv.log"; then
     ok "relayed transfer via coturn; route: relayed reported"
-  else bad "relay"; tail -n 3 "$WORK/g10-send.log" "$WORK/g10-recv.log"; fi
+  else bad "relay"; tail -n 3 "$WORK/g10-send.log" "$WORK/g10-recv.log"; grep -h "route:\|relay" "$WORK/g10-send.log" "$WORK/g10-recv.log" | head -5; tail -n 5 "$WORK/g10-coturn.log" 2>/dev/null; fi
 elif [ $WITH_RELAY -eq 1 ]; then
   # Was a FAILURE, not a skip. The gate launched its backend with a hardcoded
   # interpreter path from a job directory that no longer exists, so it reported
@@ -461,7 +614,7 @@ elif [ $WITH_RELAY -eq 1 ]; then
   # of the fourteen failures in the first complete run were that one missing
   # file. A gate that cannot run must say so, not invent a product failure.
   say "10: TURN relay path + route detection (C2/C17, docker coturn)"
-  echo "SKIP (needs a usable python and docker; set FILAMENT_TEST_VENV to point at one)"
+  echo "SKIP (needs a usable python and docker; set TUNLION_TEST_VENV to point at one)"
 fi
 
 # --------------------------------------------------------------- gate 11 ----
@@ -473,10 +626,12 @@ D="$WORK/g11"; mkdir -p "$D"
 # idle threshold low and sleep past it after the freeze to keep that
 # deterministic regardless of how fast the replacement joins.
 # -v on the sender: "superseding old link" is a DEBUG (resilience-internal) line.
-FILAMENT_ADOPT_ACTIVE_MS=500 "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
+# The freeze must land mid-transfer; see gate 2 for the stall.
+TUNLION_ADOPT_ACTIVE_MS=500 TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g11-send.log") || { bad "uid supersede (no code minted)"; tail -n 3 "$WORK/g11-send.log"; }
-FILAMENT_UID="samedevice$$" "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv1.log" 2>&1 &
+TUNLION_UID="samedevice$$" "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
 for _ in $(seq 1 60); do
   sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
@@ -487,9 +642,9 @@ done
 # with the SAME uid joins, the sender must take the supersede path, not the
 # peer-left path.
 kill -STOP $R1 2>/dev/null
-sleep 3   # > FILAMENT_ADOPT_ACTIVE_MS so the frozen link reads as idle (#28)
+sleep 3   # > TUNLION_ADOPT_ACTIVE_MS so the frozen link reads as idle (#28)
 # -v on the replacement: "resuming at" is a DEBUG (resilience-internal) line.
-FILAMENT_UID="samedevice$$" timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
+TUNLION_UID="samedevice$$" timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
 RC2=$?
 # bounded wait: a hung sender must fail the gate, not the whole suite
 RCS=99
@@ -518,17 +673,17 @@ D1B="$WORK/g11b1"; D2B="$WORK/g11b2"; mkdir -p "$D1B" "$D2B"
 # the 8 MB threshold below is crossed in ~0.08s, inside the first poll. On a fast
 # runner the transfer finished before the reconnect, "keeping active link" never
 # printed, and the gate failed BECAUSE the machine was quick. Same problem, and
-# the same remedy, as FILAMENT_TEST_PAIR_STALL in gate 17b.
+# the same remedy, as TUNLION_TEST_PAIR_STALL in gate 17b.
 #
 # 3ms is chosen, not guessed: 80 MB in ~60 KiB chunks is ~1365 chunks, so 3ms
 # each adds ~4.1s and the transfer lasts ~4.9s. R2 is spawned within ~0.6s (a
 # 0.5s poll plus process start), so the reconnect lands mid-flight with about 8x
 # margin, and the suite pays four seconds. 25ms would have added 34s.
-FILAMENT_TEST_TRANSFER_STALL_MS=${FILAMENT_TEST_TRANSFER_STALL_MS:-3} \
+TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
   "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W2=$(wait_code "$WORK/g11b-send.log") || { bad "flow-preserve (no code minted)"; tail -n 3 "$WORK/g11b-send.log"; }
-FILAMENT_UID="livedev$$" "$BIN" receive "$W2" -y --dir "$D1B" --server "$SERVER" >"$WORK/g11b-recv1.log" 2>&1 &
+TUNLION_UID="livedev$$" "$BIN" receive "$W2" -y --dir "$D1B" --server "$SERVER" >"$WORK/g11b-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
 for _ in $(seq 1 60); do
   sz=$(stat -c %s "$D1B/big.bin.part" 2>/dev/null || echo 0)
@@ -537,7 +692,7 @@ for _ in $(seq 1 60); do
 done
 # Same device rejoins (same uid, new sid) while R1 keeps flowing — must NOT
 # supersede. R1 is left running; R2 is a never-adopted bystander we reap.
-FILAMENT_UID="livedev$$" timeout 120 "$BIN" receive -y --dir "$D2B" --server "$SERVER" >"$WORK/g11b-recv2.log" 2>&1 &
+TUNLION_UID="livedev$$" timeout 120 "$BIN" receive -y --dir "$D2B" --server "$SERVER" >"$WORK/g11b-recv2.log" 2>&1 &
 R2B=$!; pids+=($R2B)
 RCS=99
 for _ in $(seq 1 120); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }; sleep 1; done
@@ -565,10 +720,10 @@ else bad "flow-preserve (#28)"; tail -n 4 "$WORK/g11b-send.log" "$WORK/g11b-recv
 # link — it DEFERS the drop and the transfer completes on the same live
 # channel. 11b covered the same-uid SUPERSEDE path (a new sid arrives); this
 # covers the peer-left path, which used to drop unconditionally and kill the
-# transfer. FILAMENT_TEST_INJECT_PEER_LEFT deterministically injects the
+# transfer. TUNLION_TEST_INJECT_PEER_LEFT deterministically injects the
 # synthetic peer-left for the active sid at a byte offset WITHOUT touching the
 # data channel (a SIGSTOP/kill can't isolate the socket from the channel).
-# A/B BY CONSTRUCTION: the same hook with FILAMENT_TEST_NO_DEFER reverts to the
+# A/B BY CONSTRUCTION: the same hook with TUNLION_TEST_NO_DEFER reverts to the
 # old unconditional drop and MUST fail to complete — so a regression that
 # silently stops deferring is caught, not papered over. Pin the idle threshold
 # default (3s) >> a healthy inter-frame gap so the live channel reads flowing.
@@ -585,7 +740,7 @@ INJC=$((8 * 1024 * 1024))
 #    the transfer cannot complete on it.
 DCA="$WORK/g11ca"; mkdir -p "$DCA"
 # -v on the sender: "injecting synthetic peer-left" / "deferring drop" are DEBUG.
-FILAMENT_TEST_INJECT_PEER_LEFT=$INJC FILAMENT_TEST_NO_DEFER=1 \
+TUNLION_TEST_INJECT_PEER_LEFT=$INJC TUNLION_TEST_NO_DEFER=1 \
   "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11ca-send.log" 2>&1 &
 SPA=$!; pids+=($SPA)
 WCA=$(wait_code "$WORK/g11ca-send.log") || { bad "deferred-drop (no code minted)"; tail -n 3 "$WORK/g11ca-send.log"; }
@@ -597,7 +752,7 @@ HCA="x"; [ -f "$DCA/big.bin" ] && HCA=$(hashof "$DCA/big.bin")
 base_ok=0; { [ $RCA -ne 0 ] || [ $RCSA -ne 0 ] || [ "$HCA" != "$H_BIG" ]; } \
   && grep -q "injecting synthetic peer-left" "$WORK/g11ca-send.log" && base_ok=1
 # B) fix: defer active — the link is kept, transfer completes on it, no supersede.
-FILAMENT_TEST_INJECT_PEER_LEFT=$INJC \
+TUNLION_TEST_INJECT_PEER_LEFT=$INJC \
   "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11c-send.log" 2>&1 &
 SPB=$!; pids+=($SPB)
 WC=$(wait_code "$WORK/g11c-send.log") || { bad "deferred-drop (no code minted)"; tail -n 3 "$WORK/g11c-send.log"; }
@@ -632,15 +787,15 @@ fi
 # --------------------------------------------------------------- gate 14 ----
 say "14: daemon — pair, introduce-grade trust, room-less up receives (C19/C20/C12)"
 DA="$WORK/g14a"; DB="$WORK/g14b"; DD="$WORK/g14drop"; mkdir -p "$DA" "$DB" "$DD"
-FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$CODE_WORD" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA" "$BIN" -v send "$SMALL" --word "$CODE_WORD" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g14-s1.log") || { bad "daemon (no code minted)"; tail -n 3 "$WORK/g14-s1.log"; }
-FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" receive "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
+TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" -v receive "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
 wait $SP
-FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" up --dir "$DD" --server "$SERVER" >"$WORK/g14-up.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" up --dir "$DD" --server "$SERVER" >"$WORK/g14-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
 G14=0
-FILAMENT_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g14-s2.log" 2>&1 || G14=1
+TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g14-s2.log" 2>&1 || G14=1
 sleep 1; kill $UP 2>/dev/null
 if [ $G14 -eq 0 ] && [ "$(hashof "$DD/big.bin")" = "$H_BIG" ] \
    && grep -q "identity verified" "$WORK/g14-up.log" \
@@ -648,23 +803,122 @@ if [ $G14 -eq 0 ] && [ "$(hashof "$DD/big.bin")" = "$H_BIG" ] \
   ok "daemon: verified identity, room-less, received + hash match"
 else bad "daemon"; tail -n 3 "$WORK/g14-up.log" "$WORK/g14-s2.log"; fi
 
+# --------------------------------------------------------------- gate 14b ---
+say "14b: a daemon receiver SIGKILLed mid-transfer and restarted 4s later: the sender picks it up and finishes"
+# The blind run: the sender ignored the replacement daemon and failed with exit 8
+# after 26 s ("delivery not confirmed"), because its delivery-ack wait ran out
+# while the receiver was away, and a re-run was needed to resume. Reuses gate
+# 14's pairing (DA sends to boxB, whose daemon runs on DB). NOT in the ratchet
+# yet: gate 14 itself (and 7, `send --to`) is red on the CI runner, so this
+# gate's premise fails there before the behaviour it checks is reached
+# (measured: the daemon received 0 bytes). Ratchet it with gate 14.
+DD2="$WORK/g14bdrop"; mkdir -p "$DD2"
+TUNLION_CONFIG_DIR="$DB" "$BIN" up --dir "$DD2" --server "$SERVER" >"$WORK/g14b-up1.log" 2>&1 &
+UP1=$!; pids+=($UP1); sleep 3
+TUNLION_TEST_TRANSFER_STALL_MS=10 TUNLION_CONFIG_DIR="$DA" \
+  "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g14b-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+for _ in $(seq 1 120); do
+  sz=$(stat -c %s "$DD2/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((4 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+G14BSZ=$(stat -c %s "$DD2/big.bin.part" 2>/dev/null || echo 0)
+# No timeout wrapper on the daemon, so SIGKILL reaches the real process.
+kill -9 $UP1 2>/dev/null; wait $UP1 2>/dev/null
+sleep 4
+TUNLION_CONFIG_DIR="$DB" timeout 150 "$BIN" up --dir "$DD2" --server "$SERVER" >"$WORK/g14b-up2.log" 2>&1 &
+UP2=$!; pids+=($UP2)
+T0=$(date +%s)
+bounded_wait $SP 120 "daemon-restart sender" "$WORK/g14b-send.log" "$WORK/g14b-up2.log"; RCS=$?
+T1=$(date +%s)
+kill_tree $UP2
+echo "  killed the daemon at ${G14BSZ} bytes; sender exit $RCS $((T1 - T0))s after the restart"
+if [ "$G14BSZ" -eq 0 ]; then
+  bad "daemon-restart: the daemon received nothing before it was killed, so nothing was mid-transfer"
+  tail -n 5 "$WORK/g14b-up1.log" "$WORK/g14b-send.log"
+elif [ $RCS -eq 0 ] && [ "$(hashof "$DD2/big.bin" 2>/dev/null)" = "$H_BIG" ] \
+   && ! grep -q "120s" "$WORK/g14b-send.log"; then
+  ok "daemon-restart: the sender picked up the restarted daemon and delivered, hash matches"
+else
+  bad "daemon-restart"; tail -n 5 "$WORK/g14b-send.log" "$WORK/g14b-up2.log"
+fi
+
+# --------------------------------------------------------------- gate 14c ---
+say "14c: one peer's failed adoption never ends the daemon: logged, still serving, the next transfer lands"
+# The blind run: a real two-machine `up` EXITED 9 s after a restart with
+# "direct fallback adoption failed for peer ... ICE config: no answer within
+# 3s". Every per-peer step in the serving loop ended the process with `?`.
+# TUNLION_TEST_FAIL_ADOPT=1 fails the daemon's first adoption the same way
+# (the known-device adoption when boxA's sender appears). A build without the
+# fix dies right there, so the alive and status checks below fail on it.
+# Reuses gate 14's pairing (DA sends to boxB, whose daemon runs on DB).
+DD3="$WORK/g14cdrop"; mkdir -p "$DD3"
+G14C="$WORK/g14c.bin"; head -c $((2 * 1024 * 1024)) /dev/urandom > "$G14C"; H_G14C=$(hashof "$G14C")
+# No timeout wrapper: $! is the daemon itself, so `status` must name this pid.
+TUNLION_TEST_FAIL_ADOPT=1 TUNLION_CONFIG_DIR="$DB" "$BIN" -v up --dir "$DD3" --server "$SERVER" >"$WORK/g14c-up.log" 2>&1 &
+UPC=$!; pids+=($UPC); sleep 3
+# The attempt that meets the injected failure. Its own outcome is not the
+# claim (the direct dial may still win); the daemon outliving it is.
+RC1=0
+TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$SMALL" --to boxB --server "$SERVER" >"$WORK/g14c-s1.log" 2>&1 || RC1=$?
+FIRED=""
+for _ in $(seq 1 20); do
+  grep -q "PEER-STEP-FAILED.*TUNLION_TEST_FAIL_ADOPT" "$WORK/g14c-up.log" && { FIRED=yes; break; }
+  sleep 0.5
+done
+ALIVE=""; kill -0 $UPC 2>/dev/null && ALIVE=yes
+ST14C=$(TUNLION_CONFIG_DIR="$DB" timeout 20 "$BIN" status 2>&1)
+RC2=0
+TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$G14C" --to boxB --server "$SERVER" >"$WORK/g14c-s2.log" 2>&1 || RC2=$?
+ALIVE2=""; kill -0 $UPC 2>/dev/null && ALIVE2=yes
+kill_tree $UPC
+echo "  hook fired: ${FIRED:-no}; alive after it: ${ALIVE:-no}, after the next send: ${ALIVE2:-no}; first send exit $RC1, next send exit $RC2"
+echo "  status: $(echo "$ST14C" | head -1)"
+if [ "$FIRED" != "yes" ]; then
+  bad "daemon-survives-peer-failure: the injected adoption failure never reached the daemon, so nothing was tested"
+  tail -n 5 "$WORK/g14c-up.log"
+elif [ "$ALIVE" = "yes" ] && [ "$ALIVE2" = "yes" ] \
+   && echo "$ST14C" | grep -q "up (pid $UPC)" \
+   && [ $RC2 -eq 0 ] && [ "$(hashof "$DD3/g14c.bin" 2>/dev/null)" = "$H_G14C" ]; then
+  ok "daemon-survives-peer-failure: the daemon logged the failed adoption, stayed up, and the next transfer delivered, hash matches"
+else
+  bad "daemon-survives-peer-failure"; tail -n 8 "$WORK/g14c-up.log" "$WORK/g14c-s2.log"
+fi
+
 # --------------------------------------------------------------- gate 15 ----
 say "15: paired recv holds the line when the sender vanishes (C21)"
 D="$WORK/g15"; mkdir -p "$D"
-"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g15-send.log" 2>&1 &
+# The sender really vanishes: SIGKILLed mid-transfer, no clean leave. This gate
+# used to make the sender leave by having the receiver DECLINE (no -y, no
+# tty), and asserted that the receiver then held the line and blamed the
+# sender. That was the launch-blocker lie: a receiver that refused the offer
+# itself now ends at once with its own reason (exit 2, `no_tty`; asserted by
+# scripting-contract-gates K2). C21 is about a sender that goes away, so the
+# sender goes away. TUNLION_TEST_TRANSFER_STALL_MS keeps the kill mid-transfer
+# (the same remedy as gates 2 and 11b).
+TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g15-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g15-send.log") || { bad "stepped-away wait (no code minted)"; tail -n 3 "$WORK/g15-send.log"; }
+TUNLION_REJOIN_SECS=8 timeout 90 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" </dev/null >"$WORK/g15-recv.log" 2>&1 &
+RP=$!; pids+=($RP)
+for _ in $(seq 1 60); do
+  sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((2 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null
 T0=$(date +%s)
-# no -y and no tty -> the offer is declined -> sender exits -> peer-left with
-# nothing received; the OLD behavior bailed instantly, C21 holds the line.
-FILAMENT_REJOIN_SECS=8 timeout 60 "$BIN" receive "$W" --dir "$D" --server "$SERVER" </dev/null >"$WORK/g15-recv.log" 2>&1
-RC=$?
+wait $RP; RC=$?
 T1=$(date +%s)
-wait $SP 2>/dev/null
-if [ $RC -ne 0 ] && grep -q "holding the line" "$WORK/g15-recv.log" \
+# A sender lost mid-transfer is announced as "sender disconnected mid-transfer,
+# waiting up to 8s" (before any transfer it was "stepped away, holding the
+# line up to 8s"): either way the receiver must say it holds, and for how long.
+if [ $RC -ne 0 ] && grep -qE "(holding the line|waiting) up to 8s" "$WORK/g15-recv.log" \
    && grep -q "did not come back within 8s" "$WORK/g15-recv.log" \
    && [ $((T1 - T0)) -ge 8 ]; then
-  ok "stepped-away sender: held ${FILAMENT_REJOIN_SECS:-8}s window, then failed honestly"
+  ok "stepped-away sender: held ${TUNLION_REJOIN_SECS:-8}s window, then failed honestly"
 else bad "stepped-away wait"; tail -n 3 "$WORK/g15-recv.log"; fi
 
 say "16: known-device rendezvous + remember consent (C12/C20/C27 web)"
@@ -674,7 +928,7 @@ if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
   # phase 1 sender: mints the code (a valid 2-word phrase + machine nameplate),
   # offers a pair-keep secret (the browser must NOT store it until the human
   # clicks 'remember', C27). The browser must claim the FULL minted code.
-  FILAMENT_CONFIG_DIR="$C16" "$BIN" send "$SMALL" --word "$CODE_WORD" --remember pwdev --server "$SERVER" >"$WORK/g16-s1.log" 2>&1 &
+  TUNLION_CONFIG_DIR="$C16" "$BIN" send "$SMALL" --word "$CODE_WORD" --remember pwdev --server "$SERVER" >"$WORK/g16-s1.log" 2>&1 &
   S16=$!; pids+=($S16)
   W16=$(wait_code "$WORK/g16-s1.log") || { bad "known-device (no code minted)"; tail -n 3 "$WORK/g16-s1.log"; }
   # phase 3's decline sender is started later (below); the harness polls its log
@@ -684,10 +938,10 @@ if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
   wait $S16 || G16=1   # phase 1 transfer done; browser must now hold the secret
   # phase 2: fresh session, ISOLATED room, no code — only the secret-derived
   # channel can find the browser. The same config dir holds 'pwdev'.
-  FILAMENT_CONFIG_DIR="$C16" timeout 120 "$BIN" send "$SMALL" --to pwdev --room "g16iso$$" --server "$SERVER" >"$WORK/g16-s2.log" 2>&1 || G16=1
+  TUNLION_CONFIG_DIR="$C16" timeout 120 "$BIN" send "$SMALL" --to pwdev --room "g16iso$$" --server "$SERVER" >"$WORK/g16-s2.log" 2>&1 || G16=1
   # phase 3 (C27 decline): a new sender offers; the browser clicks 'not now';
   # the ack must make this sender DISCARD its stored half.
-  FILAMENT_CONFIG_DIR="$C16" timeout 60 "$BIN" send "$SMALL" --word "$CODE_WORD" --remember declinedev --server "$SERVER" >"$WORK/g16-s3.log" 2>&1 &
+  TUNLION_CONFIG_DIR="$C16" timeout 60 "$BIN" send "$SMALL" --word "$CODE_WORD" --remember declinedev --server "$SERVER" >"$WORK/g16-s3.log" 2>&1 &
   S16B=$!; pids+=($S16B)
   wait $PW16 || G16=1
   kill $S16B 2>/dev/null; wait $S16B 2>/dev/null
@@ -703,15 +957,21 @@ else
 fi
 
 say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
+# --word on every `add` below (and in 17b and 19): from a script, `add` with no
+# words refuses, because a code minted for a person to read out has nobody to
+# read it here (the non-TTY refusal says exactly this and names --word). These
+# gates ran `add --name X` bare and were refused before any ceremony started.
 DA17="$WORK/g17a"; DB17="$WORK/g17b"; mkdir -p "$DA17" "$DB17"
-FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --word "$CODE_WORD" --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
 P17=$!; pids+=($P17); sleep 4
 C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
-FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" join "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
+TUNLION_CONFIG_DIR="$DB17" timeout 90 "$BIN" join "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
 wait $P17 || G17=1
-CHA=$(FILAMENT_CONFIG_DIR="$DA17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
-CHB=$(FILAMENT_CONFIG_DIR="$DB17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
+# The channel id is in `devices --json`; the table stopped printing it, so this
+# compared two empty strings and the gate could not pass.
+CHA=$(TUNLION_CONFIG_DIR="$DA17" "$BIN" devices --json 2>/dev/null | grep -oE '"channel": *"[0-9a-f]+"' | head -1)
+CHB=$(TUNLION_CONFIG_DIR="$DB17" "$BIN" devices --json 2>/dev/null | grep -oE '"channel": *"[0-9a-f]+"' | head -1)
 if [ $G17 -eq 0 ] && [ -n "$CHA" ] && [ "$CHA" = "$CHB" ]; then
   ok "pair ceremony: both exited clean; channel ids match (one mutual secret)"
 else bad "pair-ceremony"; tail -n 3 "$WORK/g17-a.log" "$WORK/g17-b.log"; fi
@@ -723,16 +983,16 @@ say "17b: pair ceremony fails FAST when it can't complete (no 10-min orphan)"
 # the budget (shortened to 5s) must bail it with a clear message — NOT the
 # 600s code TTL, and well under the 90s timeout backstop.
 DC="$WORK/g17c"; mkdir -p "$DC/a" "$DC/b"
-FILAMENT_CONFIG_DIR="$DC/a" timeout 120 "$BIN" add --name gone --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DC/a" timeout 120 "$BIN" add --name gone --word "$CODE_WORD" --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
 CR=$!; pids+=($CR); sleep 4
 CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
 T0=$(date +%s)
-FILAMENT_TEST_PAIR_STALL=1 FILAMENT_PAIR_GRACE_SECS=5 FILAMENT_CONFIG_DIR="$DC/b" \
+TUNLION_TEST_PAIR_STALL=1 TUNLION_PAIR_GRACE_SECS=5 TUNLION_CONFIG_DIR="$DC/b" \
   timeout 90 "$BIN" join "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
 RC=$?; T1=$(date +%s)
 kill $CR 2>/dev/null; wait $CR 2>/dev/null
 if [ $RC -ne 0 ] && [ $((T1 - T0)) -lt 30 ] \
-   && grep -q "could not connect before pairing finished" "$WORK/g17c-b.log"; then
+   && grep -q "before setup finished" "$WORK/g17c-b.log"; then
   ok "ceremony bailed in $((T1 - T0))s with a clear message (was: 600s orphan)"
 else bad "pair fail-fast"; echo "  rc=$RC walltime=$((T1-T0))s"; tail -n 3 "$WORK/g17c-b.log"; fi
 
@@ -742,7 +1002,7 @@ say "18: recv quiet-exit when peer-left never arrives (G-k)"
 # LOST (delivery is best-effort — observed live under load). recv must notice
 # everything is done + nobody attached and exit 0 on its own.
 #
-# Simulating the loss: FILAMENT_TEST_DROP_PEER_LEFT makes recv drop incoming
+# Simulating the loss: TUNLION_TEST_DROP_PEER_LEFT makes recv drop incoming
 # peer-left events at exactly the delivery boundary. (A SIGSTOP'd sender can't
 # do it: engine.io's ping timeout reaps the frozen client in ~30 s and the
 # legit peer-left wins the race against link teardown — measured.)
@@ -764,7 +1024,7 @@ W=$(wait_code "$WORK/g18-send.log") || { bad "quiet-exit (G-k) (no code minted)"
     sleep 0.1
   done ) &
 T0=$(date +%s)
-FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=3 \
+TUNLION_TEST_DROP_PEER_LEFT=1 TUNLION_QUIET_EXIT_SECS=3 \
   timeout 120 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" </dev/null >"$WORK/g18-recv.log" 2>&1
 RC=$?
 T1=$(date +%s)
@@ -790,10 +1050,10 @@ fi
 # passes (no contention to trigger the flap); only under suite load did the
 # departure-into-reconnect race fire — a heisenbug. This makes it DETERMINISTIC.
 #
-# FILAMENT_TEST_CHURN_AFTER_COMPLETE forces the post-completion flap from the
+# TUNLION_TEST_CHURN_AFTER_COMPLETE forces the post-completion flap from the
 # recv loop (close + re-inject Ev::Stuck with attempts reset, mirroring the wild
 # flap) ONCE the file is on disk. A/B with ONE binary via
-# FILAMENT_TEST_DISABLE_MODEB_DROP:
+# TUNLION_TEST_DISABLE_MODEB_DROP:
 #   A (baseline, drop disabled): on_stuck re-establishes → link persists → hang
 #     → RC=124. This is the bug, reproduced on demand.
 #   B (fix): on_stuck sees recv_done and DROPS the link (nothing left to fetch)
@@ -802,6 +1062,15 @@ fi
 # a MID-transfer link (by_sid non-empty) is never dropped — gate 2 (kill-resume)
 # and gate 11c (deferred-drop) reconnect paths are untouched (unit-tested too).
 say "18b: recv exits on post-completion link churn — Mode B (RC=124 flake, #28)"
+# WebRTC for this gate, by construction. The Mode B flap is a WebRTC
+# phenomenon: the churn hook closes the link's PeerConnection and `on_stuck`
+# acts only on a link whose PeerConnection is down. Until fix/known-red-gates
+# these same-install transfers always fell back to WebRTC by accident (the
+# promotion to direct never worked); now they reach QUIC, where a direct link
+# has no PeerConnection to close, the baseline never flapped, and the A half
+# could not show the bug it exists to show. TUNLION_DIRECT=0 restores the
+# premise explicitly instead of by accident.
+export TUNLION_DIRECT=0
 H_DIR="$WORK/g18b"; mkdir -p "$H_DIR"
 # A) baseline: Mode-B drop disabled → the post-completion flap hangs to timeout.
 # -v on the receivers: the flap line ("connection stuck while connecting,
@@ -811,8 +1080,8 @@ DA="$H_DIR/a"; mkdir -p "$DA"
 SPA=$!; pids+=($SPA)
 WA=$(wait_code "$WORK/g18ba-send.log") || { bad "gate-18b Mode B (no code minted)"; tail -n 3 "$WORK/g18ba-send.log"; }
 ( sleep 6; kill -9 $SPA 2>/dev/null ) &   # sender departs after delivering the file
-FILAMENT_TEST_DISABLE_MODEB_DROP=1 FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 \
-  FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
+TUNLION_TEST_DISABLE_MODEB_DROP=1 TUNLION_TEST_CHURN_AFTER_COMPLETE=1 \
+  TUNLION_TEST_DROP_PEER_LEFT=1 TUNLION_QUIET_EXIT_SECS=2 \
   timeout 30 "$BIN" -v receive "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
 RCA=$?
 kill -9 $SPA 2>/dev/null; wait $SPA 2>/dev/null
@@ -829,7 +1098,7 @@ SPB=$!; pids+=($SPB)
 WB=$(wait_code "$WORK/g18bb-send.log") || { bad "gate-18b Mode B (no code minted)"; tail -n 3 "$WORK/g18bb-send.log"; }
 T0=$(date +%s)
 ( sleep 6; kill -9 $SPB 2>/dev/null ) &
-FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
+TUNLION_TEST_CHURN_AFTER_COMPLETE=1 TUNLION_TEST_DROP_PEER_LEFT=1 TUNLION_QUIET_EXIT_SECS=2 \
   timeout 30 "$BIN" -v receive "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
 RCB=$?
 T1=$(date +%s)
@@ -844,6 +1113,7 @@ else
   bad "gate-18b Mode B"; echo "  base_ok=$base_ok RCA=$RCA RCB=$RCB fix_walltime=$((T1-T0))s"
   tail -n 6 "$WORK/g18bb-recv.log" "$WORK/g18ba-recv.log"
 fi
+unset TUNLION_DIRECT
 
 # --------------------------------------------------------------- gate 19 ----
 say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
@@ -854,17 +1124,17 @@ say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 # bugs by hand before becoming a gate (a tick starved behind a blocking
 # 600s read; see C30 in the ledger).
 DA19="$WORK/g19a"; DB19="$WORK/g19b"; D19="$WORK/g19"; mkdir -p "$DA19" "$DB19" "$D19"
-FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --word "$CODE_WORD" --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
 P19=$!; pids+=($P19); sleep 4
 C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0
-FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" join "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
+TUNLION_CONFIG_DIR="$DB19" timeout 90 "$BIN" join "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
 wait $P19 || G19=1
-FILAMENT_TEST_EMIT_LOSS=0.5 FILAMENT_TEST_EMIT_SEED=16 FILAMENT_CONFIG_DIR="$DB19" \
+TUNLION_TEST_EMIT_LOSS=0.5 TUNLION_TEST_EMIT_SEED=16 TUNLION_CONFIG_DIR="$DB19" \
   timeout 120 "$BIN" up --dir "$D19" --server "$SERVER" </dev/null >"$WORK/g19-up.log" 2>&1 &
 U19=$!; pids+=($U19); sleep 2
 T0=$(date +%s)
-FILAMENT_TEST_EMIT_LOSS=0.5 FILAMENT_TEST_EMIT_SEED=16 FILAMENT_CONFIG_DIR="$DA19" \
+TUNLION_TEST_EMIT_LOSS=0.5 TUNLION_TEST_EMIT_SEED=16 TUNLION_CONFIG_DIR="$DA19" \
   timeout 120 "$BIN" send "$SMALL" --to boxB --server "$SERVER" >"$WORK/g19-send.log" 2>&1 || G19=1
 T1=$(date +%s)
 kill $U19 2>/dev/null; wait $U19 2>/dev/null
@@ -903,39 +1173,294 @@ else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"
 # SPAKE2 crate: `cargo test` in pake/ (10 unit tests incl. reflection-rejected).
 # ============================================================================
 
-say "20: U1 implicit identity: minted once on first use, never twice, inspect screens mint nothing"
+say "20: U1 implicit identity: minted once by a verb that signs, never by one that only looks"
 # The config dir is NOT pre-created: the accessor makes it (0700) and the key
-# (0600). Run 1 creates and says so once on stderr; run 2 says nothing and
-# prints the same identity; `init` afterwards still refuses; `--json` never
-# gets the prose line. Then the three that must NOT mint: the bare tour screen
-# (an inspect surface, which must also not FAIL on a device that cannot mint),
-# `id` under the opt-out (the pre-U1 answer, exit 0, nothing written), and a
-# verb that must sign under the opt-out (still fails fast).
+# (0600). `id` used to be the minting verb here; it no longer mints (a fresh
+# machine that ran `tunlion id` was then refused by `tunlion join` for already
+# having an identity). So: `id` on a fresh dir answers "no identity yet" with
+# exit 9 (ExitKind::NoIdentity) and writes nothing, `id --json` answers
+# `"identity": null` with exit 9 and writes nothing, and the minting is proven
+# on `grant`, a verb that SIGNS: run 1 creates and says so once on stderr, run 2
+# says nothing, `id` then prints the same identity twice, and `init`
+# afterwards still refuses. Then the two that must NOT mint: the bare tour
+# screen, and a signing verb under the opt-out (still fails fast).
+#
+# Changed with the exit-code taxonomy: the opt-out `id` used to exit 0 with
+# "no identity yet"; it now exits 9 like every keyless `id` (documented in
+# `tunlion --help`, EXIT CODES).
 D20="$WORK/g20-cfg"; rm -rf "$D20"
-FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-1.out" 2>"$WORK/g20-1.err"; R20A=$?
-FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-2.out" 2>"$WORK/g20-2.err"; R20B=$?
+D20Z="$WORK/g20-fresh"; rm -rf "$D20Z"
+TUNLION_CONFIG_DIR="$D20Z" "$BIN" id >"$WORK/g20-0.out" 2>"$WORK/g20-0.err"; R20Z=$?
+D20J="$WORK/g20-json"; rm -rf "$D20J"
+TUNLION_CONFIG_DIR="$D20J" "$BIN" id --json >"$WORK/g20-j.out" 2>"$WORK/g20-j.err"; R20J=$?
+J20=$(python3 -c "
+import json,sys
+v=json.load(open('$WORK/g20-j.out'))
+print('ok' if v.get('identity',1) is None and v.get('ok') is False and v['error']['exit']==9 else 'bad')
+" 2>/dev/null)
+TUNLION_CONFIG_DIR="$D20" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-1.out" 2>"$WORK/g20-1.err"
+TUNLION_CONFIG_DIR="$D20" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-2.out" 2>"$WORK/g20-2.err"
 N20A=$(grep -c "created your identity" "$WORK/g20-1.err"); N20B=$(grep -c "created your identity" "$WORK/g20-2.err")
 M20K=$(stat -c %a "$D20/identity.ed25519" 2>/dev/null); M20D=$(stat -c %a "$D20" 2>/dev/null)
-FILAMENT_CONFIG_DIR="$D20" "$BIN" init --yes --name g20 --recovery-file "$WORK/g20-rec" >"$WORK/g20-init.log" 2>&1; R20I=$?
-D20J="$WORK/g20-json"; rm -rf "$D20J"
-FILAMENT_CONFIG_DIR="$D20J" "$BIN" id --json >"$WORK/g20-j.out" 2>"$WORK/g20-j.err"; R20J=$?
+TUNLION_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-id1.out" 2>&1; R20A=$?
+TUNLION_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-id2.out" 2>&1; R20B=$?
+TUNLION_CONFIG_DIR="$D20" "$BIN" init --yes --name g20 --recovery-file "$WORK/g20-rec" >"$WORK/g20-init.log" 2>&1; R20I=$?
 D20T="$WORK/g20-tour"; rm -rf "$D20T"
-FILAMENT_CONFIG_DIR="$D20T" "$BIN" >"$WORK/g20-t.log" 2>&1; R20T=$?
+TUNLION_CONFIG_DIR="$D20T" "$BIN" >"$WORK/g20-t.log" 2>&1; R20T=$?
 D20N="$WORK/g20-noimplicit"; rm -rf "$D20N"
-FILAMENT_NO_IMPLICIT_INIT=1 FILAMENT_CONFIG_DIR="$D20N" "$BIN" id >"$WORK/g20-n.log" 2>&1; R20N=$?
-FILAMENT_NO_IMPLICIT_INIT=1 FILAMENT_CONFIG_DIR="$D20N" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-g.log" 2>&1; R20G=$?
-if [ $R20A -eq 0 ] && [ $R20B -eq 0 ] && [ "$N20A" = 1 ] && [ "$N20B" = 0 ] \
-   && cmp -s "$WORK/g20-1.out" "$WORK/g20-2.out" && [ "$M20K" = 600 ] && [ "$M20D" = 700 ] \
+TUNLION_NO_IMPLICIT_INIT=1 TUNLION_CONFIG_DIR="$D20N" "$BIN" id >"$WORK/g20-n.log" 2>&1; R20N=$?
+TUNLION_NO_IMPLICIT_INIT=1 TUNLION_CONFIG_DIR="$D20N" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-g.log" 2>&1; R20G=$?
+if [ $R20Z -eq 9 ] && grep -q "no identity yet" "$WORK/g20-0.err" && [ ! -e "$D20Z/identity.ed25519" ] \
+   && [ $R20J -eq 9 ] && [ "$J20" = ok ] && [ ! -e "$D20J/identity.ed25519" ] \
+   && [ "$N20A" = 1 ] && [ "$N20B" = 0 ] && [ "$M20K" = 600 ] && [ "$M20D" = 700 ] \
+   && [ $R20A -eq 0 ] && [ $R20B -eq 0 ] && cmp -s "$WORK/g20-id1.out" "$WORK/g20-id2.out" \
    && [ $R20I -ne 0 ] && grep -q "already has identity" "$WORK/g20-init.log" \
-   && [ $R20J -eq 0 ] && ! grep -q "created your identity" "$WORK/g20-j.err" && [ -f "$D20J/identity.ed25519" ] \
    && [ $R20T -eq 0 ] && grep -q "do this:" "$WORK/g20-t.log" && [ ! -e "$D20T/identity.ed25519" ] \
-   && [ $R20N -eq 0 ] && grep -q "no identity yet" "$WORK/g20-n.log" \
+   && [ $R20N -eq 9 ] && grep -q "no identity yet" "$WORK/g20-n.log" \
    && [ $R20G -ne 0 ] && grep -q "tunlion init" "$WORK/g20-g.log" && [ ! -e "$D20N/identity.ed25519" ]; then
-  ok "U1: created once ($N20A line, key $M20K, dir $M20D), second run silent, init refuses, --json silent, tour and opt-out mint nothing"
+  ok "U1: created once ($N20A line, key $M20K, dir $M20D) by a signing verb, second run silent, init refuses; id and id --json mint nothing (exit 9), tour and opt-out mint nothing"
 else
   bad "u1-implicit-init"
-  echo "  rc: id=$R20A/$R20B lines=$N20A/$N20B key=$M20K dir=$M20D init=$R20I json=$R20J tour=$R20T optout-id=$R20N optout-grant=$R20G"
-  tail -n 3 "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-j.err" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
+  echo "  rc: id-fresh=$R20Z id-json=$R20J/$J20 lines=$N20A/$N20B key=$M20K dir=$M20D id=$R20A/$R20B init=$R20I tour=$R20T optout-id=$R20N optout-grant=$R20G"
+  tail -n 3 "$WORK/g20-0.err" "$WORK/g20-j.out" "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
+fi
+
+say "21: up waits for the network instead of exiting; up --detach reports a dead daemon"
+# Item 7: a daemon whose server is unreachable (127.0.0.1:9, nothing listens)
+# must stay up, say it is waiting, and keep retrying; it used to exit at once.
+# Item 6: `up --detach` used to print "daemon detached" and exit 0 for a
+# daemon that died a moment later. Here the daemon dies at startup (its --dir
+# is a regular FILE, so creating it fails): --detach must exit nonzero and
+# quote the daemon's own last output. And for the waiting daemon, --detach
+# must not claim it is serving.
+# Each config dir gets an identity first: `up` with no identity AND nothing
+# paired now refuses with exit 9 (it would serve no one), which is not what
+# this gate measures. A device that has either still runs `up`.
+g21_init() { TUNLION_CONFIG_DIR="$1" "$BIN" init --name "$2" --recovery-file "$1/rec.txt" --no-background --yes >/dev/null 2>&1; }
+D21="$WORK/g21-cfg"; rm -rf "$D21"; mkdir -p "$D21"; g21_init "$D21" g21a
+TUNLION_CONFIG_DIR="$D21" "$BIN" --server http://127.0.0.1:9 up --dir "$WORK/g21-drop" >"$WORK/g21-up.log" 2>&1 &
+P21=$!; pids+=($P21)
+sleep 6
+A21=0; kill -0 $P21 2>/dev/null && A21=1
+W21=$(grep -c "waiting for network" "$WORK/g21-up.log")
+PIDLINES=$(wc -l < "$D21/up.pid" 2>/dev/null | tr -d ' ')
+PIDVAL=$(cat "$D21/up.pid" 2>/dev/null)
+kill "$P21" 2>/dev/null; wait "$P21" 2>/dev/null
+D21B="$WORK/g21-cfg-b"; rm -rf "$D21B"; mkdir -p "$D21B"; g21_init "$D21B" g21b
+: > "$WORK/g21-notadir"
+TUNLION_CONFIG_DIR="$D21B" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/g21-notadir" >"$WORK/g21-detach.log" 2>&1; R21D=$?
+D21C="$WORK/g21-cfg-c"; rm -rf "$D21C"; mkdir -p "$D21C"; g21_init "$D21C" g21c
+TUNLION_CONFIG_DIR="$D21C" timeout 30 "$BIN" --server http://127.0.0.1:9 up --detach --dir "$WORK/g21-drop-c" >"$WORK/g21-detach-wait.log" 2>&1; R21W=$?
+P21C=$(cat "$D21C/up.pid" 2>/dev/null)
+[ -n "$P21C" ] && kill "$P21C" 2>/dev/null
+if [ "$A21" = 1 ] && [ "$W21" -ge 1 ] && [ "$PIDLINES" = 1 ] && [ "$PIDVAL" = "$P21" ] \
+   && [ $R21D -ne 0 ] && [ $R21D -ne 124 ] && grep -q "exited during startup" "$WORK/g21-detach.log" \
+   && ! grep -q "detached and serving" "$WORK/g21-detach.log" \
+   && [ $R21W -eq 0 ] && grep -q "not connected yet" "$WORK/g21-detach-wait.log" \
+   && ! grep -q "detached and serving" "$WORK/g21-detach-wait.log"; then
+  ok "daemon waits for the network (alive after 6s, says so), up.pid is the pid alone, --detach exits $R21D on a dead daemon and does not claim a waiting one is serving"
+else
+  bad "daemon-network-wait"
+  echo "  alive=$A21 waiting-lines=$W21 pidlines=$PIDLINES pid=$PIDVAL/$P21 detach-dead=$R21D detach-wait=$R21W"
+  tail -n 5 "$WORK/g21-up.log" "$WORK/g21-detach.log" "$WORK/g21-detach-wait.log"
+fi
+
+say "22: exit codes from the blind automation run: usage is 2, an offline known device is 6, fast"
+# Each of these exited 1 before. Usage (2): a missing local file for `send`
+# (and its --json names the local file, not the peer), non-interactive `init`
+# without --recovery-file/--yes, `add <name> --for <name>`, `grant` with an
+# unknown capability. Offline (6): `send --to` a known device whose daemon is
+# not running answers after the short offline wait, not the 60 s timeout.
+D22="$WORK/g22-cfg"; rm -rf "$D22"; mkdir -p "$D22"
+TUNLION_CONFIG_DIR="$D22" "$BIN" --server "$SERVER" send "$WORK/g22-no-such-file" --to nobody >"$WORK/g22-send.out" 2>"$WORK/g22-send.err"; R22S=$?
+TUNLION_CONFIG_DIR="$D22" "$BIN" --server "$SERVER" send "$WORK/g22-no-such-file" --to nobody --json >"$WORK/g22-sendj.out" 2>"$WORK/g22-sendj.err"; R22SJ=$?
+J22=$(python3 -c "
+import json
+v=json.load(open('$WORK/g22-sendj.out'))
+e=v['error']
+print('ok' if v['ok'] is False and e['code']=='usage' and e['exit']==2 and 'g22-no-such-file' in e['message'] and 'peer' not in e['message'].lower() else 'bad')
+" 2>/dev/null)
+D22I="$WORK/g22-init"; rm -rf "$D22I"
+TUNLION_CONFIG_DIR="$D22I" "$BIN" init --no-interactive --name g22 </dev/null >"$WORK/g22-init.log" 2>&1; R22I=$?
+TUNLION_CONFIG_DIR="$D22" "$BIN" add g22a --for g22b </dev/null >"$WORK/g22-add.log" 2>&1; R22A=$?
+TUNLION_CONFIG_DIR="$D22" "$BIN" grant g22peer nosuchcap >"$WORK/g22-grant.log" 2>&1; R22G=$?
+# A known device that never comes online. The secret only names its channel.
+printf '[{"name":"g22off","secret":"%s"}]' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$D22/devices.json"
+T22=$(date +%s)
+TUNLION_CONFIG_DIR="$D22" timeout 50 "$BIN" --server "$SERVER" send "$SMALL" --to g22off >"$WORK/g22-off.out" 2>"$WORK/g22-off.err"; R22O=$?
+E22=$(( $(date +%s) - T22 ))
+if [ $R22S -eq 2 ] && [ $R22SJ -eq 2 ] && [ "$J22" = ok ] \
+   && [ $R22I -eq 2 ] && grep -q "non-interactive init needs" "$WORK/g22-init.log" \
+   && [ $R22A -eq 2 ] && grep -q "named the invitee twice" "$WORK/g22-add.log" \
+   && [ $R22G -eq 2 ] && grep -q "unknown capability" "$WORK/g22-grant.log" \
+   && [ $R22O -eq 6 ] && grep -q "is offline" "$WORK/g22-off.err" && [ "$E22" -lt 40 ]; then
+  ok "exit codes: send missing file / init / add twice / unknown capability are usage (2), send to an offline known device is 6 in ${E22}s"
+else
+  bad "exit-codes-blind-run"
+  echo "  rc: send-missing=$R22S json=$R22SJ/$J22 init=$R22I add-twice=$R22A grant=$R22G offline=$R22O in ${E22}s"
+  tail -n 3 "$WORK/g22-send.err" "$WORK/g22-sendj.out" "$WORK/g22-init.log" "$WORK/g22-add.log" "$WORK/g22-grant.log" "$WORK/g22-off.err"
+fi
+
+# ---------------------------------------------------------------- gate T1 ----
+say "T1/T2: a source send cannot read is a fast local error (exit 2) and reaches no receiver; a FIFO or device never hangs"
+# The blind run: a mode-000 file printed "ok", then blamed the network (exit 6,
+# "re-run the same tunlion send to resume"), or stalled until killed, and left
+# unread, unread.part and unread.part.meta on the receiver; an EMPTY mode-000
+# file reported "ok unread 0 B" (exit 0); a FIFO and /dev/zero hung silently.
+# A receiver waits in a room the whole time: it must receive nothing at all.
+DT1="$WORK/gT1"; rm -rf "$DT1"; mkdir -p "$DT1/rx"
+RT1="gT1room$$"
+"$BIN" receive -y --dir "$DT1/rx" --room "$RT1" --server "$SERVER" >"$WORK/gT1-recv.log" 2>&1 &
+RT1P=$!; pids+=($RT1P); sleep 3
+echo secret >"$DT1/unread"; chmod 000 "$DT1/unread"
+: >"$DT1/unread-empty"; chmod 000 "$DT1/unread-empty"
+mkfifo "$DT1/fifo"
+t1_run() {  # $1 = label, $2 = path; prints "rc seconds"
+  local t0 rc
+  t0=$(date +%s)
+  timeout 30 "$BIN" send "$2" --room "$RT1" --server "$SERVER" >"$WORK/gT1-$1.out" 2>"$WORK/gT1-$1.err"; rc=$?
+  echo "$rc $(( $(date +%s) - t0 ))"
+}
+read -r T1U T1US <<<"$(t1_run unread "$DT1/unread")"
+read -r T1E T1ES <<<"$(t1_run empty "$DT1/unread-empty")"
+read -r T1F T1FS <<<"$(t1_run fifo "$DT1/fifo")"
+read -r T1Z T1ZS <<<"$(t1_run zero /dev/zero)"
+sleep 2
+T1RX=$(ls -A "$DT1/rx" | tr '\n' ' ')
+kill_tree $RT1P
+chmod 600 "$DT1/unread" "$DT1/unread-empty" 2>/dev/null
+echo "  unreadable: rc=$T1U ${T1US}s; empty unreadable: rc=$T1E ${T1ES}s; fifo: rc=$T1F ${T1FS}s; /dev/zero: rc=$T1Z ${T1ZS}s; receiver holds: [$T1RX]"
+if [ "$(id -u)" = 0 ]; then
+  bad "unreadable-source: running as root, which can read a mode-000 file, so this gate cannot test it"
+elif [ "$T1U" = 2 ] && [ "$T1E" = 2 ] && [ "$T1F" = 2 ] && [ "$T1Z" = 2 ] \
+   && [ "$T1US" -le 5 ] && [ "$T1ES" -le 5 ] && [ "$T1FS" -le 5 ] && [ "$T1ZS" -le 5 ] \
+   && grep -q "$DT1/unread'" "$WORK/gT1-unread.err" && grep -qi "permission denied" "$WORK/gT1-unread.err" \
+   && grep -q "not a regular file" "$WORK/gT1-fifo.err" && grep -q "tunlion send -" "$WORK/gT1-fifo.err" \
+   && grep -q "not a regular file" "$WORK/gT1-zero.err" \
+   && ! grep -qh "^ok \|lost the receiving peer\|  ok " "$WORK"/gT1-*.err "$WORK"/gT1-*.out \
+   && [ -z "$T1RX" ]; then
+  ok "unreadable-source: mode-000 (and empty), FIFO and /dev/zero refused in seconds with exit 2 and the reason; the receiver got nothing"
+else
+  bad "unreadable-source"
+  tail -n 2 "$WORK/gT1-unread.err" "$WORK/gT1-empty.err" "$WORK/gT1-fifo.err" "$WORK/gT1-zero.err" "$WORK/gT1-recv.log"
+fi
+
+# --------------------------------------------------------------- gate T1b ----
+say "T1b: a source that stops being readable mid-transfer cancels it on both ends, exit 2, nothing left behind"
+# The source is truncated while it is being sent (the read the sender does
+# next returns end-of-file early). The sender must stop as a local problem,
+# never retry or blame the peer, and the receiver must discard its partial.
+DT1B="$WORK/gT1b"; rm -rf "$DT1B"; mkdir -p "$DT1B/rx"
+cp "$BIG" "$DT1B/shrinks.bin"
+RT1B="gT1broom$$"
+"$BIN" receive -y --dir "$DT1B/rx" --room "$RT1B" --server "$SERVER" >"$WORK/gT1b-recv.log" 2>&1 &
+RT1BP=$!; pids+=($RT1BP); sleep 3
+TUNLION_TEST_TRANSFER_STALL_MS=10 \
+  "$BIN" send "$DT1B/shrinks.bin" --room "$RT1B" --server "$SERVER" >"$WORK/gT1b-send.log" 2>&1 &
+ST1B=$!; pids+=($ST1B)
+for _ in $(seq 1 120); do
+  sz=$(stat -c %s "$DT1B/rx/shrinks.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((2 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+T1BSZ=$(stat -c %s "$DT1B/rx/shrinks.bin.part" 2>/dev/null || echo 0)
+truncate -s 1048576 "$DT1B/shrinks.bin"
+T0=$(date +%s)
+wait_for_exit $ST1B 60; RT1BS=$?
+T1BT=$(( $(date +%s) - T0 ))
+wait_for_exit $RT1BP 60; RT1BR=$?
+T1BRX=$(ls -A "$DT1B/rx" | tr '\n' ' ')
+echo "  part at truncation: $T1BSZ; sender rc=$RT1BS in ${T1BT}s; receiver rc=$RT1BR; receiver holds: [$T1BRX]"
+if [ "$T1BSZ" -eq 0 ]; then
+  bad "shrinking-source: nothing was received before the truncation, so nothing was mid-transfer"
+elif [ $RT1BS -eq 2 ] && [ "$T1BT" -le 20 ] && grep -q "shorter than offered" "$WORK/gT1b-send.log" \
+   && ! grep -q "lost the receiving peer" "$WORK/gT1b-send.log" \
+   && [ $RT1BR -ne 0 ] && [ $RT1BR -ne 124 ] && grep -q "the sender cancelled" "$WORK/gT1b-recv.log" \
+   && [ -z "$T1BRX" ]; then
+  ok "shrinking-source: sender stopped in ${T1BT}s with exit 2, the receiver discarded its partial and said why"
+else
+  bad "shrinking-source"
+  tail -n 3 "$WORK/gT1b-send.log" "$WORK/gT1b-recv.log"
+fi
+
+# ---------------------------------------------------------------- gate T3 ---
+say "T3: receive -o - into a slow pipe streams in order, verified (no seek on a pipe)"
+# Every `receive <code> -o - | reader` failed "Invalid seek (os error 29)": the
+# stdout writer used positional writes, which a pipe refuses. The reader here
+# is deliberately slow so the pipe fills and writes block.
+D="$WORK/gT3"; mkdir -p "$D"
+"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/gT3-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/gT3-send.log") || { bad "stdout-pipe (no code minted)"; tail -n 3 "$WORK/gT3-send.log"; }
+if [ -n "${W:-}" ]; then
+  { timeout 120 "$BIN" receive "$W" -y -o - --server "$SERVER" 2>"$WORK/gT3-recv.log"; echo $? >"$WORK/gT3-recv.rc"; } \
+    | python3 -c '
+import sys, time
+out = open(sys.argv[1], "wb")
+while True:
+    b = sys.stdin.buffer.read(65536)
+    if not b:
+        break
+    out.write(b)
+    time.sleep(0.05)
+' "$D/out.bin"
+  RCR=$(cat "$WORK/gT3-recv.rc" 2>/dev/null || echo missing)
+  wait_for_exit $SP 60; RCS=$?
+  if [ "$RCR" = 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/out.bin")" = "$H_SMALL" ] \
+     && ! grep -qi "invalid seek\|could not save" "$WORK/gT3-recv.log" "$WORK/gT3-send.log"; then
+    ok "stdout-pipe: -o - into a slow pipe is byte-exact, and the sender got a verified ack (exit 0 both)"
+  else
+    bad "stdout-pipe"
+    echo "  receiver rc=$RCR sender rc=$RCS"
+    tail -n 4 "$WORK/gT3-recv.log" "$WORK/gT3-send.log"
+  fi
+fi
+
+# ---------------------------------------------------------------- gate T4 ---
+say "T4: one-shot receiver whose sender is SIGKILLed mid-transfer gives up honestly and in bounded time"
+# Was: ~96 s, then "lost the sender after 5 attempts; the partial is kept,
+# re-run `tunlion receive <code>` to resume" (exit 1) for a code that had
+# already burned, plus five "polite-role: legacy path" debug lines at the
+# default verbosity. Now: the rejoin bound (25 s), exit 6 where the exit-code
+# taxonomy exists, a message naming what was kept and the resume that works.
+D="$WORK/gT4"; mkdir -p "$D"
+TUNLION_TEST_TRANSFER_STALL_MS=10 \
+  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/gT4-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/gT4-send.log") || { bad "sender-killed (no code minted)"; tail -n 3 "$WORK/gT4-send.log"; }
+if [ -n "${W:-}" ]; then
+  "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/gT4-recv.log" 2>&1 &
+  R=$!; pids+=($R)
+  for _ in $(seq 1 120); do
+    sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+    [ "$sz" -gt $((4 * 1024 * 1024)) ] && break
+    sleep 0.5
+  done
+  GT4SZ=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+  # The sender runs without a timeout wrapper, so SIGKILL reaches it.
+  kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null
+  T0=$(date +%s)
+  wait_for_exit $R 120; RCR=$?
+  T1=$(date +%s)
+  WANT_RC=nonzero
+  "$BIN" --help 2>&1 | grep -q "EXIT CODES" && WANT_RC=6
+  if [ "$GT4SZ" -eq 0 ]; then
+    bad "sender-killed: nothing was received before the kill, so nothing was mid-transfer"
+  elif [ $RCR -eq 124 ] || [ $RCR -eq 0 ]; then
+    bad "sender-killed: receiver exit $RCR (124 = still running after 120s)"; tail -n 4 "$WORK/gT4-recv.log"
+  elif [ "$WANT_RC" = 6 ] && [ $RCR -ne 6 ]; then
+    bad "sender-killed: receiver exited $RCR, not 6 (the sender is unreachable)"; tail -n 4 "$WORK/gT4-recv.log"
+  elif [ $((T1 - T0)) -gt 60 ]; then
+    bad "sender-killed: receiver took $((T1 - T0))s to give up (bound 60s)"; tail -n 4 "$WORK/gT4-recv.log"
+  elif ! grep -q "unreachable" "$WORK/gT4-recv.log" || ! grep -q "big.bin.part (" "$WORK/gT4-recv.log" \
+       || ! grep -q "new code" "$WORK/gT4-recv.log" || grep -q "receive <code>\` to resume" "$WORK/gT4-recv.log" \
+       || [ ! -s "$D/big.bin.part" ]; then
+    bad "sender-killed: the message is not the true one, or the partial it names is not there"; tail -n 4 "$WORK/gT4-recv.log"
+  elif grep -q "polite-role" "$WORK/gT4-recv.log"; then
+    bad "sender-killed: debug lines at the default verbosity"; grep -m2 "polite-role" "$WORK/gT4-recv.log"
+  else
+    ok "sender-killed: receiver gave up in $((T1 - T0))s, exit $RCR, named the kept partial and the resume that works"
+  fi
 fi
 
 # --------------------------------------------------------- L2 tunnel gates ---

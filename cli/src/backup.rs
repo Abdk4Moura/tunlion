@@ -34,7 +34,7 @@ pub async fn backup_cmd(
 
     // Build rsync command. Use -e to specify the remote shell.
     // For L3 direct: rsync -e "ssh <opts>" source login@peer.mesh:dest
-    // For L2 fallback: rsync -e "ssh <opts> -o ProxyCommand=..." source login@filament-peer:dest
+    // For L2 fallback: rsync -e "ssh <opts> -o ProxyCommand=..." source login@tunlion-peer:dest
     let mut cmd = std::process::Command::new("rsync");
     cmd.arg("-avz");
 

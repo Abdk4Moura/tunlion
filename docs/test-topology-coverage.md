@@ -51,11 +51,11 @@ exercises the real deployment topology.
 
 ## Topology Knobs
 
-- `FILAMENT_DIRECT_LOOPBACK_ONLY=1` is enabled for Ubuntu and Windows CI so
+- `TUNLION_DIRECT_LOOPBACK_ONLY=1` is enabled for Ubuntu and Windows CI so
   same-host direct candidates use loopback. macOS sets it to `0` because its
   hosted ARM64 runner does not gather usable loopback host candidates. This is
   a same-host test workaround, not NAT coverage (`.github/workflows/capability-ci.yml:181-182`).
-- `FILAMENT_DIRECT_PER_OS=0` disables direct-QUIC on macOS CI, while Ubuntu and
+- `TUNLION_DIRECT_PER_OS=0` disables direct-QUIC on macOS CI, while Ubuntu and
   Windows use `1`. This leaves macOS without rung-1 direct-QUIC coverage and
   does not simulate a NAT failure (`.github/workflows/capability-ci.yml:175-182`).
 - `--relay` and the local coturn gate exercise a selected relay route, but do

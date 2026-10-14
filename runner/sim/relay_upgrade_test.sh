@@ -11,16 +11,16 @@
 # becomes a way-station, not a destination.
 #
 # How the relay phase + the heal are forced deterministically:
-#   - FILAMENT_TEST_FREEZE_PERSIST=1 + FILAMENT_TEST_FREEZE_AFTER_BYTES=N make
+#   - TUNLION_TEST_FREEZE_PERSIST=1 + TUNLION_TEST_FREEZE_AFTER_BYTES=N make
 #     EVERY direct-QUIC transport go dark — so the direct ladder EXHAUSTS and the
 #     session falls to the TURN relay (P1 rung d, `relay_committed`).
-#   - FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 + a local coturn make "relay" concretely
+#   - TUNLION_TEST_WEBRTC_RELAY_ONLY=1 + a local coturn make "relay" concretely
 #     the TURN route (a real relay carries the session).
-#   - FILAMENT_TEST_DIRECT_UNBLOCK_MS=M LIFTS the persistent freeze for any direct
+#   - TUNLION_TEST_DIRECT_UNBLOCK_MS=M LIFTS the persistent freeze for any direct
 #     transport born after M ms — i.e. the network HEALS mid-session. The prober's
 #     fresh DIRECT standby (born after the lift) then carries data, so the
 #     verify-before-upgrade confirms it and CUTS OVER back to direct.
-#   - FILAMENT_TEST_DIRECT_FLAKY=1 (RUN F only) makes the post-lift standby connect
+#   - TUNLION_TEST_DIRECT_FLAKY=1 (RUN F only) makes the post-lift standby connect
 #     then RE-FREEZE immediately — a flaky direct path. The verify guard MUST catch
 #     this and DISCARD it (stay on relay) — proving no flap.
 #
@@ -38,7 +38,7 @@
 #         flap)") and NEVER upgraded — and still completed byte-exact on relay.
 #
 # Isolated: own backend on a private port, own coturn on private ports, own
-# FILAMENT_CONFIG_DIRs, the BUILT --features test-hooks binary. Never the live
+# TUNLION_CONFIG_DIRs, the BUILT --features test-hooks binary. Never the live
 # daemon / installed CLI / production TURN.
 #
 # Usage (from repo root or anywhere):  runner/sim/relay_upgrade_test.sh
@@ -50,14 +50,14 @@ BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`
-# level. Export FILAMENT_LOG=debug so every $BIN child prints them; the
+# level. Export TUNLION_LOG=debug so every $BIN child prints them; the
 # value-prop lines (route, relay banner, P5 upgrade) are `critical` and show
 # regardless. Respect an explicit override if the caller set one.
-export FILAMENT_LOG="${FILAMENT_LOG:-debug}"
-PORT="${FILAMENT_TEST_PORT:-8096}"
+export TUNLION_LOG="${TUNLION_LOG:-debug}"
+PORT="${TUNLION_TEST_PORT:-8096}"
 SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/relay-upgrade.XXXXXX")"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
 [ -x "$PYV" ] || PYV="$(command -v python3)"
 
 # coturn (local TURN) — private ports, loopback only.
@@ -106,7 +106,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resilience gates drive the env-gated test hooks (FILAMENT_TEST_*), which ship
+# Resilience gates drive the env-gated test hooks (TUNLION_TEST_*), which ship
 # ONLY in a `--features test-hooks` build (stripped from default/release).
 if [ -z "${FILJOB_BIN:-}" ]; then
   ( cd "$CLI_DIR" && cargo build --release --features test-hooks ) || { echo "build failed"; exit 2; }
@@ -159,9 +159,9 @@ DA="$WORK/devA"; DB="$WORK/devB"; mkdir -p "$DA" "$DB"
 PAIRFILE="$WORK/pair.bin"; head -c 1000000 /dev/urandom >"$PAIRFILE"
 pair() {
   local W="pair-$$-$RANDOM"
-  FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$PAIRFILE" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
+  TUNLION_CONFIG_DIR="$DA" "$BIN" send "$PAIRFILE" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
   local SP=$!; sleep 3
-  FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
+  TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
   wait $SP 2>/dev/null
 }
 say "setup: pairing A<->B (--remember over a code)"
@@ -180,14 +180,14 @@ one_attempt() {
   local DG="$WORK/$tag-drop"; rm -rf "$DG"; mkdir -p "$DG"
   local UPLOG="$WORK/$tag-up.log"; local SENDLOG="$WORK/$tag-send.log"
   local FLAKY_ENV=""
-  [ "$flaky" = "1" ] && FLAKY_ENV="FILAMENT_TEST_DIRECT_FLAKY=1"
+  [ "$flaky" = "1" ] && FLAKY_ENV="TUNLION_TEST_DIRECT_FLAKY=1"
   # The `up` daemon is the canonical long-lived session (warm_standby + prober
   # default ON). Both ends carry the persistent freeze + the unblock heal so direct
   # first stalls (-> relay) then a FRESH direct standby (born after the heal)
   # carries data and the prober upgrades back. The prober knobs are tightened so the
   # detect->verify->upgrade lands inside the run.
   #
-  # FILAMENT_WARM_STANDBY=1 on BOTH ends: this models an INTERACTIVE transfer
+  # TUNLION_WARM_STANDBY=1 on BOTH ends: this models an INTERACTIVE transfer
   # session (the case the upgrade prober serves). It makes the fall-to-relay
   # SYMMETRIC + fast — both ends do the P3 warm-relay instant failover and COMMIT
   # to relay — instead of the sender taking the slower cold WebRTC-fallback ladder,
@@ -197,21 +197,21 @@ one_attempt() {
   # (the QUIC simultaneous-open needs both sides dialing). The relay-fallback gate
   # pins WARM_STANDBY=0 to test the cold ladder; this gate pins it =1 to test the
   # warm path's upgrade-back, which is the P5 surface.
-  FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=1 \
-    FILAMENT_UPGRADE_FIRST_MS="$UPGRADE_FIRST_MS" FILAMENT_UPGRADE_STEADY_MS="$UPGRADE_STEADY_MS" \
-    FILAMENT_UPGRADE_VERIFY_MS="$UPGRADE_VERIFY_MS" FILAMENT_UPGRADE_VERIFY_IDLE_MS="$UPGRADE_VERIFY_IDLE_MS" \
-    FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
-    FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" FILAMENT_TEST_DIRECT_UNBLOCK_MS="$UNBLOCK_MS" \
+  TUNLION_CONFIG_DIR="$DB" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 \
+    TUNLION_STALL_MS="$STALL_MS" TUNLION_WARM_STANDBY=1 \
+    TUNLION_UPGRADE_FIRST_MS="$UPGRADE_FIRST_MS" TUNLION_UPGRADE_STEADY_MS="$UPGRADE_STEADY_MS" \
+    TUNLION_UPGRADE_VERIFY_MS="$UPGRADE_VERIFY_MS" TUNLION_UPGRADE_VERIFY_IDLE_MS="$UPGRADE_VERIFY_IDLE_MS" \
+    TUNLION_TEST_FREEZE_PERSIST=1 TUNLION_TEST_WEBRTC_RELAY_ONLY=1 \
+    TUNLION_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" TUNLION_TEST_DIRECT_UNBLOCK_MS="$UNBLOCK_MS" \
     env $FLAKY_ENV timeout 90 "$BIN" up --dir "$DG" --server "$SERVER" >"$UPLOG" 2>&1 &
   local UP=$!; pids+=($UP); sleep 3
   A_RC=0
-  FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=1 \
-    FILAMENT_UPGRADE_FIRST_MS="$UPGRADE_FIRST_MS" FILAMENT_UPGRADE_STEADY_MS="$UPGRADE_STEADY_MS" \
-    FILAMENT_UPGRADE_VERIFY_MS="$UPGRADE_VERIFY_MS" FILAMENT_UPGRADE_VERIFY_IDLE_MS="$UPGRADE_VERIFY_IDLE_MS" \
-    FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
-    FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" FILAMENT_TEST_DIRECT_UNBLOCK_MS="$UNBLOCK_MS" \
+  TUNLION_CONFIG_DIR="$DA" TUNLION_DIRECT=1 TUNLION_DIRECT_LOOPBACK_ONLY=1 \
+    TUNLION_STALL_MS="$STALL_MS" TUNLION_WARM_STANDBY=1 \
+    TUNLION_UPGRADE_FIRST_MS="$UPGRADE_FIRST_MS" TUNLION_UPGRADE_STEADY_MS="$UPGRADE_STEADY_MS" \
+    TUNLION_UPGRADE_VERIFY_MS="$UPGRADE_VERIFY_MS" TUNLION_UPGRADE_VERIFY_IDLE_MS="$UPGRADE_VERIFY_IDLE_MS" \
+    TUNLION_TEST_FREEZE_PERSIST=1 TUNLION_TEST_WEBRTC_RELAY_ONLY=1 \
+    TUNLION_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" TUNLION_TEST_DIRECT_UNBLOCK_MS="$UNBLOCK_MS" \
     env $FLAKY_ENV timeout 90 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$SENDLOG" 2>&1 || A_RC=1
   sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
   A_FROZE=0;  grep -hq "data-path FREEZE engaged" "$SENDLOG" "$UPLOG" 2>/dev/null && A_FROZE=1

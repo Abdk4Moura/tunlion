@@ -109,6 +109,13 @@ pub struct AuthKey {
     version: u8,
 }
 
+// PROTOCOL LITERAL: frozen, do not rename. Signature/derivation domains for
+// auth keys and enrollment; released builds sign and verify these exact bytes.
+const AUTH_KEY_V1_TAG: &[u8] = b"filament-auth-key-v1";
+const AUTH_KEY_V2_TAG: &[u8] = b"filament-auth-key-v2";
+const ENROLL_CHANNEL_DOMAIN: &[u8] = b"filament-enroll-v1";
+const ENROLL_POSSESSION_DOMAIN: &[u8] = b"filament-auth-key-enroll-v1";
+
 /// Canonical bytes that the signature covers — deterministic, no ambiguity.
 /// Uses u32 length prefixes to prevent truncation-based canonical collisions.
 /// v2 appends `max_offline` after the ephemeral byte and prefixes a v2 tag, so
@@ -116,9 +123,9 @@ pub struct AuthKey {
 fn auth_key_canonical_bytes(k: &AuthKey) -> Vec<u8> {
     let mut b = Vec::new();
     if k.version >= 2 {
-        b.extend_from_slice(b"filament-auth-key-v2");
+        b.extend_from_slice(AUTH_KEY_V2_TAG);
     } else {
-        b.extend_from_slice(b"filament-auth-key-v1");
+        b.extend_from_slice(AUTH_KEY_V1_TAG);
     }
     b.extend_from_slice(&k.issuer);
     b.extend_from_slice(&k.enroll_pub);
@@ -440,7 +447,7 @@ pub fn issuer_fingerprint(pubkey: &[u8; 32]) -> [u8; 8] {
 pub fn enroll_channel_fp(fp: &[u8; 8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"filament-enroll-v1");
+    h.update(ENROLL_CHANNEL_DOMAIN);
     h.update(fp);
     hex::encode(h.finalize().as_slice())
 }
@@ -671,8 +678,15 @@ impl Invitation {
         b
     }
 
-    /// Parse a TOKEN (fields + seed + sig). Derives the public key from the
-    /// seed and verifies the signature; returns None on any failure.
+    /// Parse a TOKEN (fields + seed + sig) and derive the public key from the
+    /// seed. Returns None on a malformed encoding.
+    ///
+    /// This does NOT verify the signature: parsing cannot, because the owner
+    /// public key it binds to is not in the token (only its fingerprint is).
+    /// The owner side checks the presented payload with `verify_against_owner`
+    /// before honouring any field; the joining side holds no owner key and
+    /// binds the owner through the join acknowledgement's certificates, which
+    /// must match the token's issuer fingerprint.
     pub fn from_token(raw: &[u8]) -> Option<Self> {
         let fixed = inv_field_fixed_len();
         if raw.len() < fixed + 32 + 64 {
@@ -713,7 +727,11 @@ impl Invitation {
     }
 
     /// Parse a PAYLOAD (fields + pub + sig). The verifier learns only the
-    /// public key; no seed is present. Verifies the signature.
+    /// public key; no seed is present. Returns None on a malformed encoding.
+    ///
+    /// Like `from_token`, this does NOT verify the signature; the owner key is
+    /// not in the payload. Callers must run `verify_against_owner` before
+    /// trusting any field.
     pub fn from_payload(raw: &[u8]) -> Option<Self> {
         let fixed = inv_field_fixed_len();
         if raw.len() < fixed + 32 + 64 {
@@ -858,7 +876,7 @@ pub struct EnrollmentPayload {
 /// AND verifier, so a payload captured for peer A cannot be presented to peer B.
 pub fn enrollment_possession_msg(nonce: &[u8; 32], device_pub: &[u8; 32], verifier_pub: &[u8; 32]) -> Vec<u8> {
     let mut msg = Vec::new();
-    msg.extend_from_slice(b"filament-auth-key-enroll-v1");
+    msg.extend_from_slice(ENROLL_POSSESSION_DOMAIN);
     msg.extend_from_slice(nonce);
     msg.extend_from_slice(device_pub);
     msg.extend_from_slice(verifier_pub);
@@ -2163,5 +2181,32 @@ mod route_ceiling_tests {
         let ak = inv.to_auth_key(&owner_pub);
         assert!(ak.caps.contains(&"route:10.66.0.0/24".to_string()), "caps: {:?}", ak.caps);
         assert!(!ak.caps.contains(&"route".to_string()), "a bare route would be unscoped");
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+/// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+///
+/// Each digest was computed from the ORIGINAL (pre-rename) literal with
+/// `printf '%s' '<literal>' | sha256sum`. A digest cannot be satisfied by a
+/// find-and-replace: if a rename touches one of these literals this test
+/// fails, and the literal is what must be put back.
+    #[test]
+    fn enrollment_domains_are_frozen() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("AUTH_KEY_V1_TAG", super::AUTH_KEY_V1_TAG,
+             "751479aa8dc89611ac8db0db03223d335a85492a650525bf6a8b2b1801a08935"),
+            ("AUTH_KEY_V2_TAG", super::AUTH_KEY_V2_TAG,
+             "61302bc8801d0f43c3b5aafc09758f81c6e8fc1a14846d807b5b28063ff92ac9"),
+            ("ENROLL_CHANNEL_DOMAIN", super::ENROLL_CHANNEL_DOMAIN,
+             "d79d7def998510abeac50b5550fcb46cce1f49b5bd40c2e157caba652ce1473d"),
+            ("ENROLL_POSSESSION_DOMAIN", super::ENROLL_POSSESSION_DOMAIN,
+             "855097ddf646eb7931fedbac4d9d71cbdae9e9e286de7799a36b1dbbdea1b13c"),
+        ] {
+            let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
+        }
     }
 }

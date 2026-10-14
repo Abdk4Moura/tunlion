@@ -3,7 +3,7 @@
 # Two daemons' worth of identity (acceptor `up` + one-shot initiator), a
 # reciprocal pair secret so B trusts A, real bytes over the real link.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./sync-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./sync-gates.sh
 #
 
 # --- BITE-CHECK CONVENTION (four rules, each earned by a specific failure) ---
@@ -40,7 +40,7 @@
 # bite run, because every conclusion drawn from it is the opposite of the truth: a gate
 # that never started looks exactly like a gate whose bite did not bite. This gate starts a
 # python backend on port 8107 and needs the backend's requirements, so invoke it with
-# FILAMENT_TEST_VENV pointing at an interpreter that has them (see
+# TUNLION_TEST_VENV pointing at an interpreter that has them (see
 # backend/requirements.txt); without that it dies with ModuleNotFoundError and produces no
 # verdicts at all. Pin the interpreter in every caller rather than rediscovering it.
 #
@@ -85,10 +85,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8107
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-sync-gates.XXXXXX")"
 DA="$WORK/A"; DB="$WORK/B"; mkdir -p "$DA" "$DB"
 
@@ -101,11 +101,11 @@ SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
 printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 DROP="$WORK/Bdrop"; mkdir -p "$DROP"
-env FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB "$BIN" up --dir "$DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB "$BIN" up --dir "$DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 FIX_PIDS+=($!)
 sleep 3
 
-SYNC=(env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA timeout 120 "$BIN" --server "$SERVER")
+SYNC=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA timeout 120 "$BIN" --server "$SERVER")
 CHUNK=262144
 
 # --- the tree: a (300 B), big (3 chunks), sub/c (5 B), link (symlink) ---
@@ -124,7 +124,9 @@ for line in open(sys.argv[1]):
     line=line.strip()
     if not line: continue
     d=json.loads(line).get("data",{})
+    # --json-lines: one record per file. --json: one document, files listed.
     if "file" in d: rows.append((d["file"],d["state"],d["bytes"]))
+    for r in d.get("files") or []: rows.append((r["file"],r["state"],r["bytes"]))
 for f,s,b in sorted(rows): print(f"{s}\t{f}\t{b}")
 PY
 }
@@ -159,13 +161,42 @@ with open(p,"r+b") as f:
     f.seek(chunk+100); f.write(b"\xff\xfe\xfd")
 PY
 head -c 1000 /dev/urandom > "$TREE/d"
-"${SYNC[@]}" --json sync "$TREE" boxB:inbox >"$WORK/B.jsonl" 2>"$WORK/B.err"; rcB=$?
+"${SYNC[@]}" sync --json-lines "$TREE" boxB:inbox >"$WORK/B.jsonl" 2>"$WORK/B.err"; rcB=$?
 echo "## rc=$rcB"; cat "$WORK/B.jsonl"
 if [ "$rcB" = 0 ] && [ "$(jstates "$WORK/B.jsonl")" = "$(printf 'same\ta\t0\nupdated\tbig\t%s\nsent\td\t1000\nskipped\tlink\t0\nsame\tsub/c\t0' "$CHUNK")" ]; then
   ok "gateB: exactly two files moved: one chunk of big, all of d"
 else cat "$WORK/B.err"; jstates "$WORK/B.jsonl"; bad "gateB: delta records wrong (rc=$rcB)"; fi
 [ "$(jfinal "$WORK/B.jsonl" moved)" = "$((CHUNK + 1000))" ] && ok "gateB: bytes moved == one chunk + d ($((CHUNK+1000)))" || bad "gateB: moved=$(jfinal "$WORK/B.jsonl" moved)"
 if same_bytes big && same_bytes d && same_bytes a; then ok "gateB: landed bytes identical after the delta"; else bad "gateB: landed tree differs after the delta"; fi
+
+# ===================================================================== GATE K ==
+# J4: `--json` is ONE document like every other verb (A), `--json-lines` is the
+# NDJSON stream (B), and in both the labelled counters partition the entries and
+# the bytes add up: `counts.total` is every local entry, the states sum to it,
+# `bytes.moved` is what was sent and acknowledged.
+say K
+python3 - "$WORK/A.jsonl" "$WORK/B.jsonl" "$TOTAL" "$CHUNK" <<'PY' && ok "gateK: --json is one document, --json-lines a stream, and the counters add up" || bad "gateK: sync JSON shape or counters"
+import json, sys
+a_path, b_path, total, chunk = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+def parts(c):
+    return sum(c[k] for k in ("sent", "updated", "same", "skipped", "failed", "would_send", "would_update"))
+a = [l for l in open(a_path) if l.strip()]
+assert len(a) == 1, f"--json printed {len(a)} documents"
+d = json.loads(a[0]); data = d["data"]; c = data["counts"]
+assert d["ok"] is True and d["verb"] == "sync", d
+assert len(data["files"]) == 4 and c["total"] == 4 == parts(c), c
+assert (c["sent"], c["skipped"], c["same"]) == (3, 1, 0), c
+assert data["bytes"]["moved"] == data["bytes"]["total"] == total == data["moved"] == data["total"], data
+b = [json.loads(l) for l in open(b_path) if l.strip()]
+recs, summary = b[:-1], b[-1]["data"]
+assert len(recs) == 5 and all("file" in r["data"] for r in recs), recs
+assert "files" not in summary, "the stream does not repeat the files in its summary"
+c = summary["counts"]
+assert c["total"] == 5 == parts(c) == len(recs), c
+assert (c["same"], c["updated"], c["sent"], c["skipped"]) == (2, 1, 1, 1), c
+assert summary["bytes"]["moved"] == chunk + 1000 == sum(r["data"]["bytes"] for r in recs), summary
+print("## A counts", json.dumps(data["counts"]), "B counts", json.dumps(c))
+PY
 
 # ===================================================================== GATE C ==
 say C
@@ -237,7 +268,7 @@ else cat "$WORK/H.err"; jstates "$WORK/H.jsonl"; bad "gateH: resume moved the wr
 say I
 DO="$WORK/owner"
 init_owner "$DO"
-env FILAMENT_CONFIG_DIR="$DO" FILAMENT_NAME=alpha "$BIN" --server "$SERVER" up --dir "$WORK/owner-drop" >"$WORK/up-owner.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DO" TUNLION_NAME=alpha "$BIN" --server "$SERVER" up --dir "$WORK/owner-drop" >"$WORK/up-owner.log" 2>&1 &
 FIX_PIDS+=($!)
 sleep 3
 for d in nosend cansend; do
@@ -247,16 +278,16 @@ for d in nosend cansend; do
   esac
   DDC="$WORK/$d"
   mkdir -p "$DDC"
-  env FILAMENT_CONFIG_DIR="$DO" "$BIN" --server "$SERVER" add --for "$d" --allow "$ALLOW" \
+  env TUNLION_CONFIG_DIR="$DO" "$BIN" --server "$SERVER" add --for "$d" --allow "$ALLOW" \
     --out "$WORK/$d-inv.txt" --yes >/dev/null 2>&1
-  env FILAMENT_CONFIG_DIR="$DDC" "$BIN" --server "$SERVER" join \
+  env TUNLION_CONFIG_DIR="$DDC" "$BIN" --server "$SERVER" join \
     --invite-file "$WORK/$d-inv.txt" --name "$d" --no-interactive >"$WORK/$d-join.log" 2>&1
 done
 sleep 2
 mkdir -p "$WORK/itree"; head -c 100 /dev/urandom > "$WORK/itree/f"
 
 # NEGATIVE: no transfer in the ceiling -> refused, exit 4, with a reason.
-env FILAMENT_CONFIG_DIR="$WORK/nosend" FILAMENT_NAME=nosend timeout 120 "$BIN" \
+env TUNLION_CONFIG_DIR="$WORK/nosend" TUNLION_NAME=nosend timeout 120 "$BIN" \
   --server "$SERVER" sync "$WORK/itree" alpha:inbox >"$WORK/I-neg.out" 2>&1; rcI=$?
 # The refusal is asserted in TWO places, because they say different things:
 #   * the OWNER'S LOG carries the decision, and it names the ceiling: "this
@@ -275,7 +306,7 @@ fi
 
 # POSITIVE half, so a gate that refuses EVERYTHING is distinguishable from one
 # that refuses only the wrong thing.
-env FILAMENT_CONFIG_DIR="$WORK/cansend" FILAMENT_NAME=cansend timeout 120 "$BIN" \
+env TUNLION_CONFIG_DIR="$WORK/cansend" TUNLION_NAME=cansend timeout 120 "$BIN" \
   --server "$SERVER" sync "$WORK/itree" alpha:inbox >"$WORK/I-pos.out" 2>&1; rcI2=$?
 if [ "$rcI2" = 0 ] && [ -f "$WORK/owner-drop/inbox/f" ]; then
   ok "gateI: a peer WITH transfer in its ceiling syncs (exit 0, file landed)"

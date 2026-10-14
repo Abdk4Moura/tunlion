@@ -20,7 +20,7 @@
 # run as a sequential solo tail on a quiet host (their ICE/ssh/PAKE timing is
 # contention-sensitive on a small box). Wall-clock = batch + solo tail.
 #
-# SAFETY: every tunlion call sets a throwaway FILAMENT_CONFIG_DIR under /tmp/ux;
+# SAFETY: every tunlion call sets a throwaway TUNLION_CONFIG_DIR under /tmp/ux;
 # every backend we start carries the marker FIL_UX_RIG=1; teardown kills ONLY our
 # tracked children and only backends carrying that marker. The user's real
 # ~/.config/tunlion, their `tunlion up` daemon, the gallery server on 8095, and

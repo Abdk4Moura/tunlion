@@ -159,7 +159,7 @@ class Watcher:
         self.reship_attempts = reship_attempts
         self.reship_gap_s = reship_gap_s
         self.reship_deadline_s = reship_deadline_s
-        # each individual `tunlion send` is BOUNDED (FILAMENT_SEND_TIMEOUT) so a
+        # each individual `tunlion send` is BOUNDED (TUNLION_SEND_TIMEOUT) so a
         # wedged establishment is abandoned and re-invoked (a fresh connect clears
         # a stuck candidate pair); the retry loop + reship deadline are what wait
         # "until the peer appears". 0 would disable the bound (wait forever) —
@@ -385,16 +385,16 @@ class Watcher:
         if self.relay:
             cmd.append("--relay")
         env = dict(os.environ)
-        env["FILAMENT_CONFIG_DIR"] = self.dout_cfg
+        env["TUNLION_CONFIG_DIR"] = self.dout_cfg
         env["HOME"] = self.dout_cfg
-        env["FILAMENT_L2"] = "1"
+        env["TUNLION_L2"] = "1"
         # RETRY-UNTIL-PEER: on a flaky link the host's dout sink may not be
         # subscribed yet (or the signaling link is mid-reconnect), so a single
         # `send` would hit "no peer connected" and give up. We (a) stop the CLI
-        # from giving up early by setting FILAMENT_SEND_TIMEOUT (0 = wait for the
+        # from giving up early by setting TUNLION_SEND_TIMEOUT (0 = wait for the
         # peer), and (b) re-invoke on a hard failure with backoff. The outer
         # _ship_loop bounds total time via the ACK deadline.
-        env["FILAMENT_SEND_TIMEOUT"] = str(self.send_timeout_s)
+        env["TUNLION_SEND_TIMEOUT"] = str(self.send_timeout_s)
         last = None
         attempts = max(1, self.send_retry_attempts)
         for attempt in range(attempts):
@@ -464,8 +464,8 @@ def main(argv):
     ap = argparse.ArgumentParser(description="tunlion box-side file-driven job watcher")
     ap.add_argument("--jobs-root", default=os.environ.get("FILJOB_ROOT", "~/filament-jobs"))
     ap.add_argument("--server", default=os.environ.get("FILJOB_SERVER",
-                    "https://api.filament.autumated.com"))
-    ap.add_argument("--bin", default=os.environ.get("FILAMENT_BIN", "tunlion"))
+                    "https://api.tunlion.autumated.com"))
+    ap.add_argument("--bin", default=os.environ.get("TUNLION_BIN", "tunlion"))
     ap.add_argument("--dout-cfg", default=os.environ.get("FILJOB_BOX_DOUT_CFG",
                     "~/filament-jobs/cfg-dout"))
     ap.add_argument("--host-dout-peer", default=os.environ.get("FILJOB_HOST_DOUT_PEER", "host-out"))
@@ -482,7 +482,7 @@ def main(argv):
                     help="give up re-shipping a job after this many seconds with no host ack")
     ap.add_argument("--send-timeout", type=int,
                     default=int(os.environ.get("FILJOB_SEND_TIMEOUT_S", "45")),
-                    help="FILAMENT_SEND_TIMEOUT bounding each send invocation (the retry "
+                    help="TUNLION_SEND_TIMEOUT bounding each send invocation (the retry "
                          "loop + reship deadline wait for the peer; 0 = wait forever, avoid)")
     ap.add_argument("--send-retries", type=int,
                     default=int(os.environ.get("FILJOB_SEND_RETRIES", "6")),

@@ -20,11 +20,11 @@
 # also the realistic shape: a remote box fronts a remote network, the owner's
 # machine consumes it.
 #
-# WHY NAMESPACES. l3::ifname() is a hardcoded const ("filament0"), so a second
+# WHY NAMESPACES. l3::ifname() is a hardcoded const ("tunlion0"), so a second
 # daemon on a host that already runs one cannot get a kernel TUN. It silently
 # degrades to the USERSPACE overlay, which installs no kernel routes, and subnet
 # routing then fails for a reason unrelated to subnet routing. A netns gives each
-# test daemon its own filament0 and leaves both machines' real daemons untouched.
+# test daemon its own tunlion0 and leaves both machines' real daemons untouched.
 #
 # NEGATIVE CONTROL FIRST, always: the receiver must FAIL to reach the LAN before
 # the grant exists and succeed after. A run that only checks success cannot tell
@@ -34,7 +34,7 @@ set -uo pipefail
 # PINNED OUT OF THE SHARED CARGO_TARGET_DIR: a concurrent build in another
 # checkout has silently replaced a rig binary mid-run before, which makes every
 # number after it a measurement of something else.
-BIN=${FILAMENT_BIN:-/tmp/sr-bin/tunlion}
+BIN=${TUNLION_BIN:-/tmp/sr-bin/tunlion}
 WANT_SHA=${WANT_SHA:-}
 PEER=${PEER:-interserver-0x0}
 LOCAL_BIN=${LOCAL_BIN:-$HOME/.local/bin/tunlion}   # drives the remote PTY
@@ -58,12 +58,12 @@ rsh() {
         | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b\]3008;[^\\]*\\//g; s/\r//g')
   printf '%s\n' "$out" | awk '/__B__/{f=1;next} /__E__/{f=0} f' | grep -vE '^\s*$'
 }
-# NEVER `export` FILAMENT_CONFIG_DIR: rsh drives the REAL local tunlion, the
+# NEVER `export` TUNLION_CONFIG_DIR: rsh drives the REAL local tunlion, the
 # only thing that can reach the peer at all. Pointing it at the throwaway config
 # breaks every remote step in a way that looks like a network fault.
-own() { ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" "$BIN" "$@"; }
+own() { ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" "$BIN" "$@"; }
 
-# Kill test daemons BY EXECUTABLE. FILAMENT_CONFIG_DIR is an env var and never
+# Kill test daemons BY EXECUTABLE. TUNLION_CONFIG_DIR is an env var and never
 # appears in /proc/<pid>/cmdline, so matching on the config dir killed nothing
 # and every aborted run leaked a live daemon; three had piled up before a
 # "Text file busy" on rebuild gave it away. Matching the exe path also cannot
@@ -101,7 +101,7 @@ cleanup >/dev/null 2>&1
 rm -rf "$W"; mkdir -p "$W/rtr"
 say "binary: $("$BIN" --version)  sha ${GOT_SHA:0:16}"
 
-say "1. receiver namespace here (owner side, own filament0)"
+say "1. receiver namespace here (owner side, own tunlion0)"
 sysctl -qw net.ipv4.ip_forward=1
 ip netns add srr
 ip link add srr-h type veth peer name srr-n && ip link set srr-n netns srr
@@ -113,7 +113,7 @@ mkdir -p /etc/netns/srr && echo "nameserver 1.1.1.1" > /etc/netns/srr/resolv.con
 iptables -t nat -A POSTROUTING -s 10.77.0.0/24 ! -o srr-h -j MASQUERADE
 iptables -I FORWARD 1 -i srr-h -j ACCEPT
 iptables -I FORWARD 1 -o srr-h -j ACCEPT
-ip netns exec srr getent hosts api.filament.autumated.com >/dev/null 2>&1 \
+ip netns exec srr getent hosts api.tunlion.autumated.com >/dev/null 2>&1 \
   && ok "receiver namespace has DNS + internet" || { echo "SETUP: receiver ns has no internet"; exit 2; }
 
 say "2. router namespace on the remote machine, with a LAN behind it"
@@ -139,7 +139,7 @@ rsh "sysctl -qw net.ipv4.ip_forward=1
 RLAN=$(rsh "ip netns exec srp ping -c1 -W2 $LANHOST >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$RLAN" = "OK" ] && ok "router reaches $LANHOST on its own LAN" \
                    || { echo "SETUP: router cannot reach its LAN"; exit 2; }
-RNET=$(rsh "ip netns exec srp getent hosts api.filament.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
+RNET=$(rsh "ip netns exec srp getent hosts api.tunlion.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$RNET" = "OK" ] && ok "router namespace has internet" || { echo "SETUP: router ns has no internet"; exit 2; }
 
 say "3. NEGATIVE CONTROL: can the receiver reach that LAN today?"
@@ -160,13 +160,13 @@ own id >/dev/null 2>&1 || { echo "SETUP: owner identity was not created"; exit 2
 # means it. Setting it on a running daemon and then testing for routes measures
 # nothing.
 own set accept-routes true 2>&1 | tail -1
-ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" FILAMENT_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
+ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" TUNLION_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
 for i in $(seq 1 45); do grep -q "L3 overlay" "$W/rtr.log" 2>/dev/null && break; sleep 2; done
 grep -q "userspace" "$W/rtr.log" 2>/dev/null && {
   echo "SETUP: receiver fell back to the userspace overlay, which installs no kernel routes"
   grep -E "TUNSETIFF|userspace" "$W/rtr.log" | head -2; exit 2; }
-ip netns exec srr ip link show filament0 >/dev/null 2>&1 \
-  && ok "receiver has kernel filament0 in its namespace" || { echo "SETUP: no kernel TUN"; exit 2; }
+ip netns exec srr ip link show tunlion0 >/dev/null 2>&1 \
+  && ok "receiver has kernel tunlion0 in its namespace" || { echo "SETUP: no kernel TUN"; exit 2; }
 
 # ---------------------------------------------------------------------------
 # One phase: invite the router with a given CEILING, join, advertise, and see
@@ -200,7 +200,7 @@ run_phase() {
   # 600 on the remote side too: tunlion refuses to read a world-readable secret.
   rsh "umask 077; printf '%s' '$INV' > $RDIR/inv.txt; chmod 600 $RDIR/inv.txt; wc -c < $RDIR/inv.txt" 90 >/dev/null
   # Detached: a join outlives the PTY session that starts it.
-  rsh "setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN join $RDIR/inv.txt --yes' >$RDIR/join.log 2>&1 & echo started" 90 >/dev/null
+  rsh "setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN join $RDIR/inv.txt --yes' >$RDIR/join.log 2>&1 & echo started" 90 >/dev/null
   local J=0 i
   for i in $(seq 1 25); do
     J=$(rsh "grep -c 'joined as' $RDIR/join.log 2>/dev/null || echo 0" 60 | tail -1)
@@ -210,13 +210,13 @@ run_phase() {
   echo "  ceiling as the owner recorded it:"
   own devices 2>&1 | grep -E '●.*vps' | sed 's/^/    /'
 
-  rsh "ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR $RBIN set advertise-routes '$PREFIX' 2>&1 | tail -1" 90
-  rsh "setsid nohup bash -c 'ip netns exec srp env FILAMENT_CONFIG_DIR=$RDIR FILAMENT_LOG=${FLOG:-info} $RBIN up' >$RDIR/up.log 2>&1 & echo up" 90 >/dev/null
+  rsh "ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR $RBIN set advertise-routes '$PREFIX' 2>&1 | tail -1" 90
+  rsh "setsid nohup bash -c 'ip netns exec srp env TUNLION_CONFIG_DIR=$RDIR TUNLION_LOG=${FLOG:-info} $RBIN up' >$RDIR/up.log 2>&1 & echo up" 90 >/dev/null
   sleep 25
 
   # Restart the receiver so it re-reads settings and takes a fresh announcement.
   kill_local; sleep 3; : > "$W/rtr.log"
-  ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" FILAMENT_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
+  ip netns exec srr env TUNLION_CONFIG_DIR="$W/rtr" TUNLION_LOG="${FLOG:-info}" setsid nohup "$BIN" up --name-as "$MYNAME" >"$W/rtr.log" 2>&1 &
   for i in $(seq 1 45); do grep -q "L3 overlay" "$W/rtr.log" 2>/dev/null && break; sleep 2; done
   sleep 45
 

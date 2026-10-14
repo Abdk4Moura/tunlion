@@ -37,6 +37,9 @@ fn renewal_standing_for(device_pub: &[u8; 32]) -> crate::fleet_renewal::Standing
             || record["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED),
         lapsed: record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED),
         stored_device_pub: stored,
+        // A delegated (invited) device's admission ends at its invitation end.
+        access_until: (record["principalKind"].as_str() == Some("delegated"))
+            .then(|| record["principalExpires"].as_u64().unwrap_or(0)),
     }
 }
 
@@ -89,18 +92,39 @@ pub(crate) async fn respond_to_cert_renew_request(conn: &mut Conn, pid: String) 
         }
         crate::fleet_renewal::Decision::Renew => {
             let now = identity::now_secs();
-            // The lifetime the device ALREADY has, not the global default. See
-            // fleet_renewal::renewal_ttl: renewing a one-hour guest into a
-            // 90-day member would widen the exact bound renewal enforces.
-            let ttl = match devices_find_by_device_pub(&device_pub)
+            // The lifetime the device ALREADY has, not the global default (see
+            // fleet_renewal::renewal_ttl), and NEVER past its invitation end
+            // (fleet_renewal::renewal_expiry). Without the second clamp a guest
+            // invited for 4 minutes renewed itself to 6.5 and kept going.
+            let Some(current) = devices_find_by_device_pub(&device_pub)
                 .as_ref()
                 .and_then(|r| identity::DeviceCert::from_json(&r["deviceCert"]))
-            {
-                Some(current) => {
-                    crate::fleet_renewal::renewal_ttl(&current, identity::CERT_TTL_SECS)
+            else {
+                ui::debug("  cert renewal refused: no stored certificate to extend");
+                if let Some(t) = conn.transport_of(&pid) {
+                    let _ = t
+                        .send_control(&json!({"type": "identity-cert-renew-error"}))
+                        .await;
                 }
-                None => identity::CERT_TTL_SECS,
+                return;
             };
+            let Some(expires) = crate::fleet_renewal::renewal_expiry(
+                &current,
+                now,
+                identity::CERT_TTL_SECS,
+                standing.access_until,
+            ) else {
+                ui::debug(
+                    "  cert renewal declined: the device's invitation ends before this would extend its certificate",
+                );
+                if let Some(t) = conn.transport_of(&pid) {
+                    let _ = t
+                        .send_control(&json!({"type": "identity-cert-renew-error"}))
+                        .await;
+                }
+                return;
+            };
+            let ttl = expires.saturating_sub(now);
             let Ok(fresh) = identity::DeviceCert::certify(&owner_key, device_pub, now, ttl) else {
                 ui::debug("  cert renewal failed: could not sign");
                 return;
@@ -123,6 +147,21 @@ pub(crate) async fn respond_to_cert_renew_request(conn: &mut Conn, pid: String) 
                         false,
                     );
                 }
+            }
+            // The link's cached deadline follows the renewal, so a long-lived
+            // link is judged by the certificate the device now holds. The
+            // delegated deadline is recomposed from the record at every gate
+            // (peer_authz), and stays bounded by the invitation end.
+            if let Some(l) = conn.link_mut(&pid) {
+                let (_, not_after, max_offline, last_seen) =
+                    crate::persisted_principal_for_cert(&fresh);
+                let (deadline, _) = crate::effective_principal_deadline(
+                    fresh.expires,
+                    not_after,
+                    last_seen,
+                    max_offline,
+                );
+                l.identity_cert_expires = Some(deadline);
             }
             if let Some(t) = conn.transport_of(&pid) {
                 let _ = t
@@ -218,6 +257,9 @@ pub(crate) async fn respond_to_auth_key_enroll_request(
     v: serde_json::Value,
 ) {
     let Some(t) = conn.transport_of(&pid) else {
+        // Never silent: the joiner cannot tell a dropped request from a slow
+        // one, so it waits out its whole deadline (the join hang).
+        crate::conn::dropped_no_transport(&pid, "enrolment request");
         return;
     };
 
@@ -237,7 +279,7 @@ pub(crate) async fn respond_to_auth_key_enroll_request(
     // enforced in shadow mode too (cap_gate_effective's ceiling check is
     // mode-independent and load-bearing exactly because shadow's effective
     // decision is legacy_allowed, which the ceiling check precedes). An
-    // earlier gate refused enrollment unless FILAMENT_CAP_AUTHORITATIVE=1;
+    // earlier gate refused enrollment unless TUNLION_CAP_AUTHORITATIVE=1;
     // that rationale is stale and it made the flagship join flow fail for a
     // default-configured owner. The joined device's ceiling binds either way.
 
@@ -343,6 +385,7 @@ pub(crate) async fn handle_auth_key_enroll_response(
     v: serde_json::Value,
 ) {
     let Some(t) = conn.transport_of(&pid) else {
+        crate::conn::dropped_no_transport(&pid, "enrolment response");
         return;
     };
     let payload = match crate::ephemeral::EnrollmentPayload::from_json(&v) {
@@ -407,6 +450,29 @@ pub(crate) async fn handle_auth_key_enroll_response(
                     .await;
                 return;
             }
+            // The in-memory burn above is process-local: a daemon restart
+            // cleared it, and a used invitation enrolled again (with the old
+            // device key or a brand-new one). The durable count is kept apart
+            // from every device record, so no forget/rename/revoke resets it;
+            // only the invitation's own expiry does (invite_burn.rs).
+            if let Err(refusal) = crate::invite_burn::record_use(
+                &hex::encode(enroll_pub),
+                &ak.reuse,
+                ak.expires,
+                identity::now_secs(),
+            ) {
+                ui::debug(&format!(
+                    "enroll response refused: invitation {:?} (durable use count)",
+                    refusal
+                ));
+                let _ = t
+                    .send_control(&json!({
+                        "type": "identity-auth-key-enroll-error",
+                        "reason": refusal.wire_reason()
+                    }))
+                    .await;
+                return;
+            }
             // #155: the enrollment side READS the signed `ephemeral` flag. An
             // ephemeral key admits in-memory only: nothing durable is written,
             // so the device is gone at daemon restart by construction (Q2). A
@@ -417,6 +483,18 @@ pub(crate) async fn handle_auth_key_enroll_response(
                 .link(&pid)
                 .map(|link| link.name.clone())
                 .unwrap_or_else(|| "joined-device".to_string());
+            // The owner named this invitee when minting (`add beta --out f`):
+            // that choice wins over the name the joiner proposes (its
+            // hostname, unless `join --name` said otherwise). The usual rules
+            // below still apply to it: a name another key holds is suffixed.
+            if let Some(chosen) = crate::armed::invitee_name(&hex::encode(enroll_pub)) {
+                if chosen != requested_name {
+                    ui::say(&format!(
+                        "  a device that calls itself '{requested_name}' joined with the invitation you made for '{chosen}'; it is listed as '{chosen}'"
+                    ));
+                }
+                requested_name = chosen;
+            }
             // A device re-joining with its own device_pub meets its prior record.
             // LAPSED revives (a network accident): keep the name for continuity,
             // and the delegated write below OVERWRITES the whole bounding set
@@ -424,6 +502,21 @@ pub(crate) async fn handle_auth_key_enroll_response(
             // decision, not an accident: refuse, and tell the owner only
             // `devices restore` undoes it.
             let prior = devices_find_by_device_pub(&device_pub);
+            // A key revoked and then forgotten has no record left to refuse
+            // it, so a fresh invitation would have re-admitted the very key
+            // the owner cut off. The key list keeps that decision.
+            // Whatever record does or does not exist: a key on the revocation
+            // list never enrols again, by any invitation.
+            if crate::fleet_support::device_key_revoked(&device_pub, identity::now_secs()) {
+                ui::debug(&format!("enroll response refused: device {pid} holds a revoked key"));
+                let _ = t
+                    .send_control(&json!({
+                        "type": "identity-auth-key-enroll-error",
+                        "reason": "this device key was revoked by the owner; run `tunlion reset` on this device for a new key, then join again"
+                    }))
+                    .await;
+                return;
+            }
             if let Some(prior_record) = &prior {
                 if let Some(reason) = enrollment_refusal(prior_record) {
                     ui::debug(&format!(
@@ -460,6 +553,15 @@ pub(crate) async fn handle_auth_key_enroll_response(
                 while crate::devices_store::name_pinned_by_other(&candidate, &hex) && n < 1000 {
                     candidate = format!("{base}-{n}");
                     n += 1;
+                }
+                // The suffix is the security rule (a new key never takes over
+                // another key's name). Say it out loud, with the way back, so a
+                // reset device does not sit beside its stale self forever.
+                if candidate != base {
+                    ui::say(&format!(
+                        "  {} a new device asked to be called {base}, a name another key holds, so it was stored as {candidate}. If {base} was reset and this is the same machine: `tunlion devices forget {base} -y` then `tunlion devices rename {candidate} {base}`.",
+                        ui::paint(ui::Tone::Warn, "!")
+                    ));
                 }
             }
             let requested_name = candidate;
@@ -516,8 +618,12 @@ pub(crate) async fn handle_auth_key_enroll_response(
             ack["device_pub"] = json!(hex::encode(device_pub));
             ack["max_offline"] = json!(ak.max_offline);
             let _ = t.send_control(&ack).await;
+            // A `--for <device>` invitation enrolls a lasting device under its
+            // name; only a session-only enrolment is ephemeral.
+            let kind = if persistent { "device" } else { "ephemeral device" };
+            let who = if persistent { stored_name.as_str() } else { pid.as_str() };
             ui::say(&format!(
-                "  {} ephemeral device {pid} enrolled (caps: {})",
+                "  {} {kind} {who} enrolled (caps: {})",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                 capability_list_summary(&ak.caps)
             ));

@@ -12,9 +12,19 @@ use zeroize::{Zeroize, Zeroizing};
 use std::path::{Path, PathBuf};
 
 pub const CERT_TTL_SECS: u64 = 90 * 24 * 3600;
+// PROTOCOL LITERAL: frozen, do not rename. Every byte string below is a
+// signature/KDF domain or an on-disk format tag. Changing one (for example in a
+// product rename) silently changes every derived key, signature and stored
+// file: a recovery phrase would restore a DIFFERENT identity, and certificates
+// minted by released builds would stop verifying. They keep the original
+// `filament` spelling forever; `frozen_protocol_literals` pins their digests.
 const CERT_SIGN_DOMAIN: &[u8] = b"filament/identity-device-cert/v1";
-const RECOVERY_KEY_DOMAIN: &[u8] = b"tunlion/user-identity/recovery/v1";
+const RECOVERY_KEY_DOMAIN: &[u8] = b"filament/user-identity/recovery/v1";
 const RECOVERY_SEED_PREFIX: &[u8] = b"filament-id-seed-v1\0";
+// PROTOCOL LITERAL: frozen, do not rename (possession-message tag).
+const POSSESSION_TAG: &[u8] = b"filament-identity-possession-v1";
+// PROTOCOL LITERAL: frozen, do not rename (identity-expose HKDF info).
+const EXPOSE_SEAL_INFO: &[u8] = b"filament-identity-expose-v1:seal";
 
 /// Host-provided key persistence, injected so this crate stays decoupled from
 /// the CLI's platform module. The CLI's `PlatformKeyStore` forwards to
@@ -276,6 +286,7 @@ pub struct RosterDevice {
     pub petname: String,
 }
 
+// PROTOCOL LITERAL: frozen, do not rename (roster signature domain).
 pub const ROSTER_SIGN_DOMAIN: &[u8] = b"filament/mesh-roster/v1";
 
 impl MeshRoster {
@@ -529,9 +540,8 @@ pub fn possession_msg(
         buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
         buf.extend_from_slice(field);
     }
-    let tag = b"filament-identity-possession-v1";
     let mut v = Vec::new();
-    lp(&mut v, tag);
+    lp(&mut v, POSSESSION_TAG);
     lp(&mut v, &[binding_type]);
     lp(&mut v, binding_value);
     lp(&mut v, &[scope_byte]);
@@ -549,7 +559,7 @@ pub fn possession_msg_legacy(confirm_mac: &[u8], device_pub: &[u8; 32]) -> Vec<u
         buf.extend_from_slice(field);
     }
     let mut v = Vec::new();
-    lp(&mut v, b"filament-identity-possession-v1");
+    lp(&mut v, POSSESSION_TAG);
     lp(&mut v, confirm_mac);
     lp(&mut v, device_pub);
     v
@@ -595,7 +605,7 @@ pub fn sealing_key_from_k(k: &[u8]) -> [u8; 32] {
     use sha2_pake::Sha256;
     let hk = Hkdf::<Sha256>::new(None, k);
     let mut out = [0u8; 32];
-    hk.expand(b"filament-identity-expose-v1:seal", &mut out)
+    hk.expand(EXPOSE_SEAL_INFO, &mut out)
         .expect("32 bytes valid HKDF length");
     out
 }
@@ -686,6 +696,77 @@ mod tests {
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(keypair.public_key().as_ref());
         (keypair, pubkey)
+    }
+
+    /// GOLDEN: a fixed recovery phrase must restore to a fixed identity.
+    ///
+    /// The expected values were NOT produced by this code. They come from the
+    /// RELEASED 0.8.5 binary (asset `filament-x86_64-unknown-linux-musl.tar.gz`
+    /// of release `cli-v0.8.5`, archive sha256 a8c32f37...c451dc42), run fully
+    /// isolated: `filament --json id recover --words-file <the phrase below>`,
+    /// then `filament --json id show` printed `publicKey`; the seed is the 32
+    /// bytes after `filament-id-seed-v1\0` in the identity.ed25519 it wrote.
+    /// The phrase is the standard BIP39 all-zero-entropy test vector.
+    ///
+    /// If this fails, existing users' recovery phrases no longer restore the
+    /// identity they were issued for. Fix the derivation, never these values.
+    #[test]
+    fn golden_recovery_phrase_restores_the_released_identity() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon abandon abandon about";
+        const SEED_085: &str = "bc03445fa6c790428dab39ef1ac7538a795456bd1f0bc2e723dc544927dd61c8";
+        const PUBLIC_KEY_085: &str =
+            "2562276a8902accb0bff0b4f09bc8014bf10639be6734fb4c2ceda9594964205";
+        let phrase = PHRASE.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let store = TempStore::new();
+        let restored = UserKey::restore(&store, &phrase).unwrap();
+        assert_eq!(restored.public_key_hex(), PUBLIC_KEY_085);
+        assert_eq!(restored.fingerprint(), "2562276a");
+
+        // The stored form is byte-identical to what 0.8.5 writes.
+        let on_disk = std::fs::read(user_key_path(&store)).unwrap();
+        let seed = on_disk
+            .strip_prefix(RECOVERY_SEED_PREFIX)
+            .expect("restored identity carries the seed prefix");
+        assert_eq!(hex::encode(seed), SEED_085);
+        // And it loads back to the same key.
+        assert_eq!(
+            UserKey::load(&store).unwrap().unwrap().public_key_hex(),
+            PUBLIC_KEY_085
+        );
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2_pake::Digest;
+        Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+    ///
+    /// Each digest was computed from the ORIGINAL (pre-rename) literal with
+    /// `printf '%s' '<literal>' | sha256sum` (a trailing `\0` is part of the
+    /// bytes). A digest cannot be satisfied by a find-and-replace: if a rename
+    /// touches one of these literals this test fails, and the literal is what
+    /// must be put back.
+    #[test]
+    fn frozen_protocol_literals() {
+        for (name, bytes, digest) in [
+            ("CERT_SIGN_DOMAIN", CERT_SIGN_DOMAIN,
+             "9295c8ef66326ce271645112a3be32cc4eab6fbd3eef4370b87cca50f69b76b1"),
+            ("RECOVERY_KEY_DOMAIN", RECOVERY_KEY_DOMAIN,
+             "5e10aedb513810550600c6004f63609392ac29ecd86ba6708be8a2219dc3b0bb"),
+            ("RECOVERY_SEED_PREFIX", RECOVERY_SEED_PREFIX,
+             "a72c201995332a326321a3e42cff3be750ff3ea51f9284144f1fc3634386ecdc"),
+            ("ROSTER_SIGN_DOMAIN", ROSTER_SIGN_DOMAIN,
+             "11cc0652262560fc7ae8f9efe808ffec21af673018af1007ce416cb78df097c3"),
+            ("POSSESSION_TAG", POSSESSION_TAG,
+             "f65f2f4db5ea3e93a44523aa13da83f692eefe7dbbcbea403204eef1c8d1037f"),
+            ("EXPOSE_SEAL_INFO", EXPOSE_SEAL_INFO,
+             "165d3e8026b642aa2bec5a900f24b4b4505a84aa10d735cdc30cb5541b46e7e5"),
+        ] {
+            assert_eq!(sha256_hex(bytes), digest, "frozen protocol literal {name} changed");
+        }
     }
 
     #[test]

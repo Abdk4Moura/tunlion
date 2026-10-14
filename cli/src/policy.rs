@@ -15,7 +15,7 @@ use std::time::Duration;
 /// attached, no questions) before exiting without a `peer-left`. The 10 s
 /// default is overridable for tests (gate 18).
 pub(crate) fn quiet_exit_window() -> Duration {
-    std::env::var("FILAMENT_QUIET_EXIT_SECS") // test knob (gate 18)
+    std::env::var("TUNLION_QUIET_EXIT_SECS") // test knob (gate 18)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -30,7 +30,7 @@ pub(crate) fn relay_forbidden() -> bool {
 /// THE interactivity GATE, scripts/automation are safe BY DEFAULT. Three layers:
 ///   1. stdin is not a TTY  -> never interactive (pipes, CI, `< /dev/null`).
 ///   2. TTY but opted out    -> never interactive: `--no-interactive` OR the env
-///                              var `FILAMENT_NONINTERACTIVE` (any value).
+///                              var `TUNLION_NONINTERACTIVE` (any value).
 ///   3. TTY and not opted out -> interactive (the guided entry may open).
 /// When this returns false, callers MUST keep exactly today's behavior (a clear
 /// parse error + expected format and non-zero exit for a malformed arg, or the
@@ -38,7 +38,7 @@ pub(crate) fn relay_forbidden() -> bool {
 pub(crate) fn interactive_allowed() -> bool {
     std::io::stdin().is_terminal()
         && !NO_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-        && std::env::var_os("FILAMENT_NONINTERACTIVE").is_none()
+        && std::env::var_os("TUNLION_NONINTERACTIVE").is_none()
 }
 
 /// The one honest CLI line shown whenever a transfer/connection is actually on

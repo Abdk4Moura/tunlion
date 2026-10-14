@@ -120,9 +120,14 @@ pub(crate) fn owner_signed_cap_ops() -> Vec<Value> {
     store
         .into_iter()
         .filter(|e| {
-            crate::capability::CapOp::from_json(e)
-                .map(|op| op.grantor == owner)
-                .unwrap_or(false)
+            // A revoke tombstone parses as an op too, but it is a LOCAL version
+            // record, not policy to hand out: a receiver merges by appending,
+            // so a relayed tombstone would sit beside the grant it should have
+            // beaten and change nothing.
+            e.get("type").and_then(|v| v.as_str()) != Some(crate::capability::CAP_TOMBSTONE_TYPE)
+                && crate::capability::CapOp::from_json(e)
+                    .map(|op| op.grantor == owner)
+                    .unwrap_or(false)
         })
         .collect()
 }
@@ -147,6 +152,13 @@ pub(crate) fn merge_owner_cap_ops(ops: &[Value]) -> usize {
             continue;
         };
         if op.grantor != owner || op.verify(&owner, now).is_err() {
+            continue;
+        }
+        // An op at or below a local revoke tombstone is a replay of something
+        // this device already saw revoked. Owner-signed is not enough: the
+        // signature on the old grant is still valid, which is exactly why the
+        // tombstone keeps the version it beat.
+        if crate::capability::superseded_by_tombstone(&store, &op) {
             continue;
         }
         let dup = store.iter().any(|e| e == v);
@@ -204,15 +216,24 @@ pub(crate) fn require_known_device(name: &str) -> Result<()> {
     if known.iter().any(|n| n == name) {
         return Ok(());
     }
+    // Classified, not left to the text: an unknown device is exit 3 for every
+    // verb that asks (exit_codes::ExitKind::UnknownDevice).
+    use crate::exit_codes::{ExitKind, err};
     if known.is_empty() {
-        bail!(
-            "no device named '{name}'. You have not paired any devices yet: `tunlion add` to pair one"
-        );
+        return Err(err(
+            ExitKind::UnknownDevice,
+            format!(
+                "no device named '{name}'. You have not paired any devices yet: `tunlion add` to pair one"
+            ),
+        ));
     }
-    bail!(
-        "no device named '{name}'. Known devices: {}\n  tunlion devices   to see them\n  tunlion add       to pair a new one",
-        known.join(", ")
-    )
+    Err(err(
+        ExitKind::UnknownDevice,
+        format!(
+            "no device named '{name}'. Known devices: {}\n  tunlion devices   to see them\n  tunlion add       to pair a new one",
+            known.join(", ")
+        ),
+    ))
 }
 
 /// #157 call-site derivation for the gate's `cert_revoked` input. A peer with
@@ -229,7 +250,7 @@ pub(crate) fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
 /// misconfiguration cannot make the re-check effectively never run, or spin on a
 /// read-heavy stream by re-reading the device store every operation.
 pub(crate) fn revoke_recheck_interval() -> std::time::Duration {
-    let ms = std::env::var("FILAMENT_REVOKE_RECHECK_MS")
+    let ms = std::env::var("TUNLION_REVOKE_RECHECK_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0) // 0 and garbage mean "default", never "never re-check"
@@ -314,6 +335,55 @@ pub(crate) fn certify_local_device(
     Ok(cert)
 }
 
+/// The one supported way to give a joined device a capability its invitation
+/// ceiling does not include: enrol it again with the capability in a fresh
+/// invitation. A grant cannot widen a ceiling, and a joined device refuses a
+/// second invitation while it holds the first ("already joined an identity"),
+/// so the advice that used to be printed here (`add --for <dev> --allow shell`
+/// alone) dead-ended on the device. These are the steps that work, in order,
+/// with the machine each one runs on; `cli/tests/reenrol-advice-gates.sh`
+/// follows them end to end.
+///
+/// `ceiling` is the device's current ceiling: `--allow` REPLACES the default
+/// ceiling, so what it already had is carried over rather than lost.
+pub(crate) fn reenrol_steps(device: &str, owner: &str, capability: &str, ceiling: &[String]) -> String {
+    let mut caps: Vec<String> = ceiling.to_vec();
+    if !caps.iter().any(|c| c == capability) {
+        caps.push(capability.to_string());
+    }
+    let caps = caps.join(",");
+    let invite = format!("{device}-invite.txt");
+    let on_owner = format!("on {owner}:");
+    let on_device = format!("on {device}:");
+    let w = on_owner.len().max(on_device.len());
+    let pad = " ".repeat(w);
+    format!(
+        "To give {device} {capability}, enrol it again with {capability} in its invitation:\n  \
+         {on_owner:<w$}  tunlion devices forget {device} -y\n  \
+         {pad}  tunlion add --for {device} --allow {caps} --out {invite} --yes\n  \
+         {pad}  (copy {invite} to {device})\n  \
+         {on_device:<w$}  tunlion down -y\n  \
+         {pad}  tunlion reset -y\n  \
+         {pad}  tunlion join --invite-file {invite} --name {device}\n  \
+         {pad}  tunlion up --detach\n  \
+         (reset clears {device}'s local tunlion state; the forget freed its name, so it rejoins as {device})"
+    )
+}
+
+/// The refusal for `shell`, `exec` or `mount` to a device whose enrolment
+/// ceiling (recorded HERE, from its invitation) excludes the capability. The
+/// decision is made locally before anything is sent, so the words say so: it
+/// used to read "exec denied by bravo", and bravo was never asked. The remedy
+/// is the re-enrolment that works (`reenrol_steps`), not a grant, which cannot
+/// widen a ceiling.
+pub(crate) fn ceiling_refusal_here(verb: &str, peer: &str, capability: &str, ceiling: &[String]) -> String {
+    format!(
+        "{verb} refused here, before contacting {peer}: {peer} joined with an invitation ceiling of ({}), which does not include {capability}, so it cannot serve {verb}. Nothing was sent.\n{}",
+        ceiling.join(", "),
+        reenrol_steps(peer, &crate::display_name(), capability, ceiling)
+    )
+}
+
 /// The persisted capability ceiling of a device record, when that record is a
 /// delegated (joined) device. None for an owner device or a plain pair, which
 /// are not ceiling-restricted.
@@ -371,6 +441,147 @@ pub(crate) fn ceiling_covers_action(idev: Option<&[u8; 32]>, action: &str) -> bo
         })
         .unwrap_or(false);
     idev.is_some() && covered
+}
+
+/// What a delegated (invitation-admitted) device may still do, read fresh from
+/// its record: the ceiling it was admitted with and the single moment its access
+/// ends. Every gate and every live-session re-check asks THIS, so the deadline a
+/// gate enforces and the one a running stream is cut at cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DelegatedAccess {
+    pub ceiling: Vec<String>,
+    /// When access ends: `min(cert expiry, invitation end, offline budget)`, and
+    /// the moment the record was marked lapsed when it was.
+    pub deadline: u64,
+    pub clock: DeadlineClock,
+}
+
+impl DelegatedAccess {
+    pub(crate) fn expired(&self, now: u64) -> bool {
+        now >= self.deadline
+    }
+}
+
+/// Pure: the delegated access a device record grants, or None when the record
+/// is not a delegated principal (an owner device, a plain pair, a fleet sibling
+/// enrolled without an end). A delegated record with no readable certificate
+/// has already ended: fail closed.
+pub(crate) fn delegated_access_from_record(record: &Value) -> Option<DelegatedAccess> {
+    if record["principalKind"].as_str() != Some("delegated") {
+        return None;
+    }
+    let ceiling: Vec<String> = record["principalCeiling"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let cert_expires = identity::DeviceCert::from_json(&record["deviceCert"])
+        .map(|c| c.expires)
+        .unwrap_or(0);
+    let (mut deadline, mut clock) = effective_principal_deadline(
+        cert_expires,
+        // A delegated record ALWAYS carries its invitation end. Absent means a
+        // half-written record, and that ends now rather than never.
+        Some(record["principalExpires"].as_u64().unwrap_or(0)),
+        record["lastSeen"].as_u64(),
+        record["principalMaxOffline"].as_u64(),
+    );
+    if record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED) {
+        let at = record["lapsedAt"].as_u64().unwrap_or(0);
+        if at < deadline {
+            deadline = at;
+            clock = DeadlineClock::AbsoluteStop;
+        }
+    }
+    Some(DelegatedAccess { ceiling, deadline, clock })
+}
+
+/// The delegated access of the device with this key, read fresh from the store.
+pub(crate) fn delegated_access_for(device_pub: &[u8; 32]) -> Option<DelegatedAccess> {
+    let hex = hex::encode(device_pub);
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let record = arr
+        .iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))?;
+    delegated_access_from_record(record)
+}
+
+/// What to re-invite an expired delegated device with: the ceiling it was
+/// admitted with and the lifetime its invitation granted (`principalIssued`,
+/// stamped at enrolment, to `principalExpires`). Pure.
+pub(crate) fn reinvite_from_record(record: &Value) -> Option<crate::refusal::Reinvite> {
+    let access = delegated_access_from_record(record)?;
+    let end = record["principalExpires"].as_u64()?;
+    let start = record["principalIssued"]
+        .as_u64()
+        .or_else(|| record["addedAt"].as_u64())
+        .unwrap_or(end);
+    let ceiling: Vec<String> = access.ceiling.into_iter().filter(|c| !c.starts_with("route:")).collect();
+    (!ceiling.is_empty()).then(|| crate::refusal::Reinvite {
+        ceiling,
+        lifetime: end.saturating_sub(start).max(1),
+    })
+}
+
+/// [`reinvite_from_record`] for the device with this key.
+pub(crate) fn reinvite_for(device_pub: &[u8; 32]) -> Option<crate::refusal::Reinvite> {
+    let hex = hex::encode(device_pub);
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let record = arr
+        .iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))?;
+    reinvite_from_record(record)
+}
+
+/// The one wording for a device revoked here, at open and mid-session.
+pub(crate) const DEVICE_REVOKED_REASON: &str = "device revoked";
+
+/// Why a LIVE session (exec, pty, forward, mount) must end now, if it must.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveCut {
+    /// The device was revoked here.
+    Revoked,
+    /// The invitation that admitted it ended at this time (UTC seconds).
+    Expired(u64),
+}
+
+impl LiveCut {
+    /// The reason the acceptor sends with the close, which the initiator maps
+    /// to its exit code and remedy (`refusal::code_from_reason`).
+    pub(crate) fn reason(self) -> String {
+        match self {
+            // The words the gate refuses a revoked device with at open
+            // ("device revoked"): one cause, one wording, mid-session or not.
+            // It said "access revoked" here, so a revoke read two ways.
+            LiveCut::Revoked => DEVICE_REVOKED_REASON.to_string(),
+            LiveCut::Expired(at) => crate::capability::expired_reason(at),
+        }
+    }
+
+    /// [`LiveCut::reason`] with what the device's invitation allowed, read
+    /// from this store, so a mid-session cut gives the same remedy as a
+    /// refusal at open (`capability::expired_reason_for`).
+    pub(crate) fn reason_for(self, idev: Option<&[u8; 32]>) -> String {
+        match self {
+            LiveCut::Revoked => self.reason(),
+            LiveCut::Expired(at) => crate::capability::expired_reason_for(at, idev),
+        }
+    }
+}
+
+/// The one live re-check every serving loop asks. Revocation first (it is the
+/// decision a person made), then the delegated deadline. An unidentified peer
+/// has no opinion here: its opens were judged by the gate.
+pub(crate) fn live_session_cut(idev: Option<&[u8; 32]>) -> Option<LiveCut> {
+    let idev = idev?;
+    if cert_revoked_for(Some(idev)) {
+        return Some(LiveCut::Revoked);
+    }
+    match delegated_access_for(idev) {
+        Some(a) if a.expired(crate::identity::now_secs()) => Some(LiveCut::Expired(a.deadline)),
+        _ => None,
+    }
 }
 
 /// Liveness re-check for live sessions: recompose the delegated deadline
@@ -496,6 +707,82 @@ mod tests {
         assert!(
             !cert_revoked_for(Some(&unknown)),
             "an unknown device (no record) is not revoked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod delegated_access_tests {
+    use super::{delegated_access_from_record, reinvite_from_record};
+    use serde_json::json;
+
+    fn record(cert_expires: u64, principal_expires: u64) -> serde_json::Value {
+        json!({
+            "name": "guest-b",
+            "principalKind": "delegated",
+            "principalCeiling": ["transfer", "shell"],
+            "principalExpires": principal_expires,
+            "principalIssued": principal_expires - 240,
+            "deviceCert": {
+                "devicePub": hex::encode([7u8; 32]),
+                "userPub": hex::encode([9u8; 32]),
+                "issued": 0,
+                "expires": cert_expires,
+                "sig": hex::encode([0u8; 64]),
+            },
+        })
+    }
+
+    /// A renewed certificate does not move the end: the invitation end binds.
+    #[test]
+    fn the_invitation_end_binds_even_past_a_renewed_cert() {
+        let r = record(1_000 + 394, 1_000 + 240);
+        if crate::identity::DeviceCert::from_json(&r["deviceCert"]).is_none() {
+            // The fixture must parse, or the test proves nothing.
+            panic!("fixture certificate does not parse");
+        }
+        let a = delegated_access_from_record(&r).expect("delegated");
+        assert_eq!(a.deadline, 1_240);
+        assert!(!a.expired(1_239));
+        assert!(a.expired(1_240));
+    }
+
+    #[test]
+    fn a_lapsed_record_ends_when_it_lapsed() {
+        let mut r = record(5_000, 5_000);
+        r["principalState"] = json!("lapsed");
+        r["lapsedAt"] = json!(1_500);
+        assert_eq!(delegated_access_from_record(&r).unwrap().deadline, 1_500);
+    }
+
+    #[test]
+    fn a_non_delegated_record_has_no_invitation_end() {
+        let mut r = record(5_000, 5_000);
+        r["principalKind"] = serde_json::Value::Null;
+        assert!(delegated_access_from_record(&r).is_none());
+    }
+
+    /// The re-invite preserves exactly the ceiling and the lifetime.
+    #[test]
+    fn the_reinvite_keeps_caps_and_lifetime() {
+        let r = record(1_240, 1_240);
+        let inv = reinvite_from_record(&r).unwrap();
+        assert_eq!(inv.ceiling, vec!["transfer".to_string(), "shell".to_string()]);
+        assert_eq!(inv.lifetime, 240);
+        assert_eq!(crate::refusal::expires_text(inv.lifetime), "4m");
+    }
+}
+
+#[cfg(test)]
+mod live_cut_wording_tests {
+    /// RC lab item 9: a revoke read "device revoked" at open and "access
+    /// revoked" when it cut a live session. One cause, one wording.
+    #[test]
+    fn a_revoked_live_cut_reads_like_the_refusal_at_open() {
+        assert_eq!(super::LiveCut::Revoked.reason(), "device revoked");
+        assert_eq!(
+            crate::refusal::Refusal::new(crate::refusal::Code::CertRevoked, None).reason,
+            super::LiveCut::Revoked.reason()
         );
     }
 }

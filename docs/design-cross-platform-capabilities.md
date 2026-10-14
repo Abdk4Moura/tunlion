@@ -77,12 +77,12 @@ That is correct and stays. But running a *command* in a shell is not uniform, so
 1. **`interactive()`** spawns the login shell as a PTY. Resolution order, first
    match wins:
    1. `tunlion up --shell-program "<cmd>"` (explicit, one-off)
-   2. `FILAMENT_SHELL` env var
+   2. `TUNLION_SHELL` env var
    3. `tunlion set shell "<cmd>"` config value (persists; fits the daemon)
    4. `$SHELL` on Unix, `%ComSpec%` / powershell on Windows (platform default)
    5. hardcoded fallback (`/bin/bash`→`/bin/sh`, `cmd.exe`)
 
-   The value is argv-split, so it can carry args: `FILAMENT_SHELL="pwsh -NoLogo"`,
+   The value is argv-split, so it can carry args: `TUNLION_SHELL="pwsh -NoLogo"`,
    `bash -l`, `nu`, `fish`.
 
 2. **`exec(cmd)`** runs a one-shot command string (for `tunlion <peer> '<cmd>'`)

@@ -73,7 +73,7 @@ VERIFIED in source by `claude-advisor`:
   silent discard a compile error.
 - `#[track_caller]` on `drop_link`: a teardown names the call site that ordered
   it. This answered in one CI cycle what a 17-call-site audit had not.
-- Gate P (`FILAMENT_TEST_DROP_PUSH`): server-side push dropper, so "can a client
+- Gate P (`TUNLION_TEST_DROP_PUSH`): server-side push dropper, so "can a client
   recover from a missed push" is testable on demand.
 
 ## Open, with owners

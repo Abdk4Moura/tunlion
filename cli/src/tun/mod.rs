@@ -24,7 +24,7 @@
 /// macOS's 4-byte AF header, is added/stripped inside the backend).
 #[async_trait::async_trait]
 pub trait TunDevice: Send + Sync {
-    /// The interface name (Linux honors `filament0`; macOS assigns `utunN`).
+    /// The interface name (Linux honors `tunlion0`; macOS assigns `utunN`).
     fn name(&self) -> &str;
     /// Await the next OUTBOUND bare IP packet the local stack wants on the wire.
     async fn recv(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
@@ -40,14 +40,14 @@ pub use netstack::{NetstackListener, NetstackStream, NetstackTun};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
+pub use linux::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, l3_blocker, l3_grant_pending, KernelTun};
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
+pub use macos::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, l3_blocker, l3_grant_pending, KernelTun};
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
+pub use windows::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, l3_blocker, l3_grant_pending, KernelTun};

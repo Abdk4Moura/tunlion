@@ -22,16 +22,16 @@ use std::time::Duration;
 /// Default grace before the watchdog force-exits, in milliseconds. Comfortably
 /// under systemd's default `TimeoutStopSec` (90s) so the process exits on its
 /// own terms well before SIGKILL. Overridable for tests / tuning via
-/// `FILAMENT_SHUTDOWN_GRACE_MS`.
+/// `TUNLION_SHUTDOWN_GRACE_MS`.
 pub const DEFAULT_GRACE_MS: u64 = 3_000;
 
 /// The bounded shutdown grace, env-tunable. Pure given the environment; the
 /// parsing/clamping logic is unit-tested via `grace_from`.
 pub fn grace() -> Duration {
-    grace_from(std::env::var("FILAMENT_SHUTDOWN_GRACE_MS").ok().as_deref())
+    grace_from(std::env::var("TUNLION_SHUTDOWN_GRACE_MS").ok().as_deref())
 }
 
-/// Pure: turn an optional `FILAMENT_SHUTDOWN_GRACE_MS` value into the grace
+/// Pure: turn an optional `TUNLION_SHUTDOWN_GRACE_MS` value into the grace
 /// duration. A missing / unpar0able value falls back to the default. `0` is
 /// honored (force-exit on the next scheduler tick) so an operator can opt into
 /// an immediate exit; everything else is taken verbatim.
@@ -40,6 +40,23 @@ pub fn grace_from(raw: Option<&str>) -> Duration {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_GRACE_MS);
     Duration::from_millis(ms)
+}
+
+static LAST_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Record which termination signal arrived (as its exit code: 130 SIGINT,
+/// 143 SIGTERM) so a graceful path that only sees "interrupted" exits with the
+/// code of the signal that was actually sent.
+pub fn note_signal(code: i32) {
+    LAST_SIGNAL.store(code, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The exit code for the recorded signal; SIGINT's 130 when none was noted.
+pub fn signal_code() -> i32 {
+    match LAST_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => crate::exit_codes::INTERRUPTED,
+        c => c,
+    }
 }
 
 /// Arm a detached watchdog that force-exits the process with `code` after
@@ -54,7 +71,11 @@ pub fn arm_force_exit(code: i32, grace: Duration) {
         tokio::time::sleep(grace).await;
         // The graceful path did not finish in time. A dropped link is already an
         // ordinary disconnect to the peer's resilience layer, so exiting now
-        // corrupts nothing a normal disconnect wouldn't.
+        // corrupts nothing a normal disconnect wouldn't. An interrupt still
+        // answers a `--json` caller with its failure object first.
+        if code == crate::exit_codes::INTERRUPTED || code == crate::exit_codes::TERMINATED {
+            crate::exit_codes::interrupted_exit(code);
+        }
         std::process::exit(code);
     });
 }
@@ -62,6 +83,15 @@ pub fn arm_force_exit(code: i32, grace: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_code_reports_the_signal_that_arrived() {
+        assert_eq!(signal_code(), crate::exit_codes::INTERRUPTED);
+        note_signal(crate::exit_codes::TERMINATED);
+        assert_eq!(signal_code(), 143);
+        note_signal(crate::exit_codes::INTERRUPTED);
+        assert_eq!(signal_code(), 130);
+    }
 
     #[test]
     fn grace_defaults_when_unset() {

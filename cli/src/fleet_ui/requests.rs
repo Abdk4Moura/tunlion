@@ -77,8 +77,10 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
         lines.push(String::new());
     }
 
-    lines.push(ui::paint(Tone::Dim, "  Nothing pushes to you yet — check `tunlion requests`, or wire a hook:"));
-    lines.push(ui::paint(Tone::Dim, "    tunlion requests --notify 'notify-send %s'   (also: webhook, email)"));
+    // This used to offer `tunlion requests --notify 'notify-send %s'` as a hook.
+    // `requests` has no --notify flag and nothing implements one, so the line
+    // told the user to type a usage error. Say only what is true.
+    lines.push(ui::paint(Tone::Dim, "  Nothing pushes to you yet; check `tunlion requests` for new ones."));
 
     lines.join("\n")
 }
@@ -96,15 +98,15 @@ fn capability_label(capability: &str) -> &str {
 fn deliberate_explanation(capability: &str) -> &str {
     match capability {
         "shell" => "this is deliberate access, owner-equivalent: a real terminal that can act as you on this machine",
-        "mount" => "this is deliberate access — can change or delete your files",
-        "all-ports" => "this is deliberate access — reaches ports beyond those exposed",
+        "mount" => "this is deliberate access: it can change or delete your files",
+        "all-ports" => "this is deliberate access: it reaches ports beyond those exposed",
         _ => "this is deliberate access",
     }
 }
 
 /// Render the empty requests list.
 pub fn render_empty() -> String {
-    ui::paint(Tone::Dim, "  Nothing waiting. Requests from other people show up here (pull — no tray needed yet).")
+    ui::paint(Tone::Dim, "  Nothing waiting. Requests from other people show up here (pull: no tray needed yet).")
 }
 
 /// Render the approve guard for deliberate access.
@@ -115,7 +117,7 @@ pub fn render_approve_guard(request_id: u64, cap: &str) -> String {
         cap
     };
     format!(
-        "{err} request {request_id} asks for {label} — deliberate access. Name it and bound it:\n  {fix}",
+        "{err} request {request_id} asks for {label}, which is deliberate access. Name it and bound it:\n  {fix}",
         err = ui::paint(Tone::Err, ui::glyph_err()),
         fix = format!("tunlion requests approve {request_id} --allow <capability> --for 1h"),
     )
@@ -260,5 +262,18 @@ mod tests {
         assert!(s.contains("carol"), "must show peer name");
         assert!(s.contains("Denied"), "must confirm denial");
         assert!(s.contains("No trace kept"), "must confirm no trace");
+    }
+
+    /// No em dash in what `tunlion requests` prints (the lab read "(pull — no
+    /// tray needed yet)").
+    #[test]
+    fn requests_output_has_no_em_dash() {
+        let mut all = vec![render_empty(), render_approve_guard(7, "shell"), render_approve_guard(8, "mount")];
+        for cap in ["shell", "mount", "all-ports", "other"] {
+            all.push(deliberate_explanation(cap).to_string());
+        }
+        for s in all {
+            assert!(!s.contains('\u{2014}'), "em dash in user-facing text: {s}");
+        }
     }
 }

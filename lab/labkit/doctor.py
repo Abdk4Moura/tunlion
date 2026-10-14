@@ -22,7 +22,7 @@ from typing import List, Optional
 # The LOCALLY-BUILT tunlion binary (never the installed ~/.local/bin one, never
 # the running daemon). Resolved relative to the repo root (lab/ is at repo root).
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-FILAMENT_BIN = REPO_ROOT / "cli" / "target" / "release" / "tunlion"
+TUNLION_BIN = REPO_ROOT / "cli" / "target" / "release" / "tunlion"
 
 
 @dataclass
@@ -119,8 +119,8 @@ def run(link: str = "pipe", want_iperf: bool = True) -> Report:
                     hint="install wireguard-tools (apt-get install -y wireguard-tools)."))
     elif link == "tunlion":
         r.add(Check("tunlion (locally-built release binary)",
-                    FILAMENT_BIN.exists(),
-                    detail=str(FILAMENT_BIN), fatal=True,
+                    TUNLION_BIN.exists(),
+                    detail=str(TUNLION_BIN), fatal=True,
                     hint="build it: (cd cli && cargo build --release)."))
 
     return r

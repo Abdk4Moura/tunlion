@@ -24,7 +24,7 @@ path = "src/main.rs"
 # Env-gated fault/injection hooks used ONLY by the resilience gates
 # (runner/sim/*). NOT in `default` and NOT pulled by the release profile, so a
 # default `cargo build --release` (what users install) strips every test hook
-# from the binary — no `FILAMENT_TEST_*` env reads, no corruption/freeze/drop
+# from the binary — no `TUNLION_TEST_*` env reads, no corruption/freeze/drop
 # injection logic. Build the gates' binary with `--features test-hooks`.
 #
 # FORWARDED, not merely declared. Half these hooks now live in
@@ -102,7 +102,7 @@ flate2 = "1.1.9"
 qrcode = { version = "0.14.1", default-features = false }
 # web-shell: spawn a login shell in a PTY and bridge it to the browser terminal.
 portable-pty = "0.8"
-# rung-1 direct CLI<->CLI transport (FILAMENT_DIRECT=1). ring crypto to match
+# rung-1 direct CLI<->CLI transport (TUNLION_DIRECT=1). ring crypto to match
 # the rest of the rustls tree; we hand quinn an explicit ring-based config so
 # no process-default crypto provider is required.
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
@@ -165,6 +165,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    # Console modes for the interactive PTY: VT input so mouse and special keys
+    # reach a remote app (see l2.rs win_console). A feature, not a new crate.
+    "Win32_System_Console",
+    # A served exec dies with the daemon: a kill-on-close job object
+    # (platform::contain_with_daemon). Threading is what the job's extended
+    # limit struct is gated on.
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
 
 [profile.release]

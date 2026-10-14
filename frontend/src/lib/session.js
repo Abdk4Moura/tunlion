@@ -20,7 +20,7 @@
 // fails in CI by construction. Per the design doc the BROWSER reads this from a
 // query param (`?telLoss=0.3&telSeed=...`); it cannot read process env at
 // runtime the way the CLI does. (The pinned protocol names env vars
-// FILAMENT_TEST_EMIT_LOSS/FILAMENT_TEST_EMIT_SEED for the CLI flavor; the
+// TUNLION_TEST_EMIT_LOSS/TUNLION_TEST_EMIT_SEED for the CLI flavor; the
 // browser-specific mechanism is the query param. See shared notes.)
 
 const TICK_MS = 5000 // loop cadence

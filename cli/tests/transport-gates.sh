@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Tunlion — rung-1 DIRECT CLI<->CLI transport gates (FILAMENT_DIRECT=1).
+# Tunlion — rung-1 DIRECT CLI<->CLI transport gates (TUNLION_DIRECT=1).
 #
 # OPT-IN. These exercise the additive QUIC transport (docs/design-direct-cli-
 # transport.md realized over quinn). They are SEPARATE from gates.sh and never
-# run by default — the direct path is gated behind FILAMENT_DIRECT.
+# run by default — the direct path is gated behind TUNLION_DIRECT.
 #
 # THREE gates (the negative-auth one is the security claim):
-#   1. direct-connect : two known-device CLIs (FILAMENT_DIRECT=1) connect over
+#   1. direct-connect : two known-device CLIs (TUNLION_DIRECT=1) connect over
 #                       QUIC (route: direct-quic, NOT relayed/webrtc) + byte-exact.
 #   2. NEGATIVE auth   : a peer with the WRONG pair secret cannot establish —
 #                       the keying-material MAC fails, peer rejected, ZERO bytes
 #                       (and the WebRTC fallback also can't auto-accept it).
-#   3. fallback        : direct blocked (FILAMENT_DIRECT_TEST_BLOCK=1) → WebRTC
+#   3. fallback        : direct blocked (TUNLION_DIRECT_TEST_BLOCK=1) → WebRTC
 #                       fallback still completes the transfer with the flag ON.
 #
 # Port 8098 ONLY for the fixture backend. Run from cli/:
@@ -20,10 +20,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
 BIN="$CLI_DIR/target/release/tunlion"
-PORT="${FILAMENT_TEST_PORT:-8098}"          # 8098 ONLY (task constraint)
+PORT="${TUNLION_TEST_PORT:-8098}"          # 8098 ONLY (task constraint)
 SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d /tmp/wt-transport-gates.XXXXXX)"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 
 PASS=0; FAIL=0; FAILED=""
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
@@ -68,21 +68,21 @@ pair() {
   # successful transfer. The invitation flow is the supported non-interactive
   # ceremony; the owner's daemon must be UP or `join` only times out.
   # `add --for` needs an owner identity ("no identity. Run `tunlion init` first").
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes \
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes \
       >"$WORK/pair-a-init.log" 2>&1 || { echo "init failed"; cat "$WORK/pair-a-init.log"; return 1; }
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$DDROP" \
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$DDROP" \
       >"$WORK/pair-a-daemon.log" 2>&1 &
   PAIR_DAEMON=$!
   sleep 3
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for boxB \
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for boxB \
       --out "$WORK/inv.txt" --yes >"$WORK/pair-a.log" 2>&1
-  env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" \
+  env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" \
       --name boxB --no-interactive >"$WORK/pair-b.log" 2>&1
   kill "$PAIR_DAEMON" 2>/dev/null; sleep 2
 }
 say "setup: pairing A<->B (bounded invitation + join)"
 pair
-if FILAMENT_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q 'boxB' \
+if TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q 'boxB' \
    && [ -s "$DB/devices.json" ]; then
   ok "paired (A knows boxB by name)"
 else
@@ -91,15 +91,15 @@ else
 fi
 
 # ===========================================================================
-say "GATE 1: direct-connect (FILAMENT_DIRECT=1) — route: direct-quic + byte-exact"
+say "GATE 1: direct-connect (TUNLION_DIRECT=1) — route: direct-quic + byte-exact"
 DG="$WORK/g1drop"; mkdir -p "$DG"
 # -v on both ends: the "DIRECT-CONNECT ok (route: ...)" marker is a DEBUG
 # (direct-connect diagnostic) line; the user-facing route label is "route:" on
 # its own. The transfer itself is verbosity-independent.
-FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" -v up --dir "$DG" --server "$SERVER" >"$WORK/g1-up.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" -v up --dir "$DG" --server "$SERVER" >"$WORK/g1-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
 G1=0
-FILAMENT_CONFIG_DIR="$DA" timeout 60 "$BIN" -v send "$BIG" --to boxB --server "$SERVER" >"$WORK/g1-send.log" 2>&1 || G1=1
+TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" -v send "$BIG" --to boxB --server "$SERVER" >"$WORK/g1-send.log" 2>&1 || G1=1
 sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
 GOT="$DG/big.bin"
 if [ $G1 -eq 0 ] \
@@ -141,11 +141,11 @@ print("tampered boxA secret")
 PY
 DG2="$WORK/g2drop"; mkdir -p "$DG2"
 # B (wrong secret) receives; no -y, stdin from /dev/null => untrusted offer declined.
-FILAMENT_CONFIG_DIR="$DBX" FILAMENT_REJOIN_SECS=4 timeout 45 \
+TUNLION_CONFIG_DIR="$DBX" TUNLION_REJOIN_SECS=4 timeout 45 \
   "$BIN" up --dir "$DG2" --server "$SERVER" </dev/null >"$WORK/g2-recv.log" 2>&1 &
 RP=$!; pids+=($RP); sleep 3
 # A (correct secret) tries to send.
-FILAMENT_CONFIG_DIR="$DA" timeout 25 \
+TUNLION_CONFIG_DIR="$DA" timeout 25 \
   "$BIN" send "$SMALL" --to boxB --server "$SERVER" </dev/null >"$WORK/g2-send.log" 2>&1
 sleep 2; kill $RP 2>/dev/null; wait $RP 2>/dev/null
 # zero bytes: no completed file in the drop dir
@@ -168,11 +168,11 @@ fi
 # ===========================================================================
 say "GATE 3: fallback — direct blocked (flag ON) -> WebRTC still transfers"
 DG3="$WORK/g3drop"; mkdir -p "$DG3"
-FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT_TEST_BLOCK=1 timeout 90 \
+TUNLION_CONFIG_DIR="$DB" TUNLION_DIRECT_TEST_BLOCK=1 timeout 90 \
   "$BIN" up --dir "$DG3" --server "$SERVER" >"$WORK/g3-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
 G3=0
-FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT_TEST_BLOCK=1 timeout 75 \
+TUNLION_CONFIG_DIR="$DA" TUNLION_DIRECT_TEST_BLOCK=1 timeout 75 \
   "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g3-send.log" 2>&1 || G3=1
 sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
 GOT3="$DG3/big.bin"

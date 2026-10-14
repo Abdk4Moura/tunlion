@@ -33,18 +33,17 @@ use crate::config_set;
 use crate::conn::owner_pub_for_resources;
 use crate::ctl;
 use crate::daemon_alive;
-use crate::device_caps::{device_set_cap, devices_remove, effective_device_caps};
+use crate::device_caps::{device_set_cap, effective_device_caps};
 use crate::device_cert_for;
 use crate::device_countdown;
 use crate::device_entries;
 use crate::device_record_exists;
 use crate::devices_info;
-use crate::devices_store::{devices_load, devices_path, with_devices_mut};
+use crate::devices_store::devices_load;
 use crate::doctor;
 use crate::down_cmd;
 use crate::drop_dir;
 use crate::enrollment::enroll_and_send_cmd;
-use crate::ephemeral_cmd;
 use crate::expose;
 use crate::first_screen_actions;
 use crate::fleet_certificate_warning;
@@ -94,10 +93,119 @@ use crate::ui;
 use crate::up_logs::{logs_cmd, up_cmd};
 use crate::update_cmd;
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser};
 use serde_json::{Value, json};
 use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Commands that honour the global `--json`. The global flag's help names
+/// exactly these; `json_help_lists_exactly_the_supported_commands` keeps the
+/// two in agreement.
+pub(crate) fn json_supported(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Init { .. }
+            | Cmd::Add { .. }
+            | Cmd::Join { .. }
+            | Cmd::Id { .. }
+            | Cmd::Status { .. }
+            | Cmd::Set { .. }
+            | Cmd::Reach { .. }
+            | Cmd::Send { .. }
+            | Cmd::Receive { .. }
+            | Cmd::Sync { .. }
+            | Cmd::Doctor { .. }
+            | Cmd::Addr { .. }
+            | Cmd::Devices { action: None, .. }
+            | Cmd::Skill { .. }
+    )
+}
+
+/// `grant <device> <cap>` or `grant --tag <tag> <cap>`: with --tag the one
+/// positional is the capability. Returns (device, capability).
+pub(crate) fn grant_operands(
+    device: Option<String>,
+    capability: Option<String>,
+    tag: Option<&str>,
+) -> Result<(Option<String>, String)> {
+    match (tag, device, capability) {
+        (Some(_), Some(cap), None) => Ok((None, cap)),
+        (Some(t), Some(dev), Some(_)) => crate::bail_usage!(
+            "grant --tag {t} takes only the capability (`tunlion grant --tag {t} <capability>`); drop '{dev}' or drop --tag"
+        ),
+        (Some(t), None, _) => crate::bail_usage!("missing the capability: tunlion grant --tag {t} <capability>"),
+        (None, Some(dev), Some(cap)) => Ok((Some(dev), cap)),
+        (None, Some(dev), None) => {
+            crate::bail_usage!("missing the capability: tunlion grant {dev} <capability> (e.g. shell)")
+        }
+        (None, None, _) => crate::bail_usage!(
+            "name a device or a tag: tunlion grant <device> <capability>, or tunlion grant --tag <tag> <capability>"
+        ),
+    }
+}
+
+/// Check a grant spec before anything else looks at it, so every device gives
+/// the same answer. `grant hostA port:8000` used to tell a joined device to
+/// "run this on the owner's machine: tunlion grant hostA port:8000", while the
+/// owner answered "unknown capability 'port'": the advice suggested a command
+/// that cannot work. The spec is now checked first, on every device, and
+/// `port[:N]` names the narrow path that does work (`expose`).
+///
+/// The owner key only names a route's resource id; validity does not depend on
+/// it, so a placeholder key checks the spec on a device that holds none.
+pub(crate) fn validate_grant_spec(spec: &str) -> Result<()> {
+    let (name, rest) = match spec.split_once(':') {
+        Some((n, r)) => (n, Some(r.trim())),
+        None => (spec, None),
+    };
+    if matches!(name.trim().to_ascii_lowercase().as_str(), "port" | "ports") {
+        let cmd = match rest.filter(|p| p.parse::<u16>().is_ok()) {
+            Some(p) => format!("tunlion expose {p}"),
+            None => "tunlion expose <port>".to_string(),
+        };
+        bail!(
+            "'{spec}' is not a capability (valid: {}). To let your devices reach a port on this machine, expose it:\n  {cmd}",
+            crate::capability::CANONICAL_CAPABILITIES.join(", ")
+        );
+    }
+    crate::capability::parse_grant_spec(spec, &[0u8; 32]).map(|_| ())
+}
+
+/// `devices --json`: the rows in the shared `--json` envelope. Pure.
+pub(crate) fn devices_json_envelope(rows: Vec<Value>) -> Value {
+    json!({ "ok": true, "verb": "devices", "schema": 2, "data": { "devices": rows } })
+}
+
+/// The daemon's warm-link reply with only the links whose device answered a
+/// liveness ping just now (bounded, in parallel; never establishes anything).
+/// `None` stays `None`: no daemon means the rows assert nothing (#217).
+async fn answering_links(warm: Option<Value>) -> Option<Value> {
+    let mut warm = warm?;
+    let names: Vec<String> = crate::warm_device_names(Some(&warm)).into_iter().collect();
+    let live: std::collections::HashSet<String> = futures_util::future::join_all(
+        names
+            .into_iter()
+            .map(|n| async move { ctl::try_ping(&n).await.is_some().then_some(n) }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(links) = warm.get_mut("links").and_then(Value::as_array_mut) {
+        links.retain(|l| {
+            l["name"]
+                .as_str()
+                .is_some_and(|n| live.iter().any(|x| x.eq_ignore_ascii_case(n)))
+        });
+    }
+    Some(warm)
+}
+
+/// A grant spec that does not parse (an unknown capability, `route` without a
+/// prefix, a resource on a self-scoped capability) is a usage error, exit 2:
+/// the command line is wrong, nothing was refused.
+pub(crate) fn grant_usage(e: anyhow::Error) -> anyhow::Error {
+    crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, e.to_string())
+}
 
 pub(crate) async fn async_main() -> Result<()> {
     // Pick ring explicitly before anything touches TLS. Kept UNCONDITIONAL on
@@ -119,9 +227,6 @@ pub(crate) async fn async_main() -> Result<()> {
     // ordering-window probe fires here (and in the harness) but not in unit
     // tests that construct the window state deliberately.
     crate::capability::set_gate_live();
-    // Migrate state from legacy cwd-relative .config/filament (the broken
-    // Windows fallback when HOME was unset) to the platform-correct path.
-    platform::Paths::migrate_legacy();
     match platform::Paths::repair_sensitive_permissions() {
         Ok(repaired) if repaired > 0 => {
             eprintln!("tunlion: repaired permissions on {repaired} sensitive config path(s)");
@@ -129,6 +234,7 @@ pub(crate) async fn async_main() -> Result<()> {
         Ok(_) => {}
         Err(e) => eprintln!("tunlion: sensitive config permission repair failed: {e}"),
     }
+    platform::tighten_config_dir(&platform::Paths::config_dir());
     // Bare-arg comfort dispatch: `tunlion <path>` sends it with a code;
     // `tunlion <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
@@ -233,7 +339,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     std::process::exit(2);
                 }
                 BareTarget::Unknown => {
-                    // Not a command, path, code, or paired device. Give a filament-native
+                    // Not a command, path, code, or paired device. Give a tunlion-native
                     // error with a did-you-mean over BOTH commands and device names,
                     // instead of clap's bare "unrecognized subcommand" (smart errors).
                     // The 0.7.5 rule: a deleted legacy name errors with a did-you-mean.
@@ -346,19 +452,40 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         }
     }
-    let cli = Cli::parse_from(argv);
+    // The verb's name, for the --json failure envelope. The first argv token
+    // that names a subcommand (aliases resolve to the canonical name).
+    let verb_name: Option<String> = {
+        use clap::CommandFactory;
+        let c = Cli::command();
+        argv.iter().skip(1).find_map(|t| {
+            c.get_subcommands()
+                .find(|sc| sc.get_name() == t || sc.get_all_aliases().any(|a| a == t))
+                .map(|sc| sc.get_name().to_string())
+        })
+    };
+    // Parsed through the same derive, with every subcommand's --help ending in
+    // the exit codes that verb can return (exit_codes::with_exit_code_help).
+    let cli = {
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = crate::exit_codes::with_exit_code_help(Cli::command()).get_matches_from(argv);
+        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+    };
+    // From here every failure under --json is reported as the JSON envelope on
+    // stdout (exit_codes::report). Subcommands with their own `json` flag
+    // (reach, doctor) shadow the global one and set it again in their arm.
+    crate::exit_codes::set_json_mode(cli.json, verb_name.as_deref());
     let ui_caps = UiCapability::from_cli(&cli);
     // Resolve the global output verbosity ONCE, before any worker spawns:
-    // FILAMENT_LOG (if set) overrides the -v/-q flags. Default = info.
+    // TUNLION_LOG (if set) overrides the -v/-q flags. Default = info.
     ui::init_verbosity(cli.verbose, cli.quiet);
     if let Some(n) = &cli.name_as {
         // single-threaded at this point (before the runtime spawns workers)
-        unsafe { std::env::set_var("FILAMENT_NAME", n) };
+        unsafe { std::env::set_var("TUNLION_NAME", n) };
     }
     // A --color flag overrides the NO_COLOR/TERM env contract (flags win); record
     // it before any output so both stdout (readout) and stderr (caps) honor it.
     if let Some(when) = &cli.color {
-        unsafe { std::env::set_var("FILAMENT_COLOR", when) };
+        unsafe { std::env::set_var("TUNLION_COLOR", when) };
     }
     // P1 (GAP-4): record the hard direct-only choice before any worker spawns.
     // Precedence: an explicit --relay/--no-relay flag always wins; otherwise the
@@ -379,12 +506,12 @@ pub(crate) async fn async_main() -> Result<()> {
         }
     };
     // Record the global --no-interactive opt-out before any command runs (the
-    // gate also honors FILAMENT_NONINTERACTIVE and a non-TTY stdin).
+    // gate also honors TUNLION_NONINTERACTIVE and a non-TTY stdin).
     if cli.interactive && !std::io::stdin().is_terminal() {
-        bail!("--interactive requires a terminal; remove it or provide every required option");
+        crate::bail_usage!("--interactive requires a terminal; remove it or provide every required option");
     }
     if cli.interactive && (cli.no_interactive || cli.json) {
-        bail!("--interactive conflicts with --no-interactive and --json; pick one mode");
+        crate::bail_usage!("--interactive conflicts with --no-interactive and --json; pick one mode");
     }
     if cli.no_interactive || cli.json {
         NO_INTERACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -398,30 +525,46 @@ pub(crate) async fn async_main() -> Result<()> {
         cli.server.clone()
     };
     let server = server.trim_end_matches('/').to_string();
+    // `up`'s daemon flags exactly as typed, for the paths that start a second
+    // process (--install, --detach): taken before `cli.cmd` is moved below.
+    let up_daemon = crate::up_logs::DaemonOpts::from_cli(&cli);
     // Bare `tunlion` (no subcommand): a short, state-aware tour of what you'd do
     // next, instead of clap's wall of subcommands. Power users still get --help.
     let Some(cmd) = cli.cmd else {
         return tour_cmd();
     };
-    if cli.json
-        && !matches!(
-            &cmd,
-            Cmd::Init { .. }
-                | Cmd::Add { .. }
-                | Cmd::Join { .. }
-                | Cmd::Id { .. }
-                | Cmd::Status { .. }
-                | Cmd::Set { .. }
-                | Cmd::Reach { .. }
-                | Cmd::Sync { .. }
-                | Cmd::Doctor { .. }
-                | Cmd::Addr { .. }
-                | Cmd::Devices { action: None, .. }
-        )
-    {
-        bail!(
-            "--json is not implemented for this operation; refusing to mix human output with machine data"
-        );
+    if cli.json && !json_supported(&cmd) {
+        return Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            "--json is not implemented for this operation; refusing to mix human output with machine data",
+        ));
+    }
+    // A corrupt state file is an error naming it, never an empty store
+    // (state_files.rs). The verbs that stop, repair or only print are exempt.
+    let exempt = matches!(
+        cmd,
+        Cmd::Reset
+            | Cmd::Down
+            | Cmd::Logs { .. }
+            | Cmd::Config { .. }
+            | Cmd::Completions { .. }
+            | Cmd::Man { .. }
+            | Cmd::Update { .. }
+            | Cmd::Skill { .. }
+    );
+    if !exempt {
+        // A verb with its own --json flag must still answer in JSON.
+        let own_json = match &cmd {
+            Cmd::Devices { json, .. } => Some((*json, "devices")),
+            Cmd::Status { json } => Some((*json, "status")),
+            Cmd::Reach { json, .. } => Some((*json, "reach")),
+            Cmd::Doctor { json, .. } => Some((*json, "doctor")),
+            _ => None,
+        };
+        if let Some((true, verb)) = own_json {
+            crate::exit_codes::set_json_mode(true, Some(verb));
+        }
+        crate::state_files::check_all()?;
     }
     match cmd {
         Cmd::Init {
@@ -466,8 +609,30 @@ pub(crate) async fn async_main() -> Result<()> {
             name,
             remember,
             auth_key,
+            timeout,
         } => {
-            if let Some(ak_path) = auth_key {
+            let json_out = ui_caps.json || cli.json;
+            // Eval item 5: `--remember` was silently a no-op wherever it could
+            // not apply. It names the device met over a CODE; without one there
+            // is nobody to remember, so refuse rather than ignore it.
+            if let Some(r) = remember.as_deref() {
+                if auth_key.is_none() && !code && word.is_none() {
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Usage,
+                        format!(
+                            "--remember {r} names the device you pair with over a code, and this send has none. \
+                             Add --code (the receiver passes --remember too), or pair for good with:  tunlion add {r}"
+                        ),
+                    ));
+                }
+            }
+            let remember_name = remember.clone();
+            let peer = to.clone();
+            crate::send_report::arm_history(
+                peer.as_deref(),
+                crate::send_report::source_labels(&paths, name.as_deref()),
+            );
+            let res = if let Some(ak_path) = auth_key {
                 enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
             } else {
                 send_cmd(
@@ -480,9 +645,40 @@ pub(crate) async fn async_main() -> Result<()> {
                     name,
                     relay,
                     remember,
+                    timeout,
                 )
                 .await
+            };
+            if let (Ok(()), Some(r)) = (&res, remember_name.as_deref()) {
+                let answered = crate::shared_defs::REMEMBER_ANSWERED.load(std::sync::atomic::Ordering::Relaxed);
+                let stored = crate::shared_defs::REMEMBER_STORED.load(std::sync::atomic::Ordering::Relaxed);
+                // The true final outcome only. "remembered this device as"
+                // is no longer printed before the receiver answers, so a
+                // decline ("declined to be remembered, nothing stored") is
+                // never contradicted; this adds only what to do about it.
+                if !stored {
+                    ui::caution(
+                        &crate::shared_defs::remember_not_stored_msg(r, true, crate::identity_flow::has_identity()),
+                        None,
+                        &[],
+                    );
+                } else if stored && !answered {
+                    // Kept our half; the receiver never said either way.
+                    let as_name = crate::shared_defs::REMEMBER_STORED_AS
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                        .unwrap_or_else(|| r.to_string());
+                    ui::say(&crate::shared_defs::remember_stored_msg(&as_name));
+                }
             }
+            // Both ends keep a structured history; this is the sender's half.
+            crate::send_report::persist_outcome(res.as_ref().err().map(|e| format!("{e:#}")).as_deref());
+            if json_out {
+                // One result object on stdout, success or failure.
+                return crate::send_report::emit(res, peer.as_deref());
+            }
+            res
         }
         Cmd::Receive {
             code,
@@ -504,7 +700,29 @@ pub(crate) async fn async_main() -> Result<()> {
                     "`receive --background` was renamed: the always-on receiver is the daemon. Run `up --install` instead"
                 );
             } else {
-                recv_cmd(
+                let json_out = ui_caps.json || cli.json;
+                if json_out && output.as_deref() == Some("-") {
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Usage,
+                        "--json and -o - both write to stdout; pick one",
+                    ));
+                }
+                let shown_dir = dir.display().to_string();
+                // Eval item 5: never a silent no-op. With no code and no
+                // terminal to type one into, there is no sender to remember.
+                if let Some(r) = remember.as_deref() {
+                    if code.is_none() && !crate::interactive_allowed() {
+                        return Err(crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::Usage,
+                            format!(
+                                "--remember {r} names the sender of a CODE transfer, and no code was given: \
+                                 tunlion receive <code> --remember {r}"
+                            ),
+                        ));
+                    }
+                }
+                let remember_name = remember.clone();
+                let res = recv_cmd(
                     &server,
                     code,
                     dir,
@@ -520,17 +738,37 @@ pub(crate) async fn async_main() -> Result<()> {
                     None,
                     false,
                 )
-                .await
+                .await;
+                // Refused files decide the outcome: all refused is the
+                // refusal's own code, some refused is partial.
+                let res = crate::recv_report::finish(res);
+                if let (Ok(()), Some(r)) = (&res, remember_name.as_deref()) {
+                    if !crate::shared_defs::REMEMBER_STORED.load(std::sync::atomic::Ordering::Relaxed) {
+                        ui::caution(
+                            &crate::shared_defs::remember_not_stored_msg(r, false, crate::identity_flow::has_identity()),
+                            None,
+                            &[],
+                        );
+                    }
+                }
+                if json_out {
+                    return crate::recv_report::emit(res, &shown_dir);
+                }
+                res
             }
         }
+        // Every field is named: a `..` here is how `set --yes`, `--json` and
+        // `--out` were once accepted and then dropped on the floor (the local
+        // --yes even shadowed the global one, so `set --reset --yes` refused).
         Cmd::Set {
             key,
             value,
             peer,
             dry_run,
             reset,
+            unset,
             hard,
-            ..
+            soft,
         } => {
             settings::run_set(
                 key.as_deref(),
@@ -538,7 +776,9 @@ pub(crate) async fn async_main() -> Result<()> {
                 &peer,
                 dry_run,
                 reset,
+                unset,
                 hard,
+                soft,
                 ui_caps.yes,
                 ui_caps.json || cli.json,
             )
@@ -585,9 +825,11 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 };
                 if json_output {
-                    println!(
+                    crate::outln!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "verb": "addr",
                             "name": name,
                             "channel": channel,
                             "caps": caps,
@@ -599,21 +841,24 @@ pub(crate) async fn async_main() -> Result<()> {
                         }))?
                     );
                 } else {
-                    println!("  {}", ui::paint(ui::Tone::Bold, &name));
-                    println!("  channel:  {}", &channel[..12.min(channel.len())]);
+                    crate::outln!("  {}", ui::paint(ui::Tone::Bold, &name));
+                    crate::outln!("  channel:  {}", &channel[..12.min(channel.len())]);
                     // Show overlay addresses if we have them.
                     if let Some(v6) = &stored_v6 {
                         let v4_str = stored_v4
                             .as_ref()
                             .map(|a| format!(" / {a}"))
                             .unwrap_or_default();
-                        println!("  overlay:  {v6}{v4_str}");
-                        println!("  mesh:     {name}.mesh");
+                        crate::outln!("  overlay:  {v6}{v4_str}");
+                        crate::outln!("  mesh:     {name}.mesh");
+                        if let Some(p) = crate::proxy_state::current() {
+                            ui::say(&crate::proxy_state::mesh_hint(&p));
+                        }
                     }
                     // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
                     // (what THIS machine authorized the peer to do), NOT what the peer offers.
-                    println!("  granted:  {}", capability_list_summary(&caps));
-                    println!("  last seen: {last_seen_str}");
+                    crate::outln!("  granted:  {}", capability_list_summary(&caps));
+                    crate::outln!("  last seen: {last_seen_str}");
                 }
             } else {
                 // Show this machine's address.
@@ -621,9 +866,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
                 let mesh_name = l3::sanitize_host(&my_name);
                 if json_output {
-                    println!(
+                    crate::outln!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "verb": "addr",
                             "name": mesh_name,
                             "overlayV6": id.addr().to_string(),
                             "overlayV4": id.addr_v4().to_string(),
@@ -631,11 +878,14 @@ pub(crate) async fn async_main() -> Result<()> {
                         }))?
                     );
                 } else if v4 {
-                    println!("{}", id.addr_v4());
+                    crate::outln!("{}", id.addr_v4());
                 } else {
-                    println!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
-                    println!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
-                    println!("  mesh:     {mesh_name}.mesh");
+                    crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
+                    crate::outln!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
+                    crate::outln!("  mesh:     {mesh_name}.mesh");
+                    if let Some(p) = crate::proxy_state::current() {
+                        ui::say(&crate::proxy_state::mesh_hint(&p));
+                    }
                 }
             }
             Ok(())
@@ -643,23 +893,13 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Id { action } => {
             match action.unwrap_or(IdAction::Show) {
                 IdAction::Show => {
-                    // U1: a keyless device gets its identity minted here, and
-                    // `id` is the one inspect verb that should mint, because the
-                    // identity IS its subject. Two devices keep the pre-U1
-                    // no-key display below instead: a joined one, which must
-                    // never quietly become a second owner, and one that set the
-                    // opt-out, which asked for the old answer and must keep
-                    // getting it (`{"configured": false}`, exit 0) rather than
-                    // an error the old build never returned.
-                    let key = match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
-                        Some(key) => Some(key),
-                        None if local_device_cert_path().exists()
-                            || crate::identity_flow::implicit_init_disabled() =>
-                        {
-                            None
-                        }
-                        None => Some(crate::identity_flow::ensure_user_key(ui_caps.json)?),
-                    };
+                    // `id` LOOKS; it never mints. It used to (U1, "the identity
+                    // is its subject"), and a first-time user who ran `tunlion
+                    // id` to see where they stood then found `tunlion join`
+                    // refusing the machine for already having an identity.
+                    // A keyless device gets the answer every read-only verb
+                    // gives: no identity yet, exit 9 (exit_codes::NoIdentity).
+                    let key = identity::UserKey::load(&crate::platform::PlatformKeyStore)?;
                     match key {
                         None => {
                             if let Ok(raw) = std::fs::read_to_string(local_device_cert_path()) {
@@ -672,10 +912,13 @@ pub(crate) async fn async_main() -> Result<()> {
                                             .take(8)
                                             .collect::<String>();
                                         if ui_caps.json {
-                                            println!(
+                                            crate::outln!(
                                                 "{}",
                                                 serde_json::to_string_pretty(&json!({
+                                                    "ok": true,
+                                                    "verb": "id",
                                                     "configured": true,
+                                                    "identity": fingerprint,
                                                     "fingerprint": fingerprint,
                                                     "role": "joined-device",
                                                     "holdsOwnerSigningKey": false,
@@ -683,11 +926,11 @@ pub(crate) async fn async_main() -> Result<()> {
                                                 }))?
                                             );
                                         } else {
-                                            println!(
+                                            crate::outln!(
                                                 "  identity:          {}",
                                                 ui::paint(ui::Tone::Bold, &fingerprint)
                                             );
-                                            println!(
+                                            crate::outln!(
                                                 "  role:              joined device (no owner signing key)"
                                             );
                                             // #275: this printed the raw epoch, on the one
@@ -696,7 +939,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                             // `device_countdown`, the same helper `devices`
                                             // renders from, so the two cannot drift and #236's
                                             // wording rules (nothing renews) apply here too.
-                                            println!(
+                                            crate::outln!(
                                                 "  local certificate: {}  ({})",
                                                 device_countdown(
                                                     fleet_ui::devices::DeviceTier::Fleet,
@@ -709,21 +952,25 @@ pub(crate) async fn async_main() -> Result<()> {
                                     }
                                 }
                             }
-                            if ui_caps.json {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&json!({ "configured": false }))?
-                                );
-                            } else if local_device_cert_path().exists() {
-                                crate::ui::say(&format!(
-                                    "this device holds a joined certificate that could not be read; `tunlion join` again from a clean device."
-                                ));
+                            if local_device_cert_path().exists() {
+                                if ui_caps.json {
+                                    crate::outln!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&json!({
+                                            "ok": true,
+                                            "verb": "id",
+                                            "configured": false,
+                                            "identity": Value::Null,
+                                            "role": "joined-device",
+                                        }))?
+                                    );
+                                } else {
+                                    crate::ui::say(&format!(
+                                        "this device holds a joined certificate that could not be read; `tunlion join` again from a clean device."
+                                    ));
+                                }
                             } else {
-                                // The opt-out path: implicit minting is off, so
-                                // this is the pre-U1 answer, verbatim.
-                                println!(
-                                    "no identity yet. Run 'tunlion init' or 'tunlion join'."
-                                );
+                                return Err(crate::identity_flow::no_identity(ui_caps.json));
                             }
                         }
                         Some(uk) => {
@@ -740,10 +987,13 @@ pub(crate) async fn async_main() -> Result<()> {
                                         })
                                     })
                                     .collect::<Vec<_>>();
-                                println!(
+                                crate::outln!(
                                     "{}",
                                     serde_json::to_string_pretty(&json!({
+                                        "ok": true,
+                                        "verb": "id",
                                         "configured": true,
+                                        "identity": uk.fingerprint(),
                                         "fingerprint": uk.fingerprint(),
                                         "publicKey": uk.public_key_hex(),
                                         "role": "owner",
@@ -753,11 +1003,11 @@ pub(crate) async fn async_main() -> Result<()> {
                                 );
                                 return Ok(());
                             }
-                            println!(
+                            crate::outln!(
                                 "  user fingerprint: {}",
                                 ui::paint(ui::Tone::Bold, &uk.fingerprint())
                             );
-                            println!(
+                            crate::outln!(
                                 "  public key:       {}",
                                 ui::paint(ui::Tone::Dim, &uk.public_key_hex())
                             );
@@ -766,12 +1016,11 @@ pub(crate) async fn async_main() -> Result<()> {
                                 let exp = if identity::now_secs() >= cert.expires {
                                     "EXPIRED".to_string()
                                 } else {
-                                    format!(
-                                        "{}d",
-                                        cert.expires.saturating_sub(identity::now_secs()) / 86400
+                                    crate::device_view::remaining_span(
+                                        cert.expires.saturating_sub(identity::now_secs()),
                                     )
                                 };
-                                println!(
+                                crate::outln!(
                                     "  {} {}",
                                     ui::paint(ui::Tone::Bold, &name),
                                     ui::paint(ui::Tone::Dim, &format!("(valid {exp})"))
@@ -779,7 +1028,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                 found += 1;
                             }
                             if found == 0 {
-                                println!(
+                                crate::outln!(
                                     "  {}",
                                     ui::paint(
                                         ui::Tone::Warn,
@@ -801,13 +1050,13 @@ pub(crate) async fn async_main() -> Result<()> {
             match (key, value) {
                 (Some(k), Some(v)) => {
                     config_set(&k, &v)?;
-                    println!("{k} = {v}");
+                    crate::outln!("{k} = {v}");
                 }
-                (Some(k), None) => println!("{}", config_get(&k).unwrap_or_default()),
+                (Some(k), None) => crate::outln!("{}", config_get(&k).unwrap_or_default()),
                 (None, _) => {
                     for k in ["name", "server", "dir"] {
                         if let Some(v) = config_get(k) {
-                            println!("{k} {v}");
+                            crate::outln!("{k} {v}");
                         }
                     }
                 }
@@ -832,7 +1081,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
             if userspace {
-                unsafe { std::env::set_var("FILAMENT_L3_USERSPACE", "1") };
+                unsafe { std::env::set_var("TUNLION_L3_USERSPACE", "1") };
             }
             // Flags win; otherwise fall back to persistent settings. Per-peer
             // `shell on` overrides fold into the shell-only allowlist so
@@ -851,11 +1100,16 @@ pub(crate) async fn async_main() -> Result<()> {
             if shell || shell_only.as_ref().is_some_and(|s| !s.is_empty()) {
                 crate::sshd::arm_ssh_ca_for_serving().await;
             }
+            let daemon = up_daemon.unwrap_or_default();
             up_cmd(
                 &server,
-                install,
-                system,
-                detach,
+                crate::up_logs::UpMode {
+                    install,
+                    system,
+                    detach,
+                    install_system,
+                },
+                &daemon,
                 dir,
                 relay,
                 shell,
@@ -863,12 +1117,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 shell_program,
                 shell_user,
                 i_know,
-                install_system,
                 no_proxy_fallback,
             )
             .await
         }
-        Cmd::Status { json } => status_cmd(json || ui_caps.json),
+        Cmd::Status { json } => status_cmd(json || ui_caps.json).await,
         Cmd::Down => {
             ui_caps.confirm("shut down the daemon")?;
             down_cmd()
@@ -895,7 +1148,10 @@ pub(crate) async fn async_main() -> Result<()> {
             let for_ = match (who, for_) {
                 (Some(w), None) => Some(w),
                 (Some(w), Some(f)) => {
-                    bail!("you named the invitee twice: `add {w}` and `--for {f}`. Use one.")
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Usage,
+                        format!("you named the invitee twice: `add {w}` and `--for {f}`. Use one."),
+                    ));
                 }
                 (None, f) => f,
             };
@@ -915,7 +1171,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // everywhere and `--internal` is gone.
             if out.is_some() {
                 // Delivering as a file is the invitation ceremony, unchanged.
-                add_for_cmd(&ui_caps, for_, allow, expires, out).await
+                add_for_cmd(&ui_caps, for_, name, allow, expires, out).await
             } else if for_.is_some() {
                 // Same question, spoken-code transport. Resolving here (rather
                 // than inside the ceremony) means a script that omits the answer
@@ -926,6 +1182,18 @@ pub(crate) async fn async_main() -> Result<()> {
                 // form --help leads with, and still met both prompts.
                 let for_given = for_.is_some();
                 let (kind, named) = resolve_for_kind(&ui_caps, for_)?;
+                // Eval item 3: `add --for person --name u2-a` on a device that
+                // is already one of yours silently re-enrolled it as fleet, and
+                // the two sides were told opposite things. A device holding
+                // your identity's certificate cannot be filed as someone
+                // else's, so refuse before any code is minted, with the reason.
+                if kind == "person" {
+                    if let Some(who) = name.as_deref().or(named.as_deref()) {
+                        if let Some(msg) = crate::pair_cmd::person_names_own_device(who) {
+                            return Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, msg));
+                        }
+                    }
+                }
                 let who_given = named.is_some() || for_given;
                 // ASK "how", not only "who". The comment above names three
                 // orthogonal axes and the guided flow asked exactly one of them,
@@ -953,7 +1221,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 let via = match via.as_deref() {
                     Some("code") => Some("code".to_string()),
                     Some("file") => Some("file".to_string()),
-                    Some(other) => bail!("--via takes `code` or `file`, not '{other}'"),
+                    Some(other) => crate::bail_usage!("--via takes `code` or `file`, not '{other}'"),
                     // --out names a file, so it answers HOW by itself.
                     None if out.is_some() => Some("file".to_string()),
                     // An unattended runner is never present to hear a code read
@@ -1004,10 +1272,21 @@ pub(crate) async fn async_main() -> Result<()> {
                 // what `ephemeral mint` was a separate verb for. Same two
                 // questions, third answer to the first one.
                 if via.as_deref() == Some("file") {
-                    let path = out.unwrap_or_else(|| invite_path_for(named.as_deref(), &kind));
-                    return add_for_cmd(&ui_caps, Some(kind), allow, expires, Some(path)).await;
+                    let invitee = crate::add_for::invitee_name(named, name)?;
+                    let path = out.unwrap_or_else(|| invite_path_for(invitee.as_deref(), &kind));
+                    // The kind is settled; the name rides along. --name used to
+                    // be dropped here, so `add --for device --name b` made a
+                    // device named after the joiner's hostname.
+                    return add_for_cmd(&ui_caps, Some(kind), invitee, allow, expires, Some(path)).await;
                 }
                 let internal = kind == "device";
+                crate::pair_cmd::FOR_PERSON
+                    .store(kind == "person", std::sync::atomic::Ordering::Relaxed);
+                if internal {
+                    if let Some(e) = crate::identity_flow::add_needs_init() {
+                        return Err(e);
+                    }
+                }
                 if internal && load_owner_key().is_none() {
                     bail!(
                         "`add --for device` enrols the other side into your mesh, which \
@@ -1016,13 +1295,39 @@ pub(crate) async fn async_main() -> Result<()> {
                          `--for person` to pair without enrolling."
                     );
                 }
+                // `--expires` is the certificate lifetime here, parsed and
+                // bounded the same way as the invitation path above. Resolved
+                // before the ceremony so a bad value fails before a code shows.
+                let enrol_ttl = crate::pair_cmd::code_enrolment_ttl(expires.as_deref(), internal)?;
                 let quick = ui_caps.interactive && who_given && via_defaulted;
-                pair_cmd(&server, code, name.or(named), word, relay, internal, allow, quick).await
+                if code.is_none() && word.is_none() && !crate::interactive_allowed() {
+                    return Err(add_code_needs_people(named.as_deref()));
+                }
+                pair_cmd(
+                    &server,
+                    code,
+                    name.or(named),
+                    word,
+                    relay,
+                    internal,
+                    allow,
+                    enrol_ttl,
+                    quick,
+                )
+                .await
             } else {
                 // No answer given and none required: an ordinary pair, which
                 // confers no membership. This is the safe default and the
-                // pre-existing behaviour.
-                pair_cmd(&server, code, name, word, relay, false, allow, false).await
+                // pre-existing behaviour. It issues no certificate, so a
+                // `--expires` here would bound nothing: refused, not ignored.
+                crate::pair_cmd::code_enrolment_ttl(expires.as_deref(), false)?;
+                // `pair_cmd` refuses a non-terminal with the message for a BARE
+                // `add`. If arguments were given, answer what was typed instead.
+                let args_given = via.is_some() || name.is_some() || !allow.is_empty() || expires.is_some();
+                if args_given && code.is_none() && word.is_none() && !crate::interactive_allowed() {
+                    return Err(add_code_needs_people(name.as_deref()));
+                }
+                pair_cmd(&server, code, name, word, relay, false, allow, None, false).await
             }
         }
         Cmd::Join {
@@ -1052,22 +1357,38 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 other => (other, invite_file),
             };
+            // A path that does not exist used to fall through to the code
+            // ceremony and come back as "that code doesn't look right", which
+            // sends the person hunting for a typo in a code they never typed.
+            if let Some(arg) = code.as_deref() {
+                if let Some(msg) = crate::identity_flow::join_missing_file_msg(arg, invite_file.is_some() || invite_fd.is_some()) {
+                    crate::bail_usage!("{msg}");
+                }
+            }
             if let Some(code) = code {
                 if invite_file.is_some() || invite_fd.is_some() {
-                    bail!("give a code or an invitation file, not both");
+                    crate::bail_usage!("give a code or an invitation file, not both");
                 }
                 // Same ceremony `add <code>` runs: accepting a code confers no
                 // membership by itself, the offering side decides that.
-                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), false).await
+                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), None, false).await
+            } else if invite_file.is_none() && invite_fd.is_none() && ui_caps.interactive {
+                // Nothing given at a terminal: ONE prompt that takes a code, an
+                // invitation, or a file path, and runs whichever it is. The
+                // menu's single accept entry lands here; it used to open the
+                // invitation reader, which answered a code with "invitation
+                // has an unknown format".
+                crate::identity_flow::join_guided(&ui_caps, &server, relay, name, to).await
             } else {
-                join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await
+                join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to, None).await
             }
         }
         Cmd::Depart => depart_cmd(&server, relay).await,
         Cmd::Devices { action, json, caps } => {
+            crate::exit_codes::set_json_mode(json || ui_caps.json, Some("devices"));
             if let Some(selector) = caps {
                 if action.is_some() {
-                    bail!("--caps is a view; it takes a device name, not a subcommand");
+                    crate::bail_usage!("--caps is a view; it takes a device name, not a subcommand");
                 }
                 let name = (!selector.is_empty()).then_some(selector.as_str());
                 return crate::device_perms::devices_caps_cmd(name, json || ui_caps.json);
@@ -1075,27 +1396,38 @@ pub(crate) async fn async_main() -> Result<()> {
             match action {
                 None => {
                     let all = devices_load();
+                    // Nothing to list and no identity: the same answer `id`
+                    // gives (exit 9), not an empty list with exit 0 beside a
+                    // `status` that exits nonzero. A keyless device that
+                    // paired by code still lists its devices, with the hint.
+                    let nothing_to_list = crate::identity_flow::devices_has_nothing_to_list(
+                        crate::identity_flow::has_identity(),
+                        crate::device_view::device_entries(None).len(),
+                    );
+                    if nothing_to_list && (json || ui_caps.json) {
+                        return Err(crate::identity_flow::no_identity(true));
+                    }
                     if json || ui_caps.json {
-                        let arr: Vec<Value> = all
-                            .iter()
-                            .map(|(n, s)| {
-                                let (last_seen, v6, v4) =
-                                    devices_info(n).unwrap_or((0, None, None));
-                                let addr = v6.clone().or_else(|| v4.clone()).unwrap_or_default();
-                                let mesh = format!("{n}.mesh");
-                                json!({
-                                    "name": n,
-                                    "channel": channel_of(s),
-                                    "caps": effective_device_caps(n),
-                                    "lastSeen": last_seen,
-                                    "address": addr,
-                                    "mesh": mesh,
-                                })
-                            })
-                            .collect();
-                        println!("{}", serde_json::to_string_pretty(&arr)?);
+                        // ONE source of truth for "online": the same answering
+                        // links and the same per-row rule the human list uses
+                        // (device_entries). The JSON computed its own set by
+                        // pinging the stored names, and said false for a
+                        // device the human list showed online and a send
+                        // reached. null when no daemon answers: then nothing
+                        // here can know, as the human row omits it (#217).
+                        let arr = devices_json_rows(&all).await;
+                        // The envelope every other --json verb uses
+                        // (docs/agent-output-audit.md section 4): the array
+                        // is `data.devices`, unchanged one level down.
+                        // `schema: 2`; schema 1 was the bare array.
+                        ui::json_out(&devices_json_envelope(arr));
                     } else {
-                        let warm = ctl::try_list_warm().await;
+                        // "online" on this screen means what it means in
+                        // --json: the device answered a liveness ping on the
+                        // held link just now. A held link alone showed a
+                        // SIGSTOPped, stopped or wiped peer as "online (last
+                        // seen just now)" while every send to it failed.
+                        let warm = answering_links(ctl::try_list_warm().await).await;
                         let pending = ctl::try_list_pending().await;
                         let now = identity::now_secs();
                         // Honest roster heading: show the epoch and when it was
@@ -1117,62 +1449,57 @@ pub(crate) async fn async_main() -> Result<()> {
                             pending_request_count(pending.as_ref()),
                             roster_heading,
                         );
-                        println!("{rendered}");
+                        crate::outln!("{rendered}");
+                        // Read only: a device with no identity is told how to
+                        // get one, and nothing is minted by looking.
+                        if !crate::identity_flow::has_identity() {
+                            ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
+                        }
+                        // The screen keeps its shape (the empty list on
+                        // stdout, the hint above); the exit says why.
+                        if nothing_to_list {
+                            return Err(crate::exit_codes::reported(
+                                crate::exit_codes::ExitKind::NoIdentity,
+                            ));
+                        }
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
-                    let had = device_record_exists(&name);
-                    if !had {
+                    // A live fleet certificate outlives its record, so a forget
+                    // records its KEY as revoked before dropping the record, and
+                    // a revoked record carries its revocation over the same way
+                    // (fleet_support::forget_device). The name is then free.
+                    //
+                    // Destructive, so it asks like `down`, `reset` and `devices
+                    // revoke` do: a prompt at a terminal, `-y` from a script.
+                    // It was the one destructive verb that did neither.
+                    if !device_record_exists(&name) {
                         bail!("no device named '{name}', see `tunlion devices`");
                     }
-                    // advisor's anti-theatre point: deleting the record also
-                    // discards any revocation on it, and the copy must say so.
-                    // Otherwise a revoked device that is forgotten looks like a
-                    // first-time peer again, and typing its code (its own or a
-                    // fresh mint) reads as ordinary pairing with nothing
-                    // signalling the revocation was just undone.
-                    let was_revoked = std::fs::read_to_string(devices_path())
-                        .ok()
-                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                        .and_then(|v| v.as_array().cloned())
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|d| {
-                            d["name"].as_str() == Some(name.as_str())
-                                && d["certRevoked"].as_bool() == Some(true)
-                        });
-                    devices_remove(&name)?;
-                    if was_revoked {
-                        println!(
-                            "forgot '{name}' and its revocation; it can now be added or joined again (if it still holds its key)"
-                        );
-                    } else {
-                        println!(
-                            "forgot '{name}', it can no longer find or auto-connect to this machine"
-                        );
+                    ui_caps.confirm(&format!(
+                        "forget {name} (delete its record; its key stays refused)"
+                    ))?;
+                    let report = crate::fleet_support::forget_device(&name, identity::now_secs())?;
+                    crate::outln!("{report}");
+                    // Its pending access requests cannot be approved into
+                    // anything any more; drop them with the record.
+                    crate::withdraw_requests_for(&name);
+                    // The store is written; the RUNNING daemon must act on it too
+                    // (revocation_live.rs). Say only what it confirmed. The old
+                    // line here promised the forgotten device would hear "never
+                    // met you": it does not, because this machine stops answering
+                    // it at all, so from its side we look offline.
+                    let answer = crate::revocation_live::tell_daemon().await;
+                    match crate::revocation_live::daemon_line(&name, &answer, true) {
+                        Ok(line) => ui::say(&line),
+                        Err(e) => bail!(e),
                     }
-                    println!(
-                        "(their side still holds its half; it will hear \"never met you\" on the next proof)"
-                    );
                 }
                 Some(DevicesAction::Rename { old, new }) => {
                     // Rename in place on the raw record so caps/v2 fields ride
                     // along (remove+store dropped the renamed device's caps).
-                    with_devices_mut(|arr| {
-                        if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
-                            bail!("no device named '{old}', see `tunlion devices`");
-                        }
-                        if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
-                            bail!("'{new}' already exists, forget it first or pick another name");
-                        }
-                        for d in arr.iter_mut() {
-                            if d["name"].as_str() == Some(old.as_str()) {
-                                d["name"] = json!(new);
-                            }
-                        }
-                        Ok(())
-                    })?;
-                    println!(
+                    crate::fleet_support::rename_device(&old, &new)?;
+                    crate::outln!(
                         "renamed '{old}' -> '{new}' (local alias only, the secret, and the other side, are unchanged)"
                     );
                 }
@@ -1185,16 +1512,40 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                     ui_caps.confirm(&format!("durably revoke {name} (it will stop being recognized and cannot rejoin until restored)"))?;
                     set_device_revoked(&name, true)?;
-                    println!(
+                    crate::withdraw_requests_for(&name);
+                    crate::outln!(
                         "revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `tunlion devices restore {name}` can)"
                     );
+                    let answer = crate::revocation_live::tell_daemon().await;
+                    match crate::revocation_live::daemon_line(&name, &answer, false) {
+                        Ok(line) => ui::say(&line),
+                        Err(e) => bail!(e),
+                    }
                 }
                 Some(DevicesAction::Restore { name }) => {
-                    if !device_record_exists(&name) {
-                        bail!("no device named '{name}', see `tunlion devices`");
+                    // Eval item 2: restore did nothing for a FORGOTTEN device,
+                    // whose record is gone but whose key stays refused. It now
+                    // undoes both: a revoke (record kept) and the key block a
+                    // forget leaves behind.
+                    let record = device_record_exists(&name);
+                    let revoked = record && crate::device_view::device_record_revoked(&name);
+                    if revoked {
+                        set_device_revoked(&name, false)?;
                     }
-                    set_device_revoked(&name, false)?;
-                    println!("restored '{name}'; it is recognized again under its prior record");
+                    let lifted = crate::fleet_support::lift_key_revocations_named(&name)?;
+                    crate::outln!(
+                        "{}",
+                        crate::fleet_support::restore_report(&name, record, revoked, &lifted)
+                    );
+                    if !record && lifted.is_empty() {
+                        return Err(crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::UnknownDevice,
+                            format!("no device named '{name}', and no forgotten device by that name; see `tunlion devices`"),
+                        ));
+                    }
+                    if revoked || !lifted.is_empty() {
+                        let _ = crate::revocation_live::tell_daemon().await;
+                    }
                 }
             }
             Ok(())
@@ -1213,7 +1564,7 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Man { page } => {
             if let Some(p) = page {
                 if p == "routing" {
-                    println!("{}", include_str!("../docs/tunlion-routing.md"));
+                    crate::outln!("{}", include_str!("../docs/tunlion-routing.md"));
                     return Ok(());
                 }
                 // Unknown page: print clear message instead of falling through to roff
@@ -1257,7 +1608,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     devices[selected].0.clone()
                 }
                 None => {
-                    bail!("shell needs a device in non-interactive mode: tunlion shell <device>")
+                    crate::bail_usage!("shell needs a device in non-interactive mode: tunlion shell <device>")
                 }
             };
             require_known_device(&peer)?;
@@ -1267,10 +1618,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // before opening anything, matching the #206 mount pre-check.
             if let Some(caps) = principal_ceiling_for(&peer) {
                 if !caps.iter().any(|c| c == "shell") {
-                    bail!(
-                        "shell denied by {peer}: this device's invitation ceiling ({}) does not include shell",
-                        caps.join(", ")
-                    );
+                    bail!("{}", crate::identity_state::ceiling_refusal_here("shell", &peer, "shell", &caps));
                 }
             }
             if opened_flow {
@@ -1326,7 +1674,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     devices[selected].0.clone()
                 }
                 None => {
-                    bail!(
+                    crate::bail_usage!(
                         "exec needs a device in non-interactive mode: tunlion exec <device> -- <cmd>"
                     )
                 }
@@ -1337,14 +1685,11 @@ pub(crate) async fn async_main() -> Result<()> {
             // serve one. Say so before opening anything, like #219 did.
             if let Some(caps) = principal_ceiling_for(&peer) {
                 if !caps.iter().any(|c| c == "shell") {
-                    bail!(
-                        "exec denied by {peer}: this device's invitation ceiling ({}) does not include shell",
-                        caps.join(", ")
-                    );
+                    bail!("{}", crate::identity_state::ceiling_refusal_here("exec", &peer, "shell", &caps));
                 }
             }
             if argv.is_empty() {
-                bail!("exec needs a command: tunlion exec <device> -- <cmd>");
+                crate::bail_usage!("exec needs a command: tunlion exec <device> -- <cmd>");
             }
             // --shell wraps here, visibly, on the initiator side: the receiver
             // never invokes a shell on its own.
@@ -1371,7 +1716,13 @@ pub(crate) async fn async_main() -> Result<()> {
             dest,
             delete,
             dry_run,
+            json_lines,
         } => {
+            if json_lines {
+                // NDJSON is still machine output: failures and interrupts
+                // answer in JSON too.
+                crate::exit_codes::set_json_mode(true, Some("sync"));
+            }
             // `<device>:<remote-dir>`; the remote dir may be empty (the drop root).
             let Some((peer, remote_dir)) = dest.split_once(':') else {
                 ui::problem(
@@ -1384,7 +1735,8 @@ pub(crate) async fn async_main() -> Result<()> {
             let opts = crate::sync_cmd::SyncOpts {
                 delete,
                 dry_run,
-                json: cli.json,
+                json: cli.json && !json_lines,
+                json_lines,
             };
             match crate::sync_cmd::run(&server, &local, peer, remote_dir, relay, opts).await {
                 0 => Ok(()),
@@ -1393,13 +1745,14 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         Cmd::Reach { dev, until_direct, timeout, json, socks } => {
             if socks {
-                bail!(
+                crate::bail_usage!(
                     "`reach --socks` moved to `forward --socks`: reach now probes only. Run `tunlion forward <device>:<port> --socks`"
                 );
             }
             let json = json || ui_caps.json;
+            crate::exit_codes::set_json_mode(json, Some("reach"));
             match dev {
-                Some(d) if d.contains(':') => bail!(
+                Some(d) if d.contains(':') => crate::bail_usage!(
                     "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `tunlion forward {d}`"
                 ),
                 Some(d) => {
@@ -1430,12 +1783,12 @@ pub(crate) async fn async_main() -> Result<()> {
                         return Ok(());
                     }
                     if until_direct {
-                        crate::ping::reach_until_direct(&d, timeout, json, relay).await
+                        crate::ping::reach_until_direct(&d, timeout.unwrap_or(30), json, relay).await
                     } else {
-                        crate::ping::ping_cmd(&server, &d, 1, json, relay).await
+                        crate::ping::ping_cmd(&server, &d, 1, json, relay, timeout).await
                     }
                 }
-                None => bail!(
+                None => crate::bail_usage!(
                     "reach needs a device to probe: `tunlion reach <device>`. To tunnel a port use `tunlion forward <device>:<port>`."
                 ),
             }
@@ -1448,15 +1801,19 @@ pub(crate) async fn async_main() -> Result<()> {
             port,
             bind,
             http_port,
+            allow_remote,
         } => {
             let (peer, rport) = match target.split_once(':') {
                 Some((p, r)) => (
                     p.to_string(),
                     r.parse().map_err(|_| {
-                        anyhow!("invalid port in '{target}'; expected <device>:<port>")
+                        crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::Usage,
+                            format!("invalid port in '{target}'; expected <device>:<port>"),
+                        )
                     })?,
                 ),
-                None => bail!("forward needs <device>:<port>, e.g. `tunlion forward laptop:5432`"),
+                None => crate::bail_usage!("forward needs <device>:<port>, e.g. `tunlion forward laptop:5432`"),
             };
             if stdio {
                 // #202: the netcat shape - pipe stdio to the peer's port (the
@@ -1465,7 +1822,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 require_known_device(&peer)?;
                 l2::netcat_cmd(&server, &peer, rport, relay).await
             } else if socks {
-                l2::proxy_cmd(&server, &bind, port, http_port, relay).await
+                l2::proxy_cmd(&server, &bind, port, http_port, relay, allow_remote).await
             } else {
                 require_known_device(&peer)?;
                 let lport = lport.unwrap_or(rport);
@@ -1489,7 +1846,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     ui_caps.confirm("unexpose a port")?;
                     expose::unexpose_cmd(p).await
                 } else {
-                    bail!("expose --off requires a port number");
+                    crate::bail_usage!("expose --off requires a port number");
                 }
             } else {
                 expose::expose_cmd(port, to, peer, list).await
@@ -1499,18 +1856,26 @@ pub(crate) async fn async_main() -> Result<()> {
             device,
             watch,
             repeat,
+            timeout,
             json,
         } => {
+            crate::exit_codes::set_json_mode(json || ui_caps.json, Some("doctor"));
             if let Some(d) = &device {
                 require_known_device(d)?;
             }
-            doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay).await
+            doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay, timeout)
+                .await
         }
         Cmd::Grant {
             device,
             capability,
             tag,
+            user,
         } => {
+            let (device, capability) = grant_operands(device, capability, tag.as_deref())?;
+            // Valid on every device or on none: checked before the owner/joined
+            // split, so no advice below can name a spec that would be refused.
+            validate_grant_spec(&capability).map_err(grant_usage)?;
             // The owner key resolves the RESOURCE, so it is needed before the
             // capability name is final: `route:10.0.0.0/24` names an owner-bound
             // resource, while `shell` names "self".
@@ -1525,7 +1890,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 // just the public half. Keep requiring a full identity here.
                 let user_key = crate::identity_flow::ensure_user_key(false)?;
                 let pk = user_key.public_key_bytes();
-                let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                 let (capability, resource) = (g.action.clone(), g.resource.clone());
                 let target_bytes = crate::capability::make_tag_target(&pk, t);
                 let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
@@ -1545,9 +1910,13 @@ pub(crate) async fn async_main() -> Result<()> {
                 store.push(op.to_json());
                 let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
                     .context("save cap store")?;
-                println!("granted '{capability}' to tag '{t}'.");
+                crate::outln!("granted '{capability}' to tag '{t}'.");
                 return Ok(());
             }
+            // grant_operands returns a device whenever there is no --tag.
+            let Some(device) = device else {
+                crate::bail_usage!("name a device: tunlion grant <device> <capability>");
+            };
             // Device path. The owner PUBLIC key is needed up front for the same
             // reason as the tag path: it resolves a `route:CIDR` spec to its
             // owner-bound resource id.
@@ -1570,7 +1939,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 .map(|k| k.public_key_bytes());
             let (capability, cap_resource, cap_nonce) = match owner_pk {
                 Some(pk) => {
-                    let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                    let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                     (g.action, g.resource, g.nonce)
                 }
                 None => {
@@ -1590,11 +1959,11 @@ pub(crate) async fn async_main() -> Result<()> {
                         // U1: not joined and no key, so this is the first use;
                         // mint the identity and bind the resource to it.
                         let pk = crate::identity_flow::ensure_user_key(false)?.public_key_bytes();
-                        let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                        let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                         (g.action, g.resource, g.nonce)
                     } else {
                         (
-                            crate::capability::canonical_capability(&spec)?,
+                            crate::capability::canonical_capability(&spec).map_err(grant_usage)?,
                             "self".to_string(),
                             crate::capability::self_resource_nonce(),
                         )
@@ -1618,24 +1987,70 @@ pub(crate) async fn async_main() -> Result<()> {
                 // resource id, still found nothing and declined every route.
                 // Only a bare, self-scoped grant can be genuinely redundant.
                 let resource_scoped = cap_resource != "self";
-                if !resource_scoped && ceiling.iter().any(|c| c == &capability) {
-                    bail!(
-                        "'{capability}' is already granted to '{device}' by its invitation ceiling; no grant is needed"
-                    );
+                // The same decision the pairing hint asks (`grant_vs_ceiling`),
+                // so a hint can never name a grant this refuses.
+                match crate::pair_cmd::grant_vs_ceiling(
+                    Some(ceiling.as_slice()),
+                    &capability,
+                    resource_scoped,
+                ) {
+                    // The state asked for already holds: success, not an
+                    // error. It exited 1, so a provisioning script that
+                    // grants idempotently failed on its second run.
+                    crate::pair_cmd::GrantVsCeiling::AlreadyCovered => {
+                        ui::say(&format!(
+                            "'{capability}' is already granted to '{device}' by its invitation ceiling; nothing to do"
+                        ));
+                        return Ok(());
+                    }
+                    // A decision against the request: the documented
+                    // "denied" exit (4), not the catch-all 1.
+                    _ => {
+                        return Err(crate::exit_codes::err(
+                            crate::exit_codes::ExitKind::Denied,
+                            format!(
+                                "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
+                                ceiling.join(", "),
+                                crate::identity_state::reenrol_steps(
+                                    &device,
+                                    &crate::display_name(),
+                                    &capability,
+                                    &ceiling
+                                )
+                            ),
+                        ));
+                    }
                 }
+            }
+            if user && owner_pk.is_none() {
                 bail!(
-                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  tunlion add --for {device} --allow {capability} --yes",
-                    ceiling.join(", ")
+                    "a user-wide grant (--user) is an owner-signed grant to a user key, and this device holds no owner signing key. Run it on the owner's machine, or grant to the device:\n  tunlion grant {device} {spec}"
+                );
+            }
+            // A device with no certified identity (a browser, which pairs by
+            // code and holds only the pairing secret) cannot be the target of an
+            // owner-signed grant. Its pairing permission below is what the gate
+            // honours for it. This used to write that permission, which took
+            // effect, and THEN fail with "identity not available" (exit 1), so
+            // a grant that worked reported that it had not.
+            let signing_key =
+                crate::identity::UserKey::load(&crate::platform::PlatformKeyStore).ok().flatten();
+            let peer_cert = device_cert_for(&device);
+            if signing_key.is_some() && peer_cert.is_none() && user {
+                bail!(
+                    "'{device}' has no certified identity (a browser, or a device paired by code only), so there is no user key to grant to. Grant to the device instead:\n  tunlion grant {device} {spec}"
                 );
             }
             device_set_cap(&device, &capability, true, None)?;
+            if signing_key.is_some() && peer_cert.is_none() {
+                ui::say(&format!(
+                    "'{device}' has no certified identity (a browser, or a device paired by code only), so this is a pairing permission, not an owner-signed grant. It takes effect now; `tunlion revoke {device} {capability}` removes it."
+                ));
+            }
             // If identity layer is active, also issue an owner-signed CapOp
-            if let Ok(Some(user_key)) =
-                crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
-            {
+            if let (Some(user_key), Some(peer_cert)) = (signing_key, peer_cert) {
                 let config_dir = crate::settings::config_dir();
                 let mut store = crate::capability::load_cap_store(&config_dir);
-                let pk = user_key.public_key_bytes();
 
                 // Ensure a genesis header exists for the resource being granted.
                 // Keyed by the RESOURCE, so a route prefix gets its own header
@@ -1677,54 +2092,41 @@ pub(crate) async fn async_main() -> Result<()> {
                     store.push(hdr_json);
                 }
 
-                // Create CapOp: target the peer's real user_pub from their
-                // stored device cert (not SHA-256 of the device name, which
-                // never matches evaluate()'s principal_user_pub comparison).
-                // Requires the peer to have a certified identity (paired +
-                // identity-expose completed).
-                let Some(peer_cert) = device_cert_for(&device) else {
-                    return Err(anyhow!(
-                        "peer identity for '{device}' is not available. Pair with the peer first so their identity can be certified; the grant requires a known user key to target"
-                    ));
-                };
+                // Create CapOp: target the peer's DEVICE key from their stored
+                // device cert (not SHA-256 of the device name, which never
+                // matches evaluate()'s principal comparison). Requires the peer
+                // to have a certified identity (paired + identity-expose
+                // completed).
+                //
+                // The DEVICE key, not the user key, unless `--user` says so. A
+                // user-targeted grant matches every device that user certified,
+                // and for a device of my own fleet that user is ME: `grant
+                // laptop shell` granted shell to the whole fleet under
+                // authoritative evaluation. See device_caps::GrantScope.
                 if peer_cert.verify(crate::identity::now_secs()).is_err() {
                     return Err(anyhow!(
                         "peer identity cert for '{device}' is expired; re-pair to refresh it"
                     ));
                 }
-                let target_arr = peer_cert.user_pub;
-
-                // Version must EXCEED any existing grant for this target, the
-                // same monotonic ratchet `revoke` respects. This was
-                // hlc_next(0, ..), which ignores what is already in the store,
-                // so a regrant could be minted below the floor. That could not
-                // fail while the op was pushed straight in; through
-                // apply_cap_op it would be refused, which is the point.
-                let existing_ver = store
-                    .iter()
-                    .filter(|e| {
-                        e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
-                            && e["grantor"].as_str() == Some(hex::encode(pk).as_str())
-                            && e["resource"].as_str() == Some("self")
-                            && e["target"].as_str() == Some(hex::encode(target_arr).as_str())
-                    })
-                    .filter_map(|e| e["version"].as_u64())
-                    .max()
-                    .unwrap_or(0);
-                let v = crate::capability::hlc_next(existing_ver, crate::capability::now_ms());
-                let mut op = crate::capability::CapOp {
-                    op: crate::capability::CapOpKind::Grant,
-                    grantor: pk,
-                    target_kind: 0x00, // User
-                    target: target_arr,
-                    resource: cap_resource.clone(),
-                    permissions: vec![capability.clone()],
-                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
-                    issued_at: crate::capability::now_secs(),
-                    version: v,
-                    sig: [0u8; 64],
+                let scope = if user {
+                    crate::device_caps::GrantScope::User
+                } else {
+                    crate::device_caps::GrantScope::Device
                 };
-                op.sig = crate::capability::sign_cap_op(&op, &user_key.keypair());
+
+                // Version must EXCEED everything recorded for this target,
+                // revoke tombstones included: the same monotonic ratchet
+                // `revoke` respects, and apply_cap_op refuses anything at or
+                // below it.
+                let op = crate::device_caps::sign_next_cap_op(
+                    &store,
+                    &user_key,
+                    crate::capability::CapOpKind::Grant,
+                    scope.target(&peer_cert),
+                    &cap_resource,
+                    vec![capability.clone()],
+                    crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                );
                 // ONE VALIDATED OP-CREATION PATH. `revoke` already went through
                 // apply_cap_op; `grant` pushed its JSON straight into the store
                 // and then called update_ratchet by hand, patching the single
@@ -1779,24 +2181,48 @@ pub(crate) async fn async_main() -> Result<()> {
             if capability == "shell" {
                 crate::sshd::arm_ssh_ca_for_serving().await;
             }
-            println!(
+            if user {
+                let names: Vec<String> = device_cert_for(&device)
+                    .map(|c| {
+                        crate::certified_device_names(&c.user_pub)
+                            .into_iter()
+                            .map(|(n, _)| n)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ui::say(&format!(
+                    "user-wide grant: every device certified by the user key of '{device}' holds '{capability}' ({})",
+                    if names.is_empty() { device.clone() } else { names.join(", ") }
+                ));
+            }
+            crate::outln!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
-                    "OWNER-EQUIVALENT: they can act as you through `tunlion shell --ssh` (their key is installed on first connect)."
+                    "OWNER-EQUIVALENT: they can act as you through `tunlion shell`, `tunlion exec` and `tunlion shell --ssh` (for ssh, their key is installed on first connect)."
                 } else {
                     ""
                 }
             );
+            // Grants are read per open, and the daemon re-reads whether ANY
+            // shell grant exists on every loop turn, so this applies to a running
+            // daemon at once. It used to need a restart that nothing mentioned.
+            if capability == "shell" && crate::daemon_alive().is_some() {
+                ui::say(&ui::paint(
+                    ui::Tone::Dim,
+                    "  the running daemon applies this on the next connection; no restart needed",
+                ));
+            }
             Ok(())
         }
         Cmd::Revoke {
             device,
             capability,
             certificate,
+            user,
         } => {
             if certificate {
                 if capability.is_some() {
-                    bail!("choose either a capability or --certificate, not both");
+                    crate::bail_usage!("choose either a capability or --certificate, not both");
                 }
                 ui_caps.confirm(&format!("revoke fleet certificate from {device}"))?;
                 let cert = device_cert_for(&device)
@@ -1805,16 +2231,21 @@ pub(crate) async fn async_main() -> Result<()> {
                             // vouched device got an error and no route. A record with no
                             // certificate is removed by forgetting it, and nothing else
                             // said so.
-                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `tunlion devices`).\n  To remove its access: tunlion devices forget {device}"
+                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `tunlion devices`).\n  To remove its access: tunlion devices forget {device} -y"
                         ))?;
                 let owner = load_owner_key().ok_or_else(|| anyhow!("no local user identity"))?;
                 if cert.user_pub != owner.public_key_bytes() {
                     bail!("device '{device}' certificate is not chained to this user identity");
                 }
                 set_device_cert_revoked(&device, true)?;
-                println!(
+                crate::outln!(
                     "revoked fleet certificate from '{device}'; the device is denied by the local capability gate"
                 );
+                let answer = crate::revocation_live::tell_daemon().await;
+                match crate::revocation_live::daemon_line(&device, &answer, false) {
+                    Ok(line) => ui::say(&line),
+                    Err(e) => bail!(e),
+                }
                 return Ok(());
             }
             let capability = capability
@@ -1834,12 +2265,17 @@ pub(crate) async fn async_main() -> Result<()> {
                     ceiling.join(", ")
                 );
             }
+            if user && load_owner_key().is_none() {
+                bail!(
+                    "a user-wide grant (--user) is owner-signed, and this device holds no owner signing key; run the revoke on the owner's machine"
+                );
+            }
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false, None)?;
             // Mirror the grant path: also emit an owner-signed Revoke cap_op so
             // the AUTHORITATIVE capability gate actually denies. The legacy
             // device_set_cap(false) only clears devices.json; it leaves the cap
-            // store granting, so under FILAMENT_CAP_AUTHORITATIVE the gate keeps
+            // store granting, so under TUNLION_CAP_AUTHORITATIVE the gate keeps
             // ALLOWing and a re-connect re-installs the shell key (revocation was
             // a no-op at the gate). apply_cap_op removes the matching grant, so
             // evaluate() then denies and devices_with_shell_revoked lists this
@@ -1850,7 +2286,6 @@ pub(crate) async fn async_main() -> Result<()> {
             {
                 let config_dir = crate::settings::config_dir();
                 let mut store = crate::capability::load_cap_store(&config_dir);
-                let pk = user_key.public_key_bytes();
                 let header = store
                     .iter()
                     .find(|e| {
@@ -1861,36 +2296,50 @@ pub(crate) async fn async_main() -> Result<()> {
                 // A revoke only bites if there is a header AND the peer has a
                 // certified identity to target (same requirement as grant).
                 if let (Some(hdr), Some(peer_cert)) = (header, device_cert_for(&device)) {
-                    let target_arr = peer_cert.user_pub;
-                    // Version MUST exceed the existing grant's version (monotonic
-                    // ratchet), else apply_cap_op refuses.
-                    let existing_ver = store
-                        .iter()
-                        .filter(|e| {
-                            e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
-                                && e["grantor"].as_str() == Some(hex::encode(pk).as_str())
-                                && e["resource"].as_str() == Some("self")
-                                && e["target"].as_str() == Some(hex::encode(target_arr).as_str())
-                        })
-                        .filter_map(|e| e["version"].as_u64())
-                        .max()
-                        .unwrap_or(0);
-                    let v = crate::capability::hlc_next(existing_ver, crate::capability::now_ms());
                     let now = crate::capability::now_secs();
-                    let mut op = crate::capability::CapOp {
-                        op: crate::capability::CapOpKind::Revoke,
-                        grantor: pk,
-                        target_kind: 0x00, // User
-                        target: target_arr,
-                        resource: "self".to_string(),
-                        permissions: vec![capability.clone()],
-                        expires: now.saturating_add(90 * 24 * 3600),
-                        issued_at: now,
-                        version: v,
-                        sig: [0u8; 64],
+                    // The revoke names the same key the grant named: the
+                    // DEVICE key by default, the user key with `--user`. See
+                    // device_caps::GrantScope.
+                    let scope = if user {
+                        crate::device_caps::GrantScope::User
+                    } else {
+                        crate::device_caps::GrantScope::Device
                     };
-                    op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
-                    match crate::capability::apply_cap_op(&mut store, &hdr, &op, now) {
+                    // A user-wide grant (made with `--user`, or by a release
+                    // that targeted every grant at the user key) still covers
+                    // this device after its own grant is revoked, so revoking
+                    // only the device key would print success and change
+                    // nothing. signed_revoke_ops takes the user-wide grant
+                    // too, and we say who else it covered.
+                    let (ops, also_user_wide) = crate::device_caps::signed_revoke_ops(
+                        &store,
+                        &user_key,
+                        &peer_cert,
+                        &capability,
+                        scope,
+                    );
+                    if also_user_wide {
+                        let others: Vec<String> = crate::certified_device_names(&peer_cert.user_pub)
+                            .into_iter()
+                            .map(|(n, _)| n)
+                            .filter(|n| n != &device)
+                            .collect();
+                        ui::say(&format!(
+                            "'{capability}' was also granted user-wide to the user key of '{device}'; revoking that too{}",
+                            if others.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    ", which also removes it from {} unless they hold their own grant",
+                                    others.join(", ")
+                                )
+                            }
+                        ));
+                    }
+                    let applied = ops
+                        .iter()
+                        .try_for_each(|op| crate::capability::apply_cap_op(&mut store, &hdr, op, now));
+                    match applied {
                         Ok(()) => {
                             let revoked =
                                 crate::capability::save_and_list_revoked(&store, &config_dir)
@@ -1930,11 +2379,17 @@ pub(crate) async fn async_main() -> Result<()> {
             }
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
-                println!(
-                    "revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block."
+                crate::outln!(
+                    "revoked 'shell' from '{device}' and removed its tunlion-managed authorized_keys block."
                 );
             } else {
-                println!("revoked '{capability}' from '{device}'.");
+                crate::outln!("revoked '{capability}' from '{device}'.");
+            }
+            if capability == "shell" && crate::daemon_alive().is_some() {
+                ui::say(&ui::paint(
+                    ui::Tone::Dim,
+                    "  the running daemon applies this now; no restart needed",
+                ));
             }
             if let Some(warning) = fleet_certificate_warning(&device) {
                 eprintln!("{warning}");
@@ -1974,7 +2429,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                     "restart the daemon without it, or scope it: tunlion up --shell-only <others>"
                                 ),
                                 format!(
-                                    "or remove the device entirely: tunlion devices forget {device}"
+                                    "or remove the device entirely: tunlion devices forget {device} -y"
                                 ),
                             ],
                         );
@@ -2016,12 +2471,25 @@ pub(crate) async fn async_main() -> Result<()> {
                 mount::check_cmd(&path)
             } else {
                 if options.is_some() || foreground || save_auto {
-                    bail!(
+                    crate::bail_usage!(
                         "--options, --foreground, and --save-auto belong to the retired sshfs path and are not supported by mesh-native mount"
                     );
                 }
+                // A missing local prerequisite (no FUSE) is a problem with this
+                // machine's setup, not a failure of the mount: exit 2 (usage:
+                // bad input or environment), before anything connects.
+                crate::platform::mount_prerequisite().map_err(|m| {
+                    crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, m)
+                })?;
                 let plan = resolve_mount_plan(&ui_caps, peer, remote, local, read_write)?;
                 require_known_device(&plan.peer)?;
+                // Before any network work, and long before a "mounted." line:
+                // FUSE itself must be usable here. Without this, a missing
+                // /dev/fuse or fusermount3 printed "ok mounted." and then a bare
+                // "No such file or directory (os error 2)".
+                if let Err(why) = crate::platform::fuse_prerequisites() {
+                    bail!("cannot mount here: {why}");
+                }
                 let client = l2::mount_cmd(&server, &plan.peer, relay, &plan.remote).await?;
                 #[cfg(any(
                     target_os = "linux",
@@ -2043,7 +2511,8 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
-        Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
+        Cmd::Skill { action } => crate::skill::skill_cmd(action, ui_caps.json || cli.json),
+        Cmd::Dashboard { no_open, port } => crate::dashboard::dashboard_cmd(no_open, port, &server).await,
         Cmd::Backup {
             peer,
             source,
@@ -2060,4 +2529,75 @@ pub(crate) async fn async_main() -> Result<()> {
             .await
         }
     }
+}
+
+/// `add ... --via code` with no terminal: print the refusal addressed to the
+/// arguments that were given, and fail as a usage error (exit 2).
+fn add_code_needs_people(named: Option<&str>) -> anyhow::Error {
+    let (message, _) = fleet_ui::pair_ui::err_add_code_noninteractive(named);
+    ui::critical(&message);
+    crate::exit_codes::reported(crate::exit_codes::ExitKind::Usage)
+}
+
+/// The rows of `devices --json` (`data.devices`), one per stored device: what
+/// the gate enforces now, liveness from the daemon's answering links, and the
+/// address. Shared by `devices --json` and the dashboard so both say the same.
+pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
+    let warm = answering_links(ctl::try_list_warm().await).await;
+    let online: std::collections::HashMap<String, Option<bool>> =
+        device_entries(warm.as_ref())
+            .into_iter()
+            .map(|e| (e.name, e.online))
+            .collect();
+    let records: Vec<Value> = std::fs::read_to_string(crate::devices_store::devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let now = identity::now_secs();
+    let arr: Vec<Value> = all
+        .iter()
+        .map(|(n, s)| {
+            let (last_seen, v6, v4) =
+                devices_info(n).unwrap_or((0, None, None));
+            let addr = v6.clone().or_else(|| v4.clone()).unwrap_or_default();
+            let mesh = format!("{n}.mesh");
+            // What the gate enforces now: state, effective
+            // caps, cert expiry and the access deadline.
+            let access = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(n.as_str()))
+                .map(|r| crate::device_caps::device_access_json(r, now))
+                .unwrap_or_else(|| json!({ "state": "active", "effectiveCaps": effective_device_caps(n) }));
+            // `caps` IS the effective set: empty once the
+            // device expired, lapsed or was revoked.
+            let caps = access["effectiveCaps"].clone();
+            json!({
+                "name": n,
+                "channel": channel_of(s),
+                "caps": caps,
+                "grantedCaps": access["grantedCaps"].clone(),
+                "state": access["state"].clone(),
+                "certExpires": access["certExpires"].clone(),
+                "accessUntil": access["accessUntil"].clone(),
+                "invitationEnds": access["invitationEnds"].clone(),
+                "lastSeen": last_seen,
+                "address": addr,
+                "mesh": mesh,
+                // Live, not remembered: the daemon holds a
+                // link to it AND the device answered a
+                // liveness ping on that link just now.
+                "online": online.get(n).copied().flatten(),
+                // The human row's word for the same
+                // value: "idle" is online:false (no
+                // answering link right now), not a
+                // second opinion.
+                "status": match online.get(n).copied().flatten() {
+                    Some(true) => json!("online"),
+                    Some(false) => json!("idle"),
+                    None => Value::Null,
+                },
+            })
+        })
+        .collect();
+    arr
 }

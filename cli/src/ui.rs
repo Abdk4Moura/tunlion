@@ -35,13 +35,13 @@ pub enum Level {
 static VERBOSITY: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
 /// Resolve and install the global verbosity ONCE, at startup. Precedence:
-///   1. `FILAMENT_LOG=<critical|info|debug|trace>` env, OVERRIDES the flags.
+///   1. `TUNLION_LOG=<critical|info|debug|trace>` env, OVERRIDES the flags.
 ///   2. otherwise the clap flags: `-q/--quiet` -> critical; repeated `-v` raises
 ///      info -> debug -> trace (count saturates at trace).
 ///   3. persistent `verbosity` setting (e.g. `tunlion set verbosity debug`).
 /// Call this from `main` right after parsing, before any worker spawns.
 pub fn init_verbosity(verbose: u8, quiet: bool) {
-    let level = if let Ok(s) = std::env::var("FILAMENT_LOG") {
+    let level = if let Ok(s) = std::env::var("TUNLION_LOG") {
         match s.trim().to_ascii_lowercase().as_str() {
             "critical" | "crit" | "quiet" | "q" => Level::Critical,
             "info" => Level::Info,
@@ -93,9 +93,19 @@ pub fn enabled(lvl: Level) -> bool {
 
 pub struct Caps {
     pub tty: bool,
+    /// Redraw in place (progress bar, spinner, erase-line): a tty that is not
+    /// `TERM=dumb`. A dumb terminal promises no control sequences, and
+    /// `ESC[2K` landed there as literal noise on every progress tick.
+    pub live: bool,
     pub color: bool,
-    pub truecolor: bool,
     pub unicode: bool,
+    /// How many colors the terminal shows (see `style::depth_from`).
+    pub depth: crate::style::Depth,
+    /// The terminal's background when known, so the palette can pick the
+    /// tuning that reads best on it (see `style::bg_from`).
+    pub bg: crate::style::Bg,
+    /// `TUNLION_REDUCED_MOTION`: the pulse and knock stay still.
+    pub reduced_motion: bool,
 }
 
 pub fn caps() -> &'static Caps {
@@ -103,30 +113,192 @@ pub fn caps() -> &'static Caps {
     C.get_or_init(|| {
         let tty = std::io::stderr().is_terminal();
         let term = std::env::var("TERM").unwrap_or_default();
-        let color = match std::env::var("FILAMENT_COLOR").as_deref() {
+        let color = match std::env::var("TUNLION_COLOR").as_deref() {
             Ok("always") => true,
             Ok("never") => false,
             _ => tty && std::env::var_os("NO_COLOR").is_none() && term != "dumb",
         };
-        let truecolor = color
-            && std::env::var("COLORTERM")
-                .map(|v| v.contains("truecolor") || v.contains("24bit"))
-                .unwrap_or(false);
-        let unicode = std::env::var("LC_ALL")
-            .or_else(|_| std::env::var("LC_CTYPE"))
-            .or_else(|_| std::env::var("LANG"))
-            .map(|v| v.to_uppercase().contains("UTF"))
-            .unwrap_or(cfg!(windows)); // Windows Terminal is UTF-16 native
-        Caps { tty, color, truecolor, unicode }
+        let var = |k: &str| std::env::var(k).ok();
+        let unicode = unicode_from(var("LC_ALL"), var("LC_CTYPE"), var("LANG"), &term);
+        let live = live_from(tty, &term);
+        let depth = crate::style::depth_from(var("COLORTERM").as_deref(), &term);
+        let bg = crate::style::bg_from(var("TUNLION_THEME").as_deref(), var("COLORFGBG").as_deref());
+        let reduced_motion = crate::style::reduced_motion_from(var("TUNLION_REDUCED_MOTION").as_deref());
+        Caps { tty, live, color, unicode, depth, bg, reduced_motion }
     })
+}
+
+/// Whether stderr can be redrawn in place: a tty whose TERM is not `dumb`.
+/// Pure.
+pub fn live_from(tty: bool, term: &str) -> bool {
+    tty && term != "dumb"
+}
+
+/// Whether to print Unicode glyphs, from the locale and the terminal. Pure.
+///
+/// POSIX order: the first of LC_ALL, LC_CTYPE, LANG that is set AND non-empty
+/// decides (an empty LC_ALL is unset, not "C"). `TERM=dumb` is ASCII whatever
+/// the locale: a dumb terminal promises nothing beyond it. With no locale at
+/// all, Windows (UTF-16 native consoles) says yes and everything else no.
+pub fn unicode_from(lc_all: Option<String>, lc_ctype: Option<String>, lang: Option<String>, term: &str) -> bool {
+    if term == "dumb" {
+        return false;
+    }
+    [lc_all, lc_ctype, lang]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(|v| v.to_uppercase().contains("UTF"))
+        .unwrap_or(cfg!(windows))
+}
+
+/// The glyphs human lines use, and their ASCII stand-ins. Applied to every
+/// line `emit` prints when the terminal or locale is not Unicode (`LANG=C`,
+/// `TERM=dumb`), so a glyph written inline at a call site (`✓`, `⚡ warm`,
+/// `○ cold`, `→`, `●`) cannot reach an ASCII terminal as mojibake. Only these
+/// characters are mapped: a file name with other non-ASCII letters is the
+/// user's data and passes through.
+const ASCII_GLYPHS: &[(char, &str)] = &[
+    ('✓', "ok"),
+    ('✗', "x"),
+    ('⚡', "*"),
+    ('→', "->"),
+    ('←', "<-"),
+    ('↳', "->"),
+    ('●', "*"),
+    ('○', "o"),
+    ('◐', "o"),
+    ('◇', "<>"),
+    ('⚠', "!"),
+    ('•', "*"),
+    ('·', "-"),
+    ('─', "-"),
+    ('━', "="),
+    ('╸', "-"),
+    ('…', "..."),
+];
+
+/// `line` with every known glyph replaced by its ASCII stand-in. Pure.
+pub fn ascii_glyphs(line: &str) -> String {
+    if line.is_ascii() {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        match ASCII_GLYPHS.iter().find(|(g, _)| *g == c) {
+            Some((_, a)) => out.push_str(a),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------ daemon log --
+//
+// A detached daemon's stderr IS daemon.log. Its lines had no time on them,
+// and status lines repeated without bound ("ok L3 peer ..." twice per
+// reconnect, "known device 'beta' appeared" 14 times in 150 lines).
+//
+// - In daemon-log mode (the daemon's stderr is not a terminal) every line
+//   starts with an ISO-8601 UTC timestamp.
+// - A repeating STATUS line goes through `say_folded`: a copy within
+//   DEDUP_WINDOW of its last printing is folded into a count that rides on
+//   its next printing. Folding is opt-in per call site on purpose: refusals,
+//   errors and anything a person or a gate counts stay one line per event.
+
+static DAEMON_LOG: AtomicBool = AtomicBool::new(false);
+const DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounds the memory the fold uses; a daemon prints far fewer distinct lines.
+const DEDUP_MAX: usize = 512;
+
+type FoldMap = std::collections::HashMap<String, (Instant, u64)>;
+/// line -> (when it was last PRINTED, how many copies were folded since)
+static FOLD: std::sync::Mutex<Option<FoldMap>> = std::sync::Mutex::new(None);
+
+/// Turn daemon-log mode on (the daemon calls this when its stderr is a file).
+pub fn set_daemon_log(on: bool) {
+    DAEMON_LOG.store(on, Ordering::Relaxed);
+}
+
+/// What the fold does with `line` seen at `now`. Pure over the map.
+/// `None`: fold it (a copy within the window). `Some(n)`: print it, noting
+/// `n` folded copies since it last printed.
+fn fold_decision(seen: &mut FoldMap, line: &str, now: Instant) -> Option<u64> {
+    if seen.len() >= DEDUP_MAX && !seen.contains_key(line) {
+        seen.retain(|_, (t, _)| now.duration_since(*t) < DEDUP_WINDOW);
+        if seen.len() >= DEDUP_MAX {
+            seen.clear();
+        }
+    }
+    match seen.get_mut(line) {
+        Some((t, n)) if now.duration_since(*t) < DEDUP_WINDOW => {
+            *n += 1;
+            None
+        }
+        Some((t, n)) => {
+            let folded = *n;
+            *t = now;
+            *n = 0;
+            Some(folded)
+        }
+        None => {
+            seen.insert(line.to_string(), (now, 0));
+            Some(0)
+        }
+    }
+}
+
+/// A folded line's text: the count of copies folded since it last printed. Pure.
+pub fn folded_line(line: &str, folded: u64) -> String {
+    match folded {
+        0 => line.to_string(),
+        n => format!("{line}  (and {n} more like it in the last {}s)", DEDUP_WINDOW.as_secs()),
+    }
+}
+
+/// A daemon-log line: the ISO timestamp first. Pure.
+pub fn stamped_line(stamp: &str, line: &str) -> String {
+    format!("{stamp} {line}")
+}
+
+/// INFO level, for a status line a daemon repeats (a peer appearing, a route
+/// coming up): printed at most once per DEDUP_WINDOW per distinct text, with
+/// the number of copies it stood for.
+pub fn say_folded(line: &str) {
+    if !enabled(Level::Info) {
+        return;
+    }
+    let folded = match FOLD.lock() {
+        Ok(mut g) => match fold_decision(g.get_or_insert_with(FoldMap::new), line, Instant::now()) {
+            Some(n) => n,
+            None => return,
+        },
+        // A poisoned fold never costs a line: print it unfolded.
+        Err(_) => 0,
+    };
+    emit(&folded_line(line, folded));
+}
+
+/// The line as it is written: ASCII glyphs on an ASCII terminal, and the
+/// timestamp in daemon-log mode.
+fn decorate(line: &str) -> String {
+    let line = if caps().unicode { line.to_string() } else { ascii_glyphs(line) };
+    if !DAEMON_LOG.load(Ordering::Relaxed) {
+        return line;
+    }
+    let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    stamped_line(&stamp, &line)
 }
 
 // ------------------------------------------------------------------ paint --
 
 #[derive(Clone, Copy)]
 pub enum Tone {
-    /// the brand: tunlion green (#7CF6C8)
+    /// The brand: the warm accent of the tunnel mark, bold. Commands to type,
+    /// codes, section headings.
     Brand,
+    /// The same accent without the weight: progress fill, the active choice.
+    Accent,
     Ok,
     Err,
     Warn,
@@ -134,15 +306,17 @@ pub enum Tone {
     Bold,
 }
 
-fn ansi_code(tone: Tone, truecolor: bool) -> &'static str {
+/// The escape that starts `tone`, from the design palette (`style`).
+fn ansi_code(tone: Tone, depth: crate::style::Depth, bg: crate::style::Bg) -> String {
+    use crate::style::{sgr, Role};
     match tone {
-        Tone::Brand if truecolor => "\x1b[1;38;2;124;246;200m",
-        Tone::Brand => "\x1b[1;92m",
-        Tone::Ok => "\x1b[32m",
-        Tone::Err => "\x1b[31m",
-        Tone::Warn => "\x1b[33m",
-        Tone::Dim => "\x1b[2m",
-        Tone::Bold => "\x1b[1m",
+        Tone::Brand => sgr(Role::Accent, true, depth, bg),
+        Tone::Accent => sgr(Role::Accent, false, depth, bg),
+        Tone::Ok => sgr(Role::Ok, false, depth, bg),
+        Tone::Err => sgr(Role::Bad, false, depth, bg),
+        Tone::Warn => sgr(Role::Warn, false, depth, bg),
+        Tone::Dim => sgr(Role::Sub, false, depth, bg),
+        Tone::Bold => sgr(Role::Strong, false, depth, bg),
     }
 }
 
@@ -151,15 +325,101 @@ pub fn paint(tone: Tone, s: &str) -> String {
     if !c.color {
         return s.to_string();
     }
-    format!("{}{s}\x1b[0m", ansi_code(tone, c.truecolor))
+    format!("{}{s}\x1b[0m", ansi_code(tone, c.depth, c.bg))
+}
+
+/// The escape that starts `tone` on stderr, or nothing when color is off.
+/// For renderers that write their own lines (pickers, the code entry).
+pub fn tone_code(tone: Tone) -> String {
+    let c = caps();
+    if c.color { ansi_code(tone, c.depth, c.bg) } else { String::new() }
+}
+
+/// The escape that ends a `tone_code` span, or nothing when color is off.
+pub fn tone_reset() -> &'static str {
+    if caps().color { "\x1b[0m" } else { "" }
+}
+
+/// A heading of `/`-separated parts (`TUNLION  /  3 DEVICES  /  AVAILABLE`,
+/// `FLEET  /  your devices`): the first part in `lead`, the separators faint,
+/// the rest in `rest`. The text is unchanged, so a pipe reads it as before.
+pub fn header(lead: Tone, rest: Tone, s: &str) -> String {
+    const SEP: &str = "  /  ";
+    let mut parts = s.split(SEP);
+    let mut out = paint(lead, parts.next().unwrap_or(""));
+    for p in parts {
+        out.push_str(&paint(Tone::Dim, SEP));
+        out.push_str(&paint(rest, p));
+    }
+    out
+}
+
+/// `s` without terminal escapes: SGR color codes and OSC 8 links (the link
+/// text stays). Pure.
+pub fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match it.peek() {
+            Some('[') => {
+                // CSI: parameters and intermediates up to a final byte @..~
+                it.next();
+                for d in it.by_ref() {
+                    if ('@'..='~').contains(&d) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: up to BEL or ST (ESC \)
+                it.next();
+                while let Some(d) = it.next() {
+                    if d == '\x07' {
+                        break;
+                    }
+                    if d == '\x1b' && it.peek() == Some(&'\\') {
+                        it.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Print a human line to STDOUT. Lines are painted against stderr's terminal
+/// (`caps`), so when stdout is piped or redirected while stderr is a terminal
+/// (`tunlion devices | less`, `> file`) the escapes are removed here: a pipe
+/// always reads plain text.
+pub fn out_line(s: &str) {
+    // println! (not writeln!) on purpose: a closed pipe must take the same
+    // path as every other stdout write (see exit_quietly_on_broken_pipe).
+    let line = if stdout_color() { s.to_string() } else { strip_ansi(s) };
+    println!("{line}");
+}
+
+/// `println!` for human output on stdout, through `ui::out_line`.
+#[macro_export]
+macro_rules! outln {
+    () => { $crate::ui::out_line("") };
+    ($($t:tt)*) => { $crate::ui::out_line(&format!($($t)*)) };
 }
 
 /// Color decision for STDOUT specifically (the `set`/`get` readout surface).
 /// `caps()` is stderr-scoped; stdout must be judged on its OWN tty-ness so that
 /// piped output never carries ANSI (clig.dev: humans first, machines second).
-/// Same env contract as `caps()`: NO_COLOR, TERM=dumb, FILAMENT_COLOR=never|always.
+/// Same env contract as `caps()`: NO_COLOR, TERM=dumb, TUNLION_COLOR=never|always.
 pub fn stdout_color() -> bool {
-    match std::env::var("FILAMENT_COLOR").as_deref() {
+    match std::env::var("TUNLION_COLOR").as_deref() {
         Ok("never") => return false,
         Ok("always") => return true,
         _ => {}
@@ -175,16 +435,15 @@ pub fn paint_when(color: bool, tone: Tone, s: &str) -> String {
     if !color {
         return s.to_string();
     }
-    let truecolor = std::env::var("COLORTERM")
-        .map(|v| v.contains("truecolor") || v.contains("24bit"))
-        .unwrap_or(false);
-    format!("{}{s}\x1b[0m", ansi_code(tone, truecolor))
+    // Depth and background are properties of the terminal, not the stream, so
+    // the stderr-scoped caps give the right answer for stdout too.
+    let c = caps();
+    format!("{}{s}\x1b[0m", ansi_code(tone, c.depth, c.bg))
 }
 
 pub fn glyph_ok() -> &'static str {
     if caps().unicode { "✓" } else { "ok" }
 }
-#[allow(dead_code)] // part of the glyph set; error paths adopt it next
 pub fn glyph_err() -> &'static str {
     if caps().unicode { "✗" } else { "x" }
 }
@@ -213,6 +472,11 @@ pub fn glyph_echo() -> &'static str {
     if caps().unicode { "↳" } else { "->" }
 }
 
+/// The `Error:` label in front of a failure, in the failure color.
+pub fn error_label() -> String {
+    paint(Tone::Err, "Error:")
+}
+
 /// OSC 8 hyperlink (clickable in modern terminals); plain text elsewhere.
 pub fn link(url: &str, text: &str) -> String {
     if caps().color {
@@ -224,11 +488,16 @@ pub fn link(url: &str, text: &str) -> String {
 
 /// OSC 52: put `s` on the terminal's clipboard (silently unsupported in some
 /// terminals; harmless there). Only on a tty.
-pub fn clipboard(s: &str) {
+/// Offer `s` to the terminal's clipboard (OSC 52). Returns whether it can
+/// plausibly have landed: written to a terminal AND a session with a
+/// clipboard behind it. Callers claim "(copied to clipboard)" only on `true`.
+pub fn clipboard(s: &str) -> bool {
     use base64_mini::enc;
-    if caps().tty {
-        eprint!("\x1b]52;c;{}\x07", enc(s.as_bytes()));
+    if caps().live {
+        err_write(&format!("\x1b]52;c;{}\x07", enc(s.as_bytes())));
+        return crate::platform::clipboard_reachable();
     }
+    false
 }
 
 mod base64_mini {
@@ -254,9 +523,19 @@ mod base64_mini {
 static LIVE: AtomicBool = AtomicBool::new(false);
 
 fn clear_live() {
-    if LIVE.swap(false, Ordering::Relaxed) && caps().tty {
-        eprint!("\r\x1b[2K");
+    if LIVE.swap(false, Ordering::Relaxed) && caps().live {
+        err_write("\r\x1b[2K");
     }
+}
+
+/// Write to stderr WITHOUT the print macros' panic on a closed pipe. Human
+/// output is a side channel of the work: a reader that stopped reading it
+/// (`send f --to b 2>&1 | head -1`) must not end the work. The write error is
+/// dropped; the command finishes and exits with its real result.
+fn err_write(s: &str) {
+    let mut e = std::io::stderr().lock();
+    let _ = e.write_all(s.as_bytes());
+    let _ = e.flush();
 }
 
 // Sticky status (C22): an open question or countdown survives interleaved
@@ -267,21 +546,115 @@ static STICKY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn paint_live(line: &str) {
     clear_live();
-    eprint!("{line}");
-    let _ = std::io::stderr().flush();
+    err_write(line);
     LIVE.store(true, Ordering::Relaxed);
 }
+
+// ------------------------------------------------------------- broken pipe --
+
+/// A reader that stopped reading is not a failure of this command.
+///
+/// `tunlion status | head -2` exited 101 with a Rust panic: Rust ignores
+/// SIGPIPE, so every write after `head` exits returns EPIPE, and `println!` /
+/// `eprintln!` panic on any write error. Standard tools die quietly there
+/// (SIGPIPE); this does the equivalent for the output macros everywhere at
+/// once: a panic whose cause is a print hitting a closed pipe ends the command
+/// with nothing more on the terminal, and every other panic reports exactly as
+/// before. The process exits with the code the command had ALREADY decided on
+/// (`exit_code_on_closed_pipe`), else 0, as ripgrep does: the consumer asked
+/// for less, and a pipeline under `set -o pipefail` must not fail because
+/// `head` did its job. A command whose answer IS its exit code decides it
+/// before printing: `status` with no daemon exits 11 piped into `head` exactly
+/// as it does unpiped (it exited 0 there, losing the answer a script needed).
+///
+/// SIGPIPE itself stays ignored on purpose. Restoring its default would also
+/// kill the daemon on any write to a peer or a child that went away, which is
+/// exactly the case the ignored signal exists for.
+pub fn exit_quietly_on_broken_pipe() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if is_broken_pipe_print(payload) {
+            std::process::exit(CLOSED_PIPE_EXIT.load(Ordering::Relaxed));
+        }
+        previous(info);
+    }));
+}
+
+/// The exit code a closed pipe ends the command with: 0 unless the command
+/// has already decided its answer, or the command is an ACTION (below).
+static CLOSED_PIPE_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// 128 + SIGPIPE, what a shell reports for a process SIGPIPE killed.
+pub const CLOSED_PIPE_UNFINISHED: i32 = 141;
+
+/// Verbs that only LOOK: when their reader stops reading, nothing is left
+/// undone, so a closed pipe exits with the code they decided (0 by default),
+/// as `head` asked. Every other verb is an action (send, sync, exec, receive,
+/// add, ...): its work is not finished when its output stops being read.
+const READ_ONLY_VERBS: &[&str] = &[
+    "status", "devices", "logs", "reach", "doctor", "id", "addr", "requests", "completions", "man",
+    "help",
+];
+
+/// The closed-pipe exit for this verb before it decides anything. `None` is
+/// bare `tunlion` (the tour) or `--help`/`--version`: read-only.
+///
+/// An action whose reader went away must never exit 0 for work it did not do:
+/// `tunlion send f --to beta 2>&1 | head -1` exited 0 in 0.6 s with nothing
+/// delivered, because the second human line panicked into this hook. Human
+/// lines no longer panic (`err_write`), so an action keeps working silently
+/// and exits with its real result. This default covers what is left: a bare
+/// print to a closed STDOUT inside an action ends it with 141, never 0.
+pub fn closed_pipe_default(verb: Option<&str>) -> i32 {
+    match verb {
+        None => 0,
+        Some(v) if READ_ONLY_VERBS.contains(&v) => 0,
+        Some(_) => CLOSED_PIPE_UNFINISHED,
+    }
+}
+
+/// Record the verb on the command line, once, before anything prints.
+pub fn set_closed_pipe_verb(verb: Option<&str>) {
+    CLOSED_PIPE_EXIT.store(closed_pipe_default(verb), Ordering::Relaxed);
+}
+
+/// Record the exit code this command has decided on, BEFORE it prints, so a
+/// reader that closes the pipe early (`| head -1`) does not turn the answer
+/// into 0. Only for commands whose exit code is the answer; everything else
+/// keeps the default, 0.
+pub fn exit_code_on_closed_pipe(code: i32) {
+    CLOSED_PIPE_EXIT.store(code, Ordering::Relaxed);
+}
+
+/// True for the panic std raises when `print!`/`eprint!` hit a closed pipe:
+/// "failed printing to stdout: Broken pipe (os error 32)". Windows words EPIPE
+/// as "The pipe is being closed. (os error 232)".
+pub fn is_broken_pipe_print(msg: &str) -> bool {
+    msg.starts_with("failed printing to")
+        && (msg.contains("Broken pipe") || msg.contains("os error 32)") || msg.contains("os error 232)"))
+}
+// Deliberately NOT also "any error whose cause is BrokenPipe": a peer socket
+// or a child's stdin closing mid-transfer is a real failure of the command,
+// and exiting 0 on it would report a send that did not happen as a success.
+// Only the print macros' own panic names our stdout or stderr for certain.
 
 /// Permanent line (survives in scrollback); repaints any sticky line below.
 /// The raw emitter, every leveled helper funnels through here once it has
 /// decided the line is in-budget. Use the leveled helpers (`critical`/`say`/
 /// `debug`/`trace`) at call sites so the verbosity gate is applied.
 fn emit(line: &str) {
+    let line = decorate(line);
     clear_live();
-    eprintln!("{line}");
+    err_write(&format!("{line}\n"));
     if let Ok(s) = STICKY.lock() {
         if let Some(st) = s.as_ref() {
-            if caps().tty {
+            if caps().live {
                 paint_live(st);
             }
         }
@@ -295,6 +668,29 @@ pub fn say(line: &str) {
     if enabled(Level::Info) {
         emit(line);
     }
+}
+
+/// One machine-readable JSON document on STDOUT, a line of its own. The
+/// `--json` result and failure envelopes go through here rather than a bare
+/// print so stdout carries exactly what a script parses and nothing else; it
+/// is never verbosity-gated, because a `-q` script still needs its answer.
+pub fn json_out(v: &serde_json::Value) {
+    // This command's answer is on stdout now; an interrupt after this must
+    // not add a second document (exit_codes::report_interrupted).
+    crate::exit_codes::note_json_answered();
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{v}");
+    let _ = out.flush();
+}
+
+/// An EVENT line on STDOUT under `--json`, ahead of the command's one result
+/// object (`send --json` with a code prints `{"event":"code",...}` first).
+/// Unlike [`json_out`] it does not count as the answer: the result object,
+/// or the interrupt failure object, still follows.
+pub fn json_event(v: &serde_json::Value) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{v}");
+    let _ = out.flush();
 }
 
 /// CRITICAL level: the value-prop + must-see lines, the route label, the relay
@@ -314,7 +710,7 @@ pub fn critical(line: &str) {
 /// pipe). Steps are pre-formatted by the caller, so a step may embed a command in
 /// the brand accent, e.g. `paint(Tone::Brand, "tunlion pty box")`.
 pub fn problem(headline: &str, detail: &str, steps: &[String]) {
-    critical(&format!("{} {}", paint(Tone::Err, "✗"), paint(Tone::Bold, headline)));
+    critical(&format!("{} {}", paint(Tone::Err, glyph_err()), paint(Tone::Bold, headline)));
     if !detail.is_empty() {
         critical(&format!("  {detail}"));
     }
@@ -357,7 +753,7 @@ pub fn debug(line: &str) {
     }
 }
 
-/// TRACE level (`-vv` / `FILAMENT_LOG=trace`): ICE candidates, per-frame,
+/// TRACE level (`-vv` / `TUNLION_LOG=trace`): ICE candidates, per-frame,
 /// signaling / direct-offer detail. No-op below trace.
 pub fn trace(line: &str) {
     if enabled(Level::Trace) {
@@ -370,7 +766,7 @@ pub fn trace(line: &str) {
 /// keypress) outranks transients, progress bars wait their turn rather than
 /// hiding the question (C23: users answered questions they couldn't see).
 pub fn status(line: &str) {
-    if !caps().tty {
+    if !caps().live {
         return;
     }
     if let Ok(s) = STICKY.lock() {
@@ -385,30 +781,67 @@ pub fn status(line: &str) {
 /// bare eprint would land inside whatever transient line is on screen).
 pub fn answer_echo(c: char) {
     clear_live();
-    eprintln!("  {} {}", paint(Tone::Dim, "↳"), paint(Tone::Bold, &c.to_string()));
+    err_write(&format!("  {} {}\n", paint(Tone::Dim, glyph_echo()), paint(Tone::Bold, &c.to_string())));
 }
 
 /// A status line that survives interleaved say()s until cleared, for open
 /// questions and countdowns.
 pub fn sticky(line: &str) {
-    if let Ok(mut s) = STICKY.lock() {
-        *s = Some(line.to_string());
+    let was_open = STICKY
+        .lock()
+        .map(|mut s| s.replace(line.to_string()).is_some())
+        .unwrap_or(false);
+    let c = caps();
+    if c.tty && !c.live {
+        // TERM=dumb: no line to repaint, so a new question (or the first
+        // frame of a countdown) is printed once, plainly, rather than not at
+        // all, and its later updates are not.
+        if !was_open {
+            err_write(&format!("{line}\n"));
+        }
+        return;
     }
     status(line);
 }
 
+/// A sticky line for a question that waits on the user: the knock in front of
+/// it says "your move". Live terminals only, like `sticky`; the permanent copy
+/// of the question is printed with `say` and stays unmarked.
+pub fn sticky_ask(line: &str) {
+    sticky(&format!("  {} {}", knock(), line.trim_start()));
+}
+
 pub fn clear_sticky() {
     let had = STICKY.lock().map(|mut s| s.take().is_some()).unwrap_or(false);
-    if had && caps().tty {
+    if had && caps().live {
         clear_live();
     }
 }
 
+/// Milliseconds since the process started: the clock both motifs run on.
+fn motion_ms() -> u128 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// The waiting indicator: the design's pulse (the cursor squashes on a `|..||`
+/// rhythm), for a wait on the OTHER side. Callers redraw it every ~120 ms.
 pub fn spinner_frame() -> char {
-    const U: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
-    const A: [char; 4] = ['|', '/', '-', '\\'];
-    let t = (Instant::now().elapsed().as_millis() / 80) as usize; // monotonic-ish
-    if caps().unicode { U[t % 8] } else { A[t % 4] }
+    let c = caps();
+    crate::style::pulse_frame(motion_ms(), c.unicode, c.reduced_motion)
+}
+
+/// The pulse, painted in the accent: ready to put at the front of a status line.
+pub fn pulse() -> String {
+    paint(Tone::Accent, &spinner_frame().to_string())
+}
+
+/// The design's knock (three hops of the cursor), painted in the accent: for a
+/// line where something waits on YOU (a question, an approval). Static lines
+/// get the resting frame; a redrawn line animates.
+pub fn knock() -> String {
+    let c = caps();
+    paint(Tone::Accent, &crate::style::knock_frame(motion_ms(), c.unicode, c.reduced_motion).to_string())
 }
 
 // ------------------------------------------------------------- progress bar --
@@ -434,7 +867,7 @@ impl Progress {
         }
     }
 
-    /// Thin filament-style bar: done in brand green (━), boundary ╸, rest dim.
+    /// Thin bar: done in the accent (━), boundary ╸, rest dim.
     pub fn tick(&mut self, bytes: u64) {
         let now = Instant::now();
         if now.duration_since(self.last_draw).as_millis() < 100 {
@@ -446,7 +879,7 @@ impl Progress {
         self.rate_ema = if self.rate_ema == 0.0 { inst } else { 0.85 * self.rate_ema + 0.15 * inst };
         self.last_draw = now;
         self.last_bytes = bytes;
-        if !caps().tty {
+        if !caps().live {
             return;
         }
         let frac = (bytes as f64 / self.total.max(1) as f64).min(1.0);
@@ -456,7 +889,7 @@ impl Progress {
             let done = "━".repeat(filled.min(width));
             let edge = if filled < width { "╸" } else { "" };
             let rest = "─".repeat(width - filled - if filled < width { 1 } else { 0 });
-            format!("{}{}{}", paint(Tone::Brand, &done), paint(Tone::Brand, edge), paint(Tone::Dim, &rest))
+            format!("{}{}{}", paint(Tone::Accent, &done), paint(Tone::Accent, edge), paint(Tone::Dim, &rest))
         } else {
             let done = "=".repeat(filled.min(width));
             let rest = "-".repeat(width - filled);
@@ -495,7 +928,7 @@ impl Progress {
             paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
         ));
         if caps().tty && secs > 30.0 {
-            eprint!("\x07");
+            err_write("\x07");
         }
     }
 }
@@ -523,7 +956,7 @@ pub fn transfer_summary(label: &str, bytes: u64, secs: f64) {
         paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
     ));
     if caps().tty && secs > 30.0 {
-        eprint!("\x07");
+        err_write("\x07");
     }
 }
 
@@ -674,17 +1107,50 @@ pub fn qr_or_text(url: &str, rows_used: usize) -> String {
     if qr_fits(url, rows_used) {
         qr(url)
     } else {
-        format!(
-            "  (the QR needs {} rows and this window has {}; the top would be cut off)\n  {url}",
-            qr_rows(url).unwrap_or(0),
-            crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(0),
-        )
+        match qr_too_tall_note(url, rows_used) {
+            Some(note) => format!("  {note}\n  {url}"),
+            None => format!("  {url}"),
+        }
     }
+}
+
+/// Why the QR is not drawn, when the reason is the window height. `None` when
+/// no QR could be drawn at all (no unicode, e.g. a plain or dumb terminal) or
+/// the height is unknown: "the QR needs 0 rows and this window has 40" was a
+/// sentence about a QR that never existed.
+pub fn qr_too_tall_note(url: &str, rows_used: usize) -> Option<String> {
+    let rows = qr_rows(url)?;
+    let height = crossterm::terminal::size().ok().map(|(_, h)| h as usize)?;
+    (rows_used + rows > height).then(|| {
+        format!("(the QR needs {rows} rows and this window has {height}; the top would be cut off)")
+    })
 }
 
 #[cfg(test)]
 mod verbosity_tests {
     use super::*;
+
+    /// D: the progress bar wrote ESC[2K under TERM=dumb. Only a tty that is
+    /// not dumb is redrawn in place.
+    #[test]
+    fn term_dumb_is_never_redrawn_in_place() {
+        assert!(!live_from(true, "dumb"));
+        assert!(!live_from(false, "xterm-256color"));
+        assert!(live_from(true, "xterm-256color"));
+        assert!(live_from(true, ""));
+    }
+
+    /// D: `-y` said "Accept every offer without prompting", but a code is
+    /// already consent and is never asked about; the help says so now.
+    #[test]
+    fn receive_yes_help_says_what_it_controls() {
+        let cmd = <crate::Cli as clap::CommandFactory>::command();
+        let recv = cmd.find_subcommand("receive").expect("receive");
+        let yes = recv.get_arguments().find(|a| a.get_id() == "yes").expect("-y");
+        let help = yes.get_help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help.contains("room") && help.contains("code"), "{help}");
+        assert!(!help.contains("every offer"), "{help}");
+    }
 
     #[test]
     fn flags_map_to_levels() {
@@ -721,5 +1187,146 @@ mod verbosity_tests {
 
         // restore default for any later same-process readers.
         VERBOSITY.store(Level::Info as u8, Ordering::Relaxed);
+    }
+
+    /// `tunlion status | head -2` exited 101: std panics with exactly this
+    /// text when a print hits a closed pipe. Only that panic is quiet; any
+    /// other panic, including one that merely mentions a pipe, still reports.
+    #[test]
+    fn only_a_print_into_a_closed_pipe_is_a_quiet_exit() {
+        assert!(is_broken_pipe_print("failed printing to stdout: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print("failed printing to stderr: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print(
+            "failed printing to stdout: The pipe is being closed. (os error 232)"
+        ));
+        assert!(!is_broken_pipe_print("failed printing to stdout: No space left on device (os error 28)"));
+        assert!(!is_broken_pipe_print("called `Result::unwrap()` on an `Err` value: Broken pipe"));
+        assert!(!is_broken_pipe_print("index out of bounds"));
+    }
+
+    /// A closed pipe ends the command with the code it had decided on, 0 by
+    /// default: `status | head -1` with no daemon must still exit 11.
+    #[test]
+    fn a_closed_pipe_keeps_the_decided_exit_code() {
+        use std::sync::atomic::Ordering;
+        assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 0, "default: a reader that stopped is not a failure");
+        super::exit_code_on_closed_pipe(11);
+        assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 11);
+        super::exit_code_on_closed_pipe(0);
+    }
+
+    /// J1: `send f --to beta 2>&1 | head -1` exited 0 with nothing delivered.
+    /// A read-only verb's closed pipe is the success `head` asked for; an
+    /// action's is never 0 for work it did not finish.
+    #[test]
+    fn a_closed_pipe_never_turns_undone_work_into_success() {
+        for v in ["status", "devices", "logs", "reach", "doctor", "id"] {
+            assert_eq!(super::closed_pipe_default(Some(v)), 0, "{v} only looks");
+        }
+        assert_eq!(super::closed_pipe_default(None), 0, "bare tunlion, --help");
+        for v in ["send", "sync", "exec", "receive", "backup", "add", "join", "up", "mount", "something-new"] {
+            assert_eq!(super::closed_pipe_default(Some(v)), 141, "{v} is an action");
+        }
+        assert_ne!(super::CLOSED_PIPE_UNFINISHED, 0);
+    }
+
+    /// The other half of J1: human lines never panic into the hook, so an
+    /// action whose stderr reader left keeps working. The emitter must not
+    /// use the panicking print macros.
+    #[test]
+    fn human_lines_do_not_use_the_panicking_macros() {
+        // A Windows checkout has CRLF line endings.
+        let src = include_str!("ui.rs").replace("\r\n", "\n");
+        let body = |name: &str| {
+            let start = src.find(&format!("fn {name}(")).expect(name);
+            let end = src[start..].find("\n}\n").map(|e| start + e).unwrap();
+            src[start..end].to_string()
+        };
+        for f in ["emit", "paint_live", "clear_live", "answer_echo", "clipboard"] {
+            let b = body(f);
+            assert!(!b.contains("eprint"), "{f} uses a panicking print macro");
+        }
+    }
+}
+
+#[cfg(test)]
+mod transfer_units {
+    /// Transfer sizes and rates divide by 1024, so they carry the binary
+    /// labels. "1.0 MB" for 1048576 bytes was a decimal label on a binary
+    /// number.
+    #[test]
+    fn human_labels_match_the_1024_divisor() {
+        assert_eq!(crate::human(512), "512 B");
+        assert_eq!(crate::human(1024), "1.0 KiB");
+        assert_eq!(crate::human(1536), "1.5 KiB");
+        assert_eq!(crate::human(1024 * 1024), "1.0 MiB");
+        assert_eq!(crate::human(5 * 1024 * 1024 * 1024), "5.0 GiB");
+        assert_eq!(crate::human(2 * 1024u64.pow(4)), "2.0 TiB");
+    }
+}
+
+#[cfg(test)]
+mod scripting_output_tests {
+    use super::*;
+
+    /// J7: with LANG=C or TERM=dumb the output carried ✓ ⚡ → ●.
+    #[test]
+    fn ascii_terminals_get_ascii_glyphs() {
+        let s = |v: &str| Some(v.to_string());
+        assert!(!unicode_from(None, None, s("C"), "xterm"), "LANG=C");
+        assert!(!unicode_from(None, None, s("en_US.UTF-8"), "dumb"), "TERM=dumb");
+        assert!(unicode_from(None, None, s("en_US.UTF-8"), "xterm-256color"));
+        assert!(!unicode_from(s("C"), None, s("en_US.UTF-8"), "xterm"), "LC_ALL wins");
+        assert!(unicode_from(s(""), None, s("en_US.UTF-8"), "xterm"), "an empty LC_ALL is unset");
+        assert_eq!(ascii_glyphs("  ✓ up (pid 7)"), "  ok up (pid 7)");
+        assert_eq!(ascii_glyphs("  ⚡ warm  ○ cold → ●"), "  * warm  o cold -> *");
+        assert_eq!(ascii_glyphs("café.txt delivered"), "café.txt delivered", "user data passes through");
+        for (g, a) in ASCII_GLYPHS {
+            assert!(a.is_ascii(), "{g} maps to non-ASCII");
+        }
+    }
+
+    /// J7: "known device 'beta' appeared" 14 times in 150 lines, and no
+    /// timestamps. Copies within the window fold into a count on the next
+    /// printing; every printed line starts with an ISO timestamp.
+    #[test]
+    fn daemon_log_lines_are_stamped_and_repeats_fold() {
+        let mut seen = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let l = "known device 'beta' appeared, connecting";
+        assert_eq!(fold_decision(&mut seen, l, t0), Some(0), "first time prints");
+        for i in 1..14 {
+            assert_eq!(fold_decision(&mut seen, l, t0 + std::time::Duration::from_secs(i)), None);
+        }
+        assert_eq!(fold_decision(&mut seen, "other", t0), Some(0), "a different line is not folded");
+        let later = t0 + DEDUP_WINDOW + std::time::Duration::from_secs(1);
+        assert_eq!(fold_decision(&mut seen, l, later), Some(13), "the next printing carries the count");
+        assert_eq!(fold_decision(&mut seen, l, later), None, "and the window restarts");
+        let line = stamped_line("2026-10-11T01:02:03Z", &folded_line(l, 13));
+        assert!(line.starts_with("2026-10-11T01:02:03Z known device"), "{line}");
+        assert!(line.ends_with("(and 13 more like it in the last 60s)"), "{line}");
+        assert_eq!(folded_line("x", 0), "x");
+        // Bounded: a flood of distinct lines cannot grow the map without limit.
+        for i in 0..(DEDUP_MAX * 2) {
+            fold_decision(&mut seen, &format!("line {i}"), t0);
+        }
+        assert!(seen.len() <= DEDUP_MAX);
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_and_links_keeps_text() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[1;38;5;166mFLEET\x1b[0m  /  x"), "FLEET  /  x");
+        assert_eq!(strip_ansi("\x1b[38;2;216;102;42mcode\x1b[0m"), "code");
+        assert_eq!(strip_ansi("\x1b]8;;https://a.b\x1b\\site\x1b]8;;\x1b\\ ok"), "site ok");
+        assert_eq!(strip_ansi("a\x1b]52;c;Zm9v\x07b"), "ab");
+        assert_eq!(strip_ansi("caf\u{e9} \u{2713}"), "caf\u{e9} \u{2713}", "non-ASCII text survives");
+    }
+
+    #[test]
+    fn header_keeps_its_text() {
+        // Whatever the color decision, the words of a heading never change.
+        let h = header(Tone::Brand, Tone::Dim, "TUNLION  /  3 DEVICES  /  AVAILABLE");
+        assert_eq!(strip_ansi(&h), "TUNLION  /  3 DEVICES  /  AVAILABLE");
     }
 }

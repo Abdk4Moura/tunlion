@@ -96,8 +96,8 @@ re-firing; observed progress clears the episode (`note_progress`).
 
 ## Knobs
 
-- `FILAMENT_STALL_MS` — flowing-transfer no-progress threshold (default 6 000).
-- `FILAMENT_ESTABLISH_GRACE_MS` — before-first-byte grace (default 45 000; never
+- `TUNLION_STALL_MS` — flowing-transfer no-progress threshold (default 6 000).
+- `TUNLION_ESTABLISH_GRACE_MS` — before-first-byte grace (default 45 000; never
   below `stall_ms`).
 
 ## Faults this maps to

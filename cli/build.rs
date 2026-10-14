@@ -1,5 +1,5 @@
 // Stamp the binary with commit + date for `tunlion --version`.
-// CI can override via FILAMENT_BUILD_SHA / FILAMENT_BUILD_DATE.
+// CI can override via TUNLION_BUILD_SHA / TUNLION_BUILD_DATE.
 use std::path::Path;
 use std::process::Command;
 
@@ -41,10 +41,10 @@ fn build_profile() -> String {
 }
 
 fn main() {
-    let sha = std::env::var("FILAMENT_BUILD_SHA")
+    let sha = std::env::var("TUNLION_BUILD_SHA")
         .ok()
         .or_else(|| git(&["rev-parse", "--short", "HEAD"]));
-    let date = std::env::var("FILAMENT_BUILD_DATE").ok().or_else(|| {
+    let date = std::env::var("TUNLION_BUILD_DATE").ok().or_else(|| {
         Command::new("date")
             .args(["-u", "+%Y-%m-%d"])
             .output()
@@ -53,9 +53,9 @@ fn main() {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     });
     let profile = build_profile();
-    println!("cargo:rustc-env=FILAMENT_BUILD_PROFILE={profile}");
+    println!("cargo:rustc-env=TUNLION_BUILD_PROFILE={profile}");
     println!(
-        "cargo:rustc-env=FILAMENT_BUILD_INFO={} ({} {} profile={})",
+        "cargo:rustc-env=TUNLION_BUILD_INFO={} ({} {} profile={})",
         env!("CARGO_PKG_VERSION"),
         sha.unwrap_or_else(|| "dev".into()),
         date.unwrap_or_else(|| "unstamped".into()),
@@ -84,8 +84,8 @@ fn main() {
         watch_if_exists(&packed);
     }
 
-    println!("cargo:rerun-if-env-changed=FILAMENT_BUILD_SHA");
-    println!("cargo:rerun-if-env-changed=FILAMENT_BUILD_DATE");
+    println!("cargo:rerun-if-env-changed=TUNLION_BUILD_SHA");
+    println!("cargo:rerun-if-env-changed=TUNLION_BUILD_DATE");
 
     // `l3`: one cfg gating the L3 overlay data plane, set on every platform that
     // has a TUN backend under src/tun/. Portable overlay code uses `#[cfg(l3)]`

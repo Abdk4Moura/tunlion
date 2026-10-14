@@ -2,7 +2,7 @@
 # #235: a revoked certificate must stop an ALREADY-ESTABLISHED mount.
 # Standalone, hermetic, fixture port 8106 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./mount-revoke-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./mount-revoke-gates.sh
 #
 # The property is bounded staleness, not immediacy. The server re-asks the gate
 # every recheck interval, so the gate allows a grace period and then requires the
@@ -16,10 +16,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8106
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-mount-revoke.XXXXXX")"
 DA="$WORK/A"
 GRACE=12   # > REVOKE_RECHECK, with slack for a slow box
@@ -44,10 +44,15 @@ enroll_delegate bravo --allow mount
 
 mkdir -p "$WORK/share"
 echo "written before the revoke" > "$WORK/share/before.txt"
+# The acceptor serves a mount only inside its SHARE ROOT (the `share` config
+# key, default ~/tunlion-share); a peer can no longer name any path it likes.
+# Configure alpha's share root as the directory this gate mounts, explicitly,
+# the way an owner would. The daemon reads it per mount-open, so no restart.
+printf 'share %s\n' "$WORK/share" >> "$DA/config"
 
 # ===================================================================== GATE A ==
 say "mount-revoke gate A"
-env FILAMENT_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" mount alpha "$WORK/share" "$WORK/mnt" \
+env TUNLION_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" mount alpha "$WORK/share" "$WORK/mnt" \
     >"$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!; FIX_PIDS+=("$MOUNT_PID")
 for _ in $(seq 1 40); do timeout 5 ls "$WORK/mnt" >/dev/null 2>&1 && break; sleep 0.5; done
@@ -81,29 +86,56 @@ fi
 # The discriminator. A file that did not exist at revoke time cannot come from
 # any cache, so reading it proves the data plane is still live.
 say "mount-revoke gate B"
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+# Every way a read can fail scored as a revocation here: a crashed mount
+# process, a dropped link, a FUSE error unrelated to the gate. So the revoke
+# must itself succeed, and the acceptor must say it closed the session BECAUSE
+# the peer was revoked (the critical line mount_proto.rs prints on that branch).
+REASON="mount: peer revoked, closing the live session"
+reason_before=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+revoke_rc=$?
+echo "## revoke rc=$revoke_rc"
 echo "written AFTER the revoke" > "$WORK/share/after.txt"
 sleep "$GRACE"
 AFTER=$(fs_bounded 15 cat "$WORK/mnt/after.txt"); stB="$(fs_state)"
+reason_after=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
 echo "## read after revoke (${GRACE}s): [$stB] $AFTER"
-if [ "$AFTER" = "written AFTER the revoke" ]; then
+echo "## acceptor revoked-close lines: $reason_before -> $reason_after"
+if [ "$revoke_rc" != "0" ]; then
+  bad "gateB: the revoke itself failed (rc $revoke_rc): $(tail -2 "$WORK/revoke.out" | tr '\n' ' ')"
+elif [ "$AFTER" = "written AFTER the revoke" ]; then
   bad "gateB: a revoked peer read a file created AFTER the revoke"
 elif [ "$stB" = "wedged" ]; then
   bad "gateB: the read did not return data, but the client WEDGED (no denial reached it)"
+elif [ "$stB" != "err" ]; then
+  bad "gateB: the read neither returned the file nor failed (state $stB), so no denial reached the client"
+elif [ "$reason_after" -le "$reason_before" ]; then
+  bad "gateB: the read failed, but the acceptor never logged '$REASON', so it did not fail for the revocation"
+  echo "-- up.log (tail) --"; tail -8 "$WORK/up.log"
 else
-  ok "gateB: a file created after the revoke is NOT readable, and the read FAILED (#235)"
+  ok "gateB: a file created after the revoke is NOT readable, the read FAILED, and the acceptor names the revocation (#235)"
 fi
 
 # ===================================================================== GATE C ==
+# "Stopped serving" must be a denial or an unmount, not an empty answer: a
+# listing that succeeds and simply omits before.txt would mean the mount is up
+# and lying. Either the listing fails, or the mountpoint is no longer mounted
+# (the client tore it down after the denial). And the cause must still be the
+# revocation the acceptor named in gate B.
 say "mount-revoke gate C"
 STILL=$(fs_bounded 15 ls "$WORK/mnt"); stC="$(fs_state)"
-echo "## listing after revoke: [$stC] $STILL"
+if mountpoint -q "$WORK/mnt" 2>/dev/null; then mountedC=yes; else mountedC=no; fi
+echo "## listing after revoke: [$stC] mounted=$mountedC $STILL"
 if echo "$STILL" | grep -q "before.txt"; then
   bad "gateC: the revoked mount still serves its original contents"
 elif [ "$stC" = "wedged" ]; then
   bad "gateC: the listing did not return, but the client WEDGED (no denial reached it)"
+elif [ "$stC" = "ok" ] && [ "$mountedC" = "yes" ]; then
+  bad "gateC: the mount is still mounted and answered the listing successfully without its files"
+elif [ "$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)" -le "$reason_before" ]; then
+  bad "gateC: the mount stopped serving, but the acceptor never logged '$REASON'"
 else
-  ok "gateC: the revoked mount stopped serving within ${GRACE}s"
+  ok "gateC: the revoked mount stopped serving within ${GRACE}s (listing [$stC], mounted=$mountedC), for the revocation"
 fi
 
 echo

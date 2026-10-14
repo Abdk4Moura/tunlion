@@ -29,7 +29,7 @@ Two failure modes need automatic fallback:
 2. **Stall timeout**: direct-QUIC is in the candidate race, ICE `checking`
    produces srflx candidates, but the nominated pair never completes within
    budget. Today the per-candidate budget (7s default,
-   FILAMENT_L2_CANDIDATE_SECS) fires and rotates to the next signaling
+   TUNLION_L2_CANDIDATE_SECS) fires and rotates to the next signaling
    candidate — but the direct race is never abandoned; the initiator just
    re-attempts WebRTC to the same peer.
 
@@ -114,7 +114,7 @@ direct-quic stall to verify fallback (future test, not part of this design).
   decision
 - Relay fallback for daemon-to-daemon links (those are already warm-held)
 - TURN relay server provisioning (production already has `turn:tunlion.autumated.com:3478`)
-- Any change to `FILAMENT_DIRECT` semantics for file-transfer paths
+- Any change to `TUNLION_DIRECT` semantics for file-transfer paths
 
 ## CI caveat: macOS hyperkit runner
 

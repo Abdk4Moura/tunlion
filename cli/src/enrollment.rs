@@ -14,7 +14,7 @@
 use crate::net::{self, Ev};
 use crate::{AdoptSource, Conn, direct, fleet, identity, session, shutdown, ui};
 use crate::{
-    capability_list_summary, config_set, devices_upsert_atomic, display_name, fresh_secret,
+    capability_list_summary, config_set, display_name, fresh_secret,
     is_self_uid, load_delegation, local_device_cert_path, merge_owner_cap_ops, mk_uid,
     open_enrollment,
 };
@@ -38,6 +38,20 @@ const ESTABLISH_BUDGET: Duration = Duration::from_secs(45);
 /// identical but for a hoisted local: one took an AuthKey and one an Invitation,
 /// which made them look like different functions. Once the two credentials
 /// collapsed into one, the signatures became the same and so did the bodies.
+/// The warning for a join the owner filed under a different name than the one
+/// asked for (None when it kept the name). The owner only does that when the
+/// name is held by another key, which after a reset is this machine's own
+/// stale record, so the way back names both commands, run on the owner.
+pub(crate) fn renamed_note(asked: &str, stored: &str) -> Option<String> {
+    let asked = crate::sanitize_device_name(asked);
+    if asked.is_empty() || asked == stored {
+        return None;
+    }
+    Some(format!(
+        "! asked to join as '{asked}', but the owner already holds another key under that name, so it filed this device as '{stored}'. If '{asked}' is this machine's old record, on the owner run: tunlion devices forget {asked} -y && tunlion devices rename {stored} {asked}"
+    ))
+}
+
 fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<String> {
     if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
         bail!(
@@ -110,26 +124,19 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         )?,
     )?;
     let transfer_caps = vec!["transfer".to_string()];
-    // The invitation names the fleet, but it must not re-key a DIFFERENT
-    // fleet already recorded under this name (stale join, or a hostile
-    // invitation): refuse instead of silently replacing the owner's
-    // identity. Same key re-joining passes through below.
-    if crate::devices_store::name_pinned_by_other(owner_name, &hex::encode(owner_cert.device_pub)) {
-        anyhow::bail!(
-            "already have a different fleet owner recorded as '{owner_name}': forget it first, then join"
-        );
-    }
-    // allow_reanchor: joining under an owner-signed invitation is the owner
-    // decision that permits recording under this name.
-    devices_upsert_atomic(
+    // The invitation names the fleet, but the name is presentation: it must
+    // not re-key a DIFFERENT fleet already recorded under it (stale join, or
+    // a hostile invitation), and it must not re-key a certless record that
+    // merely shares the name either (that record's grants would pass to the
+    // owner's identity). Only a record pinned to the owner's own device key
+    // is updated in place; anything else gets a new, suffixed record. See
+    // devices_store::place_joined_owner.
+    crate::devices_store::devices_store_joined_owner(
         owner_name,
-        Some(secret),
-        Some(&owner_cert),
-        Some(&transfer_caps),
-        Some(identity::IntroScope::Device.to_byte()),
-        None,
-        None,
-        true,
+        secret,
+        &owner_cert,
+        &transfer_caps,
+        identity::IntroScope::Device.to_byte(),
     )?;
     // Fleet auto-mesh: keep the rendezvous secret the owner sent. Its ABSENCE is
     // not a failure, it just means no auto-mesh (an older owner, or a join that
@@ -374,10 +381,16 @@ pub(crate) async fn enroll_cmd(
                     "device_pub": hex::encode(device_pub),
                 })).await;
                 if !json_output {
+                    // The inviting device by name, never its signaling id
+                    // (the lab read "sent enrollment request to lP0Pn2H9kZSCcpZ0AAXj").
+                    let to = conn
+                        .display_name_of(&pid)
+                        .map(|n| format!("'{n}'"))
+                        .unwrap_or_else(|| "the inviting device".to_string());
+                    ui::debug(&format!("enrollment request sent on pid {pid}"));
                     ui::say(&format!(
-                        "  {} sent enrollment request to {}",
+                        "  {} sent enrollment request to {to}",
                         ui::paint(ui::Tone::Dim, "->"),
-                        pid
                     ));
                 }
             }
@@ -422,6 +435,8 @@ pub(crate) async fn enroll_cmd(
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&json!({
+                                "ok": true,
+                                "verb": "join",
                                 "joined": true,
                                 "name": name,
                                 "devicePub": hex::encode(device_pub),
@@ -437,6 +452,15 @@ pub(crate) async fn enroll_cmd(
                             name,
                             hex::encode(device_pub)
                         ));
+                    }
+                    // The owner files a new key under a free name when the one
+                    // asked for is held by another key (a stale record of this
+                    // same machine, usually). That used to pass silently: `join
+                    // --name beta` printed "joined as 'beta-2'" and exited 0,
+                    // and the re-enrolment recipe's "rejoins under the same
+                    // name" was false. Say so, with the way back.
+                    if let Some(note) = proposed_name.and_then(|asked| renamed_note(asked, &name)) {
+                        ui::critical(&note);
                     }
                     return Ok(());
                 }
@@ -455,7 +479,7 @@ pub(crate) async fn enroll_cmd(
                 _ => {}
             },
             Ev::Interrupted => bail!("cancelled"),
-            Ev::SignalingDown(reason) => {
+            Ev::SignalingDown(reason, _) => {
                 bail!("signaling connection lost: {reason}");
             }
             _ => {}

@@ -18,12 +18,120 @@
 use crate::conn::Conn;
 use crate::l2;
 use crate::net::Transport;
+use crate::platform::TreeSignal;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+/// Where the daemon records the process groups it is serving for `exec`,
+/// beside its pidfile. A daemon killed with SIGKILL (or one that crashed) runs
+/// none of its own cleanup, so whatever a served command forked would live on
+/// under init; the next daemon reads this at startup and ends what is left.
+/// One line per group: `<pgid> <boot token> <leader start token or ->`.
+pub(crate) const SERVED_GROUPS_FILE: &str = "exec.groups";
+
+fn served_groups_path() -> PathBuf {
+    crate::settings::config_dir().join(SERVED_GROUPS_FILE)
+}
+
+/// The live record, keyed by group id. Rewritten whole (atomically) on every
+/// change, so the file never holds a half line.
+static SERVED_GROUPS: std::sync::Mutex<std::collections::BTreeMap<u32, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn persist_served_groups(groups: &std::collections::BTreeMap<u32, String>) {
+    let path = served_groups_path();
+    if groups.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let body: String = groups.values().map(|l| format!("{l}\n")).collect();
+    if let Err(e) = crate::platform::SecretFile::write_str(&path, &body) {
+        crate::ui::trace(&format!(
+            "exec: could not record served process groups in {}: {e}",
+            path.display()
+        ));
+    }
+}
+
+/// One served group's entry in the record, removed when the session ends by
+/// any path (the guard drops with `serve_exec`'s frame).
+struct ServedGroup(u32);
+
+impl ServedGroup {
+    fn record(pgid: u32) -> ServedGroup {
+        // Without a boot token a recorded number could not be trusted at the
+        // next start, so the sweep ignores it; recording it anyway is harmless.
+        let boot = crate::platform::boot_token().unwrap_or_else(|| "-".into());
+        let start = crate::platform::process_start_token(pgid).unwrap_or_else(|| "-".into());
+        if let Ok(mut g) = SERVED_GROUPS.lock() {
+            g.insert(pgid, format!("{pgid} {boot} {start}"));
+            persist_served_groups(&g);
+        }
+        ServedGroup(pgid)
+    }
+}
+
+impl Drop for ServedGroup {
+    fn drop(&mut self) {
+        if let Ok(mut g) = SERVED_GROUPS.lock() {
+            g.remove(&self.0);
+            persist_served_groups(&g);
+        }
+    }
+}
+
+/// Should a recorded line be killed now? Only a group from THIS boot, and
+/// only when its number cannot have been handed to someone else: a live
+/// process holding the leader's pid with a different start time proves the
+/// pid was reused, and a pid is reused only once its old group is empty.
+fn leftover_group(
+    line: &str,
+    boot: &str,
+    start_now: impl Fn(u32) -> Option<String>,
+) -> Option<u32> {
+    let mut f = line.split_whitespace();
+    let pgid: u32 = f.next()?.parse().ok()?;
+    let rec_boot = f.next()?;
+    let rec_start = f.next()?;
+    if pgid <= 1 || rec_boot == "-" || rec_boot != boot {
+        return None;
+    }
+    match start_now(pgid) {
+        Some(now) if rec_start != "-" && now != rec_start => None,
+        _ => Some(pgid),
+    }
+}
+
+/// End every served group a previous daemon left behind, then clear the
+/// record. Called once at startup, after the single-instance lock is held and
+/// before anything is served, so nothing in the file can be a live session of
+/// this daemon. Returns how many groups were still alive and were killed.
+pub(crate) fn kill_leftover_groups() -> usize {
+    let path = served_groups_path();
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut killed = 0;
+    if let Some(boot) = crate::platform::boot_token() {
+        for line in body.lines() {
+            let Some(pgid) = leftover_group(line, &boot, crate::platform::process_start_token)
+            else {
+                continue;
+            };
+            if crate::platform::process_group_alive(pgid)
+                && crate::platform::signal_process_group(pgid, TreeSignal::Kill).unwrap_or(false)
+            {
+                killed += 1;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    killed
+}
 
 /// Bounds that keep a hostile or buggy initiator from turning an open frame
 /// into unbounded allocation. Generous on purpose: real commands (long rsync
@@ -44,6 +152,10 @@ pub(crate) struct ExecOpen {
     /// one value (same discipline as `sid` itself -- the initiator registers
     /// the pipe before the open goes out, so stderr racing the ack finds it).
     pub(crate) err_sid: u32,
+    /// The initiator's heartbeat interval (`alive_ms`), when it promises one:
+    /// the session then ends if it stops hearing them. None for an initiator
+    /// that predates heartbeats, which is held to its link alone.
+    pub(crate) alive_ms: Option<u64>,
 }
 
 /// Parse and validate an `exec-open` frame. Returns None (caller ignores the
@@ -99,12 +211,14 @@ pub(crate) fn parse_exec_open(v: &Value) -> Option<ExecOpen> {
     if !crate::l2::is_l2_sid(err_sid) {
         return None;
     }
+    let alive_ms = v.get("alive_ms").and_then(|a| a.as_u64()).filter(|a| *a > 0);
     Some(ExecOpen {
         argv,
         cwd,
         env,
         tty,
         err_sid,
+        alive_ms,
     })
 }
 
@@ -183,6 +297,202 @@ fn is_executable(p: &std::path::Path) -> bool {
     p.is_file()
 }
 
+/// How one exec is spawned: the resolved program, its args, and the account
+/// it runs as (None = the daemon user, only when no `--shell-user` is set).
+#[derive(Debug)]
+pub(crate) struct ExecSpawnPlan {
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) run_as: Option<String>,
+}
+
+/// Decide how to spawn an exec. With `--shell-user` set, the command runs as
+/// that account through the PTY path's own drop (`Paths::exec_as_user_argv`,
+/// runuser on Unix); where that drop does not exist, or its tool cannot be
+/// found, the exec is REFUSED with the reason rather than run as the daemon
+/// user. `program` is argv[0] already resolved on the daemon PATH.
+pub(crate) fn exec_spawn_plan(
+    program: &std::path::Path,
+    args: &[String],
+    shell_user: Option<&str>,
+) -> Result<ExecSpawnPlan, String> {
+    let Some(user) = shell_user else {
+        return Ok(ExecSpawnPlan {
+            program: program.to_path_buf(),
+            args: args.to_vec(),
+            run_as: None,
+        });
+    };
+    let argv =
+        crate::platform::Paths::exec_as_user_argv(&program.to_string_lossy(), args, Some(user))?;
+    let (head, rest) = argv
+        .split_first()
+        .ok_or_else(|| "exec refused: empty spawn argv".to_string())?;
+    // The drop tool resolves on the daemon PATH like argv[0] does: the child
+    // env is cleared, so a bare name would otherwise search no PATH at all.
+    let wrapper = resolve_in_path(head).ok_or_else(|| {
+        format!(
+            "exec refused: --shell-user {user} is set but `{head}` was not found on the daemon PATH, and running the command as the daemon user would ignore that setting"
+        )
+    })?;
+    Ok(ExecSpawnPlan {
+        program: wrapper,
+        args: rest.to_vec(),
+        run_as: Some(user.to_string()),
+    })
+}
+
+/// Starting directory when the initiator names none: the daemon user's home,
+/// or for a dropped exec the target account's home (what its login shell
+/// would get), falling back to `/` when that account has no usable home.
+fn default_exec_cwd(run_as: Option<&str>) -> PathBuf {
+    match run_as {
+        None => crate::platform::Paths::home_dir(),
+        Some(user) => crate::platform::Paths::home_of_user(user)
+            .filter(|h| h.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/")),
+    }
+}
+
+/// How often an initiator says it is still there (`exec-alive`), announced in
+/// its open as `alive_ms`.
+pub(crate) const EXEC_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a served exec waits without a heartbeat before it decides the
+/// initiator is gone: six missed beats, never under 10 s (a busy relay can
+/// delay a few), never over a minute (a hostile `alive_ms` cannot buy an
+/// orphan a long life).
+pub(crate) fn alive_deadline(alive_ms: u64) -> std::time::Duration {
+    let beat = std::time::Duration::from_millis(alive_ms.clamp(250, 10_000));
+    (beat * 6).clamp(
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(60),
+    )
+}
+
+/// Grace each gentler signal gets before the next, harder one.
+const TREE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Initiator -> acceptor control for one served exec, routed by sid through
+/// the peer's own mux (`Mux::exec_control`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecCtl {
+    /// `exec-alive`: the initiator is still there.
+    Alive,
+    /// `exec-signal`: deliver this signal to the remote tree.
+    Signal(TreeSignal),
+}
+
+impl ExecCtl {
+    /// Parse `{type:"exec-alive"}` or `{type:"exec-signal", signal:"INT"}`.
+    /// An unknown signal name is ignored rather than guessed at.
+    pub(crate) fn from_frame(v: &Value) -> Option<ExecCtl> {
+        match v.get("type")?.as_str()? {
+            "exec-alive" => Some(ExecCtl::Alive),
+            "exec-signal" => TreeSignal::from_wire(v.get("signal")?.as_str()?).map(ExecCtl::Signal),
+            _ => None,
+        }
+    }
+}
+
+/// Send `sig` to the session's whole tree (its own process group), or to the
+/// leader alone where there are no groups.
+fn deliver_signal(child: &mut tokio::process::Child, pgid: Option<u32>, sig: TreeSignal) {
+    let sent = pgid
+        .map(|g| crate::platform::signal_process_group(g, sig).unwrap_or(false))
+        .unwrap_or(false);
+    if !sent && sig == TreeSignal::Kill {
+        let _ = child.start_kill();
+    }
+}
+
+/// Has the whole tree exited? Reaps the leader as it goes (a zombie leader
+/// still counts as a member of its group), then asks about the group.
+async fn tree_gone_within(
+    child: &mut tokio::process::Child,
+    pgid: Option<u32>,
+    within: std::time::Duration,
+) -> bool {
+    let end = tokio::time::Instant::now() + within;
+    loop {
+        let leader_done = matches!(child.try_wait(), Ok(Some(_)));
+        if leader_done && !pgid.is_some_and(crate::platform::process_group_alive) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The escalation ladder, starting at `first`: each step signals the whole
+/// tree and waits up to [`TREE_GRACE`] for it to go; `Kill` always ends it.
+pub(crate) fn ladder(first: TreeSignal) -> &'static [TreeSignal] {
+    match first {
+        TreeSignal::Kill => &[TreeSignal::Kill],
+        TreeSignal::Terminate => &[TreeSignal::Terminate, TreeSignal::Kill],
+        TreeSignal::Interrupt => &[
+            TreeSignal::Interrupt,
+            TreeSignal::Terminate,
+            TreeSignal::Kill,
+        ],
+        TreeSignal::Hangup => &[TreeSignal::Hangup, TreeSignal::Terminate, TreeSignal::Kill],
+    }
+}
+
+/// End a served exec whose initiator is gone (or whose access was revoked):
+/// close the output read ends first, so a writer gets EPIPE/SIGPIPE at once
+/// the way it would under a closed local pipe, then walk the signal ladder
+/// over the whole process group until nothing of it is left.
+async fn end_session_tree(
+    child: &mut tokio::process::Child,
+    pgid: Option<u32>,
+    readers: [&tokio::task::JoinHandle<u64>; 2],
+    first: TreeSignal,
+    first_already_sent: bool,
+    why: &str,
+) -> Option<i32> {
+    for r in readers {
+        r.abort();
+    }
+    let mut gone = false;
+    for (step, &sig) in ladder(first).iter().enumerate() {
+        // A signal the initiator forwarded moments ago is not sent twice: the
+        // ladder only gives it its grace before the next, harder one. Sending
+        // SIGHUP straight after a forwarded SIGINT killed a shell before its
+        // INT trap could run.
+        if !(step == 0 && first_already_sent) {
+            deliver_signal(child, pgid, sig);
+        }
+        let wait = if sig == TreeSignal::Kill {
+            std::time::Duration::from_secs(5)
+        } else {
+            TREE_GRACE
+        };
+        if tree_gone_within(child, pgid, wait).await {
+            gone = true;
+            break;
+        }
+    }
+    let group = pgid
+        .map(|p| format!(" (process group {p})"))
+        .unwrap_or_default();
+    if gone {
+        crate::ui::say(&format!(
+            "l2: exec ended: {why}; the remote command{group} was stopped"
+        ));
+    } else {
+        crate::ui::critical(&format!(
+            "l2: exec ended: {why}; the remote command{group} did not exit after SIGKILL"
+        ));
+    }
+    match child.try_wait() {
+        Ok(Some(status)) => exit_status_code(&status),
+        _ => None,
+    }
+}
+
 /// Pure exit-status mapping, split out so it is unit-testable without spawning:
 /// a clean exit keeps its raw code, signal death becomes 128+signal (the shell
 /// convention: 137 SIGKILL, 143 SIGTERM), and no information at all becomes
@@ -252,16 +562,27 @@ pub(crate) async fn authorize_exec(
     conn: &mut Conn,
     pid: &str,
     shell_policy: &crate::ShellPolicy,
-) -> Result<String, String> {
+) -> Result<String, crate::refusal::Refusal> {
     let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(
         conn,
         pid,
         shell_policy,
         crate::capability::CAP_SHELL,
     );
+    // The refusal carries a precise code and the name this device files the
+    // peer under, so the initiator can print the one remedy that applies (a
+    // missing grant used to be indistinguishable from serving being off).
     crate::shell_gate::exec_gate_decision(&inputs)
-        .map(|()| dev.unwrap_or_else(|| pid.to_string()))
-        .map_err(|r| r.unwrap_or_else(|| "shell capability not granted".to_string()))
+        .map(|()| dev.clone().unwrap_or_else(|| pid.to_string()))
+        .map_err(|r| {
+            crate::refusal::Refusal::from_shell_gate(
+                inputs.cert_revoked,
+                inputs.denied,
+                r.as_deref(),
+                dev.clone(),
+            )
+            .with_reinvite_for(inputs.idev.as_ref())
+        })
 }
 
 /// Serve one accepted exec open: spawn argv[] directly (NO shell, NO login
@@ -290,7 +611,9 @@ pub(crate) async fn serve_exec(
     sid: u32,
     req: ExecOpen,
     stdin_rx: mpsc::Receiver<Option<bytes::Bytes>>,
+    exec_ctl: mpsc::Receiver<ExecCtl>,
     authz: ExecSessionAuthz,
+    shell_user: Option<String>,
 ) {
     // stderr rides the initiator-allocated `err_sid` from the open frame
     // (same value the initiator registered before sending): allocating a
@@ -314,7 +637,21 @@ pub(crate) async fn serve_exec(
             .await;
         return;
     }
-    let cwd = req.cwd.unwrap_or_else(crate::platform::Paths::home_dir);
+    // --shell-user: the same account drop the PTY gets, or no exec at all.
+    // Never the daemon user when an operator configured a lesser one.
+    let plan = match exec_spawn_plan(&program, &req.argv[1..], shell_user.as_deref()) {
+        Ok(p) => p,
+        Err(reason) => {
+            crate::ui::say(&format!("l2: {reason}"));
+            let _ = t
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
+                .await;
+            return;
+        }
+    };
+    let cwd = req
+        .cwd
+        .unwrap_or_else(|| default_exec_cwd(plan.run_as.as_deref()));
     if !cwd.is_dir() {
         // Fail closed: a requested directory that does not exist refuses
         // rather than silently running somewhere else.
@@ -323,17 +660,31 @@ pub(crate) async fn serve_exec(
             .await;
         return;
     }
-    let mut child = match tokio::process::Command::new(&program)
-        .args(&req.argv[1..])
+    let mut cmd = tokio::process::Command::new(&plan.program);
+    cmd.args(&plan.args)
         .current_dir(&cwd)
         .env_clear()
         .envs(build_env(&req.env))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
+        .stderr(std::process::Stdio::piped());
+    // A group of its own, so ending the session ends everything the command
+    // started (`sh -c 'a | b'`, a script's children), not only its leader.
+    crate::platform::own_process_group(&mut cmd);
+    // And not one that outlives the daemon: a daemon killed with SIGKILL runs
+    // none of the session cleanup below, which left a remote `sleep` running
+    // under init across a fresh `up` (the launch candidate's acceptance run).
+    crate::platform::die_with_daemon(&mut cmd);
+    // Backstop for a task that ends abnormally (panic, abort): the leader
+    // dies with it rather than outliving the daemon's record of it.
+    cmd.kill_on_drop(true);
+    // The leader's pid is its group id (own_process_group). Recorded before
+    // the child can run any of the program and kept until this function
+    // returns, so a daemon that dies at any point after the fork has its
+    // leftovers ended by the next one (kill_leftover_groups).
+    let spawned = crate::platform::spawn_recorded(&mut cmd, ServedGroup::record);
+    let (mut child, _served) = match spawned {
+        Ok(spawned) => spawned,
         Err(e) => {
             let _ = t
                 .send_control(
@@ -343,6 +694,8 @@ pub(crate) async fn serve_exec(
             return;
         }
     };
+    crate::platform::contain_with_daemon(&child);
+    let pgid = child.id();
     let _ = t
         .send_control(&json!({ "type": "exec-open-ack", "sid": sid, "out": sid, "err": err_sid }))
         .await;
@@ -421,6 +774,22 @@ pub(crate) async fn serve_exec(
     // mid-session -- certificate OR shell grant -- loses the live exec.
     let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
     revoke_ticker.tick().await; // consume the immediate first tick
+    // Liveness of the INITIATOR, not only of the link. A client killed with
+    // SIGKILL, or one whose host vanished, sends no close, and its link can
+    // look alive for a long time after (the transport's own idle timeout, or
+    // never, when the link is shared). Observed: `exec beta -- sleep 300`
+    // killed locally left the sleep running for the full five minutes. An
+    // initiator that announces heartbeats (`alive_ms` in its open) is held to
+    // them; any initiator is held to its link.
+    let heartbeat_deadline = req.alive_ms.map(alive_deadline);
+    let mut last_heard = tokio::time::Instant::now();
+    let mut liveness = tokio::time::interval(std::time::Duration::from_millis(500));
+    liveness.tick().await;
+    let mut exec_ctl = exec_ctl;
+    let mut exec_ctl_open = true;
+    // The last signal the initiator forwarded, so the close that follows it
+    // gives that signal its grace instead of sending SIGHUP on top of it.
+    let mut forwarded: Option<TreeSignal> = None;
     // stdin: chunks in, EOF shuts the child's write-half (it may still produce
     // output -- EOF is non-terminal, same rule as the pty pumps). Channel
     // death (link gone) kills the child: nobody is left to report to, and an
@@ -531,11 +900,81 @@ pub(crate) async fn serve_exec(
                         stdin.take();
                     }
                     None => {
-                        let _ = child.kill().await;
+                        // The initiator closed the session (its l2-close: it
+                        // was interrupted, its output went away, or it quit),
+                        // or the link carrying it was torn down. Nobody is
+                        // left to report to: end the whole tree, gently first.
+                        // A Ctrl-C the initiator forwarded just before its
+                        // close may still be queued: it goes first, so the
+                        // command sees the signal its user sent.
+                        let (mut first, mut already_sent) = match forwarded {
+                            Some(sig) => (sig, true),
+                            None => (TreeSignal::Hangup, false),
+                        };
+                        while let Ok(m) = exec_ctl.try_recv() {
+                            if let ExecCtl::Signal(sig) = m {
+                                first = sig;
+                                already_sent = false;
+                            }
+                        }
+                        let status = end_session_tree(
+                            &mut child,
+                            pgid,
+                            [&out_task, &err_task],
+                            first,
+                            already_sent,
+                            "the initiator closed the session",
+                        )
+                        .await;
+                        // An initiator that closed on purpose may still be
+                        // listening for a moment: tell it the tree is gone,
+                        // with the status it ended on (128+signal).
+                        let mut close = json!({ "type": "exec-close", "sid": sid, "ended": "initiator-closed" });
+                        if let Some(code) = status {
+                            close["status"] = json!(code);
+                        }
+                        let _ = t.send_control(&close).await;
                         mux.drop_stream(sid).await;
                         mux.drop_stream(err_sid).await;
                         return;
                     }
+                }
+            }
+            ctl = exec_ctl.recv(), if exec_ctl_open => match ctl {
+                Some(ExecCtl::Alive) => last_heard = tokio::time::Instant::now(),
+                Some(ExecCtl::Signal(sig)) => {
+                    // The initiator's user pressed Ctrl-C (or it was asked to
+                    // stop): the remote tree gets the same signal, now. Its
+                    // l2-close follows and ends whatever ignores it.
+                    last_heard = tokio::time::Instant::now();
+                    deliver_signal(&mut child, pgid, sig);
+                    forwarded = Some(sig);
+                }
+                // The stream was dropped; the stdin arm sees it too and ends
+                // the session, so stop polling a closed channel.
+                None => exec_ctl_open = false,
+            },
+            _ = liveness.tick() => {
+                let silent = heartbeat_deadline.is_some_and(|d| last_heard.elapsed() >= d);
+                let link_gone = t.is_dead() || !t.is_alive();
+                if silent || link_gone {
+                    let why = if link_gone {
+                        "the link to the initiator died"
+                    } else {
+                        "the initiator stopped answering"
+                    };
+                    end_session_tree(
+                        &mut child,
+                        pgid,
+                        [&out_task, &err_task],
+                        TreeSignal::Hangup,
+                        false,
+                        why,
+                    )
+                    .await;
+                    mux.drop_stream(sid).await;
+                    mux.drop_stream(err_sid).await;
+                    return;
                 }
             }
             _ = revoke_ticker.tick() => {
@@ -545,7 +984,9 @@ pub(crate) async fn serve_exec(
                 // loses the live exec: kill the child and close with the
                 // revoked reason, so the initiator surfaces nonzero with a
                 // reason instead of hanging or rendering a clean exit.
-                let cert_gone = crate::cert_revoked_for(authz.idev.as_ref());
+                // Revocation and the delegated deadline, from the one live
+                // re-check every serving loop shares.
+                let cut = crate::identity_state::live_session_cut(authz.idev.as_ref());
                 let grant_gone = match authz.dev_name.as_deref() {
                     Some(n) => {
                         crate::device_capability_denied(n, "shell")
@@ -564,16 +1005,40 @@ pub(crate) async fn serve_exec(
                 // budget) ends it too; unresolvable identity is no opinion.
                 let lapsed =
                     matches!(crate::identity_state::peer_liveness_alive(authz.idev.as_ref()), Some(false));
-                if cert_gone || grant_gone || ceiling_gone || lapsed {
-                    crate::ui::critical("exec: peer access revoked, closing live session");
-                    let _ = child.kill().await;
-                    let _ = t
-                        .send_control(&json!({
-                            "type": "l2-close",
-                            "sid": sid,
-                            "err": crate::capability::REVOKED_REASON,
-                        }))
-                        .await;
+                if cut.is_some() || grant_gone || ceiling_gone || lapsed {
+                    // The close names the cause: an expiry must read as one
+                    // (the initiator exits 4 and prints the re-invite), not as
+                    // a revocation the owner never made.
+                    let reason = match cut {
+                        Some(c) => c.reason_for(authz.idev.as_ref()),
+                        None => crate::capability::REVOKED_REASON.to_string(),
+                    };
+                    if matches!(cut, Some(crate::identity_state::LiveCut::Expired(_))) {
+                        crate::ui::critical("exec: peer access expired, closing live session");
+                    } else {
+                        crate::ui::critical("exec: peer access revoked, closing live session");
+                    }
+                    // Revocation is immediate: the whole tree, no grace.
+                    end_session_tree(
+                        &mut child,
+                        pgid,
+                        [&out_task, &err_task],
+                        TreeSignal::Kill,
+                        false,
+                        "peer access revoked",
+                    )
+                    .await;
+                    let mut close = json!({
+                        "type": "l2-close",
+                        "sid": sid,
+                        "err": reason,
+                    });
+                    if let Some(crate::identity_state::LiveCut::Expired(at)) = cut {
+                        crate::refusal::Refusal::expired(at, authz.dev_name.clone(), None)
+                            .with_reinvite_for(authz.idev.as_ref())
+                            .annotate(&mut close);
+                    }
+                    let _ = t.send_control(&close).await;
                     mux.drop_stream(sid).await;
                     mux.drop_stream(err_sid).await;
                     return;
@@ -594,6 +1059,7 @@ pub(crate) async fn handle_exec_open(
     mux: Arc<l2::Mux>,
     v: &Value,
     shell_policy: &crate::ShellPolicy,
+    shell_user: &Option<String>,
     parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
 ) {
     let Some(req) = parse_exec_open(v) else {
@@ -605,7 +1071,8 @@ pub(crate) async fn handle_exec_open(
     if !l2::is_l2_sid(sid) {
         return;
     }
-    if let Err(reason) = authorize_exec(conn, pid, shell_policy).await {
+    if let Err(refusal) = authorize_exec(conn, pid, shell_policy).await {
+        let reason = refusal.reason.clone();
         // Settle-then-evaluate: the verdict above may rest on stale
         // (unproven) identity. Park for re-drive on proof when the deny
         // is attributable to it; otherwise the live verdict stands.
@@ -629,9 +1096,7 @@ pub(crate) async fn handle_exec_open(
         // no-op by design.
         let who = conn.link(pid).and_then(|l| l.verified_name.clone());
         crate::enqueue_if_requestable(who.as_deref().unwrap_or("<unverified>"), "shell");
-        let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
-            .await;
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     };
     // H-1 (DoS): refuse over the per-link stream cap BEFORE spawning, same as
@@ -651,6 +1116,8 @@ pub(crate) async fn handle_exec_open(
             .await;
         return;
     };
+    // Heartbeats and forwarded signals from the initiator, for this sid only.
+    let exec_ctl = mux.register_exec_ctl(sid).await;
     // Serve DETACHED: awaiting the session inline would park the daemon's
     // single recv loop for its whole lifetime, so no inbound data frame
     // could ever be dispatched while a session runs (stdin starves, the
@@ -686,7 +1153,7 @@ pub(crate) async fn handle_exec_open(
         policy_allows,
         admitted_via_ceiling: covered && !has_grant_now,
     };
-    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx, authz));
+    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx, exec_ctl, authz, shell_user.clone()));
 }
 
 #[cfg(test)]
@@ -763,6 +1230,125 @@ mod tests {
         assert!(parse_exec_open(&json!({"argv": many})).is_none());
         let big = "x".repeat(40 * 1024);
         assert!(parse_exec_open(&json!({"argv": ["ok", big]})).is_none());
+    }
+
+    // --shell-user must reach exec. Without a user the spawn is the direct
+    // argv as the daemon user; with one, the plan either runs as that user
+    // through the drop tool or refuses. It never quietly spawns the bare
+    // program as the daemon user.
+    #[test]
+    fn exec_spawn_plan_uses_the_configured_shell_user() {
+        let prog = std::path::Path::new("/usr/bin/id");
+        let args = vec!["-un".to_string()];
+        let direct = exec_spawn_plan(prog, &args, None).expect("no user: direct");
+        assert_eq!(direct.program, PathBuf::from("/usr/bin/id"));
+        assert_eq!(direct.args, args);
+        assert_eq!(direct.run_as, None);
+
+        match exec_spawn_plan(prog, &args, Some("nobody")) {
+            Ok(plan) => {
+                assert_eq!(plan.run_as.as_deref(), Some("nobody"));
+                assert_ne!(
+                    plan.program,
+                    PathBuf::from("/usr/bin/id"),
+                    "spawned as the daemon user"
+                );
+                assert!(plan.args.iter().any(|a| a == "nobody"), "{:?}", plan.args);
+                assert!(
+                    plan.args
+                        .ends_with(&["/usr/bin/id".to_string(), "-un".to_string()]),
+                    "{:?}",
+                    plan.args
+                );
+            }
+            Err(reason) => assert!(reason.contains("--shell-user nobody"), "{reason}"),
+        }
+    }
+
+    /// An open that promises heartbeats carries `alive_ms`; one that does not
+    /// (an older initiator) is held to its link alone, never to a default.
+    #[test]
+    fn parse_reads_the_heartbeat_promise() {
+        let base = json!({"type": "exec-open", "sid": 1, "err_sid": 2147483649u64, "argv": ["true"]});
+        assert_eq!(parse_exec_open(&base).unwrap().alive_ms, None);
+        let mut with = base.clone();
+        with["alive_ms"] = json!(2000u64);
+        assert_eq!(parse_exec_open(&with).unwrap().alive_ms, Some(2000));
+        let mut zero = base.clone();
+        zero["alive_ms"] = json!(0u64);
+        assert_eq!(parse_exec_open(&zero).unwrap().alive_ms, None);
+    }
+
+    /// The silence an acceptor tolerates is bounded on both sides: a beat it
+    /// can miss a few of, and never long enough for a hostile `alive_ms` to
+    /// buy an orphan a long life.
+    #[test]
+    fn heartbeat_deadline_is_bounded() {
+        use std::time::Duration;
+        let ours = EXEC_ALIVE_INTERVAL.as_millis() as u64;
+        let d = alive_deadline(ours);
+        assert!(d >= Duration::from_secs(10) && d <= Duration::from_secs(15), "{d:?}");
+        assert_eq!(alive_deadline(1), Duration::from_secs(10));
+        assert_eq!(alive_deadline(u64::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn exec_control_frames_parse_and_unknowns_are_ignored() {
+        assert_eq!(
+            ExecCtl::from_frame(&json!({"type": "exec-alive", "sid": 1})),
+            Some(ExecCtl::Alive)
+        );
+        assert_eq!(
+            ExecCtl::from_frame(&json!({"type": "exec-signal", "sid": 1, "signal": "INT"})),
+            Some(ExecCtl::Signal(TreeSignal::Interrupt))
+        );
+        assert_eq!(
+            ExecCtl::from_frame(&json!({"type": "exec-signal", "sid": 1, "signal": "STOP"})),
+            None
+        );
+        assert_eq!(ExecCtl::from_frame(&json!({"type": "exec-signal", "sid": 1})), None);
+        assert_eq!(ExecCtl::from_frame(&json!({"type": "exec-open", "sid": 1})), None);
+    }
+
+    /// The startup sweep kills only a group it can still vouch for: this boot,
+    /// and a leader pid that was not handed to someone else since.
+    #[test]
+    fn leftover_sweep_kills_only_what_is_still_ours() {
+        let gone = |_: u32| None;
+        let same = |_: u32| Some("777".to_string());
+        let reused = |_: u32| Some("999".to_string());
+        // Leader dead (PDEATHSIG), group survivors remain: kill.
+        assert_eq!(leftover_group("4242 boot-a 777", "boot-a", gone), Some(4242));
+        // Leader still running (no PDEATHSIG, e.g. macOS): kill.
+        assert_eq!(leftover_group("4242 boot-a 777", "boot-a", same), Some(4242));
+        // Pid reused by an unrelated process: its old group is empty, skip.
+        assert_eq!(leftover_group("4242 boot-a 777", "boot-a", reused), None);
+        // Another boot, or no boot token at all: never trusted.
+        assert_eq!(leftover_group("4242 boot-a 777", "boot-b", gone), None);
+        assert_eq!(leftover_group("4242 - 777", "-", gone), None);
+        // init and malformed lines are never targets.
+        assert_eq!(leftover_group("1 boot-a 777", "boot-a", gone), None);
+        assert_eq!(leftover_group("0 boot-a -", "boot-a", gone), None);
+        assert_eq!(leftover_group("x boot-a 777", "boot-a", gone), None);
+        assert_eq!(leftover_group("4242 boot-a", "boot-a", gone), None);
+        // No recorded start time: the boot match is all there is.
+        assert_eq!(leftover_group("4242 boot-a -", "boot-a", reused), Some(4242));
+    }
+
+    /// Every way a session is ended finishes on SIGKILL: a command that
+    /// ignores the gentler signals cannot outlive its initiator.
+    #[test]
+    fn every_ladder_ends_in_kill() {
+        for first in [
+            TreeSignal::Hangup,
+            TreeSignal::Interrupt,
+            TreeSignal::Terminate,
+            TreeSignal::Kill,
+        ] {
+            let steps = ladder(first);
+            assert_eq!(steps.first(), Some(&first), "{first:?}");
+            assert_eq!(steps.last(), Some(&TreeSignal::Kill), "{first:?}");
+        }
     }
 
     #[test]

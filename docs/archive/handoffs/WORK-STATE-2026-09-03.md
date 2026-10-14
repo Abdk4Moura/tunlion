@@ -396,7 +396,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    - DEFAULT (shadow) mode falls back to `legacy_ok`, which in daemon mode is
      `link_trusted`. A fleet link is untrusted by design, so it declines. That is
      section 4b working, not a defect.
-   - Under `FILAMENT_CAP_AUTHORITATIVE=1` the capability layer ALREADY has a
+   - Under `TUNLION_CAP_AUTHORITATIVE=1` the capability layer ALREADY has a
      fleet transfer path (`cap_fleet_inputs` + `scoped_in_bounds`): a same-owner
      Proven device may land a file inside the receiver's own drop dir. The
      mechanism exists and was built for this case.
@@ -531,7 +531,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    "not yet a send target" message.
 
 1c. **(historical: the earlier assessment that this needed its own session)**
-   Set `FILAMENT_FLEET_SEND=1` to exercise it. Off by default because a
+   Set `TUNLION_FLEET_SEND=1` to exercise it. Off by default because a
    half-finished feature should not be the default path; without it the clear
    "not yet a send target" message is what users get.
 
@@ -902,7 +902,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    over: the reproducer runs BOTH ends on localhost, and what actually blocked it
    was the #161 `debug_assert` panicking the receiver (1v). That assertion is
    compiled out in RELEASE, so a `--release --features test-hooks` build has the
-   injection hooks AND no panic. Added a `FILAMENT_BIN` override to the script
+   injection hooks AND no panic. Added a `TUNLION_BIN` override to the script
    (it hardcoded `/debug/`) and pointed it at such a build.
 
      baseline (no hook)     : delivered + verified   [harness OK]
@@ -1181,7 +1181,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    (2026-08-30). FIXED.** `cli/tests/ack-loss-repro.sh` exists to reproduce the
    delivery-ack teardown race deterministically on a 1 MB transfer, something the
    multi-stream push otherwise hit about 1-in-5 on 10 GB cross-machine runs. Its
-   whole mechanism is `FILAMENT_TEST_PREMATURE_CLOSE=1`, which is supposed to make
+   whole mechanism is `TUNLION_TEST_PREMATURE_CLOSE=1`, which is supposed to make
    the receiver tear the link down at the instant the ack is due.
 
    **Nothing read the flag.** `premature_close_after_ack`, `premature_close_once`,
@@ -1269,7 +1269,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    LIST did not:
 
        for p in $(pgrep -f "release/filament"); do
-           grep -q "FILAMENT_CONFIG_DIR=/tmp/claude-0" /proc/$p/environ && kill
+           grep -q "TUNLION_CONFIG_DIR=/tmp/claude-0" /proc/$p/environ && kill
        done
 
    A daemon launched from an INSTALLED binary (/root/hubtest/filament,
@@ -1306,8 +1306,8 @@ amendment section in `docs/design-mesh-network.md`. Proof:
 
    CAUSE. cli/build.rs stamps the sha from `git rev-parse` and re-runs only when
    its watched git paths change. In the cross-target musl build that did not
-   re-fire, so the crate recompiled against the CACHED FILAMENT_BUILD_INFO from
-   the previous publish. build.rs already supports FILAMENT_BUILD_SHA for
+   re-fire, so the crate recompiled against the CACHED TUNLION_BUILD_INFO from
+   the previous publish. build.rs already supports TUNLION_BUILD_SHA for
    exactly this ("CI can override"), and no publish path ever set it.
 
    WHY IT MATTERS MORE THAN IT LOOKS. "The installer reports the commit it
@@ -1333,7 +1333,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    correct (msvc, darwin). CI checks out fresh, so build.rs re-runs; a local
    cross build under its own CARGO_TARGET_DIR does not trip build.rs's watched
    paths and recompiles against the cached value. Builders should pass
-   FILAMENT_BUILD_SHA.
+   TUNLION_BUILD_SHA.
 
    Impact was contained: install.ps1 uses the MSVC artifact, which was correct.
    Only the direct .exe download carried a possibly-stale binary under a current
@@ -1558,14 +1558,14 @@ amendment section in `docs/design-mesh-network.md`. Proof:
 
    THE FIX HAS A PRECEDENT IN THIS FILE'S OWN SUITE. Gate 17b faced exactly this
    ("same-machine pairs otherwise finish in ~1s") and solved it with a test hook,
-   `FILAMENT_TEST_PAIR_STALL`, so the ceremony budget fires deterministically
+   `TUNLION_TEST_PAIR_STALL`, so the ceremony budget fires deterministically
    rather than racing the machine. 11b needs the transfer equivalent: a
    feature-gated stall that holds the send mid-flight so the reconnect provably
    lands inside the window. Enlarging the payload only buys margin; it does not
    make the gate deterministic, and it makes every run slower.
 
-   FIXED 2026-08-29. `FILAMENT_TEST_TRANSFER_STALL_MS` holds each chunk briefly,
-   exactly as `FILAMENT_TEST_PAIR_STALL` does for 17b, and 11b sets it to 3ms.
+   FIXED 2026-08-29. `TUNLION_TEST_TRANSFER_STALL_MS` holds each chunk briefly,
+   exactly as `TUNLION_TEST_PAIR_STALL` does for 17b, and 11b sets it to 3ms.
    That number is derived, not guessed: 80 MB in ~60 KiB chunks is ~1365 chunks,
    so 3ms each adds ~4.1s and the transfer lasts ~4.9s, against the ~0.6s R2
    needs to spawn. About 8x margin for four seconds of suite time. (25ms, the
@@ -1658,7 +1658,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
        default path, NO flag    8/8
 
    That is the first 100% this path has ever recorded, after four patches that
-   each made it worse. FILAMENT_FLEET_SEND is no longer needed: brokering works
+   each made it worse. TUNLION_FLEET_SEND is no longer needed: brokering works
    without it, and the flag now only exercises the old unbrokered fallback
    deliberately. A fleet name is accepted as a `send --to` target whenever a
    daemon is present to broker.
@@ -1706,7 +1706,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    - Nothing bounded how long an unproven peer could hold the target slot. The
      OWNER is the standing case: it is PAIRED with us, so its daemon never sends
      `fleet-hello` at all, and waiting for its proof waits forever. Now a 12s
-     per-peer budget (`FILAMENT_FLEET_PROOF_SECS`) releases the slot.
+     per-peer budget (`TUNLION_FLEET_PROOF_SECS`) releases the slot.
    - Receiver side: an offer arriving while the sender's `fleet-hello` was still
      in flight was DECIDED against a link that read `binding=None`, declining a
      peer that was about to be Proven. Now deferred and replayed on verification.
@@ -1859,7 +1859,7 @@ read from a link principal that only carries caps on the first join.
 daemon on a host that already runs one cannot get a kernel TUN and silently
 degrades to the userspace overlay, which installs no kernel routes. Each test
 daemon therefore runs in its own network namespace. Test daemons must be killed
-by EXECUTABLE, not by config dir: `FILAMENT_CONFIG_DIR` is an env var and never
+by EXECUTABLE, not by config dir: `TUNLION_CONFIG_DIR` is an env var and never
 appears in `/proc/<pid>/cmdline`, so three leaked daemons piled up before a
 "Text file busy" on rebuild gave it away. The rig pins its binary out of the
 shared `CARGO_TARGET_DIR` and asserts its hash.

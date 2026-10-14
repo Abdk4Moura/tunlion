@@ -18,7 +18,7 @@ from labkit.topology import Topology
 
 
 # Where the locally-built tunlion binary lives (tunlion provider uses it).
-from labkit.doctor import FILAMENT_BIN  # noqa: F401  (re-export for providers)
+from labkit.doctor import TUNLION_BIN  # noqa: F401  (re-export for providers)
 
 
 @dataclass

@@ -66,7 +66,7 @@ timeout -k 5 "$CAST_TIMEOUT" "$UX_BIN/asciinema" rec -f asciicast-v2 --idle-time
 # kill any children the boxed (possibly-wedged) recorded run left behind:
 # our tunlion procs (matched by cfg dir) AND scenario 06's throwaway sshd.
 for p in $(pgrep -f "$TUNLION" 2>/dev/null); do
-  tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -q "FILAMENT_CONFIG_DIR=$UX_TMP/s${ID}" && kill -9 "$p" 2>/dev/null
+  tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -q "TUNLION_CONFIG_DIR=$UX_TMP/s${ID}" && kill -9 "$p" 2>/dev/null
 done
 for p in $(pgrep -f "sshd_config" 2>/dev/null); do
   tr '\0' '\n' < /proc/$p/cmdline 2>/dev/null | grep -q "$UX_TMP/s${ID}" && kill -9 "$p" 2>/dev/null

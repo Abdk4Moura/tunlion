@@ -57,6 +57,34 @@ pub const MAX_DC_PAYLOAD: usize = 60 * 1024;
 const HIGH_WATER: usize = 4 * 1024 * 1024;
 const LOW_WATER: usize = 1024 * 1024;
 pub const WATCHDOG_SECS: u64 = 15;
+/// How long `DataChannelTransport::flush` waits with bytes still buffered and
+/// NOT ONE of them acknowledged before it declares the peer gone. Progress, not
+/// throughput: any acknowledged byte restarts it (see `flush`).
+pub const DC_FLUSH_STALL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a DataChannel write may wait while the SCTP association
+/// acknowledges NOTHING before the channel is declared dead.
+///
+/// A write does not return until the association takes the message, and the
+/// association only takes more once the peer acknowledges what is already
+/// queued (webrtc-sctp's pending queue is a 128 KiB semaphore whose permits come
+/// back only on SACK). A peer that was SIGKILLed never acknowledges again, and
+/// nothing closes that semaphore when the association dies, so an unbounded
+/// write parks for the life of the process. Measured in CI (gate 2, kill-resume):
+/// the sender's event loop parked inside its periodic `state` control send for
+/// 330 s and only the job timeout ended it.
+///
+/// The rule is on PROGRESS, never on throughput: any acknowledged byte (a drop
+/// in `buffered_amount`) restarts the clock, so a slow link that still moves is
+/// never cut off. 15 s with zero acknowledged bytes is well past the 6 s stall
+/// threshold the transfer ladder already acts on.
+pub const DC_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(15);
+/// The label `Peer::route` gives a path through a TURN relay. Callers that
+/// must react to a relayed path (the relay-honesty banner) compare against
+/// THIS, not a literal of their own: the CLI compared against "relayed" while
+/// this returned "relay", so the banner it promises on every relayed transfer
+/// never printed once.
+pub const ROUTE_RELAY: &str = "relay";
 
 /// P0 (GAP-1): default no-progress threshold (ms) for the bytes-moved stall
 /// watchdog. An in-flight transfer whose link's `idle_ms()` exceeds this, while
@@ -64,13 +92,13 @@ pub const WATCHDOG_SECS: u64 = 15;
 /// sits well above a slow-but-moving link's inter-chunk gap on a bad mobile
 /// uplink (the threshold is on *time since the last byte*, never on throughput,
 /// so a slow link that still advances resets it) and well below human patience.
-/// Overridable via `FILAMENT_STALL_MS`, mirroring the `FILAMENT_ADOPT_ACTIVE_MS`
-/// / `FILAMENT_REJOIN_SECS` knob style.
+/// Overridable via `TUNLION_STALL_MS`, mirroring the `TUNLION_ADOPT_ACTIVE_MS`
+/// / `TUNLION_REJOIN_SECS` knob style.
 pub const STALL_MS_DEFAULT: u64 = 6_000;
 
-/// Read the configured stall threshold (`FILAMENT_STALL_MS`, default 6 s).
+/// Read the configured stall threshold (`TUNLION_STALL_MS`, default 6 s).
 pub fn stall_ms() -> u64 {
-    std::env::var("FILAMENT_STALL_MS")
+    std::env::var("TUNLION_STALL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -89,13 +117,13 @@ pub fn stall_ms() -> u64 {
 /// link moves its first data byte (`Transport::has_flowed`) we give it this much
 /// larger grace; once bytes flow, the tight `stall_ms` applies. Each fresh
 /// transport (e.g. after a repair) re-earns the grace. Overridable via
-/// `FILAMENT_ESTABLISH_GRACE_MS`.
+/// `TUNLION_ESTABLISH_GRACE_MS`.
 pub const ESTABLISH_GRACE_MS_DEFAULT: u64 = 45_000;
 
-/// Read the before-first-byte establishment grace (`FILAMENT_ESTABLISH_GRACE_MS`,
+/// Read the before-first-byte establishment grace (`TUNLION_ESTABLISH_GRACE_MS`,
 /// default 45 s). Never below `stall_ms()` (a smaller grace would defeat itself).
 pub fn establish_grace_ms() -> u64 {
-    std::env::var("FILAMENT_ESTABLISH_GRACE_MS")
+    std::env::var("TUNLION_ESTABLISH_GRACE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -110,18 +138,18 @@ pub fn establish_grace_ms() -> u64 {
 /// at the receiver.  Defaults to `min(max(1, available_parallelism - 1), 4)` —
 /// i.e. one less than the CPU count, at least 1, capped at 4 (diminishing
 /// returns beyond 4 for a single flow over the same bottleneck).  Overridable
-/// via `FILAMENT_DIRECT_STREAMS`; setting it to 1 gives today's single-stream
+/// via `TUNLION_DIRECT_STREAMS`; setting it to 1 gives today's single-stream
 /// behaviour.
 /// Default K=1 (single-stream) — K>1 is disabled by default until the
-/// cross-machine primary-death bug is fixed. Set FILAMENT_DIRECT_STREAMS=n
+/// cross-machine primary-death bug is fixed. Set TUNLION_DIRECT_STREAMS=n
 /// to override. Once fixed, this reverts to 0 (auto-calc = min(cpus-1,4)).
 pub const DIRECT_STREAMS_DEFAULT: usize = 1; // K=1 single-stream (safe default, no striping risk)
 
 /// Read the configured number of direct-QUIC worker streams
-/// (`FILAMENT_DIRECT_STREAMS`). Defaults to 1 (single-stream safe default).
-/// Set `FILAMENT_DIRECT_STREAMS=n` to enable K>1 mesh streaming.
+/// (`TUNLION_DIRECT_STREAMS`). Defaults to 1 (single-stream safe default).
+/// Set `TUNLION_DIRECT_STREAMS=n` to enable K>1 mesh streaming.
 pub fn direct_streams() -> usize {
-    std::env::var("FILAMENT_DIRECT_STREAMS")
+    std::env::var("TUNLION_DIRECT_STREAMS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
@@ -136,12 +164,12 @@ pub fn direct_streams() -> usize {
 /// so the silence climbs past this and trips the re-announce. Well above the 5 s
 /// sync cadence (so a single slow ack never false-trips) and well below the
 /// minute-scale rediscovery latency the supervisor's cadence imposed.
-/// Overridable via `FILAMENT_SIGNALING_SILENCE_MS`.
+/// Overridable via `TUNLION_SIGNALING_SILENCE_MS`.
 pub const SIGNALING_SILENCE_MS_DEFAULT: u64 = 15_000;
 
-/// Read the configured signaling-silence threshold (`FILAMENT_SIGNALING_SILENCE_MS`).
+/// Read the configured signaling-silence threshold (`TUNLION_SIGNALING_SILENCE_MS`).
 pub fn signaling_silence_ms() -> u64 {
-    std::env::var("FILAMENT_SIGNALING_SILENCE_MS")
+    std::env::var("TUNLION_SIGNALING_SILENCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -161,13 +189,13 @@ pub fn signaling_silence_ms() -> u64 {
 ///
 /// The session kind decides the default (set on `Conn::warm_standby` at
 /// construction). This knob is the explicit override:
-///   `FILAMENT_WARM_STANDBY=1` forces it ON  (e.g. a sustained transfer standing
+///   `TUNLION_WARM_STANDBY=1` forces it ON  (e.g. a sustained transfer standing
 ///                                            in for an interactive session in a
 ///                                            test / power-user case),
-///   `FILAMENT_WARM_STANDBY=0` forces it OFF (kill switch / A-B baseline).
+///   `TUNLION_WARM_STANDBY=0` forces it OFF (kill switch / A-B baseline).
 /// Returns `None` when unset, so the session-kind default stands.
 pub fn warm_standby_override() -> Option<bool> {
-    match std::env::var("FILAMENT_WARM_STANDBY").ok().as_deref() {
+    match std::env::var("TUNLION_WARM_STANDBY").ok().as_deref() {
         Some("1") | Some("true") | Some("on") => Some(true),
         Some("0") | Some("false") | Some("off") => Some(false),
         _ => None,
@@ -184,12 +212,12 @@ pub fn warm_standby_override() -> Option<bool> {
 // upgrades back when one is confirmed STABLE (verify-before-upgrade). Relay
 // becomes a way-station, not a destination.
 
-/// Is the relay->direct upgrade prober ENABLED? (`FILAMENT_UPGRADE_PROBE=0`
+/// Is the relay->direct upgrade prober ENABLED? (`TUNLION_UPGRADE_PROBE=0`
 /// disables it, the kill switch the resilience plan calls for. Default ON.)
 /// A no-op under `--no-relay` (that path never reaches relay) regardless of
 /// this knob, the caller also gates on `relay_forbidden()`.
 pub fn upgrade_prober_enabled() -> bool {
-    match std::env::var("FILAMENT_UPGRADE_PROBE").ok().as_deref() {
+    match std::env::var("TUNLION_UPGRADE_PROBE").ok().as_deref() {
         Some("0") | Some("false") | Some("off") => false,
         _ => true,
     }
@@ -197,10 +225,10 @@ pub fn upgrade_prober_enabled() -> bool {
 
 /// FIRST direct re-probe delay after a peer falls to relay (ms). Soon, because
 /// the cause is often transient (a momentary NAT/path hiccup that heals in
-/// seconds). `FILAMENT_UPGRADE_FIRST_MS`, default ~5 s.
+/// seconds). `TUNLION_UPGRADE_FIRST_MS`, default ~5 s.
 pub const UPGRADE_FIRST_MS_DEFAULT: u64 = 5_000;
 pub fn upgrade_first_ms() -> u64 {
-    std::env::var("FILAMENT_UPGRADE_FIRST_MS")
+    std::env::var("TUNLION_UPGRADE_FIRST_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -209,12 +237,12 @@ pub fn upgrade_first_ms() -> u64 {
 
 /// STEADY re-probe cadence once direct keeps failing (ms). Backs off from the
 /// eager first probe to a calm cadence so a symmetric-NAT peer that will NEVER
-/// get direct doesn't get hammered (CPU/battery). `FILAMENT_UPGRADE_STEADY_MS`,
+/// get direct doesn't get hammered (CPU/battery). `TUNLION_UPGRADE_STEADY_MS`,
 /// default ~25 s. The schedule is: first probe at `first_ms`, then each failed
 /// probe doubles the interval toward this cap.
 pub const UPGRADE_STEADY_MS_DEFAULT: u64 = 25_000;
 pub fn upgrade_steady_ms() -> u64 {
-    std::env::var("FILAMENT_UPGRADE_STEADY_MS")
+    std::env::var("TUNLION_UPGRADE_STEADY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -224,11 +252,11 @@ pub fn upgrade_steady_ms() -> u64 {
 /// VERIFY-before-upgrade window (ms): once a direct standby CONNECTS alongside
 /// the live relay link, it must move real data CONTINUOUSLY for at least this
 /// long before we cut over. Prevents thrash on a flaky direct path that
-/// connects then immediately re-stalls. `FILAMENT_UPGRADE_VERIFY_MS`, default
+/// connects then immediately re-stalls. `TUNLION_UPGRADE_VERIFY_MS`, default
 /// ~2.5 s of sustained progress.
 pub const UPGRADE_VERIFY_MS_DEFAULT: u64 = 2_500;
 pub fn upgrade_verify_ms() -> u64 {
-    std::env::var("FILAMENT_UPGRADE_VERIFY_MS")
+    std::env::var("TUNLION_UPGRADE_VERIFY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -238,10 +266,10 @@ pub fn upgrade_verify_ms() -> u64 {
 /// VERIFY-before-upgrade idle guard (ms): during the verify window, if the
 /// direct standby goes idle for this long it is judged regressed and DISCARDED
 /// (we stay on relay). Tighter than `stall_ms` so a flaky standby fails fast.
-/// `FILAMENT_UPGRADE_VERIFY_IDLE_MS`, default ~1.2 s.
+/// `TUNLION_UPGRADE_VERIFY_IDLE_MS`, default ~1.2 s.
 pub const UPGRADE_VERIFY_IDLE_MS_DEFAULT: u64 = 1_200;
 pub fn upgrade_verify_idle_ms() -> u64 {
-    std::env::var("FILAMENT_UPGRADE_VERIFY_IDLE_MS")
+    std::env::var("TUNLION_UPGRADE_VERIFY_IDLE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -280,7 +308,7 @@ pub enum Ev {
     /// (peer sid, ...), every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).
     ChannelReady(String, Arc<dyn Transport>),
-    /// rung-1 direct path (FILAMENT_DIRECT): an AUTHENTICATED QUIC transport for
+    /// rung-1 direct path (TUNLION_DIRECT): an AUTHENTICATED QUIC transport for
     /// (peer sid) won the simultaneous-open race and passed the pair-secret MAC.
     /// Handled like ChannelReady but the link is pre-trusted (the MAC already
     /// proved the secret, stronger than the post-DC pair-proof), so the
@@ -330,6 +358,13 @@ pub enum Ev {
     TransferStalled(String, u64),
     /// C4: the 6s disconnected-grace timer expired for (peer sid, generation).
     GraceExpired(String, u32),
+    /// The retry ladder's backoff for (peer sid, generation of the stuck
+    /// attempt) has elapsed. `on_stuck` used to SLEEP the backoff (1,2,4,8s)
+    /// inline, which froze the whole event loop: control requests waited up to
+    /// 4s and peer exec stalled. It now schedules this event from a timer task
+    /// and returns at once; the handler re-validates the generation, so a
+    /// retry for a link that was replaced or recovered meanwhile is ignored.
+    RetryLink(String, u32),
     /// P2 (GAP-2): the signaling socket reported a clean close/error (the
     /// socket.io `close`/`error` callbacks). A FAST-PATH hint that the link is
     /// gone, the long-lived acceptor's outer reconnect loop re-dials signaling
@@ -337,8 +372,14 @@ pub enum Ev {
     /// protocol error; a hard TCP sever (the flaky-proxy case) produces NO
     /// callback at all, so the silence watchdog (`signaling_silence_ms`) is the
     /// authoritative trigger and this is purely an accelerant.
-    #[allow(dead_code)] // reason kept for logs/debug; the loop only needs the wake-up
-    SignalingDown(String),
+    ///
+    /// The `u64` is the id of the connection that ended
+    /// (`filament_signal::Client::id`). Every connection a re-dialing daemon
+    /// opens shares one event channel, so a close can arrive after the loop has
+    /// already replaced that connection; only a close whose id matches the
+    /// CURRENT client means the link is down. Acting on a stale one tore down
+    /// each fresh connection in turn: the post-SIGSTOP reconnect storm.
+    SignalingDown(String, u64),
     /// Warm-reuse opened a stream over this held link and it black-holed (no
     /// response within the verify window) - the link is a zombie (alive at the
     /// QUIC layer but dead for new streams). The loop drops it so the daemon
@@ -404,6 +445,17 @@ pub trait Transport: Send + Sync {
         }
         let idle_ms = self.idle_ms();
         (idle_ms != u64::MAX).then_some(idle_ms)
+    }
+    /// Milliseconds since the PEER last sent us anything at all (data, control,
+    /// or its keepalive), or `None` when this transport does not track it.
+    ///
+    /// Not `idle_ms`: that is stamped when OUR writes succeed too, and the relay
+    /// keepalive writes every 5 s whether or not anyone is listening, so a relay
+    /// link to a stopped or wiped peer kept `idle_ms` near zero forever and was
+    /// shown as "online (last seen just now)". A healthy relay peer sends its own
+    /// keepalive every 5 s, so silence here past a few seconds means it is gone.
+    fn heard_ms(&self) -> Option<u64> {
+        None
     }
     /// Best-effort liveness: `false` if the underlying connection is known closed.
     /// Default `true` (untracked transports are assumed live). Warm-link reuse
@@ -552,6 +604,9 @@ pub struct DataChannelTransport {
     // signaling reconnect must not supersede a link whose data channel, which
     // is independent of the socket, is still flowing.
     last_activity: Arc<std::sync::atomic::AtomicU64>,
+    // Monotonic ms-stamp of the last message the PEER sent, of any kind (see
+    // `Transport::heard_ms`). Never stamped by our own writes.
+    last_heard: Arc<std::sync::atomic::AtomicU64>,
     // Flips true the first time a DATA frame moves in either direction. Backs the
     // before-first-byte establishment grace (a link awaiting its first chunk over
     // a high-RTT relay is establishing, not stalled).
@@ -572,6 +627,51 @@ impl DataChannelTransport {
     fn is_dead(&self) -> bool {
         self.dead.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Mark the channel dead and wake every sender parked on it.
+    fn declare_dead(&self) {
+        self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.drained.notify_waiters();
+    }
+
+    /// Wait for `ready` (a write, or the backpressure condition), but never past
+    /// [`DC_WRITE_STALL`] without the association acknowledging a byte, and
+    /// never past the channel's death. Polls once a second so progress (a drop
+    /// in `buffered_amount`) can extend the deadline.
+    async fn bounded<T>(
+        &self,
+        what: &str,
+        ready: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::pin!(ready);
+        let mut last = self.raw.buffered_amount();
+        let mut deadline = tokio::time::Instant::now() + DC_WRITE_STALL;
+        loop {
+            if self.is_dead() {
+                return Err(anyhow!("channel closed"));
+            }
+            // Created before the select, so a death notified while we wait is
+            // never missed (notify_waiters reaches every Notified that exists).
+            let died = self.drained.notified();
+            tokio::select! {
+                r = &mut ready => return r,
+                _ = died => continue,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+            let now = self.raw.buffered_amount();
+            if now < last {
+                deadline = tokio::time::Instant::now() + DC_WRITE_STALL;
+            }
+            last = now;
+            if tokio::time::Instant::now() >= deadline {
+                self.declare_dead();
+                return Err(anyhow!(
+                    "data channel {what} got no acknowledgement for {}s, the peer is gone",
+                    DC_WRITE_STALL.as_secs()
+                ));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -580,14 +680,16 @@ impl Transport for DataChannelTransport {
         if self.is_dead() {
             return Err(anyhow!("channel closed"));
         }
-        self.raw
-            .write_data_channel(&Bytes::from(msg.to_string()), true)
-            .await?;
-        Ok(())
+        let data = Bytes::from(msg.to_string());
+        self.bounded("control write", async {
+            self.raw.write_data_channel(&data, true).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
     }
 
     async fn send_frame(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()> {
-        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
         let t_frame = if trace { Some(std::time::Instant::now()) } else { None };
         let mut framed = Vec::with_capacity(4 + 8 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
@@ -598,27 +700,40 @@ impl Transport for DataChannelTransport {
         // notification instead of sleep-polling. Re-check after registering
         // to close the notify race. The read loop notifies on death, so a
         // sender parked on a dying channel wakes up and errors out.
+        //
+        // Both waits below are bounded by `bounded` (DC_WRITE_STALL with no
+        // acknowledged byte): a peer that died without closing the association
+        // never drains the buffer and never notifies, and an unbounded park
+        // here is a sender that never learns its receiver is gone.
         let t_bp = if trace { Some(std::time::Instant::now()) } else { None };
-        let mut waited = false;
-        loop {
-            if self.is_dead() {
-                return Err(anyhow!("channel closed"));
-            }
-            if self.raw.buffered_amount() <= HIGH_WATER {
-                break;
-            }
-            waited = true;
-            let notified = self.drained.notified();
-            if self.raw.buffered_amount() <= HIGH_WATER {
-                break;
-            }
-            notified.await;
+        let waited = self.raw.buffered_amount() > HIGH_WATER;
+        let _ = &waited; // read only by the trace line below
+        if waited {
+            self.bounded("backpressure", async {
+                loop {
+                    if self.is_dead() {
+                        return Err::<(), anyhow::Error>(anyhow!("channel closed"));
+                    }
+                    if self.raw.buffered_amount() <= HIGH_WATER {
+                        return Ok(());
+                    }
+                    let notified = self.drained.notified();
+                    if self.raw.buffered_amount() <= HIGH_WATER {
+                        return Ok(());
+                    }
+                    notified.await;
+                }
+            })
+            .await?;
         }
         let bp_us = t_bp.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let t_write = if trace { Some(std::time::Instant::now()) } else { None };
-        self.raw
-            .write_data_channel(&Bytes::from(framed), false)
-            .await?;
+        let framed = Bytes::from(framed);
+        self.bounded("write", async {
+            self.raw.write_data_channel(&framed, false).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
         let write_us = t_write.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         if trace {
             static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -675,9 +790,35 @@ impl Transport for DataChannelTransport {
 
     async fn flush(&self) -> Result<()> {
         // Tail-drain only; polling is fine for the final few buffers.
+        //
+        // BOUNDED ON PROGRESS. `buffered_amount` only falls when the peer's SCTP
+        // stack acknowledges (SACK) what we wrote. A peer that exits or is
+        // killed right after reading our last message never acknowledges it,
+        // and nothing closes the association, so the read loop never marks the
+        // channel dead either: an unbounded poll here waited forever. That was
+        // the receiver that kept running after it had the whole verified file
+        // (gate 11c, G-k): its event loop sat in this loop behind the
+        // delivery-ack the sender had already read before exiting. Any drop in
+        // `buffered_amount` restarts the clock, so a slow link that still moves
+        // is never cut off; only a peer that acknowledges nothing at all is.
+        let mut last = self.raw.buffered_amount();
+        let mut deadline = tokio::time::Instant::now() + DC_FLUSH_STALL;
         while self.raw.buffered_amount() > 0 {
             if self.is_dead() {
                 return Err(anyhow!("channel closed while flushing"));
+            }
+            let now = self.raw.buffered_amount();
+            if now < last {
+                deadline = tokio::time::Instant::now() + DC_FLUSH_STALL;
+            }
+            last = now;
+            if tokio::time::Instant::now() >= deadline {
+                self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.drained.notify_waiters();
+                return Err(anyhow!(
+                    "data channel flush got no acknowledgement for {}s, the peer is gone",
+                    DC_FLUSH_STALL.as_secs()
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -686,6 +827,13 @@ impl Transport for DataChannelTransport {
 
     fn max_payload(&self) -> usize {
         MAX_DC_PAYLOAD
+    }
+
+    fn heard_ms(&self) -> Option<u64> {
+        if self.is_dead() {
+            return Some(u64::MAX);
+        }
+        Some(now_ms().saturating_sub(self.last_heard.load(std::sync::atomic::Ordering::Relaxed)))
     }
 
     fn idle_ms(&self) -> u64 {
@@ -747,11 +895,11 @@ impl Transport for DataChannelTransport {
 /// to win the race outright. Comfortably above a healthy resolver's answer
 /// (single-digit to low-hundreds ms) and well below the ~5 s cold stall, so a
 /// healthy box always uses fresh DNS and only a stalling resolver falls back to
-/// the cache. Overridable via `FILAMENT_DNS_RACE_MS`.
+/// the cache. Overridable via `TUNLION_DNS_RACE_MS`.
 const DNS_RACE_MS_DEFAULT: u64 = 700;
 
 fn dns_race_ms() -> u64 {
-    std::env::var("FILAMENT_DNS_RACE_MS")
+    std::env::var("TUNLION_DNS_RACE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -761,11 +909,11 @@ fn dns_race_ms() -> u64 {
 /// Hard cap on the fresh OS resolution itself, so our own pre-resolve can never
 /// hang the process even when the cache is empty (first ever connect from a box
 /// with the cold-resolver stall). Above the observed worst case (~7.4 s) with
-/// headroom. Overridable via `FILAMENT_DNS_TIMEOUT_MS`.
+/// headroom. Overridable via `TUNLION_DNS_TIMEOUT_MS`.
 const DNS_TIMEOUT_MS_DEFAULT: u64 = 9_000;
 
 fn dns_timeout_ms() -> u64 {
-    std::env::var("FILAMENT_DNS_TIMEOUT_MS")
+    std::env::var("TUNLION_DNS_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -842,7 +990,14 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
     }
     let path = dns_cache_path();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if !dir.is_dir() {
+            let _ = std::fs::create_dir_all(dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
     }
     let mut doc = std::fs::read_to_string(&path)
         .ok()
@@ -851,7 +1006,19 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
         .unwrap_or_else(|| json!({}));
     let ips: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
     doc[host] = json!(ips);
-    let _ = std::fs::write(&path, doc.to_string());
+    // Owner-only whatever the umask: this sits in the config directory, and a
+    // world-writable cache lets anyone point the next connect elsewhere.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&path) {
+        use std::io::Write;
+        let _ = f.write_all(doc.to_string().as_bytes());
+    }
 }
 
 /// Resolve `host:port` to connect targets, immune to a cold-resolver stall.
@@ -911,7 +1078,7 @@ pub(crate) async fn resolve_warm(host: &str, port: u16) -> Vec<SocketAddr> {
 
 /// Steer CONTROL-PLANE calls (config/signaling) at targets the host can actually
 /// reach, then order IPv4 first. Many hosts have NO route to public IPv6 - a home
-/// network with v4-only internet, or any overlay node whose `filament0` ULA nudges
+/// network with v4-only internet, or any overlay node whose `tunlion0` ULA nudges
 /// the stack into "thinking" it has v6 - so a v6 target dead-ends the connect with
 /// ENETUNREACH (the "Network unreachable (os error 101)" a v4-only box hit). We DROP
 /// any address the host has no source route to (a route lookup via `source_ip_for`,
@@ -1052,7 +1219,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         tokio::spawn(async move {
             while let Some(msg) = raw_rx.recv().await {
                 let ev = match msg {
-                    filament_signal::Incoming::Down(reason) => Ev::SignalingDown(reason),
+                    filament_signal::Incoming::Down { conn, reason } => Ev::SignalingDown(reason, conn),
                     filament_signal::Incoming::Event { name, data } => match name.as_str() {
                         "welcome" => Ev::Welcome(data),
                         "peer-joined" => Ev::PeerJoined(data),
@@ -1194,7 +1361,10 @@ pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, pee
     }
     ensure_ascii_session_id(my_id)?;
     ensure_ascii_session_id(peer_id)?;
-    eprintln!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
+    // Debug builds only: at the default verbosity this printed one line per
+    // decision into a user's `receive` (five of them before a failure message).
+    let _ = (source, peer_present);
+    dlog!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
     Ok(match peer_uid {
         Some(p) if p != my_uid => my_uid > p,
         _ => my_id > peer_id,
@@ -1268,7 +1438,7 @@ impl Peer {
         // runners cannot bind multicast sockets for mDNS resolution, and a
         // stuck mDNS gather blocks ALL ICE candidate gathering.
         #[cfg(feature = "test-hooks")]
-        if std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("TUNLION_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false) {
             se.set_ip_filter(Box::new(|ip: std::net::IpAddr| ip.is_loopback()));
             // THE FILTER ALONE YIELDS ZERO HOST CANDIDATES. webrtc-rs excludes
             // loopback from host gathering unless told otherwise (default off,
@@ -1613,7 +1783,7 @@ impl Peer {
         if pair.local.typ == RTCIceCandidateType::Relay
             || pair.remote.typ == RTCIceCandidateType::Relay
         {
-            return Some("relay".into());
+            return Some(ROUTE_RELAY.into());
         }
         let same_host =
             pair.local.address == pair.remote.address || is_own_addr(&pair.remote.address);
@@ -1814,6 +1984,23 @@ pub fn is_own_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The route a person reads for a direct-QUIC link pinned to `remote`, in the
+/// same words [`Peer::route`] uses for a WebRTC one: "direct over lo" when the
+/// peer is this host, else "direct over <interface>". The link's own label
+/// ("direct-quic") is an internal name: printed as the route, it left a
+/// same-host code transfer saying neither local nor direct-over-anything on
+/// either end, once code transfers moved to QUIC after the ceremony.
+pub fn direct_route_label(remote: std::net::SocketAddr) -> String {
+    let ip = remote.ip();
+    if ip.is_loopback() || is_own_addr(&ip.to_string()) {
+        return "direct over lo".into();
+    }
+    match source_ip_for(remote) {
+        Some(local) => format!("direct over {}", resolve_iface_name(&local.to_string())),
+        None => "direct".into(),
+    }
+}
+
 /// The local source IP the kernel would use to reach `remote`. Same no-packets
 /// UDP-connect trick as `is_own_addr`: after `connect()`, `local_addr()` reports
 /// the source the routing table picked. Lets `tunlion ping` name the outbound
@@ -1898,6 +2085,8 @@ async fn wire_channel(
             // Seed activity at open so a link mid-handshake (no bytes yet) is
             // never falsely treated as idle/supersedable (#28 guard).
             let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
+            // Seeded at open too: a link that just came up has just heard its peer.
+            let last_heard = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
             let first_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
             // L3-over-relay queues, created BEFORE the read loop so the reader
             // owns the inbound sender and the transport owns the receiver.
@@ -1918,19 +2107,30 @@ async fn wire_channel(
             }
 
             // Our read loop: text -> Control, binary -> [u32 sid][payload].
-            {
+            //
+            // BUILT here, SPAWNED last (after ChannelReady is queued, below). A
+            // future does nothing until it is spawned, so this only fixes WHEN
+            // reading starts. See `announce_then_read` for why that matters.
+            let reader = {
                 let raw = raw.clone();
                 let tx = tx.clone();
                 let closed = closed.clone();
                 let dead = dead.clone();
                 let drained = drained.clone();
                 let last_activity = last_activity.clone();
+                let last_heard = last_heard.clone();
                 let first_data = first_data.clone();
                 let peer_id = peer_id.clone();
-                tokio::spawn(async move {
+                async move {
                     let mut buf = vec![0u8; READ_BUF];
                     loop {
-                        match raw.read_data_channel(&mut buf).await {
+                        let read = raw.read_data_channel(&mut buf).await;
+                        if matches!(read, Ok((n, _)) if n > 0) {
+                            // Anything the peer sent, its keepalive included,
+                            // proves it is there (Transport::heard_ms).
+                            last_heard.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        match read {
                             Ok((0, _)) | Err(_) => {
                                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                                 drained.notify_waiters(); // wake parked senders
@@ -1978,9 +2178,10 @@ async fn wire_channel(
                             }
                         }
                     }
-                });
-            }
+                }
+            };
 
+            let mut ready = None;
             if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                 // Relay/DataChannel links have NO QUIC keepalive, so an idle one
                 // on a container/DERP path is silently evicted in ~10s, after which
@@ -2001,8 +2202,13 @@ async fn wire_channel(
                             if dead_k.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
-                            if raw_k.write_data_channel(&frame, true).await.is_err() {
-                                break;
+                            // Bounded: on a peer that died without closing the
+                            // association this write never returns (see
+                            // DC_WRITE_STALL), and a parked keepalive is a task
+                            // that outlives its link.
+                            match tokio::time::timeout(DC_WRITE_STALL, raw_k.write_data_channel(&frame, true)).await {
+                                Ok(Ok(_)) => {}
+                                _ => break,
                             }
                             act_k.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                         }
@@ -2034,19 +2240,123 @@ async fn wire_channel(
                 }
                 let transport: Arc<dyn Transport> =
                     Arc::new(DataChannelTransport {
-                        raw, drained, dead, last_activity, first_data, answerer: polite,
+                        raw, drained, dead, last_activity, last_heard, first_data, answerer: polite,
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
                     });
-                let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
+                ready = Some(Ev::ChannelReady(peer_id.clone(), transport));
             }
+            announce_then_read(&tx, ready, reader);
         })
     }));
+}
+
+/// Queue the channel's `ChannelReady`, THEN start the task that reads it.
+///
+/// Both go into the same unbounded FIFO, so this order is what guarantees a
+/// consumer sees `ChannelReady` for a peer before any `Control` from it. The
+/// reader used to be spawned first. A peer that writes the moment ITS side
+/// opens (the joiner sends `identity-auth-key-enroll-request` from its own
+/// ChannelReady) has that frame buffered by the time ours opens, so the reader
+/// could queue it before ChannelReady was sent. The daemon then handled the
+/// request on a link with no transport attached yet, `transport_of` was None,
+/// and the request was dropped without a word: `tunlion join` printed "sent
+/// enrollment request" and waited out its 60s deadline. That is the shape of
+/// both CI wedges seen (`join --name delta` in revocation-live, `join --name
+/// bravo` in forward-refusal): owner shows the link up, no challenge ever sent.
+///
+/// Reading later loses nothing: unread frames stay buffered in the SCTP
+/// stream until the reader takes them. `ready` is None when the link was
+/// closed while opening; the reader still runs so the channel is drained and
+/// marked dead, and it forwards nothing for a closed link.
+fn announce_then_read<F>(tx: &mpsc::UnboundedSender<Ev>, ready: Option<Ev>, reader: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Some(ev) = ready {
+        let _ = tx.send(ev);
+    }
+    tokio::spawn(reader);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubTransport;
+
+    #[async_trait]
+    impl Transport for StubTransport {
+        async fn send_control(&self, _msg: &Value) -> Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The join hang: a frame the peer wrote the instant ITS side opened is
+    /// already buffered when ours opens, so our reader forwards it at once. The
+    /// consumer must still see ChannelReady first, or it handles the frame on a
+    /// link with no transport and drops it (the enrolment request, lost without
+    /// a word, left `tunlion join` waiting out its deadline). The reader here
+    /// does exactly that, forwarding on its first poll from another worker
+    /// thread, and the check runs many times because the old order lost only
+    /// a race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn channel_ready_is_queued_before_any_control_from_the_peer() {
+        for round in 0..200 {
+            let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+            let reader_tx = tx.clone();
+            let reader = async move {
+                let _ = reader_tx.send(Ev::Control(
+                    "peer".into(),
+                    json!({ "type": "identity-auth-key-enroll-request" }),
+                ));
+            };
+            let transport: Arc<dyn Transport> = Arc::new(StubTransport);
+            announce_then_read(
+                &tx,
+                Some(Ev::ChannelReady("peer".into(), transport)),
+                reader,
+            );
+            let first = rx.recv().await.expect("an event");
+            assert!(
+                matches!(first, Ev::ChannelReady(ref p, _) if p == "peer"),
+                "round {round}: a Control from the peer was queued before its ChannelReady"
+            );
+            let second = rx.recv().await.expect("the reader's frame");
+            assert!(
+                matches!(second, Ev::Control(ref p, _) if p == "peer"),
+                "round {round}: the buffered frame must still be delivered, after ChannelReady"
+            );
+        }
+    }
+
+    /// A link closed while opening announces nothing, but its reader still runs
+    /// (it drains the channel and marks it dead), so nothing is leaked or stuck.
+    #[tokio::test]
+    async fn a_closed_channel_announces_nothing_but_still_reads() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let (ran_tx, ran_rx) = tokio::sync::oneshot::channel::<()>();
+        announce_then_read(&tx, None, async move {
+            let _ = ran_tx.send(());
+        });
+        tokio::time::timeout(Duration::from_secs(5), ran_rx)
+            .await
+            .expect("the reader must run even when nothing is announced")
+            .expect("reader signalled");
+        assert!(rx.try_recv().is_err(), "a closed channel must not announce ChannelReady");
+    }
 
     #[test]
     fn c3_defers_once_for_ice_to_pc_handoff_only() {
@@ -2141,8 +2451,8 @@ mod tests {
     #[test]
     fn host_port_parses_scheme_defaults_and_explicit() {
         assert_eq!(
-            host_port_from_url("https://api.filament.autumated.com"),
-            Some(("api.filament.autumated.com".to_string(), 443))
+            host_port_from_url("https://api.tunlion.autumated.com"),
+            Some(("api.tunlion.autumated.com".to_string(), 443))
         );
         assert_eq!(
             host_port_from_url("http://example.com/api/config?x=1"),
@@ -2178,10 +2488,10 @@ mod tests {
     #[test]
     fn cached_addrs_select_host_and_apply_port() {
         let doc = json!({
-            "api.filament.autumated.com": ["104.21.73.85", "172.67.142.8"],
+            "api.tunlion.autumated.com": ["104.21.73.85", "172.67.142.8"],
             "other.example": ["10.0.0.1"]
         });
-        let mut got = cached_addrs_from_doc(&doc, "api.filament.autumated.com", 443);
+        let mut got = cached_addrs_from_doc(&doc, "api.tunlion.autumated.com", 443);
         got.sort();
         assert_eq!(got.len(), 2);
         assert!(got.contains(&"104.21.73.85:443".parse::<SocketAddr>().unwrap()));
@@ -2215,5 +2525,18 @@ mod tests {
         assert!(roster_from_ack(&[json!({"peers": "oops"})]).is_empty());
         // No payload values at all.
         assert!(roster_from_ack(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod direct_route_label_tests {
+    use super::direct_route_label;
+
+    /// A same-host direct-QUIC link reads as the same-host WebRTC route does,
+    /// never as the internal "direct-quic" label (gates.sh gate 1).
+    #[test]
+    fn a_same_host_direct_link_is_direct_over_lo() {
+        assert_eq!(direct_route_label("127.0.0.1:52986".parse().unwrap()), "direct over lo");
+        assert_eq!(direct_route_label("[::1]:4000".parse().unwrap()), "direct over lo");
     }
 }

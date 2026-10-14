@@ -188,7 +188,7 @@ stated user concern.
 
 The design above was implemented, type-checked, unit-tested and model-checked
 green, and still did not work. Three daemons under one owner key (separate
-`FILAMENT_CONFIG_DIR`s, B and C never exchanging a code) drove out four bugs that
+`TUNLION_CONFIG_DIR`s, B and C never exchanging a code) drove out four bugs that
 none of those gates could see. Recording them because each is a trap for the next
 change, not just a bug that got fixed.
 
@@ -445,7 +445,7 @@ What is actually true:
   which in daemon mode is just `link_trusted`. A fleet link is untrusted by
   design, so it is declined. That is the real default-mode blocker, and it is
   section 4b working as written: reachability, not capability.
-- Under `FILAMENT_CAP_AUTHORITATIVE=1` the capability layer already has a FLEET
+- Under `TUNLION_CAP_AUTHORITATIVE=1` the capability layer already has a FLEET
   path for transfer: `cap_fleet_inputs` plus `scoped_in_bounds` allow a
   same-owner Proven device to land a file inside the receiver's own drop dir.
   So the mechanism that would authorize this already exists and was built for

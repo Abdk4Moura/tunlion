@@ -19,7 +19,7 @@ use std::collections::{HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
+pub(crate) const DEFAULT_SERVER: &str = "https://api.tunlion.autumated.com";
 
 /// C7: content identity for resume, sha256 over the first 256 KiB.
 pub(crate) const HEAD_BYTES: u64 = 256 * 1024;
@@ -39,10 +39,45 @@ pub(crate) const MAX_ATTEMPTS: u32 = 5;
 /// TURN relay (the never-flaky promise) or must FAIL CLEANLY (the hard
 /// direct-only promise the user asked for). A global rather than a threaded
 /// param so the many `Conn` construction sites stay untouched; written exactly
-/// once, before the runtime spawns any worker (mirrors the `FILAMENT_NAME`
+/// once, before the runtime spawns any worker (mirrors the `TUNLION_NAME`
 /// single-threaded-set pattern in `run`).
 pub(crate) static NO_RELAY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Set when `--remember <name>` actually stored a record this run (send or
+/// receive), cleared when the other side declined it. Read once the transfer
+/// is over so `--remember` is never silently a no-op.
+pub(crate) static REMEMBER_STORED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The name a sending `--remember` stored under, until the receiver's answer
+/// settles it. The sender says ONE outcome: it used to print "remembered this
+/// device as 'x'" when it stored its half and then "declined to be
+/// remembered, nothing stored" when the receiver said no.
+pub(crate) static REMEMBER_STORED_AS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set once the receiver answered the remember offer (yes or no), so the
+/// outcome has been said.
+pub(crate) static REMEMBER_ANSWERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What to say when `--remember` stored nothing. `has_identity`: whether this
+/// device has one, because `tunlion add` on a device without one is refused
+/// (exit 9), and a warning must not suggest a command that fails. Pure.
+pub(crate) fn remember_not_stored_msg(name: &str, sending: bool, has_identity: bool) -> String {
+    let other = if sending { "receiver" } else { "sender" };
+    let first = if has_identity { "" } else { "tunlion init  (this device has no identity yet), then  " };
+    format!(
+        "--remember {name}: nothing was remembered. Both sides must pass --remember on the same code transfer, \
+         and the {other} did not. To pair this device for good:  {first}tunlion add {name}  (and `tunlion join <code>` on the other side)"
+    )
+}
+
+/// The one line a sending `--remember` prints when it kept its half and the
+/// receiver never answered either way. Pure.
+pub(crate) fn remember_stored_msg(stored: &str) -> String {
+    format!("  remembered this device as '{stored}' (it keeps its half only if it passed --remember too)")
+}
 
 /// Set once in `run`, before any worker spawns, from the global `--no-interactive`
 /// flag (mirrors NO_RELAY). The guided code entry NEVER opens when this is set.
@@ -159,12 +194,12 @@ pub(crate) const REQUEST_TTL_SECS: u64 = 3600;
 /// daemon is not a managed service (a foreground `up`, no systemd) falls back
 /// to a plain kill.
 /// Which systemd manager owns a daemon pid, if any. Two units can share the
-/// name `filament.service` (a system unit and a per-user unit under Linger),
+/// name `tunlion.service` (a system unit and a per-user unit under Linger),
 /// so the cgroup's SCOPE, not the unit name, decides which manager to ask:
-///   system unit:  /system.slice/filament.service
-///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/filament.service
-/// The unit name is matched as a cgroup segment (`/filament.service`), never as
-/// a substring, so a neighbouring unit (`my-filament.service`) cannot collide.
+///   system unit:  /system.slice/tunlion.service
+///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/tunlion.service
+/// The unit name is matched as a cgroup segment (`/tunlion.service`), never as
+/// a substring, so a neighbouring unit (`my-tunlion.service`) cannot collide.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ServiceManager {
     SystemdSystem,
@@ -275,6 +310,23 @@ pub(crate) struct TtyGuard {
 mod tests {
     use crate::{MAX_PENDING, PartMeta, PendingRequest, ShellPolicy, add_pending_request};
 
+    /// RC lab item 10: the default signaling server is the tunlion host.
+    #[test]
+    fn the_default_server_is_the_tunlion_host() {
+        assert_eq!(crate::DEFAULT_SERVER, "https://api.tunlion.autumated.com");
+    }
+
+    /// RC lab items 6 and 7: the --remember warning never suggests `add` alone
+    /// on a device with no identity (that `add` is refused with exit 9).
+    #[test]
+    fn the_remember_warning_names_init_first_without_an_identity() {
+        let without = super::remember_not_stored_msg("x", true, false);
+        assert!(without.contains("tunlion init") && without.contains("tunlion add x"), "{without}");
+        assert!(without.find("tunlion init") < without.find("tunlion add x"), "{without}");
+        let with = super::remember_not_stored_msg("x", true, true);
+        assert!(!with.contains("tunlion init") && with.contains("tunlion add x"), "{with}");
+    }
+
     #[test]
     fn shell_policy_gates_auto_shell() {
         // `up` default: NOTHING auto-shells, a device needs an explicit grant.
@@ -352,6 +404,45 @@ mod tests {
         // garbage does not
         std::fs::write(&p, "{not json").unwrap();
         assert!(PartMeta::load(&p).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sidecar names the file, its size and digests, and sits in a
+    /// download dir others may read: it is created owner-only (0600) whatever
+    /// the umask, and a looser leftover is replaced rather than reused.
+    #[test]
+    fn part_meta_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("filament-test-meta-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("z.part.meta");
+        std::fs::write(&p, "1").unwrap();
+        PartMeta { size: 9, head: Some("ab".into()), full: Some("cd".into()) }.store(&p).unwrap();
+        if let Some(mode) = crate::platform::file_mode(&p) {
+            assert_eq!(mode & 0o777, 0o600, ".part.meta must be 0600, got {mode:o}");
+        }
+        assert_eq!(PartMeta::load(&p).unwrap().size, 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.part.meta` planted as a symlink must not redirect the sidecar write
+    /// onto the link's target.
+    #[test]
+    fn part_meta_store_does_not_write_through_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("filament-test-meta-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let p = dir.join("y.part.meta");
+        if crate::platform::symlink(&victim, &p).is_ok() {
+            PartMeta { size: 7, head: None, full: None }.store(&p).unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the link target is untouched");
+            assert!(!std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(), "the sidecar is a real file now");
+            assert_eq!(PartMeta::load(&p).unwrap().size, 7);
+        } else {
+            crate::ui::say("note: this platform would not create a symlink; the symlink arm is skipped");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

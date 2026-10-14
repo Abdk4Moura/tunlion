@@ -1,0 +1,174 @@
+# Mutation probe over the security decision code.
+#
+# A green test suite says the tests pass. It does not say that any test would
+# FAIL if a decision were wrong. cargo-mutants answers that second question: it
+# rewrites one expression at a time (`&&` to `||`, `<` to `<=`, a function body
+# to `true`, a deleted `!`) and reruns the tests. A mutant the tests still pass
+# on is a decision nothing pins, and in a gate, a verifier or an expiry check
+# that is exactly where a later refactor can open a hole without any red.
+#
+# Restricted with --file to the code that decides who may do what: the
+# capability evaluator and its CLI-side inputs, the shell gate, the device caps
+# and devices store, the identity certs and recovery, invitation parsing, fleet
+# membership, and the incoming-file-name sanitizer. Everything else is out of
+# scope here on purpose: a whole-repo run would bury these in noise and would
+# not fit the job limits.
+#
+# NOT on every PR: one full run is hours of runner time. Weekly, plus manual:
+#   gh workflow run mutants.yml --ref <branch>
+#   gh workflow run mutants.yml --ref <branch> -f targets=cli -f files="src/shell_gate.rs"
+#
+# No sccache: this workflow builds each target once per shard and then
+# rebuilds only the mutated crate, so a remote compiler cache buys little, and
+# the cache backend refusing ("Egress is over the account limit") would fail
+# the run for a reason unrelated to the result. Plain rust-cache keeps the
+# dependency builds warm instead.
+
+name: Mutants
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Comma-separated targets: cap, id, transfer, cli"
+        required: false
+        default: "cap,id,transfer,cli"
+      files:
+        description: "Override the --file list (space separated, relative to the target dir). Use with a single target."
+        required: false
+        default: ""
+      shards:
+        description: "Override the shard count for every selected target (blank = per-target default)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 3 * * 0"
+
+concurrency:
+  group: mutants-${{ github.ref }}-${{ github.event.inputs.targets }}-${{ github.event.inputs.files }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "1"
+  # Debug info is the bulk of a debug link; mutants never need a backtrace.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: never
+  CARGO_MUTANTS_VERSION: "27.1.0"
+
+jobs:
+  plan:
+    name: plan matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          TARGETS: ${{ github.event.inputs.targets || 'cap,id,transfer,cli' }}
+          FILES: ${{ github.event.inputs.files || '' }}
+          SHARDS: ${{ github.event.inputs.shards || '' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          # name: (dir, files, default shards, extra cargo test args)
+          T = {
+            "cap": ("crates/filament-cap", "src/capability.rs src/ephemeral.rs", 4, ""),
+            "id": ("crates/filament-id", "src/lib.rs", 2, ""),
+            "transfer": ("crates/filament-transfer", "src/lib.rs", 1, ""),
+            # The cli package is bin-only; its unit tests live in the
+            # `tunlion` bin target. The tests/ integration suites spawn
+            # daemons and need test-hooks, which this probe keeps off.
+            "cli": ("cli", "src/capability.rs src/shell_gate.rs src/device_caps.rs "
+                           "src/devices_store.rs src/membership.rs", 10, "--bin tunlion"),
+          }
+          sel = [t.strip() for t in os.environ["TARGETS"].split(",") if t.strip()]
+          bad = [t for t in sel if t not in T]
+          if bad:
+              raise SystemExit(f"unknown target(s): {bad}")
+          inc = []
+          for name in sel:
+              d, files, n, targs = T[name]
+              if os.environ["FILES"].strip():
+                  files = os.environ["FILES"].strip()
+              if os.environ["SHARDS"].strip():
+                  n = int(os.environ["SHARDS"])
+              for k in range(n):
+                  inc.append({"target": name, "dir": d, "files": files,
+                              "shard": k, "shards": n, "test_args": targs})
+          print("matrix=" + json.dumps({"include": inc}))
+          PY
+          cat "$GITHUB_OUTPUT"
+
+  mutants:
+    name: mutants ${{ matrix.target }} ${{ matrix.shard }}/${{ matrix.shards }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.dir }} -> target
+          shared-key: mutants-${{ matrix.target }}
+          save-if: ${{ matrix.shard == 0 }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@${{ env.CARGO_MUTANTS_VERSION }}
+      - name: List mutants in scope
+        working-directory: ${{ matrix.dir }}
+        run: |
+          set -euo pipefail
+          args=()
+          for f in ${{ matrix.files }}; do args+=(--file "$f"); done
+          cargo mutants --list "${args[@]}" | tee "$RUNNER_TEMP/list.txt" | tail -n 5
+          echo "total in scope: $(wc -l < "$RUNNER_TEMP/list.txt")"
+      - name: Run cargo-mutants
+        working-directory: ${{ matrix.dir }}
+        run: |
+          # Actions runs this under `bash -e`; the exit code is inspected
+          # below, so do not let a findings exit kill the step first.
+          set +e -uo pipefail
+          args=()
+          for f in ${{ matrix.files }}; do args+=(--file "$f"); done
+          # --in-place: the crates reach each other through relative path
+          # dependencies, and a CI checkout is disposable, so mutate the
+          # checkout rather than a scratch copy.
+          # Exit codes: 0 all caught, 2 some missed, 3 some timed out. Those
+          # are findings, not failures of the probe, so the job stays green
+          # and the artifact carries the verdict; anything else is a real
+          # failure (baseline red, tool error).
+          cargo mutants --in-place \
+            --test-tool cargo \
+            --shard "${{ matrix.shard }}/${{ matrix.shards }}" \
+            --output "$RUNNER_TEMP/out" \
+            "${args[@]}" \
+            -- ${{ matrix.test_args }}
+          rc=$?
+          echo "cargo-mutants exit: $rc"
+          case $rc in 0|2|3) exit 0;; *) exit $rc;; esac
+      - name: Summary
+        if: always()
+        run: |
+          o="$RUNNER_TEMP/out/mutants.out"
+          {
+            echo "### ${{ matrix.target }} shard ${{ matrix.shard }}/${{ matrix.shards }}"
+            for k in caught missed timeout unviable; do
+              n=0; [ -f "$o/$k.txt" ] && n=$(wc -l < "$o/$k.txt")
+              echo "- $k: $n"
+            done
+            if [ -s "$o/missed.txt" ]; then
+              echo '```'; cat "$o/missed.txt"; echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-${{ matrix.target }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out/mutants.out
+          if-no-files-found: warn

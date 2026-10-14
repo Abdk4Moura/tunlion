@@ -210,6 +210,14 @@ impl FleetSession {
     ///
     /// `want` is the device name the caller asked for, if it is targeting one;
     /// `None` means "admit any sibling" (the daemon's mesh case).
+    ///
+    /// `bind` turns a challenge nonce into this link's channel binding when the
+    /// transport has no exporter. On a DataChannel it MUST fold in the DTLS
+    /// fingerprints (`filament_overlay::dtls_channel_binding`): a bare nonce
+    /// can be relayed between two WebRTC sessions. It returns `None` while the
+    /// binding cannot be computed yet (fingerprints unknown), which is treated
+    /// as "no binding", never as the bare nonce. Applied on BOTH sides: to the
+    /// peer's nonce before signing, and to our nonce before verifying.
     #[allow(clippy::too_many_arguments)]
     pub fn on_control(
         &mut self,
@@ -222,6 +230,7 @@ impl FleetSession {
         mint: impl Fn() -> Vec<u8>,
         make_hello: impl Fn(&[u8]) -> Result<Value>,
         name_for_pub: impl Fn(&[u8; 32]) -> Option<String>,
+        bind: impl Fn(&[u8]) -> Option<Vec<u8>>,
     ) -> Outcome {
         if self.proved(pid) {
             return Outcome::Ignored;
@@ -235,7 +244,10 @@ impl FleetSession {
                 if nonce.len() < 16 {
                     return Outcome::Ignored;
                 }
-                match make_hello(&nonce) {
+                let Some(cb) = exporter.or_else(|| bind(&nonce)) else {
+                    return Outcome::Ignored;
+                };
+                match make_hello(&cb) {
                     Ok(hello) => Outcome::Send(hello),
                     Err(_) => Outcome::Ignored,
                 }
@@ -244,7 +256,15 @@ impl FleetSession {
                 let Some(owner) = owner_pub else {
                     return Outcome::Refused("no owner key".into());
                 };
-                let Some(cb) = self.in_binding(pid, exporter) else {
+                let cb = match exporter {
+                    Some(cb) => Some(cb),
+                    None => self
+                        .peers
+                        .get(pid)
+                        .and_then(|p| p.bind_ours.clone())
+                        .and_then(|n| bind(&n)),
+                };
+                let Some(cb) = cb else {
                     // No binding for THIS link yet: their hello beat our
                     // challenge, so there is nothing for it to have been signed
                     // against. That is a race, not a bad certificate. Challenge
@@ -387,9 +407,40 @@ mod tests {
         let mut s = FleetSession::new();
         let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&[7u8; 32]) });
         let out = s.on_control(
-            "a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None,
+            "a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None, raw,
         );
         assert!(matches!(out, Outcome::Send(_) | Outcome::Ignored));
+    }
+
+    // The bare-nonce binder: what a transport with no DTLS session uses.
+    fn raw(n: &[u8]) -> Option<Vec<u8>> {
+        Some(n.to_vec())
+    }
+
+    // H1: on a DataChannel the binder folds in the DTLS fingerprints, so what we
+    // SIGN for their nonce is the bound value, never the bare nonce, and a
+    // binder that cannot bind yet (fingerprints unknown) means no hello at all.
+    #[test]
+    fn their_nonce_is_signed_through_the_binder() {
+        let mut s = FleetSession::new();
+        let nonce = [7u8; 32];
+        let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&nonce) });
+        let fp_bind =
+            |n: &[u8]| Some(filament_overlay::dtls_channel_binding("SHA-256 AA", "SHA-256 BB", n));
+        let out = s.on_control(
+            "a", &msg, None, Some([0u8; 32]), None, 0, n1,
+            |cb| Ok(json!({ "cb": filament_overlay::b64(cb) })),
+            |_| None,
+            fp_bind,
+        );
+        let want = filament_overlay::dtls_channel_binding("SHA-256 AA", "SHA-256 BB", &nonce);
+        assert_eq!(out, Outcome::Send(json!({ "cb": filament_overlay::b64(&want) })));
+        assert_ne!(want, nonce.to_vec(), "never the bare nonce");
+
+        let out = s.on_control(
+            "b", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None, |_| None,
+        );
+        assert_eq!(out, Outcome::Ignored, "no binding yet means no signature");
     }
 
     // A too-short nonce is not a challenge.
@@ -398,7 +449,7 @@ mod tests {
         let mut s = FleetSession::new();
         let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&[7u8; 4]) });
         let out =
-            s.on_control("a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None);
+            s.on_control("a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None, raw);
         assert_eq!(out, Outcome::Ignored);
     }
 
@@ -408,10 +459,10 @@ mod tests {
         let mut s = FleetSession::new();
         let hello = json!({ "type": crate::HELLO });
         let first =
-            s.on_control("a", &hello, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None);
+            s.on_control("a", &hello, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None, raw);
         assert!(matches!(first, Outcome::Send(_)), "first is a challenge");
         let second =
-            s.on_control("a", &hello, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None);
+            s.on_control("a", &hello, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None, raw);
         assert!(matches!(second, Outcome::Refused(_)), "second must refuse, not loop");
     }
 
@@ -420,7 +471,7 @@ mod tests {
     fn no_owner_key_refuses() {
         let mut s = FleetSession::new();
         let hello = json!({ "type": crate::HELLO });
-        let out = s.on_control("a", &hello, None, None, None, 0, n1, |_| Ok(json!({})), |_| None);
+        let out = s.on_control("a", &hello, None, None, None, 0, n1, |_| Ok(json!({})), |_| None, raw);
         assert!(matches!(out, Outcome::Refused(_)));
     }
 }

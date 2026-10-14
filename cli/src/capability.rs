@@ -20,21 +20,67 @@
 
 pub use filament_cap::capability::*;
 
-/// Shell serving is OFF on the acceptor entirely. Not a capability problem, so a
-/// grant does not help and must never be suggested for it.
+/// Shell serving is OFF on the acceptor: it was started without `--shell` and
+/// no device holds a shell grant there. The fix is the grant (serving turns on
+/// live when the first one lands); the old wording sent people to
+/// `tunlion up --shell`, which refuses without `--i-know` and was never needed.
+/// Older peers still send that wording, so recognise the stable prefix
+/// ([`SHELL_OFF_PREFIX`]), never the whole sentence.
 pub const SHELL_OFF_REASON: &str =
-    "shell serving is off there; run `tunlion up --shell` on that device";
+    "shell serving is off there (no device holds a shell grant on it)";
+/// The part of [`SHELL_OFF_REASON`] every build has sent.
+pub const SHELL_OFF_PREFIX: &str = "shell serving is off there";
 
 /// The L2 tunnel acceptor is OFF on the peer entirely, so `forward`, `netcat`
 /// and the ssh bootstrap have nothing to open against. Like SHELL_OFF_REASON
 /// this is not a capability problem and a grant does not help.
 pub const TUNNEL_OFF_REASON: &str =
-    "tunnelling is off there; run `tunlion up --shell` (or set FILAMENT_L2=1) on that device";
+    "tunnelling is off there (no device holds a shell grant on it, and forwarding rides that grant)";
+/// The part of [`TUNNEL_OFF_REASON`] every build has sent.
+pub const TUNNEL_OFF_PREFIX: &str = "tunnelling is off there";
 
 /// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
 /// ceiling, so any hint built on this reason must not prescribe one: the fix is a
 /// fresh invitation that includes the capability.
 pub const CEILING_REASON: &str = "this capability is outside the device's invitation ceiling";
+
+/// The device's access ENDED: the invitation that admitted it carried an end
+/// time and that time has passed. Distinct from the ceiling on purpose: the
+/// capability may well be inside the ceiling, it simply expired, and the fix
+/// is a fresh invitation, not a wider one. Every reason built on this starts
+/// with [`EXPIRED_PREFIX`], which is what an initiator recognises.
+pub const EXPIRED_PREFIX: &str = "access expired";
+
+/// The canonical expiry reason, naming WHEN in UTC to the second.
+pub fn expired_reason(at: u64) -> String {
+    let when = chrono::DateTime::from_timestamp(at as i64, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| at.to_string());
+    format!("{EXPIRED_PREFIX} at {when}: the invitation that admitted this device has ended")
+}
+
+/// [`expired_reason`], plus what the invitation allowed and for how long when
+/// this (the acceptor's) store has the device's record. EVERY refusal path
+/// carries this reason string (a warm-link "refused:", an l2-close, a mount
+/// error, a file-decline), so the initiator's remedy is built from the same
+/// data on every path: exec used to print `--allow transfer,shell --expires
+/// 2m` while send printed a bare `add --for guest --out ... --yes`.
+pub fn expired_reason_for(at: u64, device_pub: Option<&[u8; 32]>) -> String {
+    let mut r = expired_reason(at);
+    if let Some(ri) = device_pub.and_then(crate::identity_state::reinvite_for) {
+        r.push_str(&crate::refusal::reinvite_suffix(&ri));
+    }
+    r
+}
+
+/// The expiry time named in an [`expired_reason`], when it parses. Pure.
+pub fn expired_at_from_reason(reason: &str) -> Option<u64> {
+    let rest = reason.trim().strip_prefix(EXPIRED_PREFIX)?.trim_start().strip_prefix("at ")?;
+    let stamp = rest.get(..23)?; // "YYYY-MM-DD HH:MM:SS UTC"
+    chrono::NaiveDateTime::parse_from_str(stamp.trim_end_matches(" UTC"), "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|t| t.and_utc().timestamp().max(0) as u64)
+}
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -110,6 +156,11 @@ pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> s
     let p = config_dir.join("caps.json");
     let data = serde_json::to_string_pretty(&serde_json::json!(store))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // A caps.json that does not parse (or was truncated) loads as an empty
+    // store; writing that back would erase every grant and revocation in it
+    // for good. Refuse, leaving it for repair, and keep a .bak otherwise.
+    crate::state_files::before_write(&p)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     crate::platform::SecretFile::write_str(&p, &data)?;
     // Invalidate cache: next load_cap_store will see the new mtime and re-read.
     let cache = cache_init();
@@ -148,7 +199,7 @@ pub fn save_and_list_revoked(
 /// fleets show `flip_ready=false` (paired daemons aren't provisioned, so
 /// authoritative-by-default broke ssh/transfer/mount until every capability was
 /// manually granted). Enable authoritative enforcement explicitly by setting
-/// `FILAMENT_CAP_AUTHORITATIVE=1` (or `true`); any other value, or leaving the
+/// `TUNLION_CAP_AUTHORITATIVE=1` (or `true`); any other value, or leaving the
 /// var unset, keeps legacy shadow gating. The env var is the opt-in switch,
 /// pending same-owner fleet-trust that makes the default-on flip safe.
 ///
@@ -156,7 +207,7 @@ pub fn save_and_list_revoked(
 /// `la_authorized > 0` AND `la_denied == 0` AND `la_no_header == 0`. See
 /// docs/cap-flip-checklist.md for the evidence trail.
 pub fn cap_authoritative() -> bool {
-    std::env::var("FILAMENT_CAP_AUTHORITATIVE")
+    std::env::var("TUNLION_CAP_AUTHORITATIVE")
         .map(|x| x == "1" || x.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -313,6 +364,13 @@ pub fn cap_shadow_counts() -> ShadowCounts {
 /// volume already lives in the counters. The dedup set is CAPPED, because a key
 /// space like distinct device_pubs is unbounded; past the cap, new keys stop logging
 /// (their count is still counted), bounding memory.
+/// The WIDENING shadow line ("... was REFUSED by legacy but cap AUTHORIZES;
+/// a flip will NEWLY PERMIT this open") printed on every `receive`, to people
+/// who cannot act on it: it is input to the flip review, not something the
+/// user did wrong. It is still counted (`ld_authorized`) and still logged,
+/// at -v (ui::debug) only. The CRITICAL line stays loud.
+const WIDENING_VERBOSE_ONLY: bool = true;
+
 fn log_once(key: String, msg: &str, verbose: bool) {
     const LOG_ONCE_CAP: usize = 4096;
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -539,6 +597,36 @@ pub fn cap_gate_effective(
     // ONLY thing enforcing the delegated ceiling in shadow. Deleting it would let
     // a delegated principal exceed its ceiling on every legacy-allowed open until
     // the flip. That is what makes it load-bearing, not stylistic.
+    // === Revoked device, absolute, FIRST =================================
+    // Before the ceiling and the expiry below, so a revoked device is told it
+    // was revoked rather than that its ceiling excludes the action: the reason
+    // decides the remedy the initiator prints.
+    if cert_revoked {
+        return GateDecision::Deny {
+            cap_reason: Some("device revoked".into()),
+        };
+    }
+
+    // === Delegated access ENDED (both modes) ============================
+    // A delegated principal's `cert_expires` is its composed deadline (cert
+    // expiry, invitation end, offline budget), read fresh from the record by
+    // `peer_authz`. `cap_authorize_expired` below enforces expiry only under
+    // authoritative mode, so in the shipped shadow mode an expired guest was
+    // judged by legacy trust alone and kept every capability until something
+    // else happened to empty its ceiling. Expiry is not a policy opinion that
+    // waits for the flip: the owner set an end time, and past it the device
+    // has no access at all. Scoped to delegated principals (auth_key_caps is
+    // Some) so owner devices and fleet siblings keep their existing semantics.
+    if auth_key_caps.is_some() {
+        if let Some(exp) = cert_expires {
+            if now_secs() >= exp {
+                return GateDecision::Deny {
+                    cap_reason: Some(expired_reason_for(exp, device_pub)),
+                };
+            }
+        }
+    }
+
     if let Some(caps) = auth_key_caps {
         let action_lc = action.to_lowercase();
         if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
@@ -613,7 +701,10 @@ pub fn cap_gate_effective(
                 "CAP-INFERRED-GRANT: fleet device dev={} authorized '{action}' via an explicit grant on a {binding:?} (non-Proven) binding. Fleet auto-trust requires Proven; explicit grants are still honored on Inferred pending universal identity-expose. Measured so Proven can be required for grants without silently revoking established devices.",
                 hex::encode(dev),
             ),
-            false,
+            // Debug, not loud: this is a measurement of an ALLOWED request, and
+            // a first-time-user test read it in the daemon log as an error. The
+            // access decision is unchanged; -v still shows the measurement.
+            true,
         );
     }
     // An explicit deny outranks EVERYTHING on this branch, including the
@@ -830,7 +921,7 @@ pub fn cap_gate_effective(
                     hex::encode(dev),
                     hex::encode(usr),
                 ),
-                false, // #231: a WIDENING is a real disagreement; stays loud
+                WIDENING_VERBOSE_ONLY,
             ),
             _ => {}
         }
@@ -1328,7 +1419,7 @@ mod tests {
         //
         // This proves BUCKETING (which (legacy, cap-outcome) pair increments
         // which counter), not gate behavior. Since the authoritative-default
-        // flip (0.7), cap_gate_effective reads FILAMENT_CAP_AUTHORITATIVE which
+        // flip (0.7), cap_gate_effective reads TUNLION_CAP_AUTHORITATIVE which
         // now defaults ON, so the restrictive gates run. We pass Proven binding
         // + Some(u64::MAX) cert expiry so cap_authorize_proven/expired are BOTH
         // no-ops (a valid, proven, live cert), leaving the raw cap outcome to be
@@ -1444,7 +1535,7 @@ mod tests {
         // Mode-independent since the 0.7 authoritative-default flip: pass
         // Proven binding + Some(u64::MAX) expiry so the restrictive gates are
         // no-ops and each (legacy, cap-outcome) pair is counted verbatim,
-        // whether FILAMENT_CAP_AUTHORITATIVE is on (default) or off (shadow).
+        // whether TUNLION_CAP_AUTHORITATIVE is on (default) or off (shadow).
         let uk = [0xaa; 32];
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1823,6 +1914,12 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// C: the WIDENING line is debug-only; it leaked on every `receive`.
+    #[test]
+    fn the_widening_shadow_line_is_debug_only() {
+        assert!(std::hint::black_box(WIDENING_VERBOSE_ONLY), "WIDENING must print at -v only");
+    }
+
     #[test]
     fn cap_cache_key_includes_file_length() {
         let tmp = std::env::temp_dir().join(format!("fil-cap-cache-len-{}", std::process::id()));
@@ -1837,7 +1934,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// E2E: after revoke + reconciler, NO filament-managed authorized_keys
+    /// E2E: after revoke + reconciler, NO tunlion-managed authorized_keys
     /// block remains. Exercises the full pipeline: devices_with_shell_revoked
     /// → strip_block → block gone.
     #[test]
@@ -1906,7 +2003,7 @@ mod tests {
 
         // 2. Mock authorized_keys with managed block for "bob"
         let mock_ak = format!(
-            "# BEGIN filament-managed bob\nssh-ed25519 AAAAfake filament-managed\n# END filament-managed bob\n"
+            "# BEGIN tunlion-managed bob\nssh-ed25519 AAAAfake tunlion-managed\n# END tunlion-managed bob\n"
         );
         assert!(crate::sshkeys::has_block(&mock_ak, "bob"));
 
@@ -1931,7 +2028,7 @@ mod tests {
         // Verify the block is actually removed
         assert!(
             !crate::sshkeys::has_block(&cleaned, "bob"),
-            "e2e: after reconcile, NO filament-managed authorized_keys block must remain for bob"
+            "e2e: after reconcile, NO tunlion-managed authorized_keys block must remain for bob"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -1943,7 +2040,7 @@ mod tests {
     /// input so a regression in the gate is caught by CI, not by inspection.
     #[test]
     fn reconcile_shell_keys_gated_on_authoritative() {
-        let mock_ak = "# BEGIN filament-managed bob\nssh-ed25519 AAAAfake filament-managed\n# END filament-managed bob\n";
+        let mock_ak = "# BEGIN tunlion-managed bob\nssh-ed25519 AAAAfake tunlion-managed\n# END tunlion-managed bob\n";
         let revoked = vec!["bob".to_string()];
 
         // Under authoritative, the block IS removed.
@@ -2256,8 +2353,8 @@ mod tests {
         // cert_revoked. A revoked device the legacy path trusts must be denied
         // with authoritative OFF — this is the case broken in production.
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var("FILAMENT_CAP_AUTHORITATIVE").unwrap_or_default();
-        unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", "0") };
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").unwrap_or_default();
+        unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "0") };
         let me = [0x77u8; 32];
         let d = cap_gate_effective(
             true,
@@ -2277,9 +2374,9 @@ mod tests {
             false,
         );
         if prior.is_empty() {
-            unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") };
+            unsafe { std::env::remove_var("TUNLION_CAP_AUTHORITATIVE") };
         } else {
-            unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", &prior) };
+            unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", &prior) };
         }
         assert!(
             !d.allowed(),
@@ -2371,6 +2468,86 @@ mod tests {
             !d.allowed(),
             "expired cert must deny fleet auto-trust even in-scope"
         );
+    }
+
+    /// A delegated principal past its deadline is refused in EVERY mode, with
+    /// a reason that says it expired. In the shipped shadow mode the effective
+    /// decision is legacy trust, and expiry used to be enforced only under
+    /// authoritative, so an expired guest with a shell grant kept its shell.
+    #[test]
+    fn an_expired_delegated_principal_is_denied_in_shadow_with_an_expiry_reason() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dev = [0x31u8; 32];
+        let usr = [0x32u8; 32];
+        let caps = vec![CAP_SHELL.to_string(), CAP_TRANSFER.to_string()];
+        let past = now_secs().saturating_sub(5);
+        for action in [CAP_SHELL, CAP_TRANSFER] {
+            let d = cap_gate_effective(
+                true, // legacy allows (granted, trusted)
+                &CapOutcome::Authorized,
+                action,
+                "self",
+                Some(&dev),
+                Some(&usr),
+                BindingStrength::Proven,
+                Some(past),
+                Some(caps.as_slice()),
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+            );
+            match d {
+                GateDecision::Deny { cap_reason: Some(r) } => {
+                    assert!(r.starts_with(EXPIRED_PREFIX), "{r}");
+                    assert!(!r.contains("ceiling"), "an expiry is not a ceiling: {r}");
+                }
+                other => panic!(
+                    "expired principal not denied with a reason for {action} (allowed: {})",
+                    other.allowed()
+                ),
+            }
+        }
+        // Control: the same principal before its deadline is allowed.
+        let live = cap_gate_effective(
+            true,
+            &CapOutcome::Authorized,
+            CAP_SHELL,
+            "self",
+            Some(&dev),
+            Some(&usr),
+            BindingStrength::Proven,
+            Some(now_secs() + 600),
+            Some(caps.as_slice()),
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert!(live.allowed(), "a live delegated principal must keep its access");
+        // Revocation outranks expiry: the device is told it was revoked.
+        let both = cap_gate_effective(
+            true,
+            &CapOutcome::Authorized,
+            CAP_SHELL,
+            "self",
+            Some(&dev),
+            Some(&usr),
+            BindingStrength::Proven,
+            Some(past),
+            Some(&[][..]),
+            None,
+            false,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(both.deny_reason(""), "device revoked");
     }
 
     #[test]

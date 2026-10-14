@@ -65,6 +65,17 @@ pub(crate) fn resolve_peer_identity(link: &mut Link) {
     let now = crate::identity::now_secs();
     if cert.verify(now).is_err() {
         pin_delegated_denied(link, &name);
+        // An INVITED device whose certificate ran out has ended, and the gate
+        // must be able to say so. Leaving the link with no identity made every
+        // refusal read "outside the device's invitation ceiling" (the pinned
+        // empty ceiling), which sent the user to widen a ceiling that was fine.
+        // The key is the record's own, so this names who the link is without
+        // trusting anything the peer said; binding stays unproven.
+        if principal_ceiling_for(&name).is_some() {
+            link.identity_device_pub = Some(cert.device_pub);
+            link.identity_user_pub = Some(cert.user_pub);
+            link.identity_cert_expires = Some(cert.expires);
+        }
         return;
     }
     link.identity_device_pub = Some(cert.device_pub);
@@ -386,9 +397,18 @@ pub(crate) fn handle_identity_expose(
         let (deadline, _clock) =
             effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
         l.identity_cert_expires = Some(deadline);
-        l.principal_kind = principal_kind;
+        // The same liveness rule `resolve_peer_identity` applies. Assigning the
+        // stored principal unconditionally here is what let a PROOF overturn an
+        // expiry: a parked open was denied because the delegated deadline had
+        // passed (empty ceiling), the peer then proved possession of a key
+        // whose certificate renewal had extended, and this line restored the
+        // full ceiling, so the re-driven exec ran past the invitation end.
+        let alive = deadline > identity::now_secs();
+        l.principal_kind = principal_after_liveness(principal_kind, alive);
     }
-    ui::say(&format!(
+    // The raw signaling id is an internal: -v only. The person already sees
+    // the peer named on the roster line; the proof itself is not news to them.
+    ui::debug(&format!(
         "{} identity proven for peer {}",
         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
         pid
@@ -445,7 +465,7 @@ pub(crate) fn handle_identity_expose(
                     "its certificate was not stored ({e}), so revoke has nothing to key on."
                 )),
                 &[format!(
-                    "remove it instead: tunlion devices forget {petname}"
+                    "remove it instead: tunlion devices forget {petname} -y"
                 )],
             ),
         }
@@ -453,6 +473,16 @@ pub(crate) fn handle_identity_expose(
     // Erase held nonce (single-use)
     identity_nonces.remove(pid);
     true
+}
+
+/// Tell a challenger that this link will not produce an identity, so it can
+/// stop waiting for one. Carries only the challenger's own nonce back. A peer
+/// that ignores the message (an older build) simply waits out its hold, as it
+/// did before.
+async fn say_identity_unavailable(t: &Arc<dyn Transport>, nonce_hex: &str) {
+    let _ = t
+        .send_control(&serde_json::json!({ "type": "identity-unavailable", "nonce": nonce_hex }))
+        .await;
 }
 
 /// #30 shared responder: on receiving an identity-nonce-challenge, prove
@@ -496,6 +526,7 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
     if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
         if recv_dpub_arr == own_dpub {
             crate::ui::debug("identity challenge ignored: it names my own device key");
+            say_identity_unavailable(t, nonce_hex).await;
             return;
         }
     }
@@ -504,9 +535,16 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
         // all, and a silent one is exactly how a link that cannot prove itself
         // reads as a link that was refused. Same class as the capsule's other
         // refusals, which are visible at the default level.
-        crate::ui::say(
-            "identity challenge NOT answered: this device holds no certificate for its own key",
-        );
+        // EXPECTED on a device with no identity (a code transfer from a fresh
+        // machine): there is nothing to prove, the code is the trust, and the
+        // line read as a fault on every such send. Only -v shows it there.
+        let msg = "identity challenge NOT answered: this device holds no certificate for its own key";
+        if crate::identity_flow::has_identity() {
+            crate::ui::say(msg);
+        } else {
+            crate::ui::debug(msg);
+        }
+        say_identity_unavailable(t, nonce_hex).await;
         return;
     };
     // Self-binding, made explicit rather than inherited: the certificate we are
@@ -638,13 +676,64 @@ pub(crate) fn store_provisional_identity(
     peer_cert: &identity::DeviceCert,
 ) -> Result<()> {
     let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
+    let now = identity::now_secs();
+    // Collect what earlier sessions left behind before adding one more. Each
+    // code-based transfer writes `provisional_peer-<session id>.json` (a peer's
+    // device key, certificate and user key) and nothing ever read it back
+    // under that name, so one file per transfer piled up forever.
+    if let Some(dir) = p.parent() {
+        sweep_stale_provisional(dir, now);
+    }
     let data = json!({
         "name": name,
         "deviceCert": peer_cert.to_json(),
-        "storedAt": identity::now_secs()
+        "storedAt": now
     });
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&data)?)?;
     Ok(())
+}
+
+/// How long a provisional identity is worth keeping. It exists to bridge one
+/// session's identity proof to that session's overlay announcement, which
+/// follows within seconds; an hour is generous.
+pub(crate) const PROVISIONAL_TTL_SECS: u64 = 3600;
+
+/// Remove provisional identity records under `dir` older than
+/// PROVISIONAL_TTL_SECS (by their `storedAt`, or the file's mtime when that is
+/// unreadable). Returns how many were removed. Best effort: a file that cannot
+/// be removed is left for the next sweep or `tunlion reset`.
+pub(crate) fn sweep_stale_provisional(dir: &std::path::Path, now: u64) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let is_provisional = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("provisional_") && n.ends_with(".json"));
+        if !is_provisional {
+            continue;
+        }
+        let stored_at = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| v["storedAt"].as_u64())
+            .or_else(|| {
+                entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+            })
+            .unwrap_or(0);
+        if now.saturating_sub(stored_at) >= PROVISIONAL_TTL_SECS && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 pub(crate) fn load_provisional_identity(name: &str) -> Option<identity::DeviceCert> {
@@ -657,4 +746,32 @@ pub(crate) fn load_provisional_identity(name: &str) -> Option<identity::DeviceCe
 pub(crate) fn clear_provisional_identity(name: &str) {
     let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
     let _ = std::fs::remove_file(&p);
+}
+
+#[cfg(test)]
+mod provisional_sweep_tests {
+    use super::{PROVISIONAL_TTL_SECS, sweep_stale_provisional};
+
+    #[test]
+    fn stale_provisional_identities_are_collected_and_fresh_ones_kept() {
+        let dir = std::env::temp_dir().join(format!("fil-prov-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = 10_000_000u64;
+        let write = |name: &str, at: u64| {
+            std::fs::write(
+                dir.join(format!("provisional_{name}.json")),
+                serde_json::json!({"name": name, "storedAt": at}).to_string(),
+            )
+            .unwrap();
+        };
+        write("peer-old", now - PROVISIONAL_TTL_SECS - 1);
+        write("peer-older", 1);
+        write("peer-fresh", now - 5);
+        std::fs::write(dir.join("devices.json"), b"[]").unwrap();
+        assert_eq!(sweep_stale_provisional(&dir, now), 2);
+        assert!(dir.join("provisional_peer-fresh.json").exists(), "a live session keeps its record");
+        assert!(!dir.join("provisional_peer-old.json").exists());
+        assert!(dir.join("devices.json").exists(), "only provisional records are swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

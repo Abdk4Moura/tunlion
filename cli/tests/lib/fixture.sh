@@ -4,7 +4,7 @@
 # helpers below. See mount-revoke-gates.sh / pty-revoke-gates.sh /
 # l2-revoke-gates.sh for the pattern.
 #
-# `FILAMENT_L2=1` on the acceptor is baked into `start_acceptor`, not left to the
+# `TUNLION_L2=1` on the acceptor is baked into `start_acceptor`, not left to the
 # caller, because pty-open / mount-open / l2-open are all gated on `l2_enabled`
 # and a plain `up` leaves it off with a failure that is silent on both sides.
 
@@ -109,13 +109,15 @@ start_backend() {
 # $1 = config dir. Create an owner identity named alpha there.
 init_owner() {
   mkdir -p "$1"
-  env FILAMENT_CONFIG_DIR="$1" "$BIN" init --name alpha --recovery-file "$1/rec.txt" --yes >/dev/null 2>&1 \
+  env TUNLION_CONFIG_DIR="$1" "$BIN" init --name alpha --recovery-file "$1/rec.txt" --yes >/dev/null 2>&1 \
     || { echo "init failed"; exit 2; }
 }
 
-# $1 = acceptor config dir. Start the acceptor daemon (FILAMENT_L2=1 baked in).
+# $1 = acceptor config dir. Start the acceptor daemon (TUNLION_L2=1 baked in).
 start_acceptor() {
-  env FILAMENT_CONFIG_DIR="$1" FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
+  # ACCEPTOR_LOG (e.g. debug) raises the acceptor's log level, so a gate that
+  # fails on timing can show what the daemon decided.
+  env TUNLION_CONFIG_DIR="$1" TUNLION_L2=1 ${ACCEPTOR_LOG:+TUNLION_LOG="$ACCEPTOR_LOG"} "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 2
 }
@@ -130,14 +132,14 @@ enroll_delegate() {
   local name="$1"; shift
   local ddir="$WORK/$name"; mkdir -p "$ddir"
   local out state
-  out=$(fs_bounded 45 env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes)
+  out=$(fs_bounded 45 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes)
   state=$(fs_state)
   case "$state" in
     ok) ;;
     err)  fixture_die "setup: 'add --for $name' failed (fs_state=$state): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
     *)    fixture_die "setup: 'add --for $name' WEDGED after 45s (fs_state=$state). A hang is a failure, not a slow pass; see lib/fixture.sh fs_bounded." ;;
   esac
-  out=$(fs_bounded 45 env FILAMENT_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive)
+  out=$(fs_bounded 45 env TUNLION_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive)
   state=$(fs_state)
   case "$state" in
     ok) ;;
@@ -172,6 +174,7 @@ fs_bounded() {  # $1 = seconds, rest = command
   local out="$WORK/fs.out" done="$WORK/fs.done"
   rm -f "$out" "$done"
   ( "$@" >"$out" 2>&1; echo $? >"$done" ) &
+  local fs_pid=$!
   for _ in $(seq 1 $((secs * 2))); do [ -f "$done" ] && break; sleep 0.5; done
   if [ -f "$done" ]; then
     cat "$done" > "$WORK/fs.rc"
@@ -179,8 +182,31 @@ fs_bounded() {  # $1 = seconds, rest = command
   else
     : > "$WORK/fs.rc"
     echo wedged >"$WORK/fs.state"
+    fs_forensics "$fs_pid" "$out" "$*" >&2
   fi
   cat "$out" 2>/dev/null
+}
+# A wedge used to leave nothing behind but its own name, and a rare one cannot
+# be reproduced on demand. The establishment stall was found by looking at the
+# HUNG process (which socket it held, what it waited on), not by reading code,
+# so capture exactly that at the moment of the wedge, then kill the tree so the
+# gates after this one start clean. Goes to stderr: callers capture stdout.
+fs_forensics() {  # $1 = subshell pid, $2 = output file, $3 = command
+  local root="$1" pids p
+  pids="$root $(pgrep -P "$root" 2>/dev/null) $(for c in $(pgrep -P "$root" 2>/dev/null); do pgrep -P "$c" 2>/dev/null; done)"
+  echo "===== WEDGE FORENSICS: $3"
+  echo "--- its own output so far:"; sed 's/^/    /' "$2" 2>/dev/null | tail -40
+  echo "--- process tree:"; ps -o pid,ppid,stat,etimes,wchan:24,args -p "$(echo $pids | tr ' ' ',')" 2>/dev/null
+  for p in $pids; do
+    [ -d "/proc/$p" ] || continue
+    echo "--- pid $p sockets:"; ss -tunxp 2>/dev/null | grep -E "pid=$p[,)]" | sed 's/^/    /' | head -20
+    echo "--- pid $p threads/wchan:"; for t in /proc/$p/task/*; do printf '    %s %s\n' "${t##*/}" "$(cat "$t/wchan" 2>/dev/null)"; done | sort -k2 | uniq -c -f1 | head -10
+    sudo -n cat "/proc/$p/stack" 2>/dev/null | sed 's/^/    stack: /' | head -12
+  done
+  echo "--- every daemon/server log in \$WORK (tail):"
+  for f in "$WORK"/*.log; do [ -f "$f" ] || continue; echo "  [${f##*/}]"; tail -25 "$f" | sed 's/^/    /'; done
+  echo "===== END WEDGE FORENSICS"
+  for p in $pids; do kill "$p" 2>/dev/null; done
 }
 fs_state() { cat "$WORK/fs.state" 2>/dev/null; }
 # The child's exit code, empty when it wedged. Bounded callers still need it: the gates assert
@@ -220,7 +246,7 @@ fs_out() { cat "$WORK/fs.out" 2>/dev/null; }
 
 # $1 = spoke config dir, $2 = spoke name. Start the joined device's daemon.
 start_spoke() {
-  env FILAMENT_CONFIG_DIR="$1" "$BIN" --server "$SERVER" up --dir "$WORK/$2-drop" \
+  env TUNLION_CONFIG_DIR="$1" "$BIN" --server "$SERVER" up --dir "$WORK/$2-drop" \
     >"$WORK/up-$2.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 2
@@ -236,8 +262,8 @@ start_spoke() {
 assert_certified() {
   local odir="$1" sdir="$2" name="$3"
   local ojson sjson
-  ojson=$(env FILAMENT_CONFIG_DIR="$odir" "$BIN" id --json 2>/dev/null)
-  sjson=$(env FILAMENT_CONFIG_DIR="$sdir" "$BIN" id --json 2>/dev/null)
+  ojson=$(env TUNLION_CONFIG_DIR="$odir" "$BIN" id --json 2>/dev/null)
+  sjson=$(env TUNLION_CONFIG_DIR="$sdir" "$BIN" id --json 2>/dev/null)
 
   if printf '%s' "$ojson" | python3 -c "
 import json,sys
@@ -268,7 +294,7 @@ sys.exit(0 if (s.get('configured') and s.get('role')=='joined-device'
   fi
 
   local list
-  list=$(env FILAMENT_CONFIG_DIR="$odir" "$BIN" devices 2>&1)
+  list=$(env TUNLION_CONFIG_DIR="$odir" "$BIN" devices 2>&1)
   if printf '%s' "$list" | grep -q "$name" \
      && ! printf '%s' "$list" | grep -q "NEEDS REVIEW" \
      && ! printf '%s' "$list" | grep -qi "uncertified"; then

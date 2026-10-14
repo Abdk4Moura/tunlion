@@ -93,7 +93,7 @@ git commit -m "netstack: add IPv4 CIDR parsing"
 fn netstack_opens_with_ipv4() {
     let v4_addr = std::net::Ipv4Addr::new(192, 168, 1, 1);
     let v6_addr: Ipv6Addr = "fdf1:1af7:c30d::1".parse().unwrap();
-    let tun = NetstackTun::open_dual("filament0", &v6_addr, 128, Some((v4_addr, 24)), 1280);
+    let tun = NetstackTun::open_dual("tunlion0", &v6_addr, 128, Some((v4_addr, 24)), 1280);
     assert!(tun.is_ok());
     let tun = tun.unwrap();
     assert_eq!(tun.addr(), v6_addr);
@@ -167,8 +167,8 @@ async fn netstack_ipv4_route_works() {
     let a_v6: Ipv6Addr = "fdf1:1af7:c30d::1".parse().unwrap();
     let b_addr: std::net::Ipv4Addr = "192.168.1.2".parse().unwrap();
     let b_v6: Ipv6Addr = "fdf1:1af7:c30d::2".parse().unwrap();
-    let a = Arc::new(NetstackTun::open_dual("filament0", &a_v6, 128, Some((a_addr, 24)), 1280).unwrap());
-    let b = Arc::new(NetstackTun::open_dual("filament0", &b_v6, 128, Some((b_addr, 24)), 1280).unwrap());
+    let a = Arc::new(NetstackTun::open_dual("tunlion0", &a_v6, 128, Some((a_addr, 24)), 1280).unwrap());
+    let b = Arc::new(NetstackTun::open_dual("tunlion0", &b_v6, 128, Some((b_addr, 24)), 1280).unwrap());
     // ... cross-wire and test IPv4 connectivity
 }
 ```

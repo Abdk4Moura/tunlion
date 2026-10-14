@@ -3,7 +3,7 @@
 Build `b9808062` (`verify/0.8.6`), hub binary sha256 `9eb885e4…`, plus a control
 run on released `0.8.5` (`bacae2f`).
 
-Two to four isolated identities on one Linux host, separate `FILAMENT_CONFIG_DIR`
+Two to four isolated identities on one Linux host, separate `TUNLION_CONFIG_DIR`
 per identity, daemons on `--userspace --no-proxy-fallback` so the host network
 and the production daemon were never touched. Interactive cells driven through a
 real pty, not a pipe.

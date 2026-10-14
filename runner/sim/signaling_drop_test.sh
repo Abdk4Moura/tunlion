@@ -27,12 +27,12 @@
 #                       and a FRESH sender rediscovers it + a transfer COMPLETES
 #                       byte-exact (sha256), with NO supervisor.
 #   A/B BASELINE      : with the in-core loop reverted
-#                       (FILAMENT_TEST_NO_SIGNALING_RECONNECT=1) the SAME sever
+#                       (TUNLION_TEST_NO_SIGNALING_RECONNECT=1) the SAME sever
 #                       leaves the acceptor a ZOMBIE — the fresh sender CANNOT
 #                       reach it (send fails) — proving the outer loop is
 #                       load-bearing, not incidental.
 #
-# Isolated: own backend on a private port, own proxy port, own FILAMENT_CONFIG_DIRs,
+# Isolated: own backend on a private port, own proxy port, own TUNLION_CONFIG_DIRs,
 # the BUILT release binary. NEVER touches the live `up --shell` daemon, the
 # installed ~/.local/bin/tunlion, the live T4, or the production servers.
 #
@@ -45,18 +45,18 @@ BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`
-# level. Export FILAMENT_LOG=debug so every $BIN child prints them; the
+# level. Export TUNLION_LOG=debug so every $BIN child prints them; the
 # value-prop lines (route, relay banner, P5 upgrade) are `critical` and show
 # regardless. Respect an explicit override if the caller set one.
-export FILAMENT_LOG="${FILAMENT_LOG:-debug}"
+export TUNLION_LOG="${TUNLION_LOG:-debug}"
 # PID-derived ports so overlapping runs never collide.
 _BASE=$(( 8200 + ($$ % 1200) * 2 ))
-PORT="${FILAMENT_TEST_PORT:-$_BASE}"             # backend (clients NEVER hit directly)
-PROXY_PORT="${FILAMENT_TEST_PROXY_PORT:-$(( _BASE + 1 ))}"
+PORT="${TUNLION_TEST_PORT:-$_BASE}"             # backend (clients NEVER hit directly)
+PROXY_PORT="${TUNLION_TEST_PROXY_PORT:-$(( _BASE + 1 ))}"
 BACKEND="http://127.0.0.1:$PORT"
 SERVER="http://127.0.0.1:$PROXY_PORT"            # every client goes through the proxy
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/signaling-drop.XXXXXX")"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
 [ -x "$PYV" ] || PYV="$(command -v python3)"
 
 # P2 knobs: short silence threshold so the in-core loop re-dials in seconds.
@@ -84,7 +84,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resilience gates drive the env-gated test hooks (FILAMENT_TEST_*), which now
+# Resilience gates drive the env-gated test hooks (TUNLION_TEST_*), which now
 # ship ONLY in a `--features test-hooks` build (stripped from default/release).
 # Auto-build that binary unless an explicit FILJOB_BIN was provided.
 if [ -z "${FILJOB_BIN:-}" ]; then
@@ -122,9 +122,9 @@ BIG="$WORK/big.bin"; head -c 1500000 /dev/urandom >"$BIG"; H_BIG=$(hashof "$BIG"
 DA="$WORK/devA"; DB="$WORK/devB"; mkdir -p "$DA" "$DB"
 say "setup: pairing A<->B (--remember over a code, through the proxy)"
 W="pair-$$-$RANDOM"
-FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$BIG" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA" "$BIN" send "$BIG" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
 SP=$!; sleep 3
-FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
+TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
 wait $SP 2>/dev/null
 if [ -s "$DA/devices.json" ] && [ -s "$DB/devices.json" ]; then
   ok "paired (A knows boxB, B knows boxA)"
@@ -143,12 +143,12 @@ one_attempt() {
   local DG="$WORK/$tag-drop"; rm -rf "$DG"; mkdir -p "$DG"
   local UPLOG="$WORK/$tag-up.log"; local SENDLOG="$WORK/$tag-send.log"
   local extra_env=""
-  [ "$mode" = "zombie" ] && extra_env="FILAMENT_TEST_NO_SIGNALING_RECONNECT=1"
+  [ "$mode" = "zombie" ] && extra_env="TUNLION_TEST_NO_SIGNALING_RECONNECT=1"
 
   # WebRTC route only (no direct-QUIC) so discovery rides the proxied signaling —
   # the path under test. The acceptor runs DIRECTLY: no up_supervisor.sh.
   link_up
-  env FILAMENT_CONFIG_DIR="$DB" FILAMENT_SIGNALING_SILENCE_MS="$SILENCE_MS" $extra_env \
+  env TUNLION_CONFIG_DIR="$DB" TUNLION_SIGNALING_SILENCE_MS="$SILENCE_MS" $extra_env \
     timeout 130 "$BIN" up --dir "$DG" --server "$SERVER" >"$UPLOG" 2>&1 &
   local UP=$!; pids+=($UP)
   sleep 5   # let it connect + announce its channels (assert (i))
@@ -166,7 +166,7 @@ one_attempt() {
   # (iii) a FRESH sender must rediscover the acceptor and complete the transfer.
   R_RC=0
   local budget="$SEND_BUDGET"; [ "$mode" = "zombie" ] && budget="$BASELINE_BUDGET"
-  FILAMENT_CONFIG_DIR="$DA" \
+  TUNLION_CONFIG_DIR="$DA" \
     timeout "$budget" "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$SENDLOG" 2>&1 || R_RC=1
   R_GOT="$DG/big.bin"
   sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
@@ -211,7 +211,7 @@ for n in $(seq 1 "$RUNS"); do
 done
 
 # ---- A/B BASELINE: in-core loop reverted => acceptor ZOMBIES ----------------
-say "A/B BASELINE: in-core reconnect OFF (FILAMENT_TEST_NO_SIGNALING_RECONNECT=1) — the acceptor must ZOMBIE"
+say "A/B BASELINE: in-core reconnect OFF (TUNLION_TEST_NO_SIGNALING_RECONNECT=1) — the acceptor must ZOMBIE"
 one_attempt "baseline" "zombie"
 GOTB="$WORK/baseline-drop/big.bin"
 # Zombie proof: the in-core re-announce must NOT have fired AND the fresh sender

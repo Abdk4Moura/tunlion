@@ -7,7 +7,7 @@ LOCK_FILE="$LOCK_DIR/cargo-build.lock"
 STATUS_FILE="$LOCK_DIR/cargo-build.status"
 # Release tests take minutes. Ten minutes permits ordinary queueing but fails
 # before an outer test timeout can turn a wedged holder into an unattributed run.
-WAIT_SECS="${FILAMENT_BUILD_LOCK_WAIT_SECS:-600}"
+WAIT_SECS="${TUNLION_BUILD_LOCK_WAIT_SECS:-600}"
 
 # Find the subcommand, skipping a leading +toolchain and any leading flags.
 # `case "$1"` alone was defeated by `cargo +nightly metadata` and

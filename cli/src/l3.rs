@@ -120,7 +120,7 @@ impl OverlayListener {
 }
 
 /// The TUN interface name the daemon creates for the overlay.
-const IFNAME: &str = "filament0";
+const IFNAME: &str = "tunlion0";
 
 /// The overlay interface name, for callers that must name it to the kernel
 /// (the subnet-router forwarding rules).
@@ -140,10 +140,35 @@ pub fn ipv6_disabled() -> bool {
         || read("/proc/sys/net/ipv6/conf/default/disable_ipv6")
 }
 
+/// What stops the kernel overlay on this machine before any privilege
+/// question arises, most fundamental first, or None. Pure: `dev_present` is
+/// whether /dev/net/tun exists, `ipv6_off` whether IPv6 is disabled. Only the
+/// first cause is named, so only an advice that can work is given.
+pub fn kernel_overlay_blocker(dev_present: bool, ipv6_off: bool) -> Option<String> {
+    if !dev_present {
+        return Some(
+            "/dev/net/tun does not exist here (a container started without --device /dev/net/tun, \
+             or a kernel without the tun module), so the userspace overlay is used and needs no \
+             setup; a capability grant would not change that"
+                .to_string(),
+        );
+    }
+    if ipv6_off {
+        return Some(
+            "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), so the kernel \
+             overlay cannot hold its address and the userspace overlay is used. To use the kernel \
+             overlay, re-enable it: sysctl -w net.ipv6.conf.all.disable_ipv6=0 \
+             net.ipv6.conf.default.disable_ipv6=0"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Turn a kernel-TUN failure into the thing the operator has to change.
 ///
 /// WHY THIS EXISTS. The fallback message used to quote the failed command and
-/// stop: "no kernel TUN (ip addr add fdf1:.../128 dev filament0)". That names
+/// stop: "no kernel TUN (ip addr add fdf1:.../128 dev tunlion0)". That names
 /// the symptom and hides every cause behind it, and one of those causes is
 /// silent and consequential: a host with IPv6 disabled cannot hold the overlay
 /// address at all, so it runs on the userspace plane forever while looking
@@ -153,6 +178,21 @@ pub fn ipv6_disabled() -> bool {
 /// Pure so every branch is testable without breaking the host's networking.
 pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
     let e = err.to_ascii_lowercase();
+    // IN THIS ORDER, and only the first cause that applies is advised. A box
+    // with no /dev/net/tun and IPv6 disabled (a hardened container) used to
+    // be told to re-enable IPv6 with sysctl, which would have changed nothing:
+    // the error was "open /dev/net/tun: No such file or directory". The device
+    // is the first thing the kernel plane needs, so its absence is the cause
+    // whatever else is also true; then IPv6; then privilege.
+    if e.contains("tun") && (e.contains("no such file or directory") || e.contains("no such device")) {
+        return format!(
+            "/dev/net/tun does not exist here (a container started without --device /dev/net/tun, \
+             or a kernel without the tun module), so the kernel overlay cannot start. The \
+             userspace overlay is in use instead and needs no setup. For the kernel overlay, \
+             start the container with --device /dev/net/tun, or load the module (`modprobe tun`). \
+             Original error: {err}"
+        );
+    }
     if ipv6_off || e.contains("ipv6 is disabled") {
         return format!(
             "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), and tunlion's \
@@ -165,12 +205,6 @@ pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
         return format!(
             "no permission to create a network device: tunlion needs CAP_NET_ADMIN (run as root, \
              or grant the capability on the binary). Original error: {err}"
-        );
-    }
-    if e.contains("no such file or directory") && e.contains("tun") {
-        return format!(
-            "/dev/net/tun is missing: load the tun module (`modprobe tun`) or run somewhere it is \
-             available. Original error: {err}"
         );
     }
     if e.contains("busy") {
@@ -245,13 +279,13 @@ impl L3 {
     /// endpoint: Kernel needs CAP_NET_ADMIN; Userspace needs none; Auto tries the
     /// kernel TUN and silently falls back to the userspace netstack if it can't be
     /// created (no cap, no /dev/net/tun, container without `ip`, locked netns).
-    /// `FILAMENT_L3_USERSPACE=1` forces Userspace regardless of `mode`.
+    /// `TUNLION_L3_USERSPACE=1` forces Userspace regardless of `mode`.
     pub fn start(cidr: &str, mtu: u32, identity: Option<Identity>, mode: L3Mode) -> Result<Arc<L3>> {
         cidr.split('/')
             .next()
             .and_then(|a| a.parse::<IpAddr>().ok())
             .ok_or_else(|| anyhow!("bad overlay address '{cidr}', want IP/PREFIX"))?;
-        let mode = if std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1") {
+        let mode = if std::env::var("TUNLION_L3_USERSPACE").as_deref() == Ok("1") {
             L3Mode::Userspace
         } else {
             mode
@@ -383,7 +417,7 @@ impl L3 {
     }
 
     /// Dial `dst:port` over the overlay, in BOTH modes: a kernel `TcpStream`
-    /// (routed via filament0) or an in-process smoltcp connection. This is what lets
+    /// (routed via tunlion0) or an in-process smoltcp connection. This is what lets
     /// a node reach a peer's OVERLAY-exposed service (an `expose` bound on the
     /// overlay IP, which an L2 loopback open cannot reach) - and the ONLY way a
     /// userspace node (no kernel route) reaches `<peer>.mesh:port` at all.
@@ -412,7 +446,7 @@ impl L3 {
     }
 
     /// True if `addr` is a currently-routed (verified) peer on the overlay. Any
-    /// datagram on filament0 already came from a paired peer, so this is the
+    /// datagram on tunlion0 already came from a paired peer, so this is the
     /// membership check the expose allowlist builds on.
     pub async fn is_verified_peer(&self, addr: IpAddr) -> bool {
         self.routes.lock().await.contains_host(&addr)
@@ -802,8 +836,8 @@ impl L3 {
         if self.netstack.is_some() {
             return;
         }
-        // A DEFAULT ROUTE IS NOT A SUBNET ROUTE. `10.66.0.0/24 dev filament0` is
-        // additive; `0.0.0.0/0 dev filament0` captures every packet this machine
+        // A DEFAULT ROUTE IS NOT A SUBNET ROUTE. `10.66.0.0/24 dev tunlion0` is
+        // additive; `0.0.0.0/0 dev tunlion0` captures every packet this machine
         // sends, including the ones carrying the overlay. Installed into the main
         // table it routes the tunnel through the tunnel: the link dies, the route
         // is withdrawn, the link returns, and the machine oscillates, having
@@ -915,7 +949,7 @@ fn open_kernel(
     addr_v4: Option<std::net::Ipv4Addr>,
 ) -> Result<Arc<dyn TunDevice>> {
     let tun: Arc<dyn TunDevice> = Arc::new(KernelTun::open(IFNAME, cidr, mtu)?);
-    // Route by the device's ACTUAL name: Linux honors `filament0`, but macOS assigns
+    // Route by the device's ACTUAL name: Linux honors `tunlion0`, but macOS assigns
     // `utunN` (utun devices can't be renamed). Crypto mode scatters /128s across the
     // shared ULA prefix, so route the whole prefix to the TUN (userspace demuxes).
     if crypto {
@@ -937,22 +971,35 @@ fn open_kernel(
     Ok(tun)
 }
 
-const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by tunlion; edits here are overwritten)";
-const HOSTS_END: &str = "# END filament-mesh";
+// The /etc/hosts block markers; the BEGIN line is matched by its prefix on
+// rewrite. Distinct from any other tool's block, so a rewrite never touches it.
+const HOSTS_BEGIN: &str = "# BEGIN tunlion-mesh (managed by tunlion; edits here are overwritten)";
+const HOSTS_END: &str = "# END tunlion-mesh";
 
-/// Get this machine's hostname for MagicDNS.
+/// This machine's short hostname (MagicDNS, the `init` name suggestion, the
+/// forward-to-self check). Asks the OS (`platform::os_hostname`) instead of
+/// reading /etc/hostname, which macOS does not have, so every Mac was "cli".
 pub fn hostname() -> String {
-    // #183.1: /etc/hostname is UNIX-only; Windows provides COMPUTERNAME.
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "cli".into())
+    short_host_label(&crate::platform::os_hostname().unwrap_or_default())
+}
+
+/// `Kabir-MacBook.local` -> `kabir-macbook`: the first DNS label, lowercased,
+/// with anything outside [a-z0-9-] turned into `-`, so the name works as a
+/// `<name>.mesh` label. Falls back to "device" when nothing usable is left.
+pub(crate) fn short_host_label(host: &str) -> String {
+    let first = host.trim().split('.').next().unwrap_or("");
+    let mut label = String::new();
+    for c in first.chars() {
+        let c = c.to_ascii_lowercase();
+        let c = if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' };
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
     }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into())
-    }
+    let label: String = label.trim_end_matches('-').chars().take(63).collect();
+    let label = label.trim_end_matches('-').to_string();
+    if label.is_empty() { "device".to_string() } else { label }
 }
 
 /// The OS hosts file for MagicDNS. Unix: /etc/hosts. Windows: the drivers\etc\hosts
@@ -969,7 +1016,7 @@ fn hosts_path() -> std::path::PathBuf {
     }
 }
 
-/// Replace the filament-mesh managed block in /etc/hosts with `entries`
+/// Replace the tunlion-mesh managed block in /etc/hosts with `entries`
 /// (`<addr> <name>.mesh` per peer, both AAAA and A records). Atomic via
 /// temp-file + rename. An empty `entries` removes the block. Names are
 /// display-only; routing is always by the cryptographically-verified address.
@@ -1002,7 +1049,7 @@ fn rewrite_hosts_block(entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)]) -> std:
     }
 }
 
-/// Pure transform: strip any prior filament-mesh block from `current`, then append
+/// Pure transform: strip any prior tunlion-mesh block from `current`, then append
 /// a fresh one for `entries` (none => block removed). Non-tunlion lines are kept
 /// verbatim, so we never clobber the user's /etc/hosts.
 fn render_hosts(current: &str, entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)]) -> String {
@@ -1010,7 +1057,7 @@ fn render_hosts(current: &str, entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)])
     let mut in_block = false;
     for line in current.lines() {
         let t = line.trim_start();
-        if t.starts_with("# BEGIN filament-mesh") {
+        if t.starts_with("# BEGIN tunlion-mesh") {
             in_block = true;
             continue;
         }
@@ -1086,7 +1133,7 @@ pub async fn run_point_to_point(
     });
     // TUN -> datagram (this task). Select against conn.closed() so a peer that
     // drops while our TUN is idle ends the pump promptly, instead of parking in
-    // tun.recv() forever (the process would otherwise hang holding filament0).
+    // tun.recv() forever (the process would otherwise hang holding tunlion0).
     let mut buf = vec![0u8; 65535];
     loop {
         tokio::select! {
@@ -1269,7 +1316,7 @@ mod tests {
     /// looked at since, surfaced only as a quoted `ip addr add`.
     #[test]
     fn a_disabled_ipv6_stack_is_named_and_not_just_quoted() {
-        let raw = "ip addr add fdf1::1/128 dev filament0: Error: ipv6: address disabled.";
+        let raw = "ip addr add fdf1::1/128 dev tunlion0: Error: ipv6: address disabled.";
         let d = diagnose_tun_failure(raw, true);
         assert!(d.contains("IPv6 is disabled"), "must name the cause: {d}");
         assert!(d.contains("disable_ipv6=0"), "must say how to fix it: {d}");
@@ -1284,6 +1331,40 @@ mod tests {
         assert!(d.contains("IPv6 is disabled"));
     }
 
+    /// `init` in a container with no /dev/net/tun and IPv6 off advised
+    /// `sudo setcap`. The blocker names the device first, then IPv6, and with
+    /// both present there is no blocker (privilege is a separate question).
+    #[test]
+    fn the_kernel_overlay_blocker_names_the_first_real_cause() {
+        let no_dev = kernel_overlay_blocker(false, true).unwrap();
+        assert!(no_dev.contains("/dev/net/tun does not exist"), "{no_dev}");
+        assert!(!no_dev.contains("sysctl") && !no_dev.contains("setcap"), "{no_dev}");
+        let v6 = kernel_overlay_blocker(true, true).unwrap();
+        assert!(v6.contains("IPv6 is disabled") && v6.contains("disable_ipv6=0"), "{v6}");
+        assert_eq!(kernel_overlay_blocker(true, false), None);
+    }
+
+    /// The blind test's container: no /dev/net/tun AND IPv6 disabled. The
+    /// advice must be about the missing device (the actual error) and must not
+    /// send the operator to sysctl or setcap, neither of which would help.
+    #[test]
+    fn a_missing_tun_device_is_the_cause_even_with_ipv6_disabled() {
+        let raw = "open /dev/net/tun: No such file or directory (os error 2)";
+        let d = diagnose_tun_failure(raw, true);
+        assert!(d.contains("/dev/net/tun does not exist"), "{d}");
+        assert!(d.contains("userspace overlay is in use"), "{d}");
+        assert!(d.contains("--device /dev/net/tun"), "{d}");
+        assert!(!d.contains("sysctl") && !d.contains("IPv6 is disabled"), "{d}");
+        assert!(!d.contains("CAP_NET_ADMIN") && !d.contains("setcap"), "{d}");
+        assert!(d.contains(raw), "{d}");
+        // A node present but no driver behind it: the same cause.
+        let nodev = diagnose_tun_failure("open /dev/net/tun: No such device", false);
+        assert!(nodev.contains("/dev/net/tun does not exist"), "{nodev}");
+        // With the device present, IPv6 still outranks privilege.
+        let both = diagnose_tun_failure("TUNSETIFF: Operation not permitted", true);
+        assert!(both.contains("IPv6 is disabled") && !both.contains("CAP_NET_ADMIN"), "{both}");
+    }
+
     #[test]
     fn privilege_and_module_and_busy_each_name_their_own_fix() {
         assert!(
@@ -1295,7 +1376,7 @@ mod tests {
                 .contains("modprobe tun")
         );
         assert!(
-            diagnose_tun_failure("TUNSETIFF filament0: Device or resource busy", false)
+            diagnose_tun_failure("TUNSETIFF tunlion0: Device or resource busy", false)
                 .contains("already holds")
         );
     }
@@ -1307,7 +1388,7 @@ mod tests {
         let raw = "something nobody has seen before";
         assert_eq!(diagnose_tun_failure(raw, false), raw);
     }
-    use super::{diagnose_tun_failure, dest_ip, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
+    use super::{diagnose_tun_failure, dest_ip, kernel_overlay_blocker, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
@@ -1322,13 +1403,33 @@ mod tests {
         // never a bare hostname (would shadow real names); never `localhost`
         assert!(!with.contains(&format!("{a} other-do.mesh other-do")));
         assert!(!with.lines().any(|l| l.trim() == format!("{a} other-do")));
-        assert!(with.contains("# BEGIN filament-mesh"));
+        assert!(with.contains("# BEGIN tunlion-mesh"));
         // re-rendering replaces (not stacks) the block, and empty removes it
         let again = render_hosts(&with, &[("other-do".into(), a, None)]);
-        assert_eq!(again.matches("# BEGIN filament-mesh").count(), 1);
+        assert_eq!(again.matches("# BEGIN tunlion-mesh").count(), 1);
         let cleared = render_hosts(&again, &[]);
-        assert!(!cleared.contains("filament-mesh"));
+        assert!(!cleared.contains("tunlion-mesh"));
         assert!(cleared.contains("127.0.0.1 localhost"));
+    }
+
+    #[test]
+    fn hostname_is_the_short_os_label() {
+        use super::short_host_label as l;
+        assert_eq!(l("laptop"), "laptop");
+        assert_eq!(l("Kabir-MacBook-Pro.local"), "kabir-macbook-pro");
+        assert_eq!(l("vps3584156.trouble-free.net"), "vps3584156");
+        assert_eq!(l("DESKTOP-7Q2K1"), "desktop-7q2k1");
+        assert_eq!(l("my_box  two"), "my-box-two");
+        assert_eq!(l("-edge-"), "edge");
+        assert_eq!(l(""), "device");
+        assert_eq!(l("...."), "device");
+        assert_eq!(l(&"a".repeat(80)).len(), 63);
+        // The OS answers, so the name is the machine's, never the old
+        // /etc/hostname fallback constant.
+        let os = crate::platform::os_hostname();
+        assert!(os.as_deref().is_some_and(|h| !h.is_empty()), "no hostname from the OS: {os:?}");
+        assert_eq!(super::hostname(), l(os.as_deref().unwrap()));
+        assert_ne!(super::hostname(), "cli");
     }
 
     #[test]
@@ -1347,7 +1448,7 @@ mod tests {
         assert!(is_safe_mesh_name("other-do"));
         // a peer named "localhost" is skipped entirely (no localhost.mesh either)
         let a: Ipv6Addr = "fdf1:1af7:c30d:1a1::99aa".parse().unwrap();
-        assert!(!render_hosts("", &[("localhost".into(), a, None)]).contains("filament-mesh"));
+        assert!(!render_hosts("", &[("localhost".into(), a, None)]).contains("tunlion-mesh"));
     }
 
     #[test]
@@ -1670,7 +1771,7 @@ mod tests {
         use super::*;
         // ISOLATED CONFIG DIR, under the shared lock (#339). load_identity reads
         // and writes the process-global config dir. Unguarded, this test raced
-        // the settings tests, which point FILAMENT_CONFIG_DIR at a temp dir and
+        // the settings tests, which point TUNLION_CONFIG_DIR at a temp dir and
         // then remove_dir_all it: on Windows it failed with "write overlay key:
         // The system cannot find the path specified". And with no override set
         // at all, it wrote an overlay key into the developer's REAL config dir.
@@ -1681,17 +1782,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fil-l3-v4-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var_os("FILAMENT_CONFIG_DIR");
+        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
         // SAFETY: the shared lock makes this the only test touching the env.
-        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         struct Restore(Option<std::ffi::OsString>, std::path::PathBuf);
         impl Drop for Restore {
             fn drop(&mut self) {
                 // SAFETY: still under the lock, which outlives this guard.
                 unsafe {
                     match self.0.take() {
-                        Some(v) => std::env::set_var("FILAMENT_CONFIG_DIR", v),
-                        None => std::env::remove_var("FILAMENT_CONFIG_DIR"),
+                        Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                        None => std::env::remove_var("TUNLION_CONFIG_DIR"),
                     }
                 }
                 let _ = std::fs::remove_dir_all(&self.1);

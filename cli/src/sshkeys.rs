@@ -1,7 +1,7 @@
 // sshkeys — thin CLI shim over the standalone `authkeys-managed` crate.
 //
 // The managed-ssh logic (managed keypair, private known_hosts, the removable
-// `# BEGIN/END filament-managed <device>` authorized_keys block, and the
+// `# BEGIN/END tunlion-managed <device>` authorized_keys block, and the
 // bootstrap cache) now lives in `authkeys-managed`, which is decoupled from the
 // CLI's config-dir resolution: every config-rooted function takes
 // `config_dir: &Path`. This shim injects `crate::settings::config_dir()` and

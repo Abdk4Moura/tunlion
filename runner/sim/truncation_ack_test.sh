@@ -11,12 +11,12 @@
 # on top to be reliable; P4 makes it a CORE guarantee.
 #
 # How the corrupt receive is induced DETERMINISTICALLY: an in-binary test hook,
-# FILAMENT_TEST_CORRUPT_RECV=<transfer-id>, flips the LAST byte of the received
+# TUNLION_TEST_CORRUPT_RECV=<transfer-id>, flips the LAST byte of the received
 # `.part` right before the receiver computes its whole-file sha256 — same size,
 # wrong hash: exactly the "looks complete but is corrupt" case. The transfer id is
 # deterministic: `send` mints it as "<sender-uid>-<sid>" where sid=1 for the first
 # (only) payload — so the matching id is "<uid>-1"; we pass a fixed sender uid via
-# the env so the id is known up front. FILAMENT_TEST_CORRUPT_ONCE=1 fires the flip
+# the env so the id is known up front. TUNLION_TEST_CORRUPT_ONCE=1 fires the flip
 # EXACTLY ONCE so the receiver's re-fetch then succeeds (proves auto-recovery);
 # omitting it corrupts EVERY round (proves the bounded clean failure).
 #
@@ -39,7 +39,7 @@
 #     (e) ACK HAPPY  : a clean transfer still verifies + acks end-to-end (the ack
 #                      path isn't only reached on the corrupt path).
 #
-# Isolated: own backend on a private port, own FILAMENT_CONFIG_DIRs, the BUILT
+# Isolated: own backend on a private port, own TUNLION_CONFIG_DIRs, the BUILT
 # release binary, the DEFAULT (loopback WebRTC) transport — no TURN needed. Never
 # touches the live `up` daemon or ~/.local/bin.
 #
@@ -52,14 +52,14 @@ BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`
-# level. Export FILAMENT_LOG=debug so every $BIN child prints them; the
+# level. Export TUNLION_LOG=debug so every $BIN child prints them; the
 # value-prop lines (route, relay banner, P5 upgrade) are `critical` and show
 # regardless. Respect an explicit override if the caller set one.
-export FILAMENT_LOG="${FILAMENT_LOG:-debug}"
-PORT="${FILAMENT_TEST_PORT:-8094}"
+export TUNLION_LOG="${TUNLION_LOG:-debug}"
+PORT="${TUNLION_TEST_PORT:-8094}"
 SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/trunc-ack.XXXXXX")"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${TUNLION_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
 [ -x "$PYV" ] || PYV="$(command -v python3)"
 
 RUNS="${RUNS:-2}"                  # determinism: repeat the whole gate
@@ -78,7 +78,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resilience gates drive the env-gated test hooks (FILAMENT_TEST_*), which now
+# Resilience gates drive the env-gated test hooks (TUNLION_TEST_*), which now
 # ship ONLY in a `--features test-hooks` build (stripped from default/release).
 # Auto-build that binary unless an explicit FILJOB_BIN was provided.
 if [ -z "${FILJOB_BIN:-}" ]; then
@@ -103,9 +103,9 @@ BIG="$WORK/big.bin"; head -c 2000000 /dev/urandom >"$BIG"; H_BIG=$(hashof "$BIG"
 DA="$WORK/devA"; DB="$WORK/devB"; mkdir -p "$DA" "$DB"
 pair() {
   local W="pair-$$-$RANDOM"
-  FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$BIG" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
+  TUNLION_CONFIG_DIR="$DA" "$BIN" send "$BIG" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
   local SP=$!; sleep 3
-  FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
+  TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
   wait $SP 2>/dev/null
 }
 say "setup: pairing A<->B (--remember over a code)"
@@ -122,11 +122,11 @@ fi
 #               "persist"-> flip it EVERY verify round (unrecoverable)
 #               "none"   -> clean transfer (baseline)
 # Sets globals: A_RC (sender exit code), TIMED_OUT (1 if the run hit SIGTERM=124).
-# The sender uid is pinned (FILAMENT_UID) so the transfer id the receiver must
+# The sender uid is pinned (TUNLION_UID) so the transfer id the receiver must
 # corrupt is known before the send starts. `send` mints my_uid = "cli-s-<UID>"
 # and the transfer id = "<my_uid>-<sid>"; sid=1 for the first/only payload, so
 # the id is "cli-s-<UID>-1".
-SENDER_UID="trunc"                 # FILAMENT_UID
+SENDER_UID="trunc"                 # TUNLION_UID
 XFER_ID="cli-s-$SENDER_UID-1"      # => the deterministic transfer id
 one_attempt() {
   local tag="$1" corrupt_mode="$2"
@@ -134,25 +134,25 @@ one_attempt() {
   local UPLOG="$WORK/$tag-up.log"; local SENDLOG="$WORK/$tag-send.log"
   local recv_env=()
   case "$corrupt_mode" in
-    once)    recv_env=(FILAMENT_TEST_CORRUPT_RECV="$XFER_ID" FILAMENT_TEST_CORRUPT_ONCE=1) ;;
-    persist) recv_env=(FILAMENT_TEST_CORRUPT_RECV="$XFER_ID") ;;
+    once)    recv_env=(TUNLION_TEST_CORRUPT_RECV="$XFER_ID" TUNLION_TEST_CORRUPT_ONCE=1) ;;
+    persist) recv_env=(TUNLION_TEST_CORRUPT_RECV="$XFER_ID") ;;
     none)    recv_env=() ;;
   esac
   # The receiver's verify + re-fetch loop has brief no-data gaps that the SENDER's
   # bytes-moved watchdog (P0) would otherwise treat as a stall — churning the
   # direct-repair ladder toward a relay that isn't configured here, slow and
   # orthogonal to what THIS gate asserts (the receiver's whole-file reject/recover
-  # + the ack gate). So we quiet the sender's stall watchdog (huge FILAMENT_STALL_MS)
+  # + the ack gate). So we quiet the sender's stall watchdog (huge TUNLION_STALL_MS)
   # and disable warm standby; the sender then simply waits on its bounded ack timer.
   # The P0/P1/P3 stall+relay behaviour has its own dedicated gates.
   # `env` applies the array-sourced vars (a bash assignment from an expanded array
   # before a command word is NOT treated as an env assignment — it'd try to RUN it).
-  env FILAMENT_CONFIG_DIR="$DB" FILAMENT_STALL_MS=99999999 FILAMENT_WARM_STANDBY=0 ${recv_env[@]+"${recv_env[@]}"} \
+  env TUNLION_CONFIG_DIR="$DB" TUNLION_STALL_MS=99999999 TUNLION_WARM_STANDBY=0 ${recv_env[@]+"${recv_env[@]}"} \
     timeout 55 "$BIN" up --dir "$DG" --server "$SERVER" >"$UPLOG" 2>&1 &
   local UP=$!; pids+=($UP); sleep 3
   A_RC=0; TIMED_OUT=0
-  env FILAMENT_CONFIG_DIR="$DA" FILAMENT_UID="$SENDER_UID" \
-    FILAMENT_ACK_TIMEOUT="$ACK_TIMEOUT" FILAMENT_STALL_MS=99999999 FILAMENT_WARM_STANDBY=0 \
+  env TUNLION_CONFIG_DIR="$DA" TUNLION_UID="$SENDER_UID" \
+    TUNLION_ACK_TIMEOUT="$ACK_TIMEOUT" TUNLION_STALL_MS=99999999 TUNLION_WARM_STANDBY=0 \
     timeout 55 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$SENDLOG" 2>&1 || A_RC=$?
   [ "$A_RC" = "124" ] && TIMED_OUT=1
   sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null

@@ -1,14 +1,8 @@
 # Tunlion
 
-> **Tunlion is now Tunlion.** Same project, same people, new name. The old name
-> collided with [Tunlion](https://tunlionphp.com) the Laravel admin panel, which
-> owns the search results, so this one is ours alone.
->
-> `tunlion.autumated.com` redirects here and old GitHub links redirect to this repo,
-> so nothing you have bookmarked breaks. The published `filament-cli` crate and the
-> `cli-v0.8.5` release assets keep working unchanged; new releases ship under the new
-> name. **`api.filament.autumated.com` is deliberately unchanged** and stays up: every
-> binary already installed points at it.
+> Tunlion grew out of an earlier project called filament. It is a separate
+> tool now, with its own config, service and command names, so the two can be
+> installed side by side.
 
 **Live: [tunlion.autumated.com](https://tunlion.autumated.com)** — send files and reach your devices, peer to peer. No upload, no size cap, no account.
 
@@ -48,7 +42,7 @@ tunlion send video.mp4 --code       # speak the code aloud
 tunlion receive clever-lynx-63      # …or open the website on the other device
 
 tunlion add --name phone            # remember a device (no file needed)
-tunlion up                          # receive in the background
+tunlion up --install                # receive in the background (always-on service)
 ```
 
 - **The other end can be a browser** — your wife's phone with nothing installed opens a URL and taps accept.
@@ -61,15 +55,26 @@ tunlion up                          # receive in the background
 Once two machines are paired, they share a crypto-addressed overlay — each device's public key *is* its address. On top of that:
 
 ```sh
-tunlion dovm                        # open a shell on a paired device
+tunlion shell dovm                  # open a shell on a paired device (or just: tunlion dovm)
 tunlion reach dovm                  # is it reachable, and over which route?
 tunlion reach dovm --until-direct   # wait for the link to leave the relay
 tunlion expose 5432                 # publish a local port on the mesh
-tunlion forward 5432 dovm:5432      # forward a remote port to localhost
-tunlion mount dovm:~/data ./data    # mount a remote folder (sshfs over the mesh)
+tunlion forward dovm:5432           # forward a remote port to the same local port
+tunlion mount dovm /srv/data ./data # mount a remote folder over the mesh
 ```
 
 No inbound ports, no VPN config, no accounts — reachability rides the same authenticated link as file transfer, so a headless box in another network is one command away.
+
+## Use it from an AI agent
+
+Every command that matters to a script takes `--json` and exits with a documented code (`tunlion --help`, EXIT CODES). To teach a coding agent the right commands, install the bundled skill ([cli/skills/tunlion/SKILL.md](cli/skills/tunlion/SKILL.md)). It is opt-in: nothing else ever installs it.
+
+```sh
+tunlion skill install               # into ~/.claude/skills and/or ~/.agents/skills, whichever exist
+tunlion skill install --dir ./skills # or any skills directory
+tunlion skill show                  # print the SKILL.md this binary carries
+tunlion skill uninstall             # removes only what skill install wrote
+```
 
 ## Why Tunlion over the alternatives
 

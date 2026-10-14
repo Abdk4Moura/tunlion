@@ -1,8 +1,8 @@
 //! Exit nodes: accepting a DEFAULT route without cutting your own underlay.
 //!
 //! A subnet route and a default route look identical in the protocol and are
-//! completely different in the kernel. `10.66.0.0/24 dev filament0` is additive.
-//! `0.0.0.0/0 dev filament0` captures every packet the machine sends, including
+//! completely different in the kernel. `10.66.0.0/24 dev tunlion0` is additive.
+//! `0.0.0.0/0 dev tunlion0` captures every packet the machine sends, including
 //! the ones carrying the overlay. Install it naively into the main table and the
 //! tunnel's own traffic is routed into the tunnel: the link dies, the route is
 //! withdrawn, the link returns, and the machine oscillates. The first packet
@@ -207,7 +207,7 @@ mod tests {
     /// The difference between an exit node and a disconnected machine.
     #[test]
     fn the_default_route_goes_only_to_the_dedicated_table() {
-        let plan = install_plan("filament0", Some("192.0.2.1"), &[]);
+        let plan = install_plan("tunlion0", Some("192.0.2.1"), &[]);
         let defaults: Vec<_> = plan.iter().filter(|c| c.contains(&"0.0.0.0/0".to_string())).collect();
         assert_eq!(defaults.len(), 1);
         assert!(defaults[0].contains(&"table".to_string()));
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn carve_outs_are_installed_before_the_default_route() {
         let peer: IpAddr = "203.0.113.9".parse().unwrap();
-        let plan = install_plan("filament0", Some("192.0.2.1"), &[peer]);
+        let plan = install_plan("tunlion0", Some("192.0.2.1"), &[peer]);
         let default_at = plan.iter().position(|c| c.contains(&"0.0.0.0/0".to_string())).unwrap();
         let peer_at = plan.iter().position(|c| c.contains(&"203.0.113.9/32".to_string())).unwrap();
         assert!(peer_at < default_at);

@@ -2,7 +2,7 @@
 # Certificate revocation against a CERTIFIED fleet device, live. Standalone,
 # hermetic, fixture port 8121 ONLY.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./fleet-cert-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./fleet-cert-gates.sh
 #
 # WHY THIS EXISTS. Every other shell-class gate in this directory pairs its two
 # daemons by hand-writing a shared secret into both devices.json files. A
@@ -65,13 +65,16 @@
 #   F   no ssh key was installed anywhere by A3/E (authorized_keys byte-equal)
 #   G   A/B CONTROL: `devices restore` and exec works again -- so C/D/E were
 #       the revocation and not a broken link, a dead daemon or a lost secret.
+#   FORGET-REVOKES  `devices forget` on a live certificate holder revokes its
+#       KEY (revoked-keys.json) and frees the name; a fresh fleet-hello from
+#       that device is not re-indexed.
 #   I1/I2/I3 IMPOSTOR (F1 acceptance, live): a sibling daemon hellos as the
 #       ceilinged device's exact name, trailing-space name, and control-char
 #       name; each is refused, the victim record is byte-identical, and the
 #       sibling's exec is refused.
 #   D-sh SHADOW EVIDENCE for the flip checklist: a covered fleet exec in
 #       shadow mode logs zero CAP-SHADOW CRITICAL lines.
-#   AUTH-A/B/C under FILAMENT_CAP_AUTHORITATIVE=1 on a restarted owner
+#   AUTH-A/B/C under TUNLION_CAP_AUTHORITATIVE=1 on a restarted owner
 #       daemon: shell within the enrolment ceiling succeeds (A); exec
 #       outside the ceiling (transfer-only enrolment) is refused with the
 #       grant reason (B); revoke --certificate refuses too (C).
@@ -103,10 +106,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8121
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-fleet-cert.XXXXXX")"
 DA="$WORK/owner"
 SPOKE=spoke
@@ -120,7 +123,7 @@ trap fixture_cleanup EXIT
 # passes (so the SIGNING half runs, which is what these gates are about) and
 # ssh itself fails immediately, touching nothing on the host.
 SSHD_STANDIN_PORT=9124
-SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=$SSHD_STANDIN_PORT)
+SSH_ENV=(env TUNLION_NO_L3_SSH=1 TUNLION_SSH_PORT=$SSHD_STANDIN_PORT)
 AK_FILE="$HOME/.ssh/authorized_keys"
 [ -f "$AK_FILE" ] && cp "$AK_FILE" "$WORK/ak.before" || : > "$WORK/ak.before"
 
@@ -131,8 +134,8 @@ AK_FILE="$HOME/.ssh/authorized_keys"
 # what happened to gateAUTH-A (see the header note).
 KNOWN_RED_ALLOW=()
 
-O_ENV=(env FILAMENT_CONFIG_DIR="$DA")
-S_ENV=(env FILAMENT_CONFIG_DIR="$DS")
+O_ENV=(env TUNLION_CONFIG_DIR="$DA")
+S_ENV=(env TUNLION_CONFIG_DIR="$DS")
 
 python3 -c "
 import socket
@@ -201,7 +204,7 @@ fi
 # what is asserted is that the owner's daemon passed the ssh-sign gate and
 # ISSUED, which is the third path through shell_gate::decide.
 say "A3: the owner signs an ssh certificate for the certified spoke"
-timeout 60 "${SSH_ENV[@]}" FILAMENT_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
+timeout 60 "${SSH_ENV[@]}" TUNLION_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
   shell --ssh alpha -- 'echo NO-SSHD-HERE' >"$WORK/A3.out" 2>"$WORK/A3.err" </dev/null
 echo "## (ssh sign) rc=$?"
 SIGNED_BEFORE=$(grep -c "ssh-ca: signed for '$SPOKE'" "$WORK/up.log")
@@ -290,7 +293,7 @@ fi
 # turns "the flow stopped" into "no certificate for a revoked device exists",
 # and A3 is what makes that absence meaningful.
 say "E: the revoked spoke's shell --ssh is refused, and nothing is signed"
-timeout 60 "${SSH_ENV[@]}" FILAMENT_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
+timeout 60 "${SSH_ENV[@]}" TUNLION_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
   shell --ssh alpha -- 'echo SHOULD-NOT-RUN' >"$WORK/E.out" 2>"$WORK/E.err" </dev/null
 rcE=$?
 SIGNED_AFTER=$(grep -c "ssh-ca: signed for '$SPOKE'" "$WORK/up.log")
@@ -356,7 +359,72 @@ DM="$WORK/$MALLORY"
 enroll_delegate "$MALLORY" --allow transfer
 start_spoke "$DM" "$MALLORY"
 sleep 6
-"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$MALLORY" >"$WORK/forget.log" 2>&1
+# FORGET-REVOKES: `devices forget` on a device holding a live fleet
+# certificate used to print "it can no longer find or auto-connect to this
+# machine" while fleet-hello let it straight back in. It was then REFUSED,
+# which left the name unusable for the certificate's whole life (the re-link
+# chain after a reset began with a forget that refused). Now the forget records
+# the device KEY as revoked (revoked-keys.json, kept until the certificate
+# expires) before dropping the record. Asserted end to end, on its own
+# enrollee so the impostor fixture below is untouched: the forget succeeds and
+# says it revoked, the record and the name are gone, the key is on the key
+# list, and the forgotten device's daemon, restarted so it hellos again, is
+# NOT re-indexed by fleet auto-mesh (before this change a forgotten live key
+# came straight back as a record).
+FORGOTTEN=forgetme
+DFG="$WORK/$FORGOTTEN"
+enroll_delegate "$FORGOTTEN" --allow transfer
+start_spoke "$DFG" "$FORGOTTEN"
+sleep 4
+FG_PUB=$(python3 -c "import json,sys;print(next((d.get('deviceCert',{}).get('devicePub','') for d in json.load(open('$DA/devices.json')) if d.get('name')=='$FORGOTTEN'),''))" 2>/dev/null)
+say "FORGET-REVOKES: forgetting a live certificate holder revokes its key and frees the name"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$FORGOTTEN" -y >"$WORK/forget.log" 2>&1
+rcFG=$?
+pkill -f "up --dir $WORK/$FORGOTTEN-drop" 2>/dev/null || true
+sleep 2
+start_spoke "$DFG" "$FORGOTTEN-again"
+# Wait for the hello itself, not a fixed time: a fixed `sleep 10` expired while
+# the restarted daemon was still connecting (~1 run in 7). Bounded at 60 s, then
+# a settle so the owner has had time to (wrongly) re-admit it before we look.
+FG_HELLO=0
+for _ in $(seq 1 60); do
+  if grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null; then
+    FG_HELLO=1; break
+  fi
+  sleep 1
+done
+sleep 5
+FG_REINDEXED=$(python3 -c "import json;print(1 if any(d.get('deviceCert',{}).get('devicePub')=='$FG_PUB' or d.get('name')=='$FORGOTTEN' for d in json.load(open('$DA/devices.json'))) else 0)" 2>/dev/null)
+FG_LISTED=$(python3 -c "import json;print(1 if any(e.get('devicePub')=='$FG_PUB' for e in json.load(open('$DA/revoked-keys.json'))) else 0)" 2>/dev/null)
+echo "## forget rc=$rcFG key=${FG_PUB:0:16}... on key list=$FG_LISTED re-indexed after a fresh hello=$FG_REINDEXED (hello attempted=$FG_HELLO)"
+if [ "$rcFG" = "0" ] && [ -n "$FG_PUB" ] \
+   && grep -q "revoked its fleet certificate" "$WORK/forget.log" \
+   && [ "$FG_LISTED" = "1" ] && [ "$FG_REINDEXED" = "0" ] && [ "$FG_HELLO" = "1" ]; then
+  ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and fleet-hello did not re-admit it"
+else
+  echo "-- forget.log (rc=$rcFG) --"; cat "$WORK/forget.log"
+  echo "-- forgotten device log --"; tail -5 "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null
+  bad "gateFORGET-REVOKES: forget of a live certificate holder did not cut it off truthfully (rc=$rcFG listed=$FG_LISTED reindexed=$FG_REINDEXED hello=$FG_HELLO)"
+fi
+pkill -f "up --dir $WORK/$FORGOTTEN-again-drop" 2>/dev/null || true
+# The impostor shape these gates need, "valid cert, no record, NOT revoked",
+# can no longer be produced by `devices forget` (above: it revokes the key).
+# Build it the way forget used to: drop the record from the store under the
+# same devices.json.lock flock the CLI and daemon take, with the same atomic
+# owner-only replace. Fixture setup only; nothing asserted below changes.
+python3 - "$DA" "$MALLORY" <<'PY'
+import fcntl, json, os, sys, tempfile
+d, name = sys.argv[1], sys.argv[2]
+with open(os.path.join(d, "devices.json.lock"), "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    p = os.path.join(d, "devices.json")
+    arr = [r for r in json.load(open(p)) if r.get("name") != name]
+    fd, tmp = tempfile.mkstemp(dir=d)
+    with os.fdopen(fd, "w") as f:
+        json.dump(arr, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+PY
 sleep 2
 # Stable fields only (timestamps/last_seen drift between snapshots, so a
 # whole-record comparison would fail spuriously -- gate B does the same).
@@ -372,7 +440,7 @@ print(json.dumps({
   "mallory_absent":sys.argv[3] not in rec,
 },sort_keys=True))
 PY
-M_ENV=(env FILAMENT_CONFIG_DIR="$DM")
+M_ENV=(env TUNLION_CONFIG_DIR="$DM")
 run_impostor_variant() {
   local variant="$1" tag="$2"
   # Per-variant refusal counting: the owner log accumulates, so record the
@@ -380,9 +448,21 @@ run_impostor_variant() {
   local refused_before=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   pkill -f "up --dir $WORK/$MALLORY-drop" 2>/dev/null || true
   sleep 2
-  env FILAMENT_CONFIG_DIR="$DM" FILAMENT_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
+  env TUNLION_CONFIG_DIR="$DM" TUNLION_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
   FIX_PIDS+=($!)
-  sleep 8
+  # Wait for the attempt to happen rather than a fixed 8s. The impostor's
+  # record was dropped from the owner's store, and since a running daemon
+  # applies that at once (revocation_live.rs) the impostor's stale pair secret
+  # no longer gets it a link: it reaches the owner only through fleet-hello,
+  # after its pair-path attempt fails, which can take longer than 8s. Bounded:
+  # a refusal that never comes still fails the verdicts below exactly as before.
+  for _ in $(seq 1 45); do
+    if [ "$(grep -c "reason=name-taken" "$WORK/up.log" || true)" -gt "$refused_before" ] \
+       && grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log"; then
+      break
+    fi
+    sleep 1
+  done
   local refused=0 intact=0 execref=0 attempted=0 victim_ok=0
   local refused_after=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   [ "$refused_after" -gt "$refused_before" ] && refused=1
@@ -438,7 +518,7 @@ say "I3: control-char squat refused"
 run_impostor_variant "$SPOKE$(printf '\007')" ctrl
 
 # ================================================== AUTHORITATIVE MODE ==
-# The same questions under FILAMENT_CAP_AUTHORITATIVE=1 on the owner
+# The same questions under TUNLION_CAP_AUTHORITATIVE=1 on the owner
 # daemon. The daemon reads the flag at startup, so the owner acceptor is
 # restarted with it (same config dir, fresh log); the spokes are untouched.
 # Gate D-sh runs FIRST, while the daemons are still in shadow mode.
@@ -496,10 +576,10 @@ else
   bad "gateD-sh: shadow covered exec unclean (rc=$rcSH out='$OUTSH' new_criticals=$CRITS of $CRITS_ALL total)"
 fi
 
-say "restarting the owner acceptor under FILAMENT_CAP_AUTHORITATIVE=1"
+say "restarting the owner acceptor under TUNLION_CAP_AUTHORITATIVE=1"
 pkill -f "up --dir $WORK/Adrop" 2>/dev/null || true
 sleep 2
-env FILAMENT_CONFIG_DIR="$DA" FILAMENT_CAP_AUTHORITATIVE=1 FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-auth.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" TUNLION_CAP_AUTHORITATIVE=1 TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-auth.log" 2>&1 &
 FIX_PIDS+=($!)
 sleep 6
 
@@ -517,50 +597,27 @@ else
   # challenge (`<pid> answered no possession challenge`).
   echo "-- AA.err --"; cat "$WORK/AA.err"
   echo "-- owner: links that answered no challenge --"
-  grep -c "answered no possession challenge" "$WORK/up-auth.log" || true
+  NOCHAL=$(grep -c "answered no possession challenge" "$WORK/up-auth.log" || true)
+  echo "$NOCHAL"
   grep -i "deny\|refus" "$WORK/up-auth.log" | tail -5
-  bad "gateAUTH-A: covered exec refused under authoritative (rc=$rcAA)"
+  # Classify the failure (formerly gateRECON's job): an honest, retryable
+  # reconnect-window refusal (#312 shape) versus a SILENT one, which is worse.
+  if grep -q "identity not proven within" "$WORK/AA.err" && [ "$NOCHAL" -ge 1 ]; then
+    AA_KIND="retryable 'identity not proven' refusal, owner named the unanswered link (#312 shape)"
+  else
+    AA_KIND="SILENT or unclassified refusal: no retryable reason, or the owner never named the unanswered link"
+  fi
+  bad "gateAUTH-A: covered exec refused under authoritative (rc=$rcAA; $AA_KIND)"
 fi
 
-# ================================================================== GATE RECON ==
-# The state AUTH-A lands in, asserted for what it HONESTLY is today. A link that
-# is mid-re-establishment must never fail SILENTLY and must never be reported as
-# a capability decision: the client gets a RETRYABLE reason, and the owner names
-# the link that answered no possession challenge. That is the difference between
-# a queue that has not drained and a refusal.
-#
-# NOT asserted yet, on purpose: "the retry then succeeds". Measured on this
-# stack, twelve fresh links over 20s all fail the same way, because the defect is
-# in the link (a primary transport can go writable-but-deaf, transport/direct.rs
-# :1410,:1436), not in the retry budget -- so asserting success here would be
-# asserting a fix that does not exist yet. When #312 lands, this gate gains its
-# second verdict (first-try success) and AUTH-A comes off KNOWN_RED.
-say "RECON: an exec during post-restart link re-establishment never fails SILENTLY"
-# The state AUTH-A lands in, asserted for what it HONESTLY is. A link that is
-# mid-re-establishment may refuse, but it must refuse with a RETRYABLE reason and
-# the owner must name the link that answered no possession challenge; a silent
-# drop (or a refusal that pretends to be a capability decision) is the failure
-# this gate exists to catch.
-#
-# It passes BOTH before and after #312: before, the branch below asserts the
-# honest refusal; after, the first branch asserts first-try success and this
-# gate's message names the ratchet step (AUTH-A comes off KNOWN_RED). Asserting
-# "the retry then succeeds" today would be asserting a fix that does not exist --
-# measured: twelve fresh links over 20s all fail the same way, because the defect
-# is in the link (transport/direct.rs:1410,:1436), not in the retry budget.
-RECON_RC="$rcAA"
-RECON_TEXT=$(cat "$WORK/AA.err" 2>/dev/null)
-NOCHAL=$(grep -c "answered no possession challenge" "$WORK/up-auth.log" || true)
-echo "## (reconnect window) rc=$RECON_RC no_challenge_lines=$NOCHAL"
-if [ "$RECON_RC" = "0" ] && [ "$OUTAA" = "FLEET-AUTH-OK" ]; then
-  ok "gateRECON: the covered exec survived the reconnect window first-try (link reconciliation landed: remove AUTH-A from KNOWN_RED and delete this note)"
-elif echo "$RECON_TEXT" | grep -q "identity not proven within" && [ "$NOCHAL" -ge 1 ]; then
-  ok "gateRECON: refused with the retryable 'identity not proven within N ms; retry' reason AND the owner named the unanswered link (honest, diagnosable; #312)"
-else
-  echo "-- AA.err (expected a retryable reason) --"; echo "$RECON_TEXT"
-  echo "-- owner: links that answered no challenge --"; grep -c "answered no possession challenge" "$WORK/up-auth.log" || true
-  bad "gateRECON: the reconnect-window refusal was SILENT (no retryable reason, or the owner never named the unanswered link)"
-fi
+# GATE RECON was removed here. It read AUTH-A's own result ($rcAA, $OUTAA,
+# AA.err) and passed on either of two branches: AUTH-A succeeding (a second PASS
+# for the same exec, so 23 PASS lines described 22 observations), or AUTH-A
+# failing with an honest retryable refusal. The second branch mattered only
+# while AUTH-A was KNOWN-RED (#312) and its failure did not fail the run. AUTH-A
+# is no longer on the known-red list, so its failure is a FAIL on its own, and
+# the honest-vs-silent classification RECON made now lives in AUTH-A's failure
+# message instead of a separate verdict.
 
 # ================================================================== GATE AUTH-B =
 # A second spoke enrolled WITHOUT shell in its ceiling: exec must be refused
@@ -572,7 +629,7 @@ enroll_delegate "$SPOKE2" --allow transfer
 start_spoke "$DS2" "$SPOKE2"
 sleep 6
 say "AUTH-B: exec outside the enrolment ceiling is refused under authoritative"
-OUTAB=$(timeout 60 env FILAMENT_CONFIG_DIR="$DS2" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AB.err" </dev/null)
+OUTAB=$(timeout 60 env TUNLION_CONFIG_DIR="$DS2" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AB.err" </dev/null)
 rcAB=$?
 echo "## (authoritative uncovered exec) rc=$rcAB out='$OUTAB'"
 if [ "$rcAB" != "0" ] \
@@ -588,15 +645,28 @@ fi
 # ================================================================== GATE AUTH-C =
 say "AUTH-C: revoke --certificate refuses under authoritative too"
 "${O_ENV[@]}" "$BIN" --server "$SERVER" revoke "$SPOKE" --certificate --yes >"$WORK/revoke-auth.log" 2>&1
+rcRevAC=$?
+# Counted, not grepped: the line must be NEW, from this exec, not left over.
+ac_reason_before=$(grep -c "exec refused: device revoked" "$WORK/up-auth.log" 2>/dev/null || true)
 sleep 3
 OUTAC=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AC.err" </dev/null)
 rcAC=$?
-echo "## (authoritative exec after revoke) rc=$rcAC out='$OUTAC'"
-if [ "$rcAC" != "0" ] && ! echo "$OUTAC" | grep -q "SHOULD-NOT-RUN"; then
-  ok "gateAUTH-C: revoked spoke refused under authoritative"
+ac_reason_after=$(grep -c "exec refused: device revoked" "$WORK/up-auth.log" 2>/dev/null || true)
+echo "## (authoritative exec after revoke) revoke rc=$rcRevAC exec rc=$rcAC out='$OUTAC' owner revoked-refusals: $ac_reason_before -> $ac_reason_after"
+# A nonzero exit alone is satisfied by any failure (a link that never came up,
+# a timeout). Like gateC, require the reason on both ends: the client says
+# revoked, and the owner logged a new "exec refused: device revoked".
+if [ "$rcRevAC" = "0" ] \
+   && [ "$rcAC" != "0" ] \
+   && ! echo "$OUTAC" | grep -q "SHOULD-NOT-RUN" \
+   && grep -qi "revoked" "$WORK/AC.err" \
+   && [ "$ac_reason_after" -gt "$ac_reason_before" ]; then
+  ok "gateAUTH-C: revoked spoke refused under authoritative (nonzero, reason on both ends)"
 else
+  echo "-- revoke-auth.log --"; cat "$WORK/revoke-auth.log"
   echo "-- AC.err --"; cat "$WORK/AC.err"
-  bad "gateAUTH-C: revoked exec NOT refused under authoritative (rc=$rcAC)"
+  echo "-- owner auth log --"; grep -i "refused" "$WORK/up-auth.log" | tail -5
+  bad "gateAUTH-C: revoked exec NOT refused for the revocation under authoritative (revoke rc=$rcRevAC exec rc=$rcAC)"
 fi
 
 # ========================================================================= sum =

@@ -4,6 +4,32 @@ All notable, user-facing changes to tunlion are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [Unreleased]
+
+### Breaking
+
+- **tunlion no longer shares anything local with filament.** Both tools can be
+  installed on one machine, so every local name is now tunlion's own, with no
+  fallback to the old one:
+  - environment variables: every `FILAMENT_*` the CLI reads is now `TUNLION_*`
+    (`TUNLION_CONFIG_DIR`, `TUNLION_SERVER`, `TUNLION_L2`, ...);
+  - config dir: `~/.config/tunlion` (and the platform equivalents); the
+    `filament` dir is never read, written or migrated;
+  - default drop dir: `~/Tunlion`, even when `~/Filament` exists;
+  - OS service names: systemd unit `tunlion.service`, launchd label
+    `autumated.tunlion`, Windows autostart `Tunlion`, SCM service `tunlion`,
+    firewall rule `Tunlion QUIC`, sudoers drop-in `/etc/sudoers.d/tunlion`;
+  - on-disk markers: `tunlion-managed` authorized_keys blocks, the
+    `# Added by tunlion ...` sshd_config blocks, `/etc/ssh/tunlion_ca.pub`,
+    `/etc/ssh/tunlion_principals`, the `tunlion-mesh` /etc/hosts block and the
+    `tunlion-<peer>` ssh host alias;
+  - network interfaces: `tunlion0` (overlay) and `tunlion-wg` (WireGuard).
+  - installers: `install.sh`, the Homebrew formula and the npm package no
+    longer create a `filament` command or fall back to pre-rename assets.
+
+  Wire formats (signing domains, ALPN, invite and recovery prefixes, the
+  signaling server URL) are unchanged.
+
 ## [0.8.5] - 2026-08-08
 
 ### Breaking

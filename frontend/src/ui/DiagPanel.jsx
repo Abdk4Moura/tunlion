@@ -89,9 +89,12 @@ export default function DiagPanel({ T, accent, font }) {
       data-testid="diag-fab"
       onClick={() => setOpen((o) => !o)}
       title="link diagnostics"
+      aria-label="Link diagnostics"
+      className="tl-focus"
       style={{
-        position: 'fixed', right: 12, bottom: 12, zIndex: 9500,
-        width: 40, height: 40, borderRadius: 20, cursor: 'pointer',
+        // On a phone, sit above the bottom navigation instead of over it.
+        position: 'fixed', right: 12, bottom: (typeof window !== 'undefined' && window.innerWidth < 720) ? 84 : 16, zIndex: 9500,
+        width: 44, height: 44, borderRadius: 22, cursor: 'pointer',
         display: 'grid', placeItems: 'center', fontSize: 16, lineHeight: 1,
         border: '1px solid ' + (accent + '66'), color: accent, background: T.panel,
         boxShadow: '0 2px 10px rgba(0,0,0,.4)', fontFamily: font,

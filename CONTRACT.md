@@ -245,6 +245,49 @@ both sides store `{name, secret}` (CLI: `devices.json`; browser: localStorage
 remembered". `--name` sets the local petname (a local alias; the secret is the
 identity).
 
+#### Storing a received secret never re-keys an existing device
+A secret that arrives over the wire (`pair-keep`, `pair-intro`) is stored as
+a NEW record. If its proposed name is taken, the name is suffixed (`laptop-2`);
+a secret that some record already holds is refused. The device store refuses
+any write that would replace an existing record's secret (or pin a different
+certificate to it) unless the write carries an explicit owner decision: the
+owner-run `tunlion add` ceremony, joining under an owner-signed invitation,
+or the same key re-enrolling. A name is presentation; grants follow the
+record, so re-keying a record in place would hand its grants to whoever sent
+the secret.
+
+- `pair-keep` is honoured only from the peer whose code ceremony (SPAKE2)
+  confirmed in this receive, and only with `--remember`.
+- `pair-intro` is honoured only from a link that resolved to one of our
+  records by pair-proof (`verified_name`), and only if that record was paired
+  directly: a record created by `pair-intro` carries `introducedBy` and may not
+  vouch in turn.
+- The interactive `tunlion up` console no longer pairs in-session (it ran a v1
+  code and handed a secret over a DataChannel the signaling server could MITM);
+  it points at `tunlion add <device>` / `tunlion join <code>`.
+
+### Link channel binding (`l3-nonce`, `fleet-hello`, `l3-announce`)
+`fleet-hello` and `l3-announce` sign `DOMAIN || addr || seq || cb`, where `cb`
+is the link's channel binding:
+
+- **direct QUIC**: the RFC-5705 TLS exporter (unchanged).
+- **WebRTC DataChannel** (no exporter): each side sends a fresh 32-byte
+  `{type:"l3-nonce", nonce}`; the signer uses the PEER's nonce, the verifier its
+  OWN, and on both sides
+  `cb = SHA-256("filament/dtls-link-binding/v1\0" || len32(fp_lo) || fp_lo || len32(fp_hi) || fp_hi || nonce)`
+  where `fp_lo`/`fp_hi` are the two DTLS `a=fingerprint:` values (trimmed,
+  uppercased, sorted), exactly the pair `pair-proof` binds. A party in two
+  WebRTC sessions sees a different fingerprint pair on each leg, so it cannot
+  relay one sibling's challenge and response to be admitted as that sibling;
+  the nonce keeps the binding fresh across reconnects of the same pair. Until
+  both fingerprints are known no binding exists and nothing is signed or
+  verified (never a fallback to the bare nonce).
+- **same-host `local-tcp`** (no DTLS): the bare nonce, as before.
+
+This changed what a `fleet-hello` / `l3-announce` signs on WebRTC links (it was
+the bare nonce). Pre-launch, so a mixed-version pair over WebRTC simply fails
+fleet verification until both ends upgrade; direct-QUIC links are unaffected.
+
 ### Transport eligibility and first contact
 
 Direct QUIC is an authenticated transport, not discovery or trust bootstrap.
@@ -546,6 +589,24 @@ stream kinds are refused, never misinterpreted.
   the session); only the exec-close frame ends the stream. The receiver
   serves each accepted open as a detached task, so one session's lifetime
   never blocks the daemon's event loop or another stream.
+- LIFETIME: a served command never outlives its initiator. The receiver
+  spawns it as the leader of a process group of its own and ends the WHOLE
+  group (SIGHUP, then SIGTERM, then SIGKILL, ~1.5 s apart; taskkill /T on
+  Windows) when the initiator closes the stream (`l2-close` for `sid`), when
+  the link carrying it dies, or when an initiator that announced heartbeats
+  stops sending them. The output read ends are closed first, so a command
+  still writing gets EPIPE/SIGPIPE at once, as under a closed local pipe.
+  After an initiator-requested close the receiver answers with
+  `exec-close { sid, status, ended: "initiator-closed" }`.
+- `exec-open` MAY carry `alive_ms` (the initiator sends 2000): a promise of
+  `{ type: "exec-alive", sid }` at that interval. Silence for six beats
+  (bounded to 10..60 s) ends the session as above. An open without it is
+  held to its link alone (older initiators).
+- `{ type: "exec-signal", sid, signal: "INT" | "TERM" | "HUP" | "KILL" }` --
+  the initiator was interrupted: the receiver delivers that signal to the
+  whole group at once. The initiator's `l2-close` follows and ends whatever
+  ignores it. Unknown signal names are ignored. Both frames are routed only
+  through the sending peer's own streams, by sid.
 - SHELL GATE: an exec stream is allowed exactly where a shell is allowed.
   The receiver enforces the same gate as `up --shell`, and `--shell-only
 a,b` scopes it to the listed peers/devices identically: a peer outside the
@@ -1075,7 +1136,7 @@ implement them behaves exactly as before, only slower.
   the cert cache (0700) and dies with it: on expiry, revoke, or grant
   loss the master is stopped (`ssh -O exit`) before the cache is wiped,
   so no multiplexed session outlives its authorization.
-  `FILAMENT_NO_SSH_MUX=1` opts out to one-connection-per-invocation for
+  `TUNLION_NO_SSH_MUX=1` opts out to one-connection-per-invocation for
   debugging.
 - B-SIDE ENFORCEMENT (the security property; A's cleanup above is
   hygiene, not enforcement). Revocation happens in B's store and A may

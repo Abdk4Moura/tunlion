@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mesh roster v1: a spoke can SEE the mesh. Standalone, hermetic, fixture port
-# 8120 ONLY. FILAMENT_BIN=/path/to/tunlion ./roster-gates.sh
+# 8120 ONLY. TUNLION_BIN=/path/to/tunlion ./roster-gates.sh
 #
 #   A   each spoke's `devices` lists the sibling (from the owner-signed roster)
 #   A2  `reach <sibling>` no longer says "no device named <sibling>"
@@ -9,10 +9,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8120
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-roster.XXXXXX")"
 DA="$WORK/A"
 DB="$WORK/bravo"
@@ -28,11 +28,11 @@ enroll_delegate bravo --allow shell
 enroll_delegate charlie --allow shell
 
 # Bring both spokes' daemons up so warm links to the owner form and the roster
-# is pushed over them. The roster rides the control channel (no FILAMENT_L2
+# is pushed over them. The roster rides the control channel (no TUNLION_L2
 # needed on a spoke; L2 only gates the l2/pty/mount ACCEPTORS).
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$WORK/bravo-drop" >"$WORK/upB.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$WORK/bravo-drop" >"$WORK/upB.log" 2>&1 &
 FIX_PIDS+=($!)
-env FILAMENT_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" up --dir "$WORK/charlie-drop" >"$WORK/upC.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" up --dir "$WORK/charlie-drop" >"$WORK/upC.log" 2>&1 &
 FIX_PIDS+=($!)
 # Let warm links establish + the 5s roster tick fire + delivery land.
 sleep 12
@@ -41,7 +41,7 @@ say "A: a spoke sees the mesh"
 for name in bravo charlie; do
   local_cfg="$DB"; [ "$name" = "charlie" ] && local_cfg="$DC"
   other="charlie"; [ "$name" = "bravo" ] || other="bravo"
-  fs_cli 45 env FILAMENT_CONFIG_DIR="$local_cfg" "$BIN" --server "$SERVER" devices 2>&1
+  fs_cli 45 env TUNLION_CONFIG_DIR="$local_cfg" "$BIN" --server "$SERVER" devices 2>&1
   out=$(fs_out)
   echo "$out" | grep -q "MESH" && echo "$out" | grep -q "$other" \
     && ok "gateA: $name lists sibling $other under MESH" \
@@ -49,7 +49,7 @@ for name in bravo charlie; do
 done
 
 # The owner must stop reading as EXTERNAL on a spoke.
-fs_cli 45 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices 2>&1
+fs_cli 45 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices 2>&1
 bravo_out=$(fs_out)
 if echo "$bravo_out" | grep -q "FLEET" && echo "$bravo_out" | grep -q "alpha"; then
   ok "gateA-owner: bravo files the owner under FLEET, not EXTERNAL"
@@ -58,7 +58,7 @@ else
 fi
 
 say "A2: reach <sibling> is a known name"
-fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach charlie 2>&1
+fs_cli 60 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach charlie 2>&1
 rc_reach=$(fs_rc)
 reach_out=$(fs_out)
 # Positive proof of recognition (a pong, or the roster-only mesh narration),
@@ -73,52 +73,78 @@ fi
 
 say "B: revoked device still refused even though the roster lists it"
 # bravo can shell the owner BEFORE the revoke (positive control, owner-equivalent shell).
-fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo PRE-OK' 2>&1
+fs_cli 60 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo PRE-OK' 2>&1
 pre=$(fs_out)
 echo "$pre" | grep -q "PRE-OK" \
   && ok "gateB-pre: bravo shells the owner before revoke" \
   || bad "gateB-pre: bravo could not shell before revoke (out: $pre)"
-# Revoke bravo's certificate on the owner.
-fs_cli 45 env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+# Revoke bravo's certificate on the owner. Its exit code is asserted: a revoke
+# that failed leaves bravo valid, and then the refusal below would be measuring
+# something other than revocation.
+fs_cli 45 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+rc_revoke=$(fs_rc)
+echo "## revoke bravo --certificate rc=$rc_revoke"
+[ "$rc_revoke" = "0" ] || bad "gateB-revoke: revoke bravo --certificate failed (rc=$rc_revoke: $(fs_out | tail -2 | tr '\n' ' '))"
+# The owner names the reason in its log on every refusal (fleet-cert gateD greps
+# the same line). Counted, so gateB2 can require a NEW refusal of its own.
+refusals() { grep -c "pty refused: bravo: device revoked" "$WORK/up.log" 2>/dev/null || true; }
+ref_before=$(refusals)
 # Immediately: the acceptor refuses bravo on the tombstone. charlie's stored
 # roster still lists bravo (the refresh has not re-pushed yet), so this is the
 # sharp form of the invariant: roster presence is evidence of nothing.
-fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo POST-OK' 2>&1
+fs_cli 60 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo POST-OK' 2>&1
 post=$(fs_out)
 # rc from the RECORDED code, not $?: $? here is the status of `fs_out`'s cat, which
 # always succeeds, so rc was constant 0 and this gate could not observe a refusal at all.
 rc=$(fs_rc)
-if [ "$rc" -ne 0 ]; then
-  ok "gateB: revoked bravo is refused (exit $rc), roster presence did not resurrect it"
+ref_after=$(refusals)
+echo "## (shell after revoke) rc=$rc owner refusals: $ref_before -> $ref_after"
+# A nonzero exit alone is satisfied by ANY failure (a dead link, a timeout, a
+# crash), none of which is a revocation. Require the refusal itself: the owner
+# logged it with the revoked reason, and the command never ran.
+if [ "$rc" -eq 0 ] || echo "$post" | grep -q "POST-OK"; then
+  bad "gateB: revoked bravo still got a shell (rc=$rc, out: $post)"
+elif [ "$ref_after" -le "$ref_before" ]; then
+  bad "gateB: shell failed (rc=$rc) but the owner logged no 'device revoked' refusal, so this was not a revocation (out: $post)"
 else
-  bad "gateB: revoked bravo still got a shell (false success)"
+  ok "gateB: revoked bravo is refused for being revoked (exit $rc), roster presence did not resurrect it"
 fi
 
 say "B2: after a roster refresh, the sibling no longer lists the revoked device, and it is still refused"
 # Let the owner's 5s roster tick re-mint (bravo now filtered out of the snapshot,
 # epoch bump) and push to charlie.
 sleep 8
-fs_cli 45 env FILAMENT_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" devices 2>&1
+fs_cli 45 env TUNLION_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" devices 2>&1
 charlie_after=$(fs_out)
 # Assert on the MESH section (the pushed roster) ONLY: cert-revoke removes
 # bravo from what the owner re-issues, never from charlie's LOCAL pairing
 # (FLEET section -- only `forget` removes that). Grepping the whole output
 # made this gate fail forever: the local record correctly persists.
 mesh_block=$(echo "$charlie_after" | sed -n '/MESH/,/^$/p')
-if echo "$mesh_block" | grep -q "bravo"; then
+# The absence check below passes on EMPTY output (a crashed `devices`, a missing
+# section), so the MESH heading must be there first. `devices` prints that
+# heading whenever a roster has been received (even one with no siblings left
+# in it), and gateA proved charlie received one.
+if ! echo "$charlie_after" | grep -q "MESH"; then
+  bad "gateB2: charlie's devices printed no MESH section, so bravo's absence proves nothing (out: $charlie_after)"
+elif echo "$mesh_block" | grep -q "bravo"; then
   bad "gateB2: pushed roster still lists revoked bravo after the refresh (mesh: $mesh_block)"
 else
   ok "gateB2: pushed roster no longer lists revoked bravo after the refresh"
 fi
 # And the acceptor still refuses bravo if presented again (both halves).
-fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo AGAIN-OK' 2>&1
+fs_cli 60 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo AGAIN-OK' 2>&1
 again=$(fs_out)
 # Same correction as gateB: $? would be the cat's status and the gate would be constant-false.
 rc2=$(fs_rc)
-if [ "$rc2" -ne 0 ]; then
-  ok "gateB2: revoked bravo is still refused after the refresh (exit $rc2)"
+ref_again=$(refusals)
+echo "## (shell after refresh) rc=$rc2 owner refusals: $ref_after -> $ref_again"
+if [ "$rc2" -eq 0 ] || echo "$again" | grep -q "AGAIN-OK"; then
+  bad "gateB2: revoked bravo got a shell after the refresh (rc=$rc2, out: $again)"
+elif [ "$ref_again" -le "$ref_after" ]; then
+  bad "gateB2: shell failed (rc=$rc2) but the owner logged no new 'device revoked' refusal (out: $again)"
 else
-  bad "gateB2: revoked bravo got a shell after the refresh (false success)"
+  ok "gateB2: revoked bravo is still refused for being revoked after the refresh (exit $rc2)"
 fi
 
 echo

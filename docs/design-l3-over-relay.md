@@ -18,7 +18,7 @@ back to the userspace netstack, which needs no privilege but has no kernel route
 so native tools reach peers through the SOCKS proxy instead.
 
 Consequence to be aware of when upgrading: an existing install that never opted
-in will bring up `filament0` on its next daemon restart.
+in will bring up `tunlion0` on its next daemon restart.
 
 ## 2. L3 over relay
 
@@ -78,6 +78,16 @@ an announce captured on one link would still verify on a later one between the
 same pair. The nonce is fresh per link, which is the property the exporter was
 providing.
 
+**Amended (security review): nonce AND fingerprints.** The nonce alone is fresh
+but not bound to the session: a party holding two WebRTC sessions (A-M, M-B)
+can hand A's nonce to B and relay B's signed `fleet-hello` back, and A admits M
+as B. The exporter never had that hole because a relay terminating TLS on each
+leg derives a different value. So on a DataChannel `cb` is now
+`SHA-256(label || sorted DTLS fingerprints || nonce)` on both sides
+(`filament_overlay::dtls_channel_binding`; CONTRACT.md, *Link channel
+binding*): the fingerprints tie it to this DTLS session, the nonce keeps it
+fresh across reconnects.
+
 The nonce is generated ONCE per link, not per `ChannelReady`. That event fires
 again on every re-establish and re-announce, and regenerating there invalidates
 the nonce the peer is already signing against, which presents as a permanent
@@ -90,15 +100,15 @@ auto-mesh admit a peer over a relay link.
 ## Verification
 
 Item 1 is verified live: a fresh install with no `tun-addr` in its config brings
-up `filament0` dual-stack with a working `<name>.mesh`.
+up `tunlion0` dual-stack with a working `<name>.mesh`.
 
 Item 2 is verified working end to end. With the direct ladder refused, two
 daemons hold a DataChannel link, exchange nonces, announce, install routes both
 ways, and a `ping6` across the overlay returns 3/3 with 0% loss. The path under
-test: host to `filament0`, A's L3 pump, a DataChannel datagram on the reserved
+test: host to `tunlion0`, A's L3 pump, a DataChannel datagram on the reserved
 sid, B's smoltcp netstack, ICMP echo reply.
 
-The hook that made this testable: `FILAMENT_TEST_NO_DIRECT=1` refuses the rung-1 direct
+The hook that made this testable: `TUNLION_TEST_NO_DIRECT=1` refuses the rung-1 direct
 ladder even for a daemon, which is otherwise impossible to arrange since
 `direct_ok_for` forces direct ON for every long-lived acceptor (an anti-glare
 rule that is correct in production), so two daemons on one host always find each

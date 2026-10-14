@@ -129,13 +129,17 @@ pub(crate) fn recover_identity(
         bail!("non-interactive recovery requires --words-file <path> or --words-fd <fd>");
     });
     let user_key =
-        identity::UserKey::restore(&crate::platform::PlatformKeyStore, phrase.as_str().trim())?;
+        identity::UserKey::restore(
+            &crate::platform::PlatformKeyStore,
+            crate::identity_flow::recovery_words(phrase.as_str()),
+        )?;
     certify_local_device(&user_key, &display_name())?;
     ensure_self_genesis_header(&crate::settings::config_dir(), &user_key);
     if caps.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
                 "identity": user_key.fingerprint(),
                 "restored": true,
                 "revokedStolenDevices": false,
@@ -184,7 +188,7 @@ pub(crate) fn add_pending_request(
         granted_at: None,
     });
     // Fire notify hook if configured
-    if let Ok(hook) = std::env::var("FILAMENT_NOTIFY_HOOK") {
+    if let Ok(hook) = std::env::var("TUNLION_NOTIFY_HOOK") {
         if !hook.is_empty() {
             // ARGV exec, never shell — petname is attacker-influenced
             let _ = std::process::Command::new(&hook)
@@ -279,12 +283,12 @@ pub(crate) fn stop_managed_service(pid: u32) -> bool {
     // scope decides which manager.
     match service_manager_for_pid(pid) {
         Some(ServiceManager::SystemdSystem) => std::process::Command::new("systemctl")
-            .args(["stop", "tunlion"])
+            .args(["stop", crate::platform::SYSTEMD_UNIT])
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
         Some(ServiceManager::SystemdUser) => std::process::Command::new("systemctl")
-            .args(["--user", "stop", "tunlion"])
+            .args(["--user", "stop", crate::platform::SYSTEMD_UNIT])
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
@@ -305,8 +309,11 @@ pub(crate) async fn next_ev(
     if let Some(since) = conn.rejoin.waiting_rejoin {
         if since.elapsed() > conn.rejoin.rejoin_window {
             ui::clear_sticky();
+            // "unreachable" is what the exit-code taxonomy classifies on (6):
+            // the peer is gone, which is not the same failure as a refusal or a
+            // network outage on this side, and a script must be able to tell.
             bail!(
-                "peer did not come back within {}s (partial state kept for resume)",
+                "peer unreachable: disconnected and did not come back within {}s (partial state kept for resume)",
                 conn.rejoin.rejoin_window.as_secs()
             );
         }
@@ -316,11 +323,12 @@ pub(crate) async fn next_ev(
                 .rejoin_window
                 .saturating_sub(since.elapsed())
                 .as_secs();
-            ui::sticky(&ui::paint(
-                ui::Tone::Dim,
-                &format!(
-                    "  {} holding the line, {left}s for them to come back (Ctrl-C to stop)",
-                    ui::spinner_frame()
+            ui::sticky(&format!(
+                "  {} {}",
+                ui::pulse(),
+                ui::paint(
+                    ui::Tone::Dim,
+                    &format!("holding the line, {left}s for them to come back (Ctrl-C to stop)")
                 ),
             ));
         }
@@ -372,6 +380,7 @@ pub(crate) fn is_light_command(first_arg: Option<&str>) -> bool {
                 | "set"
                 | "completions"
                 | "man"
+                | "skill"
         ),
     }
 }

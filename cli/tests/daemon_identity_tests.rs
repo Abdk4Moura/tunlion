@@ -30,7 +30,7 @@ fn scratch_root() -> std::path::PathBuf {
 
 fn status_json(cfg: &std::path::Path) -> serde_json::Value {
     let out = Command::new(real_bin())
-        .env("FILAMENT_CONFIG_DIR", cfg)
+        .env("TUNLION_CONFIG_DIR", cfg)
         .args(["status", "--json"])
         .output()
         .expect("run tunlion status");
@@ -71,10 +71,18 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
     // Hermetic config dir: the pidfile lands here, nowhere near production.
     let cfg = scratch.join("cfg");
     std::fs::create_dir_all(&cfg).unwrap();
+    // One code-paired device, so this is the receive-only daemon `up` still
+    // starts without an identity. With nothing paired and no identity, `up`
+    // now refuses with exit 9 (it would serve no one), before any pidfile.
+    std::fs::write(
+        cfg.join("devices.json"),
+        format!(r#"[{{"name":"peer","secret":"{}"}}]"#, "ab".repeat(32)),
+    )
+    .unwrap();
 
     // Spawn the real daemon under the renamed binary.
     let mut child = Command::new(&renamed)
-        .env("FILAMENT_CONFIG_DIR", &cfg)
+        .env("TUNLION_CONFIG_DIR", &cfg)
         .arg("up")
         .arg("--server")
         .arg(&server)
@@ -110,6 +118,23 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn sleeper");
+    //
+    // `up.pid` holds the pid ALONE (so `kill $(cat up.pid)` works) and the
+    // executable lives in `up.exe`. Check that format, then the legacy
+    // two-line one an older daemon still running across an upgrade wrote.
+    let daemon_pidfile = std::fs::read_to_string(cfg.join("up.pid")).unwrap_or_default();
+    assert_eq!(
+        daemon_pidfile.lines().count(),
+        1,
+        "up.pid must hold the pid alone, got {daemon_pidfile:?}"
+    );
+    std::fs::write(cfg.join("up.pid"), format!("{}\n", sleeper.id())).unwrap();
+    std::fs::write(cfg.join("up.exe"), format!("{}\n", real_bin())).unwrap();
+    let v = status_json(&cfg);
+    assert_eq!(
+        v["running"], false,
+        "an unrelated live pid must not be reported as the daemon"
+    );
     std::fs::write(
         cfg.join("up.pid"),
         format!("{}\n{}\n", sleeper.id(), real_bin()),
@@ -118,7 +143,7 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
     let v = status_json(&cfg);
     assert_eq!(
         v["running"], false,
-        "an unrelated live pid must not be reported as the daemon"
+        "an unrelated live pid must not be reported as the daemon (legacy pidfile)"
     );
 
     // Cleanup.

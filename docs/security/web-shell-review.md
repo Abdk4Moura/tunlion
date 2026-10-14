@@ -140,10 +140,10 @@ embedded in every uid (`mk_uid`, main.rs:363).
 
 The fix is present on **both** sides. Two residual notes:
 
-- **Test hook (L-4):** `is_self_uid` returns `false` whenever `FILAMENT_UID` is
+- **Test hook (L-4):** `is_self_uid` returns `false` whenever `TUNLION_UID` is
   set in the environment (main.rs:368–369), *disabling* the self-connect defense.
   This is a test affordance, but it is an env var, not a compile-time `#[cfg(test)]`
-  gate — anyone running the daemon with `FILAMENT_UID` set loses the guard.
+  gate — anyone running the daemon with `TUNLION_UID` set loses the guard.
 - **Substring matching (L-1):** the guard is a `contains("-{id}-")` substring test.
   `install_id` is an 8-hex-char slice of a fresh secret (main.rs:344); collision
   is ~2^-32 and the consequence is a false *positive* (refusing a real peer), not
@@ -189,7 +189,7 @@ The gate is enforced before daemon startup by `require_shell_owner_ack` in
 `cli/src/main.rs` (introduced with `--i-know`): any shell-enabled policy without
 `--shell-user` refuses unless the operator explicitly passes `--i-know`. The
 runtime banner repeats the same truth. `--shell-user` bounds file access only
-when the selected account cannot read `FILAMENT_CONFIG_DIR`; the PTY still runs
+when the selected account cannot read `TUNLION_CONFIG_DIR`; the PTY still runs
 as that real account and is not a bounded capability. This gate closes the
 accepted-risk posture, but it does not make shell safe or equivalent to a
 limited transfer or mount permission.
@@ -204,7 +204,7 @@ loopback: `if !host_is_loopback(&host) { Deny "non-loopback denied" }`
 that parses to a loopback address, and deliberately does **not** resolve arbitrary
 DNS names (l2.rs:464–469) — so a name like `internal.corp` is treated as
 non-loopback and refused. Port 0 is rejected (l2.rs:409–411). The test-only
-`FILAMENT_L2_DIALHOST` override is initiator-side (l2.rs:850) and cannot relax the
+`TUNLION_L2_DIALHOST` override is initiator-side (l2.rs:850) and cannot relax the
 acceptor's check. **Solid.**
 
 PTYs don't take a network target at all (the shell is local), so SSRF is N/A there.
@@ -282,7 +282,7 @@ the operator passes `--i-know`. This applies at **any uid** because the PTY runs
 as a real account and can act as that account, including reading its Tunlion
 configuration. When the daemon is root, the shell additionally has machine-wide
 reach. With `--shell-user`, file access is bounded only when the selected account
-cannot read `FILAMENT_CONFIG_DIR`; the PTY remains a real-account shell, not a
+cannot read `TUNLION_CONFIG_DIR`; the PTY remains a real-account shell, not a
 bounded permission. `runuser` requires the daemon itself to be root (it is a
 setuid login wrapper with no password prompt). The acknowledgement makes the
 operator accept owner-equivalence; it does not make shell safe or limited.
@@ -340,9 +340,9 @@ Leaks one bit ("offers a terminal") to any connected peer, including pre-verifie
 WebRTC peers. Not a secret; optionally defer the `caps` send until `trusted` to
 avoid advertising the capability to strangers.
 
-**L-4 — `FILAMENT_UID` env var disables the self-connect guard.** `main.rs:368–369`.
+**L-4 — `TUNLION_UID` env var disables the self-connect guard.** `main.rs:368–369`.
 A test hook reachable in production via environment. **Fix:** gate it behind a
-build cfg or an explicit `FILAMENT_TEST=1`, and never let it neutralize
+build cfg or an explicit `TUNLION_TEST=1`, and never let it neutralize
 `is_self_uid` in a release binary.
 
 ---

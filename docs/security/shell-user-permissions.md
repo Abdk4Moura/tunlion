@@ -15,18 +15,18 @@ it can traverse the config directory.
 `Paths::platform_config_dir` uses the `directories` crate
 (`cli/src/platform/mod.rs:29-35`):
 
-- Linux: `$XDG_CONFIG_HOME/filament`, falling back to `$HOME/.config/filament`.
+- Linux: `$XDG_CONFIG_HOME/tunlion`, falling back to `$HOME/.config/tunlion`.
 - macOS: `$HOME/Library/Application Support/tunlion`.
 - Windows: `%APPDATA%/tunlion`.
-- `FILAMENT_CONFIG_DIR` overrides all three.
+- `TUNLION_CONFIG_DIR` overrides all three.
 
 The daemon creates parent directories with ordinary `create_dir_all`, for
 example in `devices_upsert_atomic` (`cli/src/main.rs:1468-1478`). No explicit
 directory mode is set. Under the Linux default umask `0022`, a scratch config
 directory was observed as `0755 root:root` when created by root. A root daemon's
-normal `/root/.config/filament` ancestry is usually more restrictive because
+normal `/root/.config/tunlion` ancestry is usually more restrictive because
 `/root` itself is not traversable by ordinary users, but a custom
-`FILAMENT_CONFIG_DIR` may be publicly traversable.
+`TUNLION_CONFIG_DIR` may be publicly traversable.
 
 ## Secret Files
 

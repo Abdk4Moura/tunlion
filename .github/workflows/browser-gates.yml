@@ -19,10 +19,12 @@ on:
     branches: [main, "integration/**"]
     paths:
       - "frontend/**"
+      - "cli/dashboard-dist/**"
       - ".github/workflows/browser-gates.yml"
   pull_request:
     paths:
       - "frontend/**"
+      - "cli/dashboard-dist/**"
       - ".github/workflows/browser-gates.yml"
 
 jobs:
@@ -41,9 +43,39 @@ jobs:
         working-directory: frontend
         run: npm ci --no-audit --no-fund
 
+      # The pure protocol and state tests (plain node, no browser). wire.test
+      # pins the frame layout to the CLI's; it existed but ran nowhere, which
+      # is how the browser kept a 4-byte header for months after the CLI moved
+      # to 12.
+      - name: Frontend unit tests
+        working-directory: frontend
+        run: |
+          set -e
+          for f in $(find src test -name '*.test.mjs' | sort); do
+            echo "== $f"; node "$f"
+          done
+
+      # `tunlion dashboard` serves a bundle committed inside the cli crate
+      # (it ships to crates.io with the binary). Rebuild it from source and
+      # fail if the committed copy differs, so the page the CLI serves is
+      # always the page this source describes.
+      - name: Dashboard bundle matches its source
+        working-directory: frontend
+        run: |
+          set -e
+          node node_modules/.bin/vite build --config vite.dashboard.config.js
+          git diff --exit-code --stat -- ../cli/dashboard-dist || {
+            echo "::error::cli/dashboard-dist is stale: run 'npx vite build --config vite.dashboard.config.js' in frontend/ and commit it"; exit 1; }
+          test -z "$(git status --porcelain -- ../cli/dashboard-dist)"
+
       - name: Install Chromium
         working-directory: frontend
         run: npx playwright install --with-deps chromium
+
+      # The dashboard's screens against a stand-in API (the real daemon is
+      # covered by cli/tests/dashboard-gates.sh and the lab run).
+      - name: dashboard-ui
+        run: node frontend/tests/dashboard-ui.spec.cjs
 
       # pake-ux drives the real backend, so it needs the Python side present.
       # Versions match capability-ci.yml so the two jobs cannot drift apart.
@@ -63,8 +95,24 @@ jobs:
 
       - name: pake-ux
         env:
-          FILAMENT_TEST_VENV: python3
+          TUNLION_TEST_VENV: python3
         run: node frontend/tests/pake-ux.spec.cjs
+
+      # The new screens: one code box (Receive first), buttons only for access
+      # held, keyboard reach and focus rings, the phone full-bleed shell, and a
+      # code in the link's #fragment. Harness for the screens, the real built
+      # app for the fragment.
+      - name: browser-ui
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/browser-ui.spec.cjs
+
+      # The shell outlives its link: a reattach sends resume_from (exactly the
+      # bytes the terminal showed), the bar says reconnecting while the link is
+      # down, and no line arrives twice or goes missing. Fake device session that
+      # replays like the CLI acceptor.
+      - name: pty-reattach
+        run: node frontend/tests/pty-reattach.spec.cjs
 
       # Screenshots are the evidence a browser actually rendered, rather than the
       # harness reporting on itself. Keep them when a gate fails.

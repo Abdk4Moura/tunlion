@@ -3,7 +3,7 @@
 # handing that device a shell. The operator ran the security verb, saw a success
 # line, and lost nothing.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./shell-posture-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./shell-posture-gates.sh
 #
 # The subject is a VOUCH-SHAPED record: a petname holding a secret with no
 # certificate and no enrollment ceiling. That shape matters, and is why the test
@@ -28,10 +28,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
+BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8114
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-shell-posture.XXXXXX")"
 DA="$WORK/A"
 DEV=vouched
@@ -52,13 +52,37 @@ seed_vouched_record() {
 
 # Re-grant before each case: a revoke clears the cap, and gate B/C must revoke a
 # cap that is actually present or they would pass for the wrong reason.
+#
+# That premise was never checked: the grant's output went to /dev/null. When it
+# was checked it FAILED: `grant` wrote the pairing permission and then refused
+# the vouch-shaped record ("peer identity for 'vouched' is not available"),
+# exit 1. A device with no certified identity (a vouched record, a browser) now
+# gets the pairing permission and exit 0, which is what the setup slot below
+# asserts.
+GRANT_OK=""
 grant_shell() {
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant "$DEV" shell --yes >/dev/null 2>&1
+  local out rc
+  out="$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" grant "$DEV" shell --yes 2>&1)"; rc=$?
+  echo "## grant $DEV shell rc=$rc"
+  if [ "$rc" != "0" ]; then printf '%s\n' "$out" | sed 's/^/    /'; fi
+  if [ -z "$GRANT_OK" ]; then
+    if [ "$rc" = "0" ]; then
+      GRANT_OK=yes
+      ok "setup-grant: grant $DEV shell succeeded, so the revokes below remove a cap that was present"
+    else
+      GRANT_OK=no
+      bad "setup-grant: grant $DEV shell FAILED (rc $rc), so the revokes below remove a cap that was never granted"
+    fi
+  fi
 }
 
+# The setup-grant slot was a tracked KNOWN-RED until grant stopped failing on
+# a device with no certified identity; the list only shrinks, and is empty.
+KNOWN_RED_ALLOW=()
+
 stop_daemon() {
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
-  pkill -f "FILAMENT_CONFIG_DIR=$DA" >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
+  pkill -f "TUNLION_CONFIG_DIR=$DA" >/dev/null 2>&1
   for p in "${FIX_PIDS[@]:-}"; do
     if ps -o args= -p "$p" 2>/dev/null | grep -q ' up '; then kill "$p" 2>/dev/null; fi
   done
@@ -71,7 +95,7 @@ stop_daemon() {
 # was serving, so of course nothing warned.
 start_daemon() {
   local label="$1"; shift
-  env FILAMENT_CONFIG_DIR="$DA" FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/drop" "$@" \
+  env TUNLION_CONFIG_DIR="$DA" TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/drop" "$@" \
     >"$WORK/up-$label.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 5
@@ -84,25 +108,68 @@ start_daemon() {
 }
 
 revoke_shell_output() {
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke "$DEV" shell --yes 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke "$DEV" shell --yes 2>&1
 }
 
 CAUTION='still has shell access'
+# What a successful `revoke <dev> shell` prints. Gates B and C pass on the
+# ABSENCE of the caution, and a revoke that failed outright (unknown device,
+# store error, usage error) prints no caution either, so without this they
+# would score a crashed revoke as "no false alarm".
+REVOKED="revoked 'shell' from '$DEV'"
+
+revoke_succeeded() {  # $1 = rc, $2 = output
+  [ "$1" = "0" ] && printf '%s\n' "$2" | grep -qF "$REVOKED"
+}
 
 # ---------------------------------------------------------------- gate A
+# The caution must name a remedy, and the remedy must WORK: grepping for the
+# words `devices forget` passed while proving nothing about whether typing it
+# removes anything. So the printed command is extracted, run exactly as printed
+# (only the fixture's config dir and server are supplied, as for every other
+# call here), and the access it claims to remove is checked to be gone.
+#
+# "Gone" is checked at the record: the subject is a synthetic vouch-shaped
+# record with no live peer behind it, so there is no peer to attempt a shell.
+# Under `up --shell` the only thing that admits a device is its pairing record
+# (the secret it authenticates with); with the record deleted there is nothing
+# left to authenticate, which is the access the remedy promises to remove.
 say "shell-posture gate A: up --shell is serving"
 seed_vouched_record; grant_shell
 start_daemon shell --shell --i-know
-outA="$(revoke_shell_output)"
-echo "## revoke under --shell:"; printf '%s\n' "$outA" | sed 's/^/   /'
-if printf '%s\n' "$outA" | grep -q "$CAUTION"; then
-  if printf '%s\n' "$outA" | grep -q 'devices forget'; then
-    ok "gateA: the caution appears and names a remedy that removes the access"
-  else
-    bad "gateA: the caution appears but names no remedy"
-  fi
-else
+outA="$(revoke_shell_output)"; rcA=$?
+echo "## revoke under --shell (rc $rcA):"; printf '%s\n' "$outA" | sed 's/^/   /'
+# The whole printed command, flags included: `devices forget` confirms like
+# every destructive verb, so its remedy carries -y, and a pattern that stopped
+# at the name would run a different command than the one printed.
+remedy="$(printf '%s\n' "$outA" | grep -oE 'tunlion devices forget [^ ]+( -y)?' | head -1)"
+echo "## printed remedy: ${remedy:-<none>}"
+if ! revoke_succeeded "$rcA" "$outA"; then
+  bad "gateA: the revoke itself did not succeed (rc $rcA), so the caution is not about a revoked grant"
+elif ! printf '%s\n' "$outA" | grep -q "$CAUTION"; then
   bad "gateA: revoke reported success and never said the policy still grants the shell (#244)"
+elif [ "$remedy" != "tunlion devices forget $DEV -y" ]; then
+  bad "gateA: the caution appears but its remedy is not 'tunlion devices forget $DEV -y' (got: ${remedy:-nothing})"
+else
+  # Run it as printed: drop the leading program name, keep every word after it.
+  read -r -a remedy_args <<<"${remedy#tunlion }"
+  outR="$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" "${remedy_args[@]}" 2>&1)"; rcR=$?
+  echo "## ran remedy (rc $rcR):"; printf '%s\n' "$outR" | sed 's/^/   /'
+  if [ "$rcR" != "0" ]; then
+    bad "gateA: the printed remedy '$remedy' failed when typed (rc $rcR)"
+  elif python3 - "$DA/devices.json" "$DEV" <<'PY'
+import json, sys
+try:
+    devs = json.load(open(sys.argv[1]))
+except FileNotFoundError:
+    devs = []
+sys.exit(0 if any(d.get("name") == sys.argv[2] for d in devs) else 1)
+PY
+  then
+    bad "gateA: the remedy exited 0 but '$DEV' is still in devices.json, so its access was not removed"
+  else
+    ok "gateA: the caution names a remedy that runs as printed and removes the device's record"
+  fi
 fi
 stop_daemon
 
@@ -110,28 +177,34 @@ stop_daemon
 say "shell-posture gate B: plain up is serving (no false alarm)"
 seed_vouched_record; grant_shell
 start_daemon plain
-outB="$(revoke_shell_output)"
-echo "## revoke under plain up:"; printf '%s\n' "$outB" | sed 's/^/   /'
-if printf '%s\n' "$outB" | grep -q "$CAUTION"; then
+outB="$(revoke_shell_output)"; rcB=$?
+echo "## revoke under plain up (rc $rcB):"; printf '%s\n' "$outB" | sed 's/^/   /'
+if ! revoke_succeeded "$rcB" "$outB"; then
+  bad "gateB: the revoke did not succeed (rc $rcB), so the absence of a caution proves nothing"
+elif printf '%s\n' "$outB" | grep -q "$CAUTION"; then
   bad "gateB: cried wolf, warned about a policy that is not serving"
 else
-  ok "gateB: no caution when the shell really is revoked"
+  ok "gateB: the revoke succeeded and gave no caution, the shell really is revoked"
 fi
 stop_daemon
 
 # ---------------------------------------------------------------- gate C
 say "shell-posture gate C: no daemon (unknown is not reassurance)"
 seed_vouched_record; grant_shell
-outC="$(revoke_shell_output)"
-echo "## revoke with no daemon:"; printf '%s\n' "$outC" | sed 's/^/   /'
-if printf '%s\n' "$outC" | grep -q "$CAUTION"; then
+outC="$(revoke_shell_output)"; rcC=$?
+echo "## revoke with no daemon (rc $rcC):"; printf '%s\n' "$outC" | sed 's/^/   /'
+if ! revoke_succeeded "$rcC" "$outC"; then
+  bad "gateC: the revoke did not succeed (rc $rcC), so the absence of a caution proves nothing"
+elif printf '%s\n' "$outC" | grep -q "$CAUTION"; then
   bad "gateC: claimed a posture with no daemon to read it from"
 else
-  ok "gateC: silent when the posture cannot be known"
+  ok "gateC: the revoke succeeded and stayed silent when the posture cannot be known"
 fi
+
+declare_known_red_summary
 
 echo
 echo "==========================================="
-echo "shell-posture gates: $PASS passed, $FAIL failed${FAILED:+ -- failed:$FAILED}"
+echo "shell-posture gates: $PASS passed, $FAIL failed, ${#KNOWN_RED_HIT[@]} known-red${FAILED:+ -- failed:$FAILED}"
 echo "work: $WORK"
 [ "$FAIL" = "0" ]

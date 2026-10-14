@@ -2,7 +2,7 @@
 # pipeline.sh — flag-controlled, async, GPU-aware TEST + live-record pipeline that
 # drives the REAL tunlion app against REAL local tunlion peers (no mock seams).
 #
-# It stands up genuine peers (locally-built binary, isolated FILAMENT_CONFIG_DIRs,
+# It stands up genuine peers (locally-built binary, isolated TUNLION_CONFIG_DIRs,
 # a local signaling backend), PAIRS FOR REAL in the browser (a CLI peer mints a
 # PAKE code; Playwright types it into the real pair box), drives the genuine UI,
 # ASSERTS real DOM/store state, and (when recording) records the tab live to webm
@@ -279,13 +279,13 @@ case_cli() {
   mkdir -p "$cwork" "$wwork"
   local log="$PIPE_WORK/$id.log"
   # record.sh records a real cast→gif into gallery/<n>.gif AND writes
-  # results-<n>.txt; rig/lib.sh honours FILAMENT_BIN (locally-built) + UX_PORT.
+  # results-<n>.txt; rig/lib.sh honours TUNLION_BIN (locally-built) + UX_PORT.
   if [ "$RECORD" = 1 ]; then
-    FILAMENT_BIN="$FILAMENT_BIN" UX_PORT="$PIPE_PORT" UX_SERVER="$PIPE_SERVER" \
+    TUNLION_BIN="$TUNLION_BIN" UX_PORT="$PIPE_PORT" UX_SERVER="$PIPE_SERVER" \
       UX_TMP="$cwork" UX_WORK="$wwork" \
       bash "$HERE/record.sh" "$n" 100 28 >"$log" 2>&1 || true
   else
-    FILAMENT_BIN="$FILAMENT_BIN" UX_PORT="$PIPE_PORT" UX_SERVER="$PIPE_SERVER" \
+    TUNLION_BIN="$TUNLION_BIN" UX_PORT="$PIPE_PORT" UX_SERVER="$PIPE_SERVER" \
       UX_TMP="$cwork" UX_WORK="$wwork" \
       bash "$HERE/scenarios.sh" "$n" >"$log" 2>&1 || true
   fi
@@ -308,7 +308,7 @@ case_runner_local() {
   local log="$PIPE_WORK/$id.log"
   # loopback only — never touches the live T4 or the live single-flight batch.
   # Internally time-boxed so a single-host return-path stall can't hang the suite.
-  FILJOB_BIN="$FILAMENT_BIN" timeout -k 10 "${RUNNER_TIMEOUT:-360}" bash "$rl" >"$log" 2>&1
+  FILJOB_BIN="$TUNLION_BIN" timeout -k 10 "${RUNNER_TIMEOUT:-360}" bash "$rl" >"$log" 2>&1
   local rc=$?
   if [ $rc -eq 0 ]; then
     emit "$id" PASS "file-driven runner loopback: submit→watcher-runs-job→results, sha-verified"; return 0
@@ -330,7 +330,7 @@ source "$HERE/lib/journeys.sh"
 
 # ---------------------------------------------------------------- run ----------
 echo "================= tunlion e2e pipeline ================="
-echo "binary  : $FILAMENT_BIN"
+echo "binary  : $TUNLION_BIN"
 echo "suite   : $SUITE   record:$RECORD  quality:$QUALITY  async:$ASYNC  parallel:$PARALLEL"
 echo "cases   : ${SELECTED[*]:-<none>}"
 echo "out     : $OUT"

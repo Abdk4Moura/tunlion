@@ -53,7 +53,7 @@ namespace (run via `ip netns exec`). The only host-namespace operations are
 lab namespaces. The lab never touches the running `tunlion up` daemon, the
 installed `~/.local/bin/tunlion`, `~/.config/tunlion`, the live site, or the
 live T4. The `tunlion` link uses the **locally-built**
-`cli/target/release/tunlion` and **fully isolated** `FILAMENT_CONFIG_DIR`
+`cli/target/release/tunlion` and **fully isolated** `TUNLION_CONFIG_DIR`
 identities.
 
 ---
@@ -183,7 +183,7 @@ TUN-a (node-a ns)
   → fil_relay(connect)  --TCP 127.0.0.1:LPORT (host ns)-->
   → `tunlion forward LPORT labB RPORT`   (isolated config A, host ns)
   ==[ tunlion DATA CHANNEL / L2 stream ]==>
-  → `tunlion up` acceptor   (isolated config B, host ns, FILAMENT_L2=1)
+  → `tunlion up` acceptor   (isolated config B, host ns, TUNLION_L2=1)
   → dials 127.0.0.1:RPORT
   → fil_relay(listen)
   → TUN-b (node-b ns)
@@ -192,7 +192,7 @@ TUN-a (node-a ns)
 The two tunlion endpoints run in the **host** netns (they need outbound
 signaling); the TUN fds are opened by the relays via `setns` into the node
 namespaces, so **no veth-to-host is created** and host networking is untouched.
-The two identities are fully isolated (`FILAMENT_CONFIG_DIR=.state/logs/<lab>/fil-{A,B}`),
+The two identities are fully isolated (`TUNLION_CONFIG_DIR=.state/logs/<lab>/fil-{A,B}`),
 pre-seeded with a shared pair secret, and never see `~/.config/tunlion` or the
 running daemon.
 

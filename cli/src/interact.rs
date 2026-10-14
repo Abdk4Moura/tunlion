@@ -1,4 +1,5 @@
-//! Interactivity contract: one Affordance, three renderers.
+//! Interactive editors for `tunlion set <key>` at a terminal (a checklist for
+//! interface membership, a reorderable list for prefer).
 
 use std::io::Write;
 use std::net::IpAddr;
@@ -55,10 +56,7 @@ pub fn enumerate_interfaces() -> Vec<InterfaceInfo> {
 
 pub struct Affordance {
     pub command: String,
-    pub needs: String,
-    pub example: String,
     pub options: Option<Vec<OptionEntry>>,
-    pub options_label: String, // "interfaces" | "peers"
 }
 
 pub struct OptionEntry {
@@ -68,37 +66,9 @@ pub struct OptionEntry {
     pub checked: bool,
 }
 
-// --------------------------------------------------------------- renderers --
-
-pub fn render_steer(aff: &Affordance) -> ! {
-    eprintln!("error: `{}` needs a value: {}", aff.command, aff.needs);
-    if let Some(ref opts) = aff.options {
-        if !opts.is_empty() {
-            let names: Vec<&str> = opts.iter().map(|o| o.label.as_str()).collect();
-            eprintln!("{} on this machine: {}", aff.options_label, names.join(", "));
-            let mut groups: Vec<&str> = Vec::new();
-            for o in opts { if !groups.contains(&o.group.as_str()) { groups.push(&o.group); } }
-            groups.sort();
-            eprintln!("groups: {}", groups.join(", "));
-        }
-    }
-    eprintln!("example: {}", aff.example);
-    std::process::exit(2);
-}
-
-pub fn render_json_steer(aff: &Affordance) -> ! {
-    let mut obj = serde_json::json!({
-        "error": "missing_value", "command": aff.command, "needs": aff.needs, "example": aff.example,
-    });
-    if let Some(ref opts) = aff.options {
-        let interfaces: Vec<String> = opts.iter().map(|o| o.label.clone()).collect();
-        let mut groups: Vec<String> = opts.iter().map(|o| o.group.clone()).collect();
-        groups.sort(); groups.dedup();
-        obj["valid"] = serde_json::json!({"interfaces": interfaces, "groups": groups});
-    }
-    eprintln!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
-    std::process::exit(2);
-}
+// The non-terminal renderers (render_steer / render_json_steer) lived here and
+// answered `tunlion set <key>` from a pipe with "needs a value" and exit 2.
+// That form READS the value now (settings::run_get), so they had no caller.
 
 // ---------------------------------------------------- shared raw-mode guard --
 
@@ -167,16 +137,16 @@ fn paint_checklist(title: &str, _subtitle: &str, opts: &[OptionEntry], selected:
 
     if redraw { let _ = write!(err, "\x1b[{}A", vis_lines); }
 
-    let _ = writeln!(err, "\r\x1b[2K  {}", if color { format!("\x1b[1m{title}\x1b[0m") } else { title.to_string() });
+    let _ = writeln!(err, "\r\x1b[2K  {}", ui::paint_when(color, ui::Tone::Bold, title));
 
     for (i, opt) in opts.iter().enumerate() {
         let detail = if opt.detail.is_empty() { String::new() } else { format!("  {}", opt.detail) };
         let group_str = if opt.group.is_empty() || opt.group == "other" { String::new() } else { format!("  ({})", opt.group) };
 
         let (mark, cy, r) = if i == cursor {
-            ("\u{276f}", if color { "\x1b[36m" } else { "" }, if color { "\x1b[0m" } else { "" })
+            ("\u{276f}", ui::tone_code(ui::Tone::Brand), ui::tone_reset())
         } else {
-            (" ", "", "")
+            (" ", String::new(), "")
         };
         let check = if selected[i] { "[x]" } else { "[ ]" };
         let line = format!("{cy}{mark} {check} {:<20}{detail}{group_str}{r}", opt.label);
@@ -239,7 +209,7 @@ fn paint_reorder(title: &str, opts: &[OptionEntry], order: &[usize], cursor: usi
 
     if redraw { let _ = write!(err, "\x1b[{}A", vis_lines); }
 
-    let _ = writeln!(err, "\r\x1b[2K  {}", if color { format!("\x1b[1m{title}\x1b[0m") } else { title.to_string() });
+    let _ = writeln!(err, "\r\x1b[2K  {}", ui::paint_when(color, ui::Tone::Bold, title));
 
     for (pos, &idx) in order.iter().enumerate() {
         let opt = &opts[idx];
@@ -247,9 +217,9 @@ fn paint_reorder(title: &str, opts: &[OptionEntry], order: &[usize], cursor: usi
         let group_str = if opt.group.is_empty() || opt.group == "other" { String::new() } else { format!("  ({})", opt.group) };
 
         let (mark, cy, r) = if pos == cursor {
-            ("\u{276f}", if color { "\x1b[36m" } else { "" }, if color { "\x1b[0m" } else { "" })
+            ("\u{276f}", ui::tone_code(ui::Tone::Brand), ui::tone_reset())
         } else {
-            (" ", "", "")
+            (" ", String::new(), "")
         };
 
         let line = format!("{cy}{mark} {:<20}{detail}{group_str}{r}", opt.label);

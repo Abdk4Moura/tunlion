@@ -6,7 +6,7 @@
 #
 # Requires the locally-built cli/target/release/tunlion and outbound signaling
 # reachability (the tunlion endpoints handshake over the signaling server, then
-# usually connect direct). Two fully-isolated FILAMENT_CONFIG_DIRs are used; the
+# usually connect direct). Two fully-isolated TUNLION_CONFIG_DIRs are used; the
 # running `up` daemon and ~/.config/tunlion are never touched.
 name: filament-l3
 subnet: 10.52.0.0/24

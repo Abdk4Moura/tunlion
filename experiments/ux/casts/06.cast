@@ -1,7 +1,7 @@
 {"version":2,"width":80,"height":24,"timestamp":1781122731,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '06'","env":{"SHELL":"/bin/bash"}}
 [0.047359, "o", "\r\n\u001b[1;36m=== UX: grant shell, then 'tunlion ssh peer -- echo OK' over the data-channel tunnel ===\u001b[0m\r\n"]
-[0.256207, "o", "\u001b[2m  topology: B = the box you ssh INTO (acceptor, FILAMENT_L2=1); A = you\u001b[0m\r\n"]
-[0.256385, "o", "\u001b[1;35m[B]$\u001b[0m FILAMENT_L2=1 tunlion up    (the box, accepts tunnels)"]
+[0.256207, "o", "\u001b[2m  topology: B = the box you ssh INTO (acceptor, TUNLION_L2=1); A = you\u001b[0m\r\n"]
+[0.256385, "o", "\u001b[1;35m[B]$\u001b[0m TUNLION_L2=1 tunlion up    (the box, accepts tunnels)"]
 [0.256484, "o", "\r\n"]
 [1.006199, "o", "\u001b[1;35m[B]$\u001b[0m tunlion grant laptop shell   (consent: deny-by-default)"]
 [1.006363, "o", "\r\n"]

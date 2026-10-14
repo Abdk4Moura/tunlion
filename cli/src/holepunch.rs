@@ -1,4 +1,4 @@
-// Rung-2 UDP HOLE-PUNCHING (FILAMENT_HOLEPUNCH=1).
+// Rung-2 UDP HOLE-PUNCHING (TUNLION_HOLEPUNCH=1).
 //
 // Sits BETWEEN rung-1 (direct-dial QUIC, src/direct.rs) and rung-3 (WebRTC/relay)
 // on the transport ladder. When rung-1's host-candidate race fails, both peers
@@ -25,11 +25,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::direct;
-use crate::net::Transport;
 
 /// Opt-in gate. Rung-2 is dead unless this is set; rung-1 + WebRTC are unaffected.
 pub fn holepunch_enabled() -> bool {
-    std::env::var("FILAMENT_HOLEPUNCH").map(|v| v == "1").unwrap_or(false)
+    std::env::var("TUNLION_HOLEPUNCH").map(|v| v == "1").unwrap_or(false)
 }
 
 /// Total budget for the punch handshake before giving up (and stepping down to
@@ -41,7 +40,9 @@ pub const PUNCH_BUDGET: Duration = Duration::from_secs(3);
 /// race) and to survive loss.
 const PUNCH_INTERVAL: Duration = Duration::from_millis(75);
 /// Magic bytes so a punch datagram is unmistakably ours (not stray QUIC).
-const PUNCH_MAGIC: &[u8] = b"TUNLION-PUNCH-v1";
+/// PROTOCOL LITERAL: frozen, do not rename. Released peers send and match
+/// exactly these bytes; a renamed magic makes every punch to them fail.
+const PUNCH_MAGIC: &[u8] = b"FILAMENT-PUNCH-v1";
 
 // ============================================================== STUN discovery
 
@@ -204,11 +205,11 @@ fn parse_xor_mapped_address(buf: &[u8], _txid: &[u8; 12]) -> Option<SocketAddr> 
     None
 }
 
-/// Resolve the STUN server address: `FILAMENT_STUN` (host:port) override wins,
+/// Resolve the STUN server address: `TUNLION_STUN` (host:port) override wins,
 /// else the first `stun:` URL from the ICE config. Returns None if neither is
 /// available (rung-2 then simply doesn't advertise an srflx).
 pub fn stun_server_addr(stun_urls: &[String]) -> Option<SocketAddr> {
-    if let Ok(v) = std::env::var("FILAMENT_STUN") {
+    if let Ok(v) = std::env::var("TUNLION_STUN") {
         if let Some(a) = resolve_host_port(v.trim()) {
             return Some(a);
         }
@@ -225,10 +226,10 @@ pub fn stun_server_addr(stun_urls: &[String]) -> Option<SocketAddr> {
 }
 
 /// All resolvable STUN server addresses for happy-eyeballs (`stun_srflx_any`).
-/// `FILAMENT_STUN` override, when set, is authoritative (returns just it); else
+/// `TUNLION_STUN` override, when set, is authoritative (returns just it); else
 /// every distinct `stun:`/`stuns:` URL from the ICE config that resolves.
 pub fn stun_server_addrs(stun_urls: &[String]) -> Vec<SocketAddr> {
-    if let Ok(v) = std::env::var("FILAMENT_STUN") {
+    if let Ok(v) = std::env::var("TUNLION_STUN") {
         if let Some(a) = resolve_host_port(v.trim()) {
             return vec![a];
         }
@@ -343,7 +344,8 @@ pub fn endpoint_from_socket(sock: UdpSocket) -> Result<Endpoint> {
 /// Rung-2 entry point: given a freshly-bound-and-STUN'd punch socket, the peer's
 /// advertised srflx, and the pair secret, punch the NAT then run rung-1's
 /// authenticated QUIC race over the punched socket. Returns an authenticated
-/// `Arc<dyn Transport>` (route `holepunched`) or None (caller steps to WebRTC).
+/// link (route `holepunched`) whose reader starts when the caller announces it
+/// (`UnreadTransport::announce`), or None (caller steps to WebRTC).
 ///
 /// `punch_sock` ownership is moved in: on success it lives inside the quinn
 /// endpoint; on failure it is dropped (mapping released).
@@ -359,7 +361,7 @@ pub async fn connect(
     exchange: bool,
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
-) -> Option<Arc<dyn Transport>> {
+) -> Option<direct::UnreadTransport> {
     // Punch on a blocking thread (blocking UDP I/O), reclaim the socket.
     let punch_result = tokio::task::spawn_blocking(move || {
         let r = punch(&punch_sock, peer_srflx);
@@ -507,5 +509,27 @@ mod tests {
         assert!(srflx.ip().is_loopback(), "srflx ip {} not loopback", srflx.ip());
         assert_eq!(srflx.port(), client.local_addr().unwrap().port());
         handle.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+    /// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+    ///
+    /// Each digest was computed from the ORIGINAL (pre-rename) literal with
+    /// `printf '%s' '<literal>' | sha256sum` (a trailing `\0` is part of the
+    /// bytes). A digest cannot be satisfied by a find-and-replace: if a rename
+    /// touches one of these literals this test fails, and the literal is what
+    /// must be put back.
+    #[test]
+    fn punch_magic_is_frozen() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("PUNCH_MAGIC", super::PUNCH_MAGIC,
+             "e94cd67f5a3f4b181aaf614005aaf6785b60b1775bed3907314036be20497888"),
+        ] {
+            let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
+        }
     }
 }

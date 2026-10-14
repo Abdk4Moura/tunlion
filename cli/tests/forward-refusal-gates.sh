@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #232/#268: what `forward` tells the user when the peer says no.
 #
-#   FILAMENT_BIN=/path/to/tunlion ./forward-refusal-gates.sh
+#   TUNLION_BIN=/path/to/tunlion ./forward-refusal-gates.sh
 #
 # This gate exists because there was none. Every other gate in this directory is
 # a same-host fixture, and a same-host fixture cannot produce the state that
@@ -11,10 +11,13 @@
 # dir, which reproduces that state on one host.
 #
 # Gates:
-#   A  a forward to an acceptor with L2 OFF fails FAST, it does not hang   (#268)
-#   B  and the user is told the peer refused, with a reason                (#232)
-#   C  the accept-time line does not claim the peer forwarded anything     (#232)
+#   A  a forward to an acceptor with L2 OFF fails FAST, at startup: it asks the
+#      peer once before claiming "ready" and exits nonzero on its refusal   (#268)
+#   B  and the user is told the peer refused, with the reason              (#232)
+#   C  it never claims "ready" or that the peer forwarded anything         (#232)
 #   D  with L2 ON and a live target, the same forward still works          (control)
+#   E  with L2 ON and NOTHING on the remote port, the forward stays up and
+#      reports the refusal on its own stderr for EACH failed connection
 #
 # D is the control that matters. A, B and C could all be satisfied by a build
 # that refuses everything, which would "pass" while destroying the feature.
@@ -23,7 +26,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
 # The default path is a trap on this box: ~/.cargo/config.toml sets a SHARED
 # `target-dir = /root/.cargo-target`, so `cargo build` does NOT write to
-# cli/target/release. Running the gate without FILAMENT_BIN silently picked up a
+# cli/target/release. Running the gate without TUNLION_BIN silently picked up a
 # three-day-old binary and failed every assertion for reasons that had nothing
 # to do with the code under test. Prefer the shared dir when it holds a newer
 # build, and say which one was chosen.
@@ -32,10 +35,10 @@ _default_bin() {
     local b="/root/.cargo-target/release/tunlion"
     if [ -x "$b" ] && { [ ! -x "$a" ] || [ "$b" -nt "$a" ]; }; then echo "$b"; else echo "$a"; fi
 }
-BIN="${FILAMENT_BIN:-$(_default_bin)}"
+BIN="${TUNLION_BIN:-$(_default_bin)}"
 PORT=8116
 SERVER="http://127.0.0.1:$PORT"
-PYV="${FILAMENT_TEST_VENV:-python3}"
+PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-fwd-refusal.XXXXXX")"
 DA="$WORK/A"
 # The bound that separates "refused" from "hung". #268 hung until curl's own
@@ -71,14 +74,14 @@ enroll_delegate bravo --allow transfer,mount
 # the daemon running would exercise a different path from the one being
 # asserted, which is exactly the warm/cold confound that briefly made an earlier
 # A/B look like a fix. Stop it so the path is the one named in the assertions.
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" down >/dev/null 2>&1
 sleep 2
 
 # Assert the precondition rather than discovering it three gates later. Without
 # this, gateA "passed" in 0.0s with curl rc=7, connection refused because
 # nothing was listening, which is indistinguishable in the assertion from a
 # fast, correct refusal by the peer.
-if ! env FILAMENT_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q bravo; then
+if ! env TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q bravo; then
   echo "setup failed: bravo did not enrol, so nothing below would prove anything"
   sed 's/^/    /' "$WORK/bravo-join.log" 2>/dev/null | tail -5
   exit 2
@@ -87,7 +90,7 @@ fi
 # $1 = "on"|"off" (L2 on the acceptor), starts bravo's daemon in its own dir
 ACCEPTOR_PID=""
 start_acceptor_l2() {
-  # Kill the PREVIOUS acceptor by pid. `pkill -f FILAMENT_CONFIG_DIR=...` matched
+  # Kill the PREVIOUS acceptor by pid. `pkill -f TUNLION_CONFIG_DIR=...` matched
   # nothing: `env VAR=v prog` execs prog, so the assignment is in the
   # environment and never in argv. The old daemon survived, the second `up`
   # found its pidfile and printed "daemon already running; following its log"
@@ -97,14 +100,14 @@ start_acceptor_l2() {
     for _ in $(seq 1 20); do kill -0 "$ACCEPTOR_PID" 2>/dev/null || break; sleep 0.5; done
     kill -9 "$ACCEPTOR_PID" 2>/dev/null
   fi
-  env FILAMENT_CONFIG_DIR="$BDIR" "$BIN" down >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$BDIR" "$BIN" down >/dev/null 2>&1
   sleep 2
   if [ "$1" = on ]; then
-    env FILAMENT_CONFIG_DIR="$BDIR" FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" \
+    env TUNLION_CONFIG_DIR="$BDIR" TUNLION_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" \
       >"$WORK/up-$1.log" 2>&1 &
   else
-    # No FILAMENT_L2, no --shell: l2_enabled is false. This is the #268 state.
-    env FILAMENT_CONFIG_DIR="$BDIR" "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" \
+    # No TUNLION_L2, no --shell: l2_enabled is false. This is the #268 state.
+    env TUNLION_CONFIG_DIR="$BDIR" "$BIN" --server "$SERVER" up --dir "$WORK/bdrop" \
       >"$WORK/up-$1.log" 2>&1 &
   fi
   ACCEPTOR_PID=$!
@@ -117,14 +120,28 @@ start_acceptor_l2() {
   fi
 }
 
-# $1 = local port, $2 = remote port. Leaves the log in $WORK/fwd-$1.log.
+# $1 = local port, $2 = remote port, $3 = curls to make (default 1). Leaves the
+# log in $WORK/fwd-$1.log. FORWARD_EXITED/FWD_RC/FWD_SECS record a forward that
+# ended by itself before listening (the fail-fast refusal of gate A).
 run_forward() {
-  local lport="$1" rport="$2"
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward "bravo:$rport" --lport "$lport" \
+  local lport="$1" rport="$2" ncurl="${3:-1}"
+  FORWARD_UP=0; FORWARD_EXITED=0; FWD_RC=""; FWD_SECS=""
+  local s0; s0=$(date +%s)
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward "bravo:$rport" --lport "$lport" \
     >"$WORK/fwd-$lport.log" 2>&1 &
-  echo $! >"$WORK/fwd.pid"
-  FIX_PIDS+=($!)
-  sleep 6
+  local fpid=$!
+  echo $fpid >"$WORK/fwd.pid"
+  FIX_PIDS+=($fpid)
+  # Wait (bounded) for either "listening" or the process ending by itself.
+  for _ in $(seq 1 $((FAST * 2))); do
+    if ! kill -0 "$fpid" 2>/dev/null; then
+      wait "$fpid"; FWD_RC=$?
+      FORWARD_EXITED=1; FWD_SECS=$(( $(date +%s) - s0 ))
+      return
+    fi
+    grep -qsE 'ready|listening on' "$WORK/fwd-$lport.log" && break
+    sleep 0.5
+  done
   # The forward must actually be listening before the client speaks, or curl's
   # ECONNREFUSED reads exactly like a fast refusal from the peer and every
   # assertion below becomes a coin flip. Same reason the cross-machine rig
@@ -135,12 +152,15 @@ run_forward() {
     return
   fi
   FORWARD_UP=1
-  local t0 t1
-  t0=$(date +%s.%N)
-  timeout "$FAST" curl -s -o /dev/null "http://127.0.0.1:$lport/" >/dev/null 2>&1
-  CURL_RC=$?
-  t1=$(date +%s.%N)
-  ELAPSED=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
+  local t0 t1 i
+  for i in $(seq 1 "$ncurl"); do
+    t0=$(date +%s.%N)
+    timeout "$FAST" curl -s -o /dev/null "http://127.0.0.1:$lport/" >/dev/null 2>&1
+    CURL_RC=$?
+    t1=$(date +%s.%N)
+    ELAPSED=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
+    sleep 1
+  done
   sleep 2
   kill "$(cat "$WORK/fwd.pid")" 2>/dev/null
 }
@@ -151,26 +171,42 @@ start_acceptor_l2 off
 run_forward 39801 39999
 fwd=$(tr -d '\r' <"$WORK/fwd-39801.log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
 echo "## forward said:"; printf '%s\n' "$fwd" | grep -avE '^\s*$' | sed 's/^/   /' | tail -6
-echo "## curl rc=$CURL_RC after ${ELAPSED}s (rc=124 is the timeout, i.e. a hang)"
+echo "## forward exited=$FORWARD_EXITED rc=${FWD_RC:-} after ${FWD_SECS:-?}s (up=$FORWARD_UP)"
 
-if [ "${FORWARD_UP:-0}" -ne 1 ]; then
-  bad "gateA: the forward never listened, so this case measured nothing"
-elif [ "$CURL_RC" -eq 124 ]; then
-  bad "gateA: the client hung for the full ${FAST}s instead of being refused (#268)"
+# The forward asks the peer once before it claims anything, so an acceptor that
+# refuses every tunnel ends it AT STARTUP, nonzero, well inside the hang bound.
+# Listening first and letting the first client find out is the #232 defect.
+if [ "$FORWARD_EXITED" -eq 1 ] && [ "${FWD_RC:-0}" -ne 0 ] && [ "${FWD_SECS:-99}" -le "$FAST" ]; then
+  ok "gateA: refused at startup in ${FWD_SECS}s (rc=$FWD_RC), no hang and no listener"
+elif [ "${FORWARD_UP:-0}" -eq 1 ]; then
+  bad "gateA: listened (and claimed ready) although the peer refuses every tunnel (#232)"
 else
-  ok "gateA: refused in ${ELAPSED}s, no hang"
+  bad "gateA: the forward neither failed fast nor listened (exited=$FORWARD_EXITED rc=${FWD_RC:-})"
 fi
 
-if printf '%s\n' "$fwd" | grep -qi 'refused the connection'; then
-  ok "gateB: the refusal reached the user with a reason"
+if printf '%s\n' "$fwd" | grep -qi 'refused the connection' \
+   && printf '%s\n' "$fwd" | grep -qi 'tunnelling is off'; then
+  ok "gateB: the refusal reached the user with its reason"
 else
-  bad "gateB: the peer refused and the forward never said so (#232)"
+  bad "gateB: the peer refused and the forward never said why (#232)"
 fi
 
-if printf '%s\n' "$fwd" | grep -q 'first connection forwarded'; then
-  bad "gateC: still claims the peer FORWARDED it, at accept time (#232)"
+# Passing on the absence of ONE exact phrase ('first connection forwarded')
+# meant any rewording of a false success claim ("forwarded to", "the link is
+# live", "connected") passed, and so did a forward that printed nothing at all.
+# So: the refusal must be present with a non-empty reason (what the user SHOULD
+# see), and no success-shaped claim may appear anywhere in the output. The
+# accept-time line "first connection accepted, opening to" is allowed: accepting
+# the local connection is true, and claims nothing about the peer. Since the
+# forward now asks the peer before listening (#392), a "tunlion: ready" line on
+# a refused forward is also a false success claim.
+SUCCESS_RE='forwarded|link is live|is live|connected to|delivered|succeeded|success|tunlion: ready'
+if ! printf '%s\n' "$fwd" | grep -qiE 'refused the connection: *[^ ]'; then
+  bad "gateC: no refusal with a reason was printed, so the absence of a success claim proves nothing"
+elif printf '%s\n' "$fwd" | grep -qiE "$SUCCESS_RE"; then
+  bad "gateC: claims success on a refused forward (#232): $(printf '%s\n' "$fwd" | grep -iE "$SUCCESS_RE" | head -1)"
 else
-  ok "gateC: no false success claim at accept time"
+  ok "gateC: the refusal is reported and nothing claims the peer forwarded it"
 fi
 
 # ---------------------------------------------------------------- gate D
@@ -190,10 +226,34 @@ elif [ "$CURL_RC" -eq 0 ]; then
 else
   bad "gateD: the control failed (rc=$CURL_RC); A/B/C prove nothing if every forward is refused"
 fi
-if printf '%s\n' "$fwd2" | grep -qi 'refused the connection'; then
-  bad "gateD2: cried refusal on a forward that should have worked"
+# Same shape as gateC: absence of the one phrase 'refused the connection'
+# passed on any reworded refusal, and on a control that never ran. So D2 needs
+# a forward that actually carried the request (D's own evidence) before the
+# absence of every refusal-shaped word means anything.
+REFUSAL_RE='refus|denied|reject|not allowed|not permitted|forbidden'
+if [ "${FORWARD_UP:-0}" -ne 1 ] || [ "$CURL_RC" -ne 0 ]; then
+  bad "gateD2: the working-path forward did not carry the request (rc=$CURL_RC), so there is nothing to judge"
+elif printf '%s\n' "$fwd2" | grep -qiE "$REFUSAL_RE"; then
+  bad "gateD2: cried refusal on a forward that worked: $(printf '%s\n' "$fwd2" | grep -iE "$REFUSAL_RE" | head -1)"
 else
-  ok "gateD2: no false refusal on the working path"
+  ok "gateD2: the working forward carried the request and printed no refusal"
+fi
+
+# ---------------------------------------------------------------- gate E
+say "forward-refusal gate E: L2 ON, nothing listening on the remote port"
+# 39998: nothing listens there. The forward must still start (a service may come
+# up later), and each client that gets an empty reply must be told why, on the
+# forward's own stderr, every time (not once, and not only in a peer's log).
+run_forward 39803 39998 2
+fwd3=$(tr -d '\r' <"$WORK/fwd-39803.log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
+echo "## forward said:"; printf '%s\n' "$fwd3" | grep -avE '^\s*$' | sed 's/^/   /' | tail -8
+nref=$(printf '%s\n' "$fwd3" | grep -c 'refused the connection' || true)
+if [ "${FORWARD_UP:-0}" -ne 1 ]; then
+  bad "gateE: the forward did not stay up for a merely closed remote port"
+elif [ "$nref" -ge 2 ]; then
+  ok "gateE: each failed connection reported its refusal on stderr ($nref)"
+else
+  bad "gateE: $nref refusal lines for 2 failed connections (want one per connection)"
 fi
 
 echo

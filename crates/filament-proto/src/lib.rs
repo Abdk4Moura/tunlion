@@ -47,6 +47,25 @@ pub fn decline_msg(id: &str) -> Value {
     json!({ "type": "file-decline", "id": id })
 }
 
+/// A TYPED refusal: the receiver cannot store this file, and says why.
+///
+/// `reason` is a stable token (`no_space`, `name_too_long`, `read_only`,
+/// `permission`, `io`) and `error` the receiver's own sentence (it names the
+/// sizes for `no_space`). It rides `file-decline` on purpose: an older sender
+/// that knows nothing of `reason` still stops waiting, which is the bug this
+/// exists for. A receiver that could not create or write the file used to log
+/// nothing and send nothing, and the sender re-offered forever.
+pub fn refuse_msg(id: &str, reason: &str, error: &str) -> Value {
+    json!({ "type": "file-decline", "id": id, "reason": reason, "error": error })
+}
+
+/// The receiver parked this offer for a human's yes/no. Tells the sender that
+/// silence from here on is a person deciding, not a receiver that cannot answer,
+/// so its no-answer timeout must not fire.
+pub fn pending_msg(id: &str) -> Value {
+    json!({ "type": "file-pending", "id": id, "reason": "asking" })
+}
+
 pub fn end_msg(id: &str, sid: u32) -> Value {
     json!({ "type": "file-end", "id": id, "sid": sid })
 }
@@ -155,6 +174,16 @@ mod tests {
         assert_eq!(decline_msg("id1"), json!({ "type": "file-decline", "id": "id1" }));
         assert_eq!(end_msg("id1", 7), json!({ "type": "file-end", "id": "id1", "sid": 7 }));
         assert_eq!(delivery_ack_msg("id1", 7), json!({ "type": "delivery-ack", "id": "id1", "sid": 7, "v": 1 }));
+    }
+
+    #[test]
+    fn a_refusal_is_a_decline_that_carries_its_reason() {
+        // The type stays `file-decline` so an older sender still stops waiting.
+        assert_eq!(
+            refuse_msg("id1", "no_space", "out of disk space"),
+            json!({ "type": "file-decline", "id": "id1", "reason": "no_space", "error": "out of disk space" })
+        );
+        assert_eq!(pending_msg("id1"), json!({ "type": "file-pending", "id": "id1", "reason": "asking" }));
     }
 
     #[test]

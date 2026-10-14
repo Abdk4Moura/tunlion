@@ -1,0 +1,83 @@
+# The browser's PAKE is a prebuilt WebAssembly module committed under
+# frontend/src/pake/ so `npm run build` needs no Rust toolchain. Nothing built
+# it in CI, so when the CLI's confirmation MAC gained the scope byte
+# (2026-07-26) the committed module kept the old one and every browser
+# handshake with the CLI failed key confirmation, unnoticed for months.
+#
+# This job rebuilds the module from source and fails if it differs from what
+# is committed. The toolchain is pinned so the build is reproducible: when this
+# job fails after a real source change, download the `pake-wasm` artifact and
+# commit its files over frontend/src/pake/.
+name: Browser PAKE wasm
+
+on:
+  push:
+    branches: [main, "integration/**"]
+    paths:
+      - "crates/filament-pair/**"
+      - "pake/**"
+      - "frontend/src/pake/**"
+      - ".github/workflows/pake-wasm.yml"
+  pull_request:
+    paths:
+      - "crates/filament-pair/**"
+      - "pake/**"
+      - "frontend/src/pake/**"
+      - ".github/workflows/pake-wasm.yml"
+  workflow_dispatch: {}
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Keep in step with wasm-bindgen in pake/Cargo.lock: the CLI and the
+      # library must be the same version or the bindings will not load.
+      WASM_BINDGEN_VERSION: "0.2.122"
+      RUST_VERSION: "1.88.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }} with the wasm target
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_VERSION"
+
+      - name: Check wasm-bindgen matches the lockfile
+        run: |
+          locked=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/version = |"/,""); print}' pake/Cargo.lock)
+          test "$locked" = "$WASM_BINDGEN_VERSION" || { echo "pake/Cargo.lock has wasm-bindgen $locked, this job pins $WASM_BINDGEN_VERSION"; exit 1; }
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/registry
+            pake/target
+          key: pake-wasm-${{ env.RUST_VERSION }}-${{ env.WASM_BINDGEN_VERSION }}-${{ hashFiles('pake/Cargo.lock') }}
+
+      - name: Install wasm-bindgen-cli
+        run: |
+          if ! wasm-bindgen --version 2>/dev/null | grep -q "$WASM_BINDGEN_VERSION"; then
+            cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked --force
+          fi
+          wasm-bindgen --version
+
+      # No wasm-opt: its output depends on the binaryen version, and the
+      # committed module is the plain wasm-bindgen output.
+      - name: Build the module
+        run: bash pake/build-wasm.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pake-wasm
+          path: frontend/src/pake/
+          if-no-files-found: error
+
+      - name: Committed module matches the source
+        run: |
+          if ! git diff --exit-code --stat -- frontend/src/pake/; then
+            echo "frontend/src/pake/ is out of date with crates/filament-pair. Download the pake-wasm artifact from this run and commit it."
+            exit 1
+          fi

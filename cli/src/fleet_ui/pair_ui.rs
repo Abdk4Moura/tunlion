@@ -117,12 +117,11 @@ pub fn render_inter_user_form(peer_name: &str) -> String {
 
 /// Render the inter-user success message.
 pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> String {
-    let echo = match cap {
-        "shell" | "transfer" | "mount" => {
-            echo_cmd(&format!("tunlion grant {peer_name} {cap} --for {expiry}"))
-        }
-        _ => String::new(),
-    };
+    // This used to echo `tunlion grant <peer> <cap> --for <expiry>`. `grant`
+    // has no --for (or any expiry) flag, so the echoed "equivalent command"
+    // was a usage error, and no grant invocation reproduces a bounded grant.
+    // Echoing nothing is honest; echoing a command that does not parse is not.
+    let echo = String::new();
     format!(
         "{ok} {peer_name} can {cap_label} until {expiry}. It ends on its own; no cleanup needed.\n{echo}",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
@@ -159,9 +158,70 @@ pub fn err_pair_interactive() -> (String, i32) {
     (lines.join("\n"), super::EXIT_BAD_ARG)
 }
 
+/// Non-TTY refusal for `add` WITH arguments that still chose a spoken code
+/// (`add laptop --via code`). It used to print the message above, which opens
+/// "`add` with no arguments" at someone who had just typed three. Same advice,
+/// addressed to what they actually ran: keep their name, swap only the
+/// transport, or choose the words so a script can hand them over.
+pub fn err_add_code_noninteractive(named: Option<&str>) -> (String, i32) {
+    let who = named.filter(|n| !n.is_empty()).unwrap_or("laptop");
+    let lines = [
+        format!(
+            "{} `add --via code` reads a code out for someone to type, which needs a person at",
+            ui::paint(Tone::Err, ui::glyph_err())
+        ),
+        "  both ends, and this is not a terminal. Write an invitation they claim later instead:".to_string(),
+        String::new(),
+        format!("  {}", ui::paint(Tone::Brand, &format!("tunlion add {who} --out {who}.invite"))),
+        String::new(),
+        format!(
+            "  or choose the words yourself and pass them on:  {}",
+            ui::paint(Tone::Brand, &format!("tunlion add {who} --via code --word <your-words>"))
+        ),
+        format!(
+            "  They claim a file with:  {}",
+            ui::paint(Tone::Brand, "tunlion join <file>")
+        ),
+    ];
+    (lines.join("\n"), super::EXIT_BAD_ARG)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_with_arguments_is_not_told_it_has_none() {
+        let (msg, code) = err_add_code_noninteractive(Some("laptop"));
+        assert!(!msg.contains("no arguments"), "they passed arguments: {msg}");
+        assert!(msg.contains("--via code"), "name what they ran");
+        assert!(msg.contains("tunlion add laptop --out laptop.invite"), "keep their device name");
+        assert_eq!(code, 2, "bad-arg = exit 2");
+    }
+
+    /// Same rule as `every_suggested_command_parses`: what we tell someone to
+    /// type must be something clap accepts.
+    #[test]
+    fn every_command_the_add_code_refusal_suggests_parses() {
+        use clap::Parser;
+        for named in [Some("laptop"), None] {
+            let (msg, _) = err_add_code_noninteractive(named);
+            let plain = strip_ansi(&msg);
+            let mut seen = 0;
+            for line in plain.lines() {
+                let Some(i) = line.find("tunlion ") else { continue };
+                let cmd = line[i..].trim();
+                let argv: Vec<String> = cmd
+                    .split_whitespace()
+                    .map(|t| if t.starts_with('<') { "x".to_string() } else { t.to_string() })
+                    .collect();
+                crate::Cli::try_parse_from(&argv)
+                    .unwrap_or_else(|e| panic!("suggested `{cmd}` does not parse: {e}"));
+                seen += 1;
+            }
+            assert!(seen >= 3, "expected three suggestions, parsed {seen}");
+        }
+    }
 
     #[test]
     fn same_person_banner_fleet_glyph() {
