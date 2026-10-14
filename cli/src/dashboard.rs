@@ -813,10 +813,19 @@ pub(crate) async fn dashboard_cmd(no_open: bool, port: Option<u16>, server: &str
         if !started_with_daemon {
             return std::future::pending::<()>().await;
         }
+        // Three misses in a row, not one: a single look can miss a running
+        // daemon (measured in the lab: the dashboard closed while `status`
+        // still showed the daemon up), and closing is not undoable.
+        let mut misses = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if crate::shell_support::daemon_alive().is_none() {
-                return;
+                misses += 1;
+                if misses >= 3 {
+                    return;
+                }
+            } else {
+                misses = 0;
             }
         }
     };
