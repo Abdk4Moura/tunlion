@@ -3719,7 +3719,9 @@ pub(crate) async fn recv_cmd(
             keep_open,
             st.by_sid.is_empty() && st.pending.is_empty(),
             links_clear,
-            code_only,
+            // The Mode B test hook restores the old links-gated exit wholesale,
+            // so gate 18b's baseline still proves the drop matters.
+            code_only && !test_hooks::disable_modeb_drop(),
         ) {
             match last_quiet {
                 None => last_quiet = Some(Instant::now()),
