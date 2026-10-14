@@ -94,6 +94,17 @@ export function mintNameplate() {
   return String(100 + (buf[0] % 900))
 }
 
+// The nameplate for a code this browser CREATES. Four digits, the CLI's pairing
+// shape (`mint_pair_nameplate`): the CLI treats word-word-NNN as a one-time
+// transfer code and refuses it in `tunlion join`, so a three-digit browser code
+// could never be joined from a terminal (launch matrix B04). `tunlion receive`
+// takes any width, so the same code still works for a plain transfer.
+export function mintCreatedNameplate() {
+  const buf = new Uint32Array(1)
+  crypto.getRandomValues(buf)
+  return String(1000 + (buf[0] % 9000))
+}
+
 export function validateChosenPassword(raw, userName) {
   const trimmed = raw.replace(/^-+|-+$/g, '')
   const parts = trimmed.split('-').filter(s => s !== '')

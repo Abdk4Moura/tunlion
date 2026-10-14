@@ -987,6 +987,49 @@ mod offer_consent_tests {
     }
 }
 
+/// Whether a receive that has finished its files may start its quiet exit, and
+/// the line it prints. Pure. `idle` = nothing in flight and no question open.
+/// A one-time CODE receive also ends while its sender is still connected: a
+/// browser keeps its tab and link open after the files are acked, so waiting for
+/// the link to go (the rule for everyone else) waited forever (launch matrix B03).
+pub(crate) fn quiet_exit_reason(
+    completed: usize,
+    keep_open: bool,
+    idle: bool,
+    links_clear: bool,
+    code_only: bool,
+) -> Option<&'static str> {
+    if completed == 0 || keep_open || !idle {
+        return None;
+    }
+    if links_clear {
+        Some("  (peer-left never arrived, exiting on quiet)")
+    } else if code_only {
+        Some("  (the sender is still connected but sent nothing more; a code receive ends here, add --keep-open to wait for more files)")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod quiet_exit_tests {
+    use super::quiet_exit_reason;
+
+    #[test]
+    fn a_code_receive_ends_after_its_files_even_while_the_browser_stays_connected() {
+        // The B03 case: files done, idle, the browser's link still healthy.
+        assert!(quiet_exit_reason(1, false, true, false, true).is_some());
+        // Not before anything arrived, not mid-transfer, not with --keep-open.
+        assert!(quiet_exit_reason(0, false, true, false, true).is_none());
+        assert!(quiet_exit_reason(1, false, false, false, true).is_none());
+        assert!(quiet_exit_reason(1, true, true, false, true).is_none());
+        // A non-code receive keeps waiting while a healthy link is up (gate 6:
+        // a bystander between two human-paced sends), and quiet-exits once clear.
+        assert!(quiet_exit_reason(1, false, true, false, false).is_none());
+        assert!(quiet_exit_reason(1, false, true, true, false).is_some());
+    }
+}
+
 pub(crate) async fn recv_cmd(
     server: &str,
     mut code: Option<String>,
@@ -3664,19 +3707,24 @@ pub(crate) async fn recv_cmd(
         } else {
             conn.links.is_empty() || digest_says_alone
         };
-        if st.completed > 0
-            && !keep_open
-            && st.by_sid.is_empty()
-            && st.pending.is_empty()
-            && links_clear
-        {
+        // A one-time CODE receive has exactly one sender, and the code is spent.
+        // A CLI sender leaves when its files are acked, which ends us above; a
+        // BROWSER sender keeps its tab (and link) open, so `links_clear` never
+        // held and `tunlion receive <code>` sat after "verified, acked" until
+        // someone pressed Ctrl-C (launch matrix B03). Once everything offered is
+        // received and the link has been idle for the quiet window, the session
+        // is over: the same quiet exit, with a line that says why.
+        if let Some(why) = quiet_exit_reason(
+            st.completed,
+            keep_open,
+            st.by_sid.is_empty() && st.pending.is_empty(),
+            links_clear,
+            code_only,
+        ) {
             match last_quiet {
                 None => last_quiet = Some(Instant::now()),
                 Some(since) if since.elapsed() > quiet_window => {
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
-                        "  (peer-left never arrived, exiting on quiet)",
-                    ));
+                    ui::say(&ui::paint(ui::Tone::Dim, why));
                     ui::say(&format!(
                         "done ({} file{}).",
                         st.completed,
