@@ -35,7 +35,12 @@ export function rows(state) {
   const perms = new Map((state.perms || []).map((p) => [p.name, p]))
   return (state.devices || []).map((d) => {
     const p = perms.get(d.name) || { caps: [], tier: '', caveats: [] }
-    const live = (p.caps || []).filter((c) => c.effective === true && c.resource === 'self')
+    // effective is null when the gate cannot be asked from the store alone
+    // (an uncertified, code-paired device); then the cap store's own list,
+    // which `devices --json` reports, is what this device enforces.
+    const stored = new Set(d.caps || [])
+    const live = (p.caps || []).filter((c) => c.resource === 'self' && (c.effective === true || (c.effective == null && stored.has(c.action))))
+    for (const a of stored) if (!live.some((c) => c.action === a)) live.push({ action: a, resource: 'self', source: 'grant', valid_until: null, effective: null })
     const caps = live.map((c) => c.action)
     const ends = live.map((c) => c.valid_until).filter(Boolean)
     const until = d.accessUntil || (ends.length ? Math.min(...ends) : null)
