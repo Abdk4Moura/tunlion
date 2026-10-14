@@ -1357,6 +1357,14 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 other => (other, invite_file),
             };
+            // A path that does not exist used to fall through to the code
+            // ceremony and come back as "that code doesn't look right", which
+            // sends the person hunting for a typo in a code they never typed.
+            if let Some(arg) = code.as_deref() {
+                if let Some(msg) = crate::identity_flow::join_missing_file_msg(arg, invite_file.is_some() || invite_fd.is_some()) {
+                    crate::bail_usage!("{msg}");
+                }
+            }
             if let Some(code) = code {
                 if invite_file.is_some() || invite_fd.is_some() {
                     crate::bail_usage!("give a code or an invitation file, not both");

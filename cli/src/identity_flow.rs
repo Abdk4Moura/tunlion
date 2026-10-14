@@ -876,6 +876,20 @@ pub(crate) fn classify_join_input(raw: &str, is_file: &dyn Fn(&str) -> bool) -> 
     JoinInput::Unknown
 }
 
+/// `join <arg>` where <arg> names a file that is not there: the refusal, or
+/// None when <arg> may be a code (or a file was also given another way). A
+/// code is letters, digits and dashes, so anything with a path separator or a
+/// dot is a file name, never a code. Pure.
+pub(crate) fn join_missing_file_msg(arg: &str, other_source: bool) -> Option<String> {
+    let looks_like_path = arg.contains('/') || arg.contains('\\') || arg.contains('.');
+    if other_source || !looks_like_path || std::path::Path::new(arg).exists() {
+        return None;
+    }
+    Some(format!(
+        "no invitation file at '{arg}'. Check the path, or copy the file here first; a pairing code looks like brave-otter-3141"
+    ))
+}
+
 /// The refusal for an accept input that is none of the things `join` takes.
 pub(crate) fn join_input_not_recognized() -> String {
     "that is not a pairing code, an invitation, or a file that exists. A pairing code looks like \
@@ -1176,6 +1190,21 @@ mod join_input_tests {
         assert_eq!(classify_join_input("", &none), JoinInput::Unknown);
         // A transfer code is sent to the verb that takes it.
         assert!(super::join_transfer_code_msg("brave-otter-314").contains("tunlion receive brave-otter-314"));
+    }
+
+    /// Launch matrix: `join inv.txt` with no such file answered "that code
+    /// doesn't look right". A name with a dot or a slash is a file, never a
+    /// code, so a missing one is reported as a missing file.
+    #[test]
+    fn a_missing_invitation_file_is_reported_as_missing_not_as_a_bad_code() {
+        let msg = super::join_missing_file_msg("no-such-dir/inv.txt", false).expect("missing file refused");
+        assert!(msg.contains("no invitation file at 'no-such-dir/inv.txt'"), "{msg}");
+        assert!(super::join_missing_file_msg("inv-missing.txt", false).is_some());
+        // Codes, including a browser's three-digit one, still reach the ceremony.
+        assert_eq!(super::join_missing_file_msg("brave-otter-3141", false), None);
+        assert_eq!(super::join_missing_file_msg("fond-llama-112", false), None);
+        // A file given another way is not second-guessed.
+        assert_eq!(super::join_missing_file_msg("inv.txt", true), None);
     }
 }
 
