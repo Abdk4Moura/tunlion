@@ -41,6 +41,19 @@ const MAX_BAD_SECRETS: u32 = 5;
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 64 * 1024;
 
+/// The signaling server this dashboard was started with. Its child commands
+/// must use the same one: a code minted on another server cannot be claimed.
+static SERVER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn self_command() -> std::io::Result<tokio::process::Command> {
+    let mut c = tokio::process::Command::new(std::env::current_exe()?);
+    if let Some(s) = SERVER.get() {
+        c.env("TUNLION_SERVER", s);
+    }
+    c.env("TUNLION_NONINTERACTIVE", "1").env("TUNLION_COLOR", "never").env("NO_COLOR", "1");
+    Ok(c)
+}
+
 /// What a request looks like to the gate: no sockets, so the rules are tested
 /// directly.
 #[derive(Debug, Default, Clone)]
@@ -276,15 +289,12 @@ pub(crate) fn invite_argv(a: &Value, out: &std::path::Path) -> Result<Vec<String
 
 /// Run this binary with `argv`, no shell, no terminal. (exit code, what it said)
 async fn run_self(argv: &[String]) -> (i32, String) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
+    let mut cmd = match self_command() {
+        Ok(c) => c,
         Err(e) => return (1, format!("cannot find the tunlion binary: {e}")),
     };
-    let child = tokio::process::Command::new(exe)
+    let child = cmd
         .args(argv)
-        .env("TUNLION_NONINTERACTIVE", "1")
-        .env("TUNLION_COLOR", "never")
-        .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -445,8 +455,8 @@ async fn start_code(codes: &Codes, a: &Value) -> Resp {
         Ok(v) => v,
         Err(msg) => return Resp::json(400, json!({"ok": false, "error": msg})),
     };
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
+    let mut cmd = match self_command() {
+        Ok(c) => c,
         Err(e) => return Resp::json(200, json!({"ok": false, "message": format!("cannot find the tunlion binary: {e}")})),
     };
     let log = crate::settings::config_dir().join(format!("dashboard-code-{}.log", random_hex(6)));
@@ -454,11 +464,8 @@ async fn start_code(codes: &Codes, a: &Value) -> Resp {
         return Resp::json(200, json!({"ok": false, "message": "could not write in the config dir"}));
     };
     let err = match out.try_clone() { Ok(f) => f, Err(_) => return Resp::json(200, json!({"ok": false})) };
-    let child = tokio::process::Command::new(exe)
+    let child = cmd
         .args(&argv)
-        .env("TUNLION_NONINTERACTIVE", "1")
-        .env("TUNLION_COLOR", "never")
-        .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::null())
         .stdout(out)
         .stderr(err)
@@ -777,7 +784,8 @@ fn open_browser(url: &str) -> bool {
     matches!(r, Ok(s) if s.success())
 }
 
-pub(crate) async fn dashboard_cmd(no_open: bool, port: Option<u16>) -> Result<()> {
+pub(crate) async fn dashboard_cmd(no_open: bool, port: Option<u16>, server: &str) -> Result<()> {
+    let _ = SERVER.set(server.to_string());
     if !crate::identity_flow::has_identity() && crate::devices_store::devices_load().is_empty() {
         return Err(crate::exit_codes::err(
             crate::exit_codes::ExitKind::NoIdentity,

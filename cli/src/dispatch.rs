@@ -2512,7 +2512,7 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         Cmd::Requests { action } => requests_cmd(action).await,
         Cmd::Skill { action } => crate::skill::skill_cmd(action, ui_caps.json || cli.json),
-        Cmd::Dashboard { no_open, port } => crate::dashboard::dashboard_cmd(no_open, port).await,
+        Cmd::Dashboard { no_open, port } => crate::dashboard::dashboard_cmd(no_open, port, &server).await,
         Cmd::Backup {
             peer,
             source,
