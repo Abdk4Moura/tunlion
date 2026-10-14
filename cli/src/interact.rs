@@ -137,16 +137,16 @@ fn paint_checklist(title: &str, _subtitle: &str, opts: &[OptionEntry], selected:
 
     if redraw { let _ = write!(err, "\x1b[{}A", vis_lines); }
 
-    let _ = writeln!(err, "\r\x1b[2K  {}", if color { format!("\x1b[1m{title}\x1b[0m") } else { title.to_string() });
+    let _ = writeln!(err, "\r\x1b[2K  {}", ui::paint_when(color, ui::Tone::Bold, title));
 
     for (i, opt) in opts.iter().enumerate() {
         let detail = if opt.detail.is_empty() { String::new() } else { format!("  {}", opt.detail) };
         let group_str = if opt.group.is_empty() || opt.group == "other" { String::new() } else { format!("  ({})", opt.group) };
 
         let (mark, cy, r) = if i == cursor {
-            ("\u{276f}", if color { "\x1b[36m" } else { "" }, if color { "\x1b[0m" } else { "" })
+            ("\u{276f}", ui::tone_code(ui::Tone::Brand), ui::tone_reset())
         } else {
-            (" ", "", "")
+            (" ", String::new(), "")
         };
         let check = if selected[i] { "[x]" } else { "[ ]" };
         let line = format!("{cy}{mark} {check} {:<20}{detail}{group_str}{r}", opt.label);
@@ -209,7 +209,7 @@ fn paint_reorder(title: &str, opts: &[OptionEntry], order: &[usize], cursor: usi
 
     if redraw { let _ = write!(err, "\x1b[{}A", vis_lines); }
 
-    let _ = writeln!(err, "\r\x1b[2K  {}", if color { format!("\x1b[1m{title}\x1b[0m") } else { title.to_string() });
+    let _ = writeln!(err, "\r\x1b[2K  {}", ui::paint_when(color, ui::Tone::Bold, title));
 
     for (pos, &idx) in order.iter().enumerate() {
         let opt = &opts[idx];
@@ -217,9 +217,9 @@ fn paint_reorder(title: &str, opts: &[OptionEntry], order: &[usize], cursor: usi
         let group_str = if opt.group.is_empty() || opt.group == "other" { String::new() } else { format!("  ({})", opt.group) };
 
         let (mark, cy, r) = if pos == cursor {
-            ("\u{276f}", if color { "\x1b[36m" } else { "" }, if color { "\x1b[0m" } else { "" })
+            ("\u{276f}", ui::tone_code(ui::Tone::Brand), ui::tone_reset())
         } else {
-            (" ", "", "")
+            (" ", String::new(), "")
         };
 
         let line = format!("{cy}{mark} {:<20}{detail}{group_str}{r}", opt.label);

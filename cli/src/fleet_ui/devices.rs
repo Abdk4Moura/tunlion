@@ -52,7 +52,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_h
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Brand, ui::glyph_fleet()),
-            ui::paint(Tone::Brand, "FLEET  /  your devices, permissive within scope")
+            ui::header(Tone::Brand, Tone::Dim, "FLEET  /  your devices, permissive within scope")
         ));
         for d in &fleet {
             lines.push(render_device_row(d));
@@ -66,7 +66,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_h
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Dim, ui::glyph_extern()),
-            ui::paint(Tone::Dim, "EXTERNAL  /  other people, time-boxed, deny-by-default")
+            ui::header(Tone::Bold, Tone::Dim, "EXTERNAL  /  other people, time-boxed, deny-by-default")
         ));
         for d in &externs {
             lines.push(render_device_row(d));
@@ -83,7 +83,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_h
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Brand, ui::glyph_mesh()),
-            ui::paint(Tone::Brand, &heading)
+            ui::header(Tone::Brand, Tone::Dim, &heading)
         ));
         if roster.is_empty() {
             lines.push(ui::paint(Tone::Dim, "     (no other devices listed)"));
@@ -101,7 +101,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_h
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Warn, ui::glyph_review()),
-            ui::paint(Tone::Warn, "NEEDS REVIEW  /  paired, but not certified by your owner key")
+            ui::header(Tone::Warn, Tone::Dim, "NEEDS REVIEW  /  paired, but not certified by your owner key")
         ));
         for d in &review {
             lines.push(render_device_row(d));

@@ -87,6 +87,13 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/browser-ui.spec.cjs
 
+      # The shell outlives its link: a reattach sends resume_from (exactly the
+      # bytes the terminal showed), the bar says reconnecting while the link is
+      # down, and no line arrives twice or goes missing. Fake device session that
+      # replays like the CLI acceptor.
+      - name: pty-reattach
+        run: node frontend/tests/pty-reattach.spec.cjs
+
       # Screenshots are the evidence a browser actually rendered, rather than the
       # harness reporting on itself. Keep them when a gate fails.
       #

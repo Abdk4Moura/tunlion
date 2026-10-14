@@ -206,9 +206,9 @@ fn verdict(o: &crate::l2::ProbeOutcome) -> Verdict {
 /// Render one probe's phase ladder + verdict to stdout (the house style: an
 /// aligned, colored listing like `tunlion devices`).
 fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
-    println!();
-    println!("{}", ui::paint(Tone::Bold, &format!("tunlion doctor: probe to '{device}'")));
-    println!();
+    crate::outln!();
+    crate::outln!("{}", ui::paint(Tone::Bold, &format!("tunlion doctor: probe to '{device}'")));
+    crate::outln!();
     // Column widths: phase label (longest is "establishing" = 12) + time.
     for t in &o.timings {
         let status = if t.over_budget {
@@ -216,7 +216,7 @@ fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
         } else {
             ui::paint(Tone::Ok, "ok")
         };
-        println!("  {:<13} {:>6}  {}", t.phase.label(), fmt_ms(t.dur_ms), status);
+        crate::outln!("  {:<13} {:>6}  {}", t.phase.label(), fmt_ms(t.dur_ms), status);
     }
     // If it never established, show the phase it died in as a failed rung.
     if !o.established {
@@ -224,20 +224,20 @@ fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
             // Only add a rung if it isn't already the last recorded phase.
             let already = o.timings.last().map(|t| t.phase == p).unwrap_or(false);
             if !already {
-                println!("  {:<13} {:>6}  {}", p.label(), "-", ui::paint(Tone::Err, "FAILED"));
+                crate::outln!("  {:<13} {:>6}  {}", p.label(), "-", ui::paint(Tone::Err, "FAILED"));
             }
         }
     }
     // The path the link actually took: same fine detail as `tunlion ping` so the
     // diagnosis names the interface + endpoints, not just the timings.
     if let Some(p) = &o.path {
-        println!("  {:<13} {:>6}  {}", "path", "", fmt_path(p));
+        crate::outln!("  {:<13} {:>6}  {}", "path", "", fmt_path(p));
     }
-    println!();
+    crate::outln!();
     let v = verdict(o);
     let tone = if v.healthy { Tone::Ok } else { Tone::Err };
-    println!("  {} {}", ui::paint(Tone::Bold, "verdict:"), ui::paint(tone, &v.line));
-    println!();
+    crate::outln!("  {} {}", ui::paint(Tone::Bold, "verdict:"), ui::paint(tone, &v.line));
+    crate::outln!();
 }
 
 /// Render a `PathInfo` to one elegant line: interface · class, the endpoints
@@ -280,23 +280,23 @@ fn fmt_path(p: &crate::net::PathInfo) -> String {
 /// rate per phase, and the overall established rate.
 fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
     let n = outcomes.len();
-    println!();
-    println!(
+    crate::outln!();
+    crate::outln!(
         "{}",
         ui::paint(Tone::Bold, &format!("tunlion doctor: {n} probes to '{device}'"))
     );
-    println!();
+    crate::outln!();
 
     let established = outcomes.iter().filter(|o| o.established).count();
     let est_tone = if established == n { Tone::Ok } else { Tone::Warn };
-    println!(
+    crate::outln!(
         "  established: {}",
         ui::paint(est_tone, &format!("{established} of {n}"))
     );
-    println!();
+    crate::outln!();
 
     // Per-phase distribution across all probes that recorded that phase.
-    println!("  {:<13} {:>7} {:>7} {:>7}   {}", "phase", "min", "median", "max", "over budget");
+    crate::outln!("  {:<13} {:>7} {:>7} {:>7}   {}", "phase", "min", "median", "max", "over budget");
     for phase in PHASES {
         let mut durs: Vec<u64> = outcomes
             .iter()
@@ -316,7 +316,7 @@ fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
         let seen = durs.len();
         let over_str = format!("{over} of {seen} over budget");
         let over_tone = if over == 0 { Tone::Ok } else { Tone::Warn };
-        println!(
+        crate::outln!(
             "  {:<13} {:>7} {:>7} {:>7}   {}",
             phase.label(),
             fmt_ms(durs[0]),
@@ -325,7 +325,7 @@ fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
             ui::paint(over_tone, &over_str),
         );
     }
-    println!();
+    crate::outln!();
 
     // The headline: how often did it stall ANYWHERE (over budget or failed)?
     let unhealthy = outcomes.iter().filter(|o| !verdict(o).healthy).count();
@@ -337,8 +337,8 @@ fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
             &format!("{unhealthy} of {n} probes stalled or failed (the intermittent case)"),
         )
     };
-    println!("  {} {line}", ui::paint(Tone::Bold, "verdict:"));
-    println!();
+    crate::outln!("  {} {line}", ui::paint(Tone::Bold, "verdict:"));
+    crate::outln!();
 }
 
 /// The phases in ladder order (for the distribution table). Up is the steady
@@ -455,19 +455,19 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
         return preflight_result(&sig);
     }
 
-    println!();
-    println!("{}", ui::paint(Tone::Bold, "tunlion doctor: environment preflight"));
-    println!();
+    crate::outln!();
+    crate::outln!("{}", ui::paint(Tone::Bold, "tunlion doctor: environment preflight"));
+    crate::outln!();
 
     // Signaling.
     match &sig {
-        Ok(ms) => println!(
+        Ok(ms) => crate::outln!(
             "  {:<13} {}  {}",
             "signaling",
             ui::paint(Tone::Ok, "reachable"),
             ui::paint(Tone::Dim, &format!("{server} ({} round trip)", fmt_ms(*ms))),
         ),
-        Err(e) => println!(
+        Err(e) => crate::outln!(
             "  {:<13} {}  {}",
             "signaling",
             ui::paint(Tone::Err, "UNREACHABLE"),
@@ -505,19 +505,19 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
 
     // ICE / STUN.
     match &ice {
-        IceResult::Ok { srflx, class, ms } => println!(
+        IceResult::Ok { srflx, class, ms } => crate::outln!(
             "  {:<13} {}  {}",
             "ice/stun",
             ui::paint(Tone::Ok, "works"),
             ui::paint(Tone::Dim, &format!("srflx {srflx} ({class}, {} round trip)", fmt_ms(*ms))),
         ),
-        IceResult::NoServer => println!(
+        IceResult::NoServer => crate::outln!(
             "  {:<13} {}  {}",
             "ice/stun",
             ui::paint(Tone::Warn, "no STUN server"),
             ui::paint(Tone::Dim, "config advertises no stun: url; direct path limited"),
         ),
-        IceResult::Failed(e) => println!(
+        IceResult::Failed(e) => crate::outln!(
             "  {:<13} {}  {}",
             "ice/stun",
             ui::paint(Tone::Warn, "FAILED"),
@@ -543,12 +543,12 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     }
 
     // Interfaces.
-    println!("  {:<13} {}", "interfaces", iface_summary(&ifaces));
+    crate::outln!("  {:<13} {}", "interfaces", iface_summary(&ifaces));
     if ifaces.iter().any(|i| i.vpn) {
         let mut names: Vec<&str> = ifaces.iter().filter(|i| i.vpn).map(|i| i.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        println!(
+        crate::outln!(
             "  {:<13} {}",
             "",
             ui::paint(
@@ -559,11 +559,11 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     }
 
     // History.
-    println!();
-    println!("{}", ui::paint(Tone::Bold, "history (recent connect spans)"));
-    println!();
+    crate::outln!();
+    crate::outln!("{}", ui::paint(Tone::Bold, "history (recent connect spans)"));
+    crate::outln!();
     print_history(&history);
-    println!();
+    crate::outln!();
     if !crate::identity_flow::has_identity() {
         ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
     }
@@ -581,26 +581,26 @@ fn preflight_result(sig: &std::result::Result<u64, String>) -> Result<()> {
 
 fn print_history(h: &diag::Summary) {
     if h.considered == 0 {
-        println!("  {}", ui::paint(Tone::Dim, "no recorded connect attempts yet (send, shell, exec and forward to a known device record them; `tunlion doctor <device>` measures one now)"));
+        crate::outln!("  {}", ui::paint(Tone::Dim, "no recorded connect attempts yet (send, shell, exec and forward to a known device record them; `tunlion doctor <device>` measures one now)"));
         return;
     }
-    println!("  attempts     {}", h.considered);
-    println!("  succeeded    {}", ui::paint(Tone::Ok, &format!("{} of {}", h.ups, h.considered)));
+    crate::outln!("  attempts     {}", h.considered);
+    crate::outln!("  succeeded    {}", ui::paint(Tone::Ok, &format!("{} of {}", h.ups, h.considered)));
     if h.fails > 0 {
-        println!("  failed       {}", ui::paint(Tone::Warn, &format!("{} of {}", h.fails, h.considered)));
+        crate::outln!("  failed       {}", ui::paint(Tone::Warn, &format!("{} of {}", h.fails, h.considered)));
     }
     if let Some(m) = h.median_total_ms {
-        println!("  median total {}", fmt_ms(m));
+        crate::outln!("  median total {}", fmt_ms(m));
     }
     match &h.worst_phase {
-        Some((p, c)) => println!(
+        Some((p, c)) => crate::outln!(
             "  worst phase  {}",
             ui::paint(Tone::Warn, &format!("{} (over budget in {} of {} spans)", p.label(), c, h.considered)),
         ),
-        None => println!("  worst phase  {}", ui::paint(Tone::Ok, "none over budget")),
+        None => crate::outln!("  worst phase  {}", ui::paint(Tone::Ok, "none over budget")),
     }
     let stall_tone = if h.spans_with_stall == 0 { Tone::Ok } else { Tone::Warn };
-    println!(
+    crate::outln!(
         "  stall rate   {}",
         ui::paint(stall_tone, &format!("{} of {} spans stalled", h.spans_with_stall, h.considered)),
     );

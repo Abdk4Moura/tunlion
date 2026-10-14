@@ -362,7 +362,7 @@ pub(crate) async fn add_for_cmd(
         report_invitation_uptake(ttl_abs);
     }
     if caps.json {
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,

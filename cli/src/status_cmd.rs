@@ -187,7 +187,7 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         // Structured transfer records from both directions, newest last.
         let recent = crate::transfer_history::recent(RECENT);
         let (identity, role) = identity_fields();
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "verb": "status",

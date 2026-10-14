@@ -92,6 +92,14 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const [toast, setToast] = useState('') // brief copy/paste feedback
   const toastTimer = useRef(0)
   const sessionIdRef = useRef(makeSessionId(instanceId))
+  // Session resume: bytes of this session's output written to the terminal,
+  // across every link. A reattach sends it as resume_from so the device replays
+  // only what this screen missed, never what it already shows.
+  const recvRef = useRef(0)
+  const openedRef = useRef(false) // an open went out before: the next is a reattach
+  const wasReadyRef = useRef(false) // the shell was live once: a drop is "reconnecting"
+  const statusRef = useRef('connecting')
+  useEffect(() => { statusRef.current = status }, [status])
   // Predictive / local echo (mosh-style): paints keystrokes instantly, styled,
   // then reconciles to the server's authoritative bytes. Created per-terminal in
   // the mount effect. composingRef is shared with the IME path so we never both
@@ -482,6 +490,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         // count). The watchdog compares this against whether the rendered buffer
         // actually advanced, to self-heal a wedged screen without a reload.
         try { wd.current.bytesAt = Date.now(); wd.current.byteCount += (u8 && u8.length) || 0 } catch (e) {}
+        recvRef.current += (u8 && u8.length) || 0
         // predict.onServerData is itself fail-safe (wrapped in predict.js); the
         // extra guard here is belt-and-suspenders so the write still happens.
         try { predict.onServerData(u8) } catch (e) {}
@@ -495,6 +504,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         })
       }
       l.onPtyClose = (refusal) => {
+        wasReadyRef.current = false
         setStatus('closed')
         if (!refusal) { term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n'); return }
         // Refused by the device: say why, and the one command that fixes it
@@ -506,6 +516,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         if (grant) term.write(`\x1b[90mto allow it, run this on ${where}:\x1b[0m\r\n  tunlion grant ${me} shell\r\n`)
       }
       l.onPtyReady = () => {
+        wasReadyRef.current = true
         setStatus('ready')
         // The PTY is live (fresh or reattached): make sure its window size matches
         // what we actually render, then nudge a SIGWINCH so a TUI redraws to fit.
@@ -522,8 +533,11 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         if (l.channel && l.channel.readyState === 'open') {
           const cols = term.cols || 80
           const rows = term.rows || 24
-          l.openPty(cols, rows, sessionIdRef.current)
-          setStatus('connecting')
+          // A reattach says how much it already has (resume_from); the first
+          // open says nothing, so it looks exactly as it always did.
+          l.openPty(cols, rows, sessionIdRef.current, openedRef.current ? recvRef.current : undefined)
+          openedRef.current = true
+          setStatus(wasReadyRef.current ? 'reconnecting' : 'connecting')
           return true
         }
         return false
@@ -665,10 +679,41 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   // remote PTY keeps running across the swap.
   useEffect(() => {
     linkRef.current = link
-    if (!link) return
+    if (!link) {
+      // The link went away under a live shell: the remote PTY keeps running and
+      // the next link reattaches to it, so say so instead of "connecting".
+      if (wasReadyRef.current) setStatus('reconnecting')
+      return
+    }
     rebindLink()
     return () => { try { if (unbindRef.current) unbindRef.current() } catch (e) {}; unbindRef.current = null }
   }, [link, rebindLink])
+
+  // A link can die before the app hands over a new one (the channel closes, the
+  // PeerLink object stays). Watch the live shell's channel and show
+  // "reconnecting" the moment it is gone, so the bar never claims a live route.
+  // The same link can also come back (ICE recovers after a network blip). The
+  // device may have detached the shell meanwhile, so reattach over it; the
+  // resume_from count keeps that from repeating anything.
+  const rebindRef = useRef(rebindLink)
+  rebindRef.current = rebindLink
+  const downLinkRef = useRef(null)
+  useEffect(() => {
+    const t = setInterval(() => {
+      const l = linkRef.current
+      const ch = l && l.channel
+      const pcs = l && l.pc && l.pc.connectionState
+      const down = !ch || ch.readyState !== 'open' || (!!pcs && pcs !== 'connected')
+      if (statusRef.current === 'ready' && down) {
+        downLinkRef.current = l
+        setStatus('reconnecting')
+      } else if (statusRef.current === 'reconnecting' && !down && l && l === downLinkRef.current) {
+        downLinkRef.current = null
+        try { rebindRef.current() } catch (e) {}
+      }
+    }, 1000)
+    return () => clearInterval(t)
+  }, [])
 
   // Explicit teardown: closing the session (the ✕) must end the remote PTY.
   // Kept separate from the link-swap unbind above so a reconnect never kills it.
@@ -902,7 +947,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       {(() => {
         const sans = uiFont || font
         const routeWord = route === 'relayed' ? 'relay' : route === 'local' ? 'on your network' : (route || 'direct')
-        const stateWord = status === 'connecting' ? 'connecting' : status === 'closed' ? 'ended' : routeWord
+        const stateWord = status === 'connecting' ? 'connecting' : status === 'reconnecting' ? 'reconnecting' : status === 'closed' ? 'ended' : routeWord
         const tgt = narrow || isTouch ? 44 : 36
         const hb = { minHeight: tgt, minWidth: tgt, padding: '0 12px', borderRadius: 7, cursor: 'pointer', font: `600 14px ${sans}`, background: 'transparent', color: T.text, border: `1.5px solid ${T.line}` }
         return (

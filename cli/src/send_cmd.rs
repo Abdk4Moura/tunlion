@@ -627,7 +627,7 @@ pub(crate) async fn send_cmd(
         let waiting = waiting.clone();
         tokio::spawn(async move {
             while waiting.load(std::sync::atomic::Ordering::Relaxed) {
-                ui::status(&format!("  {} waiting...", ui::spinner_frame()));
+                ui::status(&format!("  {} waiting...", ui::pulse()));
                 tokio::time::sleep(Duration::from_millis(120)).await;
             }
         });
