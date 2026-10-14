@@ -885,6 +885,20 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Open the dashboard: this device's devices, people, codes and asks on
+    /// one screen in your browser.
+    ///
+    /// It is served by this device, on 127.0.0.1 only, through a link that
+    /// works once and only for your user. Every change it makes is a local
+    /// write on this machine, the same as running the command here.
+    Dashboard {
+        /// Print the link instead of opening a browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Listen on this port instead of a random one.
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 /// `tunlion skill` actions.

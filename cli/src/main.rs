@@ -628,6 +628,7 @@ mod cli_def;
 mod exit_codes;
 pub(crate) use cli_def::{Cli, Cmd, DevicesAction, IdAction};
 mod skill;
+mod dashboard;
 #[cfg(test)]
 pub(crate) use cli_def::EXAMPLES;
 

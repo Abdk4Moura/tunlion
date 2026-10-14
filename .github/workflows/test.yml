@@ -92,6 +92,14 @@ jobs:
             exit 1
           fi
           echo "OK: skills/tunlion/SKILL.md is in the package"
+          # `tunlion dashboard` embeds its built page with include_bytes!.
+          for f in dashboard-dist/dashboard.html dashboard-dist/dashboard.js dashboard-dist/dashboard.css; do
+            if ! grep -qx "$f" "$RUNNER_TEMP/package-list.txt"; then
+              echo "::error::cargo package for filament-cli does not include $f"
+              exit 1
+            fi
+          done
+          echo "OK: the dashboard bundle is in the package"
       # The real-kernel subnet-forwarding rig. It needs root and rewrites the
       # firewall, so it is `#[ignore]` in the plain run above and, until this
       # step existed, ran nowhere: it returned early without

@@ -19,10 +19,12 @@ on:
     branches: [main, "integration/**"]
     paths:
       - "frontend/**"
+      - "cli/dashboard-dist/**"
       - ".github/workflows/browser-gates.yml"
   pull_request:
     paths:
       - "frontend/**"
+      - "cli/dashboard-dist/**"
       - ".github/workflows/browser-gates.yml"
 
 jobs:
@@ -53,9 +55,27 @@ jobs:
             echo "== $f"; node "$f"
           done
 
+      # `tunlion dashboard` serves a bundle committed inside the cli crate
+      # (it ships to crates.io with the binary). Rebuild it from source and
+      # fail if the committed copy differs, so the page the CLI serves is
+      # always the page this source describes.
+      - name: Dashboard bundle matches its source
+        working-directory: frontend
+        run: |
+          set -e
+          node node_modules/.bin/vite build --config vite.dashboard.config.js
+          git diff --exit-code --stat -- ../cli/dashboard-dist || {
+            echo "::error::cli/dashboard-dist is stale: run 'npx vite build --config vite.dashboard.config.js' in frontend/ and commit it"; exit 1; }
+          test -z "$(git status --porcelain -- ../cli/dashboard-dist)"
+
       - name: Install Chromium
         working-directory: frontend
         run: npx playwright install --with-deps chromium
+
+      # The dashboard's screens against a stand-in API (the real daemon is
+      # covered by cli/tests/dashboard-gates.sh and the lab run).
+      - name: dashboard-ui
+        run: node frontend/tests/dashboard-ui.spec.cjs
 
       # pake-ux drives the real backend, so it needs the Python side present.
       # Versions match capability-ci.yml so the two jobs cannot drift apart.
