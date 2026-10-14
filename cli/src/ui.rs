@@ -473,6 +473,11 @@ pub fn glyph_echo() -> &'static str {
     if caps().unicode { "↳" } else { "->" }
 }
 
+/// The `Error:` label in front of a failure, in the failure color.
+pub fn error_label() -> String {
+    paint(Tone::Err, "Error:")
+}
+
 /// OSC 8 hyperlink (clickable in modern terminals); plain text elsewhere.
 pub fn link(url: &str, text: &str) -> String {
     if caps().color {

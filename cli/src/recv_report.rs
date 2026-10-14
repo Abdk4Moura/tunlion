@@ -198,7 +198,7 @@ pub(crate) fn emit(res: Result<()>, dir: &str) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) => {
             let kind = exit_codes::classify(&e);
-            ui::critical(&format!("Error: {}", exit_codes::human_message(&e)));
+            ui::critical(&format!("{} {}", ui::error_label(), exit_codes::human_message(&e)));
             Err(exit_codes::reported(kind))
         }
     }
