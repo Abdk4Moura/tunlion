@@ -1,3 +1,4 @@
+// ci path test
 //! The exit-code taxonomy, and the one place a failed command is reported.
 //!
 //! Before this every failure was exit 1, so a script could not tell "no such
