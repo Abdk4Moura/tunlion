@@ -445,13 +445,22 @@ fn scratch(label: &str) -> std::path::PathBuf {
     dir
 }
 
-/// A bare `receive` at a terminal first offers a code entry; Enter there
-/// means "listen on the local network", the long wait these cells interrupt.
+/// A bare `receive` at a terminal first offers a code entry (Enter there
+/// means "listen on the local network") and then a review (Enter waits).
+/// The listen that follows is the long wait these cells interrupt.
 #[cfg(unix)]
 fn start_listening(t: &mut Term, at: usize) {
     assert!(
         t.wait_for_from(at, "enter a code", 30),
         "receive never offered its code entry; screen:\n{}",
+        tail(&t.text())
+    );
+    t.settle(300, 3);
+    t.send("\r");
+    // Then the review screen: "Press Enter to wait, or type cancel".
+    assert!(
+        t.wait_for_from(at, "Press Enter to wait", 30),
+        "receive never showed its review; screen:\n{}",
         tail(&t.text())
     );
     t.settle(300, 3);
