@@ -227,6 +227,11 @@ export function useTunlion() {
   const pendingPakeRef = useRef(null) // { nameplate, password } awaiting a peer
   const pakeRef = useRef(null) // active PakePairing for the current peer
   const pakePeerRef = useRef(null) // peer sid we run the PAKE with
+  // A ceremony that never finishes must end in a clear failure, never in a
+  // silent "paired" header: the CLI refuses a bad confirmation by leaving, and
+  // nothing else would tell the browser.
+  const pairTimerRef = useRef(null)
+  const failPairingRef = useRef(null)
   // L1-a: peers authenticated by an EPHEMERAL transfer-auth ceremony
   // (receiveWithCode), secret discarded, link trusted only for this session's
   // incoming transfer. Distinct from a remembered (stored) device.
@@ -622,6 +627,11 @@ export function useTunlion() {
         makeLink({ id, name, uid })
       })
       sig.on('peer-left', ({ id }) => {
+        // The CLI ends a ceremony it refuses (wrong code, failed confirmation)
+        // by leaving. Without this the browser would sit on "paired" forever.
+        if (id && id === pakePeerRef.current && pakeRef.current && !pakeRef.current.secret) {
+          failPairingRef.current?.('the other device ended the pairing before it finished. Usually the code was mistyped or already used. Nothing was stored; ask for a fresh code.', 'peer-left')
+        }
         linksRef.current.get(id)?.close()
         linksRef.current.delete(id)
         removePeer(id)
@@ -820,6 +830,10 @@ export function useTunlion() {
   const finalizePake = useCallback(() => {
     const p = pakeRef.current
     if (!p) return
+    if (p.secret || p.aborted) {
+      if (pairTimerRef.current) clearTimeout(pairTimerRef.current)
+      pairTimerRef.current = null
+    }
     if (p.secret) {
       const peerId = pakePeerRef.current
       const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
@@ -873,6 +887,11 @@ export function useTunlion() {
       getFingerprints: () => linksRef.current.get(peerId)?.fingerprints() || null,
     })
     setPairStatus('pairing')
+    if (pairTimerRef.current) clearTimeout(pairTimerRef.current)
+    pairTimerRef.current = setTimeout(() => {
+      pairTimerRef.current = null
+      failPairingRef.current?.('the other device did not finish pairing. Nothing was stored. Check the code and ask for a fresh one if it was already used.', 'timeout')
+    }, 40000)
     return pakeRef.current
   }, [])
 
@@ -889,6 +908,34 @@ export function useTunlion() {
     finalizePake()
   }, [finalizePake])
   drivePakeRef.current = drivePake
+
+  const clearPairTimeout = useCallback(() => {
+    if (pairTimerRef.current) clearTimeout(pairTimerRef.current)
+    pairTimerRef.current = null
+  }, [])
+
+  // End an unfinished ceremony with `msg`. Safe to call when nothing is
+  // pending: a finished ceremony has already nulled both refs.
+  const failPairing = useCallback((msg, why) => {
+    clearPairTimeout()
+    if (!pendingPakeRef.current && !pakeRef.current) return
+    if (pakeRef.current?.secret) return
+    tel('pake-failed', { why })
+    setPairStatus(msg)
+    pakeRef.current = null
+    pakePeerRef.current = null
+    pendingPakeRef.current = null
+  }, [clearPairTimeout])
+
+  failPairingRef.current = failPairing
+
+  const armPairTimeout = useCallback((ms) => {
+    if (pairTimerRef.current) clearTimeout(pairTimerRef.current)
+    pairTimerRef.current = setTimeout(() => {
+      pairTimerRef.current = null
+      failPairing('the other device did not finish pairing. Nothing was stored. Check the code and ask for a fresh one if it was already used.', 'timeout')
+    }, ms)
+  }, [failPairing])
 
   const pairWithCode = useCallback(async (code) => {
     const clean = String(code).trim()
@@ -922,8 +969,9 @@ export function useTunlion() {
     }
     pendingPakeRef.current = { nameplate, password }
     setPairStatus('pairing')
+    armPairTimeout(60000)
     sigRef.current?.pairClaimV2(nameplate)
-  }, [])
+  }, [armPairTimeout])
 
   // L1-a: RECEIVE WITH CODE, claim a transfer code, run the SAME ephemeral
   // SPAKE2 ceremony as pairWithCode, but DISCARD the agreed secret (it only
@@ -954,8 +1002,9 @@ export function useTunlion() {
     // secret authenticates this transfer and is then discarded (never stored).
     pendingPakeRef.current = { nameplate, password, ephemeral: true }
     setPairStatus('pairing')
+    armPairTimeout(60000)
     sigRef.current?.pairClaimV2(nameplate)
-  }, [])
+  }, [armPairTimeout])
 
   // Mint a single-use speakable code (or register a chosen keyword). We STAY in
   // the current room while waiting; the big code is shown until it's claimed.

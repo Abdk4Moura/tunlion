@@ -594,12 +594,22 @@ function DiscoveryBar({ state, onPairWithCode, onReceiveWithCode, onGenerateCode
   }
 
   if (scope === 'pair') {
+    // The private room exists as soon as the server matched the code, before
+    // the two ends have proven they hold the same code. Say "paired" only once
+    // the ceremony succeeded; while it runs, say so; if it failed, say why.
+    const done = ps === 'paired' || ps === 'connected'
+    const failed = ps && !done && ps !== 'pairing'
     return (
-      <div style={wrap}>
-        <span style={{ fontSize: 13, color: T.text, whiteSpace: 'nowrap' }}>Paired privately</span>
-        <Pill T={T}>one-time code · burned</Pill>
-        <LanChip localHelper={state.localHelper} T={T} />
-        <span style={{ marginLeft: 'auto' }}>{ghostBtn('← back to nearby', onUseAutoRoom)}</span>
+      <div style={{ ...wrap, flexDirection: failed ? 'column' : 'row', alignItems: failed ? 'stretch' : 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+          <span data-testid="pair-state" style={{ fontSize: 13, color: failed ? '#e0564f' : T.text, whiteSpace: 'nowrap' }}>
+            {done ? 'Paired privately' : failed ? 'Pairing failed' : 'Checking the code…'}
+          </span>
+          {done && <Pill T={T}>one-time code · burned</Pill>}
+          <LanChip localHelper={state.localHelper} T={T} />
+          <span style={{ marginLeft: 'auto' }}>{ghostBtn('← back to nearby', onUseAutoRoom)}</span>
+        </div>
+        {failed && <div data-testid="pair-error" style={{ fontSize: 11, lineHeight: 1.4, color: '#e0564f' }}>{ps}</div>}
       </div>
     )
   }

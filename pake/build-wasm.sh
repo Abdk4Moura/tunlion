@@ -13,10 +13,9 @@ mkdir -p "$OUT"
 wasm-bindgen --target web --out-dir "$OUT" \
   "$HERE/target/wasm32-unknown-unknown/release/filament_pake.wasm"
 
-# Optional: shrink with wasm-opt if available (spec risk #3 — measure size).
-if command -v wasm-opt >/dev/null 2>&1; then
-  wasm-opt -Oz -o "$OUT/filament_pake_bg.wasm" "$OUT/filament_pake_bg.wasm"
-  echo "wasm-opt applied"
-fi
+# No wasm-opt: its output depends on the binaryen version, and CI
+# (.github/workflows/pake-wasm.yml) rebuilds this module and diffs it against
+# the committed one, so the build must be reproducible from the pinned Rust and
+# wasm-bindgen alone.
 echo "wasm size: $(wc -c < "$OUT/filament_pake_bg.wasm") bytes"
 echo "wrote bindings to $OUT"
