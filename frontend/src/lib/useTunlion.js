@@ -15,7 +15,7 @@ import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import * as linkdiag from './linkdiag.js'
 import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
-import { mintWords, mintNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
+import { mintWords, mintCreatedNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink } from '../net/app/recovery.js'
@@ -1079,7 +1079,7 @@ export function useTunlion() {
         // user's chosen one (first try) else a fresh mint; subsequent retries
         // always mint fresh (the chosen one collided / timed out).
         const words = customPassword || mintWords()
-        const nameplate = chosenNameplate || mintNameplate()
+        const nameplate = chosenNameplate || mintCreatedNameplate()
         chosenNameplate = null // honor a user-chosen number only on the FIRST try
         const full = `${words}-${nameplate}`
         // Stash the password so the eventual peer can run SPAKE2 with us.
