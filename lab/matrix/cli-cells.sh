@@ -186,7 +186,8 @@ c_reach_doctor() {
 c_json() {
   x $L <<<'tunlion status --json' | keep -E '"ok": ?true' || return 1
   x $L <<<'tunlion devices --json' | grep -q '"devices"' || return 1
-  x $L <<<'tunlion devices revoke nosuch -y --json 2>/dev/null; echo EXIT=$?' | keep -E '"ok": ?false'
+  # An error under --json is one envelope with ok:false and the exit code (reach is a JSON verb).
+  x $L <<<'tunlion reach nosuch --json 2>/dev/null; echo EXIT=$?' | keep -E '"ok": ?false'
 }
 c_exit_codes() {
   x $L <<<'tunlion exec nosuch -- true'; want_exit 3 $? "unknown device" || return 1
@@ -270,6 +271,26 @@ c_session_resume() { # a shell survives the server's network dropping for 10 s (
   tm_wait mxa 'AFTER-before-drop-42' 60 || return 1
   tm_keys mxa 'exit' Enter; tm_wait mxa 'sam@mx-laptop:~\$ *$' 20
 }
+c_person_external() { # a person invited with add --for person is listed as someone else's, not as one of my devices
+  x $L <<<'tunlion add --for person --name visitor --out inv-visitor.txt -y >/dev/null' || return 1
+  cp_between $L /home/sam/inv-visitor.txt $F /home/sam/inv-visitor.txt
+  x $F <<<'tunlion join inv-visitor.txt -y && tunlion up --detach >/dev/null' || return 1
+  sleep 3
+  local d; d=$(x $L <<<'tunlion devices'); echo "$d"
+  # The visitor row must sit in the EXTERNAL section, never under FLEET.
+  awk '/EXTERNAL/{s="ext"} /FLEET/{s="fleet"} /visitor/{print s}' <<<"$d" | grep -qx ext
+}
+c_demo_auto() { # the guided tour plays to the end by itself at a real TTY
+  tm_new mxb $F
+  tm_keys mxb 'clear; tunlion demo --auto --speed 0; echo DEMO-EXIT=$?' Enter
+  tm_wait mxb 'DEMO-EXIT=' 180 || return 1
+  tm_cap mxb | tail -15
+  tm_cap mxb | grep -q 'DEMO-EXIT=0'
+}
+c_demo_no_tty() { # without a terminal (and without --auto) the demo refuses with exit 2 and says how
+  local r; r=$(x $F <<<'tunlion demo </dev/null 2>&1; echo EXIT=$?'); echo "$r"
+  grep -q 'EXIT=2' <<<"$r" && grep -q -- '--auto' <<<"$r"
+}
 c_default_ceiling() { # third joined with the default ceiling (transfer, mount): no shell, and the refusal says how
   local r; r=$(x $L <<<'tunlion exec third -- true 2>&1; echo EXIT=$?'); echo "$r"
   # Either remedy is actionable: grant on the member, or re-enrol with shell in the ceiling.
@@ -305,4 +326,7 @@ cell C24 cli-cli "invitation --expires cuts live sessions"  c_invite_expiry
 cell C25 cli-cli "hostile machines: code, invite, send"     c_hostile
 cell C26 cli-cli "default ceiling: no shell, remedy named"  c_default_ceiling
 cell C27 cli-cli "shell survives a 10 s network drop"       c_session_resume
+cell C28 cli-cli "a person invitee is EXTERNAL, not FLEET"  c_person_external
+cell C29 cli     "tunlion demo --auto plays to the end"      c_demo_auto
+cell C30 cli     "tunlion demo without a TTY: exit 2"        c_demo_no_tty
 echo "results: $RES"

@@ -31,7 +31,10 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
 async function browser(kind = 'desktop') {
   const b = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const opts = kind === 'phone' ? { ...devices['Pixel 7'] } : { viewport: { width: 1280, height: 860 } };
-  const ctx = await b.newContext({ ...opts, acceptDownloads: true });
+  // serviceWorkers: 'block'. The app installs a service worker, and requests a
+  // worker makes are not seen by context.route: after the first load every
+  // reload would be served from PRODUCTION, not the build under test.
+  const ctx = await b.newContext({ ...opts, acceptDownloads: true, serviceWorkers: 'block' });
   await ctx.route(`${ORIGIN}/**`, async r => {
     const u = new URL(r.request().url()); let f = path.join(DIST, decodeURIComponent(u.pathname));
     if (!fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(DIST, 'index.html');
@@ -79,13 +82,19 @@ async function saveDownload(p, to) {
 // The Send files button on the row of the peer that came in on `code`. Other
 // browsers on the same public IP (other test runs) also appear under "near you",
 // so a bare "Drop a file to send" could go to the wrong peer.
-function sendTo(p, code) {
-  return p.locator(`xpath=//*[contains(normalize-space(.), 'code ${code}') and .//button[normalize-space()='Send files']][last()]//button[normalize-space()='Send files']`).first();
+function sendTo(p, peerName) {
+  return p.getByRole('button', { name: `send files to ${peerName}`, exact: true }).first();
 }
+// The name this browser goes by (what the other side's row is labelled).
+const selfName = p => p.evaluate(() => sessionStorage.getItem('tunlion.name'));
+// Click the Remember button of the "Paired. Remember this device?" prompt. Wait
+// for the BUTTON: the text "Remember" is always on the page (the "Remember a
+// device" mode), so waiting for the text clicked nothing and stored nothing.
 async function remember(p) {
-  const r = p.getByRole('button', { name: /^Remember$/ });
-  if (await r.count()) { await r.first().click(); await p.waitForTimeout(2500); return true; }
-  return false;
+  const r = p.getByRole('button', { name: 'Remember', exact: true }).first();
+  await r.waitFor({ state: 'visible', timeout: 30000 });
+  await r.click(); await p.waitForTimeout(2500);
+  return true;
 }
 
 let ev; const say = (...a) => { const s = a.join(' '); fs.appendFileSync(ev, s + '\n'); };
@@ -130,16 +139,14 @@ async function pairWithVpsIn(x, via) {
     lab(`tmux kill-session -t bxa 2>/dev/null; tmux new-session -d -s bxa -x 160 -y 50 "docker exec -it ${VPS} bash -l"; sleep 2; tmux send-keys -t bxa 'tunlion add' Enter; sleep 4; tmux send-keys -t bxa Enter; sleep 4`);
     const pane = lab(`tmux capture-pane -p -J -t bxa`); const code = (pane.match(CODE) || [])[0]; say('code', code); assert(code, 'CLI add showed a code');
     await enterCode(x.p, code, 'Remember a device');
-    assert(await waitText(x.p, /Remember/, 40000), 'page offers Remember');
-    await remember(x.p);
+    assert(await remember(x.p), 'page offers Remember and it was chosen');
     let pane2 = ''; for (let i = 0; i < 25 && !/remembered|verified end-to-end/.test(pane2); i++) { await x.p.waitForTimeout(1000); pane2 = lab(`tmux capture-pane -p -J -t bxa`); }
     say(pane2); assert(/remembered|verified end-to-end/.test(pane2), 'CLI reports the browser remembered');
   } else {
     // The browser creates the code in "Remember a device" mode; the CLI joins it.
     const code = await createCode(x.p, 'Remember a device'); say('code', code); assert(code, 'page shows a code');
     vps(`(timeout 90 tunlion join ${code} > join.out 2>&1; echo "EXIT=$?" >> join.out) & sleep 1`);
-    assert(await waitText(x.p, /Remember/, 30000), 'page offers Remember');
-    await remember(x.p);
+    assert(await remember(x.p), 'page offers Remember and it was chosen');
     let out = ''; for (let i = 0; i < 60 && !/EXIT=/.test(out); i++) { await x.p.waitForTimeout(1000); out = vps('cat join.out'); }
     say(out); assert(/EXIT=0/.test(out), 'CLI `join <browser code>` exited 0');
   }
@@ -165,7 +172,13 @@ async function pairWithVpsIn(x, via) {
       vps(`mkdir -p fromweb; (timeout 90 tunlion receive ${code} --dir fromweb > fw.out 2>&1; echo "EXIT=$?" >> fw.out) & sleep 1`);
       assert(await waitText(x.p, /Paired|Code accepted/, 30000), 'page pairs with the CLI receiver');
       const f = path.join(OUT, 'ev', 'web-sent.bin'); fs.writeFileSync(f, crypto.randomBytes(250000));
-      await pickFile(x.p, sendTo(x.p, code), f);
+      // The CLI receiver's row is labelled with its display name.
+      const rows = x.p.getByRole('button', { name: /^send files to /i });
+      const names = await rows.evaluateAll(els => els.map(e => e.getAttribute('aria-label')));
+      say('rows:', JSON.stringify(names));
+      const cliRow = names.find(n => /vps/.test(n));
+      assert(cliRow, 'the CLI receiver has a row on the page');
+      await pickFile(x.p, x.p.getByRole('button', { name: cliRow, exact: true }), f);
       let out = ''; for (let i = 0; i < 60 && !/EXIT=/.test(out); i++) { await x.p.waitForTimeout(1000); out = vps('cat fw.out'); }
       say(out); await shot(x.p, 'b03');
       assert(/EXIT=0/.test(out), 'CLI receive exited 0');
@@ -289,7 +302,7 @@ async function pairWithVpsIn(x, via) {
       await shot(A.p, 'bb1-A'); await shot(B.p, 'bb1-B');
       assert(ok, 'A shows paired');
       const f = path.join(OUT, 'ev', 'bb.bin'); fs.writeFileSync(f, crypto.randomBytes(350000));
-      await pickFile(A.p, sendTo(A.p, code), f);
+      await pickFile(A.p, sendTo(A.p, await selfName(B.p)), f);
       assert(await waitText(B.p, /bb\.bin[\s\S]*(done|complete)/i, 40000), 'B shows done');
       const g = await saveDownload(B.p, path.join(OUT, 'ev', 'bb-got.bin'));
       await shot(B.p, 'bb1'); assert(sha(g) === sha(f), 'B got the exact bytes');
@@ -301,13 +314,13 @@ async function pairWithVpsIn(x, via) {
     try {
       const code = await createCode(A.p, 'Remember a device'); assert(code, 'page A shows a code');
       await enterCode(B.p, code, 'Remember a device');
-      assert(await waitText(A.p, /Remember/, 30000), 'A offers Remember');
-      await remember(A.p); await remember(B.p);
+      assert(await remember(A.p), 'A offers Remember and it was chosen');
+      await remember(B.p);
       await home(A.p); await home(B.p); await A.p.waitForTimeout(8000);
       await A.p.getByRole('button', { name: 'Devices' }).click(); await A.p.waitForTimeout(3000);
       await shot(A.p, 'bb2-devices-after-reload');
       const f = path.join(OUT, 'ev', 'bb2.bin'); fs.writeFileSync(f, crypto.randomBytes(120000));
-      await pickFile(A.p, A.p.getByRole('button', { name: /send files to/i }).first(), f);
+      await pickFile(A.p, sendTo(A.p, await selfName(B.p)), f);
       assert(await waitText(B.p, /bb2\.bin[\s\S]*(done|complete)/i, 40000), 'B shows done after reload');
     } finally { await A.b.close(); await B.b.close(); }
   });

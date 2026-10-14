@@ -31,5 +31,6 @@ if [ "$WHAT" = cli ] || [ "$WHAT" = all ]; then
 fi
 if [ "$WHAT" = browser ] || [ "$WHAT" = all ]; then
   node "$here/browser/cells.cjs" "$OUT" "$FILTER" | tee "$OUT/browser-console.txt" || true
+  node "$here/browser/dashboard-cells.cjs" "$OUT" "$FILTER" | tee "$OUT/dashboard-console.txt" || true
 fi
 python3 "$here/render.py" "$OUT" "$sha"

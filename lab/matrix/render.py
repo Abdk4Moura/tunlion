@@ -3,7 +3,7 @@
 import json, sys, pathlib
 out = pathlib.Path(sys.argv[1]); sha = sys.argv[2] if len(sys.argv) > 2 else "?"
 rows = []
-for name in ("cli.jsonl", "browser.jsonl"):
+for name in ("cli.jsonl", "browser.jsonl", "dashboard.jsonl"):
     p = out / name
     if p.exists():
         rows += [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
