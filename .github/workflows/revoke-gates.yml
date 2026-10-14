@@ -77,7 +77,13 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   revoke-gates:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: revoke gates (ubuntu)
     runs-on: ubuntu-latest
     timeout-minutes: 35

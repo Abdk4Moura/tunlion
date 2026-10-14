@@ -1,0 +1,37 @@
+# Shared change detection: does this run need the Rust/CLI jobs?
+#
+# Called by every workflow whose jobs build or test the CLI. Those jobs say
+#   needs: changes
+#   if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+# so a browser-only change (frontend/** outside frontend/src/pake, docs, prose)
+# skips them, and GitHub counts a skipped required check as passed.
+#
+# Why not a path filter on the workflow trigger: a required check whose workflow
+# never starts stays "expected" forever and blocks the merge. A job that starts
+# and is skipped reports a result.
+#
+# Fail open, twice: scripts/ci_changes.py answers "true" on any doubt, and the
+# callers test `!= 'false'`, so if THIS job fails or is cancelled (output empty)
+# the Rust jobs still run. scripts/check_ci_paths.py enforces that shape.
+name: changes
+
+on:
+  workflow_call:
+    outputs:
+      rust:
+        description: "'false' only when the change provably cannot affect the CLI"
+        value: ${{ jobs.classify.outputs.rust }}
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.c.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The diff needs the PR's merge base or the push's 'before' commit.
+          fetch-depth: 0
+      - id: c
+        run: python3 scripts/ci_changes.py

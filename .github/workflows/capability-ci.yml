@@ -23,7 +23,8 @@ name: Capability CI
 
 on:
   push:
-    branches: [main]        # deliberately UNfiltered: main pushes keep caches warm
+    branches: [main]        # no path filter; the changes job skips browser-only merges.
+                            # Their Rust cache entries stay valid (nothing they cover changed).
   pull_request:
     paths-ignore:
       - "**/*.md"
@@ -44,7 +45,13 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Skip the Rust jobs for browser-only changes (see changes.yml).
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   capability-smoke:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -219,6 +226,8 @@ jobs:
   # The test-hooks feature enables signaling-bypass paths; a release binary
   # that accidentally ships test-hooks is a security hole.
   release-no-test-hooks:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: release build (no test-hooks)
     runs-on: ubuntu-latest
     timeout-minutes: 10
