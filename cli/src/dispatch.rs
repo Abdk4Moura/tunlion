@@ -227,14 +227,21 @@ pub(crate) async fn async_main() -> Result<()> {
     // ordering-window probe fires here (and in the harness) but not in unit
     // tests that construct the window state deliberately.
     crate::capability::set_gate_live();
-    match platform::Paths::repair_sensitive_permissions() {
-        Ok(repaired) if repaired > 0 => {
-            eprintln!("tunlion: repaired permissions on {repaired} sensitive config path(s)");
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("tunlion: sensitive config permission repair failed: {e}"),
+    // `tunlion demo` plays a scripted tour: point it away from the real config
+    // directory, and skip the housekeeping below, which writes a stamp file.
+    if crate::demo::invoked(&std::env::args().collect::<Vec<_>>()) {
+        crate::demo::isolate();
     }
-    platform::tighten_config_dir(&platform::Paths::config_dir());
+    if !crate::demo::isolated() {
+        match platform::Paths::repair_sensitive_permissions() {
+            Ok(repaired) if repaired > 0 => {
+                eprintln!("tunlion: repaired permissions on {repaired} sensitive config path(s)");
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("tunlion: sensitive config permission repair failed: {e}"),
+        }
+        platform::tighten_config_dir(&platform::Paths::config_dir());
+    }
     // Bare-arg comfort dispatch: `tunlion <path>` sends it with a code;
     // `tunlion <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
@@ -551,6 +558,7 @@ pub(crate) async fn async_main() -> Result<()> {
             | Cmd::Man { .. }
             | Cmd::Update { .. }
             | Cmd::Skill { .. }
+            | Cmd::Demo { .. }
     );
     if !exempt {
         // A verb with its own --json flag must still answer in JSON.
@@ -2513,6 +2521,9 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Requests { action } => requests_cmd(action).await,
         Cmd::Skill { action } => crate::skill::skill_cmd(action, ui_caps.json || cli.json),
         Cmd::Dashboard { no_open, port } => crate::dashboard::dashboard_cmd(no_open, port, &server).await,
+        Cmd::Demo { auto, step, speed, reduced_motion } => {
+            crate::demo::demo_cmd(crate::demo::Opts { auto, step, speed, reduced_motion }).await
+        }
         Cmd::Backup {
             peer,
             source,

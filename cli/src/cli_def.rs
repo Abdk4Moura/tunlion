@@ -52,6 +52,8 @@ COMMANDS
     doctor                 diagnose a link
   Agents
     skill install          teach your AI agent tunlion (opt-in; writes ~/.claude/skills)
+  Learn
+    demo                   a guided tour in this terminal, played offline
 
 EXAMPLES
   tunlion video.mp4                 send it; mints a speakable one-time code + QR
@@ -900,6 +902,31 @@ pub(crate) enum Cmd {
         #[arg(long)]
         port: Option<u16>,
     },
+    // ── Learn ───────────────────────────────────────────────────────
+    /// A guided tour you follow in this terminal: sample commands, played offline.
+    ///
+    /// Each step shows a real tunlion command (send by code, pair, shell, forward,
+    /// an invitation that expires on time, cutting a device off). Type it, or
+    /// press Enter and it is typed for you. Every peer and output line is
+    /// simulated: nothing touches the network, an account, or this machine's
+    /// tunlion identity and settings.
+    ///
+    /// Needs a terminal. --auto plays the whole tour without input, for a
+    /// recording or a pipe.
+    Demo {
+        /// Play the whole tour without input (for recordings and pipes).
+        #[arg(long)]
+        auto: bool,
+        /// Start at this step (1 is the first).
+        #[arg(long, value_name = "N")]
+        step: Option<usize>,
+        /// Pace: 1 is normal, 2 twice as fast, 0 plays without pauses.
+        #[arg(long, value_name = "X", default_value_t = 1.0)]
+        speed: f64,
+        /// No animation (also TUNLION_REDUCED_MOTION=1).
+        #[arg(long)]
+        reduced_motion: bool,
+    },
 }
 
 /// `tunlion skill` actions.
@@ -1043,9 +1070,9 @@ mod tests {
             }
             let first = trimmed.split_whitespace().next().unwrap_or("");
             let verb = first.trim_end_matches(':');
-            // Group headings in the banner (Start/Share/Serve/Devices/Mesh) are
-            // not commands.
-            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh" | "Agents") {
+            // Group headings in the banner (Start/Share/Serve/Devices/Mesh/
+            // Agents/Learn) are not commands.
+            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh" | "Agents" | "Learn") {
                 continue;
             }
             if verb.is_empty() || verb.starts_with("add") || verb.starts_with("up") {

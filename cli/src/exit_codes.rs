@@ -371,6 +371,8 @@ const PAIRING_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 130, 143];
 const LOCAL_CODES: &[i32] = &[0, 1, 2, 3, 9, 12];
 /// `skill`: a refused or unresolvable target is 2, a full disk 12.
 const SKILL_CODES: &[i32] = &[0, 1, 2, 12];
+/// `demo`: no terminal (without --auto) or a bad --step/--speed is 2.
+const DEMO_CODES: &[i32] = &[0, 1, 2, 130, 143];
 /// Verbs not listed above: the codes any command can produce.
 const DEFAULT_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 130, 143];
 
@@ -391,6 +393,7 @@ pub(crate) fn verb_exit_codes(verb: &str) -> &'static [i32] {
         "init" | "add" | "join" | "pair" | "depart" | "enroll" | "grant" | "revoke" => PAIRING_CODES,
         "set" | "addr" | "id" | "config" | "completions" | "man" => LOCAL_CODES,
         "skill" => SKILL_CODES,
+        "demo" => DEMO_CODES,
         _ => DEFAULT_CODES,
     }
 }
@@ -880,13 +883,14 @@ mod tests {
         // (the network verdict for a daemon that died starting), which are
         // up's codes. status's own codes are decided in one function,
         // status_exit_code, and asserted below.
-        let sources: [(&str, &str); 6] = [
+        let sources: [(&str, &str); 7] = [
             ("send", concat!(include_str!("send_cmd.rs"), include_str!("send_report.rs"), include_str!("send_source.rs"))),
             ("sync", include_str!("sync_cmd.rs")),
             ("exec", include_str!("exec_send.rs")),
             ("reach", include_str!("ping.rs")),
             ("receive", include_str!("recv_cmd.rs")),
             ("skill", include_str!("skill.rs")),
+            ("demo", include_str!("demo.rs")),
         ];
         for (verb, src) in sources {
             let allowed = verb_exit_codes(verb);

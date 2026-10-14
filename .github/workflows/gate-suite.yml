@@ -144,6 +144,7 @@ on:
       - 'cli/tests/rc-polish-gates.sh'
       - 'cli/tests/concurrent-code-gates.sh'
       - 'cli/tests/dashboard-gates.sh'
+      - 'cli/tests/demo-gates.sh'
       - 'backend/**'
       - '.github/workflows/gate-suite.yml'
   workflow_dispatch: {}
@@ -250,6 +251,8 @@ jobs:
             [cli/tests/concurrent-code-gates.sh]=7
             # 9: H O S A W I G C X (feat/dashboard).
             [cli/tests/dashboard-gates.sh]=9
+            # 6: A T I C N Z (feat/demo-command: the offline guided tour).
+            [cli/tests/demo-gates.sh]=6
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
@@ -287,7 +290,8 @@ jobs:
                    cli/tests/state-ux-gates.sh \
                    cli/tests/rc-polish-gates.sh \
                    cli/tests/concurrent-code-gates.sh \
-                   cli/tests/dashboard-gates.sh; do
+                   cli/tests/dashboard-gates.sh \
+                   cli/tests/demo-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare
