@@ -117,6 +117,38 @@ pub(crate) fn principal_from_records(
     )
 }
 
+/// This device's own access has ended: its certificate (for an invited device,
+/// the invitation's end) is at or past `now`. Read without verifying, because an
+/// expired certificate fails verification and that expiry is the very fact asked
+/// about. None when there is no certificate, it is not ours, or it has no end.
+pub(crate) fn own_access_ended_at(now: u64) -> Option<u64> {
+    let raw = std::fs::read_to_string(local_device_cert_path()).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let cert = identity::DeviceCert::from_json(&value["cert"])?;
+    let ours = crate::overlay::overlay_pubkey_bytes().ok()?;
+    own_access_ended(&cert, &ours, now)
+}
+
+/// Pure half of [`own_access_ended_at`]. One second of grace covers a link the
+/// serving side closed in the same second it cut the session.
+pub(crate) fn own_access_ended(cert: &identity::DeviceCert, ours: &[u8; 32], now: u64) -> Option<u64> {
+    (cert.device_pub == *ours && cert.expires != 0 && cert.expires <= now.saturating_add(1)).then_some(cert.expires)
+}
+
+/// The error for a link to `peer` that died while this device's own access had
+/// just ended. The serving side cuts the session and closes the link at its
+/// deadline; when the close outruns the cut message, the link loss is that cut,
+/// so it reads as the expiry (exit 4), never as an unreachable peer (exit 6).
+pub(crate) fn link_died_error(peer: &str, detail: &str) -> anyhow::Error {
+    match own_access_ended_at(identity::now_secs()) {
+        Some(at) => anyhow::anyhow!(
+            "'{peer}' refused to continue: {}",
+            crate::capability::expired_reason_for(at, None)
+        ),
+        None => anyhow::anyhow!("link to '{peer}' died {detail}"),
+    }
+}
+
 pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
     if let (Ok(raw), Ok(overlay_pub)) = (
         std::fs::read_to_string(local_device_cert_path()),
@@ -1429,5 +1461,38 @@ mod rc_identity_gate_tests {
             crate::exit_codes::classify_text(UP_NEEDS_IDENTITY_MSG),
             crate::exit_codes::ExitKind::NoIdentity
         );
+    }
+}
+
+#[cfg(test)]
+mod own_access_tests {
+    use super::*;
+
+    fn cert(device_pub: [u8; 32], expires: u64) -> identity::DeviceCert {
+        identity::DeviceCert { device_pub, user_pub: [9; 32], expires, issued: 1, sig: [0; 64] }
+    }
+
+    #[test]
+    fn ended_only_for_our_own_certificate_at_or_past_its_end() {
+        let ours = [7u8; 32];
+        assert_eq!(own_access_ended(&cert(ours, 1000), &ours, 1000), Some(1000));
+        assert_eq!(own_access_ended(&cert(ours, 1000), &ours, 999), Some(1000), "one second of grace");
+        assert_eq!(own_access_ended(&cert(ours, 1000), &ours, 998), None);
+        assert_eq!(own_access_ended(&cert([8; 32], 1000), &ours, 2000), None, "not our certificate");
+        assert_eq!(own_access_ended(&cert(ours, 0), &ours, 2000), None, "no end");
+    }
+
+    /// The race this exists for: the serving side cut the session and closed the
+    /// link in the same moment. With our access ended, the link loss must read as
+    /// the expiry (exit 4), not as an unreachable peer (exit 6).
+    #[test]
+    fn a_link_lost_after_our_access_ended_is_denied_not_unreachable() {
+        let msg = format!(
+            "'laptop' refused to continue: {}",
+            crate::capability::expired_reason_for(1000, None)
+        );
+        assert_eq!(crate::exit_codes::classify_text(&msg), crate::exit_codes::ExitKind::Denied);
+        let plain = "link to 'laptop' died during exec (the connection is closed)";
+        assert_eq!(crate::exit_codes::classify_text(plain), crate::exit_codes::ExitKind::Unreachable);
     }
 }

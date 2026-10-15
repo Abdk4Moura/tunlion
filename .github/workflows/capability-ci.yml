@@ -210,6 +210,14 @@ jobs:
           CXX: ${{ runner.os != 'Windows' && 'sccache c++' || '' }}
         timeout-minutes: 15
 
+      - name: Expiry/close race gate (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash cli/tests/expiry-race-gates.sh
+        env:
+          TUNLION_BIN: ${{ github.workspace }}/cli/target/release/tunlion
+        timeout-minutes: 6
+
       - name: Upload harness log (macOS)
         if: runner.os == 'macOS' && always()
         uses: actions/upload-artifact@v4

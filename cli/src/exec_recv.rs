@@ -1028,6 +1028,20 @@ pub(crate) async fn serve_exec(
                         "peer access revoked",
                     )
                     .await;
+                    // Test hook (gate proof, compiled out of release builds): close
+                    // the link BEFORE the cut message, the order a racing close
+                    // produces, so the initiator's handling of that order is gated
+                    // deterministically (cli/tests/expiry-race-gates.sh).
+                    #[cfg(feature = "test-hooks")]
+                    if matches!(cut, Some(crate::identity_state::LiveCut::Expired(_)))
+                        && std::env::var("TUNLION_TEST_EXPIRY_CLOSE_FIRST").is_ok()
+                    {
+                        crate::ui::critical("test hook: expiry closes the link before the cut message");
+                        t.force_close();
+                        mux.drop_stream(sid).await;
+                        mux.drop_stream(err_sid).await;
+                        return;
+                    }
                     let mut close = json!({
                         "type": "l2-close",
                         "sid": sid,
