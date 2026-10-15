@@ -1,11 +1,27 @@
 # Launch matrix results, 0.9.0
 
-Run: https://github.com/Abdk4Moura/tunlion/actions/runs/38737947532 (GitHub runner, `.github/workflows/matrix.yml`).
-Product code: main eda56186 (the branch adds only matrix harness changes). Signaling: production API.
-C20 (forced relay) ran against a local backend and a local coturn on the runner.
+Latest run: https://github.com/Abdk4Moura/tunlion/actions/runs/38768306726 on main 08d483a4
+(GitHub runner, `.github/workflows/matrix.yml`). Signaling: production API. C20 (forced relay)
+ran against a local backend and a local coturn on the runner.
 
-**49 pass, 0 fail, 2 n/a** of 51 cells. The browser pairing cells (B03 B04 B05 B08 B12 BB1) ran
-four more rounds in the same run: **24 of 24 pass**.
+**49 pass, 0 fail, 2 n/a** of 51 cells (C13: member-to-member links are not in this release;
+C15: no `/dev/fuse` in the containers). The browser pairing cells (B03 B04 B05 B08 B12 BB1) ran
+four more rounds in the same run: **23 of 24 pass**. The one failure (B03, round 3) was the page
+never reaching the production signaling server ("offline, reconnecting" in the page text), not a
+pairing fault.
+
+Known, with evidence:
+
+- With `signaling=local` the CLI-CLI cell C24 (invitation `--expires` cuts live sessions) ends the
+  live exec on time (116 to 117 s, within the 135 s bound) but as a dead link (exit 6) rather than
+  the "access expired" refusal (exit 4). It does the same on the commit before the latest backend
+  change, and passes with production signaling, so it is not a regression. The exit reason is a
+  race between the expiry closing the link and the session's own cut message.
+- Production coturn still allows only 41 relay ports (49160-49200). The repo's config now uses
+  49152-65535 (#457); production needs that deployed and the firewall opened.
+
+The previous all-pass run (38737947532, main eda56186) had the same totals and 24 of 24 pairing rounds.
+Per-cell results from it follow; the latest run matched them cell for cell.
 
 | Cell | Pair | Feature | Result | Seconds | Evidence |
 |---|---|---|---|---|---|
