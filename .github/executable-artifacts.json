@@ -383,6 +383,7 @@
         "cli/tests/revocation-live-gates.sh",
         "cli/tests/roster-gates.sh",
         "cli/tests/shell-posture-gates.sh",
+        "cli/tests/term-restore-gates.sh",
         "cli/tests/warm-hold-idle-gates.sh"
       ]
     },
@@ -454,6 +455,17 @@
       "disposition": "support",
       "invoked_by": [
         "cli/tests/natprobe-test.sh"
+      ]
+    },
+    {
+      "path": "cli/tests/term-restore-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/term-restore-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
       ]
     },
     {
