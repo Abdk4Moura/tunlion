@@ -496,7 +496,7 @@ async fn exec_once(
                         // a peer that can never send again means waiting is pointless, even though the
                         // connection is otherwise usable.
                         if mux.transport().is_dead() {
-                            bail!("link to '{peer}' died during exec (the output stream ended and the connection is closed)");
+                            return Err(crate::identity_flow::link_died_error(peer, "during exec (the output stream ended and the connection is closed)"));
                         }
                         // TERMINAL AND NAMED, with no timeout involved: the session's stream ended
                         // and no `exec-close` carrying a status will follow, so waiting longer can
@@ -537,7 +537,7 @@ async fn exec_once(
                             }
                         }
                         if failed {
-                            bail!("link to '{peer}' died mid-send");
+                            return Err(crate::identity_flow::link_died_error(peer, "mid-send"));
                         }
                     }
                     None => { stdin_done = true; }
@@ -603,7 +603,7 @@ async fn exec_once(
                     // anything else is ignored, with the 2s ticker as backstop.
                     Some(_) => {}
                     None => {
-                        bail!("link to '{peer}' died during exec (the link's event channel closed)");
+                        return Err(crate::identity_flow::link_died_error(peer, "during exec (the link's event channel closed)"));
                     }
                 },
                 _ = ticker.tick() => {
@@ -611,13 +611,13 @@ async fn exec_once(
                     // a peer that can never send again means waiting is pointless, even though the
                     // connection is otherwise usable.
                     if mux.transport().is_dead() {
-                        bail!("link to '{peer}' died during exec (the connection is closed)");
+                        return Err(crate::identity_flow::link_died_error(peer, "during exec (the connection is closed)"));
                     }
                     if last_heard.elapsed() >= EXEC_PEER_SILENT {
-                        bail!(
-                            "link to '{peer}' died during exec: no answer for {}s",
-                            EXEC_PEER_SILENT.as_secs()
-                        );
+                        return Err(crate::identity_flow::link_died_error(
+                            peer,
+                            &format!("during exec: no answer for {}s", EXEC_PEER_SILENT.as_secs()),
+                        ));
                     }
                 }
             }
