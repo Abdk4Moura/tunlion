@@ -77,6 +77,26 @@ use tokio::sync::mpsc;
 /// receiver (and its exit) hostage.
 const ACK_FLUSH_BUDGET: Duration = Duration::from_secs(2);
 
+/// The `caps` message to re-send on live links when what this machine serves
+/// changed (a grant, or the revoke of the last shell grant), else None. Pure.
+fn caps_reannounce(was_serving_shell: bool, serving_shell: bool) -> Option<Value> {
+    (was_serving_shell != serving_shell).then(|| json!({ "type": "caps", "shell": serving_shell }))
+}
+
+#[cfg(test)]
+mod caps_reannounce_tests {
+    use super::caps_reannounce;
+
+    #[test]
+    fn a_grant_or_last_revoke_is_announced_on_live_links() {
+        assert_eq!(caps_reannounce(false, true).unwrap()["shell"], true);
+        assert_eq!(caps_reannounce(true, false).unwrap()["shell"], false);
+        assert_eq!(caps_reannounce(true, false).unwrap()["type"], "caps");
+        assert!(caps_reannounce(true, true).is_none());
+        assert!(caps_reannounce(false, false).is_none());
+    }
+}
+
 /// A shell-class open parked while its link's possession proof is in flight
 /// (settle-then-evaluate). The link is identified by pid AND the device key
 /// known at park time: only a proof for the same identity on the same link
@@ -2094,7 +2114,23 @@ pub(crate) async fn recv_cmd(
         // Live posture: a `tunlion grant <dev> shell` (or the revoke of the last
         // shell grant) applies to the RUNNING daemon on the next open. Computed once at startup, it silently required a
         // restart and refused every granted device with "shell serving is off".
+        let was_l2 = l2_enabled;
         l2_enabled = l2_launch || crate::shell_support::any_shell_grant_live();
+        // A grant (or the revoke of the last one) changed what this machine
+        // serves: say so on the links that are already up. The `caps` message
+        // went out only at ChannelReady, so a browser that was connected when
+        // the owner ran `grant` showed no Shell button until it reconnected.
+        // Spawned: a send must never block this loop on a dead peer.
+        if let Some(caps) = caps_reannounce(was_l2, l2_enabled) {
+            for l in conn.links.values() {
+                if let Some(t) = l.transport.clone() {
+                    let caps = caps.clone();
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), t.send_control(&caps)).await;
+                    });
+                }
+            }
+        }
         // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
         // If this loop WEDGES on an await, the pings stop and systemd restarts us
         // - the backstop for the stall that also freezes the reconnect code.
