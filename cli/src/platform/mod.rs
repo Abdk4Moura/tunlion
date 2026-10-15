@@ -1159,7 +1159,7 @@ pub enum InstallResult {
 
 /// On Android the app is the service manager: it runs `tunlion up --userspace`
 /// in its own foreground service, so there is nothing for `--install` to create.
-pub const ANDROID_NO_INSTALL: &str = "`up --install` is not available on Android: the tunlion app keeps tunlion running. Run `tunlion up --userspace` (the app does this for you).";
+pub const ANDROID_NO_INSTALL: &str = "`up --install` is not available on Android: the Android app keeps the daemon running. Run `tunlion up --userspace` (the app does this for you).";
 
 impl ServiceHost {
     pub fn detect() -> Self {

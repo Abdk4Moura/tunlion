@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Result};
 
-const NO_KERNEL_TUN: &str = "Android has no kernel TUN for apps; tunlion uses the userspace overlay here";
+const NO_KERNEL_TUN: &str = "Android has no kernel TUN for apps; the userspace overlay is used here";
 
 /// Never constructed: `open` always refuses.
 pub struct KernelTun {
