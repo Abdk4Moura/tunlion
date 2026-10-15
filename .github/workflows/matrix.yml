@@ -22,6 +22,9 @@ on:
       signaling:
         description: "auto (production if it answers) | production | local"
         default: "auto"
+      debug:
+        description: "MX_DEBUG: page and CLI logs into the evidence (1 to turn on)"
+        default: ""
       pairing_repeats:
         description: "Extra rounds of the browser pairing cells (B03 B04 B05 B08 B12 BB1)"
         default: "4"
@@ -113,6 +116,7 @@ jobs:
           LAB_HOST: "bash -c"
           LAB_DIR: /home/runner/matrix
           PLAYWRIGHT: ${{ github.workspace }}/frontend/node_modules/playwright
+          MX_DEBUG: ${{ inputs.debug }}
         run: |
           export FRONTEND_DIST="$RUNNER_TEMP/dist-prod"
           OUT="$RUNNER_TEMP/out"
