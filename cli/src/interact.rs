@@ -3,7 +3,6 @@
 
 use std::io::Write;
 use std::net::IpAddr;
-use std::process::Command;
 
 use crate::ui;
 
@@ -27,7 +26,7 @@ fn classify_interface(name: &str) -> &'static str {
 
 pub fn enumerate_interfaces() -> Vec<InterfaceInfo> {
     let mut out: Vec<InterfaceInfo> = Vec::new();
-    if let Ok(raw) = Command::new("ip").args(["-o", "-4", "addr", "show"]).output() {
+    if let Ok(raw) = crate::platform::command("ip").args(["-o", "-4", "addr", "show"]).output() {
         let text = String::from_utf8_lossy(&raw.stdout);
         let mut seen: std::collections::HashMap<String, Vec<IpAddr>> = std::collections::HashMap::new();
         for line in text.lines() {

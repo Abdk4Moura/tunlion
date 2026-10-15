@@ -191,7 +191,7 @@ pub(crate) fn add_pending_request(
     if let Ok(hook) = std::env::var("TUNLION_NOTIFY_HOOK") {
         if !hook.is_empty() {
             // ARGV exec, never shell — petname is attacker-influenced
-            let _ = std::process::Command::new(&hook)
+            let _ = crate::platform::command(&hook)
                 .arg(peer)
                 .arg(capability)
                 .spawn();
@@ -282,12 +282,12 @@ pub(crate) fn stop_managed_service(pid: u32) -> bool {
     // service during development. Two units share the name here, so the cgroup
     // scope decides which manager.
     match service_manager_for_pid(pid) {
-        Some(ServiceManager::SystemdSystem) => std::process::Command::new("systemctl")
+        Some(ServiceManager::SystemdSystem) => crate::platform::command("systemctl")
             .args(["stop", crate::platform::SYSTEMD_UNIT])
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
-        Some(ServiceManager::SystemdUser) => std::process::Command::new("systemctl")
+        Some(ServiceManager::SystemdUser) => crate::platform::command("systemctl")
             .args(["--user", "stop", crate::platform::SYSTEMD_UNIT])
             .status()
             .map(|s| s.success())
@@ -393,7 +393,7 @@ pub(crate) fn unmount_fuse(local: &str) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         for bin in ["fusermount3", "fusermount"] {
-            if std::process::Command::new(bin)
+            if crate::platform::command(bin)
                 .args(["-u", local])
                 .status()
                 .map(|s| s.success())
@@ -403,14 +403,14 @@ pub(crate) fn unmount_fuse(local: &str) -> std::io::Result<()> {
             }
         }
         // Linux last resort: lazy unmount so a busy handle does not wedge teardown.
-        let _ = std::process::Command::new("fusermount3")
+        let _ = crate::platform::command("fusermount3")
             .args(["-uz", local])
             .status();
     }
     #[cfg(target_os = "macos")]
     {
         // Try diskutil first (more reliable for macFUSE), fall back to umount.
-        if std::process::Command::new("diskutil")
+        if crate::platform::command("diskutil")
             .args(["unmount", "force", local])
             .status()
             .map(|s| s.success())
@@ -418,7 +418,7 @@ pub(crate) fn unmount_fuse(local: &str) -> std::io::Result<()> {
         {
             return Ok(());
         }
-        let _ = std::process::Command::new("umount").args([local]).status();
+        let _ = crate::platform::command("umount").args([local]).status();
     }
     Ok(())
 }

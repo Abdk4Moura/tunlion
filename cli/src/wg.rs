@@ -12,7 +12,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Generate a WireGuard keypair, returned as (private_b64, public_b64), via `wg`.
 /// Can this machine actually run kernel WireGuard right now?
@@ -45,7 +45,7 @@ pub fn usable() -> bool {
         return false;
     }
     debug_assert!(WG_DEV.len() <= MAX_IFNAME, "wg device name too long for Linux");
-    if Command::new("wg").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+    if crate::platform::command("wg").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
         return false;
     }
     // SHORT ON PURPOSE. Linux caps an interface name at 15 characters, and
@@ -64,7 +64,7 @@ pub fn usable() -> bool {
 }
 
 pub fn gen_keypair() -> Result<(String, String)> {
-    let out = Command::new("wg")
+    let out = crate::platform::command("wg")
         .arg("genkey")
         .output()
         .context("run `wg genkey` (is wireguard-tools installed?)")?;
@@ -73,7 +73,7 @@ pub fn gen_keypair() -> Result<(String, String)> {
     }
     let privkey = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
-    let mut child = Command::new("wg")
+    let mut child = crate::platform::command("wg")
         .arg("pubkey")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -93,7 +93,7 @@ pub fn gen_keypair() -> Result<(String, String)> {
 }
 
 fn ip(args: &[&str]) -> Result<()> {
-    let out = Command::new("ip").args(args).output().context("exec ip")?;
+    let out = crate::platform::command("ip").args(args).output().context("exec ip")?;
     if !out.status.success() {
         bail!("ip {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -108,7 +108,7 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
 
     // `wg set <dev> private-key <path>`: feed the key on stdin via /dev/stdin so it
     // never lands on disk.
-    let mut child = Command::new("wg")
+    let mut child = crate::platform::command("wg")
         // WireGuard's registered port, not an ephemeral one. A port that
         // changes every start cannot be port-forwarded, and a forwardable port
         // is the difference between a peer being directly reachable and having
@@ -133,8 +133,8 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
 
     // If 51820 was taken the set above failed; retry on an ephemeral port so a
     // second tunlion on the same host still works, just unforwardably.
-    if Command::new("wg").args(["show", dev, "listen-port"]).output().map(|o| !o.status.success()).unwrap_or(true) {
-        let mut child = Command::new("wg")
+    if crate::platform::command("wg").args(["show", dev, "listen-port"]).output().map(|o| !o.status.success()).unwrap_or(true) {
+        let mut child = crate::platform::command("wg")
             .args(["set", dev, "private-key", "/dev/stdin", "listen-port", "0"])
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -145,7 +145,7 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
         }
         let _ = child.wait();
     }
-    let out = Command::new("wg").args(["show", dev, "listen-port"]).output().context("wg show listen-port")?;
+    let out = crate::platform::command("wg").args(["show", dev, "listen-port"]).output().context("wg show listen-port")?;
     if !out.status.success() {
         bail!("wg show listen-port failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -161,7 +161,7 @@ pub fn configure_peer(
     addr_cidr: &str,
     mtu: u32,
 ) -> Result<()> {
-    let out = Command::new("wg")
+    let out = crate::platform::command("wg")
         .args([
             "set", dev, "peer", peer_pub, "allowed-ips", allowed_ips, "endpoint", endpoint,
             "persistent-keepalive", "25",
@@ -285,7 +285,7 @@ pub async fn adopt_peer(
 /// Drop a peer whose direct path never handshook, so a dead entry cannot keep a
 /// route pointed into a tunnel that carries nothing.
 fn remove_peer(peer_pub: &str) -> Result<()> {
-    let out = Command::new("wg")
+    let out = crate::platform::command("wg")
         .args(["set", WG_DEV, "peer", peer_pub, "remove"])
         .output()
         .context("wg set peer remove")?;
@@ -309,7 +309,7 @@ fn wrap_v6(ip: std::net::IpAddr) -> String {
 /// perfectly correct, and carry nothing, which is exactly what a NAT with no
 /// inbound mapping produces.
 fn handshook(peer_pub: &str) -> bool {
-    let Ok(out) = Command::new("wg").args(["show", WG_DEV, "latest-handshakes"]).output() else {
+    let Ok(out) = crate::platform::command("wg").args(["show", WG_DEV, "latest-handshakes"]).output() else {
         return false;
     };
     String::from_utf8_lossy(&out.stdout).lines().any(|l| {
@@ -338,7 +338,7 @@ fn iface_identity() -> Result<(String, String)> {
 
 /// The listen port of an interface we already created, if any.
 fn existing_listen_port() -> Option<u16> {
-    let out = Command::new("wg").args(["show", WG_DEV, "listen-port"]).output().ok()?;
+    let out = crate::platform::command("wg").args(["show", WG_DEV, "listen-port"]).output().ok()?;
     if !out.status.success() {
         return None;
     }

@@ -1709,7 +1709,7 @@ fn down_cmd() -> Result<()> {
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
             if !stop_managed_service(pid) {
-                let status = std::process::Command::new("kill").arg(pid.to_string()).status()?;
+                let status = crate::platform::command("kill").arg(pid.to_string()).status()?;
                 // A failed kill leaves the daemon running. Saying "stopped" and
                 // deleting the pidfile would hide it from `status` and `reset`
                 // while it keeps serving, so keep the pidfile and say why.
@@ -2132,7 +2132,7 @@ async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
 
 impl TtyGuard {
     fn raw() -> TtyGuard {
-        let saved = std::process::Command::new("stty")
+        let saved = crate::platform::command("stty")
             .arg("-g")
             .stdin(std::process::Stdio::inherit())
             .output()
@@ -2140,7 +2140,7 @@ impl TtyGuard {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         if saved.is_some() {
-            let _ = std::process::Command::new("stty")
+            let _ = crate::platform::command("stty")
                 .args(["-icanon", "-echo", "min", "1", "time", "0"])
                 .stdin(std::process::Stdio::inherit())
                 .status();
@@ -2149,7 +2149,7 @@ impl TtyGuard {
     }
     fn restore(&self) {
         if let Some(s) = &self.saved {
-            let _ = std::process::Command::new("stty")
+            let _ = crate::platform::command("stty")
                 .arg(s)
                 .stdin(std::process::Stdio::inherit())
                 .status();

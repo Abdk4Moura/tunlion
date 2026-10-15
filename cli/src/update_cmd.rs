@@ -183,7 +183,7 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     std::fs::write(&staging, &new_bin)?;
     // Preserve any CAP_NET_ADMIN grant across the update (Linux only).
     #[cfg(target_os = "linux")]
-    let had_cap = std::process::Command::new("getcap")
+    let had_cap = crate::platform::command("getcap")
         .arg(&me)
         .output()
         .ok()
@@ -215,14 +215,14 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         // can't, tell the user the one command so L3 isn't silently broken.
         let is_root = unsafe { libc::geteuid() } == 0;
         let ok = if is_root {
-            std::process::Command::new("setcap")
+            crate::platform::command("setcap")
                 .args(["cap_net_admin+eip"])
                 .arg(&me)
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
         } else {
-            std::process::Command::new("sudo")
+            crate::platform::command("sudo")
                 .args(["setcap", "cap_net_admin+eip"])
                 .arg(&me)
                 .status()

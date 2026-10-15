@@ -268,7 +268,7 @@ pub async fn mount_cmd(
         // Daemon not available or mount failed, fall through to direct spawn.
     }
 
-    if std::process::Command::new("which")
+    if crate::platform::command("which")
         .arg("sshfs")
         .output()
         .map(|o| !o.status.success())
@@ -305,7 +305,7 @@ pub async fn mount_cmd(
 
     // Build the sshfs command.
     let build_sshfs = |info: &crate::l2::PeerSshInfo, use_l3: bool| -> std::process::Command {
-        let mut cmd = std::process::Command::new("sshfs");
+        let mut cmd = crate::platform::command("sshfs");
         cmd.arg("-o").arg(format!("IdentityFile={}", info.key_path.display()));
         cmd.arg("-o").arg("IdentitiesOnly=yes");
         cmd.arg("-o").arg(format!("UserKnownHostsFile={}", info.known_hosts_path.display()));
@@ -596,7 +596,7 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
 
             let path = &entry.local;
             // Try fusermount first.
-            let status = std::process::Command::new("fusermount")
+            let status = crate::platform::command("fusermount")
                 .arg("-u")
                 .arg(path)
                 .status();
@@ -608,7 +608,7 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
                     Ok(())
                 }
                 _ => {
-                    let status = std::process::Command::new("umount").arg(path).status()?;
+                    let status = crate::platform::command("umount").arg(path).status()?;
                     if status.success() {
                         let _ = remove_mount(path);
                         crate::ui::say(&format!("unmounted {path} (id: {})", entry.id));
@@ -624,7 +624,7 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
         None => {
             // Not tracked - try as a direct path.
             if Path::new(target).exists() {
-                let status = std::process::Command::new("fusermount")
+                let status = crate::platform::command("fusermount")
                     .arg("-u")
                     .arg(target)
                     .status();
@@ -634,7 +634,7 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
                         Ok(())
                     }
                     _ => {
-                        let status = std::process::Command::new("umount").arg(target).status()?;
+                        let status = crate::platform::command("umount").arg(target).status()?;
                         if status.success() {
                             crate::ui::say(&format!("unmounted {target}"));
                             Ok(())
@@ -675,7 +675,7 @@ pub async fn unmount_cmd_async(target: &str) -> Result<()> {
             }
 
             let path = &entry.local;
-            let status = tokio::process::Command::new("fusermount")
+            let status = crate::platform::tokio_command("fusermount")
                 .arg("-u")
                 .arg(path)
                 .status()
@@ -688,7 +688,7 @@ pub async fn unmount_cmd_async(target: &str) -> Result<()> {
                     Ok(())
                 }
                 _ => {
-                    let status = tokio::process::Command::new("umount")
+                    let status = crate::platform::tokio_command("umount")
                         .arg(path)
                         .status()
                         .await?;
@@ -705,7 +705,7 @@ pub async fn unmount_cmd_async(target: &str) -> Result<()> {
         }
         None => {
             if Path::new(target).exists() {
-                let status = tokio::process::Command::new("fusermount")
+                let status = crate::platform::tokio_command("fusermount")
                     .arg("-u")
                     .arg(target)
                     .status()
@@ -716,7 +716,7 @@ pub async fn unmount_cmd_async(target: &str) -> Result<()> {
                         Ok(())
                     }
                     _ => {
-                        let status = tokio::process::Command::new("umount")
+                        let status = crate::platform::tokio_command("umount")
                             .arg(target)
                             .status()
                             .await?;

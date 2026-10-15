@@ -396,7 +396,7 @@ pub(crate) async fn ensure_ca_key_with(
     let created = !key.exists();
     let status = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new(keygen_bin)
+        crate::platform::tokio_command(keygen_bin)
             .kill_on_drop(true)
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "tunlion-ca", "-f"])
             .arg(&key)
@@ -833,7 +833,7 @@ impl EphemeralKey {
         let key = dir.join("key");
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            tokio::process::Command::new(keygen_bin)
+            crate::platform::tokio_command(keygen_bin)
                 .kill_on_drop(true)
                 .args([
                     "-q",
@@ -955,7 +955,7 @@ pub(crate) async fn sign(
     let argv = build_sign_argv(ca_path, &pub_file, key_id, principal, validity, serial);
     let status = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new(keygen_bin)
+        crate::platform::tokio_command(keygen_bin)
             .kill_on_drop(true)
             .args(&argv)
             .stdin(std::process::Stdio::null())
@@ -1095,7 +1095,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let r = (|| -> anyhow::Result<()> {
-            std::process::Command::new("ssh-keygen")
+            crate::platform::command("ssh-keygen")
                 .args(["-q", "-t", "ed25519", "-f"])
                 .arg(dir.join("ca"))
                 .args(["-N", ""])
@@ -1112,13 +1112,13 @@ mod tests {
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
-            std::process::Command::new("ssh-keygen")
+            crate::platform::command("ssh-keygen")
                 .args(["-q", "-t", "ed25519", "-f"])
                 .arg(dir.join("key"))
                 .args(["-N", ""])
                 .status()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let out = std::process::Command::new("ssh-keygen")
+            let out = crate::platform::command("ssh-keygen")
                 .args([
                     "-q", "-s", &dir.join("ca").to_string_lossy(), "-I", "t",
                     "-n", "root", "-V", &validity_interval(3600), "-z", "1",
@@ -1131,7 +1131,7 @@ mod tests {
                 "relative -V must be accepted: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let out = std::process::Command::new("ssh-keygen")
+            let out = crate::platform::command("ssh-keygen")
                 .args(["-L", "-f"])
                 .arg(dir.join("key-cert.pub"))
                 .output()

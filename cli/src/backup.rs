@@ -12,7 +12,7 @@ pub async fn backup_cmd(
     relay: bool,
 ) -> Result<()> {
     // Check rsync is available.
-    if std::process::Command::new("which")
+    if crate::platform::command("which")
         .arg("rsync")
         .output()
         .map(|o| !o.status.success())
@@ -35,7 +35,7 @@ pub async fn backup_cmd(
     // Build rsync command. Use -e to specify the remote shell.
     // For L3 direct: rsync -e "ssh <opts>" source login@peer.mesh:dest
     // For L2 fallback: rsync -e "ssh <opts> -o ProxyCommand=..." source login@tunlion-peer:dest
-    let mut cmd = std::process::Command::new("rsync");
+    let mut cmd = crate::platform::command("rsync");
     cmd.arg("-avz");
 
     if dry_run {
@@ -50,7 +50,7 @@ pub async fn backup_cmd(
 
     // Build the ssh command for rsync -e.
     let peer_name = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let mut ssh_cmd = std::process::Command::new("ssh");
+    let mut ssh_cmd = crate::platform::command("ssh");
     ssh_cmd
         .arg("-o").arg(format!("IdentityFile={}", info.key_path.display()))
         .arg("-o").arg("IdentitiesOnly=yes")
@@ -108,14 +108,14 @@ pub async fn backup_cmd(
                 // Retry with fresh bootstrap.
                 crate::ui::say(&format!("tunlion: re-authenticating with '{peer}'..."));
                 let retry = crate::l2::rebootstrap_peer(server, peer, relay, false).await?;
-                let mut cmd = std::process::Command::new("rsync");
+                let mut cmd = crate::platform::command("rsync");
                 cmd.arg("-avz");
                 if dry_run { cmd.arg("--dry-run"); }
                 if delete { cmd.arg("--delete"); }
                 for pattern in &excludes {
                     cmd.arg("--exclude").arg(pattern);
                 }
-                let mut ssh_cmd = std::process::Command::new("ssh");
+                let mut ssh_cmd = crate::platform::command("ssh");
                 ssh_cmd
                     .arg("-o").arg(format!("IdentityFile={}", retry.key_path.display()))
                     .arg("-o").arg("IdentitiesOnly=yes")

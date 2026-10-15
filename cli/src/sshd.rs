@@ -56,12 +56,12 @@ pub fn configure_sshd_overlay(v6: &str, v4: &str) -> Result<()> {
 /// Reload sshd to pick up configuration changes.
 fn reload_sshd() -> Result<()> {
     // daemon-reload first to pick up unit file changes
-    let _ = std::process::Command::new("sudo")
+    let _ = crate::platform::command("sudo")
         .args(["systemctl", "daemon-reload"])
         .status();
     
     // Then restart sshd
-    let status = std::process::Command::new("sudo")
+    let status = crate::platform::command("sudo")
         .args(["systemctl", "restart", "ssh"])
         .status();
     
@@ -72,7 +72,7 @@ fn reload_sshd() -> Result<()> {
         }
         _ => {
             // Try SIGHUP fallback
-            let status = std::process::Command::new("sudo")
+            let status = crate::platform::command("sudo")
                 .args(["kill", "-HUP"])
                 .arg(get_sshd_pid()?)
                 .status();
@@ -90,7 +90,7 @@ fn reload_sshd() -> Result<()> {
 
 /// Get the sshd PID.
 fn get_sshd_pid() -> Result<String> {
-    let output = std::process::Command::new("pidof")
+    let output = crate::platform::command("pidof")
         .arg("sshd")
         .output()?;
     
@@ -251,7 +251,7 @@ pub fn ensure_sshd_ca(
     // (Unix OpenSSH path; on Windows there is no system sshd to reload --
     // the writer still renders correct lines for manual application, and
     // the unwritable branch above is how that surfaces.)
-    let tested = std::process::Command::new("sshd")
+    let tested = crate::platform::command("sshd")
         .args(["-t", "-f"])
         .arg(config_path)
         .stdin(std::process::Stdio::null())
@@ -593,7 +593,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // sshd -t needs real host keys, else every ensure rolls back.
         for name in ["hostkey", "ca"] {
-            let st = std::process::Command::new("ssh-keygen")
+            let st = crate::platform::command("ssh-keygen")
                 .args(["-q", "-t", "ed25519", "-f"])
                 .arg(dir.join(name))
                 .args(["-N", ""])
@@ -645,7 +645,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fil-sshd-rb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let st = std::process::Command::new("ssh-keygen")
+        let st = crate::platform::command("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-f"])
             .arg(dir.join("hostkey"))
             .args(["-N", ""])

@@ -755,7 +755,7 @@ fn list_interfaces() -> Vec<Iface> {
     let mut out = Vec::new();
     // `ip -o addr show` is universal on the Linux hosts this runs on. One line
     // per address: "<idx>: <ifname> <family> <addr>/<prefix> ...".
-    let Ok(o) = std::process::Command::new("ip").args(["-o", "addr", "show"]).output() else {
+    let Ok(o) = crate::platform::command("ip").args(["-o", "addr", "show"]).output() else {
         return out;
     };
     let text = String::from_utf8_lossy(&o.stdout);

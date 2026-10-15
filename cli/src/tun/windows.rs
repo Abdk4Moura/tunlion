@@ -162,7 +162,7 @@ fn split_cidr(cidr: &str) -> (String, String) {
 /// identical route ("already exists") is treated as success.
 pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     let proto = if cidr.contains(':') { "ipv6" } else { "ipv4" };
-    let out = std::process::Command::new("netsh")
+    let out = crate::platform::command("netsh")
         .args(["interface", proto, "add", "route", cidr, &format!("interface={dev}")])
         .output()
         .context("exec netsh")?;
@@ -187,7 +187,7 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
 /// into a stream of failures.
 pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
     let proto = if cidr.contains(':') { "ipv6" } else { "ipv4" };
-    let out = std::process::Command::new("netsh")
+    let out = crate::platform::command("netsh")
         .args(["interface", proto, "delete", "route", cidr, &format!("interface={dev}")])
         .output()
         .context("exec netsh delete route")?;
@@ -242,7 +242,7 @@ pub fn l3_blocker() -> Option<String> {
 pub fn ensure_hosts_writable() {}
 
 fn netsh(args: &[&str]) -> Result<()> {
-    let out = std::process::Command::new("netsh").args(args).output().context("exec netsh")?;
+    let out = crate::platform::command("netsh").args(args).output().context("exec netsh")?;
     if !out.status.success() {
         let msg = format!(
             "{}{}",

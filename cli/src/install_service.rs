@@ -65,9 +65,9 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
     // Run a privileged command, using sudo only when not already root.
     let run_priv = |args: &[&str]| -> bool {
         let mut cmd = if am_root {
-            std::process::Command::new(args[0])
+            crate::platform::command(args[0])
         } else {
-            let mut c = std::process::Command::new("sudo");
+            let mut c = crate::platform::command("sudo");
             c.arg(args[0]);
             c
         };
@@ -94,9 +94,9 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
         use std::io::Write;
         use std::process::Stdio;
         let mut cmd = if am_root {
-            std::process::Command::new("tee")
+            crate::platform::command("tee")
         } else {
-            let mut c = std::process::Command::new("sudo");
+            let mut c = crate::platform::command("sudo");
             c.arg("tee");
             c
         };
@@ -132,7 +132,7 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
     // Drop any stale file cap (ambient replaces it; keeps updates clean); retire a
     // pre-existing --user service so the two don't fight over the mesh. Best-effort.
     let _ = run_priv(&["setcap", "-r", &exe]);
-    let _ = std::process::Command::new("systemctl")
+    let _ = crate::platform::command("systemctl")
         .args(["--user", "disable", "--now", crate::platform::SYSTEMD_UNIT])
         .status();
     let enabled = run_priv(&["systemctl", "daemon-reload"])
@@ -173,9 +173,9 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
         use std::io::Write;
         use std::process::Stdio;
         let mut cmd = if am_root {
-            std::process::Command::new("tee")
+            crate::platform::command("tee")
         } else {
-            let mut c = std::process::Command::new("sudo");
+            let mut c = crate::platform::command("sudo");
             c.arg("tee");
             c
         };

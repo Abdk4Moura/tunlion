@@ -5605,7 +5605,7 @@ fn spawn_ssh_direct(
 ) -> Result<i32> {
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{mesh_host}");
-    let mut cmd = std::process::Command::new("ssh");
+    let mut cmd = crate::platform::command("ssh");
     cmd.arg("-o")
         .arg(format!("IdentityFile={}", ident.key_path.display()))
         .arg("-o")
@@ -5673,7 +5673,7 @@ fn spawn_ssh(
 
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{host}");
-    let mut cmd = std::process::Command::new("ssh");
+    let mut cmd = crate::platform::command("ssh");
     cmd.arg("-o")
         .arg(format!("ProxyCommand={proxy}"))
         .arg("-o")
