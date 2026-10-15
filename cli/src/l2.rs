@@ -869,6 +869,31 @@ impl PtySessions {
 /// outlives the link. `pty_guard` holds the global PTY slot for the session's
 /// whole life. On any failure an `l2-close{err}` is sent on the opening link and
 /// `None` is returned (nothing to store).
+///
+/// Android: a phone does not serve shells (the app never offers it), and the PTY
+/// crate does not build there, so the request is refused with a plain reason.
+#[cfg(target_os = "android")]
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_pty_session(
+    _sessions: Arc<PtySessions>,
+    _session_id: String,
+    transport: Arc<dyn Transport>,
+    sid: u32,
+    _cols: u16,
+    _rows: u16,
+    _term: &str,
+    _argv: Vec<String>,
+    _pty_guard: PtyGuard,
+    _idev: Option<[u8; 32]>,
+    _admitted_via_ceiling: bool,
+) -> Option<PtySessionHandle> {
+    let _ = transport
+        .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "this device runs Android and does not serve shells" }))
+        .await;
+    None
+}
+
+#[cfg(not(target_os = "android"))]
 pub async fn spawn_pty_session(
     sessions: Arc<PtySessions>,
     session_id: String,

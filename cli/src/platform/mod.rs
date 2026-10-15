@@ -1157,6 +1157,10 @@ pub enum InstallResult {
     System,
 }
 
+/// On Android the app is the service manager: it runs `tunlion up --userspace`
+/// in its own foreground service, so there is nothing for `--install` to create.
+pub const ANDROID_NO_INSTALL: &str = "`up --install` is not available on Android: the tunlion app keeps tunlion running. Run `tunlion up --userspace` (the app does this for you).";
+
 impl ServiceHost {
     pub fn detect() -> Self {
         #[cfg(target_os = "linux")]
@@ -1181,6 +1185,7 @@ impl ServiceHost {
             ServiceHost::Systemd => "",
             ServiceHost::Launchd => "On macOS, create a LaunchAgent plist in ~/Library/LaunchAgents/ and load it with launchctl.",
             ServiceHost::WindowsService => "On Windows, create a Scheduled Task (trigger: at logon) or register a Service with sc.exe.",
+            ServiceHost::None if cfg!(target_os = "android") => ANDROID_NO_INSTALL,
             ServiceHost::None => "No service manager detected. Start tunlion with `tunlion up` in a terminal, or configure your init system manually.",
         }
     }
@@ -1305,6 +1310,7 @@ impl ServiceHost {
             ServiceHost::Launchd => {
                 install_launch_agent(exe, argv)
             }
+            _ if cfg!(target_os = "android") => Err(anyhow::anyhow!(ANDROID_NO_INSTALL)),
             _ => Err(anyhow::anyhow!("no service manager detected")),
         }
     }
