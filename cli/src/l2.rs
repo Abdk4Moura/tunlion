@@ -3089,12 +3089,60 @@ pub(crate) fn reset_terminal_modes() {
     }
 }
 
-/// Discard input that arrived before the remote PTY was ready: typed ahead at
-/// "waiting for known device", or mouse reports from a terminal an earlier
-/// session left in mouse mode. Called once, when raw mode is first entered.
-fn discard_typeahead(stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
-    while stdin_rx.try_recv().is_ok() {}
-    crate::platform::discard_console_input();
+/// Input that arrived before the remote PTY was ready is kept (typing ahead at
+/// "waiting for known device" works), but mouse reports are taken out of it:
+/// a terminal an earlier session left in mouse mode reports every mouse move,
+/// and those must not reach the new shell as if typed. Runs once, when raw
+/// mode is first entered; what is left goes out first through `pending`.
+fn scrub_typeahead(
+    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: &mut Option<Vec<u8>>,
+) {
+    let mut queued = pending.take().unwrap_or_default();
+    while let Ok(chunk) = stdin_rx.try_recv() {
+        queued.extend_from_slice(&chunk);
+    }
+    let kept = strip_mouse_reports(&queued);
+    if !kept.is_empty() {
+        *pending = Some(kept);
+    }
+}
+
+/// Remove terminal mouse reports from `input`: SGR (`ESC [ < b ; x ; y M|m`),
+/// urxvt (`ESC [ b ; x ; y M`) and the original X10 form (`ESC [ M` and three
+/// bytes). Everything else, keystrokes and other escape sequences, is kept.
+pub(crate) fn strip_mouse_reports(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == 0x1b && input.get(i + 1) == Some(&b'[') {
+            let rest = &input[i + 2..];
+            // X10: ESC [ M Cb Cx Cy
+            if rest.first() == Some(&b'M') && rest.len() >= 4 {
+                i += 6;
+                continue;
+            }
+            // SGR (with '<') or urxvt (without): digits;digits;digits then M or m
+            let body = if rest.first() == Some(&b'<') { &rest[1..] } else { rest };
+            let lead = rest.len() - body.len();
+            let mut j = 0;
+            let mut fields = 1;
+            while j < body.len() && (body[j].is_ascii_digit() || body[j] == b';') {
+                if body[j] == b';' {
+                    fields += 1;
+                }
+                j += 1;
+            }
+            let sgr = lead == 1;
+            if j > 0 && fields == 3 && j < body.len() && (body[j] == b'M' || (sgr && body[j] == b'm')) {
+                i += 2 + lead + j + 1;
+                continue;
+            }
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
 }
 
 /// RAII guard: put the local terminal in raw mode for an interactive PTY and
@@ -3351,7 +3399,7 @@ async fn pty_attach_once(
     // On a reconnect raw is already on; the acceptor's buffer replay redraws the
     // screen cleanly anyway.
     if interactive && raw.is_none() {
-        discard_typeahead(stdin_rx);
+        scrub_typeahead(stdin_rx, pending);
         *raw = Some(RawGuard::enable()?);
     }
 
@@ -3514,7 +3562,7 @@ async fn try_warm_pty(
             "tunlion: reusing warm link to '{peer}' for pty (no establish)"
         ));
         if raw.is_none() {
-            discard_typeahead(stdin_rx);
+            scrub_typeahead(stdin_rx, pending);
             match RawGuard::enable() {
                 Ok(g) => *raw = Some(g),
                 Err(e) => return Some(Err(e)),
@@ -7400,5 +7448,18 @@ mod terminal_reset_tests {
             .filter(|s| s.contains('h'))
             .collect();
         assert_eq!(sets, vec!["25h"], "the reset must not switch any other mode on");
+    }
+
+    /// Mouse reports are taken out of typed-ahead input; keystrokes, Enter and
+    /// other escape sequences (arrow keys) are kept, in order.
+    #[test]
+    fn typeahead_keeps_keys_and_drops_mouse_reports() {
+        use super::strip_mouse_reports;
+        let input = b"ls\x1b[<35;84;9M\x1b[<0;1;2m -la\x1b[35;80;12M\x1b[M #!\r\x1b[A";
+        assert_eq!(strip_mouse_reports(input), b"ls -la\r\x1b[A".to_vec());
+        assert_eq!(strip_mouse_reports(b"echo G-42\n"), b"echo G-42\n".to_vec());
+        // Not a mouse report: two fields, or no terminator yet.
+        assert_eq!(strip_mouse_reports(b"\x1b[1;5A"), b"\x1b[1;5A".to_vec());
+        assert_eq!(strip_mouse_reports(b"\x1b[<35;84"), b"\x1b[<35;84".to_vec());
     }
 }
