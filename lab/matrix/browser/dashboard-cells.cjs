@@ -94,14 +94,22 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
     await nav('Devices and people');
     await p.getByRole('button', { name: /dinv/ }).first().click();
     await p.getByTestId('cut').click();
+    // The confirm appears only while the device is online, and it renders after
+    // the click: waiting for it (or the cut taking effect) instead of counting
+    // once, which raced the render and skipped the confirm.
     const confirm = p.getByRole('button', { name: /^Cut off/ }).last();
-    if (await confirm.count()) await confirm.click();
-    await p.waitForTimeout(3000);
-    let st = stateOf('dinv'); say('state', st); assert(st === 'revoked', 'the CLI shows dinv revoked');
+    let st = stateOf('dinv');
+    for (let i = 0; i < 30 && st !== 'revoked'; i++) {
+      if (await confirm.count() && await confirm.isVisible().catch(() => false)) await confirm.click().catch(() => {});
+      await p.waitForTimeout(500);
+      st = stateOf('dinv');
+    }
+    say('state', st); assert(st === 'revoked', 'the CLI shows dinv revoked');
     await shot(p, 'd04-cut');
     await p.getByRole('button', { name: 'Restore' }).first().click();
-    await p.waitForTimeout(3000);
-    st = stateOf('dinv'); say('state', st); assert(st === 'active', 'the CLI shows dinv active again');
+    st = stateOf('dinv');
+    for (let i = 0; i < 30 && st !== 'active'; i++) { await p.waitForTimeout(500); st = stateOf('dinv'); }
+    say('state', st); assert(st === 'active', 'the CLI shows dinv active again');
   });
 
   await cell('D05', 'a pairing code from the dashboard, joined from a terminal', async () => {
