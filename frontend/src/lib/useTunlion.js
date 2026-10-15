@@ -19,7 +19,7 @@ import { mintWords, mintCreatedNameplate, ADJ, ANIMAL as ANIMALS } from './words
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink } from '../net/app/recovery.js'
-import { shouldAutoAccept } from '../net/app/accept.js'
+import { shouldAutoAccept, offersCoveredNow } from '../net/app/accept.js'
 import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
 import { localHelperEnabled } from '../net/app/localHelper.js'
 import { pakePartnerFor } from '../net/app/pakePartner.js'
@@ -431,9 +431,7 @@ export function useTunlion() {
                 link.sendPairProofAck(true)
                 // The proof is checked asynchronously and a sender's offer can
                 // land first: accept the offers this proof now covers.
-                for (const t of link.transfers.values()) {
-                  if (shouldAutoAccept({ ...t, provenKnown: true })) link.acceptTransfer(t.id)
-                }
+                for (const tid of offersCoveredNow(link.transfers.values(), { provenKnown: true })) link.acceptTransfer(tid)
                 return
               }
             } catch {}
@@ -886,6 +884,9 @@ export function useTunlion() {
           if (link) link._verified = true
           updatePeer(peerId, { verified: name })
           ephemeralAuthRef.current.add(peerId)
+          // The sender may have offered before this ceremony finished on our
+          // side: accept what the code now covers instead of leaving it waiting.
+          if (link) for (const tid of offersCoveredNow(link.transfers.values(), { byCode: true })) link.acceptTransfer(tid)
         }
         tel('pake-transfer-authed', { peer: String(peerId).slice(-6) })
         setPairStatus('connected') // authenticated; ready to receive (secret discarded)

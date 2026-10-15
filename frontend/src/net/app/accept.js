@@ -13,3 +13,15 @@ export function shouldAutoAccept({ direction, status, byCode, provenKnown }) {
   if (direction !== 'receive' || status !== 'offered') return false
   return !!(byCode || provenKnown)
 }
+
+// Offers that arrived BEFORE the consent was established (the pair-proof or the
+// code ceremony finishes asynchronously, and a sender may offer first) are
+// re-checked the moment it lands, so the order of the two never decides the
+// outcome. Returns the ids to accept.
+export function offersCoveredNow(transfers, { byCode = false, provenKnown = false } = {}) {
+  const ids = []
+  for (const t of transfers || []) {
+    if (shouldAutoAccept({ ...t, byCode, provenKnown })) ids.push(t.id)
+  }
+  return ids
+}

@@ -17,6 +17,7 @@ import DiagPanel from './DiagPanel.jsx'
 import { makeTheme, terminalTheme, systemMode, FONT_SANS, FONT_MONO } from './theme.js'
 import { pakeReady, previewCustomCode } from '../lib/pairing.js'
 import { mintNameplate } from '../lib/words.js'
+import { oneRowPerDevice } from '../net/app/peerRows.js'
 
 // Relay honesty (transport-resilience P1, §3.5). Relay (TURN) is still
 // end-to-end encrypted but is NOT a direct link; the "no middleman on the wire"
@@ -696,7 +697,7 @@ export default function Tunlion(props) {
   const mode = ui.theme === 'light' || ui.theme === 'dark' ? ui.theme : systemMode()
   const T = makeTheme(mode)
   const TT = terminalTheme()
-  const peers = state.peers || []
+  const peers = oneRowPerDevice(state.peers || [])
   const transfers = state.transfers || []
   const knownDevices = state.knownDevices || []
   const onToggleTheme = ui.onToggleTheme
