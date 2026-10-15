@@ -449,7 +449,7 @@ pub fn publish_received_path(path: &Path, executable: bool) -> std::io::Result<(
 fn process_umask() -> u32 {
     static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *UMASK.get_or_init(|| {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
                 if let Some(v) = s.lines().find_map(|l| l.strip_prefix("Umask:")) {
@@ -460,7 +460,7 @@ fn process_umask() -> u32 {
             }
             0o022
         }
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         {
             let old = unsafe { libc::umask(0o077) };
             unsafe { libc::umask(old) };
@@ -707,7 +707,7 @@ pub fn process_group_alive(pgid: u32) -> bool {
 /// commands are spawned from runtime worker threads, which live as long as
 /// the runtime (the tree uses no `block_in_place`, which could retire one).
 pub fn die_with_daemon(cmd: &mut tokio::process::Command) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let daemon = unsafe { libc::getpid() };
         // SAFETY: only async-signal-safe calls (prctl, getppid) run between
@@ -726,7 +726,7 @@ pub fn die_with_daemon(cmd: &mut tokio::process::Command) {
             });
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = cmd;
     }
@@ -934,7 +934,7 @@ fn fd_read_exact(fd: libc::c_int, buf: &mut [u8]) -> bool {
 /// whatever happens to hold it now). None where the platform cannot say,
 /// which makes the startup sweep a no-op there.
 pub fn boot_token() -> Option<String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .ok()
@@ -956,7 +956,7 @@ pub fn boot_token() -> Option<String> {
         };
         (rc == 0 && tv.tv_sec > 0).then(|| format!("{}.{}", tv.tv_sec, tv.tv_usec))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         None
     }
@@ -966,7 +966,7 @@ pub fn boot_token() -> Option<String> {
 /// can be told from an unrelated process that later got the same pid. None
 /// when the process does not exist or the platform cannot say.
 pub fn process_start_token(pid: u32) -> Option<String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // The command name sits in parentheses and may hold spaces; the fields
@@ -975,7 +975,7 @@ pub fn process_start_token(pid: u32) -> Option<String> {
         let rest = &stat[stat.rfind(')')? + 1..];
         rest.split_whitespace().nth(19).map(str::to_string)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = pid;
         None
@@ -1941,7 +1941,7 @@ pub fn open_in_browser(url: &str) -> bool {
 /// The uid that owns the client end of a loopback TCP connection to us, when
 /// the platform can say (Linux, from /proc/net/tcp). None when it cannot.
 pub fn loopback_peer_uid(peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<u32> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let hexaddr = |a: std::net::SocketAddr| match a.ip() {
             std::net::IpAddr::V4(v) => Some(format!("{:08X}:{:04X}", u32::from_le_bytes(v.octets()), a.port())),
@@ -1957,7 +1957,7 @@ pub fn loopback_peer_uid(peer: std::net::SocketAddr, local: std::net::SocketAddr
         }
         None
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = (peer, local);
         None
@@ -2165,7 +2165,7 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
 /// /proc on either). The arms must ship together; a missing variant makes
 /// `daemon_alive` constant-false on that platform, which is the #204 bug this
 /// predicate exists to close for good.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
@@ -2216,7 +2216,7 @@ pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
 pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
     None
 }
@@ -3318,7 +3318,7 @@ pub enum LockHolder {
 /// Read-only on purpose: probing by TAKING the lock would make a concurrent
 /// `up` lose the election to a `status` that happened to look at that instant.
 pub fn instance_lock_holder(path: &Path) -> LockHolder {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use std::os::unix::fs::MetadataExt;
         let Ok(meta) = std::fs::metadata(path) else {
@@ -3333,7 +3333,7 @@ pub fn instance_lock_holder(path: &Path) -> LockHolder {
         let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0x00ff);
         lock_holder_in(&locks, major, minor, meta.ino())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = path;
         LockHolder::Unknown
@@ -3521,7 +3521,7 @@ pub fn escalate(_pid: u32, _how: Escalate) -> std::io::Result<()> {
 /// where the kernel says, None where this platform cannot tell. A stopped
 /// process keeps its pid and its locks but runs nothing: it neither serves nor
 /// exits when asked, which is why `status` and `up` must not call it running.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn process_stopped(pid: u32) -> Option<bool> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The state is the first field after the parenthesised command name, which
@@ -3530,7 +3530,7 @@ pub fn process_stopped(pid: u32) -> Option<bool> {
     Some(matches!(state, "T" | "t"))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn process_stopped(_pid: u32) -> Option<bool> {
     None
 }

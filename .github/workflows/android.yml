@@ -56,9 +56,10 @@ jobs:
           restore-keys: android-${{ matrix.target }}-
       - name: Build
         working-directory: cli
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --bin tunlion
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          echo "NDK: $ANDROID_NDK_HOME"
+          cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --bin tunlion
       - name: Stage
         run: |
           mkdir -p out
