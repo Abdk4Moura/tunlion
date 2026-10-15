@@ -1181,6 +1181,23 @@ pub(crate) async fn pair_cmd(
                     data["type"].as_str(),
                     Some("pake-msg") | Some("pake-confirm")
                 ) {
+                    match crate::pake_ceremony::partner_for(
+                        pake_peer.as_deref(),
+                        &from,
+                        data["type"].as_str() == Some("pake-msg"),
+                        crate::pake_ceremony::addressed_to(&data, &my_nameplate),
+                        cer.has_k(),
+                    ) {
+                        crate::pake_ceremony::Partner::Ours => {}
+                        crate::pake_ceremony::Partner::Switch => {
+                            ui::debug(&format!(
+                                "pair: {from} runs this code's ceremony; the first link was a bystander"
+                            ));
+                            pake_peer = Some(from.clone());
+                            cer.rearm_msg();
+                        }
+                        crate::pake_ceremony::Partner::Ignore => continue,
+                    }
                     pake_peer.get_or_insert(from.clone());
                     let fps = match conn.link(&from) {
                         Some(l) => match &l.peer {
@@ -1514,6 +1531,17 @@ pub(crate) async fn pair_cmd(
                 // sends our SPAKE2 element and, once K + fingerprints are known,
                 // the key-confirmation MAC. NO secret is sent over the DataChannel.
                 pake_peer.get_or_insert(pid.clone());
+                // A claimer shares the creator's room with everyone else on that
+                // network, so this link may be a bystander. Until the creator
+                // has spoken (its element names our nameplate and rebinds us, see
+                // `partner_for`), offer our element to each peer that comes up:
+                // only the creator can use it, and a bystander ignores a
+                // nameplate that is not its own.
+                if !creator && !cer.has_k() && pake_peer.as_deref() != Some(pid.as_str()) && !stall {
+                    sio.emit("signal", json!({ "to": pid, "data": cer.msg_payload() }))
+                        .await
+                        .ok();
+                }
                 // Settle the petname: --name wins; otherwise their own name, NOW.
                 //
                 // This used to stop and ask "remember this device as [..]:" on a
