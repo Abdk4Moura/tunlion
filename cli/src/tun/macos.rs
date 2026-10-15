@@ -195,7 +195,7 @@ fn split_cidr(cidr: &str) -> (String, String) {
 /// A pre-existing identical route ("File exists") is treated as success.
 pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     let fam = if cidr.contains(':') { "-inet6" } else { "-inet" };
-    let out = std::process::Command::new("route")
+    let out = crate::platform::command("route")
         .args(["-q", "-n", "add", fam, cidr, "-interface", dev])
         .output()
         .context("exec route")?;
@@ -215,7 +215,7 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
 /// into a stream of failures.
 pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
     let fam = if cidr.contains(':') { "-inet6" } else { "-inet" };
-    let out = std::process::Command::new("route")
+    let out = crate::platform::command("route")
         .args(["-q", "-n", "delete", fam, cidr, "-interface", dev])
         .output()
         .context("exec route delete")?;
@@ -234,7 +234,7 @@ pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
 pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
     let (addr, prefixlen) = split_cidr(cidr);
     let fam = if addr.contains(':') { "inet6" } else { "inet" };
-    let out = std::process::Command::new("ifconfig")
+    let out = crate::platform::command("ifconfig")
         .args([dev, fam, &format!("{addr}/{prefixlen}"), "alias"])
         .output()
         .context("exec ifconfig")?;
@@ -273,7 +273,7 @@ pub fn l3_blocker() -> Option<String> {
 pub fn ensure_hosts_writable() {}
 
 fn ifconfig(args: &[&str]) -> Result<()> {
-    let out = std::process::Command::new("ifconfig")
+    let out = crate::platform::command("ifconfig")
         .args(args)
         .output()
         .context("exec ifconfig")?;

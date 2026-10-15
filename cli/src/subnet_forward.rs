@@ -20,7 +20,6 @@
 //! that says it is routing and is not is the failure this module exists to avoid.
 
 use anyhow::{bail, Context, Result};
-use std::process::Command;
 
 /// What we changed, so it can be undone exactly.
 #[derive(Debug, Default, Clone)]
@@ -30,7 +29,7 @@ pub struct Applied {
 }
 
 fn run(args: &[&str]) -> Result<String> {
-    let out = Command::new(args[0])
+    let out = crate::platform::command(args[0])
         .args(&args[1..])
         .output()
         .with_context(|| format!("running {}", args.join(" ")))?;
@@ -242,10 +241,10 @@ mod tests {
             return;
         }
         let sh = |c: &str| {
-            let _ = std::process::Command::new("sh").arg("-c").arg(c).output();
+            let _ = crate::platform::command("sh").arg("-c").arg(c).output();
         };
         let ok = |c: &str| {
-            std::process::Command::new("sh")
+            crate::platform::command("sh")
                 .arg("-c")
                 .arg(c)
                 .output()

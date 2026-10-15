@@ -297,7 +297,7 @@ pub(crate) async fn add_for_cmd(
         std::io::stdin().read_line(&mut ans).ok();
         if matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
             let exe = std::env::current_exe()?;
-            let _ = std::process::Command::new(&exe)
+            let _ = crate::platform::command(&exe)
                 .arg("up")
                 .arg("--install")
                 .spawn();

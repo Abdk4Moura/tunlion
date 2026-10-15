@@ -46,7 +46,7 @@ const MAX_BODY: usize = 64 * 1024;
 static SERVER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn self_command() -> std::io::Result<tokio::process::Command> {
-    let mut c = tokio::process::Command::new(std::env::current_exe()?);
+    let mut c = crate::platform::tokio_command(std::env::current_exe()?);
     if let Some(s) = SERVER.get() {
         c.env("TUNLION_SERVER", s);
     }

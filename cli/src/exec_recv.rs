@@ -660,7 +660,7 @@ pub(crate) async fn serve_exec(
             .await;
         return;
     }
-    let mut cmd = tokio::process::Command::new(&plan.program);
+    let mut cmd = crate::platform::tokio_command(&plan.program);
     cmd.args(&plan.args)
         .current_dir(&cwd)
         .env_clear()
@@ -1397,7 +1397,7 @@ mod tests {
             .build()
             .unwrap();
         let status = rt.block_on(async {
-            tokio::process::Command::new(&sh)
+            crate::platform::tokio_command(&sh)
                 .arg("-c")
                 .arg("exit 41")
                 .status()

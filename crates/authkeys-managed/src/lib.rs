@@ -64,7 +64,16 @@ pub fn ensure_managed_key(config_dir: &Path) -> Result<String> {
             std::fs::create_dir_all(dir).context("create tunlion ssh dir")?;
             chmod(dir, 0o700);
         }
-        let st = std::process::Command::new("ssh-keygen")
+        let mut keygen = std::process::Command::new("ssh-keygen");
+        // Non-interactive (-q, empty passphrase). On Windows, CREATE_NO_WINDOW
+        // keeps a console from flashing when the caller (the detached daemon)
+        // has none of its own.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            keygen.creation_flags(0x08000000);
+        }
+        let st = keygen
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "tunlion-managed", "-f"])
             .arg(&key)
             .status()

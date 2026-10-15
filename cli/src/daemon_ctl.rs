@@ -153,7 +153,7 @@ pub(crate) async fn handle_mount(
     }
 
     // Check sshfs is available.
-    if std::process::Command::new("which")
+    if crate::platform::command("which")
         .arg("sshfs")
         .output()
         .map(|o| !o.status.success())
@@ -222,7 +222,7 @@ pub(crate) async fn handle_mount(
     }
 
     // Spawn sshfs via tokio so we get a Child we can kill later.
-    let child = match tokio::process::Command::new("sshfs")
+    let child = match crate::platform::tokio_command("sshfs")
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

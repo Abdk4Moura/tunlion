@@ -116,7 +116,7 @@ pub fn ensure_hosts_writable() {
     if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
         eprintln!("  MagicDNS names (<peer>.mesh) need write access to root-owned /etc/hosts.");
         eprintln!("  granting a per-file ACL now: {cmd}");
-        let ok = std::process::Command::new("sudo")
+        let ok = crate::platform::command("sudo")
             .args(["setfacl", "-m", &format!("u:{user}:rw"), "/etc/hosts"])
             .status()
             .map(|s| s.success())
@@ -175,7 +175,7 @@ pub fn ensure_net_admin_for_l3() -> bool {
         let granted = std::env::current_exe()
             .ok()
             .and_then(|exe| {
-                std::process::Command::new("sudo")
+                crate::platform::command("sudo")
                     .args(["setcap", "cap_net_admin+eip"])
                     .arg(exe)
                     .status()
@@ -344,7 +344,7 @@ impl crate::tun::TunDevice for KernelTun {
 /// pre-existing identical route is treated as success.
 pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     let fam = if cidr.contains(':') { "-6" } else { "-4" };
-    let out = std::process::Command::new("ip")
+    let out = crate::platform::command("ip")
         .args([fam, "route", "replace", cidr, "dev", dev])
         .output()
         .context("exec ip route")?;
@@ -361,7 +361,7 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
 /// into a stream of failures.
 pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
     let fam = if cidr.contains(':') { "-6" } else { "-4" };
-    let out = std::process::Command::new("ip")
+    let out = crate::platform::command("ip")
         .args([fam, "route", "del", cidr, "dev", dev])
         .output()
         .context("exec ip route del")?;
@@ -378,7 +378,7 @@ pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
 /// child `ip` inherits it. An existing identical address ("File exists") is success.
 pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
     let fam = if cidr.contains(':') { "-6" } else { "-4" };
-    let out = std::process::Command::new("ip")
+    let out = crate::platform::command("ip")
         .args([fam, "addr", "add", cidr, "dev", dev])
         .output()
         .context("exec ip addr")?;
@@ -394,7 +394,7 @@ pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
 /// Run an `ip` (iproute2) command, mapping a non-zero exit to an error with the
 /// captured stderr so a misconfig is legible.
 fn ip(args: &[&str]) -> Result<()> {
-    let out = std::process::Command::new("ip")
+    let out = crate::platform::command("ip")
         .args(args)
         .output()
         .context("exec ip (iproute2 not installed?)")?;

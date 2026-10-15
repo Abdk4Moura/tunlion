@@ -653,7 +653,7 @@ pub fn signal_process_group(pgid: u32, sig: TreeSignal) -> std::io::Result<bool>
         if sig == TreeSignal::Kill {
             args.insert(0, "/F");
         }
-        let st = std::process::Command::new("taskkill")
+        let st = crate::platform::command("taskkill")
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1314,10 +1314,10 @@ impl ServiceHost {
         match self {
             #[cfg(target_os = "linux")]
             ServiceHost::Systemd => {
-                let _ = std::process::Command::new("systemctl")
+                let _ = crate::platform::command("systemctl")
                     .args(["--user", "disable", "--now", SYSTEMD_UNIT])
                     .status();
-                let _ = std::process::Command::new("systemctl")
+                let _ = crate::platform::command("systemctl")
                     .args(["disable", "--now", SYSTEMD_UNIT])
                     .status();
             }
@@ -1327,13 +1327,13 @@ impl ServiceHost {
                 // machine-wide service path). The per-user autostart is removed
                 // with the HKCU Run entry, which needs no elevation.
                 if self.is_elevated() {
-                    let _ = std::process::Command::new("sc")
+                    let _ = crate::platform::command("sc")
                         .args(["delete", WINDOWS_SERVICE_NAME])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .status();
                 }
-                let _ = std::process::Command::new("reg")
+                let _ = crate::platform::command("reg")
                     .args([
                         "delete",
                         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -1343,7 +1343,7 @@ impl ServiceHost {
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
-                let _ = std::process::Command::new("schtasks")
+                let _ = crate::platform::command("schtasks")
                     .args(["/delete", "/tn", WINDOWS_AUTOSTART_NAME, "/f"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -1351,7 +1351,7 @@ impl ServiceHost {
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
-                let _ = std::process::Command::new("launchctl")
+                let _ = crate::platform::command("launchctl")
                     .arg("bootout")
                     .arg(format!("gui/{}/{LAUNCHD_LABEL}", unsafe { libc::getuid() }))
                     .status();
@@ -1470,7 +1470,7 @@ impl ServiceHost {
                 "do shell script \"{}\" with administrator privileges",
                 esc(&line)
             );
-            let ok = std::process::Command::new("osascript")
+            let ok = crate::platform::command("osascript")
                 .args(["-e", &script])
                 .status()
                 .map(|s| s.success())
@@ -1697,7 +1697,7 @@ fn run_checked(program: &str, args: &[&str]) -> Result<()> {
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ");
-    match std::process::Command::new(program).args(args).status() {
+    match crate::platform::command(program).args(args).status() {
         Ok(st) if st.success() => Ok(()),
         Ok(st) => anyhow::bail!("`{shown}` failed ({st})"),
         Err(e) => anyhow::bail!("could not run `{shown}`: {e}"),
@@ -1732,7 +1732,7 @@ fn install_run_key(exe: &Path, argv: &[String]) -> Result<()> {
     // Runs as the current user at logon with no elevation. This is the default
     // background receiver on Windows.
     let cmd = windows_command_line(exe, argv);
-    let out = std::process::Command::new("reg")
+    let out = crate::platform::command("reg")
         .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -1764,7 +1764,7 @@ fn install_scheduled_task(exe: &Path, argv: &[String]) -> Result<()> {
     );
     let tmp = std::env::temp_dir().join("tunlion-task.xml");
     std::fs::write(&tmp, &task_xml)?;
-    let out = std::process::Command::new("schtasks")
+    let out = crate::platform::command("schtasks")
         .args(["/create", "/tn", WINDOWS_AUTOSTART_NAME, "/xml", &tmp.to_string_lossy(), "/f"])
         .output()?;
     let _ = std::fs::remove_file(&tmp);
@@ -1780,7 +1780,7 @@ fn install_scheduled_task(exe: &Path, argv: &[String]) -> Result<()> {
 /// `up --install`). The bootout is allowed to fail: nothing loaded is fine.
 #[cfg(target_os = "macos")]
 fn launchctl_bootstrap(domain: &str, plist: &Path) -> Result<()> {
-    let _ = std::process::Command::new("launchctl")
+    let _ = crate::platform::command("launchctl")
         .arg("bootout")
         .arg(format!("{domain}/{LAUNCHD_LABEL}"))
         .stdout(std::process::Stdio::null())
@@ -1901,7 +1901,7 @@ mod service_argv_encoding {
 
 #[cfg(target_os = "windows")]
 pub fn add_firewall_rule(exe: &Path) {
-    let _ = std::process::Command::new("netsh")
+    let _ = crate::platform::command("netsh")
         .args(["advfirewall", "firewall", "add", "rule",
             WINDOWS_FIREWALL_RULE, "dir=in", "action=allow",
             "protocol=udp",
@@ -1921,15 +1921,15 @@ pub const DETACHED_CHILD_ENV: &str = "TUNLION_DETACHED_CHILD";
 /// desktop session) or the opener failed; the caller then prints the link.
 pub fn open_in_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
-    let r = std::process::Command::new("open").arg(url).status();
+    let r = crate::platform::command("open").arg(url).status();
     #[cfg(target_os = "windows")]
-    let r = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).status();
+    let r = crate::platform::command("rundll32").args(["url.dll,FileProtocolHandler", url]).status();
     #[cfg(all(unix, not(target_os = "macos")))]
     let r = {
         if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
             return false;
         }
-        std::process::Command::new("xdg-open")
+        crate::platform::command("xdg-open")
             .arg(url)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2065,6 +2065,51 @@ fn fuse_install_hint() -> &'static str {
     }
 }
 
+/// Every child process tunlion starts is built here, never with a bare
+/// `Command::new` (cli/tests/surface_spawn.rs holds that line).
+///
+/// Why: on Windows a process with no console of its own (the daemon after
+/// `up --detach`, which `spawn_detached` starts with DETACHED_PROCESS, or one
+/// started at logon) hands every console child (netsh, icacls, whoami, reg,
+/// schtasks, taskkill, ssh, ...) a brand new console window, which flashes on
+/// screen. So when this process has no console, children get CREATE_NO_WINDOW.
+/// When it does have one (an interactive `tunlion` in a terminal), children
+/// inherit it as before, so an interactive child such as `ssh` keeps working.
+/// Elsewhere this is `Command::new`.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut c = std::process::Command::new(program); // spawn-helper
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        if let Some(flags) = no_console_flags() {
+            c.creation_flags(flags);
+        }
+    }
+    c
+}
+
+/// `command` for tokio: the same rule, for the async spawn sites.
+pub fn tokio_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new(program); // spawn-helper
+    #[cfg(windows)]
+    {
+        if let Some(flags) = no_console_flags() {
+            c.creation_flags(flags);
+        }
+    }
+    c
+}
+
+/// CREATE_NO_WINDOW when this process has no console window, else None.
+#[cfg(windows)]
+fn no_console_flags() -> Option<u32> {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    // SAFETY: GetConsoleWindow takes no arguments and only reads this
+    // process's console attachment.
+    let hwnd = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+    hwnd.is_null().then_some(CREATE_NO_WINDOW)
+}
+
 pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::process::Child> {
     // Name the path in every failure: a HOME that does not exist used to print
     // only "No such file or directory (os error 2)", which names nothing.
@@ -2075,7 +2120,7 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
     }
     let log_file = open_private_log(log, false)
         .map_err(|e| anyhow::anyhow!("cannot open the daemon log {}: {e}", log.display()))?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = command(exe);
     cmd.args(args);
     // Marks the child as the detached daemon, whose console is `log`: it must
     // never follow that log (see up_cmd). Windows needs this; unix also
@@ -2371,7 +2416,7 @@ mod tests {
         let _rt = rt.enter();
         for i in 0..20 {
             let marker = dir.join(format!("rec-{i}"));
-            let mut cmd = tokio::process::Command::new("/bin/sh");
+            let mut cmd = crate::platform::tokio_command("/bin/sh");
             cmd.arg("-c").arg(r#"test "$(cat "$1")" = "$$""#).arg("sh").arg(&marker);
             own_process_group(&mut cmd);
             die_with_daemon(&mut cmd);
@@ -2400,7 +2445,7 @@ mod tests {
             .build()
             .unwrap();
         let _rt = rt.enter();
-        let mut cmd = tokio::process::Command::new("/definitely/not/a/tunlion/program");
+        let mut cmd = crate::platform::tokio_command("/definitely/not/a/tunlion/program");
         let r = spawn_recorded(&mut cmd, |pid| pid);
         assert!(r.is_err());
     }
@@ -2637,7 +2682,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut cmd = tokio::process::Command::new("/bin/sh");
+            let mut cmd = crate::platform::tokio_command("/bin/sh");
             cmd.arg("-c").arg("sleep 300 & sleep 300; wait");
             own_process_group(&mut cmd);
             let mut child = cmd.spawn().expect("spawn sh");
@@ -2674,7 +2719,7 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let mut cmd = tokio::process::Command::new("/bin/sleep");
+                let mut cmd = crate::platform::tokio_command("/bin/sleep");
                 cmd.arg("300");
                 own_process_group(&mut cmd);
                 die_with_daemon(&mut cmd);
@@ -2967,7 +3012,7 @@ pub mod policy_route {
     pub fn default_gateway() -> Option<String> {
         #[cfg(target_os = "linux")]
         {
-            let out = std::process::Command::new("ip")
+            let out = crate::platform::command("ip")
                 .args(["-4", "route", "show", "default"])
                 .output()
                 .ok()?;
@@ -2997,7 +3042,7 @@ pub mod policy_route {
         {
             let mut failures = Vec::new();
             for step in plan {
-                match std::process::Command::new("ip").args(step).output() {
+                match crate::platform::command("ip").args(step).output() {
                     Ok(o) if o.status.success() => {}
                     Ok(o) => {
                         let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -3453,7 +3498,7 @@ pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
     match how {
         Escalate::Continue => Ok(()),
         Escalate::Kill => {
-            let st = std::process::Command::new("taskkill")
+            let st = crate::platform::command("taskkill")
                 .args(["/F", "/PID", &pid.to_string()])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())

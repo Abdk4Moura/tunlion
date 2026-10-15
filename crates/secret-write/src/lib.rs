@@ -178,7 +178,31 @@ fn create_private_dir_all(dir: &Path) -> io::Result<()> {
 /// principal.
 #[cfg(windows)]
 fn current_user_sid() -> io::Result<String> {
-    let out = std::process::Command::new("whoami")
+    // The SID cannot change while this process runs, and every private write
+    // asks for it, so look it up once (a daemon writes private files often).
+    static SID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(sid) = SID.get() {
+        return Ok(sid.clone());
+    }
+    let sid = lookup_user_sid()?;
+    Ok(SID.get_or_init(|| sid).clone())
+}
+
+/// A captured, non-interactive helper process (whoami, icacls). It never needs
+/// a console: CREATE_NO_WINDOW keeps one from flashing on screen when the
+/// caller (the detached daemon) has no console of its own.
+#[cfg(windows)]
+fn quiet_command(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut c = std::process::Command::new(program);
+    c.creation_flags(CREATE_NO_WINDOW);
+    c
+}
+
+#[cfg(windows)]
+fn lookup_user_sid() -> io::Result<String> {
+    let out = quiet_command("whoami")
         .args(["/user", "/fo", "csv", "/nh"])
         .output()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to run whoami: {e}")))?;
@@ -217,7 +241,7 @@ fn restrict_dacl(path: &Path) -> io::Result<()> {
     // "Successfully processed 1 files; Failed processing 0 files" banner to the
     // parent's stdout, which leaks into every managed-key install. Buffer it and
     // only surface the output when the call actually fails.
-    let out = std::process::Command::new("icacls")
+    let out = quiet_command("icacls")
         .args([&path_str, "/inheritance:r", "/grant:r", &format!("*{sid}:(F)"), "/Q"])
         .output()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to run icacls: {e}")))?;

@@ -1040,7 +1040,7 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
             "  this daemon runs as a service (pid {pid}); its output goes to the journal"
         ));
         ui::say(&ui::paint(ui::Tone::Dim, &format!("    {cmd}")));
-        let child = std::process::Command::new("journalctl")
+        let child = crate::platform::command("journalctl")
             .args(scope.split_whitespace())
             .args(["-u", unit])
             .args(if follow { vec!["-f"] } else { vec![] })

@@ -4161,7 +4161,7 @@ fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
 #[test]
 fn down_reports_a_failed_kill_instead_of_stopped() {
     // A real failing exit status, portably: libtest rejects an unknown flag.
-    let failed = std::process::Command::new(std::env::current_exe().unwrap())
+    let failed = crate::platform::command(std::env::current_exe().unwrap())
         .arg("--definitely-not-a-libtest-flag")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -4173,7 +4173,7 @@ fn down_reports_a_failed_kill_instead_of_stopped() {
     assert!(why.contains("still running"), "{why}");
     assert!(why.contains("pidfile is kept"), "{why}");
     assert!(!why.contains("stopped (pid"), "{why}");
-    let ok = std::process::Command::new(std::env::current_exe().unwrap())
+    let ok = crate::platform::command(std::env::current_exe().unwrap())
         .args(["--list", "--exact", "no-such-test-name"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -4190,7 +4190,7 @@ fn down_reports_a_failed_kill_instead_of_stopped() {
 /// Helper: create a Windows directory junction via `cmd /c mklink /J`.
 #[cfg(windows)]
 fn create_junction(target: &std::path::Path, link: &std::path::Path) {
-    let status = std::process::Command::new("cmd")
+    let status = crate::platform::command("cmd")
         .args(["/C", "mklink", "/J"])
         .arg(link.to_str().unwrap())
         .arg(target.to_str().unwrap())
@@ -4201,7 +4201,7 @@ fn create_junction(target: &std::path::Path, link: &std::path::Path) {
 
 #[cfg(windows)]
 fn create_file_symlink(target: &std::path::Path, link: &std::path::Path) {
-    let status = std::process::Command::new("cmd")
+    let status = crate::platform::command("cmd")
         .args(["/C", "mklink"])
         .arg(link.to_str().unwrap())
         .arg(target.to_str().unwrap())
