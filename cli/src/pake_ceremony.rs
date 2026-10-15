@@ -144,6 +144,44 @@ pub struct Ceremony {
     peer_direct: bool,
 }
 
+/// Who a pairing ceremony should run with, given one inbound PAKE payload.
+///
+/// A claimer joins the code creator's ROOM, and everyone else on that network
+/// is in the room too. Binding the ceremony to the first link that came up let
+/// a bystander (another browser tab, another device on the same Wi-Fi) take
+/// the creator's place: our element went to it, the creator never heard from
+/// us, and pairing stalled about one time in four. The creator's own element
+/// names our nameplate, so it identifies the real partner.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Partner {
+    /// From the peer we are bound to (or nobody yet): feed the ceremony.
+    Ours,
+    /// The real partner, and we bound a bystander: switch and resend.
+    Switch,
+    /// Another code's ceremony, or a stray after K: not ours, ignore it.
+    Ignore,
+}
+
+/// Pure: see [`Partner`]. `addressed` is [`addressed_to`] for our nameplate
+/// (None for an untagged payload from an old peer, treated as ours).
+pub fn partner_for(
+    bound: Option<&str>,
+    from: &str,
+    is_msg: bool,
+    addressed: Option<bool>,
+    has_k: bool,
+) -> Partner {
+    if addressed == Some(false) {
+        return Partner::Ignore;
+    }
+    match bound {
+        None => Partner::Ours,
+        Some(b) if b == from => Partner::Ours,
+        Some(_) if is_msg && addressed == Some(true) && !has_k => Partner::Switch,
+        Some(_) => Partner::Ignore,
+    }
+}
+
 /// Is this PAKE payload for the ceremony on `nameplate`? `Some(true)` when the
 /// payload names our nameplate, `Some(false)` when it names a DIFFERENT one
 /// (another code's ceremony sharing the room: never ours to answer or to fail
@@ -215,6 +253,30 @@ impl Ceremony {
 
     pub fn secret(&self) -> Option<&String> {
         self.secret.as_ref()
+    }
+
+    /// Our element as a `signal` payload, without marking it sent: for a
+    /// claimer offering it to every peer that comes up in the room before the
+    /// creator has spoken (only the creator, who holds the code, can use it).
+    pub fn msg_payload(&self) -> Value {
+        json!({
+            "type": "pake-msg", "v": 2,
+            "msg": b64_encode(&self.msg),
+            "np": self.nameplate,
+            "direct": true,
+        })
+    }
+
+    /// Send our element again, to a new partner: the peer it went to was a
+    /// bystander in the room, not the other side of this code. Only possible
+    /// before K is derived (after that the ceremony is committed to its peer).
+    /// Returns whether the send was re-armed.
+    pub fn rearm_msg(&mut self) -> bool {
+        if self.k.is_some() {
+            return false;
+        }
+        self.sent_msg = false;
+        true
     }
     /// The abort reason, if the ceremony was refused. Callers normally act on the
     /// `Inbound::Abort` returned by `on_signal`; this accessor is used by the
@@ -553,6 +615,35 @@ mod tests {
     // nameplate, so a peer can tell another code's ceremony from its own
     // without running it (the concurrent-send defect: a receiver of code 1
     // handshook with code 2's sender, which then refused its own transfer).
+    #[test]
+    fn a_bystander_bound_at_link_up_gives_way_to_the_real_partner() {
+        // Bound to a bystander; the creator's element names our nameplate.
+        assert_eq!(partner_for(Some("desk"), "phone", true, Some(true), false), Partner::Switch);
+        // The same from the peer we are bound to.
+        assert_eq!(partner_for(Some("phone"), "phone", true, Some(true), false), Partner::Ours);
+        // Another code's ceremony never feeds ours.
+        assert_eq!(partner_for(Some("phone"), "other", true, Some(false), false), Partner::Ignore);
+        assert_eq!(partner_for(None, "other", true, Some(false), false), Partner::Ignore);
+        // Once K is derived the ceremony is committed.
+        assert_eq!(partner_for(Some("phone"), "desk", true, Some(true), true), Partner::Ignore);
+        // A confirm from someone else is never a reason to switch.
+        assert_eq!(partner_for(Some("phone"), "desk", false, Some(true), false), Partner::Ignore);
+        // Nobody bound yet: the first speaker is ours (old untagged peers too).
+        assert_eq!(partner_for(None, "phone", true, None, false), Partner::Ours);
+        // Re-arming our element works only before K.
+        let (mut a, mut b) = (
+            Ceremony::new("pw", "314", pair_v2_caps(), 1),
+            Ceremony::new("pw", "314", pair_v2_caps(), 1),
+        );
+        assert!(a.take_msg_payload().is_some());
+        assert!(a.take_msg_payload().is_none());
+        assert!(a.rearm_msg());
+        assert!(a.take_msg_payload().is_some());
+        let bm = b.take_msg_payload().unwrap();
+        a.on_signal(&bm, None);
+        assert!(!a.rearm_msg());
+    }
+
     #[test]
     fn payloads_name_their_nameplate() {
         let scope = crate::identity::IntroScope::Device.to_byte();

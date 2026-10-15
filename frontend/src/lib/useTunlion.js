@@ -22,6 +22,7 @@ import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink } from '.
 import { shouldAutoAccept } from '../net/app/accept.js'
 import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
 import { localHelperEnabled } from '../net/app/localHelper.js'
+import { pakePartnerFor } from '../net/app/pakePartner.js'
 // APPLICATION/state-reducer — pure peer/transfer list transforms (Phase 2).
 import { addPeerToList, patchPeerInList, removePeerFromList, upsertTransferInList } from '../net/app/state.js'
 
@@ -686,6 +687,22 @@ export function useTunlion() {
         // pending v2 pairing, route pake-msg/pake-confirm into the PAKE machine
         // (creating the PakePairing on first contact), OUT of the WebRTC path.
         if (data?.type === 'pake-msg' || data?.type === 'pake-confirm') {
+          const partner = pakePartnerFor({
+            bound: pakeRef.current ? pakePeerRef.current : null,
+            from,
+            isMsg: data.type === 'pake-msg',
+            np: data.np,
+            ourNp: pendingPakeRef.current?.nameplate,
+            haveK: !!pakeRef.current?.haveK,
+          })
+          if (partner === 'ignore') return
+          if (partner === 'switch') {
+            // The first link was a bystander in the room: run the ceremony
+            // with the peer that named our code, from a fresh element.
+            log.debug('pairing: the first link was a bystander; switching to', from.slice(-6))
+            pakeRef.current = null
+            pakePeerRef.current = null
+          }
           ensurePakePairing(from)
           if (pakeRef.current && pakePeerRef.current === from) {
             pakeRef.current.onSignal(data)
