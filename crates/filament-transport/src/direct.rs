@@ -987,6 +987,38 @@ fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
 /// We add a 1-byte kind tag (0=control,1=data) + 4-byte length so the reader
 /// can demux a byte-stream back into discrete messages (QUIC has no message
 /// boundaries the way SCTP/DataChannel does).
+/// How long one write may make no progress before the link is declared dead.
+/// Control frames are small, so a long stall on one means the send stream is
+/// blocked behind a peer that stopped reading; data frames get longer, because
+/// a slow receiver legitimately parks a large frame on flow control.
+/// `TUNLION_DIRECT_WRITE_STALL_MS` overrides both (gates).
+pub(crate) fn write_stall_budget(kind: u8) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let o = TEST_STALL_MS.with(|c| c.get());
+        if o > 0 {
+            return std::time::Duration::from_millis(o);
+        }
+    }
+    if let Some(ms) = std::env::var("TUNLION_DIRECT_WRITE_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    if kind == KIND_CONTROL {
+        std::time::Duration::from_secs(10)
+    } else {
+        std::time::Duration::from_secs(30)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STALL_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub struct DirectTransport {
     conn: quinn::Connection,
     send: Arc<Mutex<SendStream>>,
@@ -1053,10 +1085,42 @@ fn now_ms() -> u64 {
 
 impl DirectTransport {
     /// Frame: [1B kind][4B BE len][payload].
+    /// Every write on this link is BOUNDED, and a write that hits the bound
+    /// closes the connection.
+    ///
+    /// All writes share one send stream behind `self.send`. A peer that stays
+    /// connected but stops reading (its app is wedged, its terminal paused, its
+    /// console in selection mode) fills QUIC flow control, and `write_all` then
+    /// parks forever WHILE HOLDING THE LOCK: the connection never idles out,
+    /// because quinn keeps answering keepalives underneath. Every later write,
+    /// including the daemon event loop's own control sends (liveness pongs,
+    /// hellos, announcements), then waits on that lock forever, and the whole
+    /// daemon stops: no control socket, no signaling, no new pairings. That is
+    /// how a detached shell whose client stopped draining froze a production
+    /// daemon.
+    ///
+    /// So a write that makes no progress within the budget marks the link dead
+    /// and CLOSES the QUIC connection, which wakes the parked holder with an
+    /// error and releases the lock. The link is re-established like any other
+    /// dead link, and a detached shell keeps its output for a reattach.
     async fn write_framed(&self, kind: u8, payload: &[u8]) -> Result<()> {
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(anyhow!("direct connection closed"));
         }
+        let budget = write_stall_budget(kind);
+        match tokio::time::timeout(budget, self.write_framed_unbounded(kind, payload)).await {
+            Ok(r) => r,
+            Err(_) => {
+                self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.conn.close(quinn::VarInt::from_u32(0x5741), b"write stalled");
+                Err(anyhow!(
+                    "direct write made no progress for {budget:?}: the peer is not reading, link closed"
+                ))
+            }
+        }
+    }
+
+    async fn write_framed_unbounded(&self, kind: u8, payload: &[u8]) -> Result<()> {
         let mut hdr = [0u8; 5];
         hdr[0] = kind;
         hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -2308,6 +2372,50 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         f()
+    }
+
+    /// A peer that stays connected but stops reading must not freeze every
+    /// other write on the link. Before the bound, the data writer parked on flow
+    /// control holding the send lock, and a control send (what the daemon's event
+    /// loop does) waited on that lock forever: the production daemon hang.
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_cannot_wedge_control_sends() {
+        TEST_STALL_MS.with(|c| c.set(1500));
+        tokio::time::timeout(std::time::Duration::from_secs(40), async {
+            let ((conn_d, send_d, recv_d), (_conn_a, _send_a, _recv_a)) = connected_pair().await;
+            // The peer side never reads `_recv_a`: alive, connected, not draining.
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let ours = make_transport("peer".to_string(), conn_d, send_d, recv_d, tx, false, None, true);
+            let writer = ours.clone();
+            let flood = tokio::spawn(async move {
+                let chunk = vec![7u8; 60 * 1024];
+                for i in 0..2000u64 {
+                    if writer.send_frame(0x8000_0001, i, &chunk).await.is_err() {
+                        return true;
+                    }
+                }
+                false
+            });
+            // Let the flood fill the peer's receive window and park.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let t0 = std::time::Instant::now();
+            let r = ours.send_control(&serde_json::json!({"type": "liveness-pong"})).await;
+            assert!(r.is_err(), "a control send behind a wedged peer must fail, not succeed silently");
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(10),
+                "the control send must give up within its bound, took {:?}",
+                t0.elapsed()
+            );
+            assert!(ours.is_dead(), "a link whose peer stopped reading must be marked dead");
+            let flood_failed = tokio::time::timeout(std::time::Duration::from_secs(10), flood)
+                .await
+                .expect("the parked data writer must be woken when the link is closed")
+                .expect("flood task");
+            assert!(flood_failed, "the parked data writer must get an error once the link is closed");
+        })
+        .await
+        .expect("a control send behind a peer that stopped reading HUNG (the daemon-wedge bug)");
+        TEST_STALL_MS.with(|c| c.set(0));
     }
 
     /// The join hang's direct twin: the peer writes the moment its side is up,
