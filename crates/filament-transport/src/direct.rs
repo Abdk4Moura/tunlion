@@ -506,7 +506,7 @@ async fn public_ip(server: &str) -> Option<IpAddr> {
         }
     }
     let url = format!("{server}/api/whoami");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;

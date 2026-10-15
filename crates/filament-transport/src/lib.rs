@@ -21,4 +21,5 @@
 
 pub mod direct;
 pub mod hooks;
+pub mod http;
 pub mod net;
