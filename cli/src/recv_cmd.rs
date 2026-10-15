@@ -2094,7 +2094,23 @@ pub(crate) async fn recv_cmd(
         // Live posture: a `tunlion grant <dev> shell` (or the revoke of the last
         // shell grant) applies to the RUNNING daemon on the next open. Computed once at startup, it silently required a
         // restart and refused every granted device with "shell serving is off".
+        let was_l2 = l2_enabled;
         l2_enabled = l2_launch || crate::shell_support::any_shell_grant_live();
+        // A grant (or the revoke of the last one) changed what this machine
+        // serves: say so on the links that are already up. The `caps` message
+        // went out only at ChannelReady, so a browser that was connected when
+        // the owner ran `grant` showed no Shell button until it reconnected.
+        // Spawned: a send must never block this loop on a dead peer.
+        if was_l2 != l2_enabled {
+            for l in conn.links.values() {
+                if let Some(t) = l.transport.clone() {
+                    let caps = json!({ "type": "caps", "shell": l2_enabled });
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), t.send_control(&caps)).await;
+                    });
+                }
+            }
+        }
         // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
         // If this loop WEDGES on an await, the pings stop and systemd restarts us
         // - the backstop for the stall that also freezes the reconnect code.

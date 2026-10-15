@@ -63,16 +63,19 @@ pub(crate) struct Reinvite {
 /// A lifetime as an `--expires` value, rounded UP to one unit (an invitation
 /// joined a few seconds after it was minted still reads as the "4m" it was
 /// minted with) and never above the 30-day maximum `add` accepts. Pure.
+///
+/// Never in seconds: an invitation's expiry is carried in whole minutes
+/// (`expires_min` in the token), and the lifetime here is measured from when
+/// the device JOINED, so anything under a minute is the join delay eating into
+/// a "1m" invitation. It used to be suggested back as `--expires 51s`.
 pub(crate) fn expires_text(secs: u64) -> String {
     let secs = secs.clamp(1, 30 * 86400);
     if secs >= 86400 {
         format!("{}d", secs.div_ceil(86400))
     } else if secs >= 3600 {
         format!("{}h", secs.div_ceil(3600))
-    } else if secs >= 60 {
-        format!("{}m", secs.div_ceil(60))
     } else {
-        format!("{secs}s")
+        format!("{}m", secs.div_ceil(60))
     }
 }
 
@@ -847,7 +850,10 @@ mod tests {
 
     #[test]
     fn expires_text_rounds_up_and_caps_at_thirty_days() {
-        assert_eq!(expires_text(20), "20s");
+        // A "1m" invitation joined 9 s after it was minted is suggested as 1m,
+        // not 51s: invitation expiry is whole minutes.
+        assert_eq!(expires_text(51), "1m");
+        assert_eq!(expires_text(20), "1m");
         assert_eq!(expires_text(223), "4m");
         assert_eq!(expires_text(3600), "1h");
         assert_eq!(expires_text(30 * 86400 - 5), "30d");
