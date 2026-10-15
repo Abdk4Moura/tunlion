@@ -49,8 +49,12 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
   const ip = lab(`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${DASH}`).trim();
   // A control socket, so the tunnel is closed by name of socket, never by pkill.
   lab(`ssh -S ~/.ssh/mxdash.sock -O exit x 2>/dev/null; ssh -M -S ~/.ssh/mxdash.sock -i ~/.ssh/mxdash -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ExitOnForwardFailure=yes -fN -L 127.0.0.1:${PORT}:127.0.0.1:${PORT} -p 2222 sam@${ip} && echo tunnel`);
-  const fwd = cp.spawn('gh', ['codespace', 'ssh', '-c', process.env.CODESPACE, '--', '-N', '-o', 'ExitOnForwardFailure=yes', '-L', `${PORT}:127.0.0.1:${PORT}`], { stdio: 'ignore' });
-  await new Promise(r => setTimeout(r, 8000));
+  // A Codespace lab host needs a second hop to this workstation; a local lab
+  // host (a CI runner) already has the tunnel's port.
+  const fwd = process.env.CODESPACE
+    ? cp.spawn('gh', ['codespace', 'ssh', '-c', process.env.CODESPACE, '--', '-N', '-o', 'ExitOnForwardFailure=yes', '-L', `${PORT}:127.0.0.1:${PORT}`], { stdio: 'ignore' })
+    : null;
+  await new Promise(r => setTimeout(r, fwd ? 8000 : 1000));
   dash(`(nohup tunlion dashboard --no-open --port ${PORT} > dash.out 2>&1 &) ; sleep 3; cat dash.out`);
   const url = (dash('cat dash.out').match(/http:\/\/127\.0\.0\.1:\d+\/#k=[0-9a-f]+/) || [])[0];
   const b = await chromium.launch();
@@ -155,6 +159,6 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
   });
 
   if (errs.length) console.log('page errors:', errs.join(' | '));
-  await b.close(); fwd.kill();
+  await b.close(); if (fwd) fwd.kill();
   lab(`ssh -S ~/.ssh/mxdash.sock -O exit x 2>/dev/null; ~/matrix/box.sh down ${DASH} ${INV} ${CODE_BOX}`);
 })().catch(e => { console.error(e); process.exit(1); });

@@ -1,0 +1,141 @@
+# The launch matrix (lab/matrix/), on a GitHub runner instead of a Codespace.
+#
+# The runner is the lab host: the CLI machines are docker containers here,
+# tmux gives them real TTYs, and Chromium runs here too. Dispatch only: it is a
+# release check, not a per-PR gate.
+#
+# Signaling: the production API when it answers (the realistic setting), else a
+# local backend (backend/app.py) on this runner. The forced-relay cell (C20)
+# always runs against a local backend and a local coturn, so the product's relay
+# path is verified independently of production TURN capacity.
+name: Launch matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Cell regex (default: every cell)"
+        default: "."
+      what:
+        description: "cli | browser | all"
+        default: "all"
+      signaling:
+        description: "auto (production if it answers) | production | local"
+        default: "auto"
+      pairing_repeats:
+        description: "Extra rounds of the browser pairing cells (B03 B04 B05 B08 B12 BB1)"
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build the CLI (static, as the release does)
+        working-directory: cli
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools tmux
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/tunlion "$RUNNER_TEMP/tunlion"
+          "$RUNNER_TEMP/tunlion" --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the web app (production API, and same-origin for a local backend)
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          cp -r dist "$RUNNER_TEMP/dist-prod"
+          rm -rf dist
+          VITE_TUNLION_API= npm run build
+          npx playwright install --with-deps chromium
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Local backend and coturn
+        run: |
+          pip install -q flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+          GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
+          TS="matrix$RANDOM$RANDOM"
+          # Pinned: coturn/coturn latest dropped --no-dtls (see cli/tests/gates.sh gate 10).
+          docker run -d --name mx-coturn --network host coturn/coturn:4.6.2 -n \
+            --listening-ip="$GW" --relay-ip="$GW" --listening-port=3478 \
+            --min-port=49160 --max-port=65535 \
+            --static-auth-secret="$TS" --realm=tunlion.test --no-tls --no-dtls --cli-password=x
+          ( cd backend && PORT=8078 FIL_TURN_HOST="turn:$GW:3478" FIL_TURN_SECRET="$TS" \
+              FIL_CLAIM_LIMIT=1000000 nohup python3 app.py > "$RUNNER_TEMP/backend.log" 2>&1 & )
+          for i in $(seq 1 30); do curl -sf "http://$GW:8078/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://$GW:8078/api/health"
+          docker inspect -f '{{.State.Running}}' mx-coturn
+          echo "MX_RELAY_SERVER=http://$GW:8078" >> "$GITHUB_ENV"
+          echo "LOCAL_SERVER=http://$GW:8078" >> "$GITHUB_ENV"
+
+      - name: Choose signaling
+        run: |
+          mode="${{ inputs.signaling }}"
+          if [ "$mode" = auto ]; then
+            if curl -sf --max-time 10 https://api.tunlion.autumated.com/api/health >/dev/null; then mode=production; else mode=local; fi
+          fi
+          echo "signaling: $mode" | tee "$RUNNER_TEMP/signaling.txt"
+          if [ "$mode" = local ]; then
+            echo "MX_SERVER_URL=$LOCAL_SERVER" >> "$GITHUB_ENV"
+            echo "MX_ORIGIN=http://127.0.0.1:8078" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run the matrix
+        env:
+          LAB_HOST: "bash -c"
+          LAB_DIR: /home/runner/matrix
+          PLAYWRIGHT: ${{ github.workspace }}/frontend/node_modules/playwright
+        run: |
+          export FRONTEND_DIST="$RUNNER_TEMP/dist-prod"
+          OUT="$RUNNER_TEMP/out"
+          lab/matrix/run.sh "$RUNNER_TEMP/tunlion" "$OUT/full" "${{ inputs.what }}" '${{ inputs.filter }}' || true
+          n="${{ inputs.pairing_repeats }}"
+          if [ "${{ inputs.what }}" != cli ] && [ "${n:-0}" -gt 0 ]; then
+            for i in $(seq 1 "$n"); do
+              lab/matrix/run.sh "$RUNNER_TEMP/tunlion" "$OUT/pair$i" browser 'B03|B04|B05|B08|B12|BB1' || true
+            done
+          fi
+          cp "$RUNNER_TEMP/signaling.txt" "$OUT/"
+          cat "$OUT/full/matrix.md"
+          for i in $(seq 1 "${n:-0}"); do [ -f "$OUT/pair$i/matrix.md" ] && { echo "== pairing round $i"; grep -E '^\| (B0[3458]|B12|BB1) ' "$OUT/pair$i/matrix.md"; }; done
+
+      - name: Keep the results
+        if: always()
+        run: |
+          cp "$RUNNER_TEMP/backend.log" "$RUNNER_TEMP/out/" 2>/dev/null || true
+          docker logs mx-coturn > "$RUNNER_TEMP/out/coturn.log" 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: launch-matrix
+          path: ${{ runner.temp }}/out
+          retention-days: 14

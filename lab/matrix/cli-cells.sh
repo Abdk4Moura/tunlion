@@ -205,9 +205,33 @@ c_skill() {
   x $L <<<'head -3 ~/sk/tunlion/SKILL.md' | grep -q 'name: tunlion'
 }
 c_relay() {
-  x $L <<<'echo via-relay > r.txt; tunlion send r.txt --to server --relay' 2>&1 | keep -i relay || return 1
-  x $S <<<'cat Tunlion/r.txt' | grep -q via-relay || return 1
-  out=$(x $L <<<'tunlion exec server --relay -- echo relayed-exec 2>/dev/null'); [ "$out" = relayed-exec ]
+  # With MX_RELAY_SERVER set, the relay cell runs against that signaling server
+  # and the TURN server it hands out (a local backend + coturn), on a pair of
+  # its own machines: the product's relay path is then checked independently
+  # of production TURN capacity. Without it, the production pair is used.
+  if [ -z "${MX_RELAY_SERVER:-}" ]; then
+    x $L <<<'echo via-relay > r.txt; tunlion send r.txt --to server --relay' 2>&1 | keep -i relay || return 1
+    x $S <<<'cat Tunlion/r.txt' | grep -q via-relay || return 1
+    out=$(x $L <<<'tunlion exec server --relay -- echo relayed-exec 2>/dev/null'); [ "$out" = relayed-exec ]
+    return
+  fi
+  local RA=mx-ra RB=mx-rb rc=0
+  echo "signaling + TURN: $MX_RELAY_SERVER (local stack)"
+  BOX_SERVER=$MX_RELAY_SERVER "$BOX" up $RA; BOX_SERVER=$MX_RELAY_SERVER "$BOX" up $RB
+  x $RA <<<'tunlion init --name ra --no-background --recovery-file ~/.r -y >/dev/null && tunlion up --detach >/dev/null && tunlion add rb --allow transfer,shell --out inv.txt -y >/dev/null && echo ok' | keep '^ok$' || rc=1
+  if [ $rc = 0 ]; then
+    cp_between $RA /home/sam/inv.txt $RB /home/sam/inv.txt
+    x $RB <<<'tunlion join inv.txt -y >/dev/null && tunlion up --detach >/dev/null && tunlion grant ra shell >/dev/null && echo joined' | keep '^joined$' || rc=1
+  fi
+  if [ $rc = 0 ]; then
+    sleep 3
+    # The relay banner is promised at default verbosity on a relayed path.
+    x $RA <<<'echo via-relay > r.txt; tunlion send r.txt --to rb --relay' 2>&1 | keep 'on relay, via a TURN server' || rc=1
+    x $RB <<<'cat Tunlion/r.txt' | keep via-relay || rc=1
+    out=$(x $RA <<<'tunlion exec rb --relay -- echo relayed-exec 2>/dev/null'); echo "exec said: $out"; [ "$out" = relayed-exec ] || rc=1
+  fi
+  "$BOX" down $RA $RB
+  return $rc
 }
 c_revoke_cap() {
   x $S <<<'tunlion revoke laptop shell -y' || return 1
