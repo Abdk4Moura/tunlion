@@ -77,6 +77,26 @@ use tokio::sync::mpsc;
 /// receiver (and its exit) hostage.
 const ACK_FLUSH_BUDGET: Duration = Duration::from_secs(2);
 
+/// The `caps` message to re-send on live links when what this machine serves
+/// changed (a grant, or the revoke of the last shell grant), else None. Pure.
+fn caps_reannounce(was_serving_shell: bool, serving_shell: bool) -> Option<Value> {
+    (was_serving_shell != serving_shell).then(|| json!({ "type": "caps", "shell": serving_shell }))
+}
+
+#[cfg(test)]
+mod caps_reannounce_tests {
+    use super::caps_reannounce;
+
+    #[test]
+    fn a_grant_or_last_revoke_is_announced_on_live_links() {
+        assert_eq!(caps_reannounce(false, true).unwrap()["shell"], true);
+        assert_eq!(caps_reannounce(true, false).unwrap()["shell"], false);
+        assert_eq!(caps_reannounce(true, false).unwrap()["type"], "caps");
+        assert!(caps_reannounce(true, true).is_none());
+        assert!(caps_reannounce(false, false).is_none());
+    }
+}
+
 /// A shell-class open parked while its link's possession proof is in flight
 /// (settle-then-evaluate). The link is identified by pid AND the device key
 /// known at park time: only a proof for the same identity on the same link
@@ -2101,10 +2121,10 @@ pub(crate) async fn recv_cmd(
         // went out only at ChannelReady, so a browser that was connected when
         // the owner ran `grant` showed no Shell button until it reconnected.
         // Spawned: a send must never block this loop on a dead peer.
-        if was_l2 != l2_enabled {
+        if let Some(caps) = caps_reannounce(was_l2, l2_enabled) {
             for l in conn.links.values() {
                 if let Some(t) = l.transport.clone() {
-                    let caps = json!({ "type": "caps", "shell": l2_enabled });
+                    let caps = caps.clone();
                     tokio::spawn(async move {
                         let _ = tokio::time::timeout(Duration::from_secs(5), t.send_control(&caps)).await;
                     });
