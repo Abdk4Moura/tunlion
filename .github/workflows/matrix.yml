@@ -129,7 +129,30 @@ jobs:
           fi
           cp "$RUNNER_TEMP/signaling.txt" "$OUT/"
           cat "$OUT/full/matrix.md"
-          for i in $(seq 1 "${n:-0}"); do [ -f "$OUT/pair$i/matrix.md" ] && { echo "== pairing round $i"; grep -E '^\| (B0[3458]|B12|BB1) ' "$OUT/pair$i/matrix.md"; }; done
+          for i in $(seq 1 "${n:-0}"); do [ -f "$OUT/pair$i/matrix.md" ] && { echo "== pairing round $i"; grep -E '^\| (B0[3458]|B12|BB1) ' "$OUT/pair$i/matrix.md" || true; }; done
+
+      # The verdict: the job is red exactly when an applicable cell failed, in the
+      # full run or in any pairing round, or when a run produced no results at
+      # all. n/a cells (features not in this release, or not possible in a
+      # container) do not count. A filtered run is judged on the cells it ran.
+      - name: Verdict
+        run: |
+          python3 - "$RUNNER_TEMP/out" <<'PY'
+          import json, pathlib, sys
+          out = pathlib.Path(sys.argv[1]); bad = []; ran = 0
+          for m in sorted(out.glob('*/matrix.json')):
+              for c in json.loads(m.read_text()).get('cells', []):
+                  ran += 1
+                  if c.get('result') not in ('pass', 'n/a'):
+                      bad.append(f"{m.parent.name}/{c.get('cell')} {c.get('result')}")
+          print(f"{ran} cell results read")
+          if not ran:
+              print('::error::no matrix results were produced'); sys.exit(1)
+          if bad:
+              for b in bad: print('::error::' + b)
+              sys.exit(1)
+          print('every applicable cell passed')
+          PY
 
       - name: Keep the results
         if: always()
