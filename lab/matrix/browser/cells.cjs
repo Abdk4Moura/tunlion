@@ -345,8 +345,12 @@ async function pairWithVpsIn(x, via) {
 
   await cell('B10', 'browser-cli', 'CLI sends --to the remembered browser', async () => {
     assert(paired, 'B05 paired a browser'); const { p, name } = paired;
-    // The transfer list is on Home; the cells before may have left the page on the shell.
-    await p.getByRole('button', { name: 'Home', exact: true }).click().catch(() => {}); await p.waitForTimeout(1000);
+    // The transfer list is on Home. The shell cells before leave their ended
+    // terminal open, and it covers the page (as it would for a person), so
+    // close it first, as a person would, then go Home.
+    const endBtn = p.getByRole('button', { name: 'End', exact: true });
+    if (await endBtn.count()) { await endBtn.first().click().catch(() => {}); await p.waitForTimeout(500); }
+    await p.getByRole('button', { name: 'Home', exact: true }).click(); await p.waitForTimeout(1000);
     vps(`head -c 200000 /dev/urandom > tob.bin; sha256sum tob.bin | cut -c1-64 > tob.sha`);
     const r = await vpsAsync(`timeout 60 tunlion send ${process.env.MX_DEBUG ? '-vv' : ''} tob.bin --to '${name}'`, { timeout: 90000 }); say(r.out, 'rc', r.rc);
     if (process.env.MX_DEBUG) { const alive = await Promise.race([p.evaluate(() => 'alive'), new Promise(r => setTimeout(() => r('HUNG'), 5000))]); paired.log.push('PAGE ' + alive); await shot(p, 'b10-after'); fs.writeFileSync(path.join(OUT, 'ev', 'B10-console.txt'), paired.log.join('\n')); }
