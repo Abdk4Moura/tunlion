@@ -229,6 +229,9 @@ pub(crate) async fn up_cmd(
         if !host.supports_install() {
             // An error, not a printed note and exit 0: a script that asked for
             // autostart did not get it, and must be able to tell.
+            if cfg!(target_os = "android") {
+                return Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Other, platform::ANDROID_NO_INSTALL));
+            }
             return Err(crate::exit_codes::err(
                 crate::exit_codes::ExitKind::Other,
                 "--install is not supported here: no service manager was found to start tunlion at boot. \

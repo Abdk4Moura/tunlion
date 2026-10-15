@@ -105,6 +105,9 @@ jobs:
           export TUNLION_CONFIG_DIR="$RUNNER_TEMP/host"
           H() { tunlion "$@"; }
           adb wait-for-device
+          # The app runs tunlion inside its own sandbox, where it may create its
+          # control socket. The adb shell user may not (SELinux), so run as root.
+          adb root >/dev/null; sleep 3; adb wait-for-device
           adb push android-bin/tunlion /data/local/tmp/tunlion >/dev/null
           adb shell chmod 755 /data/local/tmp/tunlion
           adb shell uname -a
@@ -116,11 +119,11 @@ jobs:
           sleep 5
           D status --json > st.json; python3 -c "import json;d=json.load(open('st.json'));assert d['ok'] is True" && pass "status --json valid" || { cat st.json; bad "status --json"; }
 
-          H init --name host --no-background --recovery-file "$RUNNER_TEMP/hrec.txt" -y >/dev/null && H up --userspace --detach >/dev/null && pass "host up" || bad "host up"
-
+          
           D add host --out /data/local/tmp/inv.txt -y && pass "add (invitation) on Android" || bad "add on Android"
           adb pull /data/local/tmp/inv.txt "$RUNNER_TEMP/inv.txt" >/dev/null && chmod 600 "$RUNNER_TEMP/inv.txt"
           H join "$RUNNER_TEMP/inv.txt" -y && pass "host joined the phone's invitation" || bad "host join"
+          H up --userspace --detach && pass "host up" || bad "host up"
           sleep 8
           D devices --json > dv.json; cat dv.json
           HOSTNAME_ON_PHONE=$(python3 -c "import json;d=json.load(open('dv.json'));print(d['data']['devices'][0]['name'])" 2>/dev/null)
@@ -141,7 +144,7 @@ jobs:
           (H send code.txt --code --json > send.ndjson 2>send.err &) ; sleep 6
           CODE=$(python3 -c "import json;print(json.loads(open('send.ndjson').readline())['code'])" 2>/dev/null)
           echo "code: $CODE"
-          D receive "$CODE" --dir /data/local/tmp/rx && adb shell cat /data/local/tmp/rx/code.txt | grep -q by-code && pass "receive <code> on Android" || bad "receive <code> on Android"
+          D receive "$CODE" --dir /data/local/tmp/rx; adb shell cat /data/local/tmp/rx/code.txt | grep -q by-code && pass "receive <code> on Android" || { cat send.err; bad "receive <code> on Android"; }
 
           sleep 60
           D status --json > st2.json; python3 -c "import json;d=json.load(open('st2.json'));assert d['ok'] is True" && pass "daemon still up after 60 s" || { cat st2.json; bad "daemon not up after 60 s"; }
