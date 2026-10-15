@@ -28,7 +28,7 @@ scales up/down in seconds.
   cloud)**. The only manual record (UDP can't go through the tunnel).
 - `tunlion.autumated.com` → added as a custom domain in the Pages project.
 - Firewall: open **`3478/tcp+udp`**, **`443/tcp+udp`** (TURN fallback) and
-  **`49160-49200/udp`** (coturn) on the
+  **`49152-65535/udp`** (coturn relay range; it was 49160-49200 before 0.9.0) on the
   droplet / DO cloud firewall. Nothing else.
 
 ## 1. Cloudflare Tunnel (one-time)

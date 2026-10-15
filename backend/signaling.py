@@ -411,7 +411,12 @@ def register(socketio, registry):
         """The room-join effect: leave any prior room, join the new one, and
         announce in both directions. Factored so `sync` can reuse the EXACT
         same flow when (and only when) a sid's room actually changes."""
-        _do_leave(sid)  # if this socket was already in a room, clean it first
+        # Leave any prior ROOM only. Channel subscriptions (known-device presence)
+        # are independent of the room and must survive a join: a legacy `join`
+        # right after a first `sync` used to drop them all, so a remembered
+        # device went unseen until the client's next re-sync (~30 s).
+        local_sids.discard(sid)  # unchanged from the old full leave
+        _leave_room(sid)
 
         join_room(room)
         registry.add(sid, room, name, uid)
@@ -690,8 +695,12 @@ def register(socketio, registry):
                 emit("known-peer-left", {"id": sid, "channel": ch}, to=other)
 
     def _do_leave(sid):
+        """Full departure (leave event, disconnect): channels and room."""
         _channel_goodbye(sid)
         local_sids.discard(sid)
+        _leave_room(sid)
+
+    def _leave_room(sid):
         room = registry.remove(sid)
         if not room:
             return
