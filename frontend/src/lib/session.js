@@ -172,6 +172,18 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       pendingSince = 0
       pendingDigest = null
     },
+    // The server just ran a room join for this socket (a `welcome` arrived).
+    // A join drops every channel subscription the socket held, including the
+    // ones the last sync confirmed, so that confirmation is void: re-assert
+    // now instead of leaving known devices invisible until the 30 s staleness
+    // re-sync. (The legacy `join` the signaling client sends on connect lands
+    // after the first sync, so this happened on every reload.)
+    rejoined() {
+      confirmed = { snapshot: null, at: 0 }
+      pendingSince = 0
+      pendingDigest = null
+      maybeSync(Date.now())
+    },
     // Teardown: clears the loop timer (HMR/unmount leak otherwise).
     stop() {
       clearInterval(timer)

@@ -66,6 +66,7 @@ function codeFeedback(ps) {
   if (ps === 'pairing') return { tone: 'wait', text: 'Checking the code…' }
   if (ps === 'paired') return { tone: 'ok', text: 'Code accepted. Both sides proved they hold the same code.' }
   if (ps === 'connected') return { tone: 'ok', text: 'Code accepted. Waiting for the file.' }
+  if (ps === 'received') return { tone: 'ok', text: 'Received. Save the file from the list below.' }
   const s = String(ps)
   if (/key confirmation failed/i.test(s)) return { tone: 'bad', text: "That code didn't match. Check the words and try again.", action: 'Try again' }
   if (/did not work|expired|already used/i.test(s)) return { tone: 'bad', text: "That code didn't work. It may be mistyped, already used (codes work once), or expired. Ask for a new one.", action: 'Enter another code' }

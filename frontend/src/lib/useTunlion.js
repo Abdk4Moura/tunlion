@@ -19,6 +19,9 @@ import { mintWords, mintCreatedNameplate, ADJ, ANIMAL as ANIMALS } from './words
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink } from '../net/app/recovery.js'
+import { shouldAutoAccept } from '../net/app/accept.js'
+import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
+import { localHelperEnabled } from '../net/app/localHelper.js'
 // APPLICATION/state-reducer — pure peer/transfer list transforms (Phase 2).
 import { addPeerToList, patchPeerInList, removePeerFromList, upsertTransferInList } from '../net/app/state.js'
 
@@ -152,6 +155,9 @@ export function useTunlion() {
     }
     if (t.status) transferStatusRef.current.set(t.id, t.status)
     setTransfers((prev) => upsertTransferInList(prev, t))
+    // A receive by code is over once its file is in: the code box stops saying
+    // it is waiting for the file.
+    if (t.status === 'complete') setPairStatus((ps) => codeStatusAfterTransfer(ps, t, ephemeralAuthRef.current.has(t.peerId)))
   }, [])
 
   // ---- known devices (C12/C20 browser half) ---------------------------------
@@ -342,7 +348,7 @@ export function useTunlion() {
           // (`tunlion receive <code>` never asks). Accept the authenticated
           // sender's offer instead of leaving it waiting on a second click
           // while the sender times out.
-          if (t.direction === 'receive' && t.status === 'offered' && ephemeralAuthRef.current.has(id)) {
+          if (shouldAutoAccept({ ...t, byCode: ephemeralAuthRef.current.has(id), provenKnown: !!link._verified })) {
             queueMicrotask(() => link.acceptTransfer(t.id))
           }
         },
@@ -422,6 +428,11 @@ export function useTunlion() {
                 link._verified = true // C30 ph3: the link's state ping carries this
                 tel('proof-ok', { peer: id.slice(-6) })
                 link.sendPairProofAck(true)
+                // The proof is checked asynchronously and a sender's offer can
+                // land first: accept the offers this proof now covers.
+                for (const t of link.transfers.values()) {
+                  if (shouldAutoAccept({ ...t, provenKnown: true })) link.acceptTransfer(t.id)
+                }
                 return
               }
             } catch {}
@@ -612,6 +623,7 @@ export function useTunlion() {
         // the tile flash in (subscribe → known-peer) and out (next welcome),
         // observed live ("connecting and then gotcha… it disappears").
         myIdRef.current = id // set before makeLink so politeness can be computed (#1)
+        session.rejoined() // a join dropped this socket's channel subscriptions
         for (const [pid, l] of [...linksRef.current]) {
           if (expectedSecretRef.current.has(pid)) continue // known device, room-independent
           // G-i: a signaling reconnect (our OWN socket blipped, welcome
@@ -1286,6 +1298,11 @@ export function useTunlion() {
   // Browsers may fetch http://localhost from a secure page, so this lights up
   // automatically when present and stays silent (available:false) when not.
   useEffect(() => {
+    let stored = null
+    try { stored = localStorage.getItem('tunlionLocalHelper') } catch {}
+    const choice = localHelperEnabled(window.location.search, stored)
+    if (choice.remember) { try { localStorage.setItem('tunlionLocalHelper', choice.remember) } catch {} }
+    if (!choice.enabled) return undefined
     let alive = true
     let t = null
     const HELPER = 'http://127.0.0.1:53317/peers'
