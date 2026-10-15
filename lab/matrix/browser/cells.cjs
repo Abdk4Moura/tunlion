@@ -23,6 +23,16 @@ const RES = path.join(OUT, 'browser.jsonl'); fs.writeFileSync(RES, '');
 const lab = (cmd, opt = {}) => cp.execSync(`${process.env.LAB_HOST} ${JSON.stringify(cmd)}`, { encoding: 'utf8', timeout: opt.timeout || 180000 });
 // Scripts go over stdin: a quoted multi-line command does not survive the lab-host hop.
 const vps = (script, opt = {}) => cp.execSync(`${process.env.LAB_HOST} "docker exec -i ${VPS} bash -l -s"`, { input: script + '\n', encoding: 'utf8', timeout: opt.timeout || 180000 });
+// The async form keeps node's event loop running while a long CLI command runs:
+// with execSync the Playwright connection is not serviced, so the page's CDP
+// traffic (console events, intercepted requests) backs up for the whole command.
+const vpsAsync = (script, opt = {}) => new Promise(res => {
+  const ch = cp.spawn('bash', ['-c', `${process.env.LAB_HOST} "docker exec -i ${VPS} bash -l -s"`]);
+  let out = ''; ch.stdout.on('data', d => out += d); ch.stderr.on('data', d => out += d);
+  const t = setTimeout(() => ch.kill('SIGKILL'), opt.timeout || 180000);
+  ch.on('close', code => { clearTimeout(t); res({ out, rc: code }); });
+  ch.stdin.end(script + '\n');
+});
 const tryVps = (script, opt) => { try { return { out: vps(script, opt), rc: 0 }; } catch (e) { return { out: (e.stdout || '') + (e.stderr || ''), rc: e.status }; } };
 const sha = f => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
 const CODE = /\b[a-z]+-[a-z]+(?:-[a-z]+)?-\d{2,5}\b/;
@@ -40,8 +50,10 @@ async function browser(kind = 'desktop') {
     if (!fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(DIST, 'index.html');
     await r.fulfill({ status: 200, body: fs.readFileSync(f), contentType: types[path.extname(f)] || 'application/octet-stream' });
   });
+  if (process.env.MX_DEBUG) await ctx.addInitScript(() => { try { localStorage.setItem('tunlionLog', 'trace'); } catch {} });
   const p = await ctx.newPage();
   const log = [];
+  if (process.env.MX_DEBUG) p.on('console', m => log.push(`${new Date().toISOString().slice(11, 23)} ${m.type()}: ${m.text().slice(0, 400)}`));
   p.on('pageerror', e => log.push('pageerror: ' + e.message));
   p.on('console', m => { if (m.type() === 'error') log.push('console: ' + m.text().slice(0, 200)); });
   await home(p); await p.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {}); await p.waitForTimeout(2500);
@@ -114,7 +126,9 @@ async function cell(id, pair, feature, fn) {
 
 async function receiveFromCli(kind) {
   vps(`head -c 400000 /dev/urandom > b.bin; sha256sum b.bin | cut -c1-64 > b.sha; (tunlion send b.bin --code > b.out 2>&1; echo "EXIT=$?" >> b.out) & sleep 5`);
-  const code = (vps('cat b.out').match(CODE) || [])[0]; say('code', code); assert(code, 'CLI printed a code');
+  // A cold machine can take longer than the 5 s above to reach the server: poll for the code.
+  let code; for (let i = 0; i < 25 && !code; i++) { code = (vps('cat b.out').match(CODE) || [])[0]; if (!code) cp.execSync('sleep 1'); }
+  say('code', code); assert(code, 'CLI printed a code');
   const x = await browser(kind);
   try {
     await enterCode(x.p, code);
@@ -124,6 +138,9 @@ async function receiveFromCli(kind) {
     assert(sha(f) === vps('cat b.sha').trim(), 'downloaded file matches the sender sha256');
     await x.p.waitForTimeout(2000);
     assert(/EXIT=0/.test(vps('cat b.out')), 'CLI send exited 0 (receiver verified)');
+    await x.p.waitForTimeout(8000); const after = await body(x.p); await shot(x.p, `rx-${kind}-after`);
+    assert(!/Waiting for the file/i.test(after), 'the code box no longer says it is waiting for the file');
+    assert(!/\bvps\b[\s\S]{0,80}?connecting/i.test(after), 'the finished sender is not shown as still connecting');
     say(x.log.join('\n'));
   } finally { await x.b.close(); }
 }
@@ -145,9 +162,9 @@ async function pairWithVpsIn(x, via) {
   } else {
     // The browser creates the code in "Remember a device" mode; the CLI joins it.
     const code = await createCode(x.p, 'Remember a device'); say('code', code); assert(code, 'page shows a code');
-    vps(`(timeout 90 tunlion join ${code} > join.out 2>&1; echo "EXIT=$?" >> join.out) & sleep 1`);
+    vps(`(timeout 90 tunlion join ${process.env.MX_DEBUG ? '-vv ' : ''}${code} > join.out 2>&1; echo "EXIT=$?" >> join.out) & sleep 1`);
     const offered = await remember(x.p).catch(() => false);
-    if (!offered) { await shot(x.p, `no-remember-${x.kind}`); say('join.out:', vps('sleep 5; cat join.out')); }
+    if (!offered) { await shot(x.p, `no-remember-${x.kind}`); say('join.out:', vps('sleep 5; cat join.out')); if (process.env.MX_DEBUG) fs.writeFileSync(path.join(OUT, 'ev', `nopair-${x.kind}-console.txt`), x.log.join('\n')); }
     assert(offered, 'page offers Remember and it was chosen');
     let out = ''; for (let i = 0; i < 60 && !/EXIT=/.test(out); i++) { await x.p.waitForTimeout(1000); out = vps('cat join.out'); }
     say(out); assert(/EXIT=0/.test(out), 'CLI `join <browser code>` exited 0');
@@ -170,7 +187,9 @@ async function pairWithVpsIn(x, via) {
     await p.getByRole('button', { name: /^Devices/ }).first().click();
     const t = Date.now();
     while (Date.now() - t < ms) {
-      if (new RegExp(`${name}[\\s\\S]{0,120}?ONLINE`).test(await body(p))) return true;
+      // The row's online chip names the route: ONLINE, LAN (a direct link on the
+      // local network) or RELAY. OFFLINE is the only offline state.
+      if (new RegExp(`${name}[\\s\\S]{0,120}?\\b(ONLINE|LAN|RELAY)\\b`).test(await body(p))) return true;
       await p.waitForTimeout(2000);
     }
     return false;
@@ -184,7 +203,9 @@ async function pairWithVpsIn(x, via) {
     try {
       const code = await createCode(x.p); say('code', code); assert(code, 'page shows a code');
       vps(`mkdir -p fromweb; (timeout 90 tunlion receive ${code} --dir fromweb > fw.out 2>&1; echo "EXIT=$?" >> fw.out) & sleep 1`);
-      assert(await waitText(x.p, /Paired|Code accepted/, 30000), 'page pairs with the CLI receiver');
+      const pairedUp = await waitText(x.p, /Paired|Code accepted/, 30000);
+      if (!pairedUp) { say('CLI receiver said:', tryVps('cat fw.out').out); await shot(x.p, 'b03-not-paired'); if (process.env.MX_DEBUG) fs.writeFileSync(path.join(OUT, 'ev', 'B03-console.txt'), x.log.join('\n')); }
+      assert(pairedUp, 'page pairs with the CLI receiver');
       const f = path.join(OUT, 'ev', 'web-sent.bin'); fs.writeFileSync(f, crypto.randomBytes(250000));
       // The CLI receiver's row is labelled with its display name.
       const rows = x.p.getByRole('button', { name: /^send files to /i });
@@ -243,8 +264,13 @@ async function pairWithVpsIn(x, via) {
       assert(/not granted|refused/i.test(await body(p) + await term(p)), 'shell before grant is refused with a reason');
       await home(p); await p.waitForTimeout(4000);
     } else say('no Shell button before grant (buttons only for access held)');
+    await waitOnline(p, 'vps', 60000);
     say(vps(`tunlion grant '${name}' shell; echo GRANT=$?`));
-    await home(p); await p.waitForTimeout(7000);
+    // The open page learns of the grant on its live link: no reload.
+    const shellBtn = p.getByRole('button', { name: /open a shell on/i });
+    let live = false; for (let i = 0; i < 10 && !live; i++) { await p.waitForTimeout(2000); live = (await shellBtn.count()) > 0; }
+    await shot(p, 'b07-after-grant');
+    assert(live, 'the Shell button appears after the grant without a reload');
     assert(await openShell(p), 'Shell button present after grant');
     await p.keyboard.type('echo WEB-$((40+2)); hostname\n'); await p.waitForTimeout(4000);
     const t = await term(p); say(t); await shot(p, 'b07-shell');
@@ -305,12 +331,25 @@ async function pairWithVpsIn(x, via) {
 
   await cell('B10', 'browser-cli', 'CLI sends --to the remembered browser', async () => {
     assert(paired, 'B05 paired a browser'); const { p, name } = paired;
+    // The transfer list is on Home; the cells before may have left the page on the shell.
+    await p.getByRole('button', { name: 'Home', exact: true }).click().catch(() => {}); await p.waitForTimeout(1000);
     vps(`head -c 200000 /dev/urandom > tob.bin; sha256sum tob.bin | cut -c1-64 > tob.sha`);
-    const r = tryVps(`timeout 60 tunlion send tob.bin --to '${name}'`, { timeout: 90000 }); say(r.out, 'rc', r.rc);
+    const r = await vpsAsync(`timeout 60 tunlion send ${process.env.MX_DEBUG ? '-vv' : ''} tob.bin --to '${name}'`, { timeout: 90000 }); say(r.out, 'rc', r.rc);
+    if (process.env.MX_DEBUG) { const alive = await Promise.race([p.evaluate(() => 'alive'), new Promise(r => setTimeout(() => r('HUNG'), 5000))]); paired.log.push('PAGE ' + alive); await shot(p, 'b10-after'); fs.writeFileSync(path.join(OUT, 'ev', 'B10-console.txt'), paired.log.join('\n')); }
     assert(r.rc === 0, 'CLI send --to browser exited 0');
     assert(await waitText(p, /tob\.bin[\s\S]*(done|complete)/i, 20000), 'page shows the file done');
     const f = await saveDownload(p, path.join(OUT, 'ev', 'tob.bin'));
     assert(sha(f) === vps('cat tob.sha').trim(), 'browser got the exact bytes');
+  });
+  await cell('B12', 'browser-cli', 'pairing with a bystander browser on the same network, 3 times', async () => {
+    // The browser paired in B05 is still open on this network: it shares the
+    // room every new page joins. A pairing must run with the creator of the
+    // code, never with a bystander that happened to connect first.
+    assert(paired, 'B05 left a browser open as the bystander');
+    for (let i = 1; i <= 3; i++) {
+      const x = await browser('phone');
+      try { await pairWithVpsIn(x, 'browser-code'); say(`round ${i} paired`); } finally { await x.b.close(); }
+    }
   });
   if (paired) await paired.b.close();
 
@@ -343,9 +382,13 @@ async function pairWithVpsIn(x, via) {
       await shot(A.p, 'bb2-devices-after-reload'); say('B is', bname);
       assert(up, 'B comes ONLINE on A after both reload');
       const f = path.join(OUT, 'ev', 'bb2.bin'); fs.writeFileSync(f, crypto.randomBytes(120000));
+      await A.p.getByRole('button', { name: 'Home', exact: true }).click(); await A.p.waitForTimeout(1500); // the send button is on Home's rows
       await pickFile(A.p, sendTo(A.p, await selfName(B.p)), f);
       assert(await waitText(B.p, /bb2\.bin[\s\S]*(done|complete)/i, 40000), 'B shows done after reload');
-    } finally { await A.b.close(); await B.b.close(); }
+    } finally {
+      if (process.env.MX_DEBUG) { fs.writeFileSync(path.join(OUT, 'ev', 'BB2-A.txt'), A.log.join('\n')); fs.writeFileSync(path.join(OUT, 'ev', 'BB2-B.txt'), B.log.join('\n')); }
+      await A.b.close(); await B.b.close();
+    }
   });
 
   lab(`tmux kill-session -t bxa 2>/dev/null; ~/matrix/box.sh down ${VPS}`);
