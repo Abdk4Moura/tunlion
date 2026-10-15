@@ -3066,6 +3066,37 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     Ok(())
 }
 
+/// Turns off, in the LOCAL terminal, every mode a remote program can switch on
+/// with an escape sequence: mouse reporting (1000, 1002, 1003, and the 1005,
+/// 1006 and 1015 encodings), bracketed paste (2004), the alternate screen
+/// (1049), application cursor keys (?1) and keypad (ESC >), and a hidden cursor.
+/// The remote program normally turns these off itself on exit. When the session
+/// ends abruptly (link lost, remote killed, Ctrl-C here) it never gets the
+/// chance, and the terminal keeps sending mouse reports as typed text
+/// (`35;84;9M...`), which also leaves the next prompt waiting for the rest of an
+/// escape sequence. Each part is harmless when the mode is already off.
+pub(crate) const TERMINAL_RESET: &str =
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[?1l\x1b>\x1b[?25h";
+
+/// Write [`TERMINAL_RESET`] to stdout when stdout is a terminal (never into a
+/// pipe or a file).
+pub(crate) fn reset_terminal_modes() {
+    use std::io::{IsTerminal, Write};
+    let mut out = std::io::stdout();
+    if out.is_terminal() {
+        let _ = out.write_all(TERMINAL_RESET.as_bytes());
+        let _ = out.flush();
+    }
+}
+
+/// Discard input that arrived before the remote PTY was ready: typed ahead at
+/// "waiting for known device", or mouse reports from a terminal an earlier
+/// session left in mouse mode. Called once, when raw mode is first entered.
+fn discard_typeahead(stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+    while stdin_rx.try_recv().is_ok() {}
+    crate::platform::discard_console_input();
+}
+
 /// RAII guard: put the local terminal in raw mode for an interactive PTY and
 /// ALWAYS restore cooked mode on drop (normal exit, error, or `?`). Without raw
 /// mode the local tty line-buffers + echoes and swallows control keys, so a
@@ -3089,6 +3120,7 @@ impl RawGuard {
 impl Drop for RawGuard {
     fn drop(&mut self) {
         if self.active {
+            reset_terminal_modes();
             let _ = crossterm::terminal::disable_raw_mode();
             self.console.restore();
             crossterm::execute!(std::io::stderr(), crossterm::cursor::Show).ok();
@@ -3319,6 +3351,7 @@ async fn pty_attach_once(
     // On a reconnect raw is already on; the acceptor's buffer replay redraws the
     // screen cleanly anyway.
     if interactive && raw.is_none() {
+        discard_typeahead(stdin_rx);
         *raw = Some(RawGuard::enable()?);
     }
 
@@ -3481,6 +3514,7 @@ async fn try_warm_pty(
             "tunlion: reusing warm link to '{peer}' for pty (no establish)"
         ));
         if raw.is_none() {
+            discard_typeahead(stdin_rx);
             match RawGuard::enable() {
                 Ok(g) => *raw = Some(g),
                 Err(e) => return Some(Err(e)),
@@ -3551,8 +3585,12 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // it first) nor on a signal from outside: SIGTERM, or
     // SIGHUP when the terminal goes away. Restore the terminal for those too.
     if interactive {
+        // A terminal an earlier session left in mouse mode (or a different
+        // client entirely) is fixed before anything else is shown.
+        reset_terminal_modes();
         tokio::spawn(async {
             let code = crate::platform::termination_signal().await;
+            reset_terminal_modes();
             let _ = crossterm::terminal::disable_raw_mode();
             std::process::exit(code);
         });
@@ -7338,5 +7376,29 @@ mod forward_refusal_tests {
         );
         act.handle().refused_once(crate::capability::REVOKED_REASON);
         assert_eq!(rx.try_recv().unwrap(), crate::capability::REVOKED_REASON);
+    }
+}
+
+#[cfg(test)]
+mod terminal_reset_tests {
+    use super::TERMINAL_RESET;
+
+    /// Every mode a remote program can switch on in the local terminal is
+    /// switched off, and nothing is switched ON except the cursor.
+    #[test]
+    fn terminal_reset_turns_off_every_mode_a_remote_can_turn_on() {
+        for mode in ["1000", "1002", "1003", "1005", "1006", "1015", "2004", "1049", "1"] {
+            let off = format!("\x1b[?{mode}l");
+            assert!(TERMINAL_RESET.contains(&off), "missing {off:?}");
+        }
+        assert!(TERMINAL_RESET.contains("\x1b>"), "keypad mode not reset");
+        assert!(TERMINAL_RESET.contains("\x1b[?25h"), "cursor not shown");
+        // The only private mode it sets is the cursor's visibility.
+        let sets: Vec<&str> = TERMINAL_RESET
+            .split("\x1b[?")
+            .skip(1)
+            .filter(|s| s.contains('h'))
+            .collect();
+        assert_eq!(sets, vec!["25h"], "the reset must not switch any other mode on");
     }
 }

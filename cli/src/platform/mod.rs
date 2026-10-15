@@ -3147,6 +3147,23 @@ fn win_console_get(which: u32) -> Option<u32> {
     (ok != 0).then_some(mode)
 }
 
+/// Throw away keyboard and mouse input the console has queued but nobody has
+/// read yet. Windows only: a terminal left in mouse-reporting mode by an
+/// earlier session queues reports for every mouse move, and they must not be
+/// sent to a new remote shell as if typed. Elsewhere a no-op (the stdin reader's
+/// channel is drained by the caller).
+pub fn discard_console_input() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE};
+        // SAFETY: GetStdHandle has no preconditions; FlushConsoleInputBuffer
+        // fails cleanly on a handle that is not a console.
+        unsafe {
+            FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE));
+        }
+    }
+}
+
 #[cfg(windows)]
 fn win_console_set(which: u32, mode: u32) {
     use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode};
