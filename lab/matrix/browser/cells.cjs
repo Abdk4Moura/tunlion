@@ -91,6 +91,9 @@ async function createCode(p, mode = 'Receive a file') {
     if (found) return found;
     await p.waitForTimeout(250);
   }
+  // Evidence for the failure the caller is about to report.
+  await shot(p, 'no-code-' + Date.now()).catch(() => {});
+  fs.appendFileSync(path.join(OUT, 'ev', 'no-code-pages.txt'), (await body(p)) + '\n-----\n');
   return undefined;
 }
 async function pickFile(p, opener, file) {
@@ -348,7 +351,9 @@ async function pairWithVpsIn(x, via) {
     const r = await vpsAsync(`timeout 60 tunlion send ${process.env.MX_DEBUG ? '-vv' : ''} tob.bin --to '${name}'`, { timeout: 90000 }); say(r.out, 'rc', r.rc);
     if (process.env.MX_DEBUG) { const alive = await Promise.race([p.evaluate(() => 'alive'), new Promise(r => setTimeout(() => r('HUNG'), 5000))]); paired.log.push('PAGE ' + alive); await shot(p, 'b10-after'); fs.writeFileSync(path.join(OUT, 'ev', 'B10-console.txt'), paired.log.join('\n')); }
     assert(r.rc === 0, 'CLI send --to browser exited 0');
-    assert(await waitText(p, /tob\.bin[\s\S]*(done|complete)/i, 20000), 'page shows the file done');
+    const shown = await waitText(p, /tob\.bin[\s\S]*(done|complete)/i, 20000);
+    if (!shown) { await shot(p, 'b10-not-done'); say('page text:', (await body(p)).slice(0, 1500)); }
+    assert(shown, 'page shows the file done');
     const f = await saveDownload(p, path.join(OUT, 'ev', 'tob.bin'));
     assert(sha(f) === vps('cat tob.sha').trim(), 'browser got the exact bytes');
   });
