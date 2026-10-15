@@ -71,13 +71,15 @@ async function home(p) {
   await p.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 }
 async function waitText(p, re, ms) { const t = Date.now(); while (Date.now() - t < ms) { if (re.test(await body(p))) return true; await p.waitForTimeout(500); } return false; }
+// The app's Home, not the terminal key bar's Home key (also labelled Home).
+const goHome = p => p.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: 'Home', exact: true }).click();
 const term = p => p.evaluate(() => [...document.querySelectorAll('.xterm-rows')].map(e => e.innerText).join('\n'));
 
 // UI verbs, by visible label (the code box is a two-mode toggle).
 async function enterCode(p, code, mode = 'Receive a file') {
   await p.getByRole('radio', { name: mode }).click();
   await p.getByLabel('Enter a code').fill(code);
-  await p.getByRole('button', { name: 'Connect' }).click();
+  await p.getByRole('button', { name: 'Connect', exact: true }).click();
 }
 async function createCode(p, mode = 'Receive a file') {
   await p.getByRole('radio', { name: mode }).click();
@@ -139,14 +141,16 @@ async function cell(id, pair, feature, fn) {
 }
 
 async function receiveFromCli(kind) {
-  vps(`head -c 400000 /dev/urandom > b.bin; sha256sum b.bin | cut -c1-64 > b.sha; (tunlion send b.bin --code > b.out 2>&1; echo "EXIT=$?" >> b.out) & sleep 5`);
+  vps(`head -c 400000 /dev/urandom > b.bin; sha256sum b.bin | cut -c1-64 > b.sha; (tunlion send b.bin --code > b.out 2>&1; echo "EXIT=$?" >> b.out) & echo $! > b.pid; sleep 5`);
   // A cold machine can take longer than the 5 s above to reach the server: poll for the code.
   let code; for (let i = 0; i < 25 && !code; i++) { code = (vps('cat b.out').match(CODE) || [])[0]; if (!code) cp.execSync('sleep 1'); }
   say('code', code); assert(code, 'CLI printed a code');
   const x = await browser(kind);
   try {
     await enterCode(x.p, code);
-    assert(await waitText(x.p, /b\.bin[\s\S]*(done|complete)/i, 40000), 'transfer shows done in the page');
+    const done = await waitText(x.p, /b\.bin[\s\S]*(done|complete)/i, 40000);
+    if (!done) { await shot(x.p, `rx-${kind}-not-done`); say('CLI sender said:', tryVps('cat b.out').out); say('page text:', (await body(x.p)).slice(0, 1500)); fs.writeFileSync(path.join(OUT, 'ev', `rx-${kind}-console.txt`), x.log.join('\n')); }
+    assert(done, 'transfer shows done in the page');
     await shot(x.p, `rx-${kind}`);
     const f = await saveDownload(x.p, path.join(OUT, 'ev', `rx-${kind}.bin`));
     assert(sha(f) === vps('cat b.sha').trim(), 'downloaded file matches the sender sha256');
@@ -156,7 +160,12 @@ async function receiveFromCli(kind) {
     assert(!/Waiting for the file/i.test(after), 'the code box no longer says it is waiting for the file');
     assert(!/\bvps\b[\s\S]{0,80}?connecting/i.test(after), 'the finished sender is not shown as still connecting');
     say(x.log.join('\n'));
-  } finally { await x.b.close(); }
+  } finally {
+    await x.b.close();
+    // A sender left waiting (a failed cell) would sit in the room as a second
+    // "vps" for the cells after it. Stop it by its pid.
+    tryVps('kill $(cat b.pid) 2>/dev/null; true');
+  }
 }
 
 // A browser remembered by the vps, kept open across the paired cells.
@@ -253,9 +262,10 @@ async function pairWithVpsIn(x, via) {
     assert(/vps/.test(await body(p)), 'vps is listed under Devices after reload');
     assert(await waitOnline(p, 'vps'), 'vps comes ONLINE after reload');
     const f = path.join(OUT, 'ev', 'to-vps.bin'); fs.writeFileSync(f, crypto.randomBytes(300000));
-    await p.getByRole('button', { name: 'Home', exact: true }).click(); await p.waitForTimeout(1500);
+    await goHome(p); await p.waitForTimeout(1500);
     await pickFile(p, p.getByRole('button', { name: /^send files to vps$/i }).first(), f);
     let got = ''; for (let i = 0; i < 40 && !got; i++) { await p.waitForTimeout(1000); got = tryVps('sha256sum Tunlion/to-vps.bin 2>/dev/null | cut -c1-64').out.trim(); }
+    if (got !== sha(f)) { await shot(p, 'b06-not-received'); say('vps inbox:', tryVps('ls -la Tunlion; tail -20 .config/tunlion/daemon.log 2>/dev/null').out); say('page text:', (await body(p)).slice(0, 1500)); }
     assert(got === sha(f), 'vps inbox has the exact bytes');
   });
 
@@ -348,9 +358,11 @@ async function pairWithVpsIn(x, via) {
     // The transfer list is on Home. The shell cells before leave their ended
     // terminal open, and it covers the page (as it would for a person), so
     // close it first, as a person would, then go Home.
-    const endBtn = p.getByRole('button', { name: 'End', exact: true });
-    if (await endBtn.count()) { await endBtn.first().click().catch(() => {}); await p.waitForTimeout(500); }
-    await p.getByRole('button', { name: 'Home', exact: true }).click(); await p.waitForTimeout(1000);
+    for (const label of ['End', 'Hide']) {
+      const btn = p.getByTestId('session-pane').getByRole('button', { name: label, exact: true });
+      if (await btn.count() && await btn.first().isVisible()) { await btn.first().click().catch(() => {}); await p.waitForTimeout(500); }
+    }
+    await goHome(p); await p.waitForTimeout(1000);
     vps(`head -c 200000 /dev/urandom > tob.bin; sha256sum tob.bin | cut -c1-64 > tob.sha`);
     const r = await vpsAsync(`timeout 60 tunlion send ${process.env.MX_DEBUG ? '-vv' : ''} tob.bin --to '${name}'`, { timeout: 90000 }); say(r.out, 'rc', r.rc);
     if (process.env.MX_DEBUG) { const alive = await Promise.race([p.evaluate(() => 'alive'), new Promise(r => setTimeout(() => r('HUNG'), 5000))]); paired.log.push('PAGE ' + alive); await shot(p, 'b10-after'); fs.writeFileSync(path.join(OUT, 'ev', 'B10-console.txt'), paired.log.join('\n')); }
@@ -402,7 +414,7 @@ async function pairWithVpsIn(x, via) {
       await shot(A.p, 'bb2-devices-after-reload'); say('B is', bname);
       assert(up, 'B comes ONLINE on A after both reload');
       const f = path.join(OUT, 'ev', 'bb2.bin'); fs.writeFileSync(f, crypto.randomBytes(120000));
-      await A.p.getByRole('button', { name: 'Home', exact: true }).click(); await A.p.waitForTimeout(1500); // the send button is on Home's rows
+      await goHome(A.p); await A.p.waitForTimeout(1500); // the send button is on Home's rows
       await pickFile(A.p, sendTo(A.p, await selfName(B.p)), f);
       assert(await waitText(B.p, /bb2\.bin[\s\S]*(done|complete)/i, 40000), 'B shows done after reload');
     } finally {
