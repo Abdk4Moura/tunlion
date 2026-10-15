@@ -2207,6 +2207,9 @@ pub(crate) async fn recv_cmd(
                 }
             }
         }
+        if daemon {
+            loop_watchdog::tick();
+        }
         let ev = tokio::select! {
             biased;
             // Warm-link reuse request from a sibling process. Handle it inline
@@ -9127,5 +9130,63 @@ mod expiry_redrive_tests {
         // A person's plain no (or an unknown reason) stays a plain decline.
         assert!(policy_decline_msg("x", None).get("reason").is_none());
         assert!(policy_decline_msg("x", Some("unverified peer")).get("reason").is_none());
+    }
+}
+
+/// A daemon whose event loop stops turning is invisible from outside: the
+/// process is alive, nothing is logged, and only a client timing out on the
+/// control socket notices. The loop wakes at least every 2 s, so a heartbeat it
+/// stamps each iteration going stale for much longer means one await inside an
+/// iteration never completed. A plain OS thread (not a runtime task, which would
+/// starve with the loop) watches the stamp and says so loudly, once per stall,
+/// so the next wedge names itself in the daemon log with a timestamp.
+mod loop_watchdog {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Once;
+
+    static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+    static START: Once = Once::new();
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Seconds without a tick before the watchdog speaks.
+    /// `TUNLION_LOOP_STALL_SECS` overrides (gates).
+    fn threshold_secs() -> u64 {
+        std::env::var("TUNLION_LOOP_STALL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(20)
+    }
+
+    pub(super) fn tick() {
+        LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
+        START.call_once(|| {
+            let threshold = threshold_secs();
+            let _ = std::thread::Builder::new()
+                .name("loop-watchdog".into())
+                .spawn(move || {
+                    let mut reported = false;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let last = LAST_TICK_MS.load(Ordering::Relaxed);
+                        let stalled = now_ms().saturating_sub(last) / 1000;
+                        if stalled >= threshold && !reported {
+                            crate::ui::critical(&format!(
+                                "event loop stalled: no iteration for {stalled}s (an await inside the daemon loop never completed); the daemon is not serving until it recovers"
+                            ));
+                            reported = true;
+                        } else if stalled < threshold && reported {
+                            crate::ui::critical("event loop recovered");
+                            reported = false;
+                        }
+                    }
+                });
+        });
     }
 }
