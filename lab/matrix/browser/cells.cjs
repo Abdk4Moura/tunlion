@@ -162,9 +162,9 @@ async function pairWithVpsIn(x, via) {
   } else {
     // The browser creates the code in "Remember a device" mode; the CLI joins it.
     const code = await createCode(x.p, 'Remember a device'); say('code', code); assert(code, 'page shows a code');
-    vps(`(timeout 90 tunlion join ${code} > join.out 2>&1; echo "EXIT=$?" >> join.out) & sleep 1`);
+    vps(`(timeout 90 tunlion join ${process.env.MX_DEBUG ? '-vv ' : ''}${code} > join.out 2>&1; echo "EXIT=$?" >> join.out) & sleep 1`);
     const offered = await remember(x.p).catch(() => false);
-    if (!offered) { await shot(x.p, `no-remember-${x.kind}`); say('join.out:', vps('sleep 5; cat join.out')); }
+    if (!offered) { await shot(x.p, `no-remember-${x.kind}`); say('join.out:', vps('sleep 5; cat join.out')); if (process.env.MX_DEBUG) fs.writeFileSync(path.join(OUT, 'ev', `nopair-${x.kind}-console.txt`), x.log.join('\n')); }
     assert(offered, 'page offers Remember and it was chosen');
     let out = ''; for (let i = 0; i < 60 && !/EXIT=/.test(out); i++) { await x.p.waitForTimeout(1000); out = vps('cat join.out'); }
     say(out); assert(/EXIT=0/.test(out), 'CLI `join <browser code>` exited 0');
@@ -203,7 +203,9 @@ async function pairWithVpsIn(x, via) {
     try {
       const code = await createCode(x.p); say('code', code); assert(code, 'page shows a code');
       vps(`mkdir -p fromweb; (timeout 90 tunlion receive ${code} --dir fromweb > fw.out 2>&1; echo "EXIT=$?" >> fw.out) & sleep 1`);
-      assert(await waitText(x.p, /Paired|Code accepted/, 30000), 'page pairs with the CLI receiver');
+      const pairedUp = await waitText(x.p, /Paired|Code accepted/, 30000);
+      if (!pairedUp) { say('CLI receiver said:', tryVps('cat fw.out').out); await shot(x.p, 'b03-not-paired'); if (process.env.MX_DEBUG) fs.writeFileSync(path.join(OUT, 'ev', 'B03-console.txt'), x.log.join('\n')); }
+      assert(pairedUp, 'page pairs with the CLI receiver');
       const f = path.join(OUT, 'ev', 'web-sent.bin'); fs.writeFileSync(f, crypto.randomBytes(250000));
       // The CLI receiver's row is labelled with its display name.
       const rows = x.p.getByRole('button', { name: /^send files to /i });
@@ -329,6 +331,8 @@ async function pairWithVpsIn(x, via) {
 
   await cell('B10', 'browser-cli', 'CLI sends --to the remembered browser', async () => {
     assert(paired, 'B05 paired a browser'); const { p, name } = paired;
+    // The transfer list is on Home; the cells before may have left the page on the shell.
+    await p.getByRole('button', { name: 'Home', exact: true }).click().catch(() => {}); await p.waitForTimeout(1000);
     vps(`head -c 200000 /dev/urandom > tob.bin; sha256sum tob.bin | cut -c1-64 > tob.sha`);
     const r = await vpsAsync(`timeout 60 tunlion send ${process.env.MX_DEBUG ? '-vv' : ''} tob.bin --to '${name}'`, { timeout: 90000 }); say(r.out, 'rc', r.rc);
     if (process.env.MX_DEBUG) { const alive = await Promise.race([p.evaluate(() => 'alive'), new Promise(r => setTimeout(() => r('HUNG'), 5000))]); paired.log.push('PAGE ' + alive); await shot(p, 'b10-after'); fs.writeFileSync(path.join(OUT, 'ev', 'B10-console.txt'), paired.log.join('\n')); }
@@ -336,6 +340,16 @@ async function pairWithVpsIn(x, via) {
     assert(await waitText(p, /tob\.bin[\s\S]*(done|complete)/i, 20000), 'page shows the file done');
     const f = await saveDownload(p, path.join(OUT, 'ev', 'tob.bin'));
     assert(sha(f) === vps('cat tob.sha').trim(), 'browser got the exact bytes');
+  });
+  await cell('B12', 'browser-cli', 'pairing with a bystander browser on the same network, 3 times', async () => {
+    // The browser paired in B05 is still open on this network: it shares the
+    // room every new page joins. A pairing must run with the creator of the
+    // code, never with a bystander that happened to connect first.
+    assert(paired, 'B05 left a browser open as the bystander');
+    for (let i = 1; i <= 3; i++) {
+      const x = await browser('phone');
+      try { await pairWithVpsIn(x, 'browser-code'); say(`round ${i} paired`); } finally { await x.b.close(); }
+    }
   });
   if (paired) await paired.b.close();
 
