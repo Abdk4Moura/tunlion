@@ -64,6 +64,17 @@
       ]
     },
     {
+      "path": "cli/tests/pair-bystander-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/pair-bystander-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/rc-polish-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=cli/target/release/tunlion bash cli/tests/rc-polish-gates.sh",
