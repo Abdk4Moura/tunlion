@@ -6,6 +6,8 @@
 //   LAB_HOST        command that runs a shell command on the lab host (docker + tmux)
 //   PLAYWRIGHT      path to the playwright package (CommonJS require)
 //   FRONTEND_DIST   the built frontend (vite dist) served under the real origin
+//   MX_ORIGIN       instead: the origin of a local backend that serves its own
+//                   same-origin build (backend/app.py); no interception then
 //
 // The page is served under https://tunlion.autumated.com (the production API
 // refuses other origins) from FRONTEND_DIST, and talks to the production API.
@@ -15,7 +17,8 @@ const fs = require('fs'), path = require('path'), cp = require('child_process'),
 const { chromium, devices } = require(process.env.PLAYWRIGHT || 'playwright');
 const OUT = process.argv[2], FILTER = new RegExp(process.argv[3] || '.');
 const DIST = process.env.FRONTEND_DIST;
-const ORIGIN = 'https://tunlion.autumated.com';
+const PROD_ORIGIN = 'https://tunlion.autumated.com';
+const ORIGIN = process.env.MX_ORIGIN || PROD_ORIGIN;
 const VPS = 'mx-bvps';
 fs.mkdirSync(path.join(OUT, 'ev'), { recursive: true });
 const RES = path.join(OUT, 'browser.jsonl'); fs.writeFileSync(RES, '');
@@ -45,7 +48,7 @@ async function browser(kind = 'desktop') {
   // worker makes are not seen by context.route: after the first load every
   // reload would be served from PRODUCTION, not the build under test.
   const ctx = await b.newContext({ ...opts, acceptDownloads: true, serviceWorkers: 'block' });
-  await ctx.route(`${ORIGIN}/**`, async r => {
+  if (ORIGIN === PROD_ORIGIN) await ctx.route(`${ORIGIN}/**`, async r => {
     const u = new URL(r.request().url()); let f = path.join(DIST, decodeURIComponent(u.pathname));
     if (!fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(DIST, 'index.html');
     await r.fulfill({ status: 200, body: fs.readFileSync(f), contentType: types[path.extname(f)] || 'application/octet-stream' });
@@ -78,9 +81,17 @@ async function enterCode(p, code, mode = 'Receive a file') {
 }
 async function createCode(p, mode = 'Receive a file') {
   await p.getByRole('radio', { name: mode }).click();
+  // Codes already on the page (a sample, an older code) are not the answer:
+  // wait for a code that was not there before the click.
+  const before = new Set((await body(p)).match(new RegExp(CODE.source, 'g')) || []);
   await p.getByRole('button', { name: 'Create a code' }).click();
-  await p.waitForTimeout(3000);
-  return ((await body(p)).match(CODE) || [])[0];
+  const t = Date.now();
+  while (Date.now() - t < 30000) {
+    const found = ((await body(p)).match(new RegExp(CODE.source, 'g')) || []).find(c => !before.has(c));
+    if (found) return found;
+    await p.waitForTimeout(250);
+  }
+  return undefined;
 }
 async function pickFile(p, opener, file) {
   const [fc] = await Promise.all([p.waitForEvent('filechooser', { timeout: 15000 }), opener.click({ timeout: 15000 })]);

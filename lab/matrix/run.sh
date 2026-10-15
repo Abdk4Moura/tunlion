@@ -11,6 +11,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 BIN="${1:?binary}"; OUT="${2:?outdir}"; WHAT="${3:-all}"; FILTER="${4:-.}"
 : "${LAB_HOST:?set LAB_HOST to the command that runs a shell command on the lab host}"
 : "${CODESPACE:=}"
+# Where ~/matrix is on the lab host, for file pushes (a Codespace's home by
+# default; a local lab host, such as a CI runner, sets LAB_DIR="$HOME/matrix").
+: "${LAB_DIR:=/home/codespace/matrix}"
 mkdir -p "$OUT"
 sha=$(sha256sum "$BIN" | cut -c1-12)
 echo "binary sha256 $sha" | tee "$OUT/binary.txt"
@@ -22,8 +25,8 @@ push() { # <local> <remote-path-under-home>
     $LAB_HOST "cat > $2" < "$1"; fi
 }
 lab "rm -rf ~/matrix && mkdir -p ~/matrix/ctx ~/matrix/out"
-for f in box.sh cli-cells.sh ctx/Dockerfile; do push "$here/$f" "/home/codespace/matrix/$f"; done
-push "$BIN" /home/codespace/matrix/tunlion.bin
+for f in box.sh cli-cells.sh ctx/Dockerfile; do push "$here/$f" "$LAB_DIR/$f"; done
+push "$BIN" "$LAB_DIR/tunlion.bin"
 lab "chmod +x ~/matrix/*.sh && ~/matrix/box.sh build ~/matrix/tunlion.bin"
 if [ "$WHAT" = cli ] || [ "$WHAT" = all ]; then
   lab "~/matrix/cli-cells.sh ~/matrix/out '$FILTER'" | tee "$OUT/cli-console.txt" || true
