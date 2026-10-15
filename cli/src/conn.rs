@@ -133,6 +133,27 @@ const ICE_CONFIG_FRESH: Duration = Duration::from_secs(60);
 const ICE_CONFIG_BUDGET: Duration = Duration::from_secs(3);
 /// A failed GET falls back to a cached config younger than this.
 const ICE_CONFIG_STALE_OK: Duration = Duration::from_secs(20 * 60);
+/// The STUN server used when the config API does not answer in time; the same
+/// default the backend hands out (backend/config.py DEFAULT_ICE).
+const FALLBACK_STUN: &str = "stun:stun.l.google.com:19302";
+
+/// Whether an establish may proceed on STUN alone when the config API is slow.
+/// Not under a forced relay, which needs the TURN credentials only the API has.
+fn ice_fallback_allowed(relay_only: bool) -> bool {
+    !relay_only
+}
+
+/// A config that finds direct paths without the API: STUN only, default chunks.
+fn stun_only_ice_config() -> net::ServerConfig {
+    net::ServerConfig {
+        ice_servers: vec![webrtc::ice_transport::ice_server::RTCIceServer {
+            urls: vec![FALLBACK_STUN.to_string()],
+            username: String::new(),
+            credential: String::new(),
+        }],
+        chunk_size: 64 * 1024,
+    }
+}
 /// Ceiling on building a WebRTC peer connection inside an establish.
 const PEER_BUILD_BUDGET: Duration = Duration::from_secs(5);
 /// How long `drop_link` lets a dropped link's last frames reach the peer
@@ -2058,16 +2079,29 @@ impl Conn {
                 return Ok(cfg);
             }
         }
-        match tokio::time::timeout(ICE_CONFIG_BUDGET, net::fetch_config(&self.server)).await {
+        let got = match tokio::time::timeout(ICE_CONFIG_BUDGET, net::fetch_config(&self.server)).await {
             Ok(Ok(cfg)) => {
                 lock_ice(&self.ice_cache).cfg = Some((Instant::now(), cfg.clone()));
-                Ok(cfg)
+                return Ok(cfg);
             }
             Ok(Err(e)) => Err(e.context("ICE config")),
             Err(_) => Err(anyhow::anyhow!(
                 "ICE config: no answer within {ICE_CONFIG_BUDGET:?}"
             )),
+        };
+        // A slow config API must not fail the whole connection (a `join` whose
+        // first establish found the API slow used to exit 1 after 3 s). STUN is
+        // enough to find a direct path, so proceed with it and keep asking for
+        // the full config (with TURN) off the loop for the next attempt. A forced
+        // relay is the exception: without TURN it cannot work, so say why.
+        if ice_fallback_allowed(self.relay_only) {
+            if let Err(e) = &got {
+                ui::debug(&format!("{e:#}; continuing with STUN only, TURN when the config arrives"));
+            }
+            self.refresh_ice_config_off_loop();
+            return Ok(stun_only_ice_config());
         }
+        got
     }
 
     /// Refresh the cached ICE config on a spawned task (at most one in flight).
@@ -5249,5 +5283,23 @@ mod departure_tests {
         assert!(departure_is_news("alpha", ["bravo"]));
         assert!(departure_is_news("alpha", std::iter::empty::<&str>()));
         assert!(departure_is_news("", ["", "alpha"]), "an unnamed link is always reported");
+    }
+}
+
+#[cfg(test)]
+mod ice_fallback_tests {
+    use super::*;
+
+    // B08 on production signaling: a `join` whose first establish found the
+    // config API slow exited 1 with "ICE config: no answer within 3s". A slow
+    // API now falls back to STUN, which still finds a direct path.
+    #[test]
+    fn a_slow_config_api_falls_back_to_stun_unless_relay_is_forced() {
+        assert!(ice_fallback_allowed(false));
+        assert!(!ice_fallback_allowed(true), "a forced relay needs TURN and must say so");
+        let cfg = stun_only_ice_config();
+        assert_eq!(cfg.ice_servers.len(), 1);
+        assert!(cfg.ice_servers.iter().all(net::is_stun_only), "the fallback must never claim a relay");
+        assert!(cfg.chunk_size > 0 && cfg.chunk_size <= 64 * 1024);
     }
 }
