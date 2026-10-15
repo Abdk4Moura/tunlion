@@ -1,4 +1,5 @@
 pub mod fs_at;
+pub mod pty;
 
 use std::path::{Path, PathBuf};
 
