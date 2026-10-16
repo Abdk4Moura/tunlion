@@ -46,29 +46,21 @@ import kotlinx.coroutines.withContext
 /** Registered only while this Activity is resumed. Two deliberate peaks, then cooldown. */
 class FeedbackShake(private val context: Context, private val onShake: () -> Unit) : SensorEventListener {
     private val manager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    private var previousPeak = 0L
-    private var cooldownUntil = 0L
+    private val gesture = ShakeGesture()
 
     fun start() {
-        previousPeak = 0L
+        gesture.reset()
         manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
             manager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
 
-    fun stop() { manager.unregisterListener(this); previousPeak = 0L }
+    fun stop() { manager.unregisterListener(this); gesture.reset() }
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
     override fun onSensorChanged(event: SensorEvent) {
         val now = SystemClock.elapsedRealtime()
-        if (now < cooldownUntil) return
         val g = sqrt(event.values.sumOf { (it * it).toDouble() }) / SensorManager.GRAVITY_EARTH
-        if (g < 2.7) return
-        val elapsed = now - previousPeak
-        if (previousPeak != 0L && elapsed in 180..900) {
-            previousPeak = 0L
-            cooldownUntil = now + 10_000
-            onShake()
-        } else if (elapsed > 900) previousPeak = now
+        if (gesture.sample(g, now)) onShake()
     }
 }
 

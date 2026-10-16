@@ -36,7 +36,7 @@ jobs:
           key: android-preview-signing-v1
       - name: Build debug APK
         working-directory: android
-        run: gradle --no-daemon :app:assembleDebug
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: tunlion-android-debug
