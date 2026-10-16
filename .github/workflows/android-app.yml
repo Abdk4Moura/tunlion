@@ -65,8 +65,17 @@ jobs:
       - name: Reuse preview signing key
         uses: actions/cache@v4
         with:
-          path: ~/.android/debug.keystore
-          key: android-preview-signing-v1
+          path: android/.signing/preview.keystore
+          key: android-preview-signing-v2
+      - name: Prepare preview signing key
+        run: |
+          mkdir -p android/.signing
+          if [ ! -f android/.signing/preview.keystore ]; then
+            keytool -genkeypair -keystore android/.signing/preview.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
       - name: Build debug APK
         working-directory: android
         run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug

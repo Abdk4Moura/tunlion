@@ -170,9 +170,8 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                         })
                         Screen.SETUP -> {
                             Title("Make this phone yours.", "Your identity lives on this phone. No account or sign-in.")
-                            Step("01", "Name this phone", "A name your other devices will recognise.")
-                            Step("02", "Keep your recovery words", "Confirm them before the identity is saved.")
-                            Step("03", "Connect your other devices", "Use a short code, then choose what they can use.")
+                            Step("01", "Keep your recovery words", "Confirm them before the identity is saved.")
+                            Step("02", "Your identity stays here", "Stored privately on this phone, not on a server.")
                             PrimaryButton("Create identity", busy = busy, onClick = {
                                 if (!busy) scope.launch {
                                     busy = true
@@ -217,6 +216,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                     SecondaryText("Select a section and tell us what should change.")
                                 }
                                 Switch(feedbackEnabled, onFeedbackEnabled,
+                                    colors = tunlionSwitchColors(),
                                     modifier = Modifier.semantics { contentDescription = "Shake to give feedback" })
                             }
                             OutlinedButton(onClick = onFeedback, shape = RoundedCornerShape(7.dp)) { Text("Give feedback") }
@@ -248,6 +248,7 @@ private fun Availability(status: CoreStatus, busy: Boolean, onChange: (Boolean) 
             }
         }
         Switch(status.engineRunning, onChange, enabled = !busy,
+            colors = tunlionSwitchColors(),
             modifier = Modifier.semantics { contentDescription = "Make this phone available" })
     }
 }
@@ -256,9 +257,6 @@ private fun Availability(status: CoreStatus, busy: Boolean, onChange: (Boolean) 
 private fun FirstConnection(onJoin: () -> Unit, onSetup: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Column(Modifier.fillMaxWidth().padding(top = 20.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
-        Box(Modifier.size(64.dp).background(colors.surfaceVariant, RoundedCornerShape(14.dp)).padding(16.dp)) {
-            TunlionMark(Modifier.fillMaxSize())
-        }
         Title("Your other devices,\njust a code away.", "Connect this phone to your computer. Send files directly, and keep your devices within reach.")
         PrimaryButton("I have a code", onClick = onJoin)
         OutlinedButton(onClick = onSetup, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
@@ -411,9 +409,17 @@ private fun Modifier.clipForRow() = this.then(Modifier.background(Color.Transpar
             CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = colors.onSurfaceVariant)
             Spacer(Modifier.width(9.dp))
         }
-        Text(if (busy) "Connecting…" else text, fontWeight = FontWeight.SemiBold)
+        Text(if (busy) "Please wait…" else text, fontWeight = FontWeight.SemiBold)
     }
 }
+
+@Composable private fun tunlionSwitchColors() = SwitchDefaults.colors(
+    checkedTrackColor = MaterialTheme.colorScheme.primary,
+    checkedThumbColor = MaterialTheme.colorScheme.background,
+    uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant,
+    uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    uncheckedBorderColor = MaterialTheme.colorScheme.outline,
+)
 
 @Composable private fun TunlionMark(modifier: Modifier) {
     val ink = MaterialTheme.colorScheme.onBackground

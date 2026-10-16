@@ -8,6 +8,13 @@ android {
     namespace = "com.tunlion.android"
     compileSdk = 35
     sourceSets["main"].java.srcDir("build/generated/uniffi")
+    signingConfigs.getByName("debug") {
+        storeFile = rootProject.file(".signing/preview.keystore")
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+    }
+    defaultConfig.ndk.abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
