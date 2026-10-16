@@ -1101,6 +1101,7 @@ dependencies = [
  "filament-id",
  "filament-overlay",
  "filament-pair",
+ "filament-peerloop",
  "filament-proto",
  "filament-signal",
  "filament-transfer",
@@ -1188,6 +1189,14 @@ dependencies = [
  "sha2 0.10.9",
  "spake2",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "filament-peerloop"
+version = "0.1.0"
+dependencies = [
+ "filament-transport",
+ "tokio",
 ]
 
 [[package]]

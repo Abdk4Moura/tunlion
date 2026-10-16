@@ -1,0 +1,37 @@
+# filament-peerloop -- the host-free decision and policy layer of the peer loop.
+#
+# Carved out of cli/src/conn.rs (issue #465, slice 3, "link the engine"). What
+# lives here is the warm-hold state machine, the link liveness/route predicates,
+# the adoption matcher and the petname rule. Each of them decides something about
+# the LINKS, and none has an opinion about how a peer was found, authenticated or
+# named, where files live on this machine, or how anything is rendered to a
+# terminal. That is the test docs/design-libfilament.md sets for what may leave
+# the CLI: the reusable, host-independent piece leaves; the ORCHESTRATION stays.
+#
+# `Conn` itself deliberately does NOT come with it. `Conn` carries
+# `Arc<dyn Transport>`, `Arc<Peer>`, a signaling client and tokio channels, and it
+# is what every command's event loop manipulates; it moves in the next slice, as
+# a `git mv`, once this policy is already a crate underneath it.
+#
+# This crate never calls back into the CLI, so there is no cycle.
+[package]
+name = "filament-peerloop"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+description = "Host-free policy for tunlion's peer loop: warm-hold, link liveness, adoption and the petname rule"
+readme = "README.md"
+keywords = ["p2p", "peer", "warm-hold", "liveness", "policy"]
+categories = ["network-programming"]
+
+[dependencies]
+# The event vocabulary `schedule_retry` posts into (`Ev::RetryLink`). This crate
+# is policy only: it opens nothing and sends nothing, it hands the caller a value
+# or arms a timer that posts a decision back to the caller's loop.
+filament-transport = { path = "../filament-transport", version = "0.1.0" }
+# `schedule_retry` arms its backoff on a spawned task, never on the caller's
+# event loop: sleeping inline froze every control request behind the retry ladder
+# (measured 4008ms against 7-10ms normal). Only the three pieces that needs.
+tokio = { version = "1.52.3", features = ["rt", "time", "sync"] }
