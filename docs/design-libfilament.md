@@ -9,11 +9,15 @@ Someone should be able to build on tunlion's ideas without adopting tunlion.
 Not "vendor the CLI and shell out to it" — take the piece they need, as a crate,
 with a public API and no obligation to bring the rest.
 
-That is not a rewrite. Nine crates exist now: the trust layer was already out
-(`filament-cap`, `filament-id`, `filament-pair`, `authkeys-managed`,
-`secret-write`), and `filament-transfer`, `filament-proto`, `filament-overlay`
-and `filament-fleet` followed. What is left in the CLI is `Conn` and the
-event loop.
+That is not a rewrite. Eleven crates exist now (2026-10-16): the trust layer
+was already out (`filament-cap`, `filament-id`, `filament-pair`,
+`authkeys-managed`, `secret-write`), and `filament-transfer`, `filament-proto`,
+`filament-overlay`, `filament-fleet`, `filament-signal` and
+`filament-transport` followed. `tunlion-core` is the twelfth, and it is the
+surface a caller uses rather than another extracted mechanism.
+
+What is left in the CLI is `Conn` and the event loop. `Conn` is
+`cli/src/conn.rs:1055`, not `main.rs`. `main.rs` is 2,207 lines.
 
 ## Why it is worth doing, from this repo's own history
 
@@ -28,18 +32,26 @@ produced bugs in one copy and not the other:
 - The close-reason hole was found and FIXED for `mount`, and survived in `pty`,
   because nobody walked the other copy. The contemporary record is preserved in
   [`archived work-state record`](archive/handoffs/WORK-STATE-2026-09-03.md).
-- `main.rs` is ~22,400 lines and hand-writes the peer event loop EIGHT times.
+- The peer event loop is hand-written EIGHT times. The eight `Ev::ChannelReady`
+  arms live across six files, not in one: `enrollment.rs` (two, lines 368 and
+  650), `membership.rs` (two, 174 and 409), `recv_cmd.rs` (4690), `pair_cmd.rs`
+  (1518), `send_cmd.rs` (1535) and `l2.rs` (2041).
 
-  CORRECTION (2026-08-27): an earlier version of this line said the eight were
-  copies of each other. They are not, and the difference matters for what to do
-  about them. Measured, the eight `Ev::ChannelReady` arms are 5, 8, 12, 26, 39,
-  88, 133 and 294 lines: they share a PROLOGUE and then diverge genuinely, because
-  they belong to different commands. So the duplication to remove is the shared
-  prologue and the handful of near-identical whole handlers (the two enrollment
-  arms differ only in whether they print a line), not the loops wholesale.
+  CORRECTION (2026-08-27; addresses re-measured 2026-10-16): an earlier version
+  of this line said `main.rs` was ~22,400 lines and that the eight were copies
+  of each other. Both are wrong. `main.rs` is 2,207 lines, and the eight arms
+  are not copies: they share a PROLOGUE and then diverge genuinely, because they
+  belong to different commands. The line sizes quoted in the 2026-08-27 version
+  (5, 8, 12, 26, 39, 88, 133, 294) do not reproduce against the current tree;
+  measure the arm you are about to touch rather than trusting a number here. So
+  the duplication to remove is the shared prologue and the handful of
+  near-identical whole handlers (the two enrollment arms differ only in whether
+  they print a line), not the loops wholesale.
 
-  The prologue is now `Conn::mark_ready`, six call sites collapsed into one. The
-  rest of the unification waits on splitting `Conn`.
+  The prologue is `Conn::mark_ready`, five call sites collapsed into one
+  (`enrollment.rs:369`, `membership.rs:175`, `membership.rs:410`,
+  `identity_flow.rs:1107`, `send_cmd.rs:1545`). The rest of the unification waits
+  on splitting `Conn`.
 
 A module boundary is not decoration here. It is the thing that makes a whole
 class of bug unwritable.
@@ -97,7 +109,8 @@ Next:
    | `interact::enumerate_interfaces` | 1 | shells out to `ip` |
 
    So the carve is a log facade plus four small injected traits, not a rewrite.
-   `Conn` is the harder half: it carries link state, adoption policy and
+   (Correction 2026-10-16: the earlier text here said `Conn` lives in
+   `main.rs`; it is `cli/src/conn.rs:1055`.) `Conn` is the harder half: it carries link state, adoption policy and
    presentation together, and it is what the eight event loops all manipulate,
    so it should be split as part of step 4 rather than dragged out whole here.
 
@@ -107,15 +120,18 @@ Next:
    plus three visibility promotions. Splitting it that way meant the risky
    commit landed on code already proven decoupled.
 
-   `Conn` did NOT come with it, and still lives in `main.rs`: it carries link
-   state, adoption policy and presentation together, and it is what all eight
-   event loops manipulate, so it belongs with step 4.
+   `Conn` did NOT come with it, and still lives in `cli/src/conn.rs:1055`: it
+   carries link state, adoption policy and presentation together, and it is what
+   all eight event loops manipulate, so it belongs with step 4.
 
 4. **`filament-peerloop`** — one driver replacing the eight hand-written loops.
    Do this LAST: it should be assembled from the crates above, not extracted
-   around them. Where the eight copies disagree, take the bug-free one, the way
+   around them. Where the eight arms disagree, take the bug-free one, the way
    `fleet_session` took the daemon's per-peer bindings rather than the sender's
-   single values.
+   single values. Keep the two named hazards: a lookup joins on the petname
+   (`verified_name`), never on the broadcast display name (`Link.name`), and a
+   signaling close is current only when it carries the live client id
+   (`filament_signal::Client::id`) and the same link generation.
 
 The CLI keeps what is genuinely its own: argument parsing, the terminal UI,
 config and settings, the daemon lifecycle, and the ctl socket.
@@ -124,7 +140,8 @@ config and settings, the daemon lifecycle, and the ctl socket.
 
 Do not extract the transfer ORCHESTRATION yet, only its mechanics. `send_cmd`
 interleaves establishment, the PAKE ceremony, its own event loop, offers,
-chunking, resume and progress across ~1,650 lines, and it is the path with a
+chunking, resume and progress across roughly 2,670 lines
+(`cli/src/send_cmd.rs:68` to `:2739`), and it is the path with a
 measured corruption history (~44% on direct-QUIC, ~88% on the DataChannel,
 before the short-write fix). It needs the transport and proto crates underneath
 it first, and it needs to be done against the transfer gates and the
