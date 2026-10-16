@@ -69,9 +69,55 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+    private var feedbackEnabled by mutableStateOf(true)
+    private var feedbackImage by mutableStateOf<android.graphics.Bitmap?>(null)
+    private var capturing = false
+    private var resumed = false
+    private lateinit var shake: FeedbackShake
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { TunlionApp(UnlinkedTunlionCore()) }
+        feedbackEnabled = getPreferences(MODE_PRIVATE).getBoolean("shake_feedback", true)
+        shake = FeedbackShake(this) { openFeedback() }
+        setContent {
+            TunlionApp(UnlinkedTunlionCore(), feedbackEnabled,
+                onFeedbackEnabled = { enabled ->
+                    feedbackEnabled = enabled
+                    getPreferences(MODE_PRIVATE).edit().putBoolean("shake_feedback", enabled).apply()
+                    shake.stop()
+                    if (enabled && resumed) shake.start()
+                }, onFeedback = { openFeedback() })
+            feedbackImage?.let { image ->
+                MaterialTheme {
+                    FeedbackEditor(image, onDismiss = { feedbackImage = null },
+                        onShare = { crop, comment -> shareFeedback(this, crop, comment) })
+                }
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        if (feedbackEnabled) shake.start()
+    }
+
+    override fun onPause() {
+        resumed = false
+        shake.stop()
+        super.onPause()
+    }
+
+    private fun openFeedback() {
+        if (!resumed || capturing || feedbackImage != null) return
+        capturing = true
+        captureFeedback(this) { image ->
+            capturing = false
+            if (resumed && !isDestroyed) feedbackImage = image
+            else image?.recycle()
+            if (image == null && resumed) android.widget.Toast.makeText(this,
+                "Could not capture this screen. Try again.", android.widget.Toast.LENGTH_SHORT).show()
+        }
     }
 }
 
@@ -95,7 +141,8 @@ private enum class Tab(val label: String) {
 }
 
 @Composable
-private fun TunlionApp(core: TunlionCore) {
+private fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
+    onFeedbackEnabled: (Boolean) -> Unit, onFeedback: () -> Unit) {
     val dark = androidx.compose.foundation.isSystemInDarkTheme()
     val colors = if (dark) AppColors(DarkBg, DarkSurface, DarkInk, DarkSub, DarkRule, DarkSoft, DarkAccent)
         else AppColors(Paper, Surface, Ink, Sub, Rule, Soft, Accent)
@@ -197,7 +244,7 @@ private fun TunlionApp(core: TunlionCore) {
                             }
                         },
                     )
-                    Tab.SETTINGS -> SettingsScreen(colors, status)
+                    Tab.SETTINGS -> SettingsScreen(colors, status, feedbackEnabled, onFeedbackEnabled, onFeedback)
                 }
                 notice?.let { message ->
                     Spacer(Modifier.height(16.dp))
@@ -221,16 +268,16 @@ private data class AppColors(
 @Composable
 private fun AppHeader(colors: AppColors, deviceName: String?) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 26.dp),
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        TunlionMark(colors, 34)
+        TunlionMark(colors, 26)
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
-            Text("tunlion", color = colors.ink, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-            Text(deviceName ?: "your devices, together", color = colors.sub, fontSize = 12.sp)
+            Text("tunlion", color = colors.ink, fontSize = 20.sp, letterSpacing = (-.5).sp,
+                fontWeight = FontWeight.SemiBold)
         }
-        Text("0.1 · PREVIEW", color = colors.sub, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+        Text("PREVIEW", color = colors.sub, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
     }
 }
 
@@ -247,22 +294,14 @@ private fun HomeScreen(
     onJoin: () -> Unit,
     onScan: () -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Your devices,\nwithin reach.", color = colors.ink, fontSize = 30.sp,
-                lineHeight = 35.sp, fontWeight = FontWeight.SemiBold)
-            Text("No account. A code to connect. You choose what to share.",
-                color = colors.sub, fontSize = 14.sp, lineHeight = 20.sp)
-        }
-
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Card(colors = colors) {
-            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Eyebrow("AVAILABILITY", colors)
-                        Spacer(Modifier.height(5.dp))
                         Text(if (available) "Available" else "Off", color = colors.ink,
-                            fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                            fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                        Text("This phone", color = colors.sub, fontSize = 12.sp)
                     }
                     Switch(
                         checked = available,
@@ -274,31 +313,30 @@ private fun HomeScreen(
                 }
                 Text(
                     if (available) "Your remembered devices can reach you."
-                    else "Turn on when you want your devices to reach this phone.",
+                    else "Your devices cannot reach this phone while it is off.",
                     color = colors.sub, fontSize = 13.sp, lineHeight = 18.sp,
                 )
                 if (!status.engineLinked) {
                     Row(
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(7.dp))
-                            .background(colors.soft).padding(horizontal = 11.dp, vertical = 9.dp),
+                            .background(colors.soft).padding(horizontal = 9.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Box(Modifier.size(7.dp).clip(CircleShape).background(colors.accent))
                         Spacer(Modifier.width(8.dp))
-                        Text("Native engine not linked yet", color = colors.sub,
-                            fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        Text("Preview · native engine not linked", color = colors.sub,
+                            fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                     }
                 }
             }
         }
 
         Card(colors = colors) {
-            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Eyebrow("PAIR A DEVICE", colors)
-                        Text("Enter a code", color = colors.ink, fontSize = 19.sp,
-                            fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 4.dp))
+                        Text("Enter a code", color = colors.ink, fontSize = 17.sp,
+                            fontWeight = FontWeight.SemiBold)
                     }
                     TextButton(onClick = onScan) {
                         Text("Scan", color = colors.accent, fontWeight = FontWeight.SemiBold)
@@ -319,7 +357,8 @@ private fun HomeScreen(
                     Modifier.fillMaxWidth().clickable { onRememberDevice(!rememberDevice) },
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Checkbox(checked = rememberDevice, onCheckedChange = onRememberDevice)
+                    Checkbox(checked = rememberDevice, onCheckedChange = null,
+                        modifier = Modifier.semantics { contentDescription = "Remember this device" })
                     Column {
                         Text("Remember this device", color = colors.ink, fontSize = 13.sp,
                             fontWeight = FontWeight.Medium)
@@ -337,8 +376,6 @@ private fun HomeScreen(
                 ) {
                     Text("Join with code", fontWeight = FontWeight.SemiBold)
                 }
-                Text("Pairing is consent on both devices. Remembering is your choice.",
-                    color = colors.sub, fontSize = 12.sp, lineHeight = 17.sp)
             }
         }
 
@@ -363,10 +400,9 @@ private fun EmptyDevices(colors: AppColors) {
         shape = RoundedCornerShape(9.dp),
         border = BorderStroke(1.dp, colors.rule),
     ) {
-        Column(Modifier.fillMaxWidth().padding(vertical = 25.dp, horizontal = 20.dp),
+        Column(Modifier.fillMaxWidth().padding(vertical = 18.dp, horizontal = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(9.dp)) {
-            TunlionMark(colors, 48)
             Text("No devices yet", color = colors.ink, fontSize = 17.sp,
                 fontWeight = FontWeight.SemiBold)
             Text("Enter a code to connect your first device.", color = colors.sub,
@@ -437,9 +473,23 @@ private fun FilesScreen(colors: AppColors, code: String, onCode: (String) -> Uni
 }
 
 @Composable
-private fun SettingsScreen(colors: AppColors, status: CoreStatus) {
+private fun SettingsScreen(colors: AppColors, status: CoreStatus, feedbackEnabled: Boolean,
+    onFeedbackEnabled: (Boolean) -> Unit, onFeedback: () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         ScreenTitle("Settings", "This phone and its Tunlion identity.", colors)
+        Card(colors = colors) {
+            Column(Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Eyebrow("EXPERIMENTAL", colors)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Shake to give feedback", color = colors.ink, modifier = Modifier.weight(1f))
+                    Switch(checked = feedbackEnabled, onCheckedChange = onFeedbackEnabled,
+                        modifier = Modifier.semantics { contentDescription = "Shake to give feedback" })
+                }
+                Text("Shake twice while using this preview. Select a section, add a comment, then share it into this chat. Nothing is uploaded automatically.",
+                    color = colors.sub, fontSize = 13.sp, lineHeight = 18.sp)
+                OutlinedButton(onClick = onFeedback) { Text("Give feedback without shaking") }
+            }
+        }
         Card(colors = colors) {
             Column(Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Eyebrow("THIS DEVICE", colors)

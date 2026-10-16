@@ -1,9 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application
         android:allowBackup="false"
+        android:icon="@drawable/ic_tunlion"
         android:label="Tunlion"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.feedback"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/feedback_paths" />
+        </provider>
         <activity
             android:name=".MainActivity"
             android:exported="true">
