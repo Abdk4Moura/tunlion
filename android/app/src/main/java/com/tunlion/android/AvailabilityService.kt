@@ -48,14 +48,17 @@ class AvailabilityService : Service() {
                 while (isActive && attempts < 5) {
                     EngineState.phase.value = EnginePhase.STARTING
                     EngineState.error = null
-                    val drains = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                    val drains = CoroutineScope(SupervisorJob() + Dispatchers.IO +
+                        CoroutineExceptionHandler { _, _ -> /* closing the child interrupts these readers */ })
                     try {
                         process = cli.builder(listOf("up", "--userspace", "--no-proxy-fallback", "--dir", cli.paths.inbox.absolutePath)).start()
                         val child = process!!
                         child.outputStream.close()
                             val sink = object : java.io.OutputStream() { override fun write(value: Int) = Unit; override fun write(bytes: ByteArray, offset: Int, length: Int) = Unit }
-                            val out = drains.launch { child.inputStream.use { it.copyTo(sink) } }
-                            val err = drains.launch { child.errorStream.use { it.copyTo(sink) } }
+                            // Drain only. Reaping closes these streams, which interrupts a blocked read;
+                            // that is expected shutdown, never a reason to fail the process.
+                            val out = drains.launch { try { child.inputStream.use { it.copyTo(sink) } } catch (_: Exception) {} }
+                            val err = drains.launch { try { child.errorStream.use { it.copyTo(sink) } } catch (_: Exception) {} }
                             var ready = false
                             repeat(40) {
                                 ensureActive()
@@ -84,9 +87,10 @@ class AvailabilityService : Service() {
                             process?.let { child ->
                                 child.destroy()
                                 if (!child.waitFor(2, TimeUnit.SECONDS)) { child.destroyForcibly(); child.waitFor(2, TimeUnit.SECONDS) }
-                                child.inputStream.close(); child.errorStream.close()
                             }
                             process = null
+                            // Cancel the readers first; closing their streams under a
+                            // blocked read is what used to throw on another thread.
                             drains.cancel()
                             withTimeoutOrNull(2_000) { drains.coroutineContext[Job]?.join() }
                         }

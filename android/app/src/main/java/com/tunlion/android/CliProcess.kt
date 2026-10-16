@@ -89,23 +89,37 @@ internal class CliProcess(context: Context) {
         val process = builder(listOf("--quiet", "--json") + args, config).start()
         process.outputStream.close()
         var answer: JSONObject? = null
-        val readers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        // Reader failures on shutdown (a closed pipe) must not escape as a crash.
+        val readers = CoroutineScope(SupervisorJob() + Dispatchers.IO +
+            CoroutineExceptionHandler { _, _ -> })
         try {
                 val stdout = readers.async {
                     val decoder = JsonObjectFrames()
                     val chars = CharArray(4096)
-                    process.inputStream.bufferedReader().use { reader ->
-                        while (true) {
-                            val count = runInterruptible { reader.read(chars) }
-                            if (count < 0) break
-                            for (frame in decoder.feed(String(chars, 0, count))) {
-                                if (frame.has("ok")) answer = frame
-                                onFrame(frame)
+                    try {
+                        process.inputStream.bufferedReader().use { reader ->
+                            while (true) {
+                                val count = runInterruptible { reader.read(chars) }
+                                if (count < 0) break
+                                for (frame in decoder.feed(String(chars, 0, count))) {
+                                    if (frame.has("ok")) answer = frame
+                                    onFrame(frame)
+                                }
                             }
                         }
-                    }
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    // A closed pipe on shutdown is expected, not a failure.
+                    catch (_: Exception) { }
                 }
-                val stderr = readers.async { process.errorStream.use { input -> val scratch = ByteArray(4096); while (input.read(scratch) >= 0) { /* drain without logging codes or invitation material */ } } }
+                val stderr = readers.async {
+                    // Drain only. Never log stderr: it can carry a code or invitation material.
+                    try {
+                        process.errorStream.use { input ->
+                            val scratch = ByteArray(4096)
+                            while (input.read(scratch) >= 0) { }
+                        }
+                    } catch (_: Exception) { }
+                }
                 val exit = withTimeout(timeoutMs) {
                     while (!process.waitFor(100, TimeUnit.MILLISECONDS)) {
                         ensureActive()
