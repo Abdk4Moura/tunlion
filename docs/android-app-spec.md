@@ -1,8 +1,9 @@
 # tunlion for Android: build spec (v1)
 
-Status: ready to build, 2026-10-15. Two tracks run in parallel: the Rust core
-(this repo, `cli/`) and the Android app (new, `android/`). Each track has its own
-acceptance tests below; v1 ships when both pass on a real phone.
+Status: ready to build, 2026-10-15. The Android app (`android/`) calls the shared
+Rust core through UniFFI. The Android CLI build in `cli/` is a separate platform
+compatibility track and is not the app. v1 ships when the native core and app
+acceptance tests pass on a real phone.
 
 ## What v1 is
 
@@ -28,38 +29,30 @@ v1 does:
 v1 does NOT do: the mesh VPN (phase 2), mount, port forward UI (phase 2),
 serving a shell from the phone (never by default), multi-user profiles.
 
-## Architecture (v1): the app wraps the real tunlion binary
+## Architecture (v1): Kotlin app calls the Rust library
 
-The fastest correct path, and the one Syncthing-Android proved: ship the tunlion
-executable inside the APK and drive it. No second implementation of the protocol.
+The Android app calls the shared tunlion Rust core through UniFFI. It does not
+spawn the CLI or duplicate protocol logic. The library surface, lifecycle,
+records, typed errors, file staging, and shell byte interface are specified in
+[`docs/android-ffi.md`](android-ffi.md). Keep UI and service code behind the
+Kotlin `TunlionCore` interface; its first implementation uses the generated
+UniFFI bindings.
 
-- The binary is built for `aarch64-linux-android` (phones) and `x86_64-linux-android`
-  (emulator), packaged as `jniLibs/<abi>/libtunlion.so` so Android extracts it to
-  `nativeLibraryDir`, where it may be executed (files in app data may not).
-- `TUNLION_CONFIG_DIR` points at the app's private files dir
-  (`Context.filesDir/tunlion`). Nothing outside app storage holds keys.
-- The foreground service runs `tunlion up --userspace` as a child process and
-  restarts it if it exits unexpectedly (backoff, max 5 in 10 minutes).
-- The app talks to tunlion two ways, both existing interfaces:
-  - one-shot commands with `--json` (`devices`, `status`, `add`, `join`, `send`,
-    `receive`, `grant`, `revoke`), decided by exit code and the JSON envelope
-    (`cli/skills/tunlion/SKILL.md` lists every code);
-  - for live state, poll `tunlion status --json` every 2 s while the app is in the
-    foreground, never in the background.
-- Shell: the app spawns `tunlion shell <device>` with a pseudo-terminal and renders
-  it in a terminal view. Use an existing Android terminal emulator library (the
-  Termux `terminal-view` / `terminal-emulator` modules are Apache-2.0) rather than
-  writing one.
-- `send --code` and `receive` print NDJSON events; the first line of `send --code
-  --json` is `{"event":"code","code":...}`. Show the code as soon as it arrives.
+- Build `crates/tunlion-core` as `libtunlion_core.so` for
+  `aarch64-linux-android` (phones) and `x86_64-linux-android` (emulator), and
+  package it under `jniLibs/<abi>/`.
+- `Core.open` uses `Context.filesDir/tunlion`; identity keys stay in this
+  private app directory. The foreground service owns the notification and calls
+  `Core.start` / `Core.stop`. No child process is involved.
+- Poll `Core.status()` every 2 seconds while the app is foregrounded. The core
+  owns its runtime and reports long-running transfer, pairing, and shell work
+  through typed callbacks.
+- The app stages picker/share-sheet files privately for sending. Verified
+  received files are published to `Download/Tunlion` through `MediaStore`.
+  Invitation material is passed as bytes to the native library, never through
+  command-line arguments or logs.
 
-Phase 2 replaces the subprocess with the core as a library (UniFFI) once the
-peer loop is extracted (see `docs/design-libfilament.md`, step 4). The app's UI
-layer must not depend on how the core is reached: put every call behind one
-Kotlin interface, `TunlionCore`, with the subprocess implementation as its first
-version.
-
-## Track A: Rust core (this repo)
+## Track A: Android CLI compatibility (merged prerequisite)
 
 A1. **Build for Android.** `target_os = "android"` is not `"linux"` in Rust, and
     `cli/src` has 83 Linux-only `cfg` blocks. For each: either extend it to
@@ -133,5 +126,4 @@ A4. **Acceptance (core):** on an emulator or phone via `adb shell`, running the
 ## Phase 2 (after v1)
 
 Mesh VPN through Android's `VpnService` (tunlion gets a `--tun-fd` mode for the
-userspace overlay); port forwards; the core as a library via UniFFI; Android
-Keystore-wrapped keys.
+userspace overlay); port forwards; Android Keystore-wrapped keys.
