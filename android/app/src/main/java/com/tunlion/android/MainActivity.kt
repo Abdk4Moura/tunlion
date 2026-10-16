@@ -4,6 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -55,6 +56,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -514,13 +518,21 @@ private fun StatusDot(online: Boolean, colors: AppColors) {
 
 @Composable
 private fun TunlionMark(colors: AppColors, size: Int) {
-    Box(Modifier.size(size.dp), contentAlignment = Alignment.Center) {
-        Box(
-            Modifier.fillMaxSize(.78f).clip(RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp))
-                .background(colors.ink),
-        )
-        Box(Modifier.width((size * .22f).dp).height((size * .37f).dp)
-            .align(Alignment.BottomCenter).background(colors.accent))
+    Canvas(Modifier.size(size.dp)) {
+        val factor = this.size.minDimension / 80f
+        val arch = Path().apply {
+            moveTo(12f, 74f)
+            lineTo(12f, 24f)
+            quadraticTo(12f, 10f, 26f, 10f)
+            lineTo(54f, 10f)
+            quadraticTo(68f, 10f, 68f, 24f)
+            lineTo(68f, 74f)
+        }
+        withTransform({ scale(factor, factor, pivot = androidx.compose.ui.geometry.Offset.Zero) }) {
+            drawPath(arch, colors.ink, style = Stroke(width = if (size < 24) 16f else 10f))
+            drawRect(colors.accent, topLeft = androidx.compose.ui.geometry.Offset(33f, 46f),
+                size = androidx.compose.ui.geometry.Size(14f, 28f))
+        }
     }
 }
 
