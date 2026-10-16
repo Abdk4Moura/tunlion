@@ -59,6 +59,22 @@ fn tone_to_ui(tone: Tone) -> crate::ui::Tone {
     }
 }
 
+/// So `Conn::roster` (which now speaks `Tone`) keeps accepting `ui::Tone` from
+/// the frozen command modules (`recv_cmd`, `send_cmd`) unchanged.
+impl From<crate::ui::Tone> for Tone {
+    fn from(tone: crate::ui::Tone) -> Self {
+        match tone {
+            crate::ui::Tone::Brand => Tone::Brand,
+            crate::ui::Tone::Accent => Tone::Accent,
+            crate::ui::Tone::Ok => Tone::Ok,
+            crate::ui::Tone::Err => Tone::Err,
+            crate::ui::Tone::Warn => Tone::Warn,
+            crate::ui::Tone::Dim => Tone::Dim,
+            crate::ui::Tone::Bold => Tone::Bold,
+        }
+    }
+}
+
 fn level_to_ui(level: Level) -> crate::ui::Level {
     match level {
         Level::Critical => crate::ui::Level::Critical,

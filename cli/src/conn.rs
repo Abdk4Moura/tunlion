@@ -3964,10 +3964,13 @@ impl Conn {
         &self,
         pid: &str,
         mark: &str,
-        tone: Tone,
+        tone: impl Into<Tone>,
         note: &str,
         fallback_name: &str,
     ) -> String {
+        // Frozen callers in `recv_cmd`/`send_cmd` still hand this a `ui::Tone`;
+        // the CLI glue implements `From<ui::Tone>` so those calls do not move.
+        let tone = tone.into();
         // A link with no name yet is labelled by its raw signaling id. That id
         // means nothing to a person (a first-time-user test read "ok alpha
         // ok 3f9c...e1" after `receive <code>`), so it shows only under -v:
