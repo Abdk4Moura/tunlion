@@ -135,8 +135,8 @@ jobs:
           # exit-code-lies shape this job exists to stop.
           set -euo pipefail
           for c in filament-signal filament-cap filament-id filament-overlay \
-                   filament-fleet filament-pair filament-proto filament-transfer \
-                   filament-transport authkeys-managed tunlion-core; do
+                   filament-fleet filament-peerloop filament-pair filament-proto \
+                   filament-transfer filament-transport authkeys-managed tunlion-core; do
             if [ -f "crates/$c/Cargo.toml" ]; then
               echo "::group::$c"
               cargo test --release --manifest-path "crates/$c/Cargo.toml"

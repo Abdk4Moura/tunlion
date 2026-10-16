@@ -1,6 +1,7 @@
 //! CONNECTION STATE: the peer-link table and its per-link record, presence, the
-//! resilience / warm-hold bookkeeping, the pure decisions over them, and `Conn`
-//! itself -- the orchestration state every command's event loop manipulates.
+//! resilience bookkeeping, and `Conn` itself -- the orchestration state every
+//! command's event loop manipulates. The host-free policy over that state is
+//! re-exported from `filament-peerloop` further down.
 //!
 //! Lifted out of `main.rs` in two slices: 1a moved the state types and their
 //! pure helpers, 1b moved `Conn`, `impl Conn` and the owner/principal helpers
@@ -11,16 +12,21 @@
 //!
 //! Layout mirrors the state it belongs to, not a new abstraction:
 //!   Link / Presence / Rung / StallState / DirectPending   per-link and per-attempt state
-//!   ResilienceState / RejoinState / WarmHold / WarmBackoff   bookkeeping bags
+//!   ResilienceState / RejoinState                          bookkeeping bags
 //!   Conn + impl Conn                                      the link table and its policy
-//!   promotion, adoption, principal, liveness decisions      pure helpers over the above
+//!   promotion, principal, presentation decisions            pure helpers over the above
+//!
+//! Whole decisions left the file in slice 3 and are re-exported below:
+//! the warm-hold machine, link_dead_for / link_has_live_for / direct_permitted /
+//! ice_fallback_allowed, stuck_backoff / schedule_retry, the adoption matcher, and
+//! the petname rule. Every call site here and in the command modules is unchanged.
 //!
 //! BACK-EDGES -- what a future peer-loop carve still owes. This module calls
 //! back into `main.rs` for host- or config-bound helpers (see
-//! docs/design-libtunlion.md, "the rule for what may leave"):
+//! docs/design-libfilament.md, "the rule for what may leave"):
 //! `devices_load`, `load_owner_key`, `local_device_cert_path`,
 //! `resolve_peer_identity`, `peer_entry`, `is_self_uid`, `rejoin_unwarned`,
-//! `relay_banner`, `relay_forbidden`, and the FLEET/REJOIN/WARM constants.
+//! `relay_banner`, `relay_forbidden`, and the FLEET/REJOIN constants.
 //! They belong to the CLI until they are injected rather than imported.
 use crate::direct;
 use crate::holepunch;
@@ -35,6 +41,13 @@ use crate::{
     relay_banner, relay_forbidden, resolve_peer_identity,
 };
 use crate::{fleet, identity};
+/// The host-free policy now lives in `filament-peerloop`; this module re-exports
+/// it so the ~200 call sites spread across the command modules stay unchanged.
+pub(crate) use filament_peerloop::{
+    AdoptSource, LinkPetname, WarmHold, active_binding_matches, direct_permitted,
+    ice_fallback_allowed, link_dead_for, link_has_live_for, link_petname, match_adoption_source,
+    peer_targetable, schedule_retry, stuck_backoff,
+};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -95,27 +108,6 @@ enum DirectIntent {
     Fleet,
 }
 
-/// #246: a link is dead only when nothing is serving AND its WebRTC peer is
-/// not still making progress. `peer_live` is `Peer::is_live` (anything but
-/// Failed/Closed); `transport_dead` and `workers_all_dead` describe the direct
-/// transports. A WebRTC link that just finished `establish` is
-/// (peer_live=true, transport dead, workers empty) and therefore alive: it has
-/// no transport or workers YET, but its ICE agent is working. Named as a
-/// function so the decision is one expression, unit-testable, and stable
-/// across call sites.
-pub(crate) fn link_dead_for(peer_live: bool, transport_dead: bool, workers_all_dead: bool) -> bool {
-    !peer_live && transport_dead && workers_all_dead
-}
-
-/// #246: a link counts as live when any transport serves, any worker serves,
-/// or the WebRTC peer is still making progress. The peer clause is what lets a
-/// Normal re-dial yield to an establish that is still underway instead of
-/// arming a fresh direct attempt (whose fallback timer would then tear the
-/// establish down).
-pub(crate) fn link_has_live_for(peer_live: bool, primary_ok: bool, workers_ok: bool) -> bool {
-    peer_live || primary_ok || workers_ok
-}
-
 /// Which existing link an establish may replace. Two values, not a bool, so a
 /// call site says what it means.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -137,12 +129,6 @@ const ICE_CONFIG_STALE_OK: Duration = Duration::from_secs(20 * 60);
 /// default the backend hands out (backend/config.py DEFAULT_ICE).
 const FALLBACK_STUN: &str = "stun:stun.l.google.com:19302";
 
-/// Whether an establish may proceed on STUN alone when the config API is slow.
-/// Not under a forced relay, which needs the TURN credentials only the API has.
-fn ice_fallback_allowed(relay_only: bool) -> bool {
-    !relay_only
-}
-
 /// A config that finds direct paths without the API: STUN only, default chunks.
 fn stun_only_ice_config() -> net::ServerConfig {
     net::ServerConfig {
@@ -159,32 +145,6 @@ const PEER_BUILD_BUDGET: Duration = Duration::from_secs(5);
 /// How long `drop_link` lets a dropped link's last frames reach the peer
 /// before it closes the QUIC connection under them.
 const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
-
-/// Backoff before retry `attempts` of the stuck-link ladder: 1, 2, 4, 8s,
-/// capped at 10s.
-pub(crate) fn stuck_backoff(attempts: u32) -> Duration {
-    std::cmp::min(
-        Duration::from_secs(2u64.pow(attempts.saturating_sub(1).min(16))),
-        Duration::from_secs(10),
-    )
-}
-
-/// Arm the retry-ladder timer: after `backoff`, post `Ev::RetryLink(pid,
-/// generation)` to the event loop. Returns immediately; the wait happens on
-/// a spawned task, never on the loop.
-pub(crate) fn schedule_retry(
-    tx: &mpsc::UnboundedSender<Ev>,
-    pid: &str,
-    generation: u32,
-    backoff: Duration,
-) {
-    let tx = tx.clone();
-    let pid = pid.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(backoff).await;
-        let _ = tx.send(Ev::RetryLink(pid, generation));
-    });
-}
 
 pub(crate) struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
@@ -325,6 +285,20 @@ impl Link {
         // (auth_key_caps ∩ owner_effective) bounds the principal. Setting trusted
         // would leak into legacy_ok for gates that read it directly (e.g. mount),
         // handing an ephemeral borrower an unbounded, un-ceilinged grant.
+    }
+}
+
+/// The CLI half of the petname rule: the two fields `filament_peerloop`'s
+/// `link_petname` reads. The rule itself (verify first, else the dial hypothesis,
+/// NEVER the broadcast display name) lives in the crate, so it cannot drift from
+/// the warm-hold key that depends on it.
+impl LinkPetname for Link {
+    fn proven_petname(&self) -> Option<&str> {
+        self.verified_name.as_deref()
+    }
+
+    fn dialed_petname(&self) -> Option<&str> {
+        self.expected_secret.as_ref().map(|(n, _)| n.as_str())
     }
 }
 
@@ -496,22 +470,6 @@ pub(crate) struct RejoinState {
     pub(crate) away: Option<(String, Instant)>,
 }
 
-/// WARM-HOLD state: keeps connections alive to recently-used and explicitly
-/// configured peers so `tunlion reach`/`ssh` is instant.
-///
-/// Design:
-/// - EXPLICIT peers: from `tunlion set warm-peers dovm,popos` (always connected)
-/// - RECENT peers: LRU of last 5 peers used for send/ssh/ping (auto-connected)
-/// - RECONNECT: exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap) on drop
-/// - DORMANT: go dormant after 5 failed attempts; resume on peer presence
-const WARM_RECENT_CAP: usize = 5;
-const WARM_MAX_BACKOFF: Duration = Duration::from_secs(30);
-const WARM_DORMANT_THRESHOLD: u32 = 5;
-/// A dormant peer is retried this often (instead of never). Presence re-announce
-/// still resumes it immediately; this is the floor for a peer whose announces we
-/// keep missing.
-const WARM_DORMANT_RETRY: Duration = Duration::from_secs(300);
-
 /// Auto-warm size guard: warm at most this many roster peers (see `warm-max`).
 /// Must stay under MAX_LINKS (16) so warm-all can never starve on-demand,
 /// inbound, or upgrade-probe links of link-table slots.
@@ -523,409 +481,7 @@ fn warm_max() -> usize {
         .min(MAX_LINKS - 2)
 }
 
-/// The device petname a link belongs to: the one it proved as, else the one
-/// whose pair secret it carries. `None` for an unproven, secretless link.
-pub(crate) fn link_petname(l: &Link) -> Option<&str> {
-    l.verified_name
-        .as_deref()
-        .or(l.expected_secret.as_ref().map(|(n, _)| n.as_str()))
-}
-
 pub(crate) use crate::link_manager::{WarmDecision, WarmLinkView, WarmRosterView, warm_decide};
-
-#[derive(Default)]
-pub(crate) struct WarmHold {
-    /// Explicitly configured peers (from `warm-peers` setting)
-    pub(crate) configured: std::collections::HashSet<String>,
-    /// AUTO-WARM tier: ALL online paired peers (from the live roster), synced each
-    /// warm_hold_tick. ON by default (`auto-warm` setting); also forced on while the
-    /// L3 overlay is up (L3 needs live links to route). Bounded by `warm-max`
-    /// (Change 4), not by the recent LRU cap.
-    pub(crate) auto: std::collections::HashSet<String>,
-    /// Recently-used peers in LRU order (most recent at back, capped at 5)
-    recent: std::collections::VecDeque<String>,
-    /// Per-peer last-use timestamp
-    pub(crate) last_use: HashMap<String, Instant>,
-    /// Per-peer reconnect backoff state
-    backoff: HashMap<String, WarmBackoff>,
-}
-
-#[derive(Clone)]
-struct WarmBackoff {
-    /// Current backoff duration
-    duration: Duration,
-    /// Number of consecutive failures
-    failures: u32,
-    /// When we last tried to connect
-    last_attempt: Option<Instant>,
-    /// True if we've given up (dormant) after too many failures
-    dormant: bool,
-}
-
-impl Default for WarmBackoff {
-    fn default() -> Self {
-        Self {
-            duration: Duration::from_secs(1),
-            failures: 0,
-            last_attempt: None,
-            dormant: false,
-        }
-    }
-}
-
-impl WarmHold {
-    /// Record that a peer was just used (transfer, ssh, ping)
-    pub(crate) fn note_use(&mut self, peer: &str) {
-        let peer = peer.to_string();
-        self.last_use.insert(peer.clone(), Instant::now());
-        // Move to back of LRU (most recent)
-        self.recent.retain(|p| p != &peer);
-        self.recent.push_back(peer.clone());
-        // Trim to cap
-        while self.recent.len() > WARM_RECENT_CAP {
-            self.recent.pop_front();
-        }
-        // Clear dormant flag and reset backoff on use
-        if let Some(b) = self.backoff.get_mut(&peer) {
-            b.dormant = false;
-            b.failures = 0;
-            b.duration = Duration::from_secs(1);
-        }
-    }
-
-    /// Mark a connection attempt failed (exponential backoff)
-    pub(crate) fn note_failure(&mut self, peer: &str) {
-        let b = self.backoff.entry(peer.to_string()).or_default();
-        b.failures += 1;
-        b.last_attempt = Some(Instant::now());
-        // Exponential backoff with cap
-        b.duration = (b.duration * 2).min(WARM_MAX_BACKOFF);
-        // Go dormant after too many failures
-        if b.failures >= WARM_DORMANT_THRESHOLD {
-            b.dormant = true;
-        }
-    }
-
-    /// Mark a connection succeeded (reset backoff)
-    pub(crate) fn note_success(&mut self, peer: &str) {
-        if let Some(b) = self.backoff.get_mut(peer) {
-            b.failures = 0;
-            b.duration = Duration::from_secs(1);
-            b.dormant = false;
-        }
-    }
-
-    /// Check if a peer should be connected (configured OR auto OR recently used, not dormant)
-    pub(crate) fn should_connect(&self, peer: &str) -> bool {
-        if self.configured.contains(peer) {
-            return true;
-        }
-        if self.auto.contains(peer) {
-            return true;
-        }
-        if self.recent.contains(&peer.to_string()) {
-            // Check if dormant
-            if let Some(b) = self.backoff.get(peer) {
-                return !b.dormant;
-            }
-            return true;
-        }
-        false
-    }
-
-    /// Get all peers that should be connected
-    pub(crate) fn peers_to_connect(&self) -> Vec<String> {
-        let mut peers: Vec<String> = self.configured.iter().cloned().collect();
-        // Add auto-warm peers (all online paired peers)
-        for p in &self.auto {
-            if !peers.contains(p) {
-                peers.push(p.clone());
-            }
-        }
-        // Add recent peers (capped at 5, not dormant)
-        for p in &self.recent {
-            if !peers.contains(p) {
-                if let Some(b) = self.backoff.get(p) {
-                    if !b.dormant {
-                        peers.push(p.clone());
-                    }
-                } else {
-                    peers.push(p.clone());
-                }
-            }
-        }
-        peers
-    }
-
-    /// Consecutive failed attempts for this peer (0 when none recorded).
-    pub(crate) fn failures(&self, peer: &str) -> u32 {
-        self.backoff.get(peer).map(|b| b.failures).unwrap_or(0)
-    }
-
-    /// Check if a peer is dormant (too many failures)
-    fn is_dormant(&self, peer: &str) -> bool {
-        self.backoff.get(peer).map(|b| b.dormant).unwrap_or(false)
-    }
-
-    /// Is this peer due for a (re)connect attempt this tick? Dormant peers get one
-    /// probe per WARM_DORMANT_RETRY; non-dormant peers honor their exponential
-    /// backoff window (duration since last_attempt).
-    pub(crate) fn due(&self, peer: &str) -> bool {
-        match self.backoff.get(peer) {
-            None => true,
-            Some(b) => {
-                let since = b.last_attempt.map(|t| t.elapsed());
-                if b.dormant {
-                    since.map_or(true, |d| d >= WARM_DORMANT_RETRY)
-                } else {
-                    since.map_or(true, |d| d >= b.duration)
-                }
-            }
-        }
-    }
-
-    /// Resume a dormant peer (e.g., when it reappears in signaling presence)
-    pub(crate) fn resume(&mut self, peer: &str) {
-        if let Some(b) = self.backoff.get_mut(peer) {
-            b.dormant = false;
-            b.failures = 0;
-            b.duration = Duration::from_secs(1);
-        }
-    }
-}
-
-#[cfg(test)]
-mod warm_hold_tests {
-    use super::*;
-
-    #[test]
-    fn should_connect_configured() {
-        let mut wh = WarmHold::default();
-        wh.configured.insert("dovm".into());
-        assert!(wh.should_connect("dovm"));
-        assert!(!wh.should_connect("popos"));
-    }
-
-    #[test]
-    fn should_connect_l3() {
-        let mut wh = WarmHold::default();
-        wh.auto.insert("dovm".into());
-        assert!(wh.should_connect("dovm"));
-        assert!(!wh.should_connect("popos"));
-    }
-
-    #[test]
-    fn should_connect_recent_not_dormant() {
-        let mut wh = WarmHold::default();
-        wh.note_use("dovm");
-        assert!(wh.should_connect("dovm"));
-    }
-
-    #[test]
-    fn should_connect_false_for_dormant() {
-        let mut wh = WarmHold::default();
-        for _ in 0..WARM_DORMANT_THRESHOLD {
-            wh.note_failure("dovm");
-        }
-        assert!(!wh.should_connect("dovm"));
-    }
-
-    #[test]
-    fn should_connect_false_for_unknown() {
-        let wh = WarmHold::default();
-        assert!(!wh.should_connect("unknown"));
-    }
-
-    #[test]
-    fn recent_lru_caps_at_5() {
-        let mut wh = WarmHold::default();
-        for i in 0..7 {
-            wh.note_use(&format!("peer{i}"));
-        }
-        // Should only have last 5: peer2, peer3, peer4, peer5, peer6
-        assert_eq!(wh.recent.len(), WARM_RECENT_CAP);
-        assert!(!wh.recent.contains(&"peer0".to_string()));
-        assert!(!wh.recent.contains(&"peer1".to_string()));
-        assert!(wh.recent.contains(&"peer2".to_string()));
-        assert!(wh.recent.contains(&"peer6".to_string()));
-    }
-
-    #[test]
-    fn recent_evicts_oldest() {
-        let mut wh = WarmHold::default();
-        wh.note_use("a");
-        wh.note_use("b");
-        wh.note_use("c");
-        wh.note_use("d");
-        wh.note_use("e");
-        // All 5 present
-        assert_eq!(wh.recent.len(), 5);
-        // Add 6th - "a" should be evicted
-        wh.note_use("f");
-        assert_eq!(wh.recent.len(), 5);
-        assert!(!wh.recent.contains(&"a".to_string()));
-        assert!(wh.recent.contains(&"f".to_string()));
-    }
-
-    #[test]
-    fn auto_set_is_unbounded() {
-        let mut wh = WarmHold::default();
-        // Add 10 peers to auto set
-        for i in 0..10 {
-            wh.auto.insert(format!("peer{i}"));
-        }
-        // All 10 should be in peers_to_connect
-        let peers = wh.peers_to_connect();
-        for i in 0..10 {
-            assert!(peers.contains(&format!("peer{i}")), "peer{i} missing");
-        }
-    }
-
-    #[test]
-    fn auto_disabled_clears_set() {
-        let mut wh = WarmHold::default();
-        wh.auto.insert("dovm".into());
-        wh.auto.insert("popos".into());
-        assert!(wh.should_connect("dovm"));
-        // Simulate auto-warm disabled
-        wh.auto.clear();
-        assert!(!wh.should_connect("dovm"));
-        assert!(!wh.should_connect("popos"));
-    }
-
-    #[test]
-    fn note_failure_backoff_doubling() {
-        let mut wh = WarmHold::default();
-        wh.note_failure("dovm");
-        assert_eq!(wh.backoff["dovm"].duration, Duration::from_secs(2));
-        wh.note_failure("dovm");
-        assert_eq!(wh.backoff["dovm"].duration, Duration::from_secs(4));
-        wh.note_failure("dovm");
-        assert_eq!(wh.backoff["dovm"].duration, Duration::from_secs(8));
-    }
-
-    #[test]
-    fn note_failure_caps_at_30s() {
-        let mut wh = WarmHold::default();
-        for _ in 0..10 {
-            wh.note_failure("dovm");
-        }
-        assert_eq!(wh.backoff["dovm"].duration, WARM_MAX_BACKOFF);
-    }
-
-    #[test]
-    fn note_failure_dormant_after_threshold() {
-        let mut wh = WarmHold::default();
-        for _ in 0..WARM_DORMANT_THRESHOLD {
-            wh.note_failure("dovm");
-        }
-        assert!(wh.backoff["dovm"].dormant);
-        assert!(wh.is_dormant("dovm"));
-    }
-
-    #[test]
-    fn note_use_clears_backoff() {
-        let mut wh = WarmHold::default();
-        for _ in 0..WARM_DORMANT_THRESHOLD {
-            wh.note_failure("dovm");
-        }
-        assert!(wh.is_dormant("dovm"));
-        wh.note_use("dovm");
-        assert!(!wh.is_dormant("dovm"));
-        assert_eq!(wh.backoff["dovm"].duration, Duration::from_secs(1));
-        assert_eq!(wh.backoff["dovm"].failures, 0);
-    }
-
-    #[test]
-    fn resume_clears_dormant() {
-        let mut wh = WarmHold::default();
-        for _ in 0..WARM_DORMANT_THRESHOLD {
-            wh.note_failure("dovm");
-        }
-        assert!(wh.is_dormant("dovm"));
-        wh.resume("dovm");
-        assert!(!wh.is_dormant("dovm"));
-    }
-
-    /// CI GUARDRAIL: warm peers should be instantly connectable.
-    /// This is a LOGICAL test (no network) - verifies the warm-hold state
-    /// machine would allow instant connection for a warm peer.
-    #[test]
-    fn warm_peer_allows_instant_connection() {
-        let mut wh = WarmHold::default();
-        // Simulate a warm peer (configured + auto)
-        wh.configured.insert("dovm".into());
-        wh.auto.insert("dovm".into());
-        wh.note_use("dovm");
-        // All paths should return true
-        assert!(wh.should_connect("dovm"));
-        assert!(!wh.is_dormant("dovm"));
-        // Peer is in warm sets
-        assert!(wh.configured.contains("dovm"));
-        assert!(wh.auto.contains("dovm"));
-    }
-
-    #[test]
-    fn due_respects_backoff_window() {
-        let mut wh = WarmHold::default();
-        // No backoff entry -> always due
-        assert!(wh.due("unknown"));
-        // After one failure, not due until backoff window passes
-        wh.note_failure("dovm");
-        assert!(!wh.due("dovm")); // 1s window, just failed
-    }
-
-    #[test]
-    fn dormant_peer_retries_after_interval() {
-        let mut wh = WarmHold::default();
-        // Make peer dormant
-        for _ in 0..WARM_DORMANT_THRESHOLD {
-            wh.note_failure("dovm");
-        }
-        assert!(wh.is_dormant("dovm"));
-        // Not due immediately
-        assert!(!wh.due("dovm"));
-        // After WARM_DORMANT_RETRY, would be due (can't easily test Instant::elapsed
-        // without injecting time, so just verify the dormant flag is set)
-        assert!(wh.backoff["dovm"].dormant);
-    }
-}
-
-/// Why a roster entry is being adopted. Contact is the safe default for new
-/// call sites; Digest is reserved for roster reconciliation, which must not
-/// undo an exhausted give-up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AdoptSource {
-    Contact,
-    Digest,
-}
-
-pub(crate) fn match_adoption_source(
-    suppressed: &mut HashSet<String>,
-    peer_id: &str,
-    source: AdoptSource,
-) -> bool {
-    match source {
-        AdoptSource::Contact => {
-            suppressed.remove(peer_id);
-            true
-        }
-        AdoptSource::Digest => !suppressed.contains(peer_id),
-    }
-}
-
-pub(crate) fn active_binding_matches(
-    binding: &(String, Option<String>),
-    peer_id: &str,
-    peer_uid: Option<&str>,
-) -> bool {
-    binding.0 == peer_id
-        || binding
-            .1
-            .as_deref()
-            .zip(peer_uid)
-            .is_some_and(|(bound, candidate)| bound == candidate)
-}
 
 /// P0: one peer's stall-repair episode state.
 #[derive(Default)]
@@ -1222,18 +778,6 @@ pub(crate) fn upgrade_principal(
     }
 }
 
-/// `--relay` promises to hide this machine's address from the peer. Direct
-/// transport cannot keep that promise: its `transport-offer` carries our host
-/// and public candidates, and dialing the peer's candidates hands it our source
-/// address. So a relay-mode session never takes direct, whatever else asked for
-/// it (env gate, L2 acceptor, daemon anti-glare). Decided here once, at Conn
-/// construction, and `direct_ok` is never widened afterwards, so send, receive,
-/// pair and the `up` daemon all inherit it. Runtime escalation to relay
-/// (`relay_only` set later) is a different thing and is not this flag.
-pub(crate) fn direct_permitted(relay_only: bool, direct_ok: bool) -> bool {
-    direct_ok && !relay_only
-}
-
 /// The TCP-localhost transport for two processes of ONE install (c6100a6d) is
 /// unfinished, so it stays off. Its offer advertised a listener that nothing
 /// ever `accept`s, and the offer's receiver returned before trying it because a
@@ -1448,20 +992,11 @@ impl Conn {
     }
 
     /// May this peer become the TRANSFER TARGET? (Filters gate targeting,
-    /// never answering, every peer still gets a polite link.)
+    /// never answering, every peer still gets a polite link.) The rule is
+    /// `filament_peerloop::peer_targetable`, unit-tested there; this method only
+    /// reads the two fields it needs off `Conn`.
     fn targetable(&self, name: &str, peer_uid: Option<&str>) -> bool {
-        if let Some(filter) = &self.to_filter {
-            if !name.to_lowercase().contains(&filter.to_lowercase()) {
-                return false;
-            }
-        }
-        // Same-role CLI peers never transfer to each other (gate 7).
-        if let (Some(pu), Some(my_role)) = (peer_uid, self.my_uid.get(..6)) {
-            if pu.starts_with(my_role) {
-                return false;
-            }
-        }
-        true
+        peer_targetable(self.to_filter.as_deref(), &self.my_uid, name, peer_uid)
     }
 
     fn adoption_allowed(&mut self, peer_id: &str, source: AdoptSource) -> bool {
@@ -4734,7 +4269,7 @@ mod raw_label_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AdoptSource, MAX_ATTEMPTS, active_binding_matches, match_adoption_source};
+    use crate::{AdoptSource, MAX_ATTEMPTS, match_adoption_source};
     use std::collections::HashSet;
 
     #[test]
@@ -4770,30 +4305,6 @@ mod tests {
             &mut suppressed,
             "peer-sid",
             AdoptSource::Digest
-        ));
-    }
-
-    #[test]
-    fn code_receive_binding_rejects_unrelated_paired_peer_but_allows_rejoin() {
-        let binding = (
-            "sender-old-sid".to_string(),
-            Some("sender-install".to_string()),
-        );
-
-        assert!(active_binding_matches(
-            &binding,
-            "sender-old-sid",
-            Some("sender-install")
-        ));
-        assert!(active_binding_matches(
-            &binding,
-            "sender-new-sid",
-            Some("sender-install")
-        ));
-        assert!(!active_binding_matches(
-            &binding,
-            "unrelated-paired-sid",
-            Some("unrelated-install")
         ));
     }
 }
