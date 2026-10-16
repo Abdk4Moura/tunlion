@@ -39,11 +39,28 @@ adb = [args.adb, "-s", args.device]
 started = []
 
 
+def log(message):
+    print(message, flush=True)
+
+
 def host(command, timeout=90, check=True):
     result = subprocess.run(desktop + command, env=environment, capture_output=True, text=True, timeout=timeout)
     if check and result.returncode:
         raise RuntimeError(f"Desktop {command[0]} failed ({result.returncode}): {result.stdout}\n{result.stderr}")
     return result
+
+
+def wait_for_daemon(timeout=45):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            snapshot = json.loads(host(["status", "--json"]).stdout)
+        except Exception:
+            snapshot = {}
+        if snapshot.get("running"):
+            return
+        time.sleep(1)
+    raise RuntimeError("The desktop daemon did not start")
 
 
 class Captured:
@@ -84,14 +101,22 @@ def file_code(line):
 
 
 try:
+    log("1/6 desktop identity")
     host(["init", "--name", "acceptance-desktop", "--no-background",
           "--recovery-file", str(root / "recovery.txt"), "--yes", "--json"])
-    host(["up", "--userspace", "--detach", "--dir", str(inbox)])
+    log("2/6 desktop receiver")
+    host(["up", "--userspace", "--detach", "--dir", str(inbox)], check=False)
+    if not json.loads(host(["status", "--json"]).stdout).get("running"):
+        Captured(desktop + ["up", "--userspace", "--dir", str(inbox)])
+    wait_for_daemon()
 
+    log("3/6 mint a pairing code")
     pairing = Captured(desktop + ["add", "--for", "device", "--name", "acceptance-phone",
                                   "--word", "instrument copper glacier", "--yes"])
     code = pairing.until(lambda line: (match.group(0) if (match := re.search(r"instrument-copper-glacier-[0-9]{4}", line)) else None))
+    log(f"    code {code}")
 
+    log("4/6 a receive-by-code file")
     code_file = root / "code-proof.txt"
     code_file.write_text("code-to-phone verified proof\n")
     sending = Captured(desktop + ["send", str(code_file), "--code", "--timeout", "300", "--json"])
@@ -100,6 +125,7 @@ try:
     background_file = root / ("desktop-proof-" + str(int(time.time())) + ".txt")
     background_file.write_text("desktop-to-phone verified proof\n")
 
+    log("5/6 phone pairing, transfer and availability checks")
     test = Captured(adb + ["shell", "am", "instrument", "-w", "-r",
         "-e", "class", "com.tunlion.android.CliAndroidAcceptanceTest",
         "-e", "deviceCode", code,
@@ -112,8 +138,10 @@ try:
     listed = json.loads(host(["devices", "--json"]).stdout)["data"]["devices"]
     assert listed, "The desktop did not list the phone"
     phone = next((item["name"] for item in listed if "phone" in item["name"]), listed[0]["name"])
+    log(f"    the desktop lists {phone}")
     host(["send", str(background_file), "--to", phone, "--json"], timeout=90)
 
+    log("6/6 background receive, saved bytes and availability off")
     test.until(lambda line: "CLI_ACCEPTANCE_PASSED" in line, timeout=120)
     assert test.process.wait(timeout=30) == 0
     assert sending.process.wait(timeout=30) == 0
