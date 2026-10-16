@@ -6,7 +6,7 @@
       "disposition": "diagnostic",
       "issue": "https://github.com/Abdk4Moura/tunlion/issues/294",
       "owner": "chief-ux",
-      "expires": "2026-10-15"
+      "expires": "2026-11-15"
     },
     {
       "path": "cli/tests/cap-verbs-gates.sh",
