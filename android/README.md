@@ -10,11 +10,22 @@ Build a debug APK with:
 gradle :app:assembleDebug
 ```
 
-The current preview builds the navigation, home/availability, pairing-code,
-files, and settings surfaces. `TunlionCore` is the app boundary. The native
-library binding and peer loop are not linked in this preview, so actions that
-require them fail closed with an explanation. The app never launches the CLI
-and never shows demo peers or simulated success.
+The preview uses one journey: set up this phone, connect a device, select it,
+then send a file. Home contains this phone's availability and known devices;
+code entry is a dedicated task, Files is contextual, and Settings lives in the
+header. There is no bottom navigation bar. Screen changes use short slide/fade
+transitions and in-flight actions prevent repeated submission.
+
+`TunlionCore` is the app boundary. `NativeTunlionCore` uses generated UniFFI
+bindings for real identity preparation, confirmation, and loading. Recovery
+words stay in memory until confirmed, and screenshot capture is blocked during
+recovery setup. The peer loop is not linked yet: connection and file operations
+refuse with an explanation and never show demo peers or simulated success.
+
+The app workflow pins native source and libraries from the same PR 467 commit
+(`0a5a0b0`) while that prerequisite is reviewed. Kotlin is generated in CI from
+the matching library metadata. Local builds need those generated bindings in
+`app/build/generated/uniffi` and the native libraries in `app/src/main/jniLibs`.
 
 ## Preview feedback
 

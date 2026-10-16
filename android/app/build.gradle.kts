@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.tunlion.android"
     compileSdk = 35
+    sourceSets["main"].java.srcDir("build/generated/uniffi")
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -31,6 +32,7 @@ android {
 }
 
 dependencies {
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
     testImplementation("junit:junit:4.13.2")
     implementation(platform("androidx.compose:compose-bom:2025.04.01"))
     implementation("androidx.activity:activity-compose:1.10.1")
