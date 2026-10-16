@@ -143,19 +143,23 @@ jobs:
             crates/tunlion-core/target
           key: bindings-${{ hashFiles('crates/tunlion-core/Cargo.lock') }}
           restore-keys: bindings-
+      # Both steps run INSIDE the crate. The repo has no root manifest, and
+      # uniffi-bindgen shells out to `cargo metadata` in its working directory.
+      # From the repo root that fails with "could not find Cargo.toml".
       - name: Build the library for the host
-        run: cargo build --manifest-path crates/tunlion-core/Cargo.toml --release --lib
+        working-directory: crates/tunlion-core
+        run: cargo build --release --lib
       - name: Generate the Kotlin bindings
+        working-directory: crates/tunlion-core
         run: |
-          cargo run --manifest-path crates/tunlion-core/Cargo.toml \
-            --features cli --bin uniffi-bindgen -- \
-            generate --library crates/tunlion-core/target/release/libtunlion_core.so \
+          cargo run --features cli --bin uniffi-bindgen -- \
+            generate --library target/release/libtunlion_core.so \
             --language kotlin --out-dir kotlin
           find kotlin -type f | sort
       - uses: actions/upload-artifact@v4
         with:
           name: tunlion-core-kotlin
-          path: kotlin
+          path: crates/tunlion-core/kotlin
           if-no-files-found: error
 
   emulator:

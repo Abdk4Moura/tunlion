@@ -29,11 +29,14 @@ produces them as the `tunlion-core-kotlin` artifact, from the same `.so` the app
 links, so the bindings and the symbols cannot drift:
 
 ```
-cargo run --manifest-path crates/tunlion-core/Cargo.toml \
-  --features cli --bin uniffi-bindgen -- \
-  generate --library crates/tunlion-core/target/release/libtunlion_core.so \
+cd crates/tunlion-core
+cargo run --features cli --bin uniffi-bindgen -- \
+  generate --library target/release/libtunlion_core.so \
   --language kotlin --out-dir kotlin
 ```
+
+Run it from inside the crate. The bindgen shells out to `cargo metadata`, and
+this repo has no root manifest, so the repo root fails.
 
 `uniffi::setup_scaffolding!()` in `src/lib.rs` is what exports the surface.
 `tunlion_core_abi_version` is a plain build proof and not part of the API. Do
