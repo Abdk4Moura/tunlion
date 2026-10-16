@@ -888,7 +888,7 @@ pub async fn spawn_pty_session(
     // ceiling (the grant authorizes); uncovered sessions never set this.
     admitted_via_ceiling: bool,
 ) -> Option<PtySessionHandle> {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use crate::platform::pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read as _, Write as _};
 
     let size = PtySize {

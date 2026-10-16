@@ -24,7 +24,7 @@ use std::io::Read;
 use std::time::Duration;
 
 pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = filament_transport::http::client_builder()
         .timeout(Duration::from_secs(60))
         .user_agent(format!("tunlion/{}", env!("CARGO_PKG_VERSION")))
         .build()?;

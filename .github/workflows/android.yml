@@ -1,0 +1,161 @@
+# Android builds of the CLI, for the Android app to wrap (docs/android-app-spec.md).
+# Not a required check, so a trigger path filter is fine: a browser-only change
+# never starts this workflow.
+name: Android
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "cli/**"
+      - "crates/**"
+      - "lab/android/**"
+      - ".github/workflows/android.yml"
+  push:
+    branches: [main]
+    paths:
+      - "cli/**"
+      - "crates/**"
+      - "lab/android/**"
+      - ".github/workflows/android.yml"
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: android build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+          - target: x86_64-linux-android
+            abi: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          cargo install cargo-ndk --locked --version 4.1.2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: android-${{ matrix.target }}-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: android-${{ matrix.target }}-
+      - name: Build
+        working-directory: cli
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          echo "NDK: $ANDROID_NDK_HOME"
+          cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --bin tunlion
+      - name: Stage
+        run: |
+          mkdir -p out
+          cp cli/target/${{ matrix.target }}/release/tunlion out/tunlion
+          file out/tunlion
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunlion-${{ matrix.target }}
+          path: out/tunlion
+          if-no-files-found: error
+
+  emulator:
+    name: android emulator acceptance
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tunlion-x86_64-linux-android
+          path: android-bin
+      - name: Host tunlion (Linux)
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo build --release --locked --manifest-path cli/Cargo.toml --bin tunlion
+          cp cli/target/release/tunlion /usr/local/bin/tunlion 2>/dev/null || sudo cp cli/target/release/tunlion /usr/local/bin/tunlion
+          tunlion --version
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Acceptance script
+        run: |
+          cat > "$RUNNER_TEMP/emu.sh" <<'SH'
+          set -u
+          fail=0
+          pass() { echo "PASS: $*"; }
+          bad() { echo "FAIL: $*"; fail=1; }
+          D() { adb shell "cd /data/local/tmp && TUNLION_CONFIG_DIR=/data/local/tmp/tl HOME=/data/local/tmp TUNLION_NONINTERACTIVE=1 ./tunlion $*"; }
+          export TUNLION_CONFIG_DIR="$RUNNER_TEMP/host"
+          H() { tunlion "$@"; }
+          adb wait-for-device
+          # The app runs tunlion inside its own sandbox, where it may create its
+          # control socket. The adb shell user may not (SELinux), so run as root.
+          adb root >/dev/null; sleep 3; adb wait-for-device
+          adb push android-bin/tunlion /data/local/tmp/tunlion >/dev/null
+          adb shell chmod 755 /data/local/tmp/tunlion
+          adb shell uname -a
+          D --version && pass "binary runs on Android" || bad "binary does not run"
+
+          D init --name phone --no-background --recovery-file /data/local/tmp/rec.txt -y && pass "init" || bad "init"
+          D up --install; rc=$?; [ $rc -ne 0 ] && pass "up --install refuses (exit $rc)" || bad "up --install did not refuse"
+          D up --userspace --detach && pass "up --userspace --detach" || bad "up --userspace"
+          sleep 5
+          D status --json > st.json; python3 -c "import json;d=json.load(open('st.json'));assert d['ok'] is True" && pass "status --json valid" || { cat st.json; bad "status --json"; }
+
+          
+          D add host --out /data/local/tmp/inv.txt -y && pass "add (invitation) on Android" || bad "add on Android"
+          adb pull /data/local/tmp/inv.txt "$RUNNER_TEMP/inv.txt" >/dev/null && chmod 600 "$RUNNER_TEMP/inv.txt"
+          H join "$RUNNER_TEMP/inv.txt" -y && pass "host joined the phone's invitation" || bad "host join"
+          H up --userspace --detach && pass "host up" || bad "host up"
+          sleep 8
+          D devices --json > dv.json; cat dv.json
+          HOSTNAME_ON_PHONE=$(python3 -c "import json;d=json.load(open('dv.json'));print(d['data']['devices'][0]['name'])" 2>/dev/null)
+          H devices --json > hdv.json
+          PHONE_ON_HOST=$(python3 -c "import json;d=json.load(open('hdv.json'));print(d['data']['devices'][0]['name'])" 2>/dev/null)
+          echo "phone calls host: $HOSTNAME_ON_PHONE; host calls phone: $PHONE_ON_HOST"
+
+          adb shell "echo phone-to-host > /data/local/tmp/p2h.txt"
+          D send /data/local/tmp/p2h.txt --to "$HOSTNAME_ON_PHONE" && pass "send --to from Android" || bad "send --to from Android"
+          sleep 2; ls -la "$RUNNER_TEMP/host" ~/Tunlion 2>/dev/null | head -20
+          find "$HOME" "$RUNNER_TEMP" -name 'p2h*.txt' 2>/dev/null | head -3
+
+          echo host-to-phone > h2p.txt
+          H send h2p.txt --to "$PHONE_ON_HOST" && pass "send --to the Android device" || bad "send --to the Android device"
+          adb shell "ls -la /data/local/tmp/Tunlion 2>/dev/null; find /data/local/tmp -name 'h2p*'"
+
+          echo by-code > code.txt
+          (H send code.txt --code --json > send.ndjson 2>send.err &) ; sleep 6
+          CODE=$(python3 -c "import json;print(json.loads(open('send.ndjson').readline())['code'])" 2>/dev/null)
+          echo "code: $CODE"
+          D receive "$CODE" --dir /data/local/tmp/rx; adb shell cat /data/local/tmp/rx/code.txt | grep -q by-code && pass "receive <code> on Android" || { cat send.err; bad "receive <code> on Android"; }
+
+          sleep 60
+          D status --json > st2.json; python3 -c "import json;d=json.load(open('st2.json'));assert d['ok'] is True" && pass "daemon still up after 60 s" || { cat st2.json; bad "daemon not up after 60 s"; }
+          adb shell "cat /data/local/tmp/tl/daemon.log 2>/dev/null | tail -30"
+          exit $fail
+          SH
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: bash "$RUNNER_TEMP/emu.sh"

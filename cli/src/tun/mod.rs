@@ -47,6 +47,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, l3_blocker, l3_grant_pending, KernelTun};
 
+#[cfg(target_os = "android")]
+mod android;
+#[cfg(target_os = "android")]
+pub use android::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, l3_blocker, l3_grant_pending, KernelTun};
+
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]

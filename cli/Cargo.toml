@@ -100,8 +100,6 @@ clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
 flate2 = "1.1.9"
 qrcode = { version = "0.14.1", default-features = false }
-# web-shell: spawn a login shell in a PTY and bridge it to the browser terminal.
-portable-pty = "0.8"
 # rung-1 direct CLI<->CLI transport (TUNLION_DIRECT=1). ring crypto to match
 # the rest of the rustls tree; we hand quinn an explicit ring-based config so
 # no process-default crypto provider is required.
@@ -231,3 +229,8 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.tar]
 opt-level = "z"
+
+# The PTY crate pulls in `serial`/`termios`, which do not build for Android. A
+# phone never serves shells (docs/android-app-spec.md), so Android goes without.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+portable-pty = "0.8"

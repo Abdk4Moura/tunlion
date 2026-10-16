@@ -1174,7 +1174,7 @@ pub async fn http_get_json(url: &str) -> Result<Value> {
         // Explicit timeout: reqwest has none by default, and this is awaited
         // from the event loop, a hung GET must not freeze the process.
         let mut builder =
-            reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+            crate::http::client_builder().timeout(std::time::Duration::from_secs(10));
         if let Some((host, addrs)) = &overrides {
             builder = builder.resolve_to_addrs(host, addrs);
         }

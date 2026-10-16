@@ -73,7 +73,12 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("l2.rs", 38),
         // Should approach zero as the armed set stops needing IPC at all.
         ("ctl.rs", 6),
-        ("tun/mod.rs", 6),
+        // 6 -> 8: tun/mod.rs IS the backend selector, one `mod` + `pub use` pair
+        // per OS. Android is a fourth OS with its own (refusing) backend, the
+        // same shape as the Linux, macOS and Windows arms; there is no portable
+        // function to call instead, because the choice of backend is the
+        // platform fact itself.
+        ("tun/mod.rs", 8),
         ("sdnotify.rs", 5),
         // 4 -> 2: hostname() asks platform::os_hostname instead of carrying
         // its own unix/windows split.
