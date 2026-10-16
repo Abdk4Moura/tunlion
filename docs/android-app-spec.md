@@ -53,11 +53,13 @@ executable inside the APK and drive it. No second implementation of the protocol
 - `send --code` and `receive` print NDJSON events; the first line of `send --code
   --json` is `{"event":"code","code":...}`. Show the code as soon as it arrives.
 
-Phase 2 replaces the subprocess with the core as a library (UniFFI) once the
-peer loop is extracted (see `docs/design-libfilament.md`, step 4). The app's UI
-layer must not depend on how the core is reached: put every call behind one
-Kotlin interface, `TunlionCore`, with the subprocess implementation as its first
-version.
+The app calls `crates/tunlion-core` (UniFFI), not a child `tunlion` process.
+That crate is a general library. Android is one caller. The contract is
+`docs/android-ffi.md`. The CLI Android build stays as proof the protocol
+compiles for the NDK. It is not the core. The peer loop is not linked yet:
+`start` returns `EngineNotLinked` until issue #465 slice 3. The UI still talks
+to one Kotlin interface, `TunlionCore`. Its first implementation is that
+library.
 
 ## Track A: Rust core (this repo)
 
@@ -133,5 +135,5 @@ A4. **Acceptance (core):** on an emulator or phone via `adb shell`, running the
 ## Phase 2 (after v1)
 
 Mesh VPN through Android's `VpnService` (tunlion gets a `--tun-fd` mode for the
-userspace overlay); port forwards; the core as a library via UniFFI; Android
-Keystore-wrapped keys.
+userspace overlay); port forwards; Android Keystore-wrapped keys. The library
+itself is v1, not phase 2. See `docs/android-ffi.md`.

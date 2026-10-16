@@ -72,6 +72,96 @@ jobs:
           path: out/tunlion
           if-no-files-found: error
 
+  # The library the app calls. Separate from the CLI binary job above, and not
+  # a dependency of the emulator acceptance (that still drives ./tunlion).
+  core:
+    name: android library (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+          - target: x86_64-linux-android
+            abi: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          cargo install cargo-ndk --locked --version 4.1.2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/tunlion-core/target
+          key: android-core-${{ matrix.target }}-${{ hashFiles('crates/tunlion-core/Cargo.lock') }}
+          restore-keys: android-core-${{ matrix.target }}-
+      - name: Build the library
+        working-directory: crates/tunlion-core
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          # cargo-ndk looks for Cargo.toml in the working directory. This repo
+          # has no root manifest, so the job has to start inside the crate.
+          cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --lib
+      - name: Stage
+        run: |
+          mkdir -p out
+          so="crates/tunlion-core/target/${{ matrix.target }}/release/libtunlion_core.so"
+          test -f "$so"
+          cp "$so" out/libtunlion_core.so
+          file out/libtunlion_core.so
+          nm -D out/libtunlion_core.so | grep tunlion_core_abi_version
+          # The UniFFI scaffolding is what Kotlin actually calls. A .so that
+          # built but exported no scaffolding would still pass the line above.
+          nm -D out/libtunlion_core.so | grep -q uniffi_tunlion_core_
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunlion-core-${{ matrix.target }}
+          path: out/libtunlion_core.so
+          if-no-files-found: error
+
+  # The Kotlin bindings, generated from the same metadata the .so carries so the
+  # two cannot drift. This machine is too small to run the bindgen tree; CI is
+  # where it happens.
+  bindings:
+    name: kotlin bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/tunlion-core/target
+          key: bindings-${{ hashFiles('crates/tunlion-core/Cargo.lock') }}
+          restore-keys: bindings-
+      # Both steps run INSIDE the crate. The repo has no root manifest, and
+      # uniffi-bindgen shells out to `cargo metadata` in its working directory.
+      # From the repo root that fails with "could not find Cargo.toml".
+      - name: Build the library for the host
+        working-directory: crates/tunlion-core
+        run: cargo build --release --lib
+      - name: Generate the Kotlin bindings
+        working-directory: crates/tunlion-core
+        run: |
+          cargo run --features cli --bin uniffi-bindgen -- \
+            generate --library target/release/libtunlion_core.so \
+            --language kotlin --out-dir kotlin
+          find kotlin -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunlion-core-kotlin
+          path: crates/tunlion-core/kotlin
+          if-no-files-found: error
+
   emulator:
     name: android emulator acceptance
     needs: build
