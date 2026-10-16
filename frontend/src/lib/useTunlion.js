@@ -1058,10 +1058,13 @@ export function useTunlion() {
     // people tap CREATE CODE. So: if the socket is known-dead, reconnect and
     // wait for it first; and if the mint gets no answer in 5s anyway (stale
     // 'connected' flag after a freeze), reconnect and retry ONCE.
+    // Relative to this call, not to the click. The retry below used to share
+    // t0, so a socket that took longer than 6s made the retry return at once.
     const waitUp = (ms) =>
       new Promise((res) => {
+        const start = Date.now()
         const iv = setInterval(() => {
-          if (connectedRef.current || Date.now() - t0 > ms) {
+          if (connectedRef.current || Date.now() - start > ms) {
             clearInterval(iv)
             res(connectedRef.current)
           }
@@ -1069,8 +1072,11 @@ export function useTunlion() {
       })
     if (!connectedRef.current) {
       tel('pair-create-wait-reconnect', {})
-      sig.reconnect?.()
-      if (!(await waitUp(6000))) {
+      // forceRecover drops a hung websocket onto polling. reconnect() alone
+      // retries the same transport and can sit there for the whole timeout.
+      if (sig.forceRecover) sig.forceRecover()
+      else sig.reconnect?.()
+      if (!(await waitUp(12000))) {
         tel('pair-create-blocked', { afterMs: Date.now() - t0 })
         telFlush()
         return null
@@ -1137,8 +1143,9 @@ export function useTunlion() {
           if (!retried) {
             retried = true
             tel('pair-create-retry', { afterMs: Date.now() - t0 })
-            sig.reconnect?.()
-            waitUp(6000).then(() => {
+            if (sig.forceRecover) sig.forceRecover()
+            else sig.reconnect?.()
+            waitUp(8000).then(() => {
               watchdog = arm()
               mintAndCreate()
             })

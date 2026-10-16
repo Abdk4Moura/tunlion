@@ -82,7 +82,24 @@ async function enterCode(p, code, mode = 'Receive a file') {
   await p.getByRole('button', { name: 'Connect', exact: true }).click();
 }
 async function createCode(p, mode = 'Receive a file') {
+  // A page that loaded onto a hung signaling websocket shows "offline" and a
+  // click then mints nothing. Give the client's polling fallback a moment, and
+  // reload once if it is still down. One reload is what a person would do.
+  const socketUp = async (ms) => {
+    const t = Date.now();
+    while (Date.now() - t < ms) {
+      if (!/offline, reconnecting/.test(await body(p))) return true;
+      await p.waitForTimeout(250);
+    }
+    return false;
+  };
   await p.getByRole('radio', { name: mode }).click();
+  if (!(await socketUp(8000))) {
+    say('page offline, reloading once');
+    await home(p);
+    await p.getByRole('radio', { name: mode }).click();
+    await socketUp(12000);
+  }
   // Codes already on the page (a sample, an older code) are not the answer:
   // wait for a code that was not there before the click.
   const before = new Set((await body(p)).match(new RegExp(CODE.source, 'g')) || []);

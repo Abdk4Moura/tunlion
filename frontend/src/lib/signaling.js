@@ -18,6 +18,7 @@
 
 import { io } from 'socket.io-client'
 import { API_BASE } from './api.js'
+import { SOCKET_TIMEOUT_MS, transportsAfterFailure } from './signalTransport.js'
 
 class Emitter {
   #handlers = {}
@@ -48,9 +49,21 @@ class SocketIOSignaling extends Emitter {
     // high RTT, e.g. a phone in Lagos to a US/EU origin). Trying `websocket`
     // first connects straight over WS; `polling` stays as the fallback so a
     // network that blocks WS still works (just slower there).
+    //
+    // A hung upgrade is the other failure. socket.io's default timeout is 20s,
+    // and each reconnect starts the transport list over, so a tunnel that holds
+    // the websocket leaves the page on "offline, reconnecting" for the whole
+    // wait (launch matrix pair1/B03, 2026-10-15: the page never minted a code).
+    // Bound that attempt, and after one failure lead with polling. Polling to
+    // the same API answers immediately; websocket can still upgrade later.
+    this._openedAt = Date.now()
+    this._connectErrors = 0
     this.socket = io(API_BASE || undefined, {
       autoConnect: true,
       transports: ['websocket', 'polling'],
+      timeout: SOCKET_TIMEOUT_MS,
+      reconnectionDelay: 400,
+      reconnectionDelayMax: 2000,
     })
     for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
@@ -60,10 +73,34 @@ class SocketIOSignaling extends Emitter {
     // disconnect, so without this we'd be connected but in no room. The server
     // re-emits `welcome`, which the hook treats as a fresh roster.
     this.socket.on('connect', () => {
+      this._connectErrors = 0
+      this._openedAt = Date.now()
       this._emit('status', { connected: true })
       if (this.room) this.socket.emit('join', { room: this.room, name: this.name, uid: this.uid })
     })
-    this.socket.on('disconnect', () => this._emit('status', { connected: false }))
+    this.socket.on('disconnect', () => {
+      this._openedAt = Date.now()
+      this._emit('status', { connected: false })
+    })
+    this.socket.on('connect_error', () => {
+      this._connectErrors += 1
+      this.#applyTransports()
+    })
+    // The timeout covers a hung attempt. This covers a socket that never
+    // errors and never connects (the attempt just sits). Same decision.
+    this._recoverTimer = setInterval(() => {
+      if (!this.socket.connected) this.#applyTransports(true)
+    }, 2000)
+  }
+  #applyTransports(nudge) {
+    const next = transportsAfterFailure(this.socket.io.opts.transports, {
+      attempts: this._connectErrors,
+      downMs: Date.now() - this._openedAt,
+    })
+    const leadChanged = next[0] !== this.socket.io.opts.transports[0]
+    this.socket.io.opts.transports = next
+    if (leadChanged && this.socket.io.engine) this.socket.io.engine.close()
+    if (nudge && !this.socket.connected) this.socket.connect()
   }
   join(room, name, uid) {
     this.room = room
@@ -76,7 +113,13 @@ class SocketIOSignaling extends Emitter {
   }
   leave() {
     this.room = null
+    clearInterval(this._recoverTimer)
     this.socket.emit('leave', {})
+  }
+  // Drop a hung websocket and try polling. Called when a click needs the
+  // socket and it is known-down (create-code on a page that loaded offline).
+  forceRecover() {
+    this.#applyTransports(true)
   }
   // One-time pairing (#11): mint a speakable single-use code / claim one.
   pairCreate(keyword) {
