@@ -1,6 +1,8 @@
 package com.tunlion.android
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.*
@@ -26,6 +28,8 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @Composable
 fun TunlionTheme(content: @Composable () -> Unit) {
@@ -46,7 +50,7 @@ fun TunlionTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = scheme, content = content)
 }
 
-private enum class Screen { HOME, PAIR, FILES, SETTINGS, DEVICE, SETUP, RECOVERY }
+private enum class Screen { HOME, PAIR, FILES, SETTINGS, DEVICE, SEND, SETUP, RECOVERY }
 
 @Composable
 fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
@@ -55,7 +59,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     var status by remember { mutableStateOf(core.status()) }
     var busy by remember { mutableStateOf(false) }
     var notice by remember { mutableStateOf<String?>(null) }
-    var selectedDevice by remember { mutableStateOf<CoreDevice?>(null) }
+    var selectedDevice by rememberSaveable { mutableStateOf<CoreDevice?>(null) }
     var recoveryWords by remember { mutableStateOf<String?>(null) }
     var loadFailed by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -126,6 +130,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                     Screen.FILES -> "Files"
                     Screen.SETTINGS -> "Settings"
                     Screen.DEVICE -> selectedDevice?.name ?: "Device"
+                    Screen.SEND -> "Send a file"
                     Screen.SETUP -> "Set up this phone"
                     Screen.RECOVERY -> "Recovery words"
                     else -> "Tunlion"
@@ -231,11 +236,12 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                         }
                         Screen.FILES -> FilesScreen(status, busy, onReceive = { code -> perform({ core.receiveCode(code) }) },
                             onConnect = { navigate(Screen.PAIR) }, onPickDevice = { device ->
-                                selectedDevice = device; navigate(Screen.DEVICE)
+                                selectedDevice = device; navigate(Screen.SEND)
                             })
                         Screen.DEVICE -> selectedDevice?.let { device ->
-                            DeviceDetails(device, onSend = { navigate(Screen.FILES) })
+                            DeviceDetails(device, onSend = { navigate(Screen.SEND) })
                         }
+                        Screen.SEND -> selectedDevice?.let { device -> SendScreen(device) }
                         Screen.SETTINGS -> {
                             Eyebrow("THIS PHONE")
                             DetailRow("Name", status.deviceName ?: android.os.Build.MODEL)
@@ -402,6 +408,45 @@ private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
     if (device.route == "relayed") SecondaryText("On relay, not a direct link. Still end-to-end encrypted.")
     if (device.canSendFiles) PrimaryButton("Send a file", onClick = onSend)
     if (device.canOpenShell) SecondaryText("Shell access granted. The terminal is not connected in this preview.")
+}
+
+@Composable
+private fun SendScreen(device: CoreDevice) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    var names by remember { mutableStateOf<List<String>>(emptyList()) }
+    var reading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) scope.launch {
+            reading = true
+            error = null
+            try {
+                names = withContext(Dispatchers.IO) {
+                    uris.map { uri ->
+                        context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                            if (cursor.moveToFirst()) cursor.getString(0) else "Selected file"
+                        } ?: "Selected file"
+                    }
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { error = "Could not read the selected files. Choose them again." }
+            finally { reading = false }
+        }
+    }
+    Title("Send to ${device.name}", "Choose files with Android's file picker. They stay on this phone until you send them.")
+    if (names.isNotEmpty()) {
+        Eyebrow("SELECTED FILES · ${names.size}")
+        names.forEach { name ->
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.InsertDriveFile, null)
+                Text(name, modifier = Modifier.weight(1f))
+            }
+        }
+    }
+    PrimaryButton(if (names.isEmpty()) "Choose files" else "Choose different files", reading) { picker.launch(arrayOf("*/*")) }
+    error?.let { SecondaryText(it) }
+    SecondaryText("File sending is not connected in this preview yet. Selecting a file does not upload or send it.")
 }
 
 @Composable private fun Step(number: String, title: String, detail: String) {

@@ -33,7 +33,7 @@ data class CoreDevice(
     val plainLine: String,
     val canSendFiles: Boolean,
     val canOpenShell: Boolean,
-)
+) : java.io.Serializable
 
 sealed interface CoreResult {
     data object Success : CoreResult
