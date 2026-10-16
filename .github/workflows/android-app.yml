@@ -1,0 +1,104 @@
+name: Android app
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "android/**"
+      - "cli/**"
+      - "crates/**"
+      - ".github/workflows/android-app.yml"
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "cli/**"
+      - "crates/**"
+      - ".github/workflows/android-app.yml"
+
+concurrency:
+  group: android-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+          - target: x86_64-linux-android
+            abi: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: app-cli-${{ matrix.target }}-${{ hashFiles('cli/Cargo.lock') }}
+      - run: |
+          rustup target add ${{ matrix.target }}
+          cargo install cargo-ndk --locked --version 4.1.2
+      - name: Build the CLI from this app revision
+        working-directory: cli
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --bin tunlion
+          mkdir -p ../android-cli
+          cp target/${{ matrix.target }}/release/tunlion ../android-cli/libtunlion_cli.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-cli-${{ matrix.abi }}
+          path: android-cli/libtunlion_cli.so
+  build:
+    needs: cli
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-cli-arm64-v8a
+          path: android/app/src/main/jniLibs/arm64-v8a
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-cli-x86_64
+          path: android/app/src/main/jniLibs/x86_64
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+      - name: Reuse preview signing key
+        uses: actions/cache@v4
+        with:
+          path: android/.signing/preview.keystore
+          key: android-preview-signing-v2
+      - name: Prepare preview signing key
+        run: |
+          mkdir -p android/.signing
+          if [ ! -f android/.signing/preview.keystore ]; then
+            keytool -genkeypair -keystore android/.signing/preview.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+      - name: Build debug APK
+        working-directory: android
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunlion-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunlion-android-acceptance
+          path: android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          if-no-files-found: error
