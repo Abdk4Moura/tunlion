@@ -1,0 +1,21 @@
+# tunlion-core — the library the Android app calls. Slice 1 is identity in an
+# explicit config dir. The engine is not linked. See docs/android-ffi.md.
+[package]
+name = "tunlion-core"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+description = "tunlion as a library. Android is one caller, not the only one."
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+filament-id = { path = "../filament-id", version = "0.1.2" }
+secret-write = { path = "../secret-write", version = "0.1.3" }
+
+[dev-dependencies]
+tempfile = "3"
