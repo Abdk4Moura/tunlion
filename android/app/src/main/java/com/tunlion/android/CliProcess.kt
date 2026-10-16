@@ -9,7 +9,8 @@ import java.util.concurrent.TimeUnit
 internal class CliPaths(context: Context) {
     val root = File(context.filesDir, "tunlion").apply { mkdirs(); android.system.Os.chmod(absolutePath, 448) }
     // Preserve an identity created by an earlier preview rather than replacing it.
-    val config: File get() = if (File(root, "identity.ed25519").exists() || File(root, "device-cert.json").exists()) root else File(root, "state")
+    // An owner holds identity.ed25519; a joined device holds identity/device-cert.json.
+    val config: File get() = if (File(root, "identity.ed25519").exists() || File(root, "identity/device-cert.json").exists()) root else File(root, "state")
     val inbox = File(context.filesDir, "inbox").apply { mkdirs() }
     val binary = File(context.applicationInfo.nativeLibraryDir, "libtunlion_cli.so")
     val home = context.filesDir
