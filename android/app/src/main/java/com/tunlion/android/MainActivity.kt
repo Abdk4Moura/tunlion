@@ -88,7 +88,11 @@ class MainActivity : ComponentActivity() {
                     if (enabled && resumed) shake.start()
                 }, onFeedback = { openFeedback() })
             feedbackImage?.let { image ->
-                MaterialTheme {
+                val dark = androidx.compose.foundation.isSystemInDarkTheme()
+                MaterialTheme(colorScheme = if (dark) darkColorScheme(primary = DarkAccent,
+                    surface = DarkBg, onSurface = DarkInk, onSurfaceVariant = DarkSub, outline = DarkRule)
+                    else lightColorScheme(primary = Accent, surface = Paper, onSurface = Ink,
+                        onSurfaceVariant = Sub, outline = Rule)) {
                     FeedbackEditor(image, onDismiss = { feedbackImage = null },
                         onShare = { crop, comment -> shareFeedback(this, crop, comment) })
                 }
@@ -193,6 +197,10 @@ private fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
             ) {
                 AppHeader(colors, selectedTab, onHome = { selectedTab = Tab.DEVICES },
                     onFiles = { selectedTab = Tab.FILES }, onSettings = { selectedTab = Tab.SETTINGS })
+                notice?.let { message ->
+                    NoticeCard(message, colors)
+                    TextButton(onClick = { notice = null }) { Text("Dismiss", color = colors.sub) }
+                }
                 when (selectedTab) {
                     Tab.DEVICES -> HomeScreen(
                         colors = colors,
@@ -244,10 +252,6 @@ private fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                         },
                     )
                     Tab.SETTINGS -> SettingsScreen(colors, status, feedbackEnabled, onFeedbackEnabled, onFeedback)
-                }
-                notice?.let { message ->
-                    Spacer(Modifier.height(16.dp))
-                    NoticeCard(message, colors)
                 }
             }
         }
