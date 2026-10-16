@@ -101,9 +101,12 @@ jobs:
           key: android-core-${{ matrix.target }}-${{ hashFiles('crates/tunlion-core/Cargo.lock') }}
           restore-keys: android-core-${{ matrix.target }}-
       - name: Build the library
+        working-directory: crates/tunlion-core
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          cargo ndk --platform 26 -t ${{ matrix.abi }} --manifest-path crates/tunlion-core/Cargo.toml build --release --locked --lib
+          # cargo-ndk looks for Cargo.toml in the working directory. This repo
+          # has no root manifest, so the job has to start inside the crate.
+          cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --lib
       - name: Stage
         run: |
           mkdir -p out
