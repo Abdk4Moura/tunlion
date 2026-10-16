@@ -17,6 +17,7 @@ interface TunlionCore {
 }
 
 data class CoreStatus(
+    val identityLoaded: Boolean = false,
     val deviceName: String? = null,
     val fingerprint: String? = null,
     val engineRunning: Boolean = false,

@@ -24,6 +24,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 
 @Composable
 fun TunlionTheme(content: @Composable () -> Unit) {
@@ -55,6 +57,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     var notice by remember { mutableStateOf<String?>(null) }
     var selectedDevice by remember { mutableStateOf<CoreDevice?>(null) }
     var recoveryWords by remember { mutableStateOf<String?>(null) }
+    var loadFailed by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val colors = MaterialTheme.colorScheme
 
@@ -68,7 +71,11 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     }
     LaunchedEffect(core) {
         try { status = core.refresh() }
-        catch (error: Exception) { notice = "Could not load this phone's identity. Nothing was changed." }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: Exception) {
+            loadFailed = true
+            notice = "Could not load this phone's identity. Nothing was changed."
+        }
     }
     val activity = androidx.compose.ui.platform.LocalContext.current as? android.app.Activity
     DisposableEffect(screen == Screen.RECOVERY) {
@@ -89,6 +96,10 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                     CoreResult.Success -> { status = core.refresh(); success() }
                     is CoreResult.Failure -> notice = result.message
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                notice = "That action could not finish. Your existing devices have not been changed."
             } finally { busy = false }
         }
     }
@@ -135,14 +146,34 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
             }
             AnimatedContent(targetState = screen, modifier = Modifier.weight(1f),
                 transitionSpec = {
-                    (fadeIn(tween(180)) + slideInHorizontally(tween(220)) { it / 14 }) togetherWith
-                        (fadeOut(tween(100)) + slideOutHorizontally(tween(180)) { -it / 20 })
+                    val direction = if (targetState == Screen.HOME) -1 else 1
+                    (fadeIn(tween(180)) + slideInHorizontally(tween(220)) { direction * it / 14 }) togetherWith
+                        (fadeOut(tween(100)) + slideOutHorizontally(tween(180)) { -direction * it / 20 })
                 }, label = "screen") { destination ->
                 Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp).padding(top = 24.dp, bottom = 32.dp),
                     verticalArrangement = Arrangement.spacedBy(24.dp)) {
                     when (destination) {
                         Screen.HOME -> {
+                            if (!status.identityLoaded) {
+                                if (loadFailed) {
+                                    SecondaryText("Your identity could not be opened. You can retry without replacing it.")
+                                    PrimaryButton("Try again", busy) {
+                                        scope.launch {
+                                            busy = true
+                                            try { status = core.refresh(); loadFailed = false; notice = null }
+                                            catch (_: Exception) { notice = "Could not open the identity. Nothing was changed." }
+                                            finally { busy = false }
+                                        }
+                                    }
+                                } else if (delayedBusy(true)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                                        SecondaryText("Opening this phone…")
+                                    }
+                                }
+                            } else {
                             Availability(status, busy, onChange = { turnOn ->
                                 if (status.fingerprint == null && turnOn) navigate(Screen.SETUP)
                                 else perform({ if (turnOn) core.start() else core.stop() })
@@ -159,11 +190,12 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                     SecondaryText("Open Tunlion on your other device and enter its code here.")
                                 }
                                 status.devices.forEach { device ->
-                                    DeviceRow(device) { selectedDevice = device; navigate(Screen.DEVICE) }
+                                    key(device.id) { DeviceRow(device) { selectedDevice = device; navigate(Screen.DEVICE) } }
                                 }
                             }
                             HorizontalDivider(color = colors.outline)
                             ActionRow(Icons.Outlined.FolderOpen, "Files", "Send a file or receive with a code") { navigate(Screen.FILES) }
+                            }
                         }
                         Screen.PAIR -> PairScreen(busy, onJoin = { code, remember ->
                             perform({ core.joinCode(code, remember) }) { navigate(Screen.HOME) }
@@ -341,13 +373,31 @@ private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -
 
 @Composable
 private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
-    ActionRow(Icons.Outlined.Computer, device.name,
-        if (!device.online) "Offline" else if (device.route == "relayed") "Online · relayed" else if (device.route == "direct") "Online · direct" else "Online", onClick)
+    val colors = MaterialTheme.colorScheme
+    Row(Modifier.fillMaxWidth().clipForRow().clickable(onClick = onClick).padding(vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Box(Modifier.size(8.dp).background(if (device.online) Color(0xFF137738) else colors.onSurfaceVariant,
+            androidx.compose.foundation.shape.CircleShape))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(device.name, fontWeight = FontWeight.Medium,
+                color = if (device.online) colors.onBackground else colors.onSurfaceVariant)
+            SecondaryText(if (device.online) "Online" else "Offline")
+        }
+        if (device.online && device.route != null) {
+            Text(if (device.route == "relayed") "RELAYED" else if (device.route == "direct") "DIRECT" else "",
+                fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                color = if (device.route == "relayed") {
+                    if (isSystemInDarkTheme()) Color(0xFFFFC857) else Color(0xFF9A6B00)
+                } else colors.onSurfaceVariant)
+        }
+        Icon(Icons.Outlined.ChevronRight, null, tint = colors.onSurfaceVariant)
+    }
 }
 
 @Composable
 private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
-    Title(device.name, if (device.online) "Online" else "Offline")
+    SecondaryText(if (device.online) "Online" else "Offline")
+    Eyebrow("ACCESS")
     SecondaryText(device.plainLine)
     if (device.route == "relayed") SecondaryText("On relay, not a direct link. Still end-to-end encrypted.")
     if (device.canSendFiles) PrimaryButton("Send a file", onClick = onSend)
@@ -403,14 +453,24 @@ private fun Modifier.clipForRow() = this.then(Modifier.background(Color.Transpar
 
 @Composable private fun PrimaryButton(text: String, busy: Boolean = false, enabled: Boolean = true, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
+    val showProgress = delayedBusy(busy)
     Button(onClick, enabled = enabled && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
         shape = RoundedCornerShape(7.dp), colors = ButtonDefaults.buttonColors(containerColor = colors.onBackground, contentColor = colors.background)) {
-        if (busy) {
+        if (showProgress) {
             CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = colors.onSurfaceVariant)
             Spacer(Modifier.width(9.dp))
         }
-        Text(if (busy) "Please wait…" else text, fontWeight = FontWeight.SemiBold)
+        Text(if (showProgress) "Please wait…" else text, fontWeight = FontWeight.SemiBold)
     }
+}
+
+@Composable private fun delayedBusy(busy: Boolean): Boolean {
+    var show by remember { mutableStateOf(false) }
+    LaunchedEffect(busy) {
+        show = false
+        if (busy) { delay(300); show = true }
+    }
+    return busy && show
 }
 
 @Composable private fun tunlionSwitchColors() = SwitchDefaults.colors(

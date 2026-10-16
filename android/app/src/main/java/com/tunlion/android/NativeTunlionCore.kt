@@ -18,7 +18,7 @@ class NativeTunlionCore(context: Context) : TunlionCore {
     override fun status() = cached
     override suspend fun refresh(): CoreStatus = withContext(Dispatchers.IO) {
         val native = session().status()
-        cached = cached.copy(fingerprint = native.fingerprint)
+        cached = cached.copy(fingerprint = native.fingerprint, identityLoaded = true)
         cached
     }
 
