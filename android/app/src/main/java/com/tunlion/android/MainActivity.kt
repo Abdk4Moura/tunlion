@@ -19,7 +19,7 @@ class MainActivity : ComponentActivity() {
         feedbackEnabled = getPreferences(MODE_PRIVATE).getBoolean("shake_feedback", true)
         shake = FeedbackShake(this) { openFeedback() }
         setContent {
-            val core = remember { NativeTunlionCore(this) }
+            val core = remember { CliTunlionCore(this.applicationContext) }
             TunlionTheme {
                 TunlionApp(core, feedbackEnabled,
                     onFeedbackEnabled = { enabled ->

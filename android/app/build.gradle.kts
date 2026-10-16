@@ -7,7 +7,6 @@ plugins {
 android {
     namespace = "com.tunlion.android"
     compileSdk = 35
-    sourceSets["main"].java.srcDir("build/generated/uniffi")
     signingConfigs.getByName("debug") {
         storeFile = rootProject.file(".signing/preview.keystore")
         storePassword = "android"
@@ -15,6 +14,8 @@ android {
         keyPassword = "android"
     }
     defaultConfig.ndk.abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
+    packaging.jniLibs.useLegacyPackaging = true
+    packaging.jniLibs.keepDebugSymbols.add("**/libtunlion_cli.so")
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -39,8 +40,11 @@ android {
 }
 
 dependencies {
-    implementation("net.java.dev.jna:jna:5.17.0@aar")
+    implementation("androidx.navigation:navigation-compose:2.9.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("androidx.documentfile:documentfile:1.0.1")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     implementation(platform("androidx.compose:compose-bom:2025.04.01"))
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.compose.material3:material3")

@@ -16,16 +16,38 @@ code entry is a dedicated task, Files is contextual, and Settings lives in the
 header. There is no bottom navigation bar. Screen changes use short slide/fade
 transitions and in-flight actions prevent repeated submission.
 
-`TunlionCore` is the app boundary. `NativeTunlionCore` uses generated UniFFI
-bindings for real identity preparation, confirmation, and loading. Recovery
-words stay in memory until confirmed, and screenshot capture is blocked during
-recovery setup. The peer loop is not linked yet: connection and file operations
-refuse with an explanation and never show demo peers or simulated success.
+Navigation uses Jetpack's `NavHost`, with Android predictive back enabled. Back
+gestures seek the destination transition before release; cancelling keeps the
+current destination and its form state. Back returns to the previous task,
+including Files or setup, rather than always jumping home. Recovery words and
+capture protection remain active until the recovery destination is disposed
+after a committed pop, not when a gesture merely starts.
 
-The app workflow pins native source and libraries from the same PR 467 commit
-(`0a5a0b0`) while that prerequisite is reviewed. Kotlin is generated in CI from
-the matching library metadata. Local builds need those generated bindings in
-`app/build/generated/uniffi` and the native libraries in `app/src/main/jniLibs`.
+`TunlionCore` is the app boundary. The temporary `CliTunlionCore` backend drives
+the real Rust CLI for all operations. There is no FFI dependency in this preview.
+The workflow builds the ARM64 and x86_64 CLI from the same revision as the app,
+packages it as `libtunlion_cli.so`, and enables Android native-library extraction
+so the signed executable can run from `nativeLibraryDir`. Local builds require
+the same ABI binaries under `app/src/main/jniLibs/` and a standard Android debug
+keystore under `.signing/preview.keystore`.
+
+- Commands use argument arrays, private explicit config paths, structured JSON
+  and exit codes. Stdout and stderr are drained separately without logging
+  invitation material or codes. Cancellation terminates and reaps the child.
+- CLI identity setup happens in a private draft directory. Confirmation promotes
+  the complete state directory; cancelling discards it. Capture is blocked while
+  recovery words are visible. Existing identities and pairings are never replaced.
+- Availability owns an attached `up --userspace` child in a foreground service,
+  with bounded restart backoff. Off waits for shutdown and removes its notification.
+- User-started pair/transfer operations have a foreground service while the app
+  is backgrounded. UI snapshots are polled only while the Activity is started.
+- Invitations are copied into owner-only private files and passed by path, never
+  as invitation bytes in argv. Picker content is staged privately for sending.
+- Verified receive history drives publication into `Download/Tunlion` through
+  MediaStore on Android 10+, with an export journal to avoid duplicate saves.
+  Android 8/9 uses a user-selected SAF folder. No storage permission is requested.
+- The UI reports verified completion only from CLI outcomes/history. Unknown
+  peer presence and routes are left unknown, not invented from stored names.
 
 ## Preview feedback
 

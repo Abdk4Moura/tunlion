@@ -25,6 +25,13 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
@@ -55,7 +62,8 @@ private enum class Screen { HOME, PAIR, FILES, SETTINGS, DEVICE, SEND, SETUP, RE
 @Composable
 fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     onFeedbackEnabled: (Boolean) -> Unit, onFeedback: () -> Unit, onSensitiveScreen: (Boolean) -> Unit) {
-    var screen by rememberSaveable { mutableStateOf(Screen.HOME) }
+    val navigation = rememberNavController()
+    val currentEntry by navigation.currentBackStackEntryAsState()
     var status by remember { mutableStateOf(core.status()) }
     var busy by remember { mutableStateOf(false) }
     var notice by remember { mutableStateOf<String?>(null) }
@@ -64,41 +72,48 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     var loadFailed by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val colors = MaterialTheme.colorScheme
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var operation by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    fun requestNotifications() {
+        if (android.os.Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(context,
+                android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+    }
+    LaunchedEffect(currentEntry?.id) { notice = null }
 
     fun navigate(to: Screen) {
-        if (screen == Screen.RECOVERY && to != Screen.RECOVERY) {
-            core.discardIdentity()
-            recoveryWords = null
+        if (to == Screen.HOME) {
+            navigation.popBackStack(Screen.HOME.name, inclusive = false)
+        } else {
+            navigation.navigate(to.name) { launchSingleTop = true }
         }
-        screen = to
         notice = null
     }
-    LaunchedEffect(core) {
-        try { status = core.refresh() }
-        catch (cancelled: CancellationException) { throw cancelled }
-        catch (error: Exception) {
-            loadFailed = true
-            notice = "Could not load this phone's identity. Nothing was changed."
+    LaunchedEffect(core, lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                if (!busy) try { status = core.refresh(); loadFailed = false }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    loadFailed = true
+                    notice = "Could not read Tunlion's state. Your identity has not been changed."
+                }
+                delay(2_000)
+            }
         }
     }
     val activity = androidx.compose.ui.platform.LocalContext.current as? android.app.Activity
-    DisposableEffect(screen == Screen.RECOVERY) {
-        onSensitiveScreen(screen == Screen.RECOVERY)
-        if (screen == Screen.RECOVERY) activity?.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
-        onDispose {
-            onSensitiveScreen(false)
-            activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
-        }
-    }
     fun perform(action: suspend () -> CoreResult, success: () -> Unit = {}) {
         if (busy) return
         busy = true
         notice = null
-        scope.launch {
+        operation = scope.launch {
             try {
                 when (val result = action()) {
                     CoreResult.Success -> { status = core.refresh(); success() }
-                    is CoreResult.Failure -> notice = result.message
+                    is CoreResult.Failure -> { status = core.refresh(); notice = result.message }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -108,12 +123,34 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
         }
     }
 
-    BackHandler(enabled = screen != Screen.HOME && !busy) { navigate(Screen.HOME) }
+    // NavHost owns gesture progress, cancellation, state restoration and the
+    // actual back stack. Animate the whole destination, including its header.
+    NavHost(navigation, startDestination = Screen.HOME.name, modifier = Modifier.fillMaxSize(),
+        enterTransition = { slideInHorizontally(tween(220)) { it } },
+        exitTransition = { slideOutHorizontally(tween(220)) { -it / 4 } },
+        popEnterTransition = { slideInHorizontally(tween(220)) { -it / 4 } },
+        popExitTransition = { slideOutHorizontally(tween(220)) { it } }) {
+    Screen.entries.forEach { destination ->
+    composable(destination.name) {
+    if (destination == Screen.RECOVERY) {
+        // Keep protection and the pending identity until this destination is
+        // actually disposed. A cancelled back gesture must not discard either.
+        DisposableEffect(Unit) {
+            onSensitiveScreen(true)
+            activity?.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+            onDispose {
+                core.discardIdentity()
+                recoveryWords = null
+                onSensitiveScreen(false)
+                activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        }
+    }
     Scaffold(containerColor = colors.background, topBar = {
         Column {
         Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars)
             .padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (screen == Screen.HOME) {
+            if (destination == Screen.HOME) {
                 TunlionMark(Modifier.size(25.dp))
                 Spacer(Modifier.width(9.dp))
                 Text("tunlion", fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
@@ -122,10 +159,10 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                     Icon(Icons.Outlined.Settings, "Settings")
                 }
             } else {
-                IconButton(onClick = { if (!busy) navigate(Screen.HOME) }, enabled = !busy) {
-                    Icon(Icons.Outlined.ArrowBack, "Back to devices")
+                IconButton(onClick = { if (!busy) { notice = null; navigation.popBackStack() } }, enabled = !busy) {
+                    Icon(Icons.Outlined.ArrowBack, "Back")
                 }
-                Text(when (screen) {
+                Text(when (destination) {
                     Screen.PAIR -> "Connect a device"
                     Screen.FILES -> "Files"
                     Screen.SETTINGS -> "Settings"
@@ -149,13 +186,11 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                     IconButton(onClick = { notice = null }) { Icon(Icons.Outlined.Close, "Dismiss message") }
                 }
             }
-            AnimatedContent(targetState = screen, modifier = Modifier.weight(1f),
-                transitionSpec = {
-                    val direction = if (targetState == Screen.HOME) -1 else 1
-                    (fadeIn(tween(180)) + slideInHorizontally(tween(220)) { direction * it / 14 }) togetherWith
-                        (fadeOut(tween(100)) + slideOutHorizontally(tween(180)) { -direction * it / 20 })
-                }, label = "screen") { destination ->
-                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+            if (busy && operation?.isActive == true) TextButton(onClick = {
+                operation?.cancel()
+                notice = "Cancelled."
+            }) { Text("Cancel action") }
+                Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp).padding(top = 24.dp, bottom = 32.dp),
                     verticalArrangement = Arrangement.spacedBy(24.dp)) {
                     when (destination) {
@@ -180,9 +215,10 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                 }
                             } else {
                             Availability(status, busy, onChange = { turnOn ->
-                                if (status.fingerprint == null && turnOn) navigate(Screen.SETUP)
-                                else perform({ if (turnOn) core.start() else core.stop() })
+                                if (status.fingerprint == null && status.devices.isEmpty() && turnOn) navigate(Screen.SETUP)
+                                else { if (turnOn) requestNotifications(); perform({ if (turnOn) core.start() else core.stop() }) }
                             })
+                            status.engineError?.let { SecondaryText(it) }
                             if (status.fingerprint == null && status.devices.isEmpty()) {
                                 FirstConnection(onJoin = { navigate(Screen.PAIR) }, onSetup = { navigate(Screen.SETUP) })
                             } else {
@@ -203,7 +239,11 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                             }
                         }
                         Screen.PAIR -> PairScreen(busy, onJoin = { code, remember ->
+                            requestNotifications()
                             perform({ core.joinCode(code, remember) }) { navigate(Screen.HOME) }
+                        }, onInvitation = { bytes ->
+                            requestNotifications()
+                            perform({ core.joinInvitation(bytes) }) { navigate(Screen.HOME) }
                         })
                         Screen.SETUP -> {
                             Title("Make this phone yours.", "Your identity lives on this phone. No account or sign-in.")
@@ -214,7 +254,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                     busy = true
                                     try {
                                         recoveryWords = core.prepareIdentity()
-                                        screen = Screen.RECOVERY
+                                        navigate(Screen.RECOVERY)
                                     } catch (error: Exception) {
                                         core.discardIdentity()
                                         notice = "Could not prepare an identity. Nothing has been saved."
@@ -234,18 +274,23 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                 perform({ core.confirmIdentity(phrase) }) { navigate(Screen.HOME) }
                             }
                         }
-                        Screen.FILES -> FilesScreen(status, busy, onReceive = { code -> perform({ core.receiveCode(code) }) },
+                        Screen.FILES -> FilesScreen(status, busy, onReceive = { code -> requestNotifications(); perform({ core.receiveCode(code) }) },
+                            onMakeCode = { selectedDevice = null; navigate(Screen.SEND) },
                             onConnect = { navigate(Screen.PAIR) }, onPickDevice = { device ->
                                 selectedDevice = device; navigate(Screen.SEND)
                             })
                         Screen.DEVICE -> selectedDevice?.let { device ->
                             DeviceDetails(device, onSend = { navigate(Screen.SEND) })
                         }
-                        Screen.SEND -> selectedDevice?.let { device -> SendScreen(device) }
+                        Screen.SEND -> SendScreen(selectedDevice, busy) { files, onCode ->
+                            requestNotifications()
+                            perform({ core.sendFiles(selectedDevice?.id, files, onCode) }) { navigate(Screen.FILES) }
+                        }
                         Screen.SETTINGS -> {
                             Eyebrow("THIS PHONE")
                             DetailRow("Name", status.deviceName ?: android.os.Build.MODEL)
                             DetailRow("Identity", status.fingerprint ?: "Not set up")
+                            if (android.os.Build.VERSION.SDK_INT < 29) ReceiveFolderSetting()
                             HorizontalDivider(color = colors.outline)
                             Eyebrow("EXPERIMENTAL")
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -261,13 +306,18 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                             HorizontalDivider(color = colors.outline)
                             Eyebrow("ABOUT")
                             SecondaryText("Tunlion for Android · Preview\nNo account. Your devices, your permissions.")
-                            SecondaryText(if (status.engineLinked) "Core connected" else "Connection engine is still being connected to this preview.")
+                            SecondaryText(if (status.engineLinked) "Backend: Android CLI (temporary)" else "Packaged Android CLI is missing.")
                         }
                     }
                 }
-            }
         }
     }
+    }
+    }
+    }
+    // Block back only while an operation owns the destination. Otherwise the
+    // NavHost's predictive handler, or Android's root back-to-home, handles it.
+    BackHandler(enabled = busy) { }
 }
 
 @Composable
@@ -280,8 +330,9 @@ private fun Availability(status: CoreStatus, busy: Boolean, onChange: (Boolean) 
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(status.deviceName ?: android.os.Build.MODEL, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
-            AnimatedContent(status.engineRunning, label = "availability") { running ->
-                Text(if (running) "Available" else "Off", color = if (running) colors.primary else colors.onSurfaceVariant,
+            val label = if (busy) { if (status.engineRunning) "Stopping…" else "Starting…" } else if (status.engineRunning) "Available" else "Off"
+            AnimatedContent(label, label = "availability") { text ->
+                Text(text, color = if (status.engineRunning) colors.primary else colors.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium)
             }
         }
@@ -304,26 +355,36 @@ private fun FirstConnection(onJoin: () -> Unit, onSetup: () -> Unit) {
 }
 
 @Composable
-private fun PairScreen(busy: Boolean, onJoin: (String, Boolean) -> Unit) {
+private fun PairScreen(busy: Boolean, onJoin: (String, Boolean) -> Unit, onInvitation: (ByteArray) -> Unit) {
     var code by rememberSaveable { mutableStateOf("") }
-    var remember by rememberSaveable { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    var error by remember { mutableStateOf<String?>(null) }
+    val invitation = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            try {
+                val bytes = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        val bytes = ByteArray(65537)
+                        var size = 0
+                        while (size < bytes.size) { val n = input.read(bytes, size, bytes.size - size); if (n < 0) break; size += n }
+                        bytes.copyOf(size)
+                    } ?: error("Unreadable invitation")
+                }
+                if (bytes.size > 65536) error = "That invitation file is too large." else onInvitation(bytes)
+            } catch (_: Exception) { error = "Could not read that invitation file." }
+        }
+    }
     Title("Enter the code\nfrom your other device.", "Open Tunlion there and choose to add a device. Keep both devices open while they connect.")
     OutlinedTextField(code, { code = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
         label = { Text("Device code") }, placeholder = { Text("brave-otter-3141") },
         textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
         shape = RoundedCornerShape(7.dp), enabled = !busy,
         keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(autoCorrectEnabled = false))
-    Row(Modifier.fillMaxWidth().toggleableForRemember(remember, !busy) { remember = it },
-        verticalAlignment = Alignment.CenterVertically) {
-        Checkbox(remember, null)
-        Spacer(Modifier.width(10.dp))
-        Column {
-            Text("Remember this device", fontWeight = FontWeight.Medium)
-            SecondaryText("Reconnect next time without a code.")
-        }
-    }
-    PrimaryButton("Connect device", busy, enabled = code.isNotBlank(), onClick = { onJoin(code.trim(), remember) })
-    SecondaryText("You choose what each device may use. Connecting does not grant shell access.")
+    SecondaryText("Connecting remembers the device on both ends. It does not grant shell access.")
+    PrimaryButton("Connect device", busy, enabled = code.isNotBlank(), onClick = { onJoin(code.trim(), true) })
+    OutlinedButton(onClick = { invitation.launch(arrayOf("*/*")) }, enabled = !busy, shape = RoundedCornerShape(7.dp)) { Text("Open an invitation file") }
+    error?.let { SecondaryText(it) }
 }
 
 private fun Modifier.toggleableForRemember(checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) =
@@ -354,7 +415,7 @@ private fun RecoveryScreen(phrase: String, busy: Boolean, onConfirm: () -> Unit)
 }
 
 @Composable
-private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -> Unit,
+private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -> Unit, onMakeCode: () -> Unit,
     onConnect: () -> Unit, onPickDevice: (CoreDevice) -> Unit) {
     var receiveExpanded by rememberSaveable { mutableStateOf(false) }
     var code by rememberSaveable { mutableStateOf("") }
@@ -365,6 +426,7 @@ private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -
         SecondaryText("Connect another device to send your first file.")
         OutlinedButton(onClick = onConnect, shape = RoundedCornerShape(7.dp)) { Text("Connect a device") }
     } else recipients.forEach { device -> DeviceRow(device) { onPickDevice(device) } }
+    OutlinedButton(onClick = onMakeCode, enabled = !busy, shape = RoundedCornerShape(7.dp)) { Text("Send with a code") }
     HorizontalDivider(color = MaterialTheme.colorScheme.outline)
     ActionRow(Icons.Outlined.Download, "Receive with a code", "Someone shared a file with you") { receiveExpanded = !receiveExpanded }
     AnimatedVisibility(receiveExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
@@ -374,7 +436,39 @@ private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -
             PrimaryButton("Receive file", busy, code.isNotBlank()) { onReceive(code.trim()) }
         }
     }
-    SecondaryText("Saved to Download/Tunlion when receiving is connected in this preview.")
+    SecondaryText(if (android.os.Build.VERSION.SDK_INT >= 29) "Received files are saved to Download/Tunlion after verification." else "Choose a receiving folder in Settings. Files remain in the private inbox until a folder is chosen.")
+    if (status.transfers.isNotEmpty()) {
+        Eyebrow("RECENT FILES")
+        status.transfers.forEach { transfer ->
+            Column {
+                Text(transfer.name, fontWeight = FontWeight.Medium)
+                SecondaryText(if (!transfer.verified) "Not completed" else if (!transfer.incoming) "Sent · verified" else if (transfer.saved) "Received · saved" else "Received · verified · private inbox")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReceiveFolderSetting() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    var message by remember { mutableStateOf<String?>(null) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                check(androidx.documentfile.provider.DocumentFile.fromTreeUri(context, uri)?.canWrite() == true)
+                context.getSharedPreferences("received_files", android.content.Context.MODE_PRIVATE).edit().putString("folder", uri.toString()).apply()
+                scope.launch {
+                    try { withContext(Dispatchers.IO) { ReceivedFiles(context).publish() }; message = "Receiving folder saved." }
+                    catch (_: Exception) { message = "The folder is saved, but an inbox file could not be published yet." }
+                }
+            } catch (_: Exception) { message = "Choose a folder this app can write to." }
+        }
+    }
+    OutlinedButton(onClick = { picker.launch(null) }) { Text("Choose receiving folder") }
+    message?.let { SecondaryText(it) }
 }
 
 @Composable
@@ -382,14 +476,14 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Row(Modifier.fillMaxWidth().clipForRow().clickable(onClick = onClick).padding(vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        Box(Modifier.size(8.dp).background(if (device.online) Color(0xFF137738) else colors.onSurfaceVariant,
+        Box(Modifier.size(8.dp).background(if (device.online == true) Color(0xFF137738) else colors.onSurfaceVariant,
             androidx.compose.foundation.shape.CircleShape))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(device.name, fontWeight = FontWeight.Medium,
-                color = if (device.online) colors.onBackground else colors.onSurfaceVariant)
-            SecondaryText(if (device.online) "Online" else "Offline")
+                color = if (device.online == true) colors.onBackground else colors.onSurfaceVariant)
+            SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
         }
-        if (device.online && device.route != null) {
+        if (device.online == true && device.route != null) {
             Text(if (device.route == "relayed") "RELAYED" else if (device.route == "direct") "DIRECT" else "",
                 fontSize = 10.sp, fontFamily = FontFamily.Monospace,
                 color = if (device.route == "relayed") {
@@ -402,7 +496,7 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
 
 @Composable
 private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
-    SecondaryText(if (device.online) "Online" else "Offline")
+    SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
     Eyebrow("ACCESS")
     SecondaryText(device.plainLine)
     if (device.route == "relayed") SecondaryText("On relay, not a direct link. Still end-to-end encrypted.")
@@ -411,14 +505,17 @@ private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
 }
 
 @Composable
-private fun SendScreen(device: CoreDevice) {
+private fun SendScreen(device: CoreDevice?, busy: Boolean, onSend: (List<android.net.Uri>, (String) -> Unit) -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     var names by remember { mutableStateOf<List<String>>(emptyList()) }
+    var selected by remember { mutableStateOf<List<android.net.Uri>>(emptyList()) }
+    var sendCode by remember { mutableStateOf<String?>(null) }
     var reading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) scope.launch {
+            selected = uris
             reading = true
             error = null
             try {
@@ -434,7 +531,12 @@ private fun SendScreen(device: CoreDevice) {
             finally { reading = false }
         }
     }
-    Title("Send to ${device.name}", "Choose files with Android's file picker. They stay on this phone until you send them.")
+    Title(if (device == null) "Send with a code" else "Send to ${device.name}", "Choose files with Android's file picker. They stay on this phone until you send them.")
+    sendCode?.let { code ->
+        Eyebrow("YOUR FILE CODE")
+        Text(code, fontFamily = FontFamily.Monospace, fontSize = 22.sp)
+        SecondaryText("Enter this code on the receiving device. Waiting for it to connect…")
+    }
     if (names.isNotEmpty()) {
         Eyebrow("SELECTED FILES · ${names.size}")
         names.forEach { name ->
@@ -444,9 +546,11 @@ private fun SendScreen(device: CoreDevice) {
             }
         }
     }
-    PrimaryButton(if (names.isEmpty()) "Choose files" else "Choose different files", reading) { picker.launch(arrayOf("*/*")) }
+    OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !busy && !reading, shape = RoundedCornerShape(7.dp)) { Text(if (names.isEmpty()) "Choose files" else "Choose different files") }
+    PrimaryButton(if (device == null) "Make a file code" else "Send files", busy, selected.isNotEmpty() && !reading) {
+        onSend(selected) { sendCode = it }
+    }
     error?.let { SecondaryText(it) }
-    SecondaryText("File sending is not connected in this preview yet. Selecting a file does not upload or send it.")
 }
 
 @Composable private fun Step(number: String, title: String, detail: String) {
