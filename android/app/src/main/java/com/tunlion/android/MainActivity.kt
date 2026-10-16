@@ -2,6 +2,7 @@ package com.tunlion.android
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -12,12 +13,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -51,6 +49,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -80,7 +79,8 @@ class MainActivity : ComponentActivity() {
         feedbackEnabled = getPreferences(MODE_PRIVATE).getBoolean("shake_feedback", true)
         shake = FeedbackShake(this) { openFeedback() }
         setContent {
-            TunlionApp(UnlinkedTunlionCore(), feedbackEnabled,
+            val core = remember { UnlinkedTunlionCore() }
+            TunlionApp(core, feedbackEnabled,
                 onFeedbackEnabled = { enabled ->
                     feedbackEnabled = enabled
                     getPreferences(MODE_PRIVATE).edit().putBoolean("shake_feedback", enabled).apply()
@@ -170,20 +170,18 @@ private fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
             outline = colors.rule,
         )
     }
-    var selectedTab by remember { mutableStateOf(Tab.DEVICES) }
+    var selectedTab by rememberSaveable { mutableStateOf(Tab.DEVICES) }
     var available by remember { mutableStateOf(status.engineRunning) }
-    var pairCode by remember { mutableStateOf("") }
-    var rememberDevice by remember { mutableStateOf(false) }
-    var receiveCode by remember { mutableStateOf("") }
+    var pairCode by rememberSaveable { mutableStateOf("") }
+    var rememberDevice by rememberSaveable { mutableStateOf(false) }
+    var receiveCode by rememberSaveable { mutableStateOf("") }
     var notice by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     MaterialTheme(colorScheme = materialColors) {
+        BackHandler(enabled = selectedTab != Tab.DEVICES) { selectedTab = Tab.DEVICES }
         Scaffold(
             containerColor = colors.bg,
-            bottomBar = {
-                BottomBar(selectedTab, colors, onSelect = { selectedTab = it })
-            },
         ) { insets ->
             Column(
                 modifier = Modifier
@@ -193,7 +191,8 @@ private fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                     .padding(horizontal = 20.dp)
                     .padding(bottom = 28.dp),
             ) {
-                AppHeader(colors, status.deviceName)
+                AppHeader(colors, selectedTab, onHome = { selectedTab = Tab.DEVICES },
+                    onFiles = { selectedTab = Tab.FILES }, onSettings = { selectedTab = Tab.SETTINGS })
                 when (selectedTab) {
                     Tab.DEVICES -> HomeScreen(
                         colors = colors,
@@ -266,18 +265,26 @@ private data class AppColors(
 )
 
 @Composable
-private fun AppHeader(colors: AppColors, deviceName: String?) {
+private fun AppHeader(colors: AppColors, selected: Tab, onHome: () -> Unit,
+    onFiles: () -> Unit, onSettings: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        TunlionMark(colors, 26)
-        Spacer(Modifier.width(10.dp))
-        Column(Modifier.weight(1f)) {
+        Row(Modifier.weight(1f).clip(RoundedCornerShape(6.dp)).clickable(onClick = onHome)
+            .padding(vertical = 10.dp).semantics { contentDescription = "Tunlion home" },
+            verticalAlignment = Alignment.CenterVertically) {
+            TunlionMark(colors, 26)
+            Spacer(Modifier.width(9.dp))
             Text("tunlion", color = colors.ink, fontSize = 20.sp, letterSpacing = (-.5).sp,
                 fontWeight = FontWeight.SemiBold)
         }
-        Text("PREVIEW", color = colors.sub, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+        TextButton(onClick = if (selected == Tab.FILES) onHome else onFiles) {
+            Text(if (selected == Tab.FILES) "Devices" else "Files", color = colors.ink)
+        }
+        androidx.compose.material3.IconButton(onClick = onSettings) {
+            Icon(Icons.Outlined.Settings, contentDescription = "Settings", tint = colors.ink)
+        }
     }
 }
 
@@ -582,36 +589,6 @@ private fun TunlionMark(colors: AppColors, size: Int) {
             drawPath(arch, colors.ink, style = Stroke(width = if (size < 24) 16f else 10f))
             drawRect(colors.accent, topLeft = androidx.compose.ui.geometry.Offset(33f, 46f),
                 size = androidx.compose.ui.geometry.Size(14f, 28f))
-        }
-    }
-}
-
-@Composable
-private fun BottomBar(selected: Tab, colors: AppColors, onSelect: (Tab) -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().background(colors.surface)
-            .padding(bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding())
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.SpaceAround,
-    ) {
-        Tab.entries.forEach { tab ->
-            val active = selected == tab
-            val icon = when (tab) {
-                Tab.DEVICES -> Icons.Outlined.DevicesOther
-                Tab.FILES -> Icons.Outlined.FolderOpen
-                Tab.SETTINGS -> Icons.Outlined.Settings
-            }
-            Column(
-                Modifier.clip(RoundedCornerShape(8.dp)).clickable { onSelect(tab) }
-                    .padding(horizontal = 18.dp, vertical = 5.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(3.dp),
-            ) {
-                Icon(icon, contentDescription = tab.label, tint = if (active) colors.ink else colors.sub,
-                    modifier = Modifier.size(21.dp))
-                Text(tab.label, color = if (active) colors.ink else colors.sub, fontSize = 11.sp,
-                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal)
-            }
         }
     }
 }
