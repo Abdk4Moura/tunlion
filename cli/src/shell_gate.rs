@@ -118,17 +118,22 @@ pub(crate) fn gather_shell_gate_inputs(
 }
 
 /// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
-/// identity is Proven and whose local name came from that proven key.
+/// identity is Proven and whose local name came from that proven key. The RULE
+/// itself now lives in `filament-peerloop` (written once, shared with the peer
+/// loop); this is the enum-shaped wrapper so the callers and tests here keep
+/// their signatures.
 pub(crate) fn fleet_link_proven(
     kind: &crate::capability::PrincipalKind,
     binding: BindingStrength,
     has_device_pub: bool,
     has_verified_name: bool,
 ) -> bool {
-    matches!(kind, crate::capability::PrincipalKind::FleetDevice)
-        && binding == BindingStrength::Proven
-        && has_device_pub
-        && has_verified_name
+    filament_peerloop::host::fleet_link_proven(
+        matches!(kind, crate::capability::PrincipalKind::FleetDevice),
+        binding == BindingStrength::Proven,
+        has_device_pub,
+        has_verified_name,
+    )
 }
 
 /// Shared verdict core: legacy folds trust the same way for both paths, then
