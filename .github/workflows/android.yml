@@ -115,10 +115,47 @@ jobs:
           cp "$so" out/libtunlion_core.so
           file out/libtunlion_core.so
           nm -D out/libtunlion_core.so | grep tunlion_core_abi_version
+          # The UniFFI scaffolding is what Kotlin actually calls. A .so that
+          # built but exported no scaffolding would still pass the line above.
+          nm -D out/libtunlion_core.so | grep -q uniffi_tunlion_core_
       - uses: actions/upload-artifact@v4
         with:
           name: tunlion-core-${{ matrix.target }}
           path: out/libtunlion_core.so
+          if-no-files-found: error
+
+  # The Kotlin bindings, generated from the same metadata the .so carries so the
+  # two cannot drift. This machine is too small to run the bindgen tree; CI is
+  # where it happens.
+  bindings:
+    name: kotlin bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/tunlion-core/target
+          key: bindings-${{ hashFiles('crates/tunlion-core/Cargo.lock') }}
+          restore-keys: bindings-
+      - name: Build the library for the host
+        run: cargo build --manifest-path crates/tunlion-core/Cargo.toml --release --lib
+      - name: Generate the Kotlin bindings
+        run: |
+          cargo run --manifest-path crates/tunlion-core/Cargo.toml \
+            --features cli --bin uniffi-bindgen -- \
+            generate --library crates/tunlion-core/target/release/libtunlion_core.so \
+            --language kotlin --out-dir kotlin
+          find kotlin -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunlion-core-kotlin
+          path: kotlin
           if-no-files-found: error
 
   emulator:

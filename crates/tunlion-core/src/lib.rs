@@ -5,6 +5,8 @@
 //! same types. Slice 1 is identity in an explicit config directory. The peer
 //! loop is still in the CLI, so `start` refuses by name. See `docs/android-ffi.md`.
 
+uniffi::setup_scaffolding!();
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,28 +32,33 @@ pub struct UncommittedIdentity {
 }
 
 /// Whether the peer loop is running inside this process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum EngineState {
     /// `Conn` and the receive loop still live in the CLI binary.
     NotLinked,
 }
 
 /// What the UI may poll. A missing identity is `fingerprint: None`, not an error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct Status {
     pub fingerprint: Option<String>,
     pub engine: EngineState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum CoreError {
+    #[error("{0}")]
     Io(String),
+    #[error("{0}")]
     Identity(String),
     /// The 12 words did not match the phrase this pending identity minted.
+    #[error("the recovery phrase did not match")]
     PhraseMismatch,
     /// `identity.ed25519` is already in this config directory.
+    #[error("an identity already exists in this config directory")]
     AlreadyExists,
     /// `start` was called and the engine is not in this crate yet.
+    #[error("the engine is not linked")]
     EngineNotLinked,
 }
 
@@ -103,7 +110,7 @@ impl Core {
         pending: UncommittedIdentity,
         confirmed_phrase: &str,
     ) -> Result<String, CoreError> {
-        if normalize_phrase(confirmed_phrase) != normalize_phrase(&pending.phrase()) {
+        if !pending.matches(confirmed_phrase) {
             return Err(CoreError::PhraseMismatch);
         }
         let fingerprint = pending.fingerprint();
@@ -145,6 +152,14 @@ impl UncommittedIdentity {
     pub fn fingerprint(&self) -> String {
         self.pending.fingerprint()
     }
+
+    /// Whether `phrase` is the same 12 words this identity minted. Word order
+    /// and a single space between words are what matter. Used to answer a
+    /// mistyped confirmation WITHOUT consuming the phrase, so the caller may
+    /// ask again. `commit_identity` still consumes on success.
+    pub fn matches(&self, phrase: &str) -> bool {
+        normalize_phrase(phrase) == normalize_phrase(&self.phrase())
+    }
 }
 
 fn normalize_phrase(phrase: &str) -> String {
@@ -163,6 +178,8 @@ fn id_err(err: impl ToString) -> CoreError {
         CoreError::Identity(msg)
     }
 }
+
+mod ffi;
 
 fn set_private_dir(dir: &Path) -> Result<(), CoreError> {
     #[cfg(unix)]

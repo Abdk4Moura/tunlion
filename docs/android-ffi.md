@@ -20,11 +20,24 @@ One Rust type, `Core`, opened on an explicit config directory. On Android that
 directory is `Context.filesDir/tunlion`. The library does not read
 `TUNLION_CONFIG_DIR`. Keys never leave that directory.
 
-Binding, when the engine is linked: UniFFI, crate type `cdylib` plus `rlib`,
-packaged as `jniLibs/<abi>/libtunlion_core.so` for `arm64-v8a` and `x86_64`.
-Not a hand-written JNI layer. Until UniFFI lands, the only C symbol is
-`tunlion_core_abi_version`. The app must not call it. It exists so the Android
-job can see that the `.so` exported something.
+Binding: UniFFI. Crate type `cdylib` plus `rlib`, packaged as
+`jniLibs/<abi>/libtunlion_core.so` for `arm64-v8a` and `x86_64`. Not a
+hand-written JNI layer.
+
+The Kotlin bindings are generated, not written by hand and not committed. CI
+produces them as the `tunlion-core-kotlin` artifact, from the same `.so` the app
+links, so the bindings and the symbols cannot drift:
+
+```
+cargo run --manifest-path crates/tunlion-core/Cargo.toml \
+  --features cli --bin uniffi-bindgen -- \
+  generate --library crates/tunlion-core/target/release/libtunlion_core.so \
+  --language kotlin --out-dir kotlin
+```
+
+`uniffi::setup_scaffolding!()` in `src/lib.rs` is what exports the surface.
+`tunlion_core_abi_version` is a plain build proof and not part of the API. Do
+not call it from the app.
 
 Threading: the engine will own its runtime. Kotlin calls in and gets a result
 or a callback. Tokio types do not cross the boundary.
@@ -35,12 +48,16 @@ a verb. They are not the wire format of this crate.
 
 ## Calls that exist now
 
-`open(config_dir) -> Core`
+The names below are the Rust types. The generated Kotlin uses the object names
+`CoreSession` and `PendingIdentity`, with the same methods. `CoreSession.open`
+is the constructor.
+
+`open(config_dir) -> Core` / `CoreSession.open(config_dir)`
 
 Creates the directory if needed (mode `0700` on Unix, which includes Android).
 Does not create an identity. Does not start an engine.
 
-`begin_identity() -> UncommittedIdentity`
+`begin_identity() -> UncommittedIdentity` / `PendingIdentity`
 
 Mints a 12-word recovery phrase in memory. Writes nothing. Fails with
 `AlreadyExists` if `identity.ed25519` is already in the config dir. The phrase
@@ -51,8 +68,9 @@ without `commit_identity` leaves the disk unchanged.
 
 Writes the key only if the confirmed phrase is the same 12 words. Word order
 and a single space between words are what matter; extra whitespace is ignored.
-A mismatch returns `PhraseMismatch` and writes nothing. This is the confirm-then-commit
-order. Do not commit first and delete on failure.
+A mismatch returns `PhraseMismatch`, writes nothing, and does NOT consume the
+phrase: the caller may ask again. This is the confirm-then-commit order. Do not
+commit first and delete on failure.
 
 `fingerprint() -> Option<String>`
 
