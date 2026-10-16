@@ -8,6 +8,11 @@ android {
     namespace = "com.tunlion.android"
     compileSdk = 35
 
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
     defaultConfig {
         applicationId = "com.tunlion.android"
         minSdk = 26
@@ -18,6 +23,10 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
     }
 }
 
