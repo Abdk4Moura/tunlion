@@ -52,7 +52,10 @@ class CliTunlionCore(private val context: Context) : TunlionCore {
         }
         cached = CoreStatus(identityLoaded = true, deviceName = Build.MODEL,
             fingerprint = snapshot.optString("identity").takeUnless { it.isBlank() || it == "null" },
-            engineRunning = snapshot.optBoolean("running") && snapshot.optBoolean("responding"),
+            // Mirrors the CLI's own serving rule: a live daemon whose control
+            // socket the platform cannot be asked about (responding null) still
+            // serves; only an explicit false means it is wedged or suspended.
+            engineRunning = snapshot.optBoolean("running") && snapshot.opt("responding") != false,
             engineLinked = cli.paths.binary.canExecute(), devices = devices, transfers = transfers,
             engineError = EngineState.error)
         cached

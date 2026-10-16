@@ -61,7 +61,9 @@ class AvailabilityService : Service() {
                                 ensureActive()
                                 if (!ready && child.isAlive) {
                                     val status = cli.run(listOf("status"), 5_000)
-                                    if (status.exit == 0 && status.json?.optBoolean("responding") == true) ready = true
+                                    val snapshot = status.json
+                                    if (status.exit == 0 && snapshot?.optBoolean("running") == true &&
+                                        snapshot.opt("responding") != false) ready = true
                                     else delay(250)
                                 }
                             }
