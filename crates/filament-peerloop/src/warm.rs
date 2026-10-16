@@ -163,8 +163,9 @@ impl WarmHold {
         self.backoff.get(peer).map(|b| b.failures).unwrap_or(0)
     }
 
-    /// Check if a peer is dormant (too many failures)
-    fn is_dormant(&self, peer: &str) -> bool {
+    /// Check if a peer is dormant (too many failures). A query on the machine
+    /// like `failures`/`due`, public for the same reason.
+    pub fn is_dormant(&self, peer: &str) -> bool {
         self.backoff.get(peer).map(|b| b.dormant).unwrap_or(false)
     }
 
