@@ -148,7 +148,12 @@ jobs:
       # that would resolve the virtual manifest, not tunlion-core.
       - name: Build the library for the host
         working-directory: crates/tunlion-core
-        run: cargo build --release --lib
+        # uniffi-bindgen reads the UNIFFI_META_* entries from the ELF symbol
+        # table. The workspace release profile strips symbols (as the CLI
+        # release always did), which removes them, so this host build that
+        # exists only to feed bindgen turns strip off. The shipped Android .so
+        # below stays stripped.
+        run: cargo build --release --lib --config 'profile.release.strip=false'
       - name: Generate the Kotlin bindings
         working-directory: crates/tunlion-core
         run: |
