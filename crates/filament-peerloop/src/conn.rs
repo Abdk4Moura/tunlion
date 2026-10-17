@@ -4410,17 +4410,35 @@ mod warm_identity_tests {
     }
 
     impl HostServices for TestHost {
-        fn now_secs(&self) -> u64 {
-            filament_id::now_secs()
+        fn settings_get_str(&self, _key: &str) -> Option<String> {
+            None
         }
         fn devices_load(&self) -> Vec<(String, String)> {
             self.devices.clone()
         }
+        fn is_self_uid(&self, _my_uid: &str, _peer_uid: Option<&str>) -> bool {
+            false
+        }
         fn rejoin_unwarned(&self) -> Duration {
             Duration::from_secs(25)
         }
+        fn relay_banner(&self) -> String {
+            String::new()
+        }
+        fn relay_forbidden(&self) -> bool {
+            false
+        }
         fn channel_of(&self, secret: &str) -> String {
             format!("channel-of-{secret}")
+        }
+        fn roster_snapshot_json(&self) -> Option<String> {
+            None
+        }
+        fn fleet_rv_present(&self) -> bool {
+            false
+        }
+        fn now_secs(&self) -> u64 {
+            filament_id::now_secs()
         }
     }
 
