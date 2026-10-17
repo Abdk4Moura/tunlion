@@ -19,7 +19,8 @@ use std::time::Duration;
 use filament_cap::capability::{ActionCounts, GateDecision, ShadowCounts};
 use filament_peerloop::consent::{PendingRequest, RequestBar};
 use filament_peerloop::host::{
-    CapGate, HostServices, Level, LogSink, PersistedPrincipal, StorageFailure, Tone,
+    CapGate, DelegatedAccess, HostServices, Level, LogSink, PersistedPrincipal, StorageFailure,
+    Tone,
 };
 #[cfg(l3)]
 use filament_peerloop::mesh::MeshTunnel;
@@ -218,6 +219,24 @@ impl HostServices for CliHost {
     }
     fn cap_action_counts(&self) -> Vec<ActionCounts> {
         crate::capability::cap_action_counts()
+    }
+    fn cert_revoked_for(&self, device_pub: Option<&[u8; 32]>) -> bool {
+        crate::identity_state::cert_revoked_for(device_pub)
+    }
+    fn delegated_access_for(&self, device_pub: &[u8; 32]) -> Option<DelegatedAccess> {
+        crate::identity_state::delegated_access_for(device_pub).map(|a| DelegatedAccess {
+            ceiling: a.ceiling,
+            deadline: a.deadline,
+        })
+    }
+    fn device_capability_denied(&self, name: &str, capability: &str) -> bool {
+        crate::device_caps::device_capability_denied(name, capability)
+    }
+    fn device_allows(&self, name: &str, capability: &str) -> bool {
+        crate::device_caps::device_allows(name, capability)
+    }
+    fn ceiling_covers_action(&self, device_pub: Option<&[u8; 32]>, action: &str) -> bool {
+        crate::identity_state::ceiling_covers_action(device_pub, action)
     }
     fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
         crate::capability::cap_gate_effective(

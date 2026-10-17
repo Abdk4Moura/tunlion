@@ -224,9 +224,12 @@ use device_caps::{
 use identity_lifecycle::{VOUCH_CERT_SCOPE, principal_after_liveness, update_peer_identity};
 use identity_lifecycle::{
     PROVEN_CHALLENGE_DEADLINE, clear_provisional_identity, handle_identity_expose,
-    issue_proven_challenge_and_hold, load_provisional_identity, resolve_peer_identity,
+    issue_proven_challenge_and_hold, load_provisional_identity,
     respond_to_identity_challenge, store_provisional_identity,
 };
+// Still reached from this crate root by recv_cmd; it is the crate's resolver
+// re-exported by identity_lifecycle, so it stays visible here.
+pub(crate) use identity_lifecycle::resolve_peer_identity;
 use renewal_lifecycle::{
     handle_auth_key_enroll_response, handle_cert_renew_ack, maybe_request_cert_renewal,
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
@@ -1243,47 +1246,8 @@ pub(crate) use dlog;
 
 
 
-impl ShellPolicy {
-    pub(crate) fn auto_allows(&self, name: &str) -> bool {
-        match self {
-            ShellPolicy::Granted => false,
-            ShellPolicy::All => true,
-            ShellPolicy::Only(set) => set.contains(name),
-        }
-    }
-    /// #244: the posture this daemon is actually serving, for `cap-status`.
-    ///
-    /// Reported by the RUNNING daemon rather than derived from settings by the
-    /// asking process. `up --shell` sets the policy from a launch flag that
-    /// never touches the settings file, so a settings-derived answer would be
-    /// true about the config and wrong about the daemon, which is precisely the
-    /// gap that lets `revoke <device> shell` report success while the policy
-    /// keeps handing out the shell.
-    fn label(&self) -> &'static str {
-        match self {
-            ShellPolicy::Granted => "granted",
-            ShellPolicy::All => "all",
-            ShellPolicy::Only(_) => "only",
-        }
-    }
-    /// The petnames this policy auto-shells regardless of any per-device grant.
-    /// Empty for `Granted`; `Only`'s set; `All` answers for every peer, so the
-    /// caller must read `label() == "all"` rather than look for a name here.
-    fn auto_names(&self) -> Vec<String> {
-        match self {
-            ShellPolicy::Only(set) => {
-                let mut v: Vec<String> = set.iter().cloned().collect();
-                v.sort();
-                v
-            }
-            _ => Vec::new(),
-        }
-    }
-    /// Active policy implies the L2 tunnel acceptor is on (you can't ssh without it).
-    fn enables_l2(&self) -> bool {
-        !matches!(self, ShellPolicy::Granted)
-    }
-}
+// `ShellPolicy` and its methods live in filament_peerloop::shell_gate now
+// (issue #465), re-exported through shared_defs.
 
 
 
@@ -1796,72 +1760,11 @@ fn invite_path_for(named: Option<&str>, kind: &str) -> std::path::PathBuf {
 
 
 
-impl PeerAuthz {
-    /// The gate's arguments in the order every call site uses them.
-    ///
-    /// Returned as one tuple because the alternative was five identical lines of
-    /// destructuring at five call sites, which is the duplication this struct
-    /// was extracted to remove, reintroduced one layer up.
-    fn parts(
-        &self,
-    ) -> (
-        Option<&[u8; 32]>,
-        Option<&[u8; 32]>,
-        crate::capability::BindingStrength,
-        Option<u64>,
-        bool,
-        Option<&[String]>,
-    ) {
-        (
-            self.idev.as_ref(),
-            self.iusr.as_ref(),
-            self.binding,
-            self.expires,
-            self.cert_revoked,
-            self.ak_caps.as_deref(),
-        )
-    }
-}
-
-fn peer_authz(conn: &mut Conn, pid: &str) -> PeerAuthz {
-    if let Some(l) = conn.link_mut(pid) {
-        resolve_peer_identity(l);
-    }
-    let link = conn.link(pid);
-    let idev = link.and_then(|l| l.identity_device_pub);
-    let iusr = link.and_then(|l| l.identity_user_pub);
-    let mut expires = link.and_then(|l| l.identity_cert_expires);
-    let mut ak_caps = link
-        .and_then(|l| l.principal_kind.auth_key_caps())
-        .map(|c| c.to_vec());
-    // A DELEGATED device's deadline and ceiling are read FRESH from its record
-    // at every gate, never trusted from what the link cached when its identity
-    // first resolved. The cached copy is how an invited guest kept access past
-    // its invitation end: the link was resolved while the invitation was live,
-    // nothing re-read it, and a later proof re-bound it from the presented
-    // (renewed) certificate. The record is the owner's own statement, kept in
-    // step by renewal, and it carries the invitation end.
-    if let Some(access) = idev.as_ref().and_then(crate::identity_state::delegated_access_for) {
-        expires = Some(access.deadline);
-        if access.expired(crate::identity::now_secs()) {
-            ak_caps = Some(Vec::new());
-        } else if ak_caps.is_none() {
-            // A delegated record never authorizes as an owner device, whatever
-            // the link's principal says.
-            ak_caps = Some(access.ceiling.clone());
-        }
-    }
-    PeerAuthz {
-        binding: link
-            .map(|l| l.identity_binding)
-            .unwrap_or(crate::capability::BindingStrength::None),
-        expires,
-        cert_revoked: cert_revoked_for(idev.as_ref()),
-        ak_caps,
-        idev,
-        iusr,
-    }
-}
+// The gate's per-peer preamble (`PeerAuthz`, its ordering of inputs and the
+// parts() tuple) moved to filament_peerloop::shell_gate with the gate that
+// consumes it (issue #465). Re-exported so recv_cmd and ssh_ca keep importing
+// `crate::peer_authz` and the struct unchanged.
+pub(crate) use filament_peerloop::shell_gate::peer_authz;
 
 /// Does this positional look like a pairing code rather than a device name?
 ///
