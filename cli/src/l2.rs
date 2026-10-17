@@ -2260,7 +2260,9 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     Ok(())
 }
 
-/// Recovery for the LOCAL terminal at client entry/final exit only. A killed
+/// Recovery for the LOCAL terminal at client entry/final exit only. Interactive
+/// shell takes ownership of its attached tty; a parent TUI must suspend its own
+/// modes before launching the child and restore them after it returns. A killed
 /// TUI may leave mouse/focus/paste reports enabled, polluting the next shell's
 /// stdin. These bytes belong on local stdout, NEVER in transport frames or the
 /// PTY replay ring: the remote application owns modes while attached, including
