@@ -3044,6 +3044,29 @@ fn win_console_set(which: u32, mode: u32) {
     }
 }
 
+/// A deterministic Unix PTY fixture: emit a prefix, wait for a line, emit its
+/// continuation, then wait again. No interactive Windows console coverage is
+/// implied by this fixture; that requires a different host-specific driver.
+#[cfg(test)]
+pub fn pty_mode_test_argv(before: &str, after: &str) -> Option<Vec<String>> {
+    #[cfg(unix)]
+    {
+        Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty -echo; printf '%s' \"$1\"; IFS= read -r line; printf '%s' \"$2\"; IFS= read -r line".into(),
+            "pty-mode-test".into(),
+            before.into(),
+            after.into(),
+        ])
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (before, after);
+        None
+    }
+}
+
 /// Create a symlink, for tests that need a symlinked entry in a fixture.
 ///
 /// Both arms live here because platform differences belong in `platform/` (docs/architecture/PLATFORM.md):

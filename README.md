@@ -67,6 +67,8 @@ tunlion mount dovm /srv/data ./data # mount a remote folder over the mesh
 
 No inbound ports, no VPN config, no accounts — reachability rides the same authenticated link as file transfer, so a headless box in another network is one command away.
 
+An interactive `tunlion shell` temporarily owns the current terminal, as an SSH client or terminal application does. On final exit it restores local input-reporting modes that a remote TUI may have left enabled; it never resets them during reconnects and does not switch screens. A parent TUI should suspend its terminal modes before launching a child shell and restore them when the child exits.
+
 ## Use it from an AI agent
 
 Every command that matters to a script takes `--json` and exits with a documented code (`tunlion --help`, EXIT CODES). To teach a coding agent the right commands, install the bundled skill ([cli/skills/tunlion/SKILL.md](cli/skills/tunlion/SKILL.md)). It is opt-in: nothing else ever installs it.
