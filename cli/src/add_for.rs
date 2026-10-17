@@ -156,13 +156,14 @@ pub(crate) async fn add_for_cmd(
     let mut reuse = reuse;
     if kind == "runner" && caps.interactive {
         if reuse.is_none() {
-            let answer =
-                runner_prompt("  How many boxes may use this invitation? [1, or type cancel]: ")?;
+            let answer = runner_prompt(
+                "  How many boxes may use this invitation? [default: 1; Enter keeps it; number/forever; cancel]: ",
+            )?;
             reuse = Some(parse_reuse_answer(&answer)?);
         }
         if expires.is_none() {
             let answer = runner_prompt(&format!(
-                "  How long may each stay? [{default_ttl}, or type cancel]: "
+                "  How long may each stay? [default: {default_ttl}; Enter keeps it; e.g. 30m, 2h, 7d; cancel]: "
             ))?;
             expires = Some(parse_ttl_answer(&answer, default_ttl)?);
         }
@@ -171,7 +172,7 @@ pub(crate) async fn add_for_cmd(
             // instead of being the default. A runner's everyday job is moving
             // bytes; a terminal on this machine is the owner's own authority.
             let choices = vec![
-                "Send files only".to_string(),
+                "Send files only  (DEFAULT)".to_string(),
                 "Send files, and open a terminal here  (OWNER-EQUIVALENT)".to_string(),
             ];
             let picked = codeentry::pick("WHAT EACH RUNNER MAY DO", &choices)?;

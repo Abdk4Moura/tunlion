@@ -31,6 +31,11 @@ That works today. The rest of this file is what it costs.
 1. **No prompts, ever.** Everything must work at a non-TTY. Mostly true:
    `--no-interactive`, `-y` where confirmation is needed, `--json` on the verbs
    that carry it.
+   For credential creation, the target kind is required intent: interactive
+   `add` guides the user and visibly preselects safe defaults; Enter accepts
+   them. In a script, missing intent fails with a copyable command. Optional
+   policy settings keep their safe defaults (runner: one use, one hour, transfer
+   only) instead of making automation restate them.
 2. **Bounded waits.** A job that hangs burns the whole workflow. `send` has
    `--timeout`; `receive` and `up` do not, so a CI script has to wrap them in
    `timeout(1)`. That is the single most annoying gap.
