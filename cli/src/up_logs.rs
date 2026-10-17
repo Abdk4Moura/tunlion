@@ -1250,6 +1250,10 @@ mod tests {
         "yes",
         "help",
         "version",
+        // Read once, before the daemon is spawned: `up` joins with it, or does
+        // not need it at all. Forwarding it would put the key (or its path) in
+        // the daemon's argv for no reason.
+        "authkey_file",
     ];
 
     fn parse(argv: &[String]) -> crate::Cli {
