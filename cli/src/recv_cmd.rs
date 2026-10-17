@@ -1537,6 +1537,8 @@ pub(crate) async fn recv_cmd(
         // initiator). See `direct_ok_for`. One-shot send/recv/pair (daemon=false)
         // are unaffected and keep their WebRTC default.
         direct_ok_for(daemon, l2_enabled),
+        crate::host_impl::cli_log(),
+        crate::host_impl::cli_host(),
     );
     // WARM-HOLD: load configured warm-peers at daemon startup
     if daemon {

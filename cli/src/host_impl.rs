@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use filament_peerloop::host::{HostServices, Level, LogSink, Tone};
+use filament_peerloop::host::{HostServices, Level, LogSink, PersistedPrincipal, Tone};
 
 /// The terminal `ui` module, as a [`LogSink`].
 pub(crate) struct CliLog;
@@ -117,6 +117,37 @@ impl HostServices for CliHost {
     }
     fn fleet_rv_present(&self) -> bool {
         crate::fleet::rv().is_some()
+    }
+    fn now_secs(&self) -> u64 {
+        crate::identity::now_secs()
+    }
+    fn device_cert_for(&self, name: &str) -> Option<filament_id::DeviceCert> {
+        crate::device_cert_for(name)
+    }
+    fn principal_ceiling_for(&self, name: &str) -> Option<Vec<String>> {
+        crate::principal_ceiling_for(name)
+    }
+    fn persisted_principal_for_cert(
+        &self,
+        cert: &filament_id::DeviceCert,
+    ) -> PersistedPrincipal {
+        let (kind, not_after, max_offline, last_seen) =
+            crate::persisted_principal_for_cert(cert);
+        PersistedPrincipal {
+            kind,
+            not_after,
+            max_offline,
+            last_seen,
+        }
+    }
+    fn principal_deadline(
+        &self,
+        cert_expires: u64,
+        not_after: Option<u64>,
+        last_seen: Option<u64>,
+        max_offline: Option<u64>,
+    ) -> u64 {
+        crate::effective_principal_deadline(cert_expires, not_after, last_seen, max_offline).0
     }
 }
 

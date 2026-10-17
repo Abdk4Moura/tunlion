@@ -516,20 +516,28 @@ if __name__ == '__main__':
     # green while describing something that stopped being true, which is the
     # defect class this whole file exists to catch.
     here = os.path.dirname(os.path.abspath(__file__))
-    src_dir = os.path.join(here, os.pardir, "cli", "src")
-    # Anchor is anywhere in cli/src since the 2026-09-12 main.rs
-    # decomposition (fn rearm_channel_ready now lives in conn.rs).
-    files = sorted(glob.glob(os.path.join(src_dir, "**", "*.rs"), recursive=True))
+    # Anchor is anywhere in the Rust that carries the peer loop: cli/src since
+    # the 2026-09-12 main.rs decomposition, and filament-peerloop/src since
+    # #465 slice 3 moved `Conn` (and `fn rearm_channel_ready`) there.
+    src_dirs = [
+        os.path.join(here, os.pardir, "cli", "src"),
+        os.path.join(here, os.pardir, "crates", "filament-peerloop", "src"),
+    ]
+    files = []
+    for src_dir in src_dirs:
+        files.extend(
+            sorted(glob.glob(os.path.join(src_dir, "**", "*.rs"), recursive=True))
+        )
     try:
         if not files:
-            raise OSError(f"no .rs files under {src_dir}")
+            raise OSError(f"no .rs files under {src_dirs}")
         tree = "".join(
             open(p, encoding="utf-8", errors="replace").read() for p in files
         )
     except OSError as e:
         # An expiry check that cannot read the tree has not passed, it has
         # failed to run. Never let that read as a pass.
-        print(f"\n  GATE 0 EXPIRY UNVERIFIABLE: cannot read {src_dir} ({e}).")
+        print(f"\n  GATE 0 EXPIRY UNVERIFIABLE: cannot read {src_dirs} ({e}).")
         print("  The calibration cannot be confirmed current. Refusing to report.")
         sys.exit(1)
 

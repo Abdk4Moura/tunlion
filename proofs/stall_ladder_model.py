@@ -32,14 +32,22 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def source_ladder_constants():
     """Read the ladder bounds from the Rust tree this model claims to describe."""
-    # Anchor is anywhere in cli/src since the 2026-09-12 main.rs
-    # decomposition (const MAX_ATTEMPTS now lives in shared_defs.rs).
+    # Anchor is anywhere in the Rust that carries the ladder: cli/src since the
+    # 2026-09-12 main.rs decomposition, and filament-peerloop/src since #465
+    # slice 3 moved `const MAX_ATTEMPTS` into limits.rs.
     import glob
-    src_dir = os.path.join(ROOT, "cli", "src")
-    files = sorted(glob.glob(os.path.join(src_dir, "**", "*.rs"), recursive=True))
+    src_dirs = [
+        os.path.join(ROOT, "cli", "src"),
+        os.path.join(ROOT, "crates", "filament-peerloop", "src"),
+    ]
+    files = []
+    for src_dir in src_dirs:
+        files.extend(
+            sorted(glob.glob(os.path.join(src_dir, "**", "*.rs"), recursive=True))
+        )
     if not files:
         raise SystemExit(
-            "stall-ladder guard: no .rs files under cli/src; "
+            "stall-ladder guard: no .rs files under the known roots; "
             "the calibration cannot be confirmed current. Refusing to report."
         )
     main = "".join(open(p, encoding="utf-8", errors="replace").read() for p in files)

@@ -1195,8 +1195,16 @@ dependencies = [
 name = "filament-peerloop"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "filament-cap",
+ "filament-id",
+ "filament-signal",
  "filament-transport",
+ "quinn",
+ "serde_json",
  "tokio",
+ "webrtc",
 ]
 
 [[package]]

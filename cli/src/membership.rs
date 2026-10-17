@@ -90,6 +90,8 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
         Some(owner_name.clone()),
         false,
         direct::direct_enabled(),
+        crate::host_impl::cli_log(),
+        crate::host_impl::cli_host(),
     );
 
     let started = Instant::now();

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Model the link manager's placement and upgrade-verify decisions.
 
-`cli/src/link_manager.rs` decides which existing link a request rides and when
+`crates/filament-peerloop/src/link_manager.rs` decides which existing link a request rides and when
 a direct standby has earned the cutover from relay. This model mirrors those
 two pure functions and checks, exhaustively over a small domain, the
 properties the rest of the system relies on:
@@ -33,7 +33,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LM = os.path.join(ROOT, "cli", "src", "link_manager.rs")
+LM = os.path.join(ROOT, "crates", "filament-peerloop", "src", "link_manager.rs")
 DC = os.path.join(ROOT, "cli", "src", "daemon_ctl.rs")
 
 

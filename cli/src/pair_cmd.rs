@@ -504,6 +504,8 @@ pub(crate) async fn pair_cmd(
         None,                     // to_filter
         false,                    // warm_standby default (pair is one-shot)
         direct::direct_enabled(), // direct_ok: env gate only (no L2 acceptor here)
+        crate::host_impl::cli_log(),
+        crate::host_impl::cli_host(),
     );
     {
         let tx = tx.clone();

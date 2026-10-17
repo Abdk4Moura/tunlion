@@ -642,6 +642,8 @@ pub(crate) async fn send_cmd(
         to,                       // to_filter
         false,                    // warm_standby default (one-shot send)
         direct::direct_enabled(), // direct_ok: env gate only (file transfer keeps WebRTC default)
+        crate::host_impl::cli_log(),
+        crate::host_impl::cli_host(),
     );
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
