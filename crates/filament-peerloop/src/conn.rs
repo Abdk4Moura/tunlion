@@ -23,8 +23,9 @@
 //!
 //! BACK-EDGES -- what a future peer-loop carve still owes. The terminal and the
 //! machine's own facts no longer appear here as imports: `Conn` carries
-//! `log: Arc<dyn LogSink>` and `host: Arc<dyn HostServices>` (traits defined in
-//! `filament-peerloop::host`, implemented over the real CLI functions in
+//! `log: Arc<dyn LogSink>`, `host: Arc<dyn HostServices>` and
+//! `present: Arc<dyn Presentation>` (traits defined in `filament-peerloop::host`
+//! and `filament-peerloop::present`, implemented over the real CLI functions in
 //! `cli/src/host_impl.rs`). Rendering (`ui::…`), config (`settings::get_str`),
 //! devices.json, the owner key, the rendezvous channel, the roster snapshot, the
 //! relay policy and the fleet-presence check all go through those fields now.
@@ -47,6 +48,7 @@ use crate::identity::resolve_peer_identity;
 use crate::limits::{
     FLEET_LINK_NAME, MAX_ATTEMPTS, REJOIN_WINDOW, STALL_MAX_REPAIRS, VERIFY_PROBE_SID,
 };
+use crate::present::{NoScreen, Presentation};
 use crate::resilience;
 use crate::test_hooks;
 use filament_cap::capability::{BindingStrength, PrincipalKind};
@@ -730,6 +732,11 @@ pub struct Conn {
     /// read goes through this instead of a CLI import, so this state has no
     /// back-edge into the CLI and can later `git mv` into the crate.
     pub host: Arc<dyn HostServices>,
+    /// The injected terminal presentation. The sticky line, a waiting question,
+    /// transfer bars, OSC 52 and the raw-mode echo go through this instead of
+    /// `cli::ui`, so a screen-less consumer gets the same loop with `NoScreen`.
+    /// See `filament_peerloop::present`.
+    pub present: Arc<dyn Presentation>,
 }
 
 /// The cached ICE config (see `Conn::ice_config`).
@@ -853,7 +860,17 @@ impl Conn {
             roster_absent: HashMap::new(),
             log,
             host,
+            present: Arc::new(NoScreen),
         }
+    }
+
+    /// Install the session's terminal presentation. The constructor leaves the
+    /// inert [`NoScreen`] so a caller that renders nothing (a daemon journal, a
+    /// library consumer, a test) is silent by default; the CLI command loop
+    /// replaces it with its `ui` adapter, keeping the bytes identical.
+    pub fn with_presentation(mut self, present: Arc<dyn Presentation>) -> Self {
+        self.present = present;
+        self
     }
 
     pub fn link(&self, pid: &str) -> Option<&Link> {

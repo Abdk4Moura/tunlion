@@ -1,7 +1,8 @@
 //! HOST GLUE: the CLI's answers to `filament-peerloop`'s host traits.
 //!
-//! `filament-peerloop::host` defines [`LogSink`] and [`HostServices`]; this
-//! module implements them over the CLI's real functions, so a `Conn` built via
+//! `filament-peerloop::host` defines [`LogSink`] and [`HostServices`], and
+//! `filament-peerloop::present` defines [`Presentation`]; this module implements
+//! all three over the CLI's real functions, so a `Conn` built via
 //! `Conn::for_command` behaves byte-for-byte as it did when it imported those
 //! functions directly. The point of the indirection is that the peer-loop state
 //! no longer names the CLI at all, which is what makes its later `git mv` into
@@ -21,6 +22,7 @@ use filament_peerloop::host::{
 };
 #[cfg(l3)]
 use filament_peerloop::mesh::MeshTunnel;
+use filament_peerloop::present::{Ask, Presentation, Progress};
 
 /// The terminal `ui` module, as a [`LogSink`].
 pub(crate) struct CliLog;
@@ -270,6 +272,49 @@ impl HostServices for CliHost {
 /// A fresh [`LogSink`] over the real terminal UI.
 pub(crate) fn cli_log() -> Arc<dyn LogSink> {
     Arc::new(CliLog)
+}
+
+/// The terminal `ui` module, as a [`Presentation`]. Every method is a one-line
+/// pass-through on purpose: the receive loop's bytes at a tty stay identical to
+/// the imports it used to make.
+pub(crate) struct CliScreen;
+
+impl Presentation for CliScreen {
+    fn clear_sticky(&self) {
+        crate::ui::clear_sticky();
+    }
+    fn sticky_ask(&self, question: &str) -> Ask {
+        crate::ui::sticky_ask(question);
+        Ask::Fronted
+    }
+    fn progress(&self, label: &str, total: u64) -> Box<dyn Progress> {
+        Box::new(CliBar(crate::ui::Progress::new(label, total)))
+    }
+    fn clipboard(&self, text: &str) {
+        // The return value only tells an interactive caller whether the OS
+        // clipboard looks reachable; the receive loop has never needed it.
+        let _ = crate::ui::clipboard(text);
+    }
+    fn answer_echo(&self, ch: char) {
+        crate::ui::answer_echo(ch);
+    }
+}
+
+/// The CLI's real transfer bar, behind the host-free [`Progress`] handle.
+struct CliBar(crate::ui::Progress);
+
+impl Progress for CliBar {
+    fn tick(&mut self, bytes: u64) {
+        self.0.tick(bytes);
+    }
+    fn done(&self, bytes: u64) {
+        self.0.done(bytes);
+    }
+}
+
+/// A fresh [`Presentation`] over the real terminal.
+pub(crate) fn cli_screen() -> Arc<dyn Presentation> {
+    Arc::new(CliScreen)
 }
 
 /// A fresh [`HostServices`] over the real CLI.

@@ -297,6 +297,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         roster_absent: HashMap::new(),
         log: crate::host_impl::cli_log(),
         host: crate::host_impl::cli_host(),
+        present: crate::host_impl::cli_screen(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
