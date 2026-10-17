@@ -36,6 +36,9 @@
 use crate::dlog;
 use crate::signaling_health;
 #[cfg(l3)]
+use filament_overlay::Announce;
+use filament_overlay::{b64, unb64};
+#[cfg(l3)]
 use crate::l3;
 #[cfg(l3)]
 use crate::{
@@ -1723,7 +1726,7 @@ pub(crate) async fn recv_cmd(
     // transport is installed, so a hello that races ahead of the link is not lost
     // (review fix #3).
     #[cfg(l3)]
-    let mut l3_seen: HashMap<String, overlay::Announce> = HashMap::new();
+    let mut l3_seen: HashMap<String, Announce> = HashMap::new();
     #[cfg(l3)]
     let l3: Option<std::sync::Arc<l3::L3>> = if daemon {
         match host.settings_get_str("tun-addr") {
@@ -4881,7 +4884,7 @@ pub(crate) async fn recv_cmd(
                     let _ = t
                         .send_control(&json!({
                             "type": "l3-nonce",
-                            "nonce": crate::overlay::b64(&nonce),
+                            "nonce": b64(&nonce),
                         }))
                         .await;
                 }
@@ -5121,7 +5124,7 @@ pub(crate) async fn recv_cmd(
                     }
                 }
                 Some("l3-nonce") => {
-                    match v["nonce"].as_str().map(crate::overlay::unb64) {
+                    match v["nonce"].as_str().map(unb64) {
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
                             bind_theirs.insert(pid.clone(), nonce);
                             if let Some(t) = conn.transport_of(&pid) {
@@ -5460,7 +5463,7 @@ pub(crate) async fn recv_cmd(
                         ));
                         continue;
                     }
-                    match overlay::Announce::from_json(&v) {
+                    match Announce::from_json(&v) {
                         Ok(ann) => {
                             l3_seen.insert(pid.clone(), ann.clone());
                             // Try to process immediately if transport is available.
@@ -7066,7 +7069,7 @@ pub(crate) async fn recv_cmd(
                         // For identity layer, after introduction, generate nonce challenge to learn peer's identity (0x02 path)
                         // Challenge carries ONLY {nonce, receiver_device_pub} per correction A
                         // Receiver_device_pub is our own overlay key (always exists, not cert-or-zeros)
-                        if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
+                        if let Ok(own_dpub) = host.overlay_pubkey() {
                             if let Some(t) = conn.transport_of(&pid) {
                                 use ring::rand::{SecureRandom, SystemRandom};
                                 let rng = SystemRandom::new();
@@ -7116,7 +7119,7 @@ pub(crate) async fn recv_cmd(
                                     &sender_dpub,
                                     &recv_dpub_arr,
                                 );
-                                if let Ok(sig) = crate::overlay::overlay_sign_possession(&msg) {
+                                if let Ok(sig) = host.overlay_sign_possession(&msg) {
                                     // For introduce path, identity-expose goes over DIRECT A-B DTLS data channel (the introduced pair's OWN transport,
                                     // whose DTLS keys the introducer/hub does NOT know). This is E2E encrypted, so unsealed is actually FINE and BETTER than
                                     // sealing with HKDF(fresh_secret) (which introducer CAN open, since it minted fresh_secret). DTLS gives true A-B E2E,
@@ -7183,8 +7186,7 @@ pub(crate) async fn recv_cmd(
                                                             let chash =
                                                                 crate::identity::cert_hash(&cert);
                                                             if let Ok(own_dpub) =
-                                                                crate::overlay::overlay_pubkey_bytes(
-                                                                )
+                                                                host.overlay_pubkey()
                                                             {
                                                                 let sender_dpub = cert.device_pub;
                                                                 let receiver_dpub = own_dpub; // our own device_pub as receiver
