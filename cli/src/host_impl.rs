@@ -15,8 +15,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use filament_cap::capability::{ActionCounts, GateDecision, ShadowCounts};
 use filament_peerloop::host::{
-    HostServices, Level, LogSink, PersistedPrincipal, StorageFailure, Tone,
+    CapGate, HostServices, Level, LogSink, PersistedPrincipal, StorageFailure, Tone,
 };
 
 /// The terminal `ui` module, as a [`LogSink`].
@@ -154,6 +155,40 @@ impl HostServices for CliHost {
     }
     fn fleet_rv_present(&self) -> bool {
         crate::fleet::rv().is_some()
+    }
+    fn ensure_self_genesis_header(&self, user_key: &crate::identity::UserKey) -> bool {
+        crate::ensure_self_genesis_header(&self.config_dir(), user_key)
+    }
+    fn cap_store(&self) -> Vec<serde_json::Value> {
+        crate::capability::load_cap_store(&self.config_dir())
+    }
+    fn cap_authoritative(&self) -> bool {
+        crate::capability::cap_authoritative()
+    }
+    fn cap_shadow_counts(&self) -> ShadowCounts {
+        crate::capability::cap_shadow_counts()
+    }
+    fn cap_action_counts(&self) -> Vec<ActionCounts> {
+        crate::capability::cap_action_counts()
+    }
+    fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
+        crate::capability::cap_gate_effective(
+            gate.legacy_allowed,
+            gate.outcome,
+            gate.action,
+            gate.resource,
+            gate.device_pub,
+            gate.user_pub,
+            gate.binding,
+            gate.cert_expires,
+            gate.auth_key_caps,
+            gate.own_user_pub,
+            gate.scoped_in_bounds,
+            gate.has_explicit_grant,
+            gate.cert_revoked,
+            gate.denied,
+            gate.ceiling_authorizes,
+        )
     }
     fn now_secs(&self) -> u64 {
         crate::identity::now_secs()

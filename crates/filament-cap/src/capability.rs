@@ -1506,7 +1506,7 @@ pub struct ActionCounts {
 }
 
 /// Shadow counts, bucketed by legacy outcome and cap outcome.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct ShadowCounts {
     pub la_authorized: u64,
     pub la_denied: u64,
