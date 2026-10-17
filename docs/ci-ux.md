@@ -68,15 +68,19 @@ on both ends.
    arrived". Removes the `timeout(1)` wrapper from every caller.
 2. `receive --expect-sha256 <hex>` (and `--expect-name <name>`): refuse to report
    success unless the received bytes match. Removes hand-rolled verification.
-3. `tunlion wait <device> --timeout <secs>`: block until a named device is
+3. `up` has no `--json`. A CI box starts the daemon and then has to poll
+   `status --json` to learn whether it came up, because `up --json` is refused as
+   unimplemented (exit 2). Either give `up` a machine-readable result or make
+   `up --detach` print the daemon pid and state.
+4. `tunlion wait <device> --timeout <secs>`: block until a named device is
    online. Removes the `devices --json` polling loop.
-4. `receive --json` should end with one object naming every file it wrote and its
+5. `receive --json` should end with one object naming every file it wrote and its
    sha256, so a caller has a manifest without hashing again.
-5. A cohort action: retire an invitation and stop renewal for every device it
+6. A cohort action: retire an invitation and stop renewal for every device it
    admitted. Today the record carries no provenance, so this needs the field
    first.
-6. A `tunlion job` verb wrapping (2)+(3) and the manifest, so the box side is one
-   command instead of a script.
+7. A `tunlion job` verb wrapping (2)+(3)+(4) and the manifest, so the box side is
+   one command instead of a script.
 
 ## What is deliberately out of scope
 
