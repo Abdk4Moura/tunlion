@@ -746,6 +746,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     None,
                     false,
                     crate::host_impl::cli_log(),
+                    crate::host_impl::cli_host(),
                 )
                 .await;
                 // Refused files decide the outcome: all refused is the
