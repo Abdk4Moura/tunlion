@@ -289,7 +289,12 @@ jobs:
             $tamperedDir = Join-Path $tempRoot 'tampered'
             $env:TUNLION_INSTALL_DIR = $tamperedDir
             $badOut = & pwsh -NoProfile -File $installer -Archive $zip -Checksums $badSums 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0) {
+            $badCode = $LASTEXITCODE
+            # This non-zero is the expected result. GitHub's pwsh wrapper
+            # propagates a lingering $LASTEXITCODE as the step's exit code, so
+            # clear it before the assertions and the step's own success.
+            $LASTEXITCODE = 0
+            if ($badCode -eq 0) {
               Write-Host $badOut
               throw 'the installer accepted a bad SHA-256'
             }

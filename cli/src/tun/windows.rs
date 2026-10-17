@@ -250,8 +250,11 @@ pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
 /// Windows has no capability model; Wintun adapter creation needs Administrator.
 /// We can't self-elevate, so guide; the real check is the adapter-create error.
 pub fn ensure_net_admin_for_l3() -> bool {
-    eprintln!("  L3 on Windows needs Administrator (adapter creation) and wintun.dll beside tunlion.exe.");
-    eprintln!("  For the always-on service run `tunlion up --install`; for a kernel adapter run this shell as Administrator.");
+    eprintln!(
+        "  L3 on Windows needs Administrator (adapter creation) and wintun.dll beside tunlion.exe. \
+         For the always-on service run `tunlion up --install`; for a kernel adapter run this shell \
+         as Administrator."
+    );
     true
 }
 
