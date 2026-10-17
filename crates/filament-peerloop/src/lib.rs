@@ -39,6 +39,7 @@ pub mod limits;
 pub mod link_manager;
 pub mod liveness;
 pub mod local;
+pub mod mesh;
 mod petname;
 pub mod resilience;
 mod retry;

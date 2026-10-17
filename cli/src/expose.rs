@@ -200,8 +200,8 @@ pub use imp::Exposer;
 #[cfg(l3)]
 mod imp {
     use super::{load, Binding};
-    use crate::l3::L3;
     use anyhow::Result;
+    use filament_peerloop::mesh::{MeshListener, MeshTunnel};
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::Arc;
@@ -221,12 +221,12 @@ mod imp {
     /// against `expose.json` on demand. Keyed by port; each value pairs the binding
     /// that spawned the listener (to detect changes) with its task handle.
     pub struct Exposer {
-        l3: Arc<L3>,
+        l3: Arc<dyn MeshTunnel>,
         active: Mutex<HashMap<u16, (Binding, JoinHandle<()>)>>,
     }
 
     impl Exposer {
-        pub fn new(l3: Arc<L3>) -> Arc<Exposer> {
+        pub fn new(l3: Arc<dyn MeshTunnel>) -> Arc<Exposer> {
             Arc::new(Exposer { l3, active: Mutex::new(HashMap::new()) })
         }
 
@@ -279,7 +279,11 @@ mod imp {
             // Mode-agnostic listen on the overlay: a kernel TcpListener bound on the
             // overlay IP, or the userspace smoltcp listener (TUN-free). The accept +
             // splice below is identical either way.
-            let listener = self.l3.bind(b.port).await?;
+            let listener = self
+                .l3
+                .bind(b.port)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             let me = self.clone();
             let jh = tokio::spawn(async move {
                 loop {

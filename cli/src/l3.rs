@@ -33,17 +33,15 @@ use tokio::task::AbortHandle;
 use crate::net::Transport;
 use crate::overlay::{Announce, Identity};
 use crate::tun::{KernelTun, NetstackListener, NetstackStream, NetstackTun, TunDevice};
+use filament_peerloop::mesh::{MeshListener, MeshStream, MeshTunnel};
 
-/// How the overlay's packet endpoint is provided.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum L3Mode {
-    /// Kernel TUN when it can be created, else the userspace netstack. The default.
-    Auto,
-    /// Force the kernel TUN; fail if it can't be created.
-    Kernel,
-    /// Force the userspace smoltcp netstack (zero privilege; containers/CI/no-sudo).
-    Userspace,
-}
+/// How the overlay's packet endpoint is provided. Defined by the peer-loop
+/// crate so the receive loop can ask a host to start one without naming the
+/// CLI; re-exported here so existing callers keep resolving.
+pub use filament_peerloop::mesh::L3Mode;
+/// The pure mesh naming and route rules moved to the peer-loop crate. Kept as
+/// re-exports so this module and its tests still name them the same way.
+pub(crate) use filament_peerloop::mesh::{installable_routes, sanitize_host, short_host_label};
 
 /// A mode-agnostic accepted overlay connection: a kernel `TcpStream` (bound on the
 /// overlay IP) or a userspace smoltcp stream. Implements the same async byte-stream
@@ -217,16 +215,13 @@ pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
 }
 
 pub fn advertised_prefixes() -> Vec<String> {
-    crate::settings::get_str("advertise-routes", None)
-        .unwrap_or_default()
-        .split(',')
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .collect()
+    filament_peerloop::mesh::advertised_prefixes(
+        crate::settings::get_str("advertise-routes", None).as_deref(),
+    )
 }
 
 pub fn ifname() -> &'static str {
-    IFNAME
+    filament_peerloop::mesh::IFNAME
 }
 
 pub struct L3 {
@@ -937,6 +932,95 @@ impl L3 {
     }
 }
 
+/// The mesh packet endpoint, as the receive loop sees it. Every method forwards
+/// to the inherent one; the loop decides WHEN, the host only carries it out.
+#[async_trait::async_trait]
+impl MeshTunnel for L3 {
+    fn my_addr(&self) -> Option<Ipv6Addr> {
+        L3::my_addr(self)
+    }
+    fn my_addr_v4(&self) -> Option<Ipv4Addr> {
+        L3::my_addr_v4(self)
+    }
+    fn is_userspace(&self) -> bool {
+        L3::is_userspace(self)
+    }
+    fn identity_addrs(&self) -> Option<(Ipv6Addr, Ipv4Addr)> {
+        self.identity_ref().map(|id| (id.addr(), id.addr_v4()))
+    }
+    async fn names_insert(&self, pid: &str, name: &str, v6: Ipv6Addr, v4: Option<Ipv4Addr>) {
+        L3::names_insert(self, pid, name, v6, v4).await
+    }
+    async fn refresh_hosts(&self) {
+        L3::refresh_hosts(self).await
+    }
+    fn make_announce(&self, cb: &[u8]) -> Option<Announce> {
+        L3::make_announce(self, cb)
+    }
+    async fn rename_peer(&self, pid: &str, name: &str) -> bool {
+        L3::rename_peer(self, pid, name).await
+    }
+    async fn peers_with_transport(&self) -> Vec<(String, IpAddr, Arc<dyn Transport>)> {
+        L3::peers_with_transport(self).await
+    }
+    async fn reconcile_routes(&self) {
+        L3::reconcile_routes(self).await
+    }
+    async fn remove_by_pid(&self, pid: &str) {
+        L3::remove_by_pid(self, pid).await
+    }
+    async fn accept_seq(&self, pubkey: &[u8; 32], seq: u64) -> bool {
+        L3::accept_seq(self, pubkey, seq).await
+    }
+    async fn add_peer(
+        &self,
+        pid: &str,
+        who: &str,
+        v6: IpAddr,
+        v4: Option<Ipv4Addr>,
+        t: Arc<dyn Transport>,
+    ) {
+        L3::add_peer(self, pid, who, v6, v4.map(IpAddr::V4), t).await
+    }
+    async fn set_peer_subnets(&self, pid: &str, t: &Arc<dyn Transport>, cidrs: &[String]) {
+        L3::set_peer_subnets(self, pid, t, cidrs).await
+    }
+    async fn peer_overlay_of(&self, pid: &str) -> Option<IpAddr> {
+        L3::peer_overlay_of(self, pid).await
+    }
+    async fn addr_of(&self, name: &str) -> Option<Ipv6Addr> {
+        L3::addr_of(self, name).await
+    }
+    async fn dial(&self, dst: Ipv6Addr, port: u16) -> Result<Box<dyn MeshStream>, String> {
+        L3::dial(self, dst, port)
+            .await
+            .map(|s| Box::new(s) as Box<dyn MeshStream>)
+            .map_err(|e| e.to_string())
+    }
+    async fn bind(&self, port: u16) -> Result<Box<dyn MeshListener>, String> {
+        L3::bind(self, port)
+            .await
+            .map(|l| Box::new(l) as Box<dyn MeshListener>)
+            .map_err(|e| e.to_string())
+    }
+    async fn is_verified_peer(&self, addr: IpAddr) -> bool {
+        L3::is_verified_peer(self, addr).await
+    }
+    async fn petname_of(&self, addr: IpAddr) -> Option<String> {
+        L3::petname_of(self, addr).await
+    }
+}
+
+#[async_trait::async_trait]
+impl MeshListener for OverlayListener {
+    async fn accept(&self) -> Result<(Box<dyn MeshStream>, IpAddr), String> {
+        let (stream, src) = OverlayListener::accept(self)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((Box::new(stream), src))
+    }
+}
+
 /// Open the KERNEL TUN end to end: create the device AND install the overlay-prefix
 /// route (crypto mode). Both steps can fail in a container (no cap, no /dev/net/tun,
 /// no `ip`, locked netns); doing them together lets `L3Mode::Auto` catch ANY failure
@@ -983,25 +1067,6 @@ pub fn hostname() -> String {
     short_host_label(&crate::platform::os_hostname().unwrap_or_default())
 }
 
-/// `Kabir-MacBook.local` -> `kabir-macbook`: the first DNS label, lowercased,
-/// with anything outside [a-z0-9-] turned into `-`, so the name works as a
-/// `<name>.mesh` label. Falls back to "device" when nothing usable is left.
-pub(crate) fn short_host_label(host: &str) -> String {
-    let first = host.trim().split('.').next().unwrap_or("");
-    let mut label = String::new();
-    for c in first.chars() {
-        let c = c.to_ascii_lowercase();
-        let c = if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' };
-        if c == '-' && (label.is_empty() || label.ends_with('-')) {
-            continue;
-        }
-        label.push(c);
-    }
-    let label: String = label.trim_end_matches('-').chars().take(63).collect();
-    let label = label.trim_end_matches('-').to_string();
-    if label.is_empty() { "device".to_string() } else { label }
-}
-
 /// The OS hosts file for MagicDNS. Unix: /etc/hosts. Windows: the drivers\etc\hosts
 /// under %SystemRoot% (default C:\Windows), which the resolver consults like /etc/hosts.
 fn hosts_path() -> std::path::PathBuf {
@@ -1020,16 +1085,6 @@ fn hosts_path() -> std::path::PathBuf {
 /// (`<addr> <name>.mesh` per peer, both AAAA and A records). Atomic via
 /// temp-file + rename. An empty `entries` removes the block. Names are
 /// display-only; routing is always by the cryptographically-verified address.
-pub(crate) fn sanitize_host(name: &str) -> String {
-    // If name contains @, extract just the hostname part (user@host → host)
-    let base = name.split('@').last().unwrap_or(name);
-    let s: String = base
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' })
-        .collect();
-    s.trim_matches('-').to_string()
-}
-
 fn rewrite_hosts_block(entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)]) -> std::io::Result<()> {
     let path = hosts_path();
     let cur = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1159,41 +1214,6 @@ pub async fn run_point_to_point(
     }
     down.abort();
     Ok(())
-}
-
-/// Destination IP of a raw IP packet (v4 header dst at [16..20], v6 at [24..40]).
-/// `None` for a truncated or non-IP frame.
-/// Which advertised prefixes may actually be installed from one peer.
-///
-/// TWO GATES, both required, and they answer different questions:
-///
-/// - `accept_routes` is the RECEIVER's decision: "do I take routes from this
-///   device at all". Off by default, per peer.
-/// - `authorized` is the OWNER's decision, carried by a signed CAP_ROUTE grant
-///   naming that exact prefix as its resource.
-///
-/// Requiring both is not belt-and-braces. The grant says the owner designated
-/// this device to carry this prefix; accept-routes says this machine wants to
-/// route through it. A device can be legitimately granted a prefix that a given
-/// peer still has no business sending its traffic through, and a peer can want
-/// routes from a device the owner never authorized. Neither implies the other.
-///
-/// A verified signature on the advertisement is a THIRD, prior condition handled
-/// by the caller (`Announce::verify_routes`): it establishes who said it, which
-/// is what makes asking these two questions meaningful at all.
-pub(crate) fn installable_routes<F>(
-    advertised: &[String],
-    accept_routes: bool,
-    authorized: F,
-) -> Vec<String>
-where
-    F: Fn(&str) -> bool,
-{
-    if !accept_routes {
-        // Cheap and total: no grant can override the receiver declining.
-        return Vec::new();
-    }
-    advertised.iter().filter(|c| authorized(c)).cloned().collect()
 }
 
 /// Does `addr` fall inside the prefix `net/len`?

@@ -1199,6 +1199,7 @@ dependencies = [
  "async-trait",
  "filament-cap",
  "filament-id",
+ "filament-overlay",
  "filament-signal",
  "filament-transport",
  "quinn",

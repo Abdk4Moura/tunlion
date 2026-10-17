@@ -4411,6 +4411,7 @@ mod warm_identity_tests {
         devices: Vec<(String, String)>,
     }
 
+    #[async_trait::async_trait]
     impl HostServices for TestHost {
         fn settings_get_str(&self, _key: &str) -> Option<String> {
             None

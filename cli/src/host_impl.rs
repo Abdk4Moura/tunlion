@@ -19,6 +19,8 @@ use filament_cap::capability::{ActionCounts, GateDecision, ShadowCounts};
 use filament_peerloop::host::{
     CapGate, HostServices, Level, LogSink, PersistedPrincipal, StorageFailure, Tone,
 };
+#[cfg(l3)]
+use filament_peerloop::mesh::MeshTunnel;
 
 /// The terminal `ui` module, as a [`LogSink`].
 pub(crate) struct CliLog;
@@ -99,6 +101,7 @@ fn level_to_ui(level: Level) -> crate::ui::Level {
 /// The CLI's config/identity/filesystem facts, as [`HostServices`].
 pub(crate) struct CliHost;
 
+#[async_trait::async_trait]
 impl HostServices for CliHost {
     fn config_dir(&self) -> std::path::PathBuf {
         crate::settings::config_dir()
@@ -155,6 +158,47 @@ impl HostServices for CliHost {
     }
     fn fleet_rv_present(&self) -> bool {
         crate::fleet::rv().is_some()
+    }
+    #[cfg(l3)]
+    fn hostname(&self) -> String {
+        crate::l3::hostname()
+    }
+    fn overlay_identity(&self) -> Result<filament_overlay::Identity, String> {
+        crate::overlay::load_identity().map_err(|e| e.to_string())
+    }
+    fn overlay_pubkey(&self) -> Result<[u8; 32], String> {
+        crate::overlay::overlay_pubkey_bytes().map_err(|e| e.to_string())
+    }
+    fn overlay_sign_possession(&self, msg: &[u8]) -> Result<[u8; 64], String> {
+        crate::overlay::overlay_sign_possession(msg).map_err(|e| e.to_string())
+    }
+    #[cfg(l3)]
+    fn l3_start(
+        &self,
+        cidr: &str,
+        mtu: u32,
+        identity: Option<filament_overlay::Identity>,
+        mode: filament_peerloop::mesh::L3Mode,
+    ) -> Result<std::sync::Arc<dyn MeshTunnel>, String> {
+        let mesh = crate::l3::L3::start(cidr, mtu, identity, mode).map_err(|e| e.to_string())?;
+        Ok(mesh)
+    }
+    fn ssh_host_pubkeys(&self) -> Vec<String> {
+        crate::sshkeys::host_pubkeys()
+    }
+    fn install_authorized_key(&self, device: &str, pubkey: &str) -> Result<(), String> {
+        crate::sshkeys::install_authorized_key(device, pubkey).map_err(|e| e.to_string())
+    }
+    async fn restore_mounts(&self, server: &str, relay: bool) -> Result<(), String> {
+        crate::mount::restore_mounts(server, relay)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    fn is_mount_point(&self, local: &str) -> bool {
+        crate::mount::is_mount_point(local)
+    }
+    fn remove_mount(&self, local: &str) -> Result<(), String> {
+        crate::mount::remove_mount(local).map_err(|e| e.to_string())
     }
     fn ensure_self_genesis_header(&self, user_key: &crate::identity::UserKey) -> bool {
         crate::ensure_self_genesis_header(&self.config_dir(), user_key)
