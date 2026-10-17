@@ -66,7 +66,7 @@ use crate::{
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
     respond_to_identity_challenge, safe_create_part, safe_incoming_name, safe_resume_part,
     save_requests, sdnotify, session, shell_argv, shutdown, spawn_session_pumps, sshd,
-    sshd_listening, sshkeys, store_provisional_identity, subnet_forward, sweep_completed_streams,
+    sshd_listening, store_provisional_identity, subnet_forward, sweep_completed_streams,
     test_hooks, ui, verify_incoming, with_devices_mut,
 };
 // Unix-only daemon-control names, gated exactly like their definitions in
@@ -6371,7 +6371,7 @@ pub(crate) async fn recv_cmd(
                     // peer can't inject extra authorized_keys lines. Enforced here
                     // AND again inside install_authorized_key (defense in depth).
                     if cert_only {
-                        let hostkeys = sshkeys::host_pubkeys();
+                        let hostkeys = host.ssh_host_pubkeys();
                         let login = host.serving_user().unwrap_or_else(|| "root".into());
                         let ssh_port = v["ssh_port"]
                             .as_u64()
@@ -6393,7 +6393,7 @@ pub(crate) async fn recv_cmd(
                             .await;
                         continue;
                     }
-                    let pubkey = match sshkeys::validate_pubkey(&pubkey) {
+                    let pubkey = match authkeys_managed::validate_pubkey(&pubkey) {
                         Ok(k) => k,
                         Err(e) => {
                             log.say(&format!(
@@ -6408,9 +6408,9 @@ pub(crate) async fn recv_cmd(
                             continue;
                         }
                     };
-                    match sshkeys::install_authorized_key(&device, &pubkey) {
+                    match host.install_authorized_key(&device, &pubkey) {
                         Ok(()) => {
-                            let hostkeys = sshkeys::host_pubkeys();
+                            let hostkeys = host.ssh_host_pubkeys();
                             let login = host.serving_user().unwrap_or_else(|| "root".into());
                             // Tell the initiator whether an sshd is actually
                             // listening on the port `tunlion shell --ssh` will dial here,
