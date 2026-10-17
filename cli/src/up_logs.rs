@@ -564,6 +564,7 @@ pub(crate) async fn up_cmd(
         shell_policy,
         shell_user,
         no_proxy_fallback,
+        crate::host_impl::cli_log(),
     )
     .await;
     crate::file_io::remove_pidfile();

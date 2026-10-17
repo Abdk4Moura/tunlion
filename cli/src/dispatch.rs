@@ -745,6 +745,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     ShellPolicy::Granted,
                     None,
                     false,
+                    crate::host_impl::cli_log(),
                 )
                 .await;
                 // Refused files decide the outcome: all refused is the
