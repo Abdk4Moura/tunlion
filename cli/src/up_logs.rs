@@ -1464,13 +1464,9 @@ pub(crate) async fn connect_signaling_patiently(
                 ));
                 crate::sdnotify::status("waiting for network");
                 attempt = attempt.saturating_add(1);
-                tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        crate::file_io::remove_pidfile();
-                        crate::exit_codes::interrupted_exit(130);
-                    }
-                }
+                // The receive invocation's outer cancellation race covers both
+                // this backoff and the connect await; no process policy here.
+                tokio::time::sleep(wait).await;
             }
         }
     }

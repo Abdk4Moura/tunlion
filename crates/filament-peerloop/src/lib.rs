@@ -40,6 +40,7 @@ pub mod conn;
 pub mod consent;
 pub mod control;
 pub mod daemon_ctl;
+pub mod driver;
 pub mod holepunch;
 pub mod host;
 pub mod identity;
