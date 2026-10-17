@@ -583,6 +583,7 @@ pub(crate) async fn up_cmd(
         None,
         true,
         None, // the daemon has no deadline
+        None, // the daemon does not apply a one-shot expected digest
         relay,
         None,
         true,
