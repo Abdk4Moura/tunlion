@@ -50,7 +50,7 @@ integration step (owner: orchestrator, after the security core lands).
   What is this key for?
    ● (o) A device in my fleet       my own laptop / box / CI — permissive within scope   [Brand ●]
      ( ) An external share          give someone else narrow, time-boxed access
-     ( ) A CI / automation runner   single-use, pinned to one machine, then forgotten
+     ( ) A CI / automation runner   one machine by default; --reuse N for several, then forgotten
 ```
 
 ### 1c. "This key can… / cannot…" live summary (above the buttons)
@@ -83,7 +83,7 @@ CI / automation runner:
   ── This key can ──
    ✓ run one job on ci-box, then vanish
    ✗ persist · open a shell · reach other ports · join your mesh
-   single-use · pinned to ci-box · expires in 15m · ephemeral (no identity left behind)
+   single-use by default · pinned to ci-box · expires in 15m · ephemeral (no identity left behind)
 ```
 
 ### 1d. Deliberate-access region + type-to-confirm

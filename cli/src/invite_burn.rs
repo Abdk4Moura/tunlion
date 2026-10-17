@@ -1,7 +1,8 @@
 //! Used invitations, on disk, apart from any device record.
 //!
-//! An invitation says it is good for one use. The only thing that enforced that
-//! was `filament_cap::ephemeral::burn_auth_key`, whose own doc says "Burn is
+//! An invitation says how many times it may be used (once by default, or a
+//! bounded count, or until it expires). The only thing that enforced that was
+//! `filament_cap::ephemeral::burn_auth_key`, whose own doc says "Burn is
 //! process-local: a daemon restart clears all burn state". Measured on the
 //! launch candidate: a device joined with `beta.invite`, the owner forgot it and
 //! restarted its daemon (which the forget then needed, see revocation_live.rs),

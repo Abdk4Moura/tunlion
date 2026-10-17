@@ -45,7 +45,7 @@ COMMANDS
     requests               approve or deny access others asked for
     dashboard              devices, people, codes and asks in your browser
     grant / revoke         give or take a capability on a device
-    add --for runner       a temporary key for a CI or borrowed box; it runs `tunlion join <file>`
+    add --for runner       a temporary key for a CI or borrowed box; it runs `tunlion join <file>` (--reuse N for several)
     status                 what the daemon is doing / recently received
   Mesh
     addr                   show your overlay address (or a device's)
@@ -61,6 +61,8 @@ EXAMPLES
   tunlion send big.iso --to laptop  send to a remembered device, no code
   tunlion add                       offer a code; the other device runs `tunlion join <code>`
   tunlion add --for person          bounded invitation; the other device runs `tunlion join`
+  tunlion add --for runner --reuse 5 --out ci.key
+                                    up to five boxes claim it, each runs `tunlion join ci.key`
   tunlion up --install              always-on receiver (the daemon, autostart)
   tunlion shell laptop              open a shell on a known device
   tunlion reach laptop              check if a device is reachable
@@ -283,7 +285,22 @@ pub(crate) enum Cmd {
         background: bool,
     },
     /// Add a device or person with consent on both ends.
-    #[command(next_help_heading = "Connect")]
+    ///
+    /// `--reuse` makes a bounded invitation claimable by more than one machine
+    /// (or by the same machine again): `--reuse 5` admits up to five, and
+    /// `--reuse forever` keeps admitting until the invitation expires. Each
+    /// claimer generates its own device key, so this is five devices, not five
+    /// copies of one identity. The default is once, and a spoken pairing code
+    /// is always single-use.
+    #[command(
+        next_help_heading = "Connect",
+        after_help = "\x1b[1mExamples:\x1b[0m\n  \
+        tunlion add --for runner --out ci.key             one CI box claims it, then it is spent\n  \
+        tunlion add --for runner --reuse 5 --out ci.key   up to five boxes claim it\n  \
+        tunlion add --for device --out laptop.key         a lasting device; one claim by default\n  \
+        tunlion add --for person --reuse forever --out alice.key  claimable until it expires\n\n\
+        The claiming side always runs:  tunlion join <file>"
+    )]
     Add {
         /// Who you are adding: a name for the device or person. `tunlion add
         /// laptop` is the short way to say `--for laptop`, which means a device
@@ -322,6 +339,19 @@ pub(crate) enum Cmd {
         /// Invitation and joined certificate lifetime, such as 1h or 30d.
         #[arg(long)]
         expires: Option<String>,
+        /// How many machines may claim this bounded invitation: a count from 1
+        /// to 250, or `forever`. Default: once.
+        ///
+        /// Needs a bounded invitation (`--for ...`); a spoken pairing code is
+        /// always single-use. Without --out the invitation is written to the
+        /// default file, which is chosen from the invitee's name. Each machine
+        /// generates its own device key, so they are separate devices, not one
+        /// identity shared by several boxes.
+        ///
+        /// 250 is the format's limit, not a policy choice: the invitation
+        /// stores the count in one byte (0 is once, 255 is forever).
+        #[arg(long, value_name = "N|forever")]
+        reuse: Option<String>,
         /// Write the invitation to a new owner-only file instead of displaying it.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,

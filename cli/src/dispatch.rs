@@ -1145,9 +1145,17 @@ pub(crate) async fn async_main() -> Result<()> {
             for_,
             allow,
             expires,
+            reuse,
             out,
             via,
         } => {
+            // `--reuse` only means something for a bounded invitation artifact.
+            // Parse it before any prompt or mint so a typo, 0 or an
+            // unrepresentable count fails with exit 2 and nothing on disk.
+            let reuse = reuse
+                .as_deref()
+                .map(crate::add_for::parse_reuse)
+                .transpose()?;
             // `tunlion add laptop` == `tunlion add --for laptop`. `--for`
             // already accepts a device NAME (that is how --for my-laptop works),
             // so the positional needs no new meaning, only a shorter spelling of
@@ -1165,6 +1173,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 (None, f) => f,
             };
+            // A bare `add` offers an ordinary pair, which confers no lasting
+            // access: there is no invitation to reuse. Refuse rather than
+            // ignore the flag, because a silently single-use artifact is the
+            // exact failure this flag exists to remove.
+            crate::add_for::check_reuse_target(for_.is_some(), reuse.is_some())?;
             // `add` OFFERS. Accepting is `join`, which is the only spelling now:
             // `add <code>` was the second one, and per WORK-STATE's no-backward-
             // compat rule (no real users yet, clean breaks everywhere) a second
@@ -1181,7 +1194,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // everywhere and `--internal` is gone.
             if out.is_some() {
                 // Delivering as a file is the invitation ceremony, unchanged.
-                add_for_cmd(&ui_caps, for_, name, allow, expires, out).await
+                add_for_cmd(&ui_caps, for_, name, allow, expires, reuse, out).await
             } else if for_.is_some() {
                 // Same question, spoken-code transport. Resolving here (rather
                 // than inside the ceremony) means a script that omits the answer
@@ -1228,6 +1241,14 @@ pub(crate) async fn async_main() -> Result<()> {
                 // is skipping the questions safe, because only then were they going
                 // to be asked. Captured before `via` is shadowed below.
                 let via_defaulted = via.is_none() && out.is_none() && word.is_none();
+                // --word chooses the SPAKE2 words for a spoken code, and a code
+                // is a one-time ceremony. A caller who asked for both is
+                // contradicting themselves, not asking for one of them to win.
+                if reuse.is_some() && word.is_some() {
+                    crate::bail_usage!(
+                        "`--word` makes a spoken pairing code, which is used once; `--reuse` needs a bounded invitation file. Drop --word, or write the invitation with --out <path>."
+                    );
+                }
                 let via = match via.as_deref() {
                     Some("code") => Some("code".to_string()),
                     Some("file") => Some("file".to_string()),
@@ -1237,6 +1258,10 @@ pub(crate) async fn async_main() -> Result<()> {
                     // An unattended runner is never present to hear a code read
                     // out, so the question does not arise: it is always a file.
                     None if kind == "runner" => Some("file".to_string()),
+                    // `--reuse` is a property of an invitation artifact. A code
+                    // cannot carry it, so asking HOW would offer an answer that
+                    // then has to be refused. Answer it: file.
+                    None if reuse.is_some() => Some("file".to_string()),
                     // `add <name>` on a terminal: they are almost always both
                     // present, the code is the fast path, and the question only
                     // confirmed its default. Straight to the code; the file
@@ -1278,6 +1303,16 @@ pub(crate) async fn async_main() -> Result<()> {
                     None => Some("file".to_string()),
                 };
 
+                // What is left is an explicit --via code (or an interactive
+                // answer of "code" that --reuse could not suppress). Refuse
+                // before minting anything: the code ceremony has no place to
+                // carry a use count.
+                if reuse.is_some() && via.as_deref() != Some("file") {
+                    crate::bail_usage!(
+                        "a spoken pairing code is used once. `--reuse` needs a bounded invitation file: add --out <path>, or use --via file."
+                    );
+                }
+
                 // A runner is not a member: it gets a temporary KEY, which is
                 // what `ephemeral mint` was a separate verb for. Same two
                 // questions, third answer to the first one.
@@ -1287,7 +1322,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     // The kind is settled; the name rides along. --name used to
                     // be dropped here, so `add --for device --name b` made a
                     // device named after the joiner's hostname.
-                    return add_for_cmd(&ui_caps, Some(kind), invitee, allow, expires, Some(path)).await;
+                    return add_for_cmd(&ui_caps, Some(kind), invitee, allow, expires, reuse, Some(path)).await;
                 }
                 let internal = kind == "device";
                 crate::pair_cmd::FOR_PERSON

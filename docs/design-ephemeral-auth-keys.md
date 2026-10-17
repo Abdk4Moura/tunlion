@@ -150,7 +150,8 @@ is the real control. Best-effort gossip narrows the window.
 
 ## Use cases
 
-- **CI runner**: single-use-per-job, audience-pinned to the target peer,
+- **CI runner**: single-use per job by default (`--reuse N` when a small pool of
+  boxes shares one invitation), audience-pinned to the target peer,
   `[transfer]` or `[gpu-run]` caps, short expiry, ephemeral.
 - **Autoscaled worker**: reusable, audience-pinned, narrow caps, short expiry.
 - **lend-gpu GPU borrower**: ephemeral, `[gpu-run]` only, audience = the lender's
