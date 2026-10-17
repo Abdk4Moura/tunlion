@@ -557,6 +557,7 @@ pub(crate) async fn up_cmd(
         None,
         None,
         true,
+        None, // the daemon has no deadline
         relay,
         None,
         true,

@@ -695,11 +695,20 @@ pub(crate) async fn async_main() -> Result<()> {
             room,
             to,
             keep_open,
+            timeout,
             remember,
             output,
             background,
         } => {
             let dir = drop_dir(dir);
+            // A deadline and "keep listening" ask for opposite things. Refuse
+            // before opening anything rather than let one silently win.
+            if timeout.is_some() && keep_open {
+                return Err(crate::exit_codes::err(
+                    crate::exit_codes::ExitKind::Usage,
+                    "--timeout and --keep-open conflict: a deadline ends the receive, --keep-open keeps it alive. Drop one",
+                ));
+            }
             if background {
                 // 0.8.5: receive --background was a second name for `up --install`
                 // (the same call), created because `up` was hidden. `up` is now
@@ -738,6 +747,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     room,
                     to,
                     keep_open,
+                    timeout,
                     relay,
                     remember,
                     false,
