@@ -39,7 +39,9 @@ use crate::signaling_health;
 use filament_overlay::Announce;
 use filament_overlay::{b64, unb64};
 #[cfg(l3)]
-use crate::l3;
+use filament_peerloop::mesh::{
+    advertised_prefixes, installable_routes, sanitize_host, L3Mode, MeshTunnel, IFNAME,
+};
 #[cfg(l3)]
 use crate::{
     AdoptSource, Ceremony, Conn, DaemonMounts, Ev, IncomingFile, MAX_ATTEMPTS, MAX_VERIFY_FAILS,
@@ -57,7 +59,7 @@ use crate::{
     issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
     load_provisional_identity, load_requests, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
-    mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding, overlay,
+    mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding,
     owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz,
     principal_ceiling_for, prompt_line, proof_for, protocol, pwrite_at, quiet_exit_window,
     record_range, regex_lite_code, relay_banner, resolve_peer_identity,
@@ -1728,11 +1730,11 @@ pub(crate) async fn recv_cmd(
     #[cfg(l3)]
     let mut l3_seen: HashMap<String, Announce> = HashMap::new();
     #[cfg(l3)]
-    let l3: Option<std::sync::Arc<l3::L3>> = if daemon {
+    let l3: Option<std::sync::Arc<dyn MeshTunnel>> = if daemon {
         match host.settings_get_str("tun-addr") {
             Some(setting) => {
                 let (cidr, identity) = if setting == "auto" {
-                    match overlay::load_identity() {
+                    match host.overlay_identity() {
                         Ok(id) => (format!("{}/128", id.addr()), Some(id)),
                         Err(e) => {
                             log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
@@ -1749,11 +1751,11 @@ pub(crate) async fn recv_cmd(
                     // default Auto; TUNLION_L3_USERSPACE / `up --userspace` force
                     // userspace (handled inside L3::start via the env).
                     let mode = match host.settings_get_str("l3-mode").as_deref() {
-                        Some("kernel") => l3::L3Mode::Kernel,
-                        Some("userspace") => l3::L3Mode::Userspace,
-                        _ => l3::L3Mode::Auto,
+                        Some("kernel") => L3Mode::Kernel,
+                        Some("userspace") => L3Mode::Userspace,
+                        _ => L3Mode::Auto,
                     };
-                    match l3::L3::start(&cidr, 1280, identity, mode) {
+                    match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
                             let addr = m.my_addr().map(|a| a.to_string()).unwrap_or(cidr);
 
@@ -1766,7 +1768,9 @@ pub(crate) async fn recv_cmd(
                             // Same reader the announce paths use, so what the
                             // kernel is told to forward and what the wire
                             // advertises cannot diverge.
-                            let advertised: Vec<String> = crate::l3::advertised_prefixes();
+                            let advertised: Vec<String> = advertised_prefixes(
+                                host.settings_get_str("advertise-routes").as_deref(),
+                            );
                             if !advertised.is_empty() {
                                 if m.is_userspace() {
                                     log.say(&log.paint(
@@ -1778,7 +1782,7 @@ pub(crate) async fn recv_cmd(
                                     ));
                                 } else {
                                     let snat = host.settings_get_bool("route-snat");
-                                    match subnet_forward::enable(l3::ifname(), &advertised, snat) {
+                                    match subnet_forward::enable(IFNAME, &advertised, snat) {
                                         Ok(_applied) => log.say(&format!(
                                             "  {} carrying {} for peers{}",
                                             log.paint(Tone::Ok, log.glyph_ok()),
@@ -1886,10 +1890,10 @@ pub(crate) async fn recv_cmd(
                                     v4
                                 ));
                                 // Show the .mesh name that resolves to this machine.
-                                let my_name = l3::hostname();
+                                let my_name = host.hostname();
                                 log.say(&format!(
                                     "    this machine resolves as {}{}",
-                                    l3::sanitize_host(&my_name),
+                                    sanitize_host(&my_name),
                                     ".mesh"
                                 ));
                             }
@@ -1897,19 +1901,18 @@ pub(crate) async fn recv_cmd(
                             // `<name>.mesh` resolves locally (not just peers).
                             // Uses the tunlion device name (from `tunlion set name`
                             // or hostname if unset), sanitized for DNS.
-                            if let Some(id) = m.identity_ref() {
-                                let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
-                                let v6 = id.addr();
-                                let v4 = Some(id.addr_v4());
-                                m.names_insert("__self__", &l3::sanitize_host(&my_name), v6, v4)
+                            if let Some((v6, v4_addr)) = m.identity_addrs() {
+                                let my_name = config_get("name").unwrap_or_else(|| host.hostname());
+                                let v4 = Some(v4_addr);
+                                m.names_insert("__self__", &sanitize_host(&my_name), v6, v4)
                                     .await;
                                 if !m.is_userspace() {
                                     m.refresh_hosts().await;
                                 }
                                 // Configure sshd to listen on overlay addresses if enabled.
                                 if host.settings_get_bool("sshd-overlay") {
-                                    let v6_str = id.addr().to_string();
-                                    let v4_str = id.addr_v4().to_string();
+                                    let v6_str = v6.to_string();
+                                    let v4_str = v4_addr.to_string();
                                     if let Err(e) = sshd::configure_sshd_overlay(&v6_str, &v4_str) {
                                         log.say(&log.paint(
                                             Tone::Warn,
@@ -5372,7 +5375,7 @@ pub(crate) async fn recv_cmd(
                                         #[cfg(l3)]
                                         if let Some(l3) = l3.as_ref() {
                                             if l3
-                                                .rename_peer(&pid, &l3::sanitize_host(&shown))
+                                                .rename_peer(&pid, &sanitize_host(&shown))
                                                 .await
                                             {
                                                 l3.refresh_hosts().await;
@@ -5702,7 +5705,7 @@ pub(crate) async fn recv_cmd(
                                                         .collect();
                                                 let cap_entries = host.cap_store();
                                                 let cap_now = host.now_secs();
-                                                let ok = crate::l3::installable_routes(
+                                                let ok = installable_routes(
                                                     &advertised,
                                                     accept,
                                                     |cidr| {
