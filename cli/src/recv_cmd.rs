@@ -13,6 +13,16 @@
 //! the module path is gated the same way. The two traits used by method syntax
 //! (`anyhow::Context` for `.with_context`, `std::io::IsTerminal` for `.is_terminal`) are
 //! imported; the rest travel inside the body's own function-local `use`s.
+//!
+//! LOGGING: every log line in this file goes through the `LogSink` passed to
+//! `recv_cmd` (`log` here, `conn.log` in the split-out handlers), so a caller
+//! with no terminal can run the same loop with `NoLog`. The remaining `ui::`
+//! calls are NOT log lines: they are terminal presentation state owned by the
+//! next slice. They are `ui::clear_sticky` (tearing down the sticky status
+//! area), `ui::sticky_ask` (fronting a question there), `ui::Progress` (the
+//! transfer bars), `ui::clipboard` (OSC 52) and `ui::answer_echo` (landing a
+//! keystroke in raw mode). Anything that prints a message must stay on the
+//! sink, not here.
 use crate::dlog;
 use crate::signaling_health;
 #[cfg(l3)]
@@ -53,6 +63,7 @@ use crate::{
     warm_link_for,
 };
 use anyhow::{Context, Result, bail};
+use filament_peerloop::host::{Level, LogSink, Tone};
 use filament_transfer::{MAX_RECV_RANGES, chunk_fits_offer};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -200,8 +211,9 @@ async fn deny_unsettled(
     sid: u32,
     kind: ParkKind,
     reason: &str,
+    log: &dyn LogSink,
 ) {
-    crate::ui::say(&format!("l2: {kind:?} unsettled open denied: {reason}"));
+    log.say(&format!("l2: {kind:?} unsettled open denied: {reason}"));
     let _ = t
         .send_control(&serde_json::json!({ "type": "l2-close", "sid": sid, "err": reason }))
         .await;
@@ -211,12 +223,12 @@ async fn deny_unsettled(
 /// forgotten here while we ran) with the refusal, over signaling: no link is
 /// built for it, and its sender reports the reason at once instead of
 /// waiting out its establishment window.
-async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str) {
+async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str, log: &dyn LogSink) {
     let refusal = crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None);
     let mut data = json!({ "type": "not-recognized", "reason": refusal.reason });
     refusal.annotate(&mut data);
     let _ = sio.emit("signal", json!({ "to": pid, "data": data })).await;
-    ui::debug(&format!("refused a dial from {pid}: a device forgotten here"));
+    log.debug(&format!("refused a dial from {pid}: a device forgotten here"));
 }
 
 /// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
@@ -231,11 +243,17 @@ async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str) {
 /// before it destroys), and the next roster push, warm-hold tick or retry
 /// rung drives that peer again. A one-shot `receive` has exactly one sender,
 /// so there the error still ends the run, unchanged, with its exit code.
-fn peer_step<T>(daemon: bool, pid: &str, what: &str, r: Result<T>) -> Result<Option<T>> {
+fn peer_step<T>(
+    daemon: bool,
+    pid: &str,
+    what: &str,
+    r: Result<T>,
+    log: &dyn LogSink,
+) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
         Err(e) if daemon => {
-            ui::debug(&format!(
+            log.debug(&format!(
                 "tunlion: PEER-STEP-FAILED peer={pid} step={what}: {e:#}; the daemon keeps serving"
             ));
             Ok(None)
@@ -272,8 +290,8 @@ async fn retire_link_streams(
     }
 }
 
-fn log_ctl_rx<'a>(pid: &str, ty: Option<&'a str>) -> Option<&'a str> {
-    crate::ui::debug(&format!("ctl rx {} <- {pid}", ty.unwrap_or("?")));
+fn log_ctl_rx<'a>(pid: &str, ty: Option<&'a str>, log: &dyn LogSink) -> Option<&'a str> {
+    log.debug(&format!("ctl rx {} <- {pid}", ty.unwrap_or("?")));
     ty
 }
 
@@ -389,7 +407,7 @@ pub(crate) async fn park_on_deny(
     }
     let per_link = parked.iter().filter(|p| p.pid == pid).count();
     if !park_budget_ok(per_link, parked.len()) {
-        deny_unsettled(t, sid, kind, "identity settling, retry").await;
+        deny_unsettled(t, sid, kind, "identity settling, retry", conn.log.as_ref()).await;
         return true;
     }
     let ms = crate::identity_state::gate_settle_ms();
@@ -403,7 +421,7 @@ pub(crate) async fn park_on_deny(
         deadline: Instant::now() + Duration::from_millis(ms),
         settle_ms: ms,
     });
-    crate::ui::say(&format!(
+    conn.log.say(&format!(
         "l2: {kind:?} open parked {ms}ms for identity proof (gate said: {gate_reason})"
     ));
     true
@@ -569,7 +587,7 @@ async fn handle_forward_open(
         let diag = l2_deny_reason
             .as_deref()
             .unwrap_or("device not granted shell");
-        ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
+        conn.log.say(&format!("l2: refused stream {sid:#x}: {diag}"));
         let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
         // The gate's own cause when it is final (expired, revoked): a revoked
         // device used to be told "device lacks shell grant", which sent it to
@@ -632,10 +650,10 @@ async fn handle_forward_open(
                 // suppressed under -q) - a refused SSRF/port-scan or
                 // untrusted/over-cap open is a security event the
                 // operator should see, mirroring the
-                // shell-bootstrap-deny path (`ui::say`). Normal
+                // shell-bootstrap-deny path (`log.say`). Normal
                 // initiators always dial 127.0.0.1, so this is silent
                 // in normal operation and only fires on an anomaly.
-                ui::say(&format!("l2: refused stream {sid:#x}: {err}"));
+                conn.log.say(&format!("l2: refused stream {sid:#x}: {err}"));
                 let _ = t
                     .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
                     .await;
@@ -760,7 +778,7 @@ async fn handle_pty_open(
             return;
         }
         let who = dev.as_deref().unwrap_or("<unverified>");
-        ui::say(&format!(
+        conn.log.say(&format!(
             "l2: pty refused: {who}: {}",
             cap_reason.as_deref().unwrap_or("no shell cap / untrusted")
         ));
@@ -793,7 +811,7 @@ async fn handle_pty_open(
     {
         let refusal =
             crate::refusal::Refusal::new(crate::refusal::Code::UserDropUnavailable, dev.clone());
-        ui::say(&format!("l2: pty refused: {}", refusal.reason));
+        conn.log.say(&format!("l2: pty refused: {}", refusal.reason));
         let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
@@ -836,7 +854,7 @@ async fn handle_pty_open(
     // the new sid so typing and SIGWINCH reach the surviving PTY.
     if let Some(sess) = pty_sessions.get_live(&session_id).await {
         if mux.at_stream_cap().await {
-            ui::say("l2: pty reattach refused: too many streams on this link");
+            conn.log.say("l2: pty reattach refused: too many streams on this link");
             let _ = t
                 .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
                 .await;
@@ -846,7 +864,7 @@ async fn handle_pty_open(
         // a live forward/pty/mount sid) register refuses; deny the
         // reattach rather than displacing the existing stream.
         let Some(rx) = mux.register_stream(sid).await else {
-            ui::say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
+            conn.log.say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
             let _ = t
                 .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
                 .await;
@@ -866,7 +884,7 @@ async fn handle_pty_open(
             .or_default()
             .insert(sid, session_id.clone());
         spawn_session_pumps(sess.clone(), rx, rrx);
-        ui::say(&format!(
+        conn.log.say(&format!(
             "l2: pty REATTACHED to '{}', {cols}x{rows}",
             dev.unwrap_or_default()
         ));
@@ -886,14 +904,14 @@ async fn handle_pty_open(
     // PTY cap BEFORE spawning a shell. A flaky/hostile paired
     // device can otherwise flood `pty-open` and exhaust threads.
     if mux.at_stream_cap().await {
-        ui::say("l2: pty refused: too many streams on this link");
+        conn.log.say("l2: pty refused: too many streams on this link");
         let _ = t
             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
             .await;
         return;
     }
     let Some(pty_guard) = l2::PtyGuard::try_acquire() else {
-        ui::say(&format!(
+        conn.log.say(&format!(
             "l2: pty refused: too many PTYs (global cap {})",
             l2::MAX_PTYS_GLOBAL
         ));
@@ -906,7 +924,7 @@ async fn handle_pty_open(
     // displace) if the peer named an already-live sid. `pty_guard`
     // drops on `continue`, freeing the global PTY slot it reserved.
     let Some(rx) = mux.register_stream(sid).await else {
-        ui::say(&format!("l2: pty refused: sid {sid:#x} in use"));
+        conn.log.say(&format!("l2: pty refused: sid {sid:#x} in use"));
         let _ = t
             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
             .await;
@@ -958,7 +976,7 @@ async fn handle_pty_open(
                 .or_default()
                 .insert(sid, session_id.clone());
             spawn_session_pumps(sess, rx, rrx);
-            ui::say(&format!(
+            conn.log.say(&format!(
                 "l2: pty granted to '{}', {cols}x{rows}",
                 dev.unwrap_or_default()
             ));
@@ -1100,6 +1118,10 @@ pub(crate) async fn recv_cmd(
     // means the PTY runs as the up-process user (documented root risk).
     mut shell_user: Option<String>,
     no_proxy_fallback: bool,
+    // Where this loop says what it is doing. The CLI hands it the terminal
+    // sink; a caller with no terminal hands it `NoLog` and every line below
+    // still formats, but nothing is printed.
+    log: Arc<dyn LogSink>,
 ) -> Result<()> {
     let opened_flow =
         !daemon && interactive_allowed() && (code.is_none() || interactive_requested());
@@ -1112,7 +1134,7 @@ pub(crate) async fn recv_cmd(
     if daemon {
         if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
             if ensure_self_genesis_header(&crate::settings::config_dir(), &uk) {
-                ui::debug("seeded owner self genesis capability header");
+                log.debug("seeded owner self genesis capability header");
             }
         }
     }
@@ -1123,8 +1145,8 @@ pub(crate) async fn recv_cmd(
     // An explicit --room (or --to) already says where to meet: asking for a
     // code there contradicted the flag the user typed.
     if !daemon && code.is_none() && room.is_none() && to.is_none() && interactive_allowed() {
-        ui::say(&ui::paint(
-            ui::Tone::Dim,
+        log.say(&log.paint(
+            Tone::Dim,
             "  enter a code to connect to a specific person, or press enter to use the local network",
         ));
         match codeentry::run("  receive / code  ", codeentry::Mode::Claim, "", "")? {
@@ -1139,7 +1161,7 @@ pub(crate) async fn recv_cmd(
     }
     if opened_flow {
         eprintln!();
-        eprintln!("  {}", ui::paint(ui::Tone::Brand, "RECEIVE"));
+        eprintln!("  {}", log.paint(Tone::Brand, "RECEIVE"));
         eprintln!(
             "  from     {}",
             to.as_deref().unwrap_or(if code.is_some() {
@@ -1336,6 +1358,7 @@ pub(crate) async fn recv_cmd(
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
             ctl_ready = Some(ready_rx);
             let ctl_tx = ctl_tx.clone();
+            let log = log.clone();
             tokio::spawn(async move {
                 if let Err(e) =
                     ctl::serve_at(crate::ctl::control_sock_path(), ctl_tx, Some(ready_tx)).await
@@ -1353,7 +1376,7 @@ pub(crate) async fn recv_cmd(
                     // FATAL now, not a log line: the startup below waits on the
                     // readiness signal this task drops, and stops the daemon with
                     // this reason. A daemon nobody can talk to is not "up".
-                    crate::ui::critical(&format!(
+                    log.critical(&format!(
                         "tunlion: control socket unavailable: {e}\n  \
                          without it, `status`, `set`, warm links, `tunlion requests` and \
                          instant invitations cannot reach this daemon, so it will not start"
@@ -1411,9 +1434,9 @@ pub(crate) async fn recv_cmd(
                 }
             }
             if crate::armed::is_armed() {
-                ui::debug("enrollment armed: ephemeral devices may enroll");
+                log.debug("enrollment armed: ephemeral devices may enroll");
             } else {
-                ui::debug("enrollment closed (no armed keys: mint or arm an auth-key to open)");
+                log.debug("enrollment closed (no armed keys: mint or arm an auth-key to open)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             let mut c = chans;
@@ -1440,23 +1463,23 @@ pub(crate) async fn recv_cmd(
             }
             sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
             sess.channels = c;
-            ui::say(&format!(
+            log.say(&format!(
                 "  {} tunlion up, {} known device{} {} {}",
-                ui::paint(ui::Tone::Brand, "●"),
+                log.paint(Tone::Brand, "●"),
                 devices.len(),
                 if devices.len() == 1 { "" } else { "s" },
-                ui::glyph_arrow(),
-                ui::paint(ui::Tone::Bold, &dir.display().to_string()),
+                log.glyph_arrow(),
+                log.paint(Tone::Bold, &dir.display().to_string()),
             ));
-            ui::say(&ui::paint(
-                ui::Tone::Dim,
+            log.say(&log.paint(
+                Tone::Dim,
                 "  trusted devices only · invisible to strangers · Ctrl-C or `tunlion down` to stop",
             ));
             // C29: this is a SESSION, like a browser tab, pairing and petname
             // management happen right here.
             if std::io::stdin().is_terminal() {
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
+                log.say(&log.paint(
+                    Tone::Dim,
                     "  type a code to pair a new device · `pair` mints one · `devices` · `forget <name>`",
                 ));
             }
@@ -1469,16 +1492,16 @@ pub(crate) async fn recv_cmd(
             };
             // C22: proactive affordance, tell the user what they CAN do,
             // cargo-style gutter, before they have to guess.
-            ui::say(&format!(
+            log.say(&format!(
                 "  {} listening, same-network devices appear automatically  {}",
-                ui::paint(ui::Tone::Brand, "●"),
-                ui::paint(
-                    ui::Tone::Dim,
+                log.paint(Tone::Brand, "●"),
+                log.paint(
+                    Tone::Dim,
                     &format!("(room {room} · dir {})", dir.display())
                 ),
             ));
-            ui::say(&ui::paint(
-                ui::Tone::Dim,
+            log.say(&log.paint(
+                Tone::Dim,
                 "  have a code? just type it here (like brave-otter-123) and press Enter",
             ));
             sess.room = Some(room.clone());
@@ -1491,7 +1514,7 @@ pub(crate) async fn recv_cmd(
             // C12: announce on every known device's presence channel
             if !devices.is_empty() {
                 let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
-                ui::say(&format!("watching for {} known device(s)", devices.len()));
+                log.say(&format!("watching for {} known device(s)", devices.len()));
                 sess.emit(&sio, "subscribe", json!({ "channels": chans }))
                     .await;
             }
@@ -1537,7 +1560,7 @@ pub(crate) async fn recv_cmd(
         // initiator). See `direct_ok_for`. One-shot send/recv/pair (daemon=false)
         // are unaffected and keep their WebRTC default.
         direct_ok_for(daemon, l2_enabled),
-        crate::host_impl::cli_log(),
+        log.clone(),
         crate::host_impl::cli_host(),
     );
     // WARM-HOLD: load configured warm-peers at daemon startup
@@ -1651,7 +1674,7 @@ pub(crate) async fn recv_cmd(
                     match overlay::load_identity() {
                         Ok(id) => (format!("{}/128", id.addr()), Some(id)),
                         Err(e) => {
-                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  L3 disabled: {e}")));
+                            log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
                             (String::new(), None)
                         }
                     }
@@ -1685,8 +1708,8 @@ pub(crate) async fn recv_cmd(
                             let advertised: Vec<String> = crate::l3::advertised_prefixes();
                             if !advertised.is_empty() {
                                 if m.is_userspace() {
-                                    ui::say(&ui::paint(
-                                        ui::Tone::Warn,
+                                    log.say(&log.paint(
+                                        Tone::Warn,
                                         &format!(
                                             "  advertise-routes is set ({}) but L3 is in userspace mode; a subnet router needs the kernel TUN, so nothing is being carried",
                                             advertised.join(", ")
@@ -1695,16 +1718,16 @@ pub(crate) async fn recv_cmd(
                                 } else {
                                     let snat = settings::get_bool("route-snat", None);
                                     match subnet_forward::enable(l3::ifname(), &advertised, snat) {
-                                        Ok(_applied) => ui::say(&format!(
+                                        Ok(_applied) => log.say(&format!(
                                             "  {} carrying {} for peers{}",
-                                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                            log.paint(Tone::Ok, log.glyph_ok()),
                                             advertised.join(", "),
                                             if snat { " (masqueraded)" } else { "" }
                                         )),
                                         // LOUD, not swallowed: a router that cannot
                                         // forward must not look like one that can.
-                                        Err(e) => ui::say(&ui::paint(
-                                            ui::Tone::Err,
+                                        Err(e) => log.say(&log.paint(
+                                            Tone::Err,
                                             &format!(
                                                 "  cannot carry {}: {e}",
                                                 advertised.join(", ")
@@ -1714,16 +1737,16 @@ pub(crate) async fn recv_cmd(
                                 }
                             }
                             if m.is_userspace() {
-                                ui::say(&format!(
+                                log.say(&format!(
                                     "  {} L3 overlay {} (userspace, zero privilege)",
-                                    ui::paint(ui::Tone::Brand, "●"),
+                                    log.paint(Tone::Brand, "●"),
                                     addr
                                 ));
-                                ui::say(&ui::paint(
-                                    ui::Tone::Warn,
+                                log.say(&log.paint(
+                                    Tone::Warn,
                                     "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access",
                                 ));
-                                ui::say(
+                                log.say(
                                     "    native tools reach <peer>.mesh via `tunlion forward <peer>:<port> --socks` (no kernel route in userspace)",
                                 );
                                 // Auto-start SOCKS5 proxy when kernel TUN is unavailable.
@@ -1745,6 +1768,7 @@ pub(crate) async fn recv_cmd(
                                         Ok((listener, port, tok)) => {
                                             crate::proxy_state::record("127.0.0.1", port);
                                             let server = server.to_string();
+                                            let log = log.clone();
                                             tokio::spawn(async move {
                                                 if let Err(e) = l2::proxy_serve(
                                                     &server,
@@ -1757,7 +1781,7 @@ pub(crate) async fn recv_cmd(
                                                 )
                                                 .await
                                                 {
-                                                    ui::critical(&format!(
+                                                    log.critical(&format!(
                                                         "auto-proxy on 127.0.0.1:{port} stopped: {e}"
                                                     ));
                                                 }
@@ -1767,19 +1791,19 @@ pub(crate) async fn recv_cmd(
                                             } else {
                                                 " (1080 was taken)".to_string()
                                             };
-                                            ui::say(&format!(
+                                            log.say(&format!(
                                                 "  {} started SOCKS5 proxy on 127.0.0.1:{port}{note} (set your tools' proxy to this)",
-                                                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                                log.paint(Tone::Ok, log.glyph_ok())
                                             ));
                                             // The proxy opens mesh streams as this owner, so it
                                             // requires the password in the token file; the
                                             // proxy's own banner prints how to pass it.
                                             for line in l2::proxy_usage_lines("127.0.0.1", port) {
-                                                ui::say(&format!("  {line}"));
+                                                log.say(&format!("  {line}"));
                                             }
                                         }
-                                        Err(why) => ui::say(&ui::paint(
-                                            ui::Tone::Warn,
+                                        Err(why) => log.say(&log.paint(
+                                            Tone::Warn,
                                             &format!(
                                                 "  no SOCKS5 proxy: {why}. To run one on a free port: `tunlion forward <device>:<port> --socks --port <free port>`"
                                             ),
@@ -1794,15 +1818,15 @@ pub(crate) async fn recv_cmd(
                                     .my_addr_v4()
                                     .map(|a| format!(" / {a}"))
                                     .unwrap_or_default();
-                                ui::say(&format!(
+                                log.say(&format!(
                                     "  {} L3 overlay {}{} on tunlion0",
-                                    ui::paint(ui::Tone::Brand, "●"),
+                                    log.paint(Tone::Brand, "●"),
                                     addr,
                                     v4
                                 ));
                                 // Show the .mesh name that resolves to this machine.
                                 let my_name = l3::hostname();
-                                ui::say(&format!(
+                                log.say(&format!(
                                     "    this machine resolves as {}{}",
                                     l3::sanitize_host(&my_name),
                                     ".mesh"
@@ -1826,8 +1850,8 @@ pub(crate) async fn recv_cmd(
                                     let v6_str = id.addr().to_string();
                                     let v4_str = id.addr_v4().to_string();
                                     if let Err(e) = sshd::configure_sshd_overlay(&v6_str, &v4_str) {
-                                        ui::say(&ui::paint(
-                                            ui::Tone::Warn,
+                                        log.say(&log.paint(
+                                            Tone::Warn,
                                             &format!("  sshd-overlay: {e}"),
                                         ));
                                     }
@@ -1836,7 +1860,7 @@ pub(crate) async fn recv_cmd(
                             Some(m)
                         }
                         Err(e) => {
-                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  L3 disabled: {e}")));
+                            log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
                             None
                         }
                     }
@@ -1865,15 +1889,15 @@ pub(crate) async fn recv_cmd(
             let ex = expose::Exposer::new(m.clone());
             let n = ex.reconcile().await;
             if n > 0 {
-                ui::say(&format!(
+                log.say(&format!(
                     "  {} exposing {} port{} on the overlay",
-                    ui::paint(ui::Tone::Brand, "●"),
+                    log.paint(Tone::Brand, "●"),
                     n,
                     if n == 1 { "" } else { "s" }
                 ));
                 if m.is_userspace() {
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
+                    log.say(&log.paint(
+                        Tone::Dim,
                         "    (userspace overlay: paired peers reach these directly; the host firewall does not filter them)",
                     ));
                 }
@@ -2109,7 +2133,7 @@ pub(crate) async fn recv_cmd(
 
     // Restore mounts that were marked with auto_restore.
     if let Err(e) = mount::restore_mounts(server, relay).await {
-        crate::ui::say(&format!("warning: failed to restore mounts: {e}"));
+        log.say(&format!("warning: failed to restore mounts: {e}"));
     }
 
     loop {
@@ -2210,7 +2234,7 @@ pub(crate) async fn recv_cmd(
             }
         }
         if daemon {
-            loop_watchdog::tick();
+            loop_watchdog::tick(log.clone());
         }
         let ev = tokio::select! {
             biased;
@@ -2276,7 +2300,7 @@ pub(crate) async fn recv_cmd(
                             let supervised = std::env::var("INVOCATION_ID").is_ok();
                             req.reply(&json!({ "ok": true, "reloading": supervised })).await;
                             if supervised {
-                                ui::say("tunlion: reloading onto the updated binary (graceful restart)");
+                                log.say("tunlion: reloading onto the updated binary (graceful restart)");
                                 #[cfg(unix)]
                                 unsafe { libc::raise(libc::SIGTERM); }
                             }
@@ -2418,7 +2442,7 @@ pub(crate) async fn recv_cmd(
                                         .await
                                         .is_ok();
                                     if sent {
-                                        ui::debug(&format!(
+                                        log.debug(&format!(
                                             "fleet-rendezvous: brokered for '{name}' over pid={pid}"
                                         ));
                                         req.reply(&json!({ "ok": true, "secret": secret })).await;
@@ -2513,7 +2537,7 @@ pub(crate) async fn recv_cmd(
                 // window, and the daemon keeps serving everyone else (its
                 // .part stays for a later resume). A one-shot ends here.
                 Ok(Err(e)) if daemon && conn.rejoin.waiting_rejoin.is_some() => {
-                    ui::debug(&format!(
+                    log.debug(&format!(
                         "tunlion: rejoin window closed ({e:#}); the daemon keeps serving"
                     ));
                     conn.rejoin.waiting_rejoin = None;
@@ -2582,7 +2606,7 @@ pub(crate) async fn recv_cmd(
                 // this failure for hours: the peer answered no challenge at all
                 // (it is usually still re-establishing), as opposed to answering
                 // with something we rejected.
-                crate::ui::say(&format!(
+                log.say(&format!(
                     "l2: {:?} open timed out settling ({}ms); denying -- {} answered no possession challenge",
                     p.kind, p.settle_ms, p.pid,
                 ));
@@ -2597,7 +2621,7 @@ pub(crate) async fn recv_cmd(
                             .await;
                     }
                 } else {
-                    crate::ui::say(&format!(
+                    log.say(&format!(
                         "l2: {:?} open expired on a replaced link; not answering",
                         p.kind
                     ));
@@ -2613,7 +2637,7 @@ pub(crate) async fn recv_cmd(
                 conn.drop_link(&p.pid);
             }
             for (p, reason) in stale {
-                crate::ui::say(&format!("l2: {:?} open dropped: {reason}", p.kind));
+                log.say(&format!("l2: {:?} open dropped: {reason}", p.kind));
                 if conn.link(&p.pid).map(|l| l.generation) == Some(p.generation) {
                     if let Some(t) = conn.transport_of(&p.pid) {
                         let _ = t
@@ -2682,7 +2706,7 @@ pub(crate) async fn recv_cmd(
                         )
                         .await
                         {
-                            crate::ui::debug(&format!(
+                            log.debug(&format!(
                                 "settle: re-sent the held identity challenge to {}",
                                 p.pid
                             ));
@@ -2722,7 +2746,7 @@ pub(crate) async fn recv_cmd(
                 });
             }
             for p in fire {
-                crate::ui::say(&format!("l2: {:?} open proven; re-driving", p.kind));
+                log.say(&format!("l2: {:?} open proven; re-driving", p.kind));
                 let Some(t) = conn.transport_of(&p.pid) else {
                     crate::conn::dropped_no_transport(&p.pid, &format!("parked {:?} open", p.kind));
                     continue;
@@ -2865,7 +2889,7 @@ pub(crate) async fn recv_cmd(
                 st.recv_deadlines.remove(&pid);
                 st.recv_cers.remove(&pid);
                 st.recv_pending_offers.remove(&pid);
-                ui::debug(&format!(
+                log.debug(&format!(
                     "recv: candidate {pid} did not authenticate in budget, dropped"
                 ));
             }
@@ -2905,7 +2929,7 @@ pub(crate) async fn recv_cmd(
                         saw_down = true;
                         down_reason = reason.clone();
                     } else {
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "  signaling: ignoring the close of replaced connection {closed} ({reason}); current is {}",
                             sio.id()
                         ));
@@ -2998,7 +3022,7 @@ pub(crate) async fn recv_cmd(
                         &format!("signaling link {why}, reconnecting..."),
                         now,
                     ) {
-                        ui::say(&ui::paint(ui::Tone::Warn, &line));
+                        log.say(&log.paint(Tone::Warn, &line));
                     }
                     sdnotify::status("signaling down - reconnecting");
                 }
@@ -3055,14 +3079,14 @@ pub(crate) async fn recv_cmd(
                             "signaling reconnected, re-announcing presence",
                             Instant::now(),
                         ) {
-                            ui::say(&ui::paint(ui::Tone::Ok, &line));
+                            log.say(&log.paint(Tone::Ok, &line));
                         }
                         sdnotify::status("up - serving");
                     }
                     Err(e) => {
                         // DEBUG, resilience internal (signaling reconnect retry).
-                        ui::debug(&ui::paint(
-                            ui::Tone::Dim,
+                        log.debug(&log.paint(
+                            Tone::Dim,
                             &format!(
                                 "  signaling reconnect failed ({e}), retrying in {}ms",
                                 reconnect_wait.as_millis()
@@ -3109,7 +3133,7 @@ pub(crate) async fn recv_cmd(
                 .map(|(pid, _)| pid.clone())
                 .collect();
             for pid in dead {
-                ui::debug(&format!(
+                log.debug(&format!(
                     "tunlion: link to '{pid}' died, dropping so it can re-connect"
                 ));
                 conn.drop_link(&pid);
@@ -3157,9 +3181,9 @@ pub(crate) async fn recv_cmd(
             last_sweep = Instant::now();
             let lapsed = devices_sweep_lapsed(crate::identity::now_secs());
             if lapsed > 0 {
-                ui::say(&format!(
+                log.say(&format!(
                     "{} {lapsed} device(s) lapsed (offline past their budget)",
-                    ui::paint(ui::Tone::Warn, ui::glyph_warn())
+                    log.paint(Tone::Warn, log.glyph_warn())
                 ));
             }
         }
@@ -3201,7 +3225,7 @@ pub(crate) async fn recv_cmd(
                             Ok(v) => v,
                             Err(e) => {
                                 crate::wg::release_attempt(&addr.to_string());
-                                ui::debug(&format!("  wg: cannot bring up the interface ({e})"));
+                                log.debug(&format!("  wg: cannot bring up the interface ({e})"));
                                 continue;
                             }
                         };
@@ -3215,7 +3239,7 @@ pub(crate) async fn recv_cmd(
                                 "port": port,
                             }))
                             .await;
-                        ui::debug(&format!("  wg: announced our key to {who}"));
+                        log.debug(&format!("  wg: announced our key to {who}"));
                     }
                 }
             }
@@ -3287,7 +3311,7 @@ pub(crate) async fn recv_cmd(
                 .collect();
             for local in dead_locals {
                 if let Some(entry) = daemon_mounts.entries.remove(&local) {
-                    ui::say(&format!(
+                    log.say(&format!(
                         "mount {local} is gone, removing from daemon tracking (was {}:{})",
                         entry.peer, entry.remote
                     ));
@@ -3420,7 +3444,7 @@ pub(crate) async fn recv_cmd(
                         fleet_greeted.remove(pid);
                         fleet_deferred_offers.retain(|(p, _, _)| p != pid);
                         unrouted.push(pid.clone());
-                        ui::say(&format!(
+                        log.say(&format!(
                             "closed the link to '{label}': it was forgotten or revoked here"
                         ));
                     }
@@ -3473,7 +3497,7 @@ pub(crate) async fn recv_cmd(
                     .collect();
                 for (pid, label) in ended {
                     expired_unrouted.insert(pid.clone());
-                    ui::say(&format!(
+                    log.say(&format!(
                         "access for '{label}' ended (its invitation expired): refusing it from here on"
                     ));
                     #[cfg(l3)]
@@ -3490,7 +3514,7 @@ pub(crate) async fn recv_cmd(
             for (n, s) in devices_load() {
                 let ch = channel_of(&s);
                 if known_channels.insert(ch.clone()) {
-                    ui::say(&format!("new device '{n}' paired, now reachable"));
+                    log.say(&format!("new device '{n}' paired, now reachable"));
                     devices.push((n, s));
                     new_chans.push(ch);
                 }
@@ -3521,7 +3545,7 @@ pub(crate) async fn recv_cmd(
                 .collect();
             fleet_deferred_offers.retain(|(_, _, dl)| now <= *dl);
             for (p, mut ov, _) in due {
-                ui::debug(&format!(
+                log.debug(&format!(
                     "fleet: offer from {p} waited out its grace unverified; deciding it"
                 ));
                 ov["__fleet_waited"] = serde_json::Value::Bool(true);
@@ -3542,7 +3566,7 @@ pub(crate) async fn recv_cmd(
             let adopted = conn.maybe_adopt(&info, true).await.with_context(|| {
                 format!("direct fallback adoption failed for peer {pid} on receive path")
             });
-            peer_step(daemon, &pid, "direct fallback adoption", adopted)?;
+            peer_step(daemon, &pid, "direct fallback adoption", adopted, log.as_ref())?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
@@ -3699,7 +3723,7 @@ pub(crate) async fn recv_cmd(
             && !conn.links.is_empty()
             && conn.only_deferred_links()
         {
-            ui::say(&format!(
+            log.say(&format!(
                 "done ({} file{}).",
                 st.completed,
                 if st.completed == 1 { "" } else { "s" }
@@ -3724,7 +3748,7 @@ pub(crate) async fn recv_cmd(
         {
             conn.rejoin.waiting_rejoin = None;
             ui::clear_sticky();
-            ui::say(&format!(
+            log.say(&format!(
                 "done ({} file{}).",
                 st.completed,
                 if st.completed == 1 { "" } else { "s" }
@@ -3800,8 +3824,8 @@ pub(crate) async fn recv_cmd(
             match last_quiet {
                 None => last_quiet = Some(Instant::now()),
                 Some(since) if since.elapsed() > quiet_window => {
-                    ui::say(&ui::paint(ui::Tone::Dim, why));
-                    ui::say(&format!(
+                    log.say(&log.paint(Tone::Dim, why));
+                    log.say(&format!(
                         "done ({} file{}).",
                         st.completed,
                         if st.completed == 1 { "" } else { "s" }
@@ -3834,7 +3858,7 @@ pub(crate) async fn recv_cmd(
                             qv["size"].as_u64().unwrap_or(0),
                             paired,
                         );
-                        ui::say(&q); // permanent: a new question fronted (C25)
+                        log.say(&q); // permanent: a new question fronted (C25)
                         ui::sticky_ask(&q);
                         st.question_shown = Instant::now();
                     }
@@ -3858,7 +3882,7 @@ pub(crate) async fn recv_cmd(
             // rides its own stream; the dropped link had no working stream).
             Ev::DropLink(pid) => {
                 if conn.links.contains_key(&pid) {
-                    ui::debug(&format!(
+                    log.debug(&format!(
                         "tunlion: dropping zombie warm link to '{pid}' (black-holed a stream)"
                     ));
                     conn.drop_link(&pid);
@@ -3898,9 +3922,9 @@ pub(crate) async fn recv_cmd(
             Ev::PairMatched(v) => {
                 claim_in_flight = false;
                 let room = v["room"].as_str().unwrap_or_default().to_string();
-                ui::say(&format!(
+                log.say(&format!(
                     "  {} code accepted, joining sender",
-                    ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                    log.paint(Tone::Ok, log.glyph_ok())
                 ));
                 sess.room = Some(room.clone()); // C30: desire moves; session repairs if the join dies
                 sess.touch();
@@ -3943,7 +3967,7 @@ pub(crate) async fn recv_cmd(
                             // Channel-digest recovery remains intentionally outside
                             // the room give-up suppression scope.
                             let r = conn.maybe_adopt(p, true).await;
-                            peer_step(daemon, &pid, "channel-digest adoption", r)?;
+                            peer_step(daemon, &pid, "channel-digest adoption", r, log.as_ref())?;
                             if let Some(l) = conn.link_mut(&pid) {
                                 l.expected_secret = Some((name, secret));
                             }
@@ -3955,7 +3979,7 @@ pub(crate) async fn recv_cmd(
                             if p["channel"].as_str() == Some(enroll_channel.as_str()) {
                                 let r = conn.maybe_adopt(p, true).await;
                                 let pid = p["id"].as_str().unwrap_or_default();
-                                peer_step(daemon, pid, "enrollment-digest adoption", r)?;
+                                peer_step(daemon, pid, "enrollment-digest adoption", r, log.as_ref())?;
                             }
                         }
                     }
@@ -3987,9 +4011,9 @@ pub(crate) async fn recv_cmd(
                         // ○ alpha left (channel digest reconcile), still listening", one
                         // peer both present and gone, with an internal reason.
                         if crate::conn::departure_is_news(&name, conn.links.values().map(|l| l.name.as_str())) {
-                            ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left, still listening", &name));
+                            log.say(&conn.roster(&pid, "○", Tone::Dim, "left, still listening", &name));
                         } else {
-                            ui::debug(&format!("dropped a stale duplicate link to '{name}' (channel digest reconcile)"));
+                            log.debug(&format!("dropped a stale duplicate link to '{name}' (channel digest reconcile)"));
                         }
                     }
                     let peers = roster.peers;
@@ -4002,12 +4026,12 @@ pub(crate) async fn recv_cmd(
                     for p in &peers {
                         let id = p["id"].as_str().unwrap_or_default();
                         if !id.is_empty() && !conn.links.contains_key(id) {
-                            ui::debug(&ui::paint(
-                                ui::Tone::Dim,
+                            log.debug(&log.paint(
+                                Tone::Dim,
                                 "  (digest: adopting a peer we never heard join)",
                             ));
                             let r = conn.maybe_adopt_from(p, true, AdoptSource::Digest).await;
-                            peer_step(daemon, id, "digest adoption", r)?;
+                            peer_step(daemon, id, "digest adoption", r, log.as_ref())?;
                         }
                     }
                     // known room-sourced link absent ×2 → a peer-left we
@@ -4044,9 +4068,9 @@ pub(crate) async fn recv_cmd(
                         // ○ alpha left (digest reconcile), still listening", one
                         // peer both present and gone, with an internal reason.
                         if crate::conn::departure_is_news(&name, conn.links.values().map(|l| l.name.as_str())) {
-                            ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left, still listening", &name));
+                            log.say(&conn.roster(&pid, "○", Tone::Dim, "left, still listening", &name));
                         } else {
-                            ui::debug(&format!("dropped a stale duplicate link to '{name}' (digest reconcile)"));
+                            log.debug(&format!("dropped a stale duplicate link to '{name}' (digest reconcile)"));
                         }
                     }
                     // The roster itself: a sid absent from two digests is gone
@@ -4058,19 +4082,19 @@ pub(crate) async fn recv_cmd(
             Ev::PairCode(v) => {
                 let c = v["code"].as_str().unwrap_or("?");
                 ui::clipboard(c);
-                ui::say("");
-                ui::say(&format!(
+                log.say("");
+                log.say(&format!(
                     "      {}",
-                    ui::paint(ui::Tone::Brand, &c.to_uppercase())
+                    log.paint(Tone::Brand, &c.to_uppercase())
                 ));
-                ui::say("");
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
+                log.say("");
+                log.say(&log.paint(
+                    Tone::Dim,
                     "  say it aloud; they type it in the web app or `tunlion join <code>` / one claim / 10 min",
                 ));
             }
             Ev::PairUsed(_) => {
-                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting..."));
+                log.say(&log.paint(Tone::Dim, "  code claimed, connecting..."));
             }
             Ev::PairError(v) => {
                 let why = v["error"].as_str().unwrap_or("?").to_string();
@@ -4090,9 +4114,9 @@ pub(crate) async fn recv_cmd(
                 // a TYPED claim failing must not kill a listening session
                 paired = false;
                 claim_in_flight = false;
-                ui::say(&format!(
+                log.say(&format!(
                     "  {} code rejected: {hint}; still listening",
-                    ui::paint(ui::Tone::Err, ui::glyph_err()),
+                    log.paint(Tone::Err, log.glyph_err()),
                 ));
             }
             Ev::Welcome(v) => {
@@ -4107,7 +4131,7 @@ pub(crate) async fn recv_cmd(
                     for p in peers {
                         let r = conn.maybe_adopt(p, true).await;
                         let pid = p["id"].as_str().unwrap_or_default();
-                        peer_step(daemon, pid, "welcome adoption", r)?;
+                        peer_step(daemon, pid, "welcome adoption", r, log.as_ref())?;
                     }
                 }
                 // C30 (dissolves the C28 belt): a welcome means a fresh sid,
@@ -4172,7 +4196,7 @@ pub(crate) async fn recv_cmd(
                         .map(|t| t.is_dead())
                         .unwrap_or(false);
                     if fresh || link_dead {
-                        ui::say_folded(&format!("known device '{n}' appeared, connecting"));
+                        log.say_folded(&format!("known device '{n}' appeared, connecting"));
                         // NOT a sighting. This is the server's roster, which it
                         // re-pushes on every (re)subscribe and sync tick, and
                         // which can still carry a session the device no longer
@@ -4183,7 +4207,7 @@ pub(crate) async fn recv_cmd(
                         // only on a link whose peer is demonstrably present
                         // (daemon_ctl::peer_present, the liveness observation).
                     } else {
-                        ui::trace(&format!(
+                        log.trace(&format!(
                             "known device '{n}' re-announced (link already up)"
                         ));
                     }
@@ -4191,7 +4215,7 @@ pub(crate) async fn recv_cmd(
                     let (n, sec) = (n.clone(), sec.clone());
                     conn.start_direct(&pid, &n, &sec).await;
                     let r = conn.maybe_adopt(&v, true).await;
-                    peer_step(daemon, &pid, "known-device adoption", r)?;
+                    peer_step(daemon, &pid, "known-device adoption", r, log.as_ref())?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
                     }
@@ -4203,7 +4227,7 @@ pub(crate) async fn recv_cmd(
                     // finds us on: tell it, rather than leave it waiting.
                     if let Some(pid) = v["id"].as_str().filter(|p| !p.is_empty()) {
                         if !conn.links.contains_key(pid) {
-                            refuse_unrecognized_dial(&sio, pid).await;
+                            refuse_unrecognized_dial(&sio, pid, log.as_ref()).await;
                         }
                     }
                 } else if let Some((sec, broker)) =
@@ -4212,7 +4236,7 @@ pub(crate) async fn recv_cmd(
                     // A meeting place opened by a sibling revoked since is closed,
                     // not honoured (the sweep also drops it from `brokered`).
                     if device_cert_revoked(&broker.device_pub) {
-                        ui::debug("brokered meeting place refused: its broker is revoked");
+                        log.debug("brokered meeting place refused: its broker is revoked");
                         revocation_sweep_now = true;
                         continue;
                     }
@@ -4237,7 +4261,7 @@ pub(crate) async fn recv_cmd(
                     brokered_pids.insert(pid.clone(), broker.clone());
                     conn.start_direct(&pid, &name, &sec).await;
                     let r = conn.maybe_adopt(&v, true).await;
-                    peer_step(daemon, &pid, "brokered adoption", r)?;
+                    peer_step(daemon, &pid, "brokered adoption", r, log.as_ref())?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((name, sec));
                         if l.transport.is_some() {
@@ -4275,7 +4299,7 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                     let r = conn.maybe_adopt(&v, true).await;
-                    peer_step(daemon, &pid, "fleet adoption", r)?;
+                    peer_step(daemon, &pid, "fleet adoption", r, log.as_ref())?;
                 } else if let Ok(Some(uk)) =
                     crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
                 {
@@ -4287,10 +4311,10 @@ pub(crate) async fn recv_cmd(
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
                         if !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid)
                         {
-                            ui::debug("enrollment peer appeared on channel, dialing");
+                            log.debug("enrollment peer appeared on channel, dialing");
                         }
                         let r = conn.maybe_adopt(&v, true).await;
-                        peer_step(daemon, &pid, "enrollment adoption", r)?;
+                        peer_step(daemon, &pid, "enrollment adoption", r, log.as_ref())?;
                     }
                 }
             }
@@ -4298,7 +4322,7 @@ pub(crate) async fn recv_cmd(
                 let had_partials = !st.by_sid.is_empty();
                 let r = conn.maybe_adopt(&v, true).await;
                 let pid = v["id"].as_str().unwrap_or_default();
-                let now_active = peer_step(daemon, pid, "peer-joined adoption", r)?;
+                let now_active = peer_step(daemon, pid, "peer-joined adoption", r, log.as_ref())?;
                 if now_active.unwrap_or(false) && had_partials {
                     // Stale per-link sid routing dies with the old link; the
                     // .part files live on and the sender's resume re-offers.
@@ -4331,7 +4355,7 @@ pub(crate) async fn recv_cmd(
                     if recv_code_path && !recv_pake_done {
                         recv_pending_direct
                             .insert(from.clone(), (cands, srflx, peer_server_public, peer_proto));
-                        ui::debug(&format!("buffering pre-auth transport-offer from {from}"));
+                        log.debug(&format!("buffering pre-auth transport-offer from {from}"));
                         continue;
                     }
                     if data["probe"].as_bool() == Some(true) {
@@ -4346,7 +4370,7 @@ pub(crate) async fn recv_cmd(
                                 || revoked_secrets.iter().any(|s| channel_of(s) == c)
                         })
                     {
-                        refuse_unrecognized_dial(&sio, &from).await;
+                        refuse_unrecognized_dial(&sio, &from, log.as_ref()).await;
                         continue;
                     }
                     // Bug 2: the sender re-dialed after mid-transfer death.
@@ -4386,7 +4410,7 @@ pub(crate) async fn recv_cmd(
                                 from.clone(),
                                 (cands, srflx, peer_server_public, peer_proto),
                             );
-                            ui::debug(&format!(
+                            log.debug(&format!(
                                 "buffering re-dial transport-offer from {from} (no pending yet)"
                             ));
                         }
@@ -4422,7 +4446,7 @@ pub(crate) async fn recv_cmd(
                         st.recv_deadlines.remove(&from);
                         st.recv_pending_offers.remove(&from);
                         recv_pending_direct.remove(&from);
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "recv: {from} runs another code's ceremony; not our sender"
                         ));
                         continue;
@@ -4432,7 +4456,7 @@ pub(crate) async fn recv_cmd(
                     // expired) or we are at the candidate cap, ignore its traffic.
                     if !st.recv_cers.contains_key(&from) {
                         if st.recv_cers.len() >= RECV_MAX_CANDIDATES {
-                            ui::debug("recv: candidate cap reached, ignoring extra peer's PAKE");
+                            log.debug("recv: candidate cap reached, ignoring extra peer's PAKE");
                             continue;
                         }
                         if let Some((pw, np)) = &recv_pake_template {
@@ -4483,7 +4507,7 @@ pub(crate) async fn recv_cmd(
                         recv_pake_done = true;
                         st.recv_cers.clear();
                         st.recv_deadlines.clear();
-                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
+                        log.say(&log.paint(Tone::Dim, "  authenticated, receiving"));
                         // Option A: start the direct-QUIC race. start_direct owns
                         // replacement after all fallible setup and pending registration.
                         // A browser sender cannot take direct QUIC:
@@ -4553,7 +4577,7 @@ pub(crate) async fn recv_cmd(
                         st.recv_deadlines.remove(&from);
                         st.recv_pending_offers.remove(&from);
                         recv_pending_direct.remove(&from);
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "recv: candidate {from} refused ({abort_why}), dropped"
                         ));
                     }
@@ -4564,7 +4588,7 @@ pub(crate) async fn recv_cmd(
                 // A responder that could not be built (or a peer announcing a
                 // malformed uid) gets no signal applied; the daemon carries on.
                 let r = conn.ensure_responder(&from, &data).await;
-                if peer_step(daemon, &from, "responder", r)?.is_none() {
+                if peer_step(daemon, &from, "responder", r, log.as_ref())?.is_none() {
                     continue;
                 }
                 conn.apply_signal(&from, data).await;
@@ -4587,7 +4611,7 @@ pub(crate) async fn recv_cmd(
                 if named_before.is_none() {
                     if let Some(n) = conn.link(&pid).and_then(|l| l.verified_name.clone()) {
                         if crate::devices_load().iter().any(|(d, _)| *d == n) {
-                            ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
+                            log.say(&format!("identity verified: '{n}' (auto-accepting)"));
                         }
                     }
                 }
@@ -4647,7 +4671,7 @@ pub(crate) async fn recv_cmd(
                     )
                     .await;
                     if crate::capability::cap_authoritative() {
-                        ui::say(&format!(
+                        log.say(&format!(
                             "  identity challenge sent to {pid}, holding until Proven or timeout"
                         ));
                         // DirectReady-specific release policy: HOLD ChannelReady (do not
@@ -4678,7 +4702,7 @@ pub(crate) async fn recv_cmd(
             Ev::DirectWorkersReady(pid, workers) => {
                 if let Some(link) = conn.link_mut(&pid) {
                     link.workers = workers;
-                    crate::ui::debug(&format!(
+                    log.debug(&format!(
                         "worker transports ready: {pid} {} workers",
                         link.workers.len()
                     ));
@@ -4790,7 +4814,7 @@ pub(crate) async fn recv_cmd(
                 // ChannelReady, and a user with no fleet has nothing to diagnose
                 // here. It is what made the dial-glare visible, so it stays.
                 if fleet::rv().is_some() {
-                    ui::debug(&format!(
+                    log.debug(&format!(
                         "fleet-hello decision pid={pid}: rv={} pending={} shaped={} verified={} cb={} secret={:?}",
                         fleet::rv().is_some(),
                         fleet_pending.contains(&pid),
@@ -4816,7 +4840,7 @@ pub(crate) async fn recv_cmd(
                                 fleet_greeted.insert(pid.clone());
                                 let _ = t.send_control(&hello).await;
                             }
-                            Err(e) => ui::debug(&format!("fleet-hello not sent to {pid}: {e}")),
+                            Err(e) => log.debug(&format!("fleet-hello not sent to {pid}: {e}")),
                         }
                     }
                 }
@@ -4837,13 +4861,13 @@ pub(crate) async fn recv_cmd(
                                 // stop a genuine announce being replayed onto
                                 // the SAME channel later.
                                 if !fleet_route_ok(&conn, &pid, pending.relay_datagrams) {
-                                    ui::debug(&format!(
+                                    log.debug(&format!(
                                         "  l3-announce from {pid} ignored: relayed link and peer does not advertise relay datagrams"
                                     ));
                                 } else if overlay_key_refused(&pending.pubkey) {
                                     // The overlay key IS the device key: a
                                     // revoked or forgotten device gets no route.
-                                    ui::debug(&format!(
+                                    log.debug(&format!(
                                         "  l3-announce from {pid} ignored: its key is revoked here"
                                     ));
                                 } else if l3.accept_seq(&pending.pubkey, pending.seq).await {
@@ -4855,7 +4879,7 @@ pub(crate) async fn recv_cmd(
                                     // Store overlay addresses for `tunlion addr <device>`
                                     devices_touch(&who, Some(ip), Some(v4));
                                 } else {
-                                    ui::debug(&format!(
+                                    log.debug(&format!(
                                         "  l3-announce from {pid} ignored: stale sequence {}",
                                         pending.seq
                                     ));
@@ -4875,8 +4899,8 @@ pub(crate) async fn recv_cmd(
                     let dup = conn.links.iter().any(|(k, o)| {
                         k != &pid && o.presence == Presence::Ready && o.label() == label
                     });
-                    if (raw && !ui::enabled(ui::Level::Debug)) || dup {
-                        ui::debug(&format!("link ready: {label} (pid {pid}), not announced"));
+                    if (raw && !log.enabled(Level::Debug)) || dup {
+                        log.debug(&format!("link ready: {label} (pid {pid}), not announced"));
                         None
                     } else {
                         Some(label)
@@ -4884,10 +4908,10 @@ pub(crate) async fn recv_cmd(
                 });
                 if let Some(l) = conn.link_mut(&pid) {
                     if let Some(label) = &announce {
-                        ui::say(&format!(
+                        log.say(&format!(
                             "  {} {}",
-                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                            ui::paint(ui::Tone::Bold, label)
+                            log.paint(Tone::Ok, log.glyph_ok()),
+                            log.paint(Tone::Bold, label)
                         ));
                     }
                     l.transport = Some(t.clone());
@@ -4895,6 +4919,7 @@ pub(crate) async fn recv_cmd(
                     let is_direct = l.direct;
                     let direct_route = l.direct_route;
                     if let Some(p) = l.peer.clone() {
+                        let log = log.clone();
                         tokio::spawn(async move {
                             // ICE may renominate; retry briefly (mirrors the
                             // browser's _detectRoute attempts) so fast transfers
@@ -4904,9 +4929,9 @@ pub(crate) async fn recv_cmd(
                                 if let Some(r) = p.route().await {
                                     // CRITICAL: the route label is the value-prop,
                                     // direct vs relayed. Always shown, even under -q.
-                                    ui::debug(&format!(
+                                    log.debug(&format!(
                                         "    {}",
-                                        ui::paint(ui::Tone::Dim, &format!("route: {r}"))
+                                        log.paint(Tone::Dim, &format!("route: {r}"))
                                     ));
                                     // Relay honesty (§3.3): the quiet `route:` line
                                     // is legible but not loud. When the route is
@@ -4914,17 +4939,17 @@ pub(crate) async fn recv_cmd(
                                     // one-line banner so the user is never unaware
                                     // they're on a middleman path. CRITICAL.
                                     if r == filament_transport::net::ROUTE_RELAY {
-                                        ui::critical(&format!("    {}", relay_banner()));
+                                        log.critical(&format!("    {}", relay_banner()));
                                     }
                                     break;
                                 }
                             }
                         });
                     } else if is_direct {
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "    {}",
-                            ui::paint(
-                                ui::Tone::Dim,
+                            log.paint(
+                                Tone::Dim,
                                 &format!("route: {}", crate::conn::shown_direct_route(direct_route, &t))
                             )
                         ));
@@ -4992,7 +5017,7 @@ pub(crate) async fn recv_cmd(
                                 .insert(pid.clone(), Instant::now() + recv_pake_budget);
                             // Once per receive, not once per candidate in the room.
                             if recv_pake_overall_deadline.is_none() {
-                                ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
+                                log.say(&log.paint(Tone::Dim, "  authenticating..."));
                             }
                             recv_pake_overall_deadline
                                 .get_or_insert_with(|| Instant::now() + recv_pake_budget);
@@ -5000,7 +5025,7 @@ pub(crate) async fn recv_cmd(
                     }
                 }
             }
-            Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str()) {
+            Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str(), log.as_ref()) {
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
                 // to this link and start pumping its datagrams into our TUN. Only
                 // when we run an overlay ourselves; ignored otherwise.
@@ -5016,7 +5041,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(ops) = v["ops"].as_array() {
                         let n = merge_owner_cap_ops(ops);
                         if n > 0 {
-                            ui::debug(&format!("fleet policy from {pid}: {n} new op(s)"));
+                            log.debug(&format!("fleet policy from {pid}: {n} new op(s)"));
                         }
                     }
                 }
@@ -5054,7 +5079,7 @@ pub(crate) async fn recv_cmd(
                         // A short or malformed nonce is refused rather than used:
                         // a peer that picks a weak challenge would weaken OUR
                         // replay protection, not theirs.
-                        _ => ui::debug(&format!(
+                        _ => log.debug(&format!(
                             "l3-nonce from {pid} ignored: missing or too short"
                         )),
                     }
@@ -5074,7 +5099,7 @@ pub(crate) async fn recv_cmd(
                         (Some(cb), Some(owner)) => {
                             match fleet::verify_hello(&v, &cb, &owner, identity::now_secs()) {
                                 Ok(ok) if device_cert_revoked(&ok.device_pub) => {
-                                    ui::debug(&format!(
+                                    log.debug(&format!(
                                         "fleet-hello from {pid} refused: device revoked"
                                     ));
                                     fleet_pending.remove(&pid);
@@ -5096,7 +5121,7 @@ pub(crate) async fn recv_cmd(
                                             .collect();
                                         fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                                         for (p, ov, _) in replay {
-                                            ui::debug(&format!(
+                                            log.debug(&format!(
                                                 "fleet: replaying offer deferred while {p} was unverified"
                                             ));
                                             let _ = tx.send(Ev::Control(p, ov));
@@ -5217,7 +5242,7 @@ pub(crate) async fn recv_cmd(
                                                 // STABLE TOKEN first so gates and log
                                                 // pipelines match on structure rather than on
                                                 // prose that a later edit may reword.
-                                                crate::ui::critical(&format!(
+                                                log.critical(&format!(
                                                     "l2: refuse reason=name-taken claimed='{shown}' existing='{shown}' (this is not the device paired under that name)"
                                                 ));
                                             } else if let Some(cert) =
@@ -5251,11 +5276,11 @@ pub(crate) async fn recv_cmd(
                                                         if let Some(l) = conn.link_mut(&pid) {
                                                             l.verified_name = Some(stored.clone());
                                                         }
-                                                        ui::debug(&format!(
+                                                        log.debug(&format!(
                                                             "fleet peer indexed as '{stored}'"
                                                         ));
                                                     }
-                                                    Err(e) => ui::debug(&format!(
+                                                    Err(e) => log.debug(&format!(
                                                         "fleet peer not indexed: {e}"
                                                     )),
                                                 }
@@ -5275,7 +5300,7 @@ pub(crate) async fn recv_cmd(
                                                 l3.refresh_hosts().await;
                                             }
                                         }
-                                        ui::say(&format!("fleet device '{shown}' joined the mesh"));
+                                        log.say(&format!("fleet device '{shown}' joined the mesh"));
                                         // A link to a fleet peer is the only
                                         // chance a joined device gets to reach a
                                         // primary. Ask here rather than on a
@@ -5286,14 +5311,14 @@ pub(crate) async fn recv_cmd(
                                     }
                                 }
                                 Err(e) => {
-                                    ui::debug(&format!("fleet-hello from {pid} rejected: {e}"));
+                                    log.debug(&format!("fleet-hello from {pid} rejected: {e}"));
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                                     conn.drop_link(&pid);
                                 }
                             }
                         }
-                        _ => ui::debug(&format!(
+                        _ => log.debug(&format!(
                             "fleet-hello from {pid} ignored: no channel binding or no owner key"
                         )),
                     }
@@ -5323,7 +5348,7 @@ pub(crate) async fn recv_cmd(
                                 })
                             });
                             match broker {
-                                None => ui::debug(&format!(
+                                None => log.debug(&format!(
                                     "fleet-rendezvous from {pid} ignored: no proven identity on the link"
                                 )),
                                 Some(broker) if !sess.channels.contains(&ch) => {
@@ -5332,14 +5357,14 @@ pub(crate) async fn recv_cmd(
                                         .emit("subscribe", json!({ "channels": [ch.clone()] }))
                                         .await;
                                     brokered.insert(ch, (sec.to_string(), broker));
-                                    ui::debug(&format!(
+                                    log.debug(&format!(
                                         "fleet-rendezvous: joined a brokered channel for {pid}"
                                     ));
                                 }
                                 Some(_) => {}
                             }
                         }
-                        _ => ui::debug("fleet-rendezvous: ignored a malformed secret"),
+                        _ => log.debug("fleet-rendezvous: ignored a malformed secret"),
                     }
                 }
                 #[cfg(l3)]
@@ -5355,7 +5380,7 @@ pub(crate) async fn recv_cmd(
                         fleet_pending.contains(&pid),
                         fleet_verified.contains(&pid),
                     ) {
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "l3-announce from unverified fleet link {pid} ignored"
                         ));
                         continue;
@@ -5375,7 +5400,7 @@ pub(crate) async fn recv_cmd(
                                             // The overlay key IS the device key: a
                                             // revoked or forgotten device gets no route.
                                             if overlay_key_refused(&ann.pubkey) {
-                                                ui::debug(&format!(
+                                                log.debug(&format!(
                                                     "  l3-announce from {pid} ignored: its key is revoked here"
                                                 ));
                                                 continue;
@@ -5388,7 +5413,7 @@ pub(crate) async fn recv_cmd(
                                             // channel from being replayed onto it later,
                                             // which is an address rollback (see accept_seq).
                                             if !l3.accept_seq(&ann.pubkey, ann.seq).await {
-                                                ui::debug(&format!(
+                                                log.debug(&format!(
                                                     "  l3-announce from {pid} ignored: stale sequence {}",
                                                     ann.seq
                                                 ));
@@ -5409,7 +5434,7 @@ pub(crate) async fn recv_cmd(
                                                         serde_json::from_str::<Vec<Value>>(&raw)
                                                     {
                                                         if let Err(e) = identity::check_overlay_against_pinned_cert(&arr, &who, &ann.pubkey) {
-                                                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  {}", e)));
+                                                            log.say(&log.paint(Tone::Warn, &format!("  {}", e)));
                                                             // Tear down: do not add peer, do not overwrite anchor, clear provisional
                                                             clear_provisional_identity(&who);
                                                             continue;
@@ -5424,8 +5449,8 @@ pub(crate) async fn recv_cmd(
                                                     &prov_cert,
                                                     &ann.pubkey,
                                                 ) {
-                                                    ui::say(&ui::paint(
-                                                        ui::Tone::Warn,
+                                                    log.say(&log.paint(
+                                                        Tone::Warn,
                                                         &format!(
                                                             "  {} for device {} - clearing provisional, no anchor written",
                                                             e, who
@@ -5451,8 +5476,8 @@ pub(crate) async fn recv_cmd(
                                                             clear_provisional_identity(&who);
                                                         }
                                                         Err(e) => {
-                                                            ui::say(&ui::paint(
-                                                                ui::Tone::Warn,
+                                                            log.say(&log.paint(
+                                                                Tone::Warn,
                                                                 &format!(
                                                                     "  takeover guard at overlay establishment: {}",
                                                                     e
@@ -5466,7 +5491,7 @@ pub(crate) async fn recv_cmd(
                                             }
                                             let v4 = ann.addr_v4();
                                             if !fleet_route_ok(&conn, &pid, ann.relay_datagrams) {
-                                                ui::debug(&format!(
+                                                log.debug(&format!(
                                                     "  L3 route for {who} withheld: relayed link and peer does not advertise relay datagrams"
                                                 ));
                                                 continue;
@@ -5479,9 +5504,9 @@ pub(crate) async fn recv_cmd(
                                                 t.clone(),
                                             )
                                             .await;
-                                            ui::say_folded(&format!(
+                                            log.say_folded(&format!(
                                                 "  {} L3 peer {who}.mesh ({ip} / {v4})",
-                                                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                                log.paint(Tone::Ok, log.glyph_ok())
                                             ));
                                             devices_touch(&who, Some(ip), Some(v4));
 
@@ -5638,7 +5663,7 @@ pub(crate) async fn recv_cmd(
                                                     // that vanishes without a word
                                                     // is indistinguishable from one
                                                     // that was never sent.
-                                                    ui::debug(&format!(
+                                                    log.debug(&format!(
                                                         "  {declined} of {} route(s) from {who} not installed (accept-routes={accept}, or not granted)",
                                                         advertised.len()
                                                     ));
@@ -5661,16 +5686,16 @@ pub(crate) async fn recv_cmd(
                                                 // nobody is carrying.
                                                 l3.set_peer_subnets(&pid, &t, &ok).await;
                                                 if !ok.is_empty() {
-                                                    ui::say(&format!(
+                                                    log.say(&format!(
                                                         "  {} routes via {who}: {}",
-                                                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                        log.paint(Tone::Ok, log.glyph_ok()),
                                                         ok.join(", ")
                                                     ));
                                                 }
                                             }
                                         }
-                                        Err(e) => ui::debug(&ui::paint(
-                                            ui::Tone::Warn,
+                                        Err(e) => log.debug(&log.paint(
+                                            Tone::Warn,
                                             &format!("  L3 announce rejected: {e}"),
                                         )),
                                     },
@@ -5679,7 +5704,7 @@ pub(crate) async fn recv_cmd(
                                 }
                             }
                         }
-                        Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
+                        Err(e) => log.debug(&format!("  L3 malformed announce: {e}")),
                     }
                 }
                 // The peer cannot answer our identity challenge (it holds no
@@ -5703,7 +5728,7 @@ pub(crate) async fn recv_cmd(
                         {
                             recv_identity_hold.insert(pid.clone(), expired);
                         }
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "  {pid} cannot prove an identity; deciding its offers without waiting"
                         ));
                     }
@@ -5720,7 +5745,7 @@ pub(crate) async fn recv_cmd(
                     // asymmetry that made an unprovable link invisible.
                     match conn.transport_of(&pid) {
                         Some(t) => respond_to_identity_challenge(&t, &v).await,
-                        None => crate::ui::say(&format!(
+                        None => log.say(&format!(
                             "l2: identity challenge received for {pid} but that link has no transport; not answered"
                         )),
                     }
@@ -5728,7 +5753,7 @@ pub(crate) async fn recv_cmd(
                 // #30: received possession-sig from peer after our challenge.
                 // Verify, upgrade binding to Proven so capability gates pass.
                 Some("identity-expose") => {
-                    crate::ui::debug(&format!("identity-expose received on {pid}"));
+                    log.debug(&format!("identity-expose received on {pid}"));
                     if handle_identity_expose(&mut conn, &pid, &v, &mut identity_nonces) {
                         // Release held ChannelReady — Proven settled before timeout.
                         if let Some((held_t, _deadline)) =
@@ -5740,11 +5765,11 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("worker-ports") => {
                     let pid = v["for"].as_str().unwrap_or_default();
-                    ui::trace(&format!(
+                    log.trace(&format!(
                         "[T:CLI] worker-ports handler: looking up key={pid}"
                     ));
                     if let Some(tx) = conn.worker_port_tx.remove(pid) {
-                        ui::trace(&format!("[T:CLI] worker-ports handler: FOUND key={pid}"));
+                        log.trace(&format!("[T:CLI] worker-ports handler: FOUND key={pid}"));
                         let ports: Vec<u16> = v["ports"]
                             .as_array()
                             .map(|a| {
@@ -5799,11 +5824,11 @@ pub(crate) async fn recv_cmd(
                                         )
                                         .await
                                         {
-                                            ui::debug(&format!("  wg: could not adopt peer ({e})"));
+                                            log.debug(&format!("  wg: could not adopt peer ({e})"));
                                         } else {
-                                            ui::say(&format!(
+                                            log.say(&format!(
                                                 "  {} WireGuard tunnel to {}",
-                                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                log.paint(Tone::Ok, log.glyph_ok()),
                                                 conn.link(&pid)
                                                     .map(|l| l.shown())
                                                     .unwrap_or_default()
@@ -5824,10 +5849,10 @@ pub(crate) async fn recv_cmd(
                                             }
                                         }
                                     }
-                                    Err(e) => ui::debug(&format!("  wg: no local interface ({e})")),
+                                    Err(e) => log.debug(&format!("  wg: no local interface ({e})")),
                                 }
                             }
-                            _ => ui::debug(
+                            _ => log.debug(
                                 "  wg: key announcement ignored (no direct endpoint or overlay address yet)",
                             ),
                         }
@@ -5848,7 +5873,7 @@ pub(crate) async fn recv_cmd(
                     // asked is not a primary. Falling out at expiry is the
                     // correct failure direction either way, so we simply keep
                     // the certificate we have and ask again on the next link.
-                    ui::debug("  peer declined to renew our certificate");
+                    log.debug("  peer declined to renew our certificate");
                 }
                 // Auth key enrollment (challenge/response flow)
                 Some("identity-auth-key-enroll-request") => {
@@ -5893,15 +5918,15 @@ pub(crate) async fn recv_cmd(
                             if let Err(why) =
                                 crate::membership::verify_depart(&dpub_arr, msg, &sig_arr)
                             {
-                                ui::say(&format!(
+                                log.say(&format!(
                                     "{} refused a depart request from {pid}: {why}",
-                                    ui::paint(ui::Tone::Warn, "!")
+                                    log.paint(Tone::Warn, "!")
                                 ));
                             } else {
                                 if let Some(name) = mark_lapsed_now(&dpub_arr) {
-                                    ui::say(&format!(
+                                    log.say(&format!(
                                         "{} {name} departed; slot freed immediately",
-                                        ui::paint(ui::Tone::Dim, "·")
+                                        log.paint(Tone::Dim, "·")
                                     ));
                                     if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
@@ -5928,12 +5953,12 @@ pub(crate) async fn recv_cmd(
                             &cert.user_pub,
                             identity::now_secs(),
                         ) {
-                            Ok(true) => ui::debug(&format!(
+                            Ok(true) => log.debug(&format!(
                                 "roster: accepted epoch {} from owner",
                                 v["epoch"].as_u64().unwrap_or(0)
                             )),
                             Ok(false) => {}
-                            Err(e) => ui::debug(&format!("roster: rejected: {e}")),
+                            Err(e) => log.debug(&format!("roster: rejected: {e}")),
                         }
                     }
                 }
@@ -5950,7 +5975,7 @@ pub(crate) async fn recv_cmd(
                 ) if unrecognized_pids.contains(&pid)
                     && conn.link(&pid).is_some_and(|l| l.verified_name.is_none()) =>
                 {
-                    ui::say(&format!("l2: {ty} refused: the peer is not a device recognized here"));
+                    log.say(&format!("l2: {ty} refused: the peer is not a device recognized here"));
                     if let Some(t) = conn.transport_of(&pid) {
                         let refusal =
                             crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None);
@@ -6221,7 +6246,7 @@ pub(crate) async fn recv_cmd(
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        ui::say(&format!(
+                        log.say(&format!(
                             "l2: shell bootstrap refused: {who}: {}",
                             granted.deny_reason("no shell cap / untrusted")
                         ));
@@ -6266,7 +6291,7 @@ pub(crate) async fn recv_cmd(
                             .and_then(|n| u16::try_from(n).ok())
                             .unwrap_or(22);
                         let sshd = sshd_listening(ssh_port).await;
-                        ui::say(&format!(
+                        log.say(&format!(
                             "l2: shell (cert) granted to '{device}', no key installed"
                         ));
                         let _ = t
@@ -6284,7 +6309,7 @@ pub(crate) async fn recv_cmd(
                     let pubkey = match sshkeys::validate_pubkey(&pubkey) {
                         Ok(k) => k,
                         Err(e) => {
-                            ui::say(&format!(
+                            log.say(&format!(
                                 "l2: shell bootstrap refused: malformed pubkey from '{device}': {e}"
                             ));
                             let _ = t
@@ -6309,7 +6334,7 @@ pub(crate) async fn recv_cmd(
                                 .and_then(|n| u16::try_from(n).ok())
                                 .unwrap_or(22);
                             let sshd = sshd_listening(ssh_port).await;
-                            ui::say(&format!(
+                            log.say(&format!(
                                 "l2: shell granted to '{device}', installed managed key (tunlion-managed block)"
                             ));
                             let _ = t
@@ -6323,7 +6348,7 @@ pub(crate) async fn recv_cmd(
                                 .await;
                         }
                         Err(e) => {
-                            ui::say(&format!(
+                            log.say(&format!(
                                 "l2: shell bootstrap install failed for '{device}': {e}"
                             ));
                             let _ = t
@@ -6592,7 +6617,7 @@ pub(crate) async fn recv_cmd(
                         // is never invisible on the default (shadow) path and never
                         // reads as a transport failure. The peer-facing string stays a
                         // coarse category and leaks no authz internals.
-                        ui::say(&format!(
+                        log.say(&format!(
                             "mount: refused for '{who}': {}",
                             authorized.deny_reason("not authorized (mount capability required)")
                         ));
@@ -6612,7 +6637,7 @@ pub(crate) async fn recv_cmd(
                     }
                     let Some(root_path) = confined_root else {
                         let who = verified.clone().unwrap_or_else(|| "<unverified>".into());
-                        ui::say(&format!(
+                        log.say(&format!(
                             "mount: refused for '{who}': {} is outside the share root {} (set `share` in the config to serve another directory)",
                             requested_root.display(),
                             crate::fleet_share_root().display()
@@ -6712,10 +6737,10 @@ pub(crate) async fn recv_cmd(
                     conn.rejoin.away =
                         Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
                     let n = conn.link_presence(&pid, Presence::Away);
-                    ui::say(&conn.roster(
+                    log.say(&conn.roster(
                         &pid,
                         "●",
-                        ui::Tone::Warn,
+                        Tone::Warn,
                         "away, choosing a file · holding the line",
                         &n,
                     ));
@@ -6725,7 +6750,7 @@ pub(crate) async fn recv_cmd(
                     conn.note_alive(&pid);
                     if was_away {
                         let n = conn.link_presence(&pid, Presence::Ready);
-                        ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
+                        log.say(&conn.roster(&pid, log.glyph_ok(), Tone::Ok, "back", &n));
                     }
                 }
                 // C30 phase 3: a state ping proves the peer is alive, clear
@@ -6735,7 +6760,7 @@ pub(crate) async fn recv_cmd(
                     conn.note_alive(&pid);
                     if was_away {
                         let n = conn.link_presence(&pid, Presence::Ready);
-                        ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
+                        log.say(&conn.roster(&pid, log.glyph_ok(), Tone::Ok, "back", &n));
                     }
                 }
                 Some("pair-keep") => {
@@ -6757,28 +6782,28 @@ pub(crate) async fn recv_cmd(
                                 Ok(stored) => {
                                     crate::shared_defs::REMEMBER_STORED
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    ui::say(&format!(
+                                    log.say(&format!(
                                         "remembered this device as '{stored}', future sends auto-accept after proof"
                                     ));
                                     true
                                 }
                                 Err(e) => {
-                                    ui::say(&ui::paint(
-                                        ui::Tone::Warn,
+                                    log.say(&log.paint(
+                                        Tone::Warn,
                                         &format!("  not remembered: {e}"),
                                     ));
                                     false
                                 }
                             },
                             (Some(_), false) => {
-                                ui::critical(&ui::paint(
-                                    ui::Tone::Warn,
+                                log.critical(&log.paint(
+                                    Tone::Warn,
                                     "ignored a remember offer from a peer that is not this code's sender",
                                 ));
                                 false
                             }
                             (None, _) => {
-                                ui::say(
+                                log.say(
                                     "(sender offered to be remembered; re-run with --remember <name> to keep it)",
                                 );
                                 false
@@ -6815,14 +6840,14 @@ pub(crate) async fn recv_cmd(
                         None => None,
                     };
                     let Some((my_fp, their_fp)) = fps else {
-                        ui::debug("pair-proof received before fingerprints known, ignoring");
+                        log.debug("pair-proof received before fingerprints known, ignoring");
                         continue;
                     };
                     // #9: pair secrets are symmetric, our own install holds
                     // every secret we do, so a same-host process could prove
                     // "pop2" and tunnel callers into the WRONG machine. Refuse.
                     let hit = if is_self_uid(&conn.my_uid, Some(peer_uid.as_str())) {
-                        ui::debug("pair-proof from our own install, refusing (self-connect)");
+                        log.debug("pair-proof from our own install, refusing (self-connect)");
                         None
                     } else {
                         devices.iter().find(|(_, s)| {
@@ -6864,7 +6889,7 @@ pub(crate) async fn recv_cmd(
                                         &mut identity_nonces,
                                     )
                                     .await;
-                                    ui::debug(&format!(
+                                    log.debug(&format!(
                                         "  identity challenge sent to {pid} at pair-proof (universal expose, WebRTC/relay path)"
                                     ));
                                     let hold_pending = st.pending_proven.clone();
@@ -6876,7 +6901,7 @@ pub(crate) async fn recv_cmd(
                                 }
                             }
                         }
-                        ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
+                        log.say(&format!("identity verified: '{n}' (auto-accepting)"));
                         unrecognized_pids.remove(&pid);
                         true
                     } else {
@@ -6885,8 +6910,8 @@ pub(crate) async fn recv_cmd(
                         unrecognized_pids.retain(|p| conn.links.contains_key(p));
                         unrecognized_pids.insert(pid.clone());
                         // CRITICAL, a security verdict the user must see (-q too).
-                        ui::critical(&ui::paint(
-                            ui::Tone::Warn,
+                        log.critical(&log.paint(
+                            Tone::Warn,
                             "pair-proof FAILED verification, treating peer as untrusted",
                         ));
                         false
@@ -6927,8 +6952,8 @@ pub(crate) async fn recv_cmd(
                         ) {
                             Ok(stored) => Some(stored),
                             Err(e) => {
-                                ui::say(&ui::paint(
-                                    ui::Tone::Warn,
+                                log.say(&log.paint(
+                                    Tone::Warn,
                                     &format!("  ignored pair-intro from {hub}: {e}"),
                                 ));
                                 None
@@ -6936,8 +6961,8 @@ pub(crate) async fn recv_cmd(
                         }
                     } else {
                         if !may_vouch {
-                            ui::say(&ui::paint(
-                                ui::Tone::Warn,
+                            log.say(&log.paint(
+                                Tone::Warn,
                                 &format!("  ignored pair-intro from unverified peer {hub}"),
                             ));
                         }
@@ -6950,9 +6975,9 @@ pub(crate) async fn recv_cmd(
                         sio.emit("subscribe", json!({ "channels": [channel_of(&isec)] }))
                             .await
                             .ok();
-                        ui::say(&format!(
+                        log.say(&format!(
                             "  {} introduced to '{}' by {}, now a known device",
-                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            log.paint(Tone::Ok, log.glyph_ok()),
                             iname,
                             hub
                         ));
@@ -7114,9 +7139,9 @@ pub(crate) async fn recv_cmd(
                                                                             }
                                                                             // The peer by name, not its raw signaling id.
                                                                             let who = conn.link(&pid).map(|l| l.label().to_string()).unwrap_or_else(|| pid.to_string());
-                                                                            let line = format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), who);
+                                                                            let line = format!("  {} identity verified for peer {}", log.paint(Tone::Ok, log.glyph_ok()), who);
                                                                             // A raw id is an internal: -v only.
-                                                                            if who.as_str() == &pid[..] { ui::debug(&line) } else { ui::say(&line) }
+                                                                            if who.as_str() == &pid[..] { log.debug(&line) } else { log.say(&line) }
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
                     }
@@ -7127,10 +7152,10 @@ pub(crate) async fn recv_cmd(
                     if v["channel"].as_str() == Some(&ek) {
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
                         if !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
-                            ui::debug(&format!("enrollment peer appeared on channel, dialing"));
+                            log.debug(&format!("enrollment peer appeared on channel, dialing"));
                         }
                         let r = conn.maybe_adopt(&v, true).await;
-                        peer_step(daemon, &pid, "enrollment adoption", r)?;
+                        peer_step(daemon, &pid, "enrollment adoption", r, log.as_ref())?;
                     }
                 }
                                                                 }
@@ -7169,11 +7194,11 @@ pub(crate) async fn recv_cmd(
                         // (a decoy that authenticated nothing) is simply ignored.
                         if !recv_pake_done && st.recv_cers.contains_key(&pid) {
                             st.recv_pending_offers.insert(pid.clone(), v.clone());
-                            ui::debug(
+                            log.debug(
                                 "buffering a pre-auth file-offer until its ceremony confirms",
                             );
                         } else {
-                            ui::debug(
+                            log.debug(
                                 "ignoring file-offer from a peer that has not authenticated via ephemeral PAKE",
                             );
                         }
@@ -7215,7 +7240,7 @@ pub(crate) async fn recv_cmd(
                             fleet_verified.contains(&pid),
                         )
                     {
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "deferring file-offer from {pid}: fleet identity still verifying"
                         ));
                         fleet_deferred_offers.push((
@@ -7261,7 +7286,7 @@ pub(crate) async fn recv_cmd(
                                     prior_full = m.full;
                                 } else {
                                     // DEBUG, resilience internal (resume mismatch, restart).
-                                    ui::debug(&format!(
+                                    log.debug(&format!(
                                         "{name}: same name+size but different content, restarting from 0"
                                     ));
                                 }
@@ -7458,7 +7483,7 @@ pub(crate) async fn recv_cmd(
                             } else {
                                 None
                             };
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "transfer-gate: from={sender_name} allowed={} legacy_ok={legacy_ok} trusted={link_trusted} binding={binding:?} own_user={} has_grant={has_grant} in_bounds={scoped_in_bounds} revoked={cert_revoked} authoritative={} reason={:?}",
                             d.allowed(),
                             own_user.is_some(),
@@ -7473,8 +7498,8 @@ pub(crate) async fn recv_cmd(
                         &xfer_gate,
                         crate::capability::cap_authoritative(),
                     ) {
-                        ui::say(&ui::paint(
-                            ui::Tone::Dim,
+                        log.say(&log.paint(
+                            Tone::Dim,
                             &format!("  declined {name} from {sender_name} ({reason})",),
                         ));
                         if daemon {
@@ -7489,7 +7514,7 @@ pub(crate) async fn recv_cmd(
                             crate::exit_codes::ExitKind::Denied,
                         );
                         let r = t.send_control(&policy_decline_msg(&id, Some(reason.as_str()))).await;
-                        peer_step(daemon, &pid, "decline", r)?;
+                        peer_step(daemon, &pid, "decline", r, log.as_ref())?;
                         continue;
                     }
                     if !ok {
@@ -7505,7 +7530,7 @@ pub(crate) async fn recv_cmd(
                                 // (nothing can be asked invisibly), with the
                                 // sticky as the live answer tail.
                                 let q = offer_question(&sender_name, &name, size, paired);
-                                ui::say(&q);
+                                log.say(&q);
                                 ui::sticky_ask(&q);
                                 st.question_shown = Instant::now();
                             }
@@ -7520,8 +7545,8 @@ pub(crate) async fn recv_cmd(
                         // outcome. Telling a user to pass a flag they already passed,
                         // for a decision no flag can change, is how a green security
                         // property turns unmeasurable.
-                        ui::say(&ui::paint(
-                            ui::Tone::Dim,
+                        log.say(&log.paint(
+                            Tone::Dim,
                             &format!(
                                 "  declined {name} from {sender_name} ({})",
                                 if daemon {
@@ -7556,7 +7581,7 @@ pub(crate) async fn recv_cmd(
                         let r = t
                             .send_control(&policy_decline_msg(&id, xfer_deny_reason.as_deref()))
                             .await;
-                        peer_step(daemon, &pid, "decline", r)?;
+                        peer_step(daemon, &pid, "decline", r, log.as_ref())?;
                         continue;
                     }
 
@@ -7593,8 +7618,8 @@ pub(crate) async fn recv_cmd(
                                 // A real concurrent duplicate, first (flowing)
                                 // stream wins. Ignore WITHOUT marking the sender
                                 // done (a benign skip, not a user decline).
-                                ui::say(&ui::paint(
-                                    ui::Tone::Dim,
+                                log.say(&log.paint(
+                                    Tone::Dim,
                                     &format!(
                                         "  (duplicate offer for {name} ignored, already receiving it)"
                                     ),
@@ -7676,20 +7701,20 @@ pub(crate) async fn recv_cmd(
                     // The inbox may have been deleted while this ran: recreate it,
                     // or refuse with that reason (not "No such file or directory").
                     match crate::recv_files::ensure_inbox(&dir) {
-                        Ok(true) => ui::say(&ui::paint(
-                            ui::Tone::Warn,
+                        Ok(true) => log.say(&log.paint(
+                            Tone::Warn,
                             &format!("  the inbox {} was missing; recreated it", dir.display()),
                         )),
                         Ok(false) => {}
                         Err(e) => {
                             let (token, msg) = crate::recv_files::inbox_refusal(&dir, &name, &e);
-                            ui::critical(&ui::paint(
-                                ui::Tone::Err,
+                            log.critical(&log.paint(
+                                Tone::Err,
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
                             note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                             let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
-                            peer_step(daemon, &pid, "refusal", r)?;
+                            peer_step(daemon, &pid, "refusal", r, log.as_ref())?;
                             continue;
                         }
                     }
@@ -7709,13 +7734,13 @@ pub(crate) async fn recv_cmd(
                                 Some(need),
                                 Some(free),
                             );
-                            ui::critical(&ui::paint(
-                                ui::Tone::Err,
+                            log.critical(&log.paint(
+                                Tone::Err,
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
                             note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                             let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
-                            peer_step(daemon, &pid, "refusal", r)?;
+                            peer_step(daemon, &pid, "refusal", r, log.as_ref())?;
                             continue;
                         }
                     }
@@ -7727,7 +7752,7 @@ pub(crate) async fn recv_cmd(
                     // the receive loop: that would kill every other in-flight transfer.
                     let file = if offset > 0 {
                         // DEBUG, resilience internal (receiver resuming from offset).
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "{name}: resuming at {} ({:.0}%)",
                             human(offset),
                             offset as f64 / size.max(1) as f64 * 100.0
@@ -7748,13 +7773,13 @@ pub(crate) async fn recv_cmd(
                                     None,
                                     None,
                                 );
-                                ui::critical(&ui::paint(
-                                    ui::Tone::Err,
+                                log.critical(&log.paint(
+                                    Tone::Err,
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
                                 note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                                 let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
-                                peer_step(daemon, &pid, "refusal", r)?;
+                                peer_step(daemon, &pid, "refusal", r, log.as_ref())?;
                                 continue;
                             }
                         }
@@ -7793,13 +7818,13 @@ pub(crate) async fn recv_cmd(
                                     None,
                                     None,
                                 );
-                                ui::critical(&ui::paint(
-                                    ui::Tone::Err,
+                                log.critical(&log.paint(
+                                    Tone::Err,
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
                                 note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                                 let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
-                                peer_step(daemon, &pid, "refusal", r)?;
+                                peer_step(daemon, &pid, "refusal", r, log.as_ref())?;
                                 continue;
                             }
                         }
@@ -7837,7 +7862,7 @@ pub(crate) async fn recv_cmd(
                     // the stream just registered. Its .part stays for the
                     // sender's resume on the next link.
                     let r = t.send_control(&protocol::accept_msg(&id, offset)).await;
-                    if peer_step(daemon, &pid, "accept", r)?.is_none() {
+                    if peer_step(daemon, &pid, "accept", r, log.as_ref())?.is_none() {
                         st.by_sid.remove(&(pid.clone(), sid));
                     }
                 }
@@ -7889,8 +7914,8 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                     for name in names {
-                        ui::critical(&ui::paint(
-                            ui::Tone::Warn,
+                        log.critical(&log.paint(
+                            Tone::Warn,
                             &format!("  {name}: the sender cancelled it ({reason}); its partial was removed"),
                         ));
                         sender_cancelled = Some(format!("{name}: {reason}"));
@@ -7947,7 +7972,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(wf) = failed {
                         st.verify_fails.remove(&id);
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -7993,16 +8018,16 @@ pub(crate) async fn recv_cmd(
                                         if test_hooks::premature_close_once() {
                                             test_hooks::premature_mark_fired();
                                         }
-                                        ui::say(&ui::paint(
-                                            ui::Tone::Warn,
+                                        log.say(&log.paint(
+                                            Tone::Warn,
                                             &format!(
                                                 "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
                                             ),
                                         ));
                                         conn.drop_link(&pid);
                                     } else if test_hooks::suppress_delivery_ack() {
-                                        ui::say(&ui::paint(
-                                            ui::Tone::Warn,
+                                        log.say(&log.paint(
+                                            Tone::Warn,
                                             &format!(
                                                 "    [test] {nm} verified but SUPPRESSING delivery-ack"
                                             ),
@@ -8022,8 +8047,8 @@ pub(crate) async fn recv_cmd(
                                         // its timeout (gate 11c, G-k).
                                         let _ = tokio::time::timeout(ACK_FLUSH_BUDGET, t.flush())
                                             .await;
-                                        ui::say(&ui::paint(
-                                            ui::Tone::Dim,
+                                        log.say(&log.paint(
+                                            Tone::Dim,
                                             &format!(
                                                 "    {nm} verified (whole-file sha256 matched), acked"
                                             ),
@@ -8035,8 +8060,8 @@ pub(crate) async fn recv_cmd(
                                 let fails = st.verify_fails.entry(id.clone()).or_insert(0);
                                 *fails += 1;
                                 if *fails > MAX_VERIFY_FAILS {
-                                    ui::critical(&ui::paint(
-                                        ui::Tone::Err,
+                                    log.critical(&log.paint(
+                                        Tone::Err,
                                         &format!(
                                             "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)",
                                             inc.name
@@ -8051,16 +8076,16 @@ pub(crate) async fn recv_cmd(
                                     inc.received.store(0, Ordering::Relaxed);
                                     inc.ranges.lock().unwrap().clear();
                                     req_offset = 0;
-                                    ui::debug(&ui::paint(
-                                        ui::Tone::Warn,
+                                    log.debug(&log.paint(
+                                        Tone::Warn,
                                         &format!(
                                             "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
                                             inc.name, *fails
                                         ),
                                     ));
                                 } else {
-                                    ui::debug(&ui::paint(
-                                        ui::Tone::Warn,
+                                    log.debug(&log.paint(
+                                        Tone::Warn,
                                         &format!(
                                             "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
                                             inc.name,
@@ -8126,7 +8151,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(wf) = failed {
                         st.verify_fails.remove(&id);
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -8172,16 +8197,16 @@ pub(crate) async fn recv_cmd(
                                         if test_hooks::premature_close_once() {
                                             test_hooks::premature_mark_fired();
                                         }
-                                        ui::say(&ui::paint(
-                                            ui::Tone::Warn,
+                                        log.say(&log.paint(
+                                            Tone::Warn,
                                             &format!(
                                                 "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
                                             ),
                                         ));
                                         conn.drop_link(&pid);
                                     } else if test_hooks::suppress_delivery_ack() {
-                                        ui::say(&ui::paint(
-                                            ui::Tone::Warn,
+                                        log.say(&log.paint(
+                                            Tone::Warn,
                                             &format!(
                                                 "    [test] {nm} verified but SUPPRESSING delivery-ack"
                                             ),
@@ -8190,8 +8215,8 @@ pub(crate) async fn recv_cmd(
                                         let _ = t
                                             .send_control(&crate::recv_files::delivery_ack(&id, ack_sid))
                                             .await;
-                                        ui::say(&ui::paint(
-                                            ui::Tone::Dim,
+                                        log.say(&log.paint(
+                                            Tone::Dim,
                                             &format!(
                                                 "    {nm} verified (whole-file sha256 matched), acked"
                                             ),
@@ -8203,8 +8228,8 @@ pub(crate) async fn recv_cmd(
                                 let fails = st.verify_fails.entry(id.clone()).or_insert(0);
                                 *fails += 1;
                                 if *fails > MAX_VERIFY_FAILS {
-                                    ui::critical(&ui::paint(
-                                        ui::Tone::Err,
+                                    log.critical(&log.paint(
+                                        Tone::Err,
                                         &format!(
                                             "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)",
                                             inc.name
@@ -8222,16 +8247,16 @@ pub(crate) async fn recv_cmd(
                                     inc.received.store(0, Ordering::Relaxed);
                                     inc.ranges.lock().unwrap().clear();
                                     req_offset = 0;
-                                    ui::debug(&ui::paint(
-                                        ui::Tone::Warn,
+                                    log.debug(&log.paint(
+                                        Tone::Warn,
                                         &format!(
                                             "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
                                             inc.name, *fails
                                         ),
                                     ));
                                 } else {
-                                    ui::debug(&ui::paint(
-                                        ui::Tone::Warn,
+                                    log.debug(&log.paint(
+                                        Tone::Warn,
                                         &format!(
                                             "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
                                             inc.name,
@@ -8293,7 +8318,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         st.verify_fails.remove(&inc.id);
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -8333,7 +8358,7 @@ pub(crate) async fn recv_cmd(
                         || inc.ranges.lock().map(|r| r.len()).unwrap_or(usize::MAX)
                             >= MAX_RECV_RANGES
                     {
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "  refusing chunk for sid {sid} from {pid}: {} bytes at {pos} is outside the offered {} bytes or too fragmented",
                             data.len(),
                             inc.size
@@ -8435,7 +8460,7 @@ pub(crate) async fn recv_cmd(
                     // Chunk arrived for unknown (pid, sid) - log instead of silently dropping.
                     // This happens during transport supersede or stall repair when old chunks
                     // arrive after the by_sid entry was removed.
-                    ui::debug(&format!(
+                    log.debug(&format!(
                         "  dropping chunk for unknown sid {sid} from {pid} ({} bytes)",
                         data.len()
                     ));
@@ -8472,8 +8497,8 @@ pub(crate) async fn recv_cmd(
                             &format!("declined {qname}"),
                             crate::exit_codes::ExitKind::Denied,
                         );
-                        ui::say(&ui::paint(
-                            ui::Tone::Dim,
+                        log.say(&log.paint(
+                            Tone::Dim,
                             &format!(
                                 "  declined {}",
                                 safe_incoming_name(qv["name"].as_str().unwrap_or("file"))
@@ -8485,7 +8510,7 @@ pub(crate) async fn recv_cmd(
                                     qv["id"].as_str().unwrap_or_default(),
                                 ))
                                 .await;
-                            peer_step(daemon, &qpid, "decline", r)?;
+                            peer_step(daemon, &qpid, "decline", r, log.as_ref())?;
                         }
                     }
                     // show the next queued question (or re-show on gibberish)
@@ -8498,7 +8523,7 @@ pub(crate) async fn recv_cmd(
                             paired,
                         );
                         if answered {
-                            ui::say(&q); // a NEW question fronted, permanent line (C25)
+                            log.say(&q); // a NEW question fronted, permanent line (C25)
                             st.question_shown = Instant::now();
                         }
                         ui::sticky_ask(&q);
@@ -8509,17 +8534,17 @@ pub(crate) async fn recv_cmd(
                 } else if ans == "devices" {
                     // C29: session commands, `up` is a place you live in.
                     if devices.is_empty() {
-                        ui::say(&ui::paint(
-                            ui::Tone::Dim,
+                        log.say(&log.paint(
+                            Tone::Dim,
                             "  no known devices yet, type a code or `pair` to add one",
                         ));
                     }
                     for (n, s) in &devices {
-                        ui::say(&format!(
+                        log.say(&format!(
                             "  {}  {}",
-                            ui::paint(ui::Tone::Bold, n),
-                            ui::paint(
-                                ui::Tone::Dim,
+                            log.paint(Tone::Bold, n),
+                            log.paint(
+                                Tone::Dim,
                                 &format!("(channel {})", &channel_of(s)[..12])
                             )
                         ));
@@ -8532,20 +8557,20 @@ pub(crate) async fn recv_cmd(
                         match devices_remove(n) {
                             Ok(()) => {
                                 devices.retain(|(dn, _)| dn != n);
-                                ui::say(&format!(
+                                log.say(&format!(
                                     "  {} forgot '{n}', it can no longer find this machine",
-                                    ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                    log.paint(Tone::Ok, log.glyph_ok())
                                 ));
                             }
-                            Err(e) if daemon => ui::say(&format!(
+                            Err(e) if daemon => log.say(&format!(
                                 "  {} could not forget '{n}': {e:#}; still listening",
-                                ui::paint(ui::Tone::Err, ui::glyph_err())
+                                log.paint(Tone::Err, log.glyph_err())
                             )),
                             Err(e) => return Err(e),
                         }
                     } else {
-                        ui::say(&ui::paint(
-                            ui::Tone::Dim,
+                        log.say(&log.paint(
+                            Tone::Dim,
                             &format!("  no device named '{n}' (try `devices`)"),
                         ));
                     }
@@ -8555,22 +8580,22 @@ pub(crate) async fn recv_cmd(
                     // signaling server could MITM. `tunlion add` / `tunlion join` run the
                     // SPAKE2 ceremony, and the running daemon picks the new
                     // device up from the store.
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
+                    log.say(&log.paint(
+                        Tone::Dim,
                         "  to pair a device, run `tunlion add <device>` in another terminal (the other side runs `tunlion join <code>`)",
                     ));
                 } else if ans == "pair" || ans == "code" {
                     sio.emit("pair-create", json!({})).await.ok();
                 } else if regex_lite_code(&line) {
                     if claim_in_flight {
-                        ui::say(&ui::paint(
-                            ui::Tone::Dim,
+                        log.say(&log.paint(
+                            Tone::Dim,
                             "  (a claim is already in flight, wait for it to resolve)",
                         ));
                     } else {
-                        ui::say(&format!(
+                        log.say(&format!(
                             "  claiming {}...",
-                            ui::paint(ui::Tone::Brand, &line)
+                            log.paint(Tone::Brand, &line)
                         ));
                         paired = true;
                         claim_in_flight = true;
@@ -8579,8 +8604,8 @@ pub(crate) async fn recv_cmd(
                             .ok();
                     }
                 } else if !line.is_empty() {
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
+                    log.say(&log.paint(
+                        Tone::Dim,
                         "  (type a code like brave-otter-123 to claim it · `pair` · `devices` · `forget <name>`)",
                     ));
                 }
@@ -8595,14 +8620,14 @@ pub(crate) async fn recv_cmd(
                 // banner already says "Ctrl-C or `tunlion down` to stop", so
                 // say the thing that banner promised.
                 if daemon {
-                    ui::say(&format!(
+                    log.say(&format!(
                         "  {} stopped serving; `tunlion up` starts again",
-                        ui::paint(ui::Tone::Dim, "·")
+                        log.paint(Tone::Dim, "·")
                     ));
                 } else {
-                    ui::say(&format!(
+                    log.say(&format!(
                         "  {} interrupted, partials kept; run the same command to resume",
-                        ui::paint(ui::Tone::Warn, "!")
+                        log.paint(Tone::Warn, "!")
                     ));
                 }
                 if let Some(g) = &tty_guard {
@@ -8634,8 +8659,8 @@ pub(crate) async fn recv_cmd(
             // is the impolite-side ICE-restart inside correct_stall.
             Ev::TransferStalled(pid, idle_ms) => {
                 // DEBUG, resilience internal (inbound stall detection).
-                ui::debug(&ui::paint(
-                    ui::Tone::Warn,
+                log.debug(&log.paint(
+                    Tone::Warn,
                     &format!("  inbound stall: {idle_ms}ms with no data from peer, repairing link"),
                 ));
                 // P0 partial-preservation: flush THIS peer's in-flight partials
@@ -8658,7 +8683,7 @@ pub(crate) async fn recv_cmd(
                             let _ = f.sync_all();
                         })
                         .await;
-                        ui::debug(&format!(
+                        log.debug(&format!(
                             "{}: parked at {} for resume",
                             inc.name,
                             human(inc.received.load(Ordering::Relaxed))
@@ -8803,13 +8828,13 @@ pub(crate) async fn recv_cmd(
                     if !st.by_sid.is_empty() {
                         // Keep partials writable-but-parked; resume comes via
                         // rejoin (C6) or a later re-offer against the .part.
-                        ui::say(&ui::paint(
-                            ui::Tone::Dim,
+                        log.say(&log.paint(
+                            Tone::Dim,
                             &format!("  sender disconnected mid-transfer, waiting up to {secs}s"),
                         ));
                         flush_inflight(&mut st.by_sid).await;
                     } else if st.completed > 0 && !keep_open {
-                        ui::say(&format!(
+                        log.say(&format!(
                             "done ({} file{}).",
                             st.completed,
                             if st.completed == 1 { "" } else { "s" }
@@ -8822,10 +8847,10 @@ pub(crate) async fn recv_cmd(
                         // the line; their client rejoins on refocus.
                         let gid = v["id"].as_str().unwrap_or_default();
                         let n = gone.unwrap_or_else(|| "sender".into());
-                        ui::say(&conn.roster(
+                        log.say(&conn.roster(
                             gid,
                             "●",
-                            ui::Tone::Warn,
+                            Tone::Warn,
                             &format!(
                                 "stepped away, holding the line up to {secs}s (Ctrl-C to stop)"
                             ),
@@ -8835,15 +8860,15 @@ pub(crate) async fn recv_cmd(
                         conn.rejoin.waiting_rejoin = None; // open listener: keep going
                         let gid = v["id"].as_str().unwrap_or_default();
                         match gone {
-                            Some(n) => ui::say(&conn.roster(
+                            Some(n) => log.say(&conn.roster(
                                 gid,
                                 "○",
-                                ui::Tone::Dim,
+                                Tone::Dim,
                                 "left, still listening",
                                 &n,
                             )),
                             None => {
-                                ui::say(&ui::paint(ui::Tone::Dim, "  peer left, still listening"))
+                                log.say(&log.paint(Tone::Dim, "  peer left, still listening"))
                             }
                         }
                     }
@@ -8863,8 +8888,8 @@ pub(crate) async fn recv_cmd(
                 {
                     conn.rejoin.rejoin_window = crate::rejoin_unwarned();
                     conn.rejoin.waiting_rejoin = Some(Instant::now());
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
+                    log.say(&log.paint(
+                        Tone::Dim,
                         &format!(
                             "  sender disconnected mid-transfer, waiting up to {}s",
                             conn.rejoin.rejoin_window.as_secs()
@@ -8910,12 +8935,13 @@ async fn stdout_delivered(inc: &IncomingFile, conn: &Conn, pid: &str, sid: u32) 
 #[cfg(test)]
 mod peer_step_tests {
     use super::*;
+    use filament_peerloop::host::NoLog;
 
     /// The daemon survives a peer's failure: the step is skipped, not the loop.
     #[test]
     fn daemon_skips_a_failed_peer_step() {
         let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"));
-        assert!(matches!(peer_step(true, "p1", "adoption", r), Ok(None)));
+        assert!(matches!(peer_step(true, "p1", "adoption", r, &NoLog), Ok(None)));
     }
 
     /// A one-shot receive still fails, with the very error it met (no added
@@ -8924,18 +8950,37 @@ mod peer_step_tests {
     fn one_shot_keeps_the_error_unchanged() {
         let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"))
             .context("direct fallback adoption failed for peer p1 on receive path");
-        let e = peer_step(false, "p1", "adoption", r).unwrap_err();
+        let e = peer_step(false, "p1", "adoption", r, &NoLog).unwrap_err();
         assert_eq!(
             format!("{e:#}"),
             "direct fallback adoption failed for peer p1 on receive path: ICE config: no answer within 3s"
         );
     }
 
+    /// The daemon's skip line goes to the injected sink, not to a terminal.
+    #[test]
+    fn a_skipped_step_is_logged_to_the_sink() {
+        let log = filament_peerloop::host::VecLog::new();
+        let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"));
+        assert!(matches!(
+            peer_step(true, "p1", "adoption", r, &log),
+            Ok(None)
+        ));
+        let lines = log.take();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, filament_peerloop::host::Level::Debug);
+        assert!(
+            lines[0].1.contains("PEER-STEP-FAILED peer=p1 step=adoption"),
+            "{:?}",
+            lines[0].1
+        );
+    }
+
     /// Success passes the value through in both modes.
     #[test]
     fn success_passes_through() {
-        assert!(matches!(peer_step(true, "p1", "adoption", Ok(true)), Ok(Some(true))));
-        assert!(matches!(peer_step(false, "p1", "adoption", Ok(false)), Ok(Some(false))));
+        assert!(matches!(peer_step(true, "p1", "adoption", Ok(true), &NoLog), Ok(Some(true))));
+        assert!(matches!(peer_step(false, "p1", "adoption", Ok(false), &NoLog), Ok(Some(false))));
     }
 }
 
@@ -9048,14 +9093,15 @@ fn refuse_failed_write(
     wf: &crate::recv_files::WriteFailure,
     from: &str,
     daemon: bool,
+    log: &dyn LogSink,
 ) -> (String, &'static str, String) {
     let need = inc.size.saturating_sub(inc.received.load(Ordering::Relaxed));
     let free = platform::free_space(dir);
     let (token, msg) =
         crate::recv_files::storage_refusal(wf.kind, &inc.name, &wf.detail, Some(need), free);
     let from = if from.is_empty() { "the sender" } else { from };
-    ui::critical(&ui::paint(
-        ui::Tone::Err,
+    log.critical(&log.paint(
+        Tone::Err,
         &format!("  refused {} from {from}: {msg}", inc.name),
     ));
     note_refusal(daemon, &inc.name, inc.size, token, &msg, crate::recv_report::storage_kind(token));
@@ -9144,7 +9190,9 @@ mod expiry_redrive_tests {
 /// so the next wedge names itself in the daemon log with a timestamp.
 mod loop_watchdog {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Once;
+    use std::sync::{Arc, Once};
+
+    use filament_peerloop::host::LogSink;
 
     static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
     static START: Once = Once::new();
@@ -9166,9 +9214,9 @@ mod loop_watchdog {
             .unwrap_or(20)
     }
 
-    pub(super) fn tick() {
+    pub(super) fn tick(log: Arc<dyn LogSink>) {
         LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
-        START.call_once(|| {
+        START.call_once(move || {
             let threshold = threshold_secs();
             let _ = std::thread::Builder::new()
                 .name("loop-watchdog".into())
@@ -9179,12 +9227,12 @@ mod loop_watchdog {
                         let last = LAST_TICK_MS.load(Ordering::Relaxed);
                         let stalled = now_ms().saturating_sub(last) / 1000;
                         if stalled >= threshold && !reported {
-                            crate::ui::critical(&format!(
+                            log.critical(&format!(
                                 "event loop stalled: no iteration for {stalled}s (an await inside the daemon loop never completed); the daemon is not serving until it recovers"
                             ));
                             reported = true;
                         } else if stalled < threshold && reported {
-                            crate::ui::critical("event loop recovered");
+                            log.critical("event loop recovered");
                             reported = false;
                         }
                     }
