@@ -108,6 +108,7 @@ mod up_logs;
 mod add_for;
 /// `tunlion recv`, the receive-side event loop.
 mod recv_cmd;
+mod recv_lifecycle;
 use recv_cmd::recv_cmd;
 /// `tunlion send`.
 mod send_cmd;
