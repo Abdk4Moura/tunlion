@@ -20,6 +20,7 @@ RUNNER="ci-$(date +%Y%m%d-%H%M%S)"
 HOST_NAME="dovm"
 REF="$(git rev-parse --abbrev-ref HEAD)"
 KEEP_SECRET=0
+INV_DIR=""
 INV=""
 PAYLOAD_DIR=""
 
@@ -35,7 +36,7 @@ while [ $# -gt 0 ]; do
 done
 
 cleanup() {
-  [ -n "$INV" ] && rm -f "$INV"
+  [ -n "$INV_DIR" ] && rm -rf "$INV_DIR"
   [ -n "$PAYLOAD_DIR" ] && rm -rf "$PAYLOAD_DIR"
   if [ "$KEEP_SECRET" = "0" ]; then
     gh secret delete TUNLION_INVITE -R "$(repo)" >/dev/null 2>&1 || true
@@ -47,7 +48,10 @@ repo() { gh repo view --json nameWithOwner -q .nameWithOwner; }
 
 say() { printf '\n== %s\n' "$*"; }
 
-INV="$(mktemp)"
+# `--out` writes a NEW file and refuses to clobber, so hand it a name that does
+# not exist yet rather than mktemp's pre-created file.
+INV_DIR="$(mktemp -d)"
+INV="$INV_DIR/invitation"
 # A DEVICE invitation, not a runner one: the owner has to ADDRESS this box to
 # push the payload, and an ephemeral runner is deliberately not persisted, so it
 # cannot be resolved by name. The box still expires and is still forgotten at
