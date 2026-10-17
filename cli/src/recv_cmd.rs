@@ -81,6 +81,11 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use filament_cap::capability as cap;
+// The control socket's request/reply types live in the peer-loop crate; the
+// server (`ctl::serve_at`) and the socket path stay in `crate::ctl`.
+use filament_peerloop::control::Req;
+#[cfg(unix)]
+use filament_peerloop::control::ReqKind;
 use filament_peerloop::host::{CapGate, HostServices, Level, LogSink, StorageFailure, Tone};
 use filament_peerloop::shell::ShellHost;
 use filament_transfer::{MAX_RECV_RANGES, chunk_fits_offer};
@@ -1417,7 +1422,7 @@ pub(crate) async fn recv_cmd(
     // with a readiness signal the banner awaits. `ctl_tx` is held for the loop's
     // life so `ctl_rx` stays open (recv pends, never spins) even when we are not
     // the daemon and `serve` was not spawned.
-    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<Req>();
     let mut ctl_ready: Option<tokio::sync::oneshot::Receiver<()>> = None;
     #[cfg(unix)]
     {
@@ -2104,7 +2109,7 @@ pub(crate) async fn recv_cmd(
     // so a forgotten device hears who refused it and why, not "serving is off"
     // or "no grant", which named fixes that cannot apply.
     let mut unrecognized_pids: std::collections::HashSet<String> = Default::default();
-    let mut revocation_waiters: Vec<ctl::Req> = Vec::new();
+    let mut revocation_waiters: Vec<Req> = Vec::new();
     // How long an offer may wait for its sender to prove itself before we decide
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
     // would turn a clean decline into the 45s timeout it replaced.
@@ -2338,26 +2343,26 @@ pub(crate) async fn recv_cmd(
                         // `tunlion set` live-reconfigure: re-read the changed key
                         // into this loop's live state, then report whether it took
                         // without a restart. Handled here (we own dir/policy/sess).
-                        if let ctl::ReqKind::Reconfigure { key } = &req.kind {
+                        if let ReqKind::Reconfigure { key } = &req.kind {
                             let key = key.clone();
                             let live = apply_reconfigure(
                                 &key, &mut dir, &mut shell_policy, &mut shell_user,
                                 l2_enabled, &mut sess, &sio, &my_uid,
                             ).await;
                             req.reply(&json!({ "ok": true, "live": live })).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::RevocationSync) {
+                        } else if matches!(&req.kind, ReqKind::RevocationSync) {
                             // `devices forget` / `revoke`: apply the store NOW.
                             // Parked, and answered by the sweep below on this
                             // same iteration, so the reply means it is done.
                             revocation_sweep_now = true;
                             revocation_waiters.push(req);
-                        } else if matches!(&req.kind, ctl::ReqKind::Wake) {
+                        } else if matches!(&req.kind, ReqKind::Wake) {
                             // Nothing to do here: receiving this event IS the point.
                             // The loop now runs its top-level arm gate this same
                             // iteration, so a just-minted invitation's enrollment
                             // channel is subscribed before the joiner can arrive.
                             req.reply(&json!({ "ok": true })).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::ReloadExpose) {
+                        } else if matches!(&req.kind, ReqKind::ReloadExpose) {
                             // `tunlion expose`/`unexpose`: reconcile overlay
                             // listeners from expose.json. live:true only if L3 is up.
                             let (live, count): (bool, usize) = {
@@ -2374,7 +2379,7 @@ pub(crate) async fn recv_cmd(
                                 }
                             };
                             req.reply(&json!({ "ok": true, "live": live, "count": count })).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::Reload) {
+                        } else if matches!(&req.kind, ReqKind::Reload) {
                             // `tunlion update` reload: only safe when a supervisor
                             // will bring us back (systemd sets INVOCATION_ID). Reply
                             // FIRST (the shutdown closes the ctl socket), then take the
@@ -2391,13 +2396,13 @@ pub(crate) async fn recv_cmd(
                                 #[cfg(unix)]
                                 unsafe { libc::raise(libc::SIGTERM); }
                             }
-                        } else if matches!(&req.kind, ctl::ReqKind::Dial { .. }) {
+                        } else if matches!(&req.kind, ReqKind::Dial { .. }) {
                             // Overlay dial (proxy `.mesh` fallback): resolve the peer
                             // to its VERIFIED overlay address ourselves, dial it over
                             // L3, and bridge the ctl socket to it. Spawned so the
                             // long-lived splice never blocks the event loop.
                             #[cfg(l3)]
-                            if let ctl::ReqKind::Dial { peer, port } = &req.kind {
+                            if let ReqKind::Dial { peer, port } = &req.kind {
                                 let (peer, port) = (peer.clone(), *port);
                                 match l3.as_ref() {
                                     Some(m) => {
@@ -2445,17 +2450,17 @@ pub(crate) async fn recv_cmd(
                             }
                             #[cfg(not(l3))]
                             req.reject("L3 overlay not supported on this build").await;
-                        } else if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
+                        } else if matches!(&req.kind, ReqKind::Bootstrap { .. }) {
                             handle_warm_bootstrap(&conn, &mut pending_bootstrap, req).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::Mount { .. }) {
+                        } else if matches!(&req.kind, ReqKind::Mount { .. }) {
                             handle_mount(req, &server, relay, &mut daemon_mounts, &mut last_mount_check).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::Unmount { .. }) {
+                        } else if matches!(&req.kind, ReqKind::Unmount { .. }) {
                             handle_unmount(req, &mut daemon_mounts).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::ListMounts) {
+                        } else if matches!(&req.kind, ReqKind::ListMounts) {
                             handle_list_mounts(req, &daemon_mounts).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
+                        } else if matches!(&req.kind, ReqKind::MountHealth { .. }) {
                             handle_mount_health(req, &daemon_mounts).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::CapStatus) {
+                        } else if matches!(&req.kind, ReqKind::CapStatus) {
                             let counts = host.cap_shadow_counts();
                             let action_counts = host.cap_action_counts();
                             req.reply(&json!({
@@ -2495,9 +2500,9 @@ pub(crate) async fn recv_cmd(
                                     no_proxy_fallback,
                                 ),
                             })).await;
-                        } else if matches!(&req.kind, ctl::ReqKind::ListWarm) {
+                        } else if matches!(&req.kind, ReqKind::ListWarm) {
                             handle_list_warm(&conn, req).await;
-                        } else if let ctl::ReqKind::FleetRendezvous { name } =
+                        } else if let ReqKind::FleetRendezvous { name } =
                             req.kind.clone()
                         {
                             // Broker a PRIVATE meeting place for a one-shot.
@@ -2541,14 +2546,14 @@ pub(crate) async fn recv_cmd(
                                     req.reject(&format!("no verified link to '{name}'")).await;
                                 }
                             }
-                        } else if matches!(&req.kind, ctl::ReqKind::ListPending) {
+                        } else if matches!(&req.kind, ReqKind::ListPending) {
                             let mut requests = load_requests();
                             expire_requests(&mut requests);
                             req.reply(&json!({
                                 "ok": true,
                                 "requests": requests,
                             })).await;
-                        } else if let ctl::ReqKind::ApproveRequest { id, allow, expires } = &req.kind {
+                        } else if let ReqKind::ApproveRequest { id, allow, expires } = &req.kind {
                             let id = *id;
                             let allow = allow.clone();
                             let expires = *expires;
@@ -2582,7 +2587,7 @@ pub(crate) async fn recv_cmd(
                             } else {
                                 req.reject(&format!("request {id} not found or not pending")).await;
                             }
-                        } else if let ctl::ReqKind::DenyRequest { id } = &req.kind {
+                        } else if let ReqKind::DenyRequest { id } = &req.kind {
                             let id = *id;
                             let mut requests = load_requests();
                             expire_requests(&mut requests);
@@ -2595,7 +2600,7 @@ pub(crate) async fn recv_cmd(
                             }
                         } else {
                             // Auto-warm: feed LRU for pty sessions (bounded, no leak).
-                            if let ctl::ReqKind::Pty { peer, .. } = &req.kind {
+                            if let ReqKind::Pty { peer, .. } = &req.kind {
                                 conn.note_warm_use(peer);
                             }
                             handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
