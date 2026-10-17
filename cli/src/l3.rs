@@ -175,6 +175,16 @@ pub fn kernel_overlay_blocker(dev_present: bool, ipv6_off: bool) -> Option<Strin
 ///
 /// Pure so every branch is testable without breaking the host's networking.
 pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
+    // Windows first: "wintun" contains "tun", so the generic checks below could
+    // otherwise claim a Wintun failure. The three cases have different fixes,
+    // and an unrecognised adapter error must keep its own OS text.
+    if let Some(w) = crate::tun::classify_wintun_failure(err) {
+        use crate::tun::WintunFailure;
+        return match w {
+            WintunFailure::Other => err.to_string(),
+            w => format!("{}. {}. Original error: {err}", w.cause(), w.advice()),
+        };
+    }
     let e = err.to_ascii_lowercase();
     // IN THIS ORDER, and only the first cause that applies is advised. A box
     // with no /dev/net/tun and IPv6 disabled (a hardened container) used to
@@ -1407,6 +1417,57 @@ mod tests {
     fn an_unknown_failure_is_passed_through_verbatim() {
         let raw = "something nobody has seen before";
         assert_eq!(diagnose_tun_failure(raw, false), raw);
+    }
+
+    /// The Windows kernel backend has three distinct failure modes, and the
+    /// banner must give a different next command for each. Folding "no DLL"
+    /// and "not elevated" into one banner told a user who already had
+    /// wintun.dll to go bundle it.
+    #[test]
+    fn each_wintun_failure_names_its_own_next_command() {
+        use crate::tun::{
+            classify_wintun_failure, WintunFailure, WINTUN_DLL_ABSENT, WINTUN_NOT_ELEVATED,
+        };
+
+        let absent = format!(
+            "load wintun.dll: {WINTUN_DLL_ABSENT}; refusing to search CWD/PATH (DLL-hijack guard)"
+        );
+        assert_eq!(classify_wintun_failure(&absent), Some(WintunFailure::DllAbsent));
+        assert_eq!(
+            WintunFailure::DllAbsent.command(),
+            Some("irm https://tunlion.autumated.com/install.ps1 | iex")
+        );
+        let banner = diagnose_tun_failure(&absent, false);
+        assert!(banner.contains("wintun.dll is missing"), "{banner}");
+        assert!(banner.contains("signed wintun.dll"), "{banner}");
+        assert!(banner.contains("install.ps1"), "{banner}");
+        assert!(banner.contains(&absent), "keep the original error: {banner}");
+        assert!(!banner.contains("CAP_NET_ADMIN"), "{banner}");
+
+        let denied = format!(
+            "create Wintun adapter 'tunlion0': Failed to create adapter. The \
+             {WINTUN_NOT_ELEVATED}."
+        );
+        assert_eq!(classify_wintun_failure(&denied), Some(WintunFailure::NotElevated));
+        assert_eq!(WintunFailure::NotElevated.command(), Some("tunlion up --install"));
+        let banner = diagnose_tun_failure(&denied, false);
+        assert!(banner.contains("not elevated"), "{banner}");
+        assert!(banner.contains("tunlion up --install"), "{banner}");
+        assert!(banner.contains("Administrator"), "{banner}");
+        assert!(banner.contains(&denied), "keep the original error: {banner}");
+        assert!(!banner.contains("wintun.dll is missing"), "{banner}");
+
+        let other = "create Wintun adapter 'tunlion0': Failed to create adapter";
+        assert_eq!(classify_wintun_failure(other), Some(WintunFailure::Other));
+        assert_eq!(WintunFailure::Other.command(), None);
+        assert_eq!(WintunFailure::Other.advice(), "");
+        assert_eq!(diagnose_tun_failure(other, false), other);
+
+        // A non-Wintun error is never claimed by the Windows classifier.
+        assert_eq!(
+            classify_wintun_failure("open /dev/net/tun: No such file or directory"),
+            None
+        );
     }
     use super::{diagnose_tun_failure, dest_ip, kernel_overlay_blocker, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

@@ -1100,6 +1100,55 @@ impl Drop for DevicesFileLock {
 
 // --------------------------------------------------------- ServiceHost --
 
+/// Whether this process holds elevated privileges (root on Unix, an elevated
+/// token on Windows).
+///
+/// Shared with the Windows TUN backend: Wintun 0.5 reports only "Failed to
+/// create adapter" and discards the Win32 error, so the token state is what
+/// separates "not elevated" from an unrelated adapter failure.
+pub(crate) fn process_is_elevated() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        // #173: this used to return true unconditionally, on the
+        // assumption that the only caller was an already-elevated
+        // re-launch. It is ALSO the first, non-elevated call, so the UAC
+        // re-launch could never run. Query the token elevation state
+        // instead.
+        unsafe {
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> isize;
+                fn OpenProcessToken(h: isize, access: u32, tok: *mut isize) -> i32;
+                fn GetTokenInformation(tok: isize, cls: u32, buf: *mut u8, len: u32, ret: *mut u32) -> i32;
+                fn CloseHandle(h: isize) -> i32;
+            }
+            const TOKEN_QUERY: u32 = 0x0008;
+            const TOKEN_ELEVATION: u32 = 20;
+            let mut tok: isize = 0;
+            let h = GetCurrentProcess();
+            if OpenProcessToken(h, TOKEN_QUERY, &mut tok) == 0 {
+                return false;
+            }
+            let mut elev: u32 = 0;
+            let mut ret: u32 = 0;
+            let ok = GetTokenInformation(
+                tok,
+                TOKEN_ELEVATION,
+                (&mut elev as *mut u32).cast::<u8>(),
+                std::mem::size_of::<u32>() as u32,
+                &mut ret,
+            );
+            CloseHandle(tok);
+            ok != 0 && elev != 0
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    { false }
+}
+
 /// The detected service manager on this platform.
 ///
 /// Supports two install tiers:
@@ -1189,46 +1238,7 @@ impl ServiceHost {
     }
 
     fn is_elevated(&self) -> bool {
-        #[cfg(unix)]
-        {
-            unsafe { libc::geteuid() == 0 }
-        }
-        #[cfg(windows)]
-        {
-            // #173: this used to return true unconditionally, on the
-            // assumption that the only caller was an already-elevated
-            // re-launch. It is ALSO the first, non-elevated call, so the UAC
-            // re-launch could never run. Query the token elevation state
-            // instead.
-            unsafe {
-                unsafe extern "system" {
-                    fn GetCurrentProcess() -> isize;
-                    fn OpenProcessToken(h: isize, access: u32, tok: *mut isize) -> i32;
-                    fn GetTokenInformation(tok: isize, cls: u32, buf: *mut u8, len: u32, ret: *mut u32) -> i32;
-                    fn CloseHandle(h: isize) -> i32;
-                }
-                const TOKEN_QUERY: u32 = 0x0008;
-                const TOKEN_ELEVATION: u32 = 20;
-                let mut tok: isize = 0;
-                let h = GetCurrentProcess();
-                if OpenProcessToken(h, TOKEN_QUERY, &mut tok) == 0 {
-                    return false;
-                }
-                let mut elev: u32 = 0;
-                let mut ret: u32 = 0;
-                let ok = GetTokenInformation(
-                    tok,
-                    TOKEN_ELEVATION,
-                    (&mut elev as *mut u32).cast::<u8>(),
-                    std::mem::size_of::<u32>() as u32,
-                    &mut ret,
-                );
-                CloseHandle(tok);
-                ok != 0 && elev != 0
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        { false }
+        process_is_elevated()
     }
 
     fn do_install_system(&self, exe: &Path, argv: &[String]) -> Result<()> {

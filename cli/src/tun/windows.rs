@@ -13,6 +13,8 @@ use anyhow::{bail, Context, Result};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+use super::{WINTUN_DLL_ABSENT, WINTUN_NOT_ELEVATED};
+
 /// A Wintun adapter session plus the async plumbing. Dropping it shuts the session
 /// down (unblocking the reader thread) and removes the adapter.
 pub struct KernelTun {
@@ -30,16 +32,24 @@ impl KernelTun {
     /// Open (or create) the `name` adapter, assign `cidr`, set `mtu`, and start
     /// pumping. Needs Administrator + wintun.dll.
     pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<KernelTun> {
-        let wintun = load_wintun().context("load wintun.dll (bundle it beside tunlion.exe)")?;
+        let wintun = load_wintun()?;
+        // Wintun 0.5 does not surface GetLastError: every adapter/session
+        // failure is "Failed to create adapter" / "WintunStartSession failed".
+        // The token state is therefore the only reliable separator between the
+        // not-elevated case and a genuinely unrelated adapter error.
+        let elevated = crate::platform::process_is_elevated();
         let adapter = wintun::Adapter::open(&wintun, name)
             .or_else(|_| wintun::Adapter::create(&wintun, name, "Tunlion", None))
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "create Wintun adapter '{name}': {e}. L3 on Windows needs Administrator and wintun.dll."
-                )
+                wintun_error(&format!("create Wintun adapter '{name}'"), &e, elevated)
             })?;
-        let session =
-            Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).context("start Wintun session")?);
+        let session = Arc::new(
+            adapter
+                .start_session(wintun::MAX_RING_CAPACITY)
+                .map_err(|e| {
+                    wintun_error(&format!("start Wintun session on '{name}'"), &e, elevated)
+                })?,
+        );
 
         // Blocking ring -> channel: a reader thread feeds recv() so the overlay's
         // async loop never blocks. shutdown() (on Drop) makes receive_blocking()
@@ -143,11 +153,30 @@ fn load_wintun() -> Result<wintun::Wintun> {
         system32
     } else {
         bail!(
-            "wintun.dll not found next to tunlion.exe or in System32; refusing to search CWD/PATH \
-             (DLL-hijack guard). Reinstall tunlion, or place WireGuard's signed wintun.dll beside tunlion.exe."
+            "{WINTUN_DLL_ABSENT}; refusing to search CWD/PATH (DLL-hijack guard)"
         );
     };
     unsafe { wintun::load_from_path(&dll) }.map_err(|e| anyhow::anyhow!("load {}: {e}", dll.display()))
+}
+
+/// Turn a Wintun adapter/session error into the text `l3` classifies.
+///
+/// The classifier itself (`tun::classify_wintun_failure`) lives one module up,
+/// so its three-way mapping is unit-tested on every runner; this backend's job
+/// is to emit the elevation marker accurately.
+///
+/// Wintun 0.5 discards the Win32 error behind `WintunCreateAdapter` and
+/// `WintunStartSession` ("Failed to create adapter"), so an `ERROR_ACCESS_DENIED`
+/// string is not available to match on. The process token is: a failure while
+/// not elevated is the elevation case, and a failure while elevated keeps its
+/// own text rather than being dressed up as a cause we did not identify.
+fn wintun_error(context: &str, e: &dyn std::fmt::Display, elevated: bool) -> anyhow::Error {
+    let text = e.to_string();
+    if elevated {
+        anyhow::anyhow!("{context}: {text}")
+    } else {
+        anyhow::anyhow!("{context}: {text}. The {WINTUN_NOT_ELEVATED}.")
+    }
 }
 
 /// Split `addr/prefixlen`; a bare address defaults to a host route (/128 or /32).
@@ -221,7 +250,8 @@ pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
 /// Windows has no capability model; Wintun adapter creation needs Administrator.
 /// We can't self-elevate, so guide; the real check is the adapter-create error.
 pub fn ensure_net_admin_for_l3() -> bool {
-    eprintln!("  L3 on Windows needs Administrator and wintun.dll beside tunlion.exe.");
+    eprintln!("  L3 on Windows needs Administrator (adapter creation) and wintun.dll beside tunlion.exe.");
+    eprintln!("  For the always-on service run `tunlion up --install`; for a kernel adapter run this shell as Administrator.");
     true
 }
 
@@ -252,4 +282,48 @@ fn netsh(args: &[&str]) -> Result<()> {
         bail!("netsh {}: {}", args.join(" "), msg.trim());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tun::{classify_wintun_failure, WintunFailure};
+
+    /// The backend has to emit the marker the cross-platform classifier keys
+    /// on. Wintun gives no Win32 detail, so the token state is the signal.
+    #[test]
+    fn a_non_elevated_process_emits_the_not_elevated_marker() {
+        let denied = wintun_error(
+            "create Wintun adapter 'tunlion0'",
+            &"Failed to create adapter",
+            false,
+        );
+        assert_eq!(
+            classify_wintun_failure(&denied.to_string()),
+            Some(WintunFailure::NotElevated),
+            "{denied}"
+        );
+        assert!(denied.to_string().contains(WINTUN_NOT_ELEVATED), "{denied}");
+    }
+
+    /// An elevated process that still fails is NOT an elevation problem: the
+    /// OS text is what the operator needs, even when it is only Wintun's
+    /// unhelpful "Failed to create adapter".
+    #[test]
+    fn an_elevated_adapter_error_stays_other() {
+        let e = wintun_error(
+            "create Wintun adapter 'tunlion0'",
+            &"Failed to create adapter",
+            true,
+        );
+        assert_eq!(classify_wintun_failure(&e.to_string()), Some(WintunFailure::Other));
+        assert!(!e.to_string().contains(WINTUN_NOT_ELEVATED), "{e}");
+    }
+
+    /// The absent-DLL error text is the marker itself.
+    #[test]
+    fn a_missing_dll_is_classified_as_absent() {
+        let raw = format!("{WINTUN_DLL_ABSENT}; refusing to search CWD/PATH (DLL-hijack guard)");
+        assert_eq!(classify_wintun_failure(&raw), Some(WintunFailure::DllAbsent));
+    }
 }
