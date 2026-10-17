@@ -1198,11 +1198,13 @@ impl Conn {
     /// The `--code` path DEFERS every offer until the PAKE confirms. The offer
     /// site says so, and states who is supposed to wake it:
     ///
-    ///     // ...on confirm the Signal handler sets `pake_done` and re-emits
-    ///     // ChannelReady to fall through here and offer.
-    ///     if use_code && !is_direct && !pake_done {
-    ///         continue; // offers/remember wait for PAKE confirm
-    ///     }
+    /// ```text
+    /// // ...on confirm the Signal handler sets `pake_done` and re-emits
+    /// // ChannelReady to fall through here and offer.
+    /// if use_code && !is_direct && !pake_done {
+    ///     continue; // offers/remember wait for PAKE confirm
+    /// }
+    /// ```
     ///
     /// The Signal handler sets `pake_done`. It has never re-emitted anything.
     /// What actually woke the loop was the Option A teardown: dropping the link
