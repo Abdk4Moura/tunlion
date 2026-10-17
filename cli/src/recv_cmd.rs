@@ -3972,7 +3972,7 @@ pub(crate) async fn recv_cmd(
                             paired,
                         );
                         log.say(&q); // permanent: a new question fronted (C25)
-                        front_question(conn.present.as_ref(), log, &q, true);
+                        front_question(conn.present.as_ref(), log.as_ref(), &q, true);
                         st.question_shown = Instant::now();
                     }
                 } else {
@@ -7644,7 +7644,7 @@ pub(crate) async fn recv_cmd(
                                 // sticky as the live answer tail.
                                 let q = offer_question(&sender_name, &name, size, paired);
                                 log.say(&q);
-                                front_question(conn.present.as_ref(), log, &q, true);
+                                front_question(conn.present.as_ref(), log.as_ref(), &q, true);
                                 st.question_shown = Instant::now();
                             }
                             continue; // decision arrives later via StdinLine
@@ -8639,7 +8639,7 @@ pub(crate) async fn recv_cmd(
                             log.say(&q); // a NEW question fronted, permanent line (C25)
                             st.question_shown = Instant::now();
                         }
-                        front_question(conn.present.as_ref(), log, &q, answered);
+                        front_question(conn.present.as_ref(), log.as_ref(), &q, answered);
                     } else {
                         st.question_open
                             .store(false, std::sync::atomic::Ordering::Relaxed);
