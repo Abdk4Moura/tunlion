@@ -66,20 +66,9 @@ pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
         .collect()
 }
 
-pub(crate) fn fresh_secret() -> String {
-    let mut buf = [0u8; 32];
-    // std-only CSPRNG is unavailable; derive from getrandom via std::fs on unix
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_err()
-    {
-        // fallback (non-unix): hash of time+pid noise, still unpredictable enough
-        let mut h = Sha256::new();
-        h.update(format!("{:?}{}", SystemTime::now(), std::process::id()));
-        buf.copy_from_slice(&h.finalize()[..32]);
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
-}
+/// A fresh 32-byte hex secret. Moved to `filament-peerloop::secret`; re-exported
+/// so every pair-secret call site keeps the same name and bytes.
+pub(crate) use filament_peerloop::secret::fresh_secret;
 
 /// Minimal `YYYY-MM-DD HH:MM` UTC stamp (civil-from-days; avoids chrono).
 pub(crate) fn chrono_now() -> String {

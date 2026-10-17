@@ -48,6 +48,7 @@ use crate::identity::resolve_peer_identity;
 use crate::limits::{
     FLEET_LINK_NAME, MAX_ATTEMPTS, REJOIN_WINDOW, STALL_MAX_REPAIRS, VERIFY_PROBE_SID,
 };
+use crate::link_manager::{LinkObs, Placement, Work, place};
 use crate::present::{NoScreen, Presentation};
 use crate::resilience;
 use crate::test_hooks;
@@ -793,6 +794,49 @@ pub fn upgrade_principal(
 /// (their session ids differ, so role election holds). It is also unencrypted
 /// and unauthenticated, which a finished version would have to answer first.
 const LOCAL_TCP_TRANSPORT: bool = false;
+
+/// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
+/// same key the L2 cap gate uses) to a warm, trusted, alive link, preferring a
+/// direct one. The single resolver for every warm-reuse op (open + pty), so the
+/// eligibility rule lives in exactly one place. A miss means the caller falls
+/// back to a fresh establish, which is correct.
+///
+/// Moved here from `cli/src/daemon_ctl.rs` with its body unchanged: it takes a
+/// [`Conn`] and returns a transport pair, both of which this crate owns, so the
+/// only thing that changed is the path that names it.
+pub fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn Transport>)> {
+    // Eligibility is "do I know WHO this link reaches", because the caller is
+    // asking to route a request AT that peer. `l.trusted` is a narrower thing:
+    // the legacy blanket-trust flag, which a fleet link deliberately never sets
+    // (its identity comes from a verified certificate, and `admit_delegated`
+    // avoids `trusted` precisely so it cannot leak into the legacy_ok gates).
+    // Testing only `trusted` made every fleet sibling ineligible for the warm
+    // path, so `shell`/`open` fell through to a cold dial for a peer we hold no
+    // secret for and reported it as unreachable while a healthy link sat right
+    // there. A Proven identity binding answers the actual question.
+    // NOTE: this decides ROUTING, not permission. What the peer may do to us is
+    // still decided by the capability gate on the receiving side.
+    let links: Vec<LinkObs<'_>> = conn
+        .links
+        .iter()
+        .map(|(pid, l)| LinkObs {
+            pid: pid.as_str(),
+            verified_name: l.verified_name.as_deref(),
+            identity_known: l.trusted || l.identity_binding == BindingStrength::Proven,
+            has_transport: l.transport.is_some(),
+            alive: l.transport.as_ref().is_some_and(|t| t.is_alive()),
+            direct: l.direct,
+            idle_ms: l.transport.as_ref().map_or(u64::MAX, |t| t.idle_ms()),
+        })
+        .collect();
+    match place(Work::Interactive, peer, &links) {
+        Placement::Reuse { pid } => {
+            let t = conn.links.get(&pid)?.transport.clone()?;
+            Some((pid, t))
+        }
+        Placement::Establish => None,
+    }
+}
 
 impl Conn {
     /// Single constructor for the `pair`/`send`/`recv` command event loops, which
