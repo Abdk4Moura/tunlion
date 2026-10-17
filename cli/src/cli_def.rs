@@ -274,6 +274,12 @@ pub(crate) enum Cmd {
         /// Keep listening after a sender disconnects
         #[arg(long)]
         keep_open: bool,
+        /// Seconds to wait for anything to arrive (default: wait without
+        /// limit). Nothing received by the deadline exits 6, so a script can
+        /// tell "nobody came" from "the transfer failed". 0 waits without
+        /// limit. Conflicts with --keep-open.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
         /// After a code pairing, remember the other device under this name
         #[arg(long)]
         remember: Option<String>,

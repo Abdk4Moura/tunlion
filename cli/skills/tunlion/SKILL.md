@@ -92,10 +92,15 @@ Use `-` as the path to send stdin (add `--name <file name>`).
 
 ```bash
 tunlion receive <code> --dir <dir> --json
+tunlion receive <code> --dir <dir> --timeout 300 --json   # give up after 5 min
 ```
 
 A code is already consent; no prompt appears. `-o -` streams a single file to
-stdout.
+stdout. `--timeout` bounds the wait for a sender: if nothing has arrived by the
+deadline the command exits 6 (`unreachable`) with "nothing arrived within Ns",
+which is different from a transfer that failed (1) or was refused (4). Use it in
+scripts and CI so a missing peer cannot hang the job. `--timeout 0` waits
+without limit, and `--timeout` conflicts with `--keep-open`.
 
 ### Keep a directory updated on another device
 

@@ -64,8 +64,10 @@ on both ends.
 
 ## The fix list, in order
 
-1. `receive --timeout <secs>` and an exit code meaning "deadline, nothing
-   arrived". Removes the `timeout(1)` wrapper from every caller.
+1. DONE: `receive --timeout <secs>` exits 6 (`unreachable`) with "nothing
+   arrived within Ns" when no sender has offered anything by the deadline.
+   `--timeout 0` waits without limit; it conflicts with `--keep-open`. This
+   removes the `timeout(1)` wrapper from every caller.
 2. `receive --expect-sha256 <hex>` (and `--expect-name <name>`): refuse to report
    success unless the received bytes match. Removes hand-rolled verification.
 3. `tunlion wait <device> --timeout <secs>`: block until a named device is

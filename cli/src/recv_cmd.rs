@@ -1110,6 +1110,45 @@ mod quiet_exit_tests {
     }
 }
 
+/// Whether a one-shot receive has waited past its deadline with nothing kept.
+/// Pure so the boundary is testable without a socket. No timeout (or 0) means
+/// "wait without limit"; anything already received means the deadline no
+/// longer applies, because the transfer happened.
+pub(crate) fn receive_timed_out(
+    elapsed: Duration,
+    timeout: Option<Duration>,
+    completed: usize,
+) -> bool {
+    completed == 0 && timeout.is_some_and(|d| !d.is_zero() && elapsed >= d)
+}
+
+#[cfg(test)]
+mod receive_timeout_tests {
+    use super::receive_timed_out;
+    use std::time::Duration;
+
+    #[test]
+    fn nothing_arrived_at_the_deadline_is_a_timeout() {
+        assert!(receive_timed_out(Duration::from_secs(30), Some(Duration::from_secs(30)), 0));
+        assert!(receive_timed_out(Duration::from_secs(31), Some(Duration::from_secs(30)), 0));
+        assert!(!receive_timed_out(Duration::from_secs(29), Some(Duration::from_secs(30)), 0));
+    }
+
+    #[test]
+    fn a_received_file_beats_the_deadline() {
+        // The transfer happened; the clock must not turn a success into a
+        // timeout because the sender stayed connected afterwards.
+        assert!(!receive_timed_out(Duration::from_secs(99), Some(Duration::from_secs(30)), 1));
+    }
+
+    #[test]
+    fn no_deadline_means_no_deadline() {
+        assert!(!receive_timed_out(Duration::from_secs(86_400), None, 0));
+        // 0 is the documented "wait without limit" value.
+        assert!(!receive_timed_out(Duration::from_secs(86_400), Some(Duration::ZERO), 0));
+    }
+}
+
 pub(crate) async fn recv_cmd(
     server: &str,
     mut code: Option<String>,
@@ -1118,6 +1157,10 @@ pub(crate) async fn recv_cmd(
     room: Option<String>,
     to: Option<String>,
     keep_open: bool,
+    // Wait at most this long for anything to arrive; None (or 0) waits without
+    // limit. A deadline that passes with nothing received exits 6, so a script
+    // can tell "nobody came" from "the transfer failed".
+    timeout: Option<u64>,
     relay: bool,
     remember: Option<String>,
     daemon: bool,
@@ -2148,6 +2191,10 @@ pub(crate) async fn recv_cmd(
         log.say(&format!("warning: failed to restore mounts: {e}"));
     }
 
+    // The deadline starts when the loop starts, not when the process did: the
+    // caller asked "wait N seconds for a sender", not "be ready in N seconds".
+    let receive_started = Instant::now();
+
     loop {
         // Live posture: a `tunlion grant <dev> shell` (or the revoke of the last
         // shell grant) applies to the RUNNING daemon on the next open. Computed once at startup, it silently required a
@@ -2244,6 +2291,23 @@ pub(crate) async fn recv_cmd(
                     ));
                 }
             }
+        }
+        // A one-shot receive with a deadline ends here, before selecting again:
+        // nothing has arrived, so there is nothing left to wait for. Exit 6 is
+        // "nobody answered", which a script can tell apart from a failed
+        // transfer (1) or a refused one (4).
+        if receive_timed_out(
+            receive_started.elapsed(),
+            timeout.map(Duration::from_secs),
+            st.completed,
+        ) {
+            ui::clear_sticky();
+            let secs = timeout.unwrap_or(0);
+            let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::Unreachable,
+                format!("nothing arrived within {secs}s: no sender offered a transfer"),
+            ));
         }
         if daemon {
             loop_watchdog::tick(log.clone());
