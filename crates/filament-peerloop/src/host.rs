@@ -24,7 +24,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use filament_cap::capability::{
@@ -674,32 +674,9 @@ impl PersistedPrincipal {
     }
 }
 
-/// The process-wide host, installed once at startup.
-///
-/// The peer loop's per-session state (`Conn`) is handed its host explicitly,
-/// but the L2 muxes are created inside command modules that this slice may not
-/// edit. They read this one process answer instead. Absent an install, the
-/// answer is [`NoHost`], so a library consumer keeps every inert default
-/// (notably: no peer-requested dial).
-static PROCESS_HOST: OnceLock<Arc<dyn HostServices>> = OnceLock::new();
-
-/// Install the process host once. A second install is ignored, like the
-/// transport hooks: the first answer is the one every mux already holds.
-pub fn install_process_host(host: Arc<dyn HostServices>) {
-    let _ = PROCESS_HOST.set(host);
-}
-
-/// The installed process host, or [`NoHost`] when nothing was installed.
-pub fn process_host() -> Arc<dyn HostServices> {
-    PROCESS_HOST
-        .get()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(NoHost))
-}
-
 /// An inert [`HostServices`]: no settings, no devices, no owner key, relay
-/// permitted, no fleet. The host-free default for a library consumer and a base
-/// for tests that only care about one method.
+/// permitted, no fleet. Pass it explicitly to opt into host-free behavior;
+/// constructors never select it as a fallback.
 #[derive(Clone, Copy, Default)]
 pub struct NoHost;
 

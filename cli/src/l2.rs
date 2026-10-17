@@ -1367,7 +1367,7 @@ pub async fn establish_probe_within(
             // same way netcat does: pump inbound events, open one stream (sends
             // l2-open), record `up`. We do NOT wait on payload; the open is the
             // last establishment rung we care about.
-            let mux = Mux::new(t);
+            let mux = Mux::new(t, crate::host_impl::cli_host());
             let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
 
             diag.enter(crate::diag::Phase::L2Open);
@@ -2200,7 +2200,7 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
         }
     };
     guard.forget(); // long-lived tunnel, keep the link alive for the process
-    let mux = Mux::new(t);
+    let mux = Mux::new(t, crate::host_impl::cli_host());
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
 
     // L2Open round trip: open the stream and wait for the acceptor's l2-open-ack
@@ -2524,7 +2524,7 @@ async fn pty_attach_once(
         }
     };
     guard.forget();
-    let mux = Mux::new(t);
+    let mux = Mux::new(t, crate::host_impl::cli_host());
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
 
     diag.enter(crate::diag::Phase::L2Open);
@@ -3400,7 +3400,7 @@ pub async fn mount_cmd(
 ) -> Result<crate::mount_proto::MountClient> {
     let (t, rx, guard, _diag) = bring_up_to_known(server, peer, relay, "mount").await?;
     guard.forget();
-    let mux = Mux::new(t.clone());
+    let mux = Mux::new(t.clone(), crate::host_impl::cli_host());
     let _pump = tokio::spawn(pump_initiator(rx, mux.clone()));
     let (sid, pipe_rx, caps) = open_mount_stream(&mux, root).await?;
     let client = crate::mount_proto::MountClient::from_mux_v2(t.clone(), sid, pipe_rx, caps);
@@ -4524,7 +4524,7 @@ async fn manage_cold_link(
             Ok((t, rx, guard, mut diag)) => {
                 guard.forget();
                 diag.up("tunnel", "datachannel-or-direct");
-                let m = Mux::new(t);
+                let m = Mux::new(t, crate::host_impl::cli_host());
                 tokio::spawn(pump_initiator(rx, m.clone()));
                 m
             }
@@ -5601,7 +5601,7 @@ mod h1_tests {
     #[tokio::test]
     async fn losing_pc_state_does_not_shutdown_live_selected_mux() {
         let selected = MockTransport::new_with_alive(true);
-        let mux = Mux::new(selected.clone());
+        let mux = Mux::new(selected.clone(), Arc::new(filament_peerloop::host::NoHost));
         let sid = L2_SID_BASE | 0x123;
         let mut stream = mux.register_stream(sid).await.expect("register stream");
         let (tx, rx) = mpsc::unbounded_channel();
@@ -5628,7 +5628,7 @@ mod h1_tests {
         // A PcState notification while the selected transport is dead does
         // retire the mux, even though its event pid is another candidate.
         let dead_transport = MockTransport::new_with_alive(false);
-        let dead_selected = Mux::new(dead_transport.clone());
+        let dead_selected = Mux::new(dead_transport.clone(), Arc::new(filament_peerloop::host::NoHost));
         let _dead_stream = dead_selected
             .register_stream(sid + 1)
             .await
@@ -5694,7 +5694,7 @@ mod h1_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let start = LIVE_PTYS.load(Ordering::SeqCst);
-        let mux = Mux::new(MockTransport::new());
+        let mux = Mux::new(MockTransport::new(), Arc::new(filament_peerloop::host::NoHost));
         let n = 5u32;
 
         // Path A: inbound l2-close frees stream + resizer.
@@ -6171,7 +6171,7 @@ mod h1_tests {
     #[tokio::test]
     async fn warm_reuse_zombie_link_self_heals_instead_of_hanging() {
         let t = CapTransport::new();
-        let mux = Mux::new(t.clone());
+        let mux = Mux::new(t.clone(), Arc::new(filament_peerloop::host::NoHost));
 
         let verdict = open_stream_verified(&mux, 22, std::time::Duration::from_millis(50)).await;
 
@@ -6203,7 +6203,7 @@ mod h1_tests {
     #[tokio::test]
     async fn warm_reuse_healthy_link_passes_and_replays_first_frame() {
         let t = CapTransport::new();
-        let mux = Mux::new(t.clone());
+        let mux = Mux::new(t.clone(), Arc::new(filament_peerloop::host::NoHost));
 
         // Drive open_stream_verified concurrently; as soon as it registers its
         // stream, deliver the peer's first frame (sshd banner / shell prompt).
@@ -6259,7 +6259,7 @@ mod h1_tests {
     #[tokio::test]
     async fn warm_reuse_client_first_link_passes_on_open_ack() {
         let t = CapTransport::new();
-        let mux = Mux::new(t.clone());
+        let mux = Mux::new(t.clone(), Arc::new(filament_peerloop::host::NoHost));
 
         let mux2 = mux.clone();
         let h = tokio::spawn(async move {

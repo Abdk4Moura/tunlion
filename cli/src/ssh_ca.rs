@@ -736,7 +736,7 @@ pub(crate) async fn acquire_ssh_cert(
             }
         };
     guard.forget();
-    let mux = crate::l2::Mux::new(t.clone());
+    let mux = crate::l2::Mux::new(t.clone(), crate::host_impl::cli_host());
     let sid = mux.alloc_sid();
     let cert = request_cert(&t, &mut rx, sid, &device_id, eph.pubkey_text(), ttl).await?;
     let cert_path = eph.dir().join("key-cert.pub");

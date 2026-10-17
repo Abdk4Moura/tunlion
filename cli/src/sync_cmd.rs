@@ -534,7 +534,7 @@ async fn sync_inner(
         Err(_) => return Err(fail(6, "unreachable", format!("couldn't reach '{peer}' in 45s"))),
     };
     guard.forget();
-    let mux = l2::Mux::new(t.clone());
+    let mux = l2::Mux::new(t.clone(), crate::host_impl::cli_host());
     let sid = mux.alloc_sid();
     let mut pipe = mux
         .register_stream(sid)
