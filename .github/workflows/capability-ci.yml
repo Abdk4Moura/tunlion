@@ -142,7 +142,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
@@ -150,11 +150,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            cli/target/release/.fingerprint/
-            cli/target/release/deps/
-            cli/target/release/build/
-            cli/target/release/libtunlion_cli*
-          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}
+            target/release/.fingerprint/
+            target/release/deps/
+            target/release/build/
+            target/release/libtunlion_cli*
+          key: ${{ runner.os }}-target-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-target-
 
@@ -170,7 +170,7 @@ jobs:
 
       - name: Codesign binary (macOS)
         if: runner.os == 'macOS'
-        run: codesign --force --sign - cli/target/release/tunlion
+        run: codesign --force --sign - target/release/tunlion
 
       - name: Run capability harness
         working-directory: cli
@@ -215,7 +215,7 @@ jobs:
         shell: bash
         run: bash cli/tests/expiry-race-gates.sh
         env:
-          TUNLION_BIN: ${{ github.workspace }}/cli/target/release/tunlion
+          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
         timeout-minutes: 6
 
       - name: Upload harness log (macOS)
@@ -262,7 +262,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 

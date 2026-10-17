@@ -24,7 +24,7 @@ on:
       - 'cli/src/mount_*.rs'
       - 'cli/src/mount_proto.rs'
       - 'cli/Cargo.toml'
-      - 'cli/Cargo.lock'
+      - 'Cargo.lock'
       - 'crates/**'
       - '.github/workflows/mount-ci.yml'
   schedule:

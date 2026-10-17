@@ -51,8 +51,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            cli/target
-          key: android-${{ matrix.target }}-${{ hashFiles('cli/Cargo.lock') }}
+            target
+          key: android-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: android-${{ matrix.target }}-
       - name: Build
         working-directory: cli
@@ -63,7 +63,7 @@ jobs:
       - name: Stage
         run: |
           mkdir -p out
-          cp cli/target/${{ matrix.target }}/release/tunlion out/tunlion
+          cp target/${{ matrix.target }}/release/tunlion out/tunlion
           file out/tunlion
           ls -la out
       - uses: actions/upload-artifact@v4
@@ -97,20 +97,20 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            crates/tunlion-core/target
-          key: android-core-${{ matrix.target }}-${{ hashFiles('crates/tunlion-core/Cargo.lock') }}
+            target
+          key: android-core-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: android-core-${{ matrix.target }}-
       - name: Build the library
         working-directory: crates/tunlion-core
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          # cargo-ndk looks for Cargo.toml in the working directory. This repo
-          # has no root manifest, so the job has to start inside the crate.
+          # cargo-ndk looks for Cargo.toml in the working directory, so the job
+          # starts inside the crate even though the workspace root has one.
           cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --lib
       - name: Stage
         run: |
           mkdir -p out
-          so="crates/tunlion-core/target/${{ matrix.target }}/release/libtunlion_core.so"
+          so="target/${{ matrix.target }}/release/libtunlion_core.so"
           test -f "$so"
           cp "$so" out/libtunlion_core.so
           file out/libtunlion_core.so
@@ -140,20 +140,25 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            crates/tunlion-core/target
-          key: bindings-${{ hashFiles('crates/tunlion-core/Cargo.lock') }}
+            target
+          key: bindings-${{ hashFiles('Cargo.lock') }}
           restore-keys: bindings-
-      # Both steps run INSIDE the crate. The repo has no root manifest, and
-      # uniffi-bindgen shells out to `cargo metadata` in its working directory.
-      # From the repo root that fails with "could not find Cargo.toml".
+      # Both steps run INSIDE the crate: uniffi-bindgen shells out to
+      # `cargo metadata` in its working directory, and from the workspace root
+      # that would resolve the virtual manifest, not tunlion-core.
       - name: Build the library for the host
         working-directory: crates/tunlion-core
-        run: cargo build --release --lib
+        # uniffi-bindgen reads the UNIFFI_META_* entries from the ELF symbol
+        # table. The workspace release profile strips symbols (as the CLI
+        # release always did), which removes them, so this host build that
+        # exists only to feed bindgen turns strip off. The shipped Android .so
+        # below stays stripped.
+        run: cargo build --release --lib --config 'profile.release.strip=false'
       - name: Generate the Kotlin bindings
         working-directory: crates/tunlion-core
         run: |
           cargo run --features cli --bin uniffi-bindgen -- \
-            generate --library target/release/libtunlion_core.so \
+            generate --library ../../target/release/libtunlion_core.so \
             --language kotlin --out-dir kotlin
           find kotlin -type f | sort
       - uses: actions/upload-artifact@v4
@@ -177,7 +182,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           cargo build --release --locked --manifest-path cli/Cargo.toml --bin tunlion
-          cp cli/target/release/tunlion /usr/local/bin/tunlion 2>/dev/null || sudo cp cli/target/release/tunlion /usr/local/bin/tunlion
+          cp target/release/tunlion /usr/local/bin/tunlion 2>/dev/null || sudo cp target/release/tunlion /usr/local/bin/tunlion
           tunlion --version
       - name: Enable KVM
         run: |

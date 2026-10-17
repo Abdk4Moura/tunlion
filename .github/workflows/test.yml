@@ -57,7 +57,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
       # The receive cells in tests/pty_flows.rs drive a real `receive` in a
@@ -197,7 +197,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
       - name: Test
@@ -263,7 +263,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
       - name: musl toolchain
@@ -313,8 +313,8 @@ jobs:
         with:
           name: tunlion-${{ matrix.target }}
           path: |
-            cli/target/${{ matrix.target }}/release/tunlion
-            cli/target/${{ matrix.target }}/release/tunlion.exe
+            target/${{ matrix.target }}/release/tunlion
+            target/${{ matrix.target }}/release/tunlion.exe
           if-no-files-found: error
           retention-days: 7
 

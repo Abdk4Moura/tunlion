@@ -43,8 +43,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            cli/target
-          key: publish-edge-${{ hashFiles('cli/Cargo.lock') }}
+            target
+          key: publish-edge-${{ hashFiles('Cargo.lock') }}
           restore-keys: publish-edge-
 
       - name: Build
@@ -56,7 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          cp cli/target/x86_64-unknown-linux-musl/release/tunlion out/tunlion
+          cp target/x86_64-unknown-linux-musl/release/tunlion out/tunlion
           ( cd out && sha256sum tunlion > SHA256SUMS )
           file out/tunlion | grep -qi "static" || { echo "not a static binary"; exit 1; }
           out/tunlion --version

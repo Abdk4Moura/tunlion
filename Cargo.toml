@@ -1,0 +1,70 @@
+# One dependency graph for the whole product. Each crate under crates/ used to
+# be a standalone package with its own lock and target dir, so CI resolved and
+# built the same dependencies once per crate. The engine is one program split
+# across crates by concern; the graph should say so.
+[workspace]
+resolver = "2"
+members = ["cli", "crates/*"]
+# Not part of the product graph: the browser PAKE crate has its own wasm build,
+# and spike/ is scratch. Without exclude, cargo refuses to run in those
+# directories because the root workspace would claim them.
+exclude = ["pake", "spike/pake-core", "spike/pake-demo"]
+
+# Profiles are workspace-wide: cargo ignores them in a non-root package. These
+# moved verbatim from cli/Cargo.toml so the release artefact is unchanged.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Fast functional iteration for real-binary gates. This is not release evidence:
+# optimization-sensitive measurements must be repeated with `--release`.
+[profile.measure]
+inherits = "release"
+opt-level = 1
+lto = false
+debug = 0
+incremental = true
+
+# SIZE: optimise the COLD crates for size, the hot ones for speed.
+#
+# opt-level "z" costs throughput, so it is applied only where throughput is not
+# the point. These crates run once per connection or once per process: argument
+# parsing, the HTTPS control plane to the signaling server, and WebRTC's
+# session setup. The bulk data path (ring, quinn, tokio, smoltcp, and tunlion's
+# own crates) stays at the default so file transfer speed is untouched.
+#
+# Verified by measurement, not assumption: throughput is re-measured against the
+# two-machine rig after any change here.
+[profile.release.package.clap_builder]
+opt-level = "z"
+[profile.release.package.clap_mangen]
+opt-level = "z"
+[profile.release.package.clap_complete]
+opt-level = "z"
+[profile.release.package.reqwest]
+opt-level = "z"
+[profile.release.package.hyper]
+opt-level = "z"
+[profile.release.package.hyper-util]
+opt-level = "z"
+[profile.release.package.h2]
+opt-level = "z"
+[profile.release.package.webrtc]
+opt-level = "z"
+[profile.release.package.webrtc-ice]
+opt-level = "z"
+[profile.release.package.webrtc-sctp]
+opt-level = "z"
+[profile.release.package.interceptor]
+opt-level = "z"
+[profile.release.package.rtcp]
+opt-level = "z"
+[profile.release.package.turn]
+opt-level = "z"
+[profile.release.package.qrcode]
+opt-level = "z"
+[profile.release.package.zip]
+opt-level = "z"
+[profile.release.package.tar]
+opt-level = "z"
