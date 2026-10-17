@@ -13,7 +13,10 @@
 //!   - the process-static observability counters that `cap-status` reads
 //!     (`cap_shadow_counts` / `cap_action_counts`) + `log_once`,
 //!   - the two glue gates `cap_authorize` (loads the store) and
-//!     `cap_gate_effective` (mutates the counters, reads the mode),
+//!     `cap_gate_effective` (mutates the counters, reads the mode). The pure
+//!     evaluation behind the store read lives in `filament-cap` as
+//!     `authorize_in` / `fleet_inputs_in`, so a caller holding an injected
+//!     store never re-reads the file,
 //!   - `devices_with_shell_revoked` (reads a `crate::identity::DeviceCert`) and
 //!     `reconcile_shell_keys` (edits `crate::sshkeys`).
 //! These call INTO `filament-cap`; the crate never calls back.
@@ -410,34 +413,15 @@ pub fn cap_authorize(
     principal_user_pub: Option<&[u8; 32]>,
     auth_key_caps: Option<&[String]>,
 ) -> CapOutcome {
-    let store = load_cap_store(config_dir);
-    let header = store
-        .iter()
-        .find(|e| {
-            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                && e["resource"].as_str() == Some(resource)
-        })
-        .and_then(CapHeader::from_json);
-
-    let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
-    let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
-
-    match header {
-        None => CapOutcome::Unprovisioned,
-        Some(hdr) => match evaluate(
-            &store,
-            &hdr,
-            &device_pub,
-            &user_pub,
-            resource,
-            action,
-            now_secs(),
-            auth_key_caps,
-        ) {
-            Decision::Authorized => CapOutcome::Authorized,
-            Decision::Denied(reason) => CapOutcome::Denied(reason),
-        },
-    }
+    authorize_in(
+        &load_cap_store(config_dir),
+        resource,
+        action,
+        principal_device_pub,
+        principal_user_pub,
+        auth_key_caps,
+        now_secs(),
+    )
 }
 
 /// Fleet-gate inputs for `resource`/`action`, from ONE cached store read:
@@ -459,33 +443,15 @@ pub fn cap_fleet_inputs(
     principal_user_pub: Option<&[u8; 32]>,
     auth_key_caps: Option<&[String]>,
 ) -> (Option<[u8; 32]>, bool) {
-    let store = load_cap_store(config_dir);
-    let header = store
-        .iter()
-        .find(|e| {
-            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                && e["resource"].as_str() == Some(resource)
-        })
-        .and_then(CapHeader::from_json);
-    let Some(hdr) = header else {
-        return (None, false);
-    };
-    let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
-    let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
-    let explicit = matches!(
-        evaluate_grants_only(
-            &store,
-            &hdr,
-            &device_pub,
-            &user_pub,
-            resource,
-            action,
-            now_secs(),
-            auth_key_caps,
-        ),
-        Decision::Authorized
-    );
-    (Some(hdr.owner_pub), explicit)
+    fleet_inputs_in(
+        &load_cap_store(config_dir),
+        resource,
+        action,
+        principal_device_pub,
+        principal_user_pub,
+        auth_key_caps,
+        now_secs(),
+    )
 }
 
 /// Whether this decision belongs to the ceiling-admitted population: the

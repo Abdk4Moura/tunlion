@@ -3,8 +3,9 @@
 //! `Conn` is the orchestration state every command's event loop manipulates. It reaches the host in exactly two ways: it renders lines to
 //! a terminal, and it reads the machine's own facts (settings, devices.json, the
 //! owner key, the rendezvous channel derivation, the relay policy, whether a
-//! link is a proven fleet device). This module is the seam: two traits the CLI
-//! implements over its real functions, handed to `Conn` as `Arc<dyn ...>` fields.
+//! link is a proven fleet device, and the capability store the gates read). This
+//! module is the seam: two traits the CLI implements over its real functions,
+//! handed to `Conn` as `Arc<dyn ...>` fields.
 //!
 //! Why traits rather than the process-global function pointers
 //! `filament-transport::hooks` uses: those hooks are facts about the process
@@ -23,7 +24,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use filament_cap::capability::PrincipalKind;
+use filament_cap::capability::{
+    ActionCounts, BindingStrength, CapOutcome, GateDecision, PrincipalKind, ShadowCounts,
+};
 use filament_id::{DeviceCert, UserKey};
 
 /// Terminal tone, mirroring `cli::ui::Tone`. The crate carries the WORD (which
@@ -274,6 +277,61 @@ pub trait HostServices: Send + Sync + 'static {
     fn roster_snapshot_json(&self) -> Option<String>;
     /// Is there a fleet rendezvous value on this machine at all?
     fn fleet_rv_present(&self) -> bool;
+    /// Seed the owner's self genesis capability header and its ratchet when
+    /// this machine has an owner key and the store lacks them. A store WRITE,
+    /// so it belongs here; returns whether anything was written.
+    fn ensure_self_genesis_header(&self, _user_key: &UserKey) -> bool {
+        false
+    }
+    /// The capability store this host holds, already parsed: the `caps.json`
+    /// array exactly as its loader returns it (empty when the file is missing
+    /// or unreadable). The peer loop never joins a path or opens the file; it
+    /// hands this slice to `filament-cap`'s pure evaluators.
+    fn cap_store(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// Is capability enforcement authoritative (live-gating) rather than the
+    /// legacy shadow mode? The host owns the switch and its default.
+    fn cap_authoritative(&self) -> bool {
+        false
+    }
+    /// This process's shadow gate counters, as `cap-status` reports them.
+    fn cap_shadow_counts(&self) -> ShadowCounts {
+        ShadowCounts::default()
+    }
+    /// This process's per-action shadow gate counters, sorted by action.
+    fn cap_action_counts(&self) -> Vec<ActionCounts> {
+        Vec::new()
+    }
+    /// Record one gate evaluation (counters, shadow diagnostics, the mode
+    /// switch) and return the effective decision. The host owns the policy
+    /// site: its counters live in its process and its diagnostics go to its
+    /// log, so the peer loop asks for the verdict instead of re-deriving it.
+    /// An inert host has no policy site and fails closed.
+    fn cap_gate_effective(&self, _gate: CapGate<'_>) -> GateDecision {
+        GateDecision::Deny { cap_reason: None }
+    }
+}
+
+/// One capability gate query, as the peer loop shapes it. A struct rather than
+/// fifteen positional arguments, so the crate and the host cannot disagree
+/// about ordering, and a new input is a named field at every call site.
+pub struct CapGate<'a> {
+    pub legacy_allowed: bool,
+    pub outcome: &'a CapOutcome,
+    pub action: &'a str,
+    pub resource: &'a str,
+    pub device_pub: Option<&'a [u8; 32]>,
+    pub user_pub: Option<&'a [u8; 32]>,
+    pub binding: BindingStrength,
+    pub cert_expires: Option<u64>,
+    pub auth_key_caps: Option<&'a [String]>,
+    pub own_user_pub: Option<&'a [u8; 32]>,
+    pub scoped_in_bounds: bool,
+    pub has_explicit_grant: bool,
+    pub cert_revoked: bool,
+    pub denied: bool,
+    pub ceiling_authorizes: bool,
 }
 
 /// The persisted principal record behind a device certificate: the kind plus
@@ -450,5 +508,9 @@ mod tests {
         assert!(!host.relay_forbidden());
         assert!(!host.fleet_rv_present());
         assert_eq!(host.roster_snapshot_json(), None);
+        assert!(host.cap_store().is_empty());
+        assert!(!host.cap_authoritative());
+        assert_eq!(host.cap_shadow_counts().la_authorized, 0);
+        assert!(host.cap_action_counts().is_empty());
     }
 }

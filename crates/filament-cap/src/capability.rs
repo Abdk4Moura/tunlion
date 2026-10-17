@@ -803,6 +803,89 @@ pub fn evaluate_grants_only(
     }
 }
 
+/// The capability header a store holds for `resource`, if any. Pure: the caller
+/// brings the store, so reading `caps.json` stays the host's business.
+pub fn store_header(store: &[Value], resource: &str) -> Option<CapHeader> {
+    store
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some(resource)
+        })
+        .and_then(CapHeader::from_json)
+}
+
+/// The pure half of a gate-facing authorization query: given the store entries
+/// the host already loaded, return the same `CapOutcome` the CLI's
+/// `cap_authorize` returns. Split out of that wrapper so a caller holding an
+/// injected store never re-reads the file, while "unprovisioned" still means
+/// "no header", never "denied".
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_in(
+    store: &[Value],
+    resource: &str,
+    action: &str,
+    principal_device_pub: Option<&[u8; 32]>,
+    principal_user_pub: Option<&[u8; 32]>,
+    auth_key_caps: Option<&[String]>,
+    now: u64,
+) -> CapOutcome {
+    let Some(header) = store_header(store, resource) else {
+        return CapOutcome::Unprovisioned;
+    };
+    let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
+    let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
+    match evaluate(
+        store,
+        &header,
+        &device_pub,
+        &user_pub,
+        resource,
+        action,
+        now,
+        auth_key_caps,
+    ) {
+        Decision::Authorized => CapOutcome::Authorized,
+        Decision::Denied(reason) => CapOutcome::Denied(reason),
+    }
+}
+
+/// The pure half of the fleet-gate inputs query, against a store the host
+/// already loaded: the resource header's owner key plus whether an explicit
+/// owner-signed grant authorizes `action` for this principal (computed WITHOUT
+/// the owner shortcut, via `evaluate_grants_only`, so a same-owner peer is not
+/// counted as granted merely for sharing the user key).
+#[allow(clippy::too_many_arguments)]
+pub fn fleet_inputs_in(
+    store: &[Value],
+    resource: &str,
+    action: &str,
+    principal_device_pub: Option<&[u8; 32]>,
+    principal_user_pub: Option<&[u8; 32]>,
+    auth_key_caps: Option<&[String]>,
+    now: u64,
+) -> (Option<[u8; 32]>, bool) {
+    let Some(header) = store_header(store, resource) else {
+        return (None, false);
+    };
+    let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
+    let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
+    let explicit = matches!(
+        evaluate_grants_only(
+            store,
+            &header,
+            &device_pub,
+            &user_pub,
+            resource,
+            action,
+            now,
+            auth_key_caps,
+        ),
+        Decision::Authorized
+    );
+    (Some(header.owner_pub), explicit)
+}
+
 /// The scoped-default action set a same-owner Proven fleet device may exercise
 /// with NO explicit grant — each bounded to a scope the GATE enforces:
 ///   - `transfer` → into the designated inbox directory (not arbitrary paths)
@@ -1506,7 +1589,7 @@ pub struct ActionCounts {
 }
 
 /// Shadow counts, bucketed by legacy outcome and cap outcome.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct ShadowCounts {
     pub la_authorized: u64,
     pub la_denied: u64,
