@@ -5633,7 +5633,8 @@ pub(crate) async fn recv_cmd(
                                                                 .map(str::to_string)
                                                         })
                                                         .collect();
-                                                let config_dir = host.config_dir();
+                                                let cap_entries = host.cap_store();
+                                                let cap_now = host.now_secs();
                                                 let ok = crate::l3::installable_routes(
                                                     &advertised,
                                                     accept,
@@ -5655,13 +5656,14 @@ pub(crate) async fn recv_cmd(
                                                             return false;
                                                         };
                                                         matches!(
-                                                            crate::capability::cap_authorize(
-                                                                &config_dir,
+                                                            cap::authorize_in(
+                                                                &cap_entries,
                                                                 &res,
                                                                 cap::CAP_ROUTE,
                                                                 idev.as_ref(),
                                                                 iusr.as_ref(),
                                                                 None,
+                                                                cap_now,
                                                             ),
                                                             cap::CapOutcome::Authorized
                                                         )
@@ -6210,22 +6212,26 @@ pub(crate) async fn recv_cmd(
                     let granted = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let outcome = crate::capability::cap_authorize(
-                            &host.config_dir(),
+                        let store = host.cap_store();
+                        let now = host.now_secs();
+                        let outcome = cap::authorize_in(
+                            &store,
                             "self",
                             cap::CAP_SHELL,
                             idev,
                             iusr,
                             ak_caps,
+                            now,
                         );
                         {
-                            let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                                &host.config_dir(),
+                            let (own_user, has_grant) = cap::fleet_inputs_in(
+                                &store,
                                 "self",
                                 cap::CAP_SHELL,
                                 idev,
                                 iusr,
                                 ak_caps,
+                                now,
                             );
                             // Deliberate tier: `shell` is never a scoped default, so a
                             // same-owner device gets it ONLY via an explicit grant
@@ -6531,14 +6537,17 @@ pub(crate) async fn recv_cmd(
                     let (authorized, read_only) = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
+                        let store = host.cap_store();
+                        let now = host.now_secs();
                         let authoritative = host.cap_authoritative();
-                        let outcome = crate::capability::cap_authorize(
-                            &host.config_dir(),
+                        let outcome = cap::authorize_in(
+                            &store,
                             "self",
                             cap::CAP_MOUNT,
                             idev,
                             iusr,
                             ak_caps,
+                            now,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize mount (pair-proof vs device-key).
@@ -6548,13 +6557,14 @@ pub(crate) async fn recv_cmd(
                         // grant ONLY read-only, within the share root (scoped_in_bounds
                         // = within_share). An auto-trusted fleet mount is served
                         // READ-ONLY; an explicit `mount` grant keeps its rw behavior.
-                        let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &host.config_dir(),
+                        let (own_user, has_grant) = cap::fleet_inputs_in(
+                            &store,
                             "self",
                             cap::CAP_MOUNT,
                             idev,
                             iusr,
                             ak_caps,
+                            now,
                         );
                         let same_owner = match (iusr, own_user.as_ref()) {
                             (Some(u), Some(o)) => u == o,
@@ -7428,13 +7438,16 @@ pub(crate) async fn recv_cmd(
                     let (ok, xfer_deny_reason, xfer_gate) = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let outcome = crate::capability::cap_authorize(
-                            &host.config_dir(),
+                        let store = host.cap_store();
+                        let now = host.now_secs();
+                        let outcome = cap::authorize_in(
+                            &store,
                             "self",
                             cap::CAP_TRANSFER,
                             idev,
                             iusr,
                             ak_caps,
+                            now,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize transfer (pair-proof vs device-key).
@@ -7455,13 +7468,14 @@ pub(crate) async fn recv_cmd(
                         // a fleet-trust follow-up.
                         let landing = dir.join(&name);
                         let scoped_in_bounds = crate::path_within(&dir, &landing);
-                        let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &host.config_dir(),
+                        let (own_user, has_grant) = cap::fleet_inputs_in(
+                            &store,
                             "self",
                             cap::CAP_TRANSFER,
                             idev,
                             iusr,
                             ak_caps,
+                            now,
                         );
                         // No deny list is consulted on the transfer path today;
                         // false preserves that exactly.
