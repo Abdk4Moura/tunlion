@@ -27,7 +27,9 @@
 //!   those decide what a person asked for and render it.
 //! - anything that reads settings, devices.json, the keystore or a `Paths`:
 //!   `host` defines the `LogSink` and `HostServices` traits the peer loop asks
-//!   through, plus host-free defaults, and the CLI implements them.
+//!   through, plus host-free defaults, and the CLI implements them. `present`
+//!   does the same for terminal state (the sticky line, a waiting question,
+//!   transfer bars, the clipboard, a raw-mode echo).
 //! Nothing here calls back into the CLI; the CLI depends on this crate.
 
 mod adoption;
@@ -42,6 +44,7 @@ pub mod liveness;
 pub mod local;
 pub mod mesh;
 mod petname;
+pub mod present;
 pub mod resilience;
 mod retry;
 pub mod shell;

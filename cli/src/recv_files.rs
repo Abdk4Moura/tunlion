@@ -17,6 +17,7 @@ use crate::test_hooks;
 use crate::ui;
 use crate::{chrono_now, human, up_log};
 use anyhow::Result;
+use filament_peerloop::present::Progress as ProgressBar;
 use filament_transfer::{coverage_complete, first_gap};
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -374,7 +375,7 @@ pub(crate) struct IncomingFile {
     /// Tracks the last received value used for progress display (to avoid
     /// re-ticking the same value). Not atomic — only accessed from the event loop.
     pub(crate) last_tick: u64,
-    pub(crate) bar: ui::Progress,
+    pub(crate) bar: Box<dyn ProgressBar>,
     /// The first write that failed on this file (disk full, a filesystem gone
     /// read-only), recorded by the writer task that hit it. The event loop turns
     /// it into a typed refusal to the sender. Before this a failed write only

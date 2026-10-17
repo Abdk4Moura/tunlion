@@ -16,13 +16,16 @@
 //!
 //! LOGGING: every log line in this file goes through the `LogSink` passed to
 //! `recv_cmd` (`log` here, `conn.log` in the split-out handlers), so a caller
-//! with no terminal can run the same loop with `NoLog`. The remaining `ui::`
-//! calls are NOT log lines: they are terminal presentation state owned by the
-//! next slice. They are `ui::clear_sticky` (tearing down the sticky status
-//! area), `ui::sticky_ask` (fronting a question there), `ui::Progress` (the
-//! transfer bars), `ui::clipboard` (OSC 52) and `ui::answer_echo` (landing a
-//! keystroke in raw mode). Anything that prints a message must stay on the
-//! sink, not here.
+//! with no terminal can run the same loop with `NoLog`.
+//!
+//! PRESENTATION: the terminal state that is not a log line (the sticky status
+//! area, a question fronted in it, the transfer bars, OSC 52 and the raw-mode
+//! keystroke echo) goes through `conn.present`, a
+//! `filament_peerloop::present::Presentation`. The CLI adapter forwards to `ui`,
+//! so a tty renders exactly the bytes it did before, and `NoScreen` makes every
+//! one of those effects inert while the loop (and the transfer) keeps running.
+//! A question the presentation cannot front comes back as `Ask::Unshown`, and
+//! `front_question` puts it on the sink instead of letting it vanish.
 //!
 //! HOST FACTS: settings, the config directory, the keystore, the inbox
 //! permissions, the serving login name, the filesystem answers, the capability
@@ -69,7 +72,7 @@ use crate::{
     respond_to_identity_challenge, safe_create_part, safe_incoming_name, safe_resume_part,
     save_requests, sdnotify, session, shell_argv, shutdown, spawn_session_pumps, sshd,
     sshd_listening, store_provisional_identity, subnet_forward, sweep_completed_streams,
-    test_hooks, ui, verify_incoming, with_devices_mut,
+    test_hooks, verify_incoming, with_devices_mut,
 };
 // Unix-only daemon-control names, gated exactly like their definitions in
 // daemon_ctl.rs. Call sites stay byte-identical to the monolith.
@@ -87,6 +90,7 @@ use filament_peerloop::control::Req;
 #[cfg(unix)]
 use filament_peerloop::control::ReqKind;
 use filament_peerloop::host::{CapGate, HostServices, Level, LogSink, StorageFailure, Tone};
+use filament_peerloop::present::{Ask, Presentation};
 use filament_peerloop::shell::ShellHost;
 use filament_transfer::{MAX_RECV_RANGES, chunk_fits_offer};
 use serde_json::{Value, json};
@@ -311,6 +315,18 @@ async fn retire_link_streams(
                 sess.detach();
             }
         }
+    }
+}
+
+/// Front a waiting question on the sticky line. A presentation with no screen
+/// can only report that (`Ask::Unshown`), so the question goes to the log sink
+/// instead: a pending ask must never become a hang on a prompt nobody saw.
+///
+/// `announced` says the caller already printed the permanent copy of `q` (C25:
+/// nothing is asked invisibly), so a screen-less host does not print it twice.
+fn front_question(present: &dyn Presentation, log: &dyn LogSink, q: &str, announced: bool) {
+    if present.sticky_ask(q) == Ask::Unshown && !announced {
+        log.critical(q);
     }
 }
 
@@ -1632,7 +1648,11 @@ pub(crate) async fn recv_cmd(
         direct_ok_for(daemon, l2_enabled),
         log.clone(),
         host.clone(),
-    );
+    )
+    // The CLI's terminal: sticky line, waiting questions, transfer bars, OSC 52
+    // and the raw-mode echo. The loop drives them through `Presentation` so the
+    // same body runs with no screen at all (a library consumer, a journal).
+    .with_presentation(crate::host_impl::cli_screen());
     // WARM-HOLD: load configured warm-peers at daemon startup
     if daemon {
         conn.load_warm_peers_config();
@@ -1682,6 +1702,7 @@ pub(crate) async fn recv_cmd(
     if interactive {
         let tx = tx.clone();
         let q = st.question_open.clone();
+        let present = conn.present.clone();
         // A DEDICATED OS thread, never `tokio::io::stdin()`. tokio's stdin is an
         // uncancellable read on the runtime's blocking pool, and dropping the
         // runtime waits for every blocking task: a receive that finished
@@ -1702,7 +1723,7 @@ pub(crate) async fn recv_cmd(
                     && "yYnN".contains(c)
                     && line.is_empty()
                 {
-                    ui::answer_echo(c); // raw mode is no-echo; land it cleanly (C23)
+                    present.answer_echo(c); // raw mode is no-echo; land it cleanly (C23)
                     let _ = tx.send(Ev::StdinLine(c.to_lowercase().to_string()));
                     continue;
                 }
@@ -2249,7 +2270,7 @@ pub(crate) async fn recv_cmd(
         }
         if !daemon && !keep_open && st.by_sid.is_empty() {
             if let Some(what) = sender_cancelled.take() {
-                ui::clear_sticky();
+                conn.present.clear_sticky();
                 let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
                 bail!(
                     "the sender cancelled the transfer because it could not read its file ({what}); \
@@ -2279,7 +2300,7 @@ pub(crate) async fn recv_cmd(
                 let sender_gone = conn.rejoin.waiting_rejoin.is_some() || conn.links.is_empty();
                 if sender_gone || since >= Duration::from_secs(3) {
                     if let Some(e) = crate::recv_report::refused_outcome() {
-                        ui::clear_sticky();
+                        conn.present.clear_sticky();
                         let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
                         return Err(e);
                     }
@@ -2294,7 +2315,7 @@ pub(crate) async fn recv_cmd(
         if !daemon {
             if let Some(since) = conn.rejoin.waiting_rejoin {
                 if since.elapsed() > conn.rejoin.rejoin_window {
-                    ui::clear_sticky();
+                    conn.present.clear_sticky();
                     let why = format!(
                         "the sender is unreachable: it disconnected and did not come back within {}s",
                         conn.rejoin.rejoin_window.as_secs()
@@ -2317,7 +2338,7 @@ pub(crate) async fn recv_cmd(
             timeout.map(Duration::from_secs),
             st.completed,
         ) {
-            ui::clear_sticky();
+            conn.present.clear_sticky();
             let secs = timeout.unwrap_or(0);
             let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
             return Err(crate::exit_codes::err(
@@ -3839,7 +3860,7 @@ pub(crate) async fn recv_cmd(
             && conn.links.is_empty()
         {
             conn.rejoin.waiting_rejoin = None;
-            ui::clear_sticky();
+            conn.present.clear_sticky();
             log.say(&format!(
                 "done ({} file{}).",
                 st.completed,
@@ -3940,7 +3961,7 @@ pub(crate) async fn recv_cmd(
             let front_id = st.pending.front().map(|(_, v)| v["id"].clone());
             st.pending.retain(|(p, _)| conn.links.contains_key(p));
             if st.pending.front().map(|(_, v)| v["id"].clone()) != front_id {
-                ui::clear_sticky();
+                conn.present.clear_sticky();
                 if let Some((qpid, qv)) = st.pending.front() {
                     let s = conn.link(qpid).map(|l| l.name.clone()).unwrap_or_default();
                     {
@@ -3951,7 +3972,7 @@ pub(crate) async fn recv_cmd(
                             paired,
                         );
                         log.say(&q); // permanent: a new question fronted (C25)
-                        ui::sticky_ask(&q);
+                        front_question(conn.present.as_ref(), log.as_ref(), &q, true);
                         st.question_shown = Instant::now();
                     }
                 } else {
@@ -4171,7 +4192,7 @@ pub(crate) async fn recv_cmd(
             // C29: a code minted in-session (`pair` typed into up).
             Ev::PairCode(v) => {
                 let c = v["code"].as_str().unwrap_or("?");
-                ui::clipboard(c);
+                conn.present.clipboard(c);
                 log.say("");
                 log.say(&format!(
                     "      {}",
@@ -7623,7 +7644,7 @@ pub(crate) async fn recv_cmd(
                                 // sticky as the live answer tail.
                                 let q = offer_question(&sender_name, &name, size, paired);
                                 log.say(&q);
-                                ui::sticky_ask(&q);
+                                front_question(conn.present.as_ref(), log.as_ref(), &q, true);
                                 st.question_shown = Instant::now();
                             }
                             continue; // decision arrives later via StdinLine
@@ -7774,7 +7795,7 @@ pub(crate) async fn recv_cmd(
                                     end_seen: Arc::new(AtomicBool::new(false)),
                                     ack_sid: 0,
                                     last_tick: 0,
-                                    bar: ui::Progress::new("(stdout)", size),
+                                    bar: conn.present.progress("(stdout)", size),
                                     write_err: Arc::new(std::sync::Mutex::new(None)),
                                     stdout: Some(sink),
                                 },
@@ -7921,7 +7942,7 @@ pub(crate) async fn recv_cmd(
                             }
                         }
                     };
-                    let bar = ui::Progress::new(&name, size);
+                    let bar = conn.present.progress(&name, size);
                     crate::transfer_truth::note_part(&mut session_parts, &name, &part_path, size);
                     let file = Arc::new(file.into_std().await);
                     let received = Arc::new(AtomicU64::new(offset));
@@ -8573,13 +8594,13 @@ pub(crate) async fn recv_cmd(
                     if ans == "y" || ans == "yes" {
                         answered = true;
                         let (qpid, mut qv) = st.pending.pop_front().unwrap();
-                        ui::clear_sticky();
+                        conn.present.clear_sticky();
                         qv["__consent"] = json!(consent_token());
                         let _ = tx.send(Ev::Control(qpid, qv)); // re-enter the offer path, consented
                     } else if ans == "n" || ans == "no" {
                         answered = true;
                         let (qpid, qv) = st.pending.pop_front().unwrap();
-                        ui::clear_sticky();
+                        conn.present.clear_sticky();
                         let qname = safe_incoming_name(qv["name"].as_str().unwrap_or("file"));
                         note_refusal(
                             daemon,
@@ -8618,7 +8639,7 @@ pub(crate) async fn recv_cmd(
                             log.say(&q); // a NEW question fronted, permanent line (C25)
                             st.question_shown = Instant::now();
                         }
-                        ui::sticky_ask(&q);
+                        front_question(conn.present.as_ref(), log.as_ref(), &q, answered);
                     } else {
                         st.question_open
                             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -9073,6 +9094,32 @@ mod peer_step_tests {
     fn success_passes_through() {
         assert!(matches!(peer_step(true, "p1", "adoption", Ok(true), &NoLog), Ok(Some(true))));
         assert!(matches!(peer_step(false, "p1", "adoption", Ok(false), &NoLog), Ok(Some(false))));
+    }
+}
+
+#[cfg(test)]
+mod front_question_tests {
+    use super::*;
+    use filament_peerloop::host::{Level, VecLog};
+    use filament_peerloop::present::NoScreen;
+
+    /// A presentation with no screen must not let a pending question vanish.
+    /// Unless the caller already printed its permanent copy, the question goes
+    /// to the sink; the ask path itself is untouched, so it still waits.
+    #[test]
+    fn an_unfronted_question_reaches_the_sink_once() {
+        let log = VecLog::new();
+        front_question(&NoScreen, &log, "keep x? [y/n]", false);
+        assert_eq!(
+            log.take(),
+            vec![(Level::Critical, "keep x? [y/n]".to_string())]
+        );
+
+        front_question(&NoScreen, &log, "keep x? [y/n]", true);
+        assert!(
+            log.take().is_empty(),
+            "the caller's permanent line already carried the question"
+        );
     }
 }
 
