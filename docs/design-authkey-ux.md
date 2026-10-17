@@ -47,9 +47,18 @@ Precedence is explicit file, then `TUNLION_AUTHKEY`, then `TUNLION_INVITE`. The
 value is trimmed and held in `Zeroizing`. It is never logged, never printed back,
 and never accepted as an argument.
 
-Naming caveat: `up`'s automatic join has no device name to use, so the box takes
-the platform hostname. A caller that needs a deterministic name (CI does, to
-send to it) should keep the explicit `tunlion join --name <name>` and then `up`.
+Naming needs no extra flag. The owner names the invitee when minting
+(`tunlion add --for device --name ci-job-123 --out key`), and that choice WINS
+over whatever the box calls itself: `renewal_lifecycle.rs:489` replaces the
+joiner's proposed name with `armed::invitee_name`. So `TUNLION_AUTHKEY=... tunlion
+up` is addressable as `ci-job-123` without the box knowing the name. A box only
+names itself when the owner did not name the invitation (then it is the platform
+hostname unless `join --name` says otherwise).
+
+Two names exist and should not be confused: the owner's petname (the `--to` key,
+chosen at mint, changed locally with `tunlion devices rename`) and the display
+name (`tunlion set name`, what peers see on the link). `set name` cannot change
+the owner's petname, and `devices rename` cannot change what the box displays.
 
 ## Why this is still not a bearer secret
 

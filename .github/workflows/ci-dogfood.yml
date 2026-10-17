@@ -62,21 +62,20 @@ jobs:
       - name: Build tunlion (the bootstrap)
         run: cargo build --release --locked --manifest-path cli/Cargo.toml
 
-      - name: Join the mesh
+      - name: Join and serve with one command
         env:
           # Read from the environment, not an argv and not a file: the key is
           # never echoed, never written by this job, and never visible in `ps`.
           TUNLION_AUTHKEY: ${{ secrets.TUNLION_INVITE }}
-          RUNNER_NAME: ${{ inputs.runner_name }}
         run: |
           set -euo pipefail
           if [ -z "${TUNLION_AUTHKEY:-}" ]; then
             echo "::error::TUNLION_INVITE is not set; run scripts/ci-dogfood.sh, which mints it"
             exit 2
           fi
-          "$TUNLION_BIN" join --name "$RUNNER_NAME" --json --no-interactive
-          # The daemon receives into WORK and keeps the signaling link up; the
-          # owner can only send once this device is present.
+          # One command: `up` joins when it has no identity, then serves. The
+          # box does not name itself; the owner named this invitation when
+          # minting, and that name wins (renewal_lifecycle.rs:489).
           #
           # `up` has no --json (docs/ci-ux.md), so start it and then read
           # `status --json`, which is the machine-readable "is it up".
