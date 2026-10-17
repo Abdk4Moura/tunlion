@@ -42,6 +42,7 @@ pub mod local;
 mod petname;
 pub mod resilience;
 mod retry;
+pub mod shell;
 #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 pub(crate) mod test_hooks;
 mod warm;
