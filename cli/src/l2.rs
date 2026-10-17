@@ -2260,27 +2260,42 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     Ok(())
 }
 
-/// Turns off, in the LOCAL terminal, every mode a remote program can switch on
-/// with an escape sequence: mouse reporting (1000, 1002, 1003, and the 1005,
-/// 1006 and 1015 encodings), bracketed paste (2004), the alternate screen
-/// (1049), application cursor keys (?1) and keypad (ESC >), and a hidden cursor.
-/// The remote program normally turns these off itself on exit. When the session
-/// ends abruptly (link lost, remote killed, Ctrl-C here) it never gets the
-/// chance, and the terminal keeps sending mouse reports as typed text
-/// (`35;84;9M...`), which also leaves the next prompt waiting for the rest of an
-/// escape sequence. Each part is harmless when the mode is already off.
-pub(crate) const TERMINAL_RESET: &str =
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[?1l\x1b>\x1b[?25h";
+/// Recovery for the LOCAL terminal at client entry/final exit only. A killed
+/// TUI may leave mouse/focus/paste reports enabled, polluting the next shell's
+/// stdin. These bytes belong on local stdout, NEVER in transport frames or the
+/// PTY replay ring: the remote application owns modes while attached, including
+/// across reconnects. Do not touch the alternate screen or discard scrollback.
+const LOCAL_TERMINAL_INPUT_RESET: &[u8] =
+    b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l";
 
-/// Write [`TERMINAL_RESET`] to stdout when stdout is a terminal (never into a
-/// pipe or a file).
-pub(crate) fn reset_terminal_modes() {
-    use std::io::{IsTerminal, Write};
-    let mut out = std::io::stdout();
-    if out.is_terminal() {
-        let _ = out.write_all(TERMINAL_RESET.as_bytes());
-        let _ = out.flush();
+#[derive(Clone, Copy)]
+enum LocalTerminalReset {
+    Entry,
+    Exit,
+}
+
+/// The only sink is a local writer, not a Transport. The tty check also applies
+/// to final cleanup, so redirected stdout never acquires escape sequences.
+fn write_local_terminal_reset(
+    out: &mut impl std::io::Write,
+    is_terminal: bool,
+    phase: LocalTerminalReset,
+) -> std::io::Result<()> {
+    if !is_terminal {
+        return Ok(());
     }
+    out.write_all(LOCAL_TERMINAL_INPUT_RESET)?;
+    if matches!(phase, LocalTerminalReset::Exit) {
+        out.write_all(b"\x1b[?1l\x1b>\x1b[?25h")?;
+    }
+    out.flush()
+}
+
+fn reset_terminal_modes(phase: LocalTerminalReset) {
+    use std::io::IsTerminal;
+    let mut out = std::io::stdout();
+    let is_terminal = out.is_terminal();
+    let _ = write_local_terminal_reset(&mut out, is_terminal, phase);
 }
 
 /// Input that arrived before the remote PTY was ready is kept (typing ahead at
@@ -2356,16 +2371,20 @@ impl RawGuard {
         let console = crate::platform::ConsoleModes::snapshot();
         crossterm::terminal::enable_raw_mode()?;
         console.enable_vt();
+        // On Windows this must follow enable_vt, otherwise a classic console
+        // may not interpret the cleanup escapes. Never repeat on reconnect.
+        reset_terminal_modes(LocalTerminalReset::Entry);
         Ok(RawGuard { active: true, console })
     }
 }
 impl Drop for RawGuard {
     fn drop(&mut self) {
         if self.active {
-            reset_terminal_modes();
+            // Flush reporting/keypad/cursor recovery while VT output is still
+            // enabled, before restoring raw mode and the Windows console modes.
+            reset_terminal_modes(LocalTerminalReset::Exit);
             let _ = crossterm::terminal::disable_raw_mode();
             self.console.restore();
-            crossterm::execute!(std::io::stderr(), crossterm::cursor::Show).ok();
             eprint!("\r\n");
         }
     }
@@ -2827,10 +2846,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     if interactive {
         // A terminal an earlier session left in mouse mode (or a different
         // client entirely) is fixed before anything else is shown.
-        reset_terminal_modes();
+        reset_terminal_modes(LocalTerminalReset::Entry);
         tokio::spawn(async {
             let code = crate::platform::termination_signal().await;
-            reset_terminal_modes();
+            reset_terminal_modes(LocalTerminalReset::Exit);
             let _ = crossterm::terminal::disable_raw_mode();
             std::process::exit(code);
         });
@@ -5915,7 +5934,6 @@ mod h1_tests {
     /// A reconnect must not guess terminal state from PTY read boundaries.
     /// In particular an unfinished CSI/OSC must join its continuation exactly,
     /// and a disable followed by an enable must not be reordered by a "heal".
-    #[cfg(unix)]
     #[tokio::test]
     async fn reattach_preserves_terminal_mode_bytes_without_injecting_resets() {
         let _slot_guard = PTY_SLOT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5925,18 +5943,23 @@ mod h1_tests {
             ("\x1b]0;partial title", "\x07READY"),
             ("\x1b[?9h\x1b[?1005h", "READY"),
         ].into_iter().enumerate() {
+            let Some(argv) = crate::platform::pty_mode_test_argv(before, after) else {
+                return; // This fixture does not exercise interactive Windows consoles.
+            };
             let sessions = PtySessions::new();
             let ta = CapTransport::new();
+            // Exercise local lifecycle cleanup alongside a real session. Its
+            // sink is deliberately separate from every transport/replay byte.
+            let mut local_stdout = Vec::new();
+            write_local_terminal_reset(&mut local_stdout, true, LocalTerminalReset::Entry).unwrap();
+            assert!(ta.frames.lock().unwrap().is_empty());
+            assert!(ta.controls.lock().unwrap().is_empty());
             let sid_a = L2_SID_BASE | 21;
             let id = format!("mode-continuation-{index}");
             let sess = spawn_pty_session(
                 sessions.clone(), id.clone(), ta.clone(), sid_a, 80, 24,
                 "xterm-256color",
-                vec![
-                    "/bin/sh".into(), "-c".into(),
-                    "stty -echo; printf '%s' \"$1\"; IFS= read -r line; printf '%s' \"$2\"; IFS= read -r line".into(),
-                    "pty-mode-test".into(), before.into(), after.into(),
-                ],
+                argv,
                 PtyGuard::try_acquire().expect("slot"), None, false,
             ).await.expect("spawn");
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -5978,6 +6001,11 @@ mod h1_tests {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }).await.expect("session cleanup");
+            write_local_terminal_reset(&mut local_stdout, true, LocalTerminalReset::Exit).unwrap();
+            assert!(!local_stdout.is_empty());
+            assert_eq!(ta.bytes_for(sid_a), before.as_bytes(), "local cleanup reached initial transport");
+            assert_eq!(tb.bytes_for(sid_b), after.as_bytes(), "local cleanup reached resumed transport");
+            assert_eq!(tc.bytes_for(sid_c), after.as_bytes(), "local cleanup reached replay transport");
         }
     }
 
@@ -6417,25 +6445,38 @@ mod forward_refusal_tests {
 
 #[cfg(test)]
 mod terminal_reset_tests {
-    use super::TERMINAL_RESET;
+    use super::{LocalTerminalReset, write_local_terminal_reset};
 
-    /// Every mode a remote program can switch on in the local terminal is
-    /// switched off, and nothing is switched ON except the cursor.
+    /// Entry only stops unsolicited input reports. Final exit does that first,
+    /// then restores normal keys and cursor visibility. Neither changes screens.
     #[test]
-    fn terminal_reset_turns_off_every_mode_a_remote_can_turn_on() {
-        for mode in ["1000", "1002", "1003", "1005", "1006", "1015", "2004", "1049", "1"] {
-            let off = format!("\x1b[?{mode}l");
-            assert!(TERMINAL_RESET.contains(&off), "missing {off:?}");
+    fn local_reset_bytes_and_order_are_exact() {
+        let expected = b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l";
+        let mut entry = Vec::new();
+        write_local_terminal_reset(&mut entry, true, LocalTerminalReset::Entry).unwrap();
+        assert_eq!(entry, expected);
+        let mut exit = Vec::new();
+        write_local_terminal_reset(&mut exit, true, LocalTerminalReset::Exit).unwrap();
+        assert_eq!(exit, [expected.as_slice(), b"\x1b[?1l\x1b>\x1b[?25h"].concat());
+        for screen in [b"?47".as_slice(), b"?1047", b"?1049"] {
+            assert!(!exit.windows(screen.len()).any(|w| w == screen));
         }
-        assert!(TERMINAL_RESET.contains("\x1b>"), "keypad mode not reset");
-        assert!(TERMINAL_RESET.contains("\x1b[?25h"), "cursor not shown");
-        // The only private mode it sets is the cursor's visibility.
-        let sets: Vec<&str> = TERMINAL_RESET
-            .split("\x1b[?")
-            .skip(1)
-            .filter(|s| s.contains('h'))
-            .collect();
-        assert_eq!(sets, vec!["25h"], "the reset must not switch any other mode on");
+    }
+
+    #[test]
+    fn redirected_local_stdout_gets_no_reset_bytes_or_flush() {
+        struct NotATerminal;
+        impl std::io::Write for NotATerminal {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                panic!("redirected stdout must not be written");
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("redirected stdout must not be flushed");
+            }
+        }
+        for phase in [LocalTerminalReset::Entry, LocalTerminalReset::Exit] {
+            write_local_terminal_reset(&mut NotATerminal, false, phase).unwrap();
+        }
     }
 
     /// Mouse reports are taken out of typed-ahead input; keystrokes, Enter and
