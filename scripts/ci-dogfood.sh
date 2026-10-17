@@ -97,16 +97,12 @@ for i in $(seq 1 10); do
 done
 say "run: ${RUN_URL:-<could not resolve the run url>}"
 
+# `devices --json` answering `online: false` is NOT "cannot send to it": a
+# connected daemon that is not mid-transfer reports `status: idle`. The question
+# a caller has is "can I reach it", which is exactly what `reach` answers.
+# (docs/ci-ux.md keeps this as the case for a `wait <device>` verb.)
 online() {
-  tunlion devices --json 2>/dev/null | python3 -c '
-import json, sys
-name = sys.argv[1].lower()
-try:
-    devices = json.load(sys.stdin).get("data", {}).get("devices", [])
-except Exception:
-    sys.exit(1)
-sys.exit(0 if any(d.get("name", "").lower() == name and d.get("online") for d in devices) else 1)
-' "$RUNNER"
+  tunlion reach "$RUNNER" --timeout 15 --json >/dev/null 2>&1
 }
 
 say "waiting for $RUNNER to come online (up to 15 min)"

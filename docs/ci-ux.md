@@ -78,8 +78,14 @@ on both ends.
    `status --json` to learn whether it came up, because `up --json` is refused as
    unimplemented (exit 2). Either give `up` a machine-readable result or make
    `up --detach` print the daemon pid and state.
-5. `tunlion wait <device> --timeout <secs>`: block until a named device is
-   online. Removes the `devices --json` polling loop.
+5. `tunlion wait <device> --timeout <secs>`: block until a named device answers.
+   Today a caller polls `devices --json` and reads `online`, which is NOT
+   sendability: a connected daemon that is not mid-transfer reports
+   `online: false` and `status: idle`, while `reach` succeeds. That trap cost the
+   first single-command dogfood a 15-minute timeout on a box that had been up
+   for five minutes (`lastSeen` 11:37:23, daemon stopped 11:37:27). One verb
+   should answer "can I send to it yet", so no caller has to learn the
+   difference between online, idle and reachable.
 6. `receive --json` should end with one object naming every file it wrote and its
    sha256, so a caller has a manifest without hashing again.
 7. A cohort action: retire an invitation and stop renewal for every device it
