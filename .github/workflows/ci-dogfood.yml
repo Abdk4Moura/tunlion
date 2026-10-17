@@ -37,11 +37,15 @@ jobs:
     name: job on ${{ inputs.runner_name }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      WORK: ${{ runner.temp }}/tunlion-work
-      TUNLION_BIN: ${{ github.workspace }}/cli/target/release/tunlion
     steps:
       - uses: actions/checkout@v4
+
+      # The `runner` context is not available in a job-level `env:`, only in
+      # steps. Set the two paths the later steps share through GITHUB_ENV.
+      - name: Paths
+        run: |
+          echo "WORK=$RUNNER_TEMP/tunlion-work" >> "$GITHUB_ENV"
+          echo "TUNLION_BIN=$GITHUB_WORKSPACE/cli/target/release/tunlion" >> "$GITHUB_ENV"
 
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal
