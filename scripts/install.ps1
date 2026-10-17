@@ -25,6 +25,8 @@
 # -DryRun prints the resolved scope, directory and PATH target without writing.
 # -Archive <zip> installs from a local release archive (SHA256SUMS beside it),
 # which is also how CI exercises the install path without the GitHub API.
+# The installer also adds `tl` as a short command, unless another command with
+# that name is already installed earlier in the user's command search path.
 #
 # Prefer a package manager? `winget install Abdk4Moura.Tunlion` works too.
 
@@ -156,15 +158,28 @@ function Remove-FileWithRetry([string]$path) {
     Die "could not remove $path (still in use); close tunlion and retry"
 }
 
+function Remove-TlLauncher([string]$dir) {
+    $path = Join-Path $dir 'tl.cmd'
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $firstLine = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue
+    if ($firstLine -eq '@rem Tunlion tl launcher. Managed by scripts/install.ps1.') {
+        Remove-FileWithRetry $path
+    } else {
+        Say "leaving $path alone because it is not the Tunlion-managed launcher"
+    }
+}
+
 if ($DryRun) {
     Say 'dry run: no files, PATH entries or services were changed'
     Say "  scope:       $(if ($AllUsers) { 'all users' } else { 'current user' })"
     Say "  install dir: $InstallDir"
     Say "  PATH target: $Scope"
+    Say '  short command: tl (installed only if no existing command collides)'
     if ($Uninstall) {
         Say "  would remove: tunlion.exe and wintun.dll from $InstallDir"
         Say "  would remove: $InstallDir from the $Scope PATH"
         Say '  would remove: the Tunlion logon autostart entry'
+        Say '  would remove: tl.cmd only if it is the Tunlion-managed launcher'
     }
     exit 0
 }
@@ -182,6 +197,7 @@ if ($Uninstall) {
     if (Test-Elevated) { & sc.exe delete tunlion 2>$null | Out-Null }
 
     Remove-FromPath $Scope $InstallDir
+    Remove-TlLauncher $InstallDir
     foreach ($f in @('tunlion.exe', 'wintun.dll')) {
         Remove-FileWithRetry (Join-Path $InstallDir $f)
     }
@@ -299,6 +315,29 @@ try {
     Say "installed $exe ($(if ($ver) { $ver } else { $Tag }))"
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+}
+
+# ----------------------------------------------------------- short command
+# `tl` is convenient but not globally reserved. Never overwrite a command
+# already discoverable in this shell; a same-directory launcher from an older
+# Tunlion install is the only existing command we own and may replace.
+$TlLauncher = Join-Path $InstallDir 'tl.cmd'
+$existingTl = Get-Command tl -ErrorAction SilentlyContinue | Select-Object -First 1
+$existingTlPath = if ($existingTl -and $existingTl.CommandType -eq 'Application') {
+    $existingTl.Source
+} else { $null }
+$ownsExistingTl = $existingTlPath -and ($existingTlPath -ieq $TlLauncher)
+if (-not $existingTl -or $ownsExistingTl) {
+    @'
+@rem Tunlion tl launcher. Managed by scripts/install.ps1.
+@echo off
+"%~dp0tunlion.exe" %*
+exit /b %errorlevel%
+'@ | Set-Content -LiteralPath $TlLauncher -Encoding Ascii
+    Say "installed the 'tl' shortcut beside tunlion.exe"
+} else {
+    $existingTlName = if ($existingTlPath) { $existingTlPath } else { $existingTl.Name }
+    Say "not installing 'tl': another command already uses that name ($existingTlName); use 'tunlion' or rename the existing command"
 }
 
 # ------------------------------------------------------------------- PATH

@@ -274,12 +274,48 @@ jobs:
               $p = Join-Path $userDir $f
               if (-not (Test-Path -LiteralPath $p)) { throw "missing $p after install" }
             }
+            $tlLauncher = Join-Path $userDir 'tl.cmd'
+            if (-not (Test-Path -LiteralPath $tlLauncher)) {
+              throw "missing tl.cmd shortcut after install"
+            }
+            if ((Get-Content -LiteralPath $tlLauncher -TotalCount 1) -ne '@rem Tunlion tl launcher. Managed by scripts/install.ps1.') {
+              throw 'tl.cmd does not have the Tunlion ownership marker'
+            }
             $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
             if (($userPath -split ';') -notcontains $userDir) {
               throw "the User PATH does not contain $userDir"
             }
             Write-Host "OK: tunlion.exe and wintun.dll are beside each other in $userDir"
+            Write-Host "OK: the tl.cmd shortcut is installed beside tunlion.exe"
             Write-Host "OK: the User PATH contains $userDir"
+
+            # A pre-existing `tl` command wins. The installer must neither
+            # overwrite that command nor leave its own colliding launcher.
+            $collisionBin = Join-Path $tempRoot 'collision-bin'
+            $collisionDir = Join-Path $tempRoot 'collision-install'
+            New-Item -ItemType Directory -Force -Path $collisionBin | Out-Null
+            $existingTl = Join-Path $collisionBin 'tl.cmd'
+            '@echo off' | Set-Content -LiteralPath $existingTl -Encoding Ascii
+            $savedPath = $env:Path
+            $savedInstallDir = $env:TUNLION_INSTALL_DIR
+            try {
+              $env:Path = "$collisionBin;$savedPath"
+              $env:TUNLION_INSTALL_DIR = $collisionDir
+              $collisionOut = Run-Installer -InstallerArgs @('-Archive', $zip)
+              if ($collisionOut -notmatch "not installing 'tl'") {
+                throw 'installer did not warn about the existing tl command'
+              }
+              if ((Get-Content -LiteralPath $existingTl -Raw) -notmatch '@echo off') {
+                throw 'installer modified a pre-existing tl command'
+              }
+              if (Test-Path -LiteralPath (Join-Path $collisionDir 'tl.cmd')) {
+                throw 'installer created a colliding tl.cmd in the install dir'
+              }
+              Write-Host 'OK: an existing tl command is preserved and the shortcut is skipped'
+            } finally {
+              $env:Path = $savedPath
+              $env:TUNLION_INSTALL_DIR = $savedInstallDir
+            }
 
             # 5. A tampered archive must be rejected before anything is
             #    written. This is the one security property the installer owns.
