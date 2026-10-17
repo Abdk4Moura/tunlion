@@ -79,7 +79,15 @@ jobs:
           "$TUNLION_BIN" join "$INV" --name "$RUNNER_NAME" --json --no-interactive
           # The daemon receives into WORK and keeps the signaling link up; the
           # owner can only send once this device is present.
-          "$TUNLION_BIN" up --detach --dir "$WORK" --json --no-interactive
+          #
+          # `up` has no --json (docs/ci-ux.md), so start it and then read
+          # `status --json`, which is the machine-readable "is it up".
+          "$TUNLION_BIN" up --detach --dir "$WORK" --no-interactive
+          for i in $(seq 1 30); do
+            if "$TUNLION_BIN" status --json >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          "$TUNLION_BIN" status --json
 
       - name: Wait for the job payload
         env:

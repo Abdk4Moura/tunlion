@@ -87,6 +87,16 @@ say "dispatching ci-dogfood.yml on $REF"
 gh workflow run ci-dogfood.yml -R "$(repo)" --ref "$REF" \
   -f runner_name="$RUNNER" -f host_name="$HOST_NAME"
 
+# The run id is the one thing a human needs when this stalls, and it takes a
+# moment to appear. Print it now rather than only on failure.
+RUN_URL=""
+for i in $(seq 1 10); do
+  sleep 2
+  RUN_URL=$(gh run list -R "$(repo)" --workflow ci-dogfood.yml --limit 1 --json url --jq '.[0].url' 2>/dev/null || true)
+  [ -n "$RUN_URL" ] && break
+done
+say "run: ${RUN_URL:-<could not resolve the run url>}"
+
 online() {
   tunlion devices --json 2>/dev/null | python3 -c '
 import json, sys
@@ -109,7 +119,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 5
 done
 if [ "$(date +%s)" -ge "$deadline" ]; then
-  echo "the box never came online; check the workflow run" >&2
+  echo "the box never came online; check ${RUN_URL:-the workflow run}" >&2
   exit 6
 fi
 
