@@ -24,7 +24,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use filament_cap::capability::{
@@ -175,6 +175,27 @@ impl LogSink for VecLog {
     fn enabled(&self, _level: Level) -> bool {
         true
     }
+}
+
+/// Why a live session must end now, as the host decided it.
+///
+/// The peer loop runs the re-check on its own cadence, but only the host can
+/// read the device store and the invitation deadline. The host supplies the
+/// cause (which picks the line the loop prints) and the exact reason string
+/// (which rides the close frame, so the initiator's exit code and remedy are
+/// the same as a refusal at open).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveCut {
+    pub cause: LiveCutCause,
+    pub reason: String,
+}
+
+/// The two decisions a live re-check can reach. The words differ because the
+/// remedy differs: a revocation cannot be repaired by a grant, an expiry can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveCutCause {
+    Revoked,
+    Expired,
 }
 
 /// A local storage failure a receiver reports to the sender as a typed refusal
@@ -529,6 +550,41 @@ pub trait HostServices: Send + Sync + 'static {
     ) -> Result<(), String> {
         Err("this host serves no control socket".to_string())
     }
+    /// Open a local TCP stream on a peer's request (the L2 acceptor's dial).
+    ///
+    /// HOST-BOUND: this opens a socket on this machine, to a target the PEER
+    /// named. The caller has already applied the loopback rule and the
+    /// operator's per-device allowlist; this method is the capability itself,
+    /// and the inert default REFUSES rather than silently granting a library
+    /// consumer the ability to dial on a peer's behalf. The CLI's implementation
+    /// is the same `TcpStream::connect` the acceptor always ran, so its ack and
+    /// close traffic (including the dial error text) is unchanged.
+    async fn connect_local_stream(
+        &self,
+        _host: &str,
+        _port: u16,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "this host does not open local sockets on a peer's request",
+        ))
+    }
+    /// Why a live session must end now, if it must. `idev` is the peer's
+    /// device key as this link resolved it; `None` (an unidentified peer, or a
+    /// warm/initiator bridge that does not gate liveness) never cuts.
+    ///
+    /// An inert host has no device store and no invitation deadlines, so it has
+    /// no opinion: silence is the honest answer, not a fabricated "still fine".
+    fn live_session_cut(&self, _idev: Option<&[u8; 32]>) -> Option<LiveCut> {
+        None
+    }
+    /// The cadence a long-lived stream re-asks [`live_session_cut`](Self::live_session_cut).
+    ///
+    /// The CLI's value matches its PTY loop and its `TUNLION_REVOKE_RECHECK_MS`
+    /// test knob; an inert host never cuts, so the default only sets a ticker.
+    fn revoke_recheck_interval(&self) -> Duration {
+        Duration::from_secs(5)
+    }
     /// The `signaling` object of a daemon status reply: this host's live link
     /// to its signaling server.
     ///
@@ -616,6 +672,29 @@ impl PersistedPrincipal {
             last_seen: None,
         }
     }
+}
+
+/// The process-wide host, installed once at startup.
+///
+/// The peer loop's per-session state (`Conn`) is handed its host explicitly,
+/// but the L2 muxes are created inside command modules that this slice may not
+/// edit. They read this one process answer instead. Absent an install, the
+/// answer is [`NoHost`], so a library consumer keeps every inert default
+/// (notably: no peer-requested dial).
+static PROCESS_HOST: OnceLock<Arc<dyn HostServices>> = OnceLock::new();
+
+/// Install the process host once. A second install is ignored, like the
+/// transport hooks: the first answer is the one every mux already holds.
+pub fn install_process_host(host: Arc<dyn HostServices>) {
+    let _ = PROCESS_HOST.set(host);
+}
+
+/// The installed process host, or [`NoHost`] when nothing was installed.
+pub fn process_host() -> Arc<dyn HostServices> {
+    PROCESS_HOST
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(NoHost))
 }
 
 /// An inert [`HostServices`]: no settings, no devices, no owner key, relay
@@ -803,6 +882,11 @@ mod tests {
         assert!(host.remove_mount("/tmp/m").is_err());
         let restored = host.restore_mounts("srv", false).await;
         assert!(restored.is_err());
+        // A peer-requested dial is a capability, not a default. An inert host
+        // refuses it instead of opening a socket the peer named.
+        assert!(host.connect_local_stream("127.0.0.1", 22).await.is_err());
+        assert!(host.live_session_cut(Some(&[0u8; 32])).is_none());
+        assert_eq!(host.revoke_recheck_interval(), Duration::from_secs(5));
     }
 
     #[tokio::test]

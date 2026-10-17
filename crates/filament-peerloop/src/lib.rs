@@ -21,6 +21,9 @@
 //! (the stall ladder), `link_manager` (placement and warm-cutover decisions),
 //! `local` (the loopback TCP transport) and `holepunch` (rung-2 STUN + UDP
 //! punch). `identity` carries `resolve_peer_identity`, which operates on `Link`.
+//! `l2::mux` carries the L2 wire vocabulary and the stream multiplexer, moved
+//! out of `cli/src/l2.rs` in the next slice; its acceptor dial and live-session
+//! cut go through `host::HostServices`, never the CLI.
 //!
 //! What the crate still does NOT contain:
 //! - the command surface (`send_cmd`, `recv_cmd`, the daemons, the roster UI):
@@ -40,6 +43,7 @@ pub mod daemon_ctl;
 pub mod holepunch;
 pub mod host;
 pub mod identity;
+pub mod l2;
 pub mod limits;
 pub mod link_manager;
 pub mod liveness;

@@ -19,8 +19,8 @@ use std::time::Duration;
 use filament_cap::capability::{ActionCounts, GateDecision, ShadowCounts};
 use filament_peerloop::consent::{PendingRequest, RequestBar};
 use filament_peerloop::host::{
-    CapGate, DelegatedAccess, HostServices, Level, LogSink, PersistedPrincipal, StorageFailure,
-    Tone,
+    CapGate, DelegatedAccess, HostServices, Level, LiveCut, LiveCutCause, LogSink,
+    PersistedPrincipal, StorageFailure, Tone,
 };
 #[cfg(l3)]
 use filament_peerloop::mesh::MeshTunnel;
@@ -328,6 +328,29 @@ impl HostServices for CliHost {
         crate::platform::serve_control(tx, ready)
             .await
             .map_err(|e| e.to_string())
+    }
+    async fn connect_local_stream(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        // The same dial the acceptor always ran. The loopback rule and the
+        // per-device allowlist were applied by the caller before this point.
+        tokio::net::TcpStream::connect((host, port)).await
+    }
+    fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<LiveCut> {
+        let cut = crate::identity_state::live_session_cut(idev)?;
+        let cause = match cut {
+            crate::identity_state::LiveCut::Revoked => LiveCutCause::Revoked,
+            crate::identity_state::LiveCut::Expired(_) => LiveCutCause::Expired,
+        };
+        Some(LiveCut {
+            cause,
+            reason: cut.reason_for(idev),
+        })
+    }
+    fn revoke_recheck_interval(&self) -> Duration {
+        crate::revoke_recheck_interval()
     }
     fn signaling_snapshot(&self) -> serde_json::Value {
         crate::signaling_health::snapshot_json()

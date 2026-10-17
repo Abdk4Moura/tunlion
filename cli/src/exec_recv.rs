@@ -374,26 +374,10 @@ pub(crate) fn alive_deadline(alive_ms: u64) -> std::time::Duration {
 const TREE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Initiator -> acceptor control for one served exec, routed by sid through
-/// the peer's own mux (`Mux::exec_control`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExecCtl {
-    /// `exec-alive`: the initiator is still there.
-    Alive,
-    /// `exec-signal`: deliver this signal to the remote tree.
-    Signal(TreeSignal),
-}
-
-impl ExecCtl {
-    /// Parse `{type:"exec-alive"}` or `{type:"exec-signal", signal:"INT"}`.
-    /// An unknown signal name is ignored rather than guessed at.
-    pub(crate) fn from_frame(v: &Value) -> Option<ExecCtl> {
-        match v.get("type")?.as_str()? {
-            "exec-alive" => Some(ExecCtl::Alive),
-            "exec-signal" => TreeSignal::from_wire(v.get("signal")?.as_str()?).map(ExecCtl::Signal),
-            _ => None,
-        }
-    }
-}
+/// the peer's own mux (`Mux::exec_control`). It moved with `Mux`'s `exec_ctl`
+/// channel and is re-exported under its old path, so every use here and in
+/// `recv_cmd` resolves unchanged.
+pub(crate) use filament_peerloop::l2::mux::ExecCtl;
 
 /// Send `sig` to the session's whole tree (its own process group), or to the
 /// leader alone where there are no groups.
