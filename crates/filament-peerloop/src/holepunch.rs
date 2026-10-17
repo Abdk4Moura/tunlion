@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crate::direct;
+use crate::host::LogSink;
+use filament_transport::direct;
 
 /// Opt-in gate. Rung-2 is dead unless this is set; rung-1 + WebRTC are unaffected.
 pub fn holepunch_enabled() -> bool {
@@ -357,10 +358,11 @@ pub async fn connect(
     my_uid: String,
     peer_uid: String,
     my_id: String,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    tx: tokio::sync::mpsc::UnboundedSender<filament_transport::net::Ev>,
     exchange: bool,
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
+    log: Arc<dyn LogSink>,
 ) -> Option<direct::UnreadTransport> {
     // Punch on a blocking thread (blocking UDP I/O), reclaim the socket.
     let punch_result = tokio::task::spawn_blocking(move || {
@@ -371,16 +373,16 @@ pub async fn connect(
     .ok()?;
     let (r, punch_sock) = punch_result;
     if let Err(e) = r {
-        crate::ui::trace(&format!("tunlion: {e}"));
+        log.trace(&format!("tunlion: {e}"));
         return None; // step down to WebRTC
     }
     // DEBUG, direct/hole-punch internal.
-    crate::ui::debug(&format!("tunlion: HOLEPUNCH ok, NAT open toward {peer_srflx}, starting QUIC"));
+    log.debug(&format!("tunlion: HOLEPUNCH ok, NAT open toward {peer_srflx}, starting QUIC"));
 
     let endpoint = match endpoint_from_socket(punch_sock) {
         Ok(ep) => ep,
         Err(e) => {
-            crate::ui::trace(&format!("tunlion: holepunch endpoint build failed: {e}"));
+            log.trace(&format!("tunlion: holepunch endpoint build failed: {e}"));
             return None;
         }
     };

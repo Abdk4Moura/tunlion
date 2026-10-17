@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::net::Transport;
+use filament_transport::net::Transport;
 
 const KIND_CONTROL: u8 = 0;
 const KIND_DATA: u8 = 1;

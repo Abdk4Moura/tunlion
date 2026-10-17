@@ -29,7 +29,7 @@
 /// anyway (quinn keepalive frames don't stamp last_activity).
 /// The net.rs 5s relay keepalive keeps idle_ms under this gate on healthy links;
 /// tripping it means the keepalive stopped, so a fresh establish is the right answer.
-pub(crate) const WARM_RELAY_STALE_MS: u64 = 8_000;
+pub const WARM_RELAY_STALE_MS: u64 = 8_000;
 
 // ============================================================================
 // PLACEMENT: which existing link (if any) a request rides.
@@ -41,7 +41,7 @@ pub(crate) const WARM_RELAY_STALE_MS: u64 = 8_000;
 /// that will want its own connection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum Work {
+pub enum Work {
     /// Interactive: shell, pty, exec, forward, netcat, control requests.
     Interactive,
     /// Bulk: a file transfer or sync of about `bytes`.
@@ -52,27 +52,27 @@ pub(crate) enum Work {
 
 /// One link as placement sees it.
 #[derive(Debug, Clone)]
-pub(crate) struct LinkObs<'a> {
-    pub(crate) pid: &'a str,
+pub struct LinkObs<'a> {
+    pub pid: &'a str,
     /// The device name this link PROVED it reaches (`Link::verified_name`).
-    pub(crate) verified_name: Option<&'a str>,
+    pub verified_name: Option<&'a str>,
     /// We know WHO this link reaches: the legacy pair-proof trust flag, or a
     /// proven certificate binding. This decides ROUTING, never permission: what
     /// the peer may do is still decided by the capability gate on its side.
-    pub(crate) identity_known: bool,
+    pub identity_known: bool,
     /// The link has a transport at all.
-    pub(crate) has_transport: bool,
+    pub has_transport: bool,
     /// The transport's own liveness verdict.
-    pub(crate) alive: bool,
+    pub alive: bool,
     /// An authenticated direct (QUIC) link rather than WebRTC/relay.
-    pub(crate) direct: bool,
+    pub direct: bool,
     /// Milliseconds since the transport last moved bytes either way.
-    pub(crate) idle_ms: u64,
+    pub idle_ms: u64,
 }
 
 /// Where a request goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Placement {
+pub enum Placement {
     /// Ride this existing link.
     Reuse { pid: String },
     /// No existing link qualifies: establish a fresh one.
@@ -85,7 +85,7 @@ pub(crate) enum Placement {
 /// we must know who it reaches, and it must be alive; a non-direct link must also
 /// not have gone quiet past `WARM_RELAY_STALE_MS`, since that is a relay path
 /// that may already be evicted.
-pub(crate) fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
+pub fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
     l.identity_known
         && l.verified_name.is_some_and(|n| n.eq_ignore_ascii_case(peer))
         && l.has_transport
@@ -98,7 +98,7 @@ pub(crate) fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
 /// Every eligible link qualifies; a direct one is preferred over a relayed one.
 /// Among equals the last one in iteration order wins, which is exactly what the
 /// resolver this replaced (`max_by_key` over the link table) did.
-pub(crate) fn place(_work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement {
+pub fn place(_work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement {
     links
         .iter()
         .filter(|l| eligible(l, peer))
@@ -118,7 +118,7 @@ pub(crate) fn place(_work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement
 /// used to be judged on `idle_ms`, which those writes stamp, so a relay link to
 /// a SIGSTOPped or wiped peer read as "online (last seen just now)" forever.
 /// Without `heard_ms`, a relay link falls back to the old `idle_ms` rule.
-pub(crate) fn peer_present(alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
+pub fn peer_present(alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
     alive
         && match heard_ms {
             Some(h) => h < WARM_RELAY_STALE_MS,
@@ -131,28 +131,28 @@ pub(crate) fn peer_present(alive: bool, direct: bool, heard_ms: Option<u64>, idl
 // ============================================================================
 
 /// One link as warm-hold sees it.
-pub(crate) struct WarmLinkView<'a> {
-    pub(crate) pid: &'a str,
+pub struct WarmLinkView<'a> {
+    pub pid: &'a str,
     /// `link_petname`: the device it is bound to, when known.
-    pub(crate) petname: Option<&'a str>,
+    pub petname: Option<&'a str>,
     /// The name the link was born with (a display name for a WebRTC link,
     /// the petname for a direct one).
-    pub(crate) name: &'a str,
+    pub name: &'a str,
     /// `Conn::has_live_transport`: serving, or still making progress.
-    pub(crate) live: bool,
+    pub live: bool,
 }
 
 /// One roster entry (a sid we saw on signaling) as warm-hold sees it.
-pub(crate) struct WarmRosterView<'a> {
-    pub(crate) pid: &'a str,
+pub struct WarmRosterView<'a> {
+    pub pid: &'a str,
     /// The DISPLAY name the sid announced.
-    pub(crate) name: Option<&'a str>,
+    pub name: Option<&'a str>,
     /// The pair channel it was met on, for a channel-introduced entry.
-    pub(crate) channel: Option<&'a str>,
+    pub channel: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum WarmDecision {
+pub enum WarmDecision {
     /// A live link to the device exists: leave it alone.
     Skip { pid: String },
     /// No live link: dial this present sid.
@@ -175,7 +175,7 @@ pub(crate) enum WarmDecision {
 /// sids actually present for it; `rotation` (the peer's consecutive failure
 /// count) walks through them when there are several, so one stale sid cannot
 /// absorb every attempt.
-pub(crate) fn warm_decide(
+pub fn warm_decide(
     peer: &str,
     channel: Option<&str>,
     links: &[WarmLinkView<'_>],
@@ -217,7 +217,7 @@ pub(crate) fn warm_decide(
 
 /// What to do with a connected direct standby on this verify tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerifyAction {
+pub enum VerifyAction {
     /// First look at this standby: start the verify window now.
     StartWindow,
     /// The heartbeat failed or the path went idle past the guard: discard the
@@ -239,7 +239,7 @@ pub(crate) enum VerifyAction {
 ///
 /// The window starts on the first look whatever that look saw; every later look
 /// discards on a failed beat or an idle path before it can upgrade.
-pub(crate) fn decide_upgrade_verify(
+pub fn decide_upgrade_verify(
     elapsed_ms: Option<u64>,
     beat_ok: bool,
     idle_ms: u64,
@@ -265,7 +265,7 @@ pub(crate) fn decide_upgrade_verify(
 // reachable from one module.
 // ============================================================================
 
-pub(crate) use crate::resilience::{StallAction, decide_stall_action};
+pub use crate::resilience::{StallAction, decide_stall_action};
 
 #[cfg(test)]
 mod tests {
