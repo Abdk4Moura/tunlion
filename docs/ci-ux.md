@@ -78,8 +78,11 @@ on both ends.
    `TUNLION_AUTHKEY=... tunlion join` (or `tunlion up`, which joins first when
    it has no identity). `--authkey-file -` reads stdin. No file has to be
    written by the job.
-3. `receive --expect-sha256 <hex>` (and `--expect-name <name>`): refuse to report
-   success unless the received bytes match. Removes hand-rolled verification.
+3. IMPLEMENTED: `receive --expect-sha256 <hex>` refuses an offer unless its
+   whole-file digest matches; accepted bytes are still verified against that
+   digest before completion is acknowledged. Older senders without a whole-file
+   digest are refused rather than treated as verified. Removes hand-rolled
+   verification for a pinned artifact.
 4. `up` has no `--json`. A CI box starts the daemon and then has to poll
    `status --json` to learn whether it came up, because `up --json` is refused as
    unimplemented (exit 2). Either give `up` a machine-readable result or make

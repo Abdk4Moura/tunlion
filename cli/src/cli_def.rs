@@ -280,6 +280,9 @@ pub(crate) enum Cmd {
         /// limit. Conflicts with --keep-open.
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
+        /// Accept only a file whose verified whole-file SHA-256 matches this hex digest
+        #[arg(long, value_name = "HEX")]
+        expect_sha256: Option<String>,
         /// After a code pairing, remember the other device under this name
         #[arg(long)]
         remember: Option<String>,

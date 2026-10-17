@@ -1161,6 +1161,18 @@ pub(crate) fn receive_timed_out(
     completed == 0 && timeout.is_some_and(|d| !d.is_zero() && elapsed >= d)
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && hex::decode(value).is_ok_and(|digest| digest.len() == 32)
+}
+
+fn sha256_matches(expected: &str, offered: Option<&str>) -> bool {
+    let (Ok(expected), Some(offered)) = (hex::decode(expected), offered) else {
+        return false;
+    };
+    expected.len() == 32
+        && hex::decode(offered).is_ok_and(|offered| offered.len() == 32 && offered == expected)
+}
+
 #[cfg(test)]
 mod receive_timeout_tests {
     use super::receive_timed_out;
@@ -1188,6 +1200,31 @@ mod receive_timeout_tests {
     }
 }
 
+#[cfg(test)]
+mod receive_expected_sha256_tests {
+    use super::{sha256_matches, valid_sha256};
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn accepts_only_a_well_formed_sha256() {
+        assert!(valid_sha256(HASH));
+        assert!(valid_sha256(&HASH.to_uppercase()));
+        assert!(!valid_sha256("abcd"));
+        assert!(!valid_sha256(&format!("{HASH}00")));
+        assert!(!valid_sha256(&"z".repeat(64)));
+    }
+
+    #[test]
+    fn compares_digest_hex_case_insensitively_and_requires_a_digest() {
+        assert!(sha256_matches(HASH, Some(HASH)));
+        assert!(sha256_matches(HASH, Some(&HASH.to_uppercase())));
+        assert!(!sha256_matches(HASH, None));
+        assert!(!sha256_matches(HASH, Some(&"f".repeat(64))));
+        assert!(!sha256_matches("invalid", Some(HASH)));
+    }
+}
+
 pub(crate) async fn recv_cmd(
     server: &str,
     mut code: Option<String>,
@@ -1200,6 +1237,10 @@ pub(crate) async fn recv_cmd(
     // limit. A deadline that passes with nothing received exits 6, so a script
     // can tell "nobody came" from "the transfer failed".
     timeout: Option<u64>,
+    // Optional content pin for a one-shot CI receive. The sender's advertised
+    // digest must match this before we accept; the normal receive path then
+    // verifies the bytes against that digest before acknowledging completion.
+    expect_sha256: Option<String>,
     relay: bool,
     remember: Option<String>,
     daemon: bool,
@@ -1218,6 +1259,14 @@ pub(crate) async fn recv_cmd(
     // `NoHost` and every read resolves to the inert default.
     host: Arc<dyn HostServices>,
 ) -> Result<()> {
+    if let Some(expected) = expect_sha256.as_deref() {
+        if !valid_sha256(expected) {
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::Usage,
+                "--expect-sha256 must be exactly 64 hexadecimal characters",
+            ));
+        }
+    }
     let opened_flow =
         !daemon && interactive_allowed() && (code.is_none() || interactive_requested());
     let to_stdout = output.as_deref() == Some("-");
@@ -7387,6 +7436,38 @@ pub(crate) async fn recv_cmd(
                     // peer). Used to verify-on-completion + drive the delivery-ack.
                     let offer_full = v["full"].as_str().map(|s| s.to_string());
                     let is_resume = v["resume"].as_bool().unwrap_or(false);
+
+                    // A pinned receive refuses unverifiable legacy offers and
+                    // content with a different advertised digest before writing
+                    // any bytes. For a match, the ordinary completion path still
+                    // hashes the received file and checks it against `offer_full`.
+                    if let Some(expected) = expect_sha256.as_deref() {
+                        if !sha256_matches(expected, offer_full.as_deref()) {
+                            let reason = if offer_full.is_some() {
+                                "offered file SHA-256 does not match --expect-sha256"
+                            } else {
+                                "sender did not provide a whole-file SHA-256 required by --expect-sha256"
+                            };
+                            log.critical(&log.paint(
+                                Tone::Err,
+                                &format!(
+                                    "  refused {name} from {}: {reason}",
+                                    conn.link(&pid).map(|l| l.name.as_str()).unwrap_or_default()
+                                ),
+                            ));
+                            note_refusal(
+                                daemon,
+                                &name,
+                                size,
+                                "sha256_mismatch",
+                                reason,
+                                crate::exit_codes::ExitKind::Denied,
+                            );
+                            let r = t.send_control(&protocol::decline_msg(&id)).await;
+                            peer_step(daemon, &pid, "digest refusal", r, log.as_ref())?;
+                            continue;
+                        }
+                    }
 
                     let part_path = dir.join(format!("{name}.part"));
                     let meta_path = dir.join(format!("{name}.part.meta"));
