@@ -424,7 +424,7 @@ async fn handle_warm_open(
     // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to.
     let mux = l2_muxes
         .entry(pid.clone())
-        .or_insert_with(|| l2::Mux::new(t))
+        .or_insert_with(|| l2::Mux::new(t, conn.host.clone()))
         .clone();
     let tx = tx.clone();
     // SELF-HEALING warm-reuse: VERIFY the held link still delivers BEFORE committing
@@ -501,7 +501,7 @@ async fn handle_warm_pty(
     };
     let mux = l2_muxes
         .entry(pid.clone())
-        .or_insert_with(|| l2::Mux::new(t))
+        .or_insert_with(|| l2::Mux::new(t, conn.host.clone()))
         .clone();
     let warm_ptys = warm_ptys.clone();
     let tx = tx.clone();

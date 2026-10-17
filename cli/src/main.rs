@@ -1835,11 +1835,6 @@ enum BareTarget {
 /// there is no doubt about what the transport can and cannot see.
 fn install_transport_hooks() {
     use filament_transport::hooks;
-    // The L2 muxes are built in command modules that predate the host seam;
-    // install the process host once so their acceptor dials and live-session
-    // re-checks reach the same CLI host `Conn` carries. Without this install
-    // the library default refuses both, which is the honest library answer.
-    filament_peerloop::host::install_process_host(host_impl::cli_host());
     hooks::set_trace(|m| ui::trace(m));
     hooks::set_debug(|m| ui::debug(m));
     hooks::set_say(|m| ui::say(m));
