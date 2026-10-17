@@ -15,7 +15,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use filament_peerloop::host::{HostServices, Level, LogSink, PersistedPrincipal, Tone};
+use filament_peerloop::host::{
+    HostServices, Level, LogSink, PersistedPrincipal, StorageFailure, Tone,
+};
 
 /// The terminal `ui` module, as a [`LogSink`].
 pub(crate) struct CliLog;
@@ -97,8 +99,34 @@ fn level_to_ui(level: Level) -> crate::ui::Level {
 pub(crate) struct CliHost;
 
 impl HostServices for CliHost {
+    fn config_dir(&self) -> std::path::PathBuf {
+        crate::settings::config_dir()
+    }
     fn settings_get_str(&self, key: &str) -> Option<String> {
         crate::settings::get_str(key, None)
+    }
+    fn settings_get_str_for(&self, key: &str, peer: Option<&str>) -> Option<String> {
+        crate::settings::get_str(key, peer)
+    }
+    fn settings_get_bool(&self, key: &str) -> bool {
+        crate::settings::get_bool(key, None)
+    }
+    fn user_key(&self) -> Option<crate::identity::UserKey> {
+        crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
+            .ok()
+            .flatten()
+    }
+    fn create_inbox_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        crate::platform::create_inbox_dir(dir)
+    }
+    fn serving_user(&self) -> Option<String> {
+        crate::platform::current_username()
+    }
+    fn free_space(&self, dir: &std::path::Path) -> Option<u64> {
+        crate::platform::free_space(dir)
+    }
+    fn storage_failure(&self, e: &std::io::Error) -> Option<StorageFailure> {
+        crate::platform::storage_failure(e)
     }
     fn devices_load(&self) -> Vec<(String, String)> {
         crate::devices_load()

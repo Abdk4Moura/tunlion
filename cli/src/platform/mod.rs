@@ -3675,13 +3675,11 @@ pub fn free_space(dir: &Path) -> Option<u64> {
 
 /// A local storage failure a receiver reports to the sender as a typed refusal
 /// instead of going silent. See `storage_failure`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageFailure {
-    NoSpace,
-    NameTooLong,
-    ReadOnly,
-    Permission,
-}
+///
+/// The vocabulary lives in `filament-peerloop::host`, because the host trait
+/// classifies io errors with it; this path re-exports it so every existing
+/// caller keeps resolving unchanged.
+pub use filament_peerloop::host::StorageFailure;
 
 /// Classify an io error as a storage failure, or `None` for anything else.
 pub fn storage_failure(e: &std::io::Error) -> Option<StorageFailure> {

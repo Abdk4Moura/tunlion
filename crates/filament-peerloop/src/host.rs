@@ -20,10 +20,11 @@
 //! from its own modules, and this crate never calls back into it.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use filament_cap::capability::PrincipalKind;
-use filament_id::DeviceCert;
+use filament_id::{DeviceCert, UserKey};
 
 /// Terminal tone, mirroring `cli::ui::Tone`. The crate carries the WORD (which
 /// role a span plays); the host decides what escapes, if any, that word means.
@@ -163,6 +164,17 @@ impl LogSink for VecLog {
     }
 }
 
+/// A local storage failure a receiver reports to the sender as a typed refusal
+/// instead of going silent. The vocabulary is host-free: the host classifies
+/// its own io errors into these words, and the peer loop only carries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFailure {
+    NoSpace,
+    NameTooLong,
+    ReadOnly,
+    Permission,
+}
+
 /// The non-terminal host facts `Conn` reads. Same rationale as [`LogSink`]: one
 /// owned object per session, implemented by the CLI over its own modules.
 ///
@@ -199,9 +211,52 @@ pub trait HostServices: Send + Sync + 'static {
     ) -> u64 {
         cert_expires
     }
+    /// This machine's config directory: the root every stored fact (settings,
+    /// devices, grants, keys) lives under. The peer loop never joins a filename
+    /// onto it; it only hands the resolved path to a caller that already owns
+    /// the layout.
+    fn config_dir(&self) -> PathBuf {
+        PathBuf::new()
+    }
     /// A `settings::get_str` lookup with no per-peer override: the configured
     /// value, or `None`.
     fn settings_get_str(&self, key: &str) -> Option<String>;
+    /// The same lookup with an optional per-peer override, resolved exactly as
+    /// the host's own settings reader resolves it.
+    fn settings_get_str_for(&self, key: &str, peer: Option<&str>) -> Option<String> {
+        match peer {
+            None => self.settings_get_str(key),
+            Some(_) => None,
+        }
+    }
+    /// A `settings::get_bool` lookup with no per-peer override.
+    fn settings_get_bool(&self, _key: &str) -> bool {
+        false
+    }
+    /// The owner user key, when this machine holds one. A joined device holds
+    /// no user signing key, so this is `None` there.
+    fn user_key(&self) -> Option<UserKey> {
+        None
+    }
+    /// Create the receiving inbox, applying the host's own permissions policy
+    /// (owner-only on unix). An existing directory is left as the user set it.
+    fn create_inbox_dir(&self, _dir: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+    /// The login name this process serves as, from the host's own account
+    /// database rather than an environment variable.
+    fn serving_user(&self) -> Option<String> {
+        None
+    }
+    /// Bytes available to this user on the filesystem holding `dir`, or `None`
+    /// when the host cannot say.
+    fn free_space(&self, _dir: &Path) -> Option<u64> {
+        None
+    }
+    /// Classify an io error as a typed storage failure, or `None`.
+    fn storage_failure(&self, _e: &std::io::Error) -> Option<StorageFailure> {
+        None
+    }
     /// Every known device as `(petname, rendezvous secret)`.
     fn devices_load(&self) -> Vec<(String, String)>;
     /// Same install (our own daemon / another process of this device)?
@@ -381,6 +436,15 @@ mod tests {
     fn nohost_is_inert_and_permissive() {
         let host = NoHost;
         assert_eq!(host.settings_get_str("k"), None);
+        assert_eq!(host.settings_get_str_for("k", Some("peer")), None);
+        assert!(!host.settings_get_bool("k"));
+        assert_eq!(host.config_dir(), std::path::PathBuf::new());
+        assert!(host.user_key().is_none());
+        assert_eq!(host.serving_user(), None);
+        assert_eq!(host.free_space(std::path::Path::new(".")), None);
+        assert!(host
+            .storage_failure(&std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .is_none());
         assert!(host.devices_load().is_empty());
         assert!(!host.is_self_uid("me", Some("me-1")));
         assert!(!host.relay_forbidden());
