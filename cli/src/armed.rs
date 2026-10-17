@@ -13,6 +13,17 @@
 //! The file holds only `key_id` (the enroll public half, hex) and `expires`
 //! (absolute unix seconds), both non-secret. Enrollment still requires the
 //! signed invitation, so a burned key lingering until expiry is harmless.
+//!
+//! A MULTI-USE INVITATION IS NOT CONSUMED HERE, and needs no change to this
+//! store. There is no use count and no "used" flag in an entry: `is_armed`
+//! drops an entry only when `expires` passes, and no code path calls `disarm`
+//! on a successful enrolment. So `Reuse::N(n)` and `Reuse::Reusable` stay
+//! subscribed to the enrollment channel for the whole TTL, which is exactly
+//! what a second or third box needs. The durable count in
+//! `used-invitations.json` is what refuses the claim past its limit; this file
+//! only answers "may the daemon listen at all". Keeping an exhausted key armed
+//! until expiry is harmless for the same reason a burned one is: the signed
+//! invitation and the use count still gate admission.
 
 use std::path::PathBuf;
 
@@ -149,6 +160,42 @@ mod invitee_name_tests {
         assert_eq!(super::invitee_kind(&"aa".repeat(32)).as_deref(), Some("person"));
         assert_eq!(super::invitee_kind(&"bb".repeat(32)), None);
         assert_eq!(super::invitee_kind(&"cc".repeat(32)), None);
+        unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod armed_lifecycle_tests {
+    /// A multi-use invitation must not be consumed by the first enrolment.
+    /// There is nothing in the armed entry to consume: it is keyed by the
+    /// invitation and pruned by expiry alone. This pins that shape, so an
+    /// added "used" flag or a disarm-on-enrol would have to change a test that
+    /// says why it must not.
+    #[test]
+    fn an_unexpired_key_stays_armed_for_its_whole_ttl() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!(
+            "fil-armed-lifecycle-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let key = "ee".repeat(32);
+        let expires = crate::capability::now_secs() + 600;
+        // The mint arms once, before any claim.
+        super::arm(key.clone(), expires, None, Some("runner".into()));
+        assert!(super::is_armed(), "an outstanding key arms the room");
+        assert!(
+            super::is_armed(),
+            "arming is per invitation and per expiry: reading it again, after a claim would have happened, must not consume it"
+        );
+        // The entry carries no count, so a claim has nothing to decrement.
+        let raw = std::fs::read_to_string(dir.join("armed.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(v[0].get("uses").is_none(), "no use count lives in armed.json");
+        assert!(v[0].get("used").is_none(), "no used flag lives in armed.json");
         unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
