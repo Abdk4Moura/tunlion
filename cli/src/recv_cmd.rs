@@ -26,13 +26,15 @@
 //!
 //! HOST FACTS: settings, the config directory, the keystore, the inbox
 //! permissions, the serving login name, the filesystem answers, the capability
-//! store, the authoritative-mode switch and the gate counters all arrive
+//! store, the authoritative-mode switch, the gate counters, the overlay key, the
+//! mesh packet endpoint, the ssh host keys and the mount hooks all arrive
 //! through the `HostServices` passed to `recv_cmd` (`host` here, `conn.host` in
 //! the split-out handlers), so a caller with no machine runs the same loop with
 //! `NoHost`. What stays a direct import is what the crates already own: the
-//! identity primitives (`filament-id`, imported as `identity`), transport, and
-//! the pure capability evaluation/token work (`filament-cap`, imported as
-//! `cap`). Those are crate calls, not host ones.
+//! identity primitives (`filament-id`, imported as `identity`), transport,
+//! overlay announce/address work (`filament-overlay`), the ssh key-line
+//! validator (`authkeys-managed`) and the pure capability evaluation/token work
+//! (`filament-cap`, imported as `cap`). Those are crate calls, not host ones.
 use crate::dlog;
 use crate::signaling_health;
 #[cfg(l3)]
@@ -59,7 +61,7 @@ use crate::{
     issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
     load_provisional_identity, load_requests, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
-    mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding,
+    mk_uid, mount_proto, net, next_ev, offer_question, out_binding,
     owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz,
     principal_ceiling_for, prompt_line, proof_for, protocol, pwrite_at, quiet_exit_window,
     record_range, regex_lite_code, relay_banner, resolve_peer_identity,
@@ -2196,7 +2198,7 @@ pub(crate) async fn recv_cmd(
     }
 
     // Restore mounts that were marked with auto_restore.
-    if let Err(e) = mount::restore_mounts(server, relay).await {
+    if let Err(e) = host.restore_mounts(server, relay).await {
         log.say(&format!("warning: failed to restore mounts: {e}"));
     }
 
@@ -3383,7 +3385,7 @@ pub(crate) async fn recv_cmd(
                 .entries
                 .iter()
                 .filter_map(|(local, _entry)| {
-                    let is_alive = mount::is_mount_point(local);
+                    let is_alive = host.is_mount_point(local);
                     let path_exists = Path::new(local).exists();
                     if !path_exists {
                         Some(local.clone())
@@ -3404,7 +3406,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(mut child) = daemon_mounts.children.remove(&local) {
                         let _ = child.kill().await;
                     }
-                    let _ = mount::remove_mount(&local);
+                    let _ = host.remove_mount(&local);
                 }
             }
         }
