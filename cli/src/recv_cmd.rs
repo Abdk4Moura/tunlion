@@ -23,6 +23,14 @@
 //! transfer bars), `ui::clipboard` (OSC 52) and `ui::answer_echo` (landing a
 //! keystroke in raw mode). Anything that prints a message must stay on the
 //! sink, not here.
+//!
+//! HOST FACTS: settings, the config directory, the keystore, the inbox
+//! permissions, the serving login name and the filesystem answers all arrive
+//! through the `HostServices` passed to `recv_cmd` (`host` here, `conn.host` in
+//! the split-out handlers), so a caller with no machine runs the same loop with
+//! `NoHost`. What stays a direct import is what the crate already owns: the
+//! identity primitives (`filament-id`, imported as `identity`), transport and
+//! capability calls. Those are crate calls, not host ones.
 use crate::dlog;
 use crate::signaling_health;
 #[cfg(l3)]
@@ -45,12 +53,12 @@ use crate::{
     load_provisional_identity, load_requests, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
     mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding, overlay,
-    owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz, platform,
+    owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz,
     principal_ceiling_for, prompt_line, proof_for, protocol, pwrite_at, quiet_exit_window,
     record_range, regex_lite_code, relay_banner, resolve_peer_identity,
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
     respond_to_identity_challenge, safe_create_part, safe_incoming_name, safe_resume_part,
-    save_requests, sdnotify, session, settings, shell_argv, shutdown, spawn_session_pumps, sshd,
+    save_requests, sdnotify, session, shell_argv, shutdown, spawn_session_pumps, sshd,
     sshd_listening, sshkeys, store_provisional_identity, subnet_forward, sweep_completed_streams,
     test_hooks, ui, verify_incoming, with_devices_mut,
 };
@@ -63,7 +71,8 @@ use crate::{
     warm_link_for,
 };
 use anyhow::{Context, Result, bail};
-use filament_peerloop::host::{Level, LogSink, Tone};
+use filament_peerloop::host::{HostServices, Level, LogSink, StorageFailure, Tone};
+use filament_peerloop::shell::ShellHost;
 use filament_transfer::{MAX_RECV_RANGES, chunk_fits_offer};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -942,11 +951,11 @@ async fn handle_pty_open(
     // detaches it, a reconnect reattaches above.
     // Resolve the shell and build interactive or one-shot argv.
     let (shell_argv, _can_use_user) = shell_argv(None, shell_user.as_deref());
-    let host = platform::ShellHost::new(&shell_argv);
+    let shell_host = ShellHost::new(&shell_argv);
     let argv = if pty_cmd.is_empty() {
-        host.interactive_args()
+        shell_host.interactive_args()
     } else {
-        host.exec_cmd_args(&pty_cmd)
+        shell_host.exec_cmd_args(&pty_cmd)
     };
     // The peer's device key, resolved again for the live session's
     // revocation re-check (the gate above resolved the same value for
@@ -1122,6 +1131,10 @@ pub(crate) async fn recv_cmd(
     // sink; a caller with no terminal hands it `NoLog` and every line below
     // still formats, but nothing is printed.
     log: Arc<dyn LogSink>,
+    // The machine's own facts (settings, the config dir, the keystore, the
+    // filesystem). The CLI hands it `CliHost`; a caller with no host hands it
+    // `NoHost` and every read resolves to the inert default.
+    host: Arc<dyn HostServices>,
 ) -> Result<()> {
     let opened_flow =
         !daemon && interactive_allowed() && (code.is_none() || interactive_requested());
@@ -1132,8 +1145,8 @@ pub(crate) async fn recv_cmd(
     // Unprovisioned. Healing on every daemon start makes old identities correct
     // on next `up` and new ones born correct. Tautological; widens nothing.
     if daemon {
-        if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-            if ensure_self_genesis_header(&crate::settings::config_dir(), &uk) {
+        if let Some(uk) = host.user_key() {
+            if ensure_self_genesis_header(&host.config_dir(), &uk) {
                 log.debug("seeded owner self genesis capability header");
             }
         }
@@ -1206,8 +1219,9 @@ pub(crate) async fn recv_cmd(
     // (`recv` vs `pair`) decides whether the agreed secret is discarded or kept.
     // So `recv` no longer redirects a 4-digit code away (the old width-based
     // hint is obsolete); any well-formed code is a valid claim here.
-    // Owner-only: peers write here (platform::create_inbox_dir).
-    crate::platform::create_inbox_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Owner-only: peers write here (the host's create_inbox_dir).
+    host.create_inbox_dir(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     // Interrupted transfers' partials wait PARTIAL_TTL_SECS for a resume, then go.
     crate::recv_files::expire_partials_and_say(&dir);
     let my_uid = mk_uid("r");
@@ -1441,9 +1455,7 @@ pub(crate) async fn recv_cmd(
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             let mut c = chans;
             if crate::armed::is_armed() {
-                if let Ok(Some(uk)) =
-                    crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
-                {
+                if let Some(uk) = host.user_key() {
                     let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                     if !c.contains(&ek) {
                         c.push(ek);
@@ -1561,7 +1573,7 @@ pub(crate) async fn recv_cmd(
         // are unaffected and keep their WebRTC default.
         direct_ok_for(daemon, l2_enabled),
         log.clone(),
-        crate::host_impl::cli_host(),
+        host.clone(),
     );
     // WARM-HOLD: load configured warm-peers at daemon startup
     if daemon {
@@ -1668,7 +1680,7 @@ pub(crate) async fn recv_cmd(
     let mut l3_seen: HashMap<String, overlay::Announce> = HashMap::new();
     #[cfg(l3)]
     let l3: Option<std::sync::Arc<l3::L3>> = if daemon {
-        match settings::get_str("tun-addr", None) {
+        match host.settings_get_str("tun-addr") {
             Some(setting) => {
                 let (cidr, identity) = if setting == "auto" {
                     match overlay::load_identity() {
@@ -1687,7 +1699,7 @@ pub(crate) async fn recv_cmd(
                     // Endpoint selection: `l3-mode` setting (kernel|userspace|auto),
                     // default Auto; TUNLION_L3_USERSPACE / `up --userspace` force
                     // userspace (handled inside L3::start via the env).
-                    let mode = match settings::get_str("l3-mode", None).as_deref() {
+                    let mode = match host.settings_get_str("l3-mode").as_deref() {
                         Some("kernel") => l3::L3Mode::Kernel,
                         Some("userspace") => l3::L3Mode::Userspace,
                         _ => l3::L3Mode::Auto,
@@ -1716,7 +1728,7 @@ pub(crate) async fn recv_cmd(
                                         ),
                                     ));
                                 } else {
-                                    let snat = settings::get_bool("route-snat", None);
+                                    let snat = host.settings_get_bool("route-snat");
                                     match subnet_forward::enable(l3::ifname(), &advertised, snat) {
                                         Ok(_applied) => log.say(&format!(
                                             "  {} carrying {} for peers{}",
@@ -1752,7 +1764,7 @@ pub(crate) async fn recv_cmd(
                                 // Auto-start SOCKS5 proxy when kernel TUN is unavailable.
                                 // Opt-out via --no-proxy-fallback or `tunlion set auto-proxy off`.
                                 let auto_proxy =
-                                    settings::get_bool("auto-proxy", None) && !no_proxy_fallback;
+                                    host.settings_get_bool("auto-proxy") && !no_proxy_fallback;
                                 if auto_proxy {
                                     // Bind FIRST, then say what is true. Another daemon
                                     // (another HOME on this machine) or a hand-started
@@ -1846,7 +1858,7 @@ pub(crate) async fn recv_cmd(
                                     m.refresh_hosts().await;
                                 }
                                 // Configure sshd to listen on overlay addresses if enabled.
-                                if settings::get_bool("sshd-overlay", None) {
+                                if host.settings_get_bool("sshd-overlay") {
                                     let v6_str = id.addr().to_string();
                                     let v4_str = id.addr_v4().to_string();
                                     if let Err(e) = sshd::configure_sshd_overlay(&v6_str, &v4_str) {
@@ -3102,7 +3114,7 @@ pub(crate) async fn recv_cmd(
         // supports 1 room/socket. This MUST run at loop top-level, not nested in
         // the signaling-reconnect Ok arm: a stable daemon (signaling never down)
         // would otherwise never subscribe and no ephemeral device could enroll.
-        if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+        if let Some(uk) = host.user_key() {
             let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
             let armed = crate::armed::is_armed();
             let subscribed = sess.channels.contains(&ek);
@@ -3203,7 +3215,7 @@ pub(crate) async fn recv_cmd(
         // other, and blocking the daemon loop on that would stall everything.
         if daemon
             && last_wg_check.elapsed() >= Duration::from_secs(10)
-            && crate::settings::get_str("wireguard", None)
+            && host.settings_get_str("wireguard")
                 .map(|v| v == "on" || v == "true")
                 .unwrap_or(false)
         {
@@ -3331,7 +3343,7 @@ pub(crate) async fn recv_cmd(
             last_warm_hold_tick = Instant::now();
             // Warm-all is the DEFAULT (auto-warm setting, opt-out). L3 forces it on:
             // the overlay routes over these links, opting out must not break L3.
-            let auto_warm = l3.is_some() || settings::get_bool("auto-warm", None);
+            let auto_warm = l3.is_some() || host.settings_get_bool("auto-warm");
             let _ = conn.warm_hold_tick(auto_warm).await;
         }
 
@@ -3971,9 +3983,7 @@ pub(crate) async fn recv_cmd(
                             if let Some(l) = conn.link_mut(&pid) {
                                 l.expected_secret = Some((name, secret));
                             }
-                        } else if let Ok(Some(uk)) =
-                            crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
-                        {
+                        } else if let Some(uk) = host.user_key() {
                             let enroll_channel =
                                 crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                             if p["channel"].as_str() == Some(enroll_channel.as_str()) {
@@ -4166,7 +4176,7 @@ pub(crate) async fn recv_cmd(
                     // start_direct/maybe_adopt below already dial immediately; this makes
                     // warm-hold RETRY if that first dial fails or the link later drops.
                     // Do NOT add to recent-LRU (that's for ACTUAL use only).
-                    let auto_warm = l3.is_some() || settings::get_bool("auto-warm", None);
+                    let auto_warm = l3.is_some() || host.settings_get_bool("auto-warm");
                     if auto_warm {
                         conn.warm_hold.auto.insert(n.clone());
                     }
@@ -4300,9 +4310,7 @@ pub(crate) async fn recv_cmd(
                     }
                     let r = conn.maybe_adopt(&v, true).await;
                     peer_step(daemon, &pid, "fleet adoption", r, log.as_ref())?;
-                } else if let Ok(Some(uk)) =
-                    crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
-                {
+                } else if let Some(uk) = host.user_key() {
                     // Enrollment channel: an ephemeral device appeared on
                     // enroll_channel(own_owner_pub). Dial it (channel-presence
                     // path, no room-join) so the auth-key handshake can run.
@@ -5537,13 +5545,13 @@ pub(crate) async fn recv_cmd(
                                             // is indistinguishable from the
                                             // machine losing the internet.
                                             {
-                                                let accept = crate::settings::get_str(
+                                                let accept = host.settings_get_str_for(
                                                     "accept-routes",
                                                     Some(&who),
                                                 )
                                                 .map(|v| v == "on" || v == "true")
                                                 .unwrap_or(false);
-                                                let config_dir = crate::settings::config_dir();
+                                                let config_dir = host.config_dir();
                                                 // The OWNER's public key, which is
                                                 // not the same as holding the
                                                 // owner's signing key.
@@ -5789,7 +5797,7 @@ pub(crate) async fn recv_cmd(
                 // stream acceptor: the first version opened one and both ends
                 // hung after creating their interface.
                 Some("wg-key") => {
-                    let enabled = crate::settings::get_str("wireguard", None)
+                    let enabled = host.settings_get_str("wireguard")
                         .map(|x| x == "on" || x == "true")
                         .unwrap_or(false);
                     if enabled && crate::wg::usable() {
@@ -6200,7 +6208,7 @@ pub(crate) async fn recv_cmd(
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
-                            &crate::settings::config_dir(),
+                            &host.config_dir(),
                             "self",
                             crate::capability::CAP_SHELL,
                             idev,
@@ -6209,7 +6217,7 @@ pub(crate) async fn recv_cmd(
                         );
                         {
                             let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                                &crate::settings::config_dir(),
+                                &host.config_dir(),
                                 "self",
                                 crate::capability::CAP_SHELL,
                                 idev,
@@ -6285,7 +6293,7 @@ pub(crate) async fn recv_cmd(
                     // AND again inside install_authorized_key (defense in depth).
                     if cert_only {
                         let hostkeys = sshkeys::host_pubkeys();
-                        let login = platform::current_username().unwrap_or_else(|| "root".into());
+                        let login = host.serving_user().unwrap_or_else(|| "root".into());
                         let ssh_port = v["ssh_port"]
                             .as_u64()
                             .and_then(|n| u16::try_from(n).ok())
@@ -6324,7 +6332,7 @@ pub(crate) async fn recv_cmd(
                     match sshkeys::install_authorized_key(&device, &pubkey) {
                         Ok(()) => {
                             let hostkeys = sshkeys::host_pubkeys();
-                            let login = platform::current_username().unwrap_or_else(|| "root".into());
+                            let login = host.serving_user().unwrap_or_else(|| "root".into());
                             // Tell the initiator whether an sshd is actually
                             // listening on the port `tunlion shell --ssh` will dial here,
                             // so it can fail fast with a clear message instead of
@@ -6521,7 +6529,7 @@ pub(crate) async fn recv_cmd(
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
-                            &crate::settings::config_dir(),
+                            &host.config_dir(),
                             "self",
                             crate::capability::CAP_MOUNT,
                             idev,
@@ -6541,7 +6549,7 @@ pub(crate) async fn recv_cmd(
                         // = within_share). An auto-trusted fleet mount is served
                         // READ-ONLY; an explicit `mount` grant keeps its rw behavior.
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(),
+                            &host.config_dir(),
                             "self",
                             crate::capability::CAP_MOUNT,
                             idev,
@@ -7124,7 +7132,7 @@ pub(crate) async fn recv_cmd(
                                                                     // overlay_pubkey_bytes()), so a same-owner fleet device (different device_pub,
                                                                     // same user key) is admitted instead of refused. This 0x02 path also binds
                                                                     // receiver_dpub in the possession_msg, so device_pub here is defense-in-depth.
-                                                                    if let Ok(Some(_own_uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+                                                                    if host.user_key().is_some() {
                                                                         if cert.device_pub == own_dpub {
                                                                             // self, refuse
                                                                         } else {
@@ -7145,7 +7153,7 @@ pub(crate) async fn recv_cmd(
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
                     }
-                } else if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+                } else if let Some(uk) = host.user_key() {
                     // Enrollment channel: an ephemeral device is trying to enroll.
                     // Recognize peers on enroll_channel(own_owner_pub) and dial them.
                     let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
@@ -7420,7 +7428,7 @@ pub(crate) async fn recv_cmd(
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
-                            &crate::settings::config_dir(),
+                            &host.config_dir(),
                             "self",
                             crate::capability::CAP_TRANSFER,
                             idev,
@@ -7451,7 +7459,7 @@ pub(crate) async fn recv_cmd(
                         let landing = dir.join(&name);
                         let scoped_in_bounds = crate::path_within(&dir, &landing);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(),
+                            &host.config_dir(),
                             "self",
                             crate::capability::CAP_TRANSFER,
                             idev,
@@ -7725,10 +7733,10 @@ pub(crate) async fn recv_cmd(
                     // the disk is full. Unknown free space (a platform that cannot
                     // say) accepts, and a write that then fails is caught below.
                     let need = size.saturating_sub(offset);
-                    if let Some(free) = platform::free_space(&dir) {
+                    if let Some(free) = host.free_space(&dir) {
                         if free < need {
                             let (token, msg) = crate::recv_files::storage_refusal(
-                                Some(platform::StorageFailure::NoSpace),
+                                Some(StorageFailure::NoSpace),
                                 &name,
                                 "",
                                 Some(need),
@@ -7767,7 +7775,7 @@ pub(crate) async fn recv_cmd(
                                 // Typed refusal, never silence: a decline the sender
                                 // never hears about is a sender that waits forever.
                                 let (token, msg) = crate::recv_files::storage_refusal(
-                                    platform::storage_failure(&e),
+                                    host.storage_failure(&e),
                                     &name,
                                     &e.to_string(),
                                     None,
@@ -7812,7 +7820,7 @@ pub(crate) async fn recv_cmd(
                                 // sender re-offered forever. Say why, to both ends.
                                 crate::recv_files::discard_partial(&part_path);
                                 let (token, msg) = crate::recv_files::storage_refusal(
-                                    platform::storage_failure(&e),
+                                    host.storage_failure(&e),
                                     &name,
                                     &e.to_string(),
                                     None,
@@ -7972,7 +7980,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(wf) = failed {
                         st.verify_fails.remove(&id);
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref());
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref(), host.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -8151,7 +8159,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(wf) = failed {
                         st.verify_fails.remove(&id);
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref());
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref(), host.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -8318,7 +8326,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         st.verify_fails.remove(&inc.id);
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref());
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref(), host.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -9094,9 +9102,10 @@ fn refuse_failed_write(
     from: &str,
     daemon: bool,
     log: &dyn LogSink,
+    host: &dyn HostServices,
 ) -> (String, &'static str, String) {
     let need = inc.size.saturating_sub(inc.received.load(Ordering::Relaxed));
-    let free = platform::free_space(dir);
+    let free = host.free_space(dir);
     let (token, msg) =
         crate::recv_files::storage_refusal(wf.kind, &inc.name, &wf.detail, Some(need), free);
     let from = if from.is_empty() { "the sender" } else { from };
