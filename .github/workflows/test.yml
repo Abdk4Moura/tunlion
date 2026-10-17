@@ -38,6 +38,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Check Unix installer syntax
+        run: sh -n scripts/install.sh
       - name: Run sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Fall back to uncached builds if the cache backend is down

@@ -172,6 +172,176 @@ jobs:
         if: runner.os == 'macOS'
         run: codesign --force --sign - target/release/tunlion
 
+      # Windows installer logic (scripts/install.ps1).
+      #
+      # COVERED HERE:
+      #   - the script parses (PowerShell AST parser)
+      #   - -DryRun resolves the per-user and all-users install dirs and the
+      #     PATH target (User vs Machine)
+      #   - a real per-user install into a temp dir, from a LOCALLY built zip
+      #     with the same SHA-256 verification, leaves tunlion.exe and
+      #     wintun.dll beside each other and adds that dir to the user PATH
+      #
+      # NOT COVERED HERE (a stock runner must not elevate or register services):
+      #   - UAC elevation and the -AllUsers install into %ProgramFiles%
+      #   - `tunlion up --install` autostart/service registration
+      #   - downloading the release zip from GitHub. cli-release.yml owns the
+      #     release asset; -Archive keeps this test independent of which
+      #     release is current.
+      - name: Windows installer (syntax, scopes, per-user install)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $PWD 'scripts/install.ps1'
+
+          function Run-Installer {
+            param([string[]]$InstallerArgs)
+            $out = & pwsh -NoProfile -File $installer @InstallerArgs 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host $out
+              throw "install.ps1 $($InstallerArgs -join ' ') exited $LASTEXITCODE"
+            }
+            return $out
+          }
+
+          # 1. Parse only. A syntax error must fail here, not halfway through
+          #    an install on a user's machine.
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            $installer, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host $_ }
+            throw "install.ps1 has $($errors.Count) parse error(s)"
+          }
+          Write-Host 'install.ps1 parses'
+
+          # 2. Both scopes resolve without writing anything.
+          $tempRoot = Join-Path $env:RUNNER_TEMP ('tunlion-install-test-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+          $userDir = Join-Path $tempRoot 'per-user'
+          $env:TUNLION_INSTALL_DIR = $userDir
+
+          $dryUser = Run-Installer -InstallerArgs @('-DryRun')
+          Write-Host $dryUser
+          if ($dryUser -notmatch [regex]::Escape("install dir: $userDir")) {
+            throw "per-user DryRun did not resolve TUNLION_INSTALL_DIR ($userDir)"
+          }
+          if ($dryUser -notmatch 'PATH target:\s+User') {
+            throw 'per-user DryRun did not name the User PATH target'
+          }
+
+          $dryAll = Run-Installer -InstallerArgs @('-AllUsers', '-DryRun')
+          Write-Host $dryAll
+          $programDir = Join-Path $env:ProgramFiles 'tunlion'
+          if ($dryAll -notmatch [regex]::Escape("install dir: $programDir")) {
+            throw "all-users DryRun did not resolve $programDir"
+          }
+          if ($dryAll -notmatch 'PATH target:\s+Machine') {
+            throw 'all-users DryRun did not name the Machine PATH target'
+          }
+
+          # 3. Build the same shape as the release asset: tunlion.exe plus
+          #    wintun.dll, and a SHA256SUMS the installer verifies.
+          $payload = Join-Path $tempRoot 'payload'
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+          # The CLI may be its own package (cli/target) or, after a workspace
+          # migration, share the root target dir. Accept either so this test
+          # does not depend on the layout.
+          $built = @(
+            (Join-Path $PWD 'cli/target/release/tunlion.exe'),
+            (Join-Path $PWD 'target/release/tunlion.exe')
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $built) { throw 'tunlion.exe not found under cli/target or target' }
+          Copy-Item -LiteralPath $built -Destination $payload
+          # A stand-in DLL: this proves the installer lays both files side by
+          # side. It is never loaded (that needs Administrator).
+          Set-Content -Path (Join-Path $payload 'wintun.dll') -Value 'test stand-in' -Encoding Ascii
+          $asset = 'tunlion-x86_64-pc-windows-msvc.zip'
+          $zip = Join-Path $tempRoot $asset
+          Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset" | Set-Content -Path (Join-Path $tempRoot 'SHA256SUMS') -Encoding Ascii
+
+          # 4. Real per-user install. The installer verifies SHA-256, unblocks
+          #    (a no-op for a locally built archive), copies both files and
+          #    appends the install dir to the USER PATH.
+          $before = [Environment]::GetEnvironmentVariable('Path', 'User')
+          try {
+            Run-Installer -InstallerArgs @('-Archive', $zip) | Write-Host
+            foreach ($f in @('tunlion.exe', 'wintun.dll')) {
+              $p = Join-Path $userDir $f
+              if (-not (Test-Path -LiteralPath $p)) { throw "missing $p after install" }
+            }
+            $tlLauncher = Join-Path $userDir 'tl.cmd'
+            if (-not (Test-Path -LiteralPath $tlLauncher)) {
+              throw "missing tl.cmd shortcut after install"
+            }
+            if ((Get-Content -LiteralPath $tlLauncher -TotalCount 1) -ne '@rem Tunlion tl launcher. Managed by scripts/install.ps1.') {
+              throw 'tl.cmd does not have the Tunlion ownership marker'
+            }
+            $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            if (($userPath -split ';') -notcontains $userDir) {
+              throw "the User PATH does not contain $userDir"
+            }
+            Write-Host "OK: tunlion.exe and wintun.dll are beside each other in $userDir"
+            Write-Host "OK: the tl.cmd shortcut is installed beside tunlion.exe"
+            Write-Host "OK: the User PATH contains $userDir"
+
+            # A pre-existing `tl` command wins. The installer must neither
+            # overwrite that command nor leave its own colliding launcher.
+            $collisionBin = Join-Path $tempRoot 'collision-bin'
+            $collisionDir = Join-Path $tempRoot 'collision-install'
+            New-Item -ItemType Directory -Force -Path $collisionBin | Out-Null
+            $existingTl = Join-Path $collisionBin 'tl.cmd'
+            '@echo off' | Set-Content -LiteralPath $existingTl -Encoding Ascii
+            $savedPath = $env:Path
+            $savedInstallDir = $env:TUNLION_INSTALL_DIR
+            try {
+              $env:Path = "$collisionBin;$savedPath"
+              $env:TUNLION_INSTALL_DIR = $collisionDir
+              $collisionOut = Run-Installer -InstallerArgs @('-Archive', $zip)
+              if ($collisionOut -notmatch "not installing 'tl'") {
+                throw 'installer did not warn about the existing tl command'
+              }
+              if ((Get-Content -LiteralPath $existingTl -Raw) -notmatch '@echo off') {
+                throw 'installer modified a pre-existing tl command'
+              }
+              if (Test-Path -LiteralPath (Join-Path $collisionDir 'tl.cmd')) {
+                throw 'installer created a colliding tl.cmd in the install dir'
+              }
+              Write-Host 'OK: an existing tl command is preserved and the shortcut is skipped'
+            } finally {
+              $env:Path = $savedPath
+              $env:TUNLION_INSTALL_DIR = $savedInstallDir
+            }
+
+            # 5. A tampered archive must be rejected before anything is
+            #    written. This is the one security property the installer owns.
+            $badSums = Join-Path $tempRoot 'SHA256SUMS.bad'
+            '0000000000000000000000000000000000000000000000000000000000000000  ' + $asset |
+              Set-Content -Path $badSums -Encoding Ascii
+            $tamperedDir = Join-Path $tempRoot 'tampered'
+            $env:TUNLION_INSTALL_DIR = $tamperedDir
+            $badOut = & pwsh -NoProfile -File $installer -Archive $zip -Checksums $badSums 2>&1 | Out-String
+            $badCode = $LASTEXITCODE
+            # This non-zero is the expected result. GitHub's pwsh wrapper
+            # propagates a lingering $LASTEXITCODE as the step's exit code, so
+            # clear it before the assertions and the step's own success.
+            $LASTEXITCODE = 0
+            if ($badCode -eq 0) {
+              Write-Host $badOut
+              throw 'the installer accepted a bad SHA-256'
+            }
+            if (Test-Path -LiteralPath (Join-Path $tamperedDir 'tunlion.exe')) {
+              throw 'files were written despite a bad SHA-256'
+            }
+            Write-Host 'OK: a bad SHA-256 is rejected before any file is written'
+          } finally {
+            [Environment]::SetEnvironmentVariable('Path', $before, 'User')
+          }
+
       - name: Run capability harness
         working-directory: cli
         shell: bash
