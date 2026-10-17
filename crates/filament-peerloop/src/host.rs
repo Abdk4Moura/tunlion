@@ -60,12 +60,25 @@ pub trait LogSink: Send + Sync + 'static {
     fn trace(&self, line: &str);
     /// INFO (the default): the normal useful lines.
     fn say(&self, line: &str);
+    /// INFO with the host's repeat folding: one line per distinct text per
+    /// window, the copies counted. Hosts that do not fold just say it.
+    fn say_folded(&self, line: &str) {
+        self.say(line);
+    }
     /// CRITICAL: must-see lines, printed even under `-q`.
     fn critical(&self, line: &str);
     /// Color a span with `tone`, or return it unchanged when color is off.
     fn paint(&self, tone: Tone, s: &str) -> String;
     /// The success glyph (unicode on a capable tty, an ASCII fallback else).
     fn glyph_ok(&self) -> &'static str;
+    /// The failure glyph.
+    fn glyph_err(&self) -> &'static str {
+        "x"
+    }
+    /// The "to" arrow used in flow and route lines.
+    fn glyph_arrow(&self) -> &'static str {
+        "->"
+    }
     /// The warning glyph.
     fn glyph_warn(&self) -> &'static str;
     /// Is `level` at or below the configured verbosity ceiling?

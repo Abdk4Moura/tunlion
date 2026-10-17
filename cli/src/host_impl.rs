@@ -30,6 +30,9 @@ impl LogSink for CliLog {
     fn say(&self, line: &str) {
         crate::ui::say(line);
     }
+    fn say_folded(&self, line: &str) {
+        crate::ui::say_folded(line);
+    }
     fn critical(&self, line: &str) {
         crate::ui::critical(line);
     }
@@ -38,6 +41,12 @@ impl LogSink for CliLog {
     }
     fn glyph_ok(&self) -> &'static str {
         crate::ui::glyph_ok()
+    }
+    fn glyph_err(&self) -> &'static str {
+        crate::ui::glyph_err()
+    }
+    fn glyph_arrow(&self) -> &'static str {
+        crate::ui::glyph_arrow()
     }
     fn glyph_warn(&self) -> &'static str {
         crate::ui::glyph_warn()
