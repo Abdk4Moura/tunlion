@@ -733,6 +733,8 @@ pub(crate) async fn init_experience(
             },
             &crate::up_logs::DaemonOpts::default(),
             Some(inbox.clone()),
+            caps,
+            None,
             relay,
             false,
             None,

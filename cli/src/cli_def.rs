@@ -451,6 +451,14 @@ pub(crate) enum Cmd {
         /// Drop directory (default: `tunlion config dir`, else ~/Tunlion)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Auth key to join with when this machine has no identity yet, then
+        /// serve in the same command. Read from this file (`-` for stdin), or
+        /// from TUNLION_AUTHKEY / TUNLION_INVITE when the flag is absent. The
+        /// key itself is never accepted on the command line: argv lands in
+        /// `ps` output and shell history. With an identity already present the
+        /// flag is ignored.
+        #[arg(long, value_name = "PATH")]
+        authkey_file: Option<PathBuf>,
         /// Serve a shell to ANY paired (proof-verified) device, with no per-device
         /// `grant`: `tunlion shell <this>` (interactive), `tunlion exec <this> -- cmd`
         /// (one command) and `tunlion shell <this> --ssh` (real ssh). Enables the

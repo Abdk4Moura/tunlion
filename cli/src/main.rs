@@ -17,6 +17,7 @@
 
 mod codeentry;
 mod armed;
+mod authkey;
 mod ctl;
 mod subnet_forward;
 mod diag;

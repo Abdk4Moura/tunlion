@@ -67,6 +67,9 @@ impl DaemonOpts {
             install_system: _,
             userspace,
             dir,
+            // Deliberately not forwarded to the daemon: the join happens in
+            // this process, before the daemon is spawned.
+            authkey_file: _,
             shell,
             shell_only,
             shell_program,
@@ -148,6 +151,8 @@ pub(crate) async fn up_cmd(
     mode: UpMode,
     daemon: &DaemonOpts,
     dir: Option<PathBuf>,
+    caps: &crate::UiCapability,
+    authkey_file: Option<PathBuf>,
     relay: bool,
     shell: bool,
     shell_only: Option<String>,
@@ -162,6 +167,26 @@ pub(crate) async fn up_cmd(
         detach,
         install_system: install_system_flag,
     } = mode;
+
+    // TAILSCALE-SHAPED ONBOARDING. `up` with a key is one command: join if this
+    // machine has no identity yet, then serve. The key is read from a file (or
+    // stdin), or from the environment, never from argv. Without a key this is a
+    // no-op and the existing "no identity" refusal below still fires (exit 9).
+    if crate::identity_flow::up_needs_identity().is_some() {
+        if let Some(material) = crate::authkey::from_env_or_file(authkey_file.as_deref())? {
+            crate::identity_flow::join_cmd(
+                caps,
+                server,
+                relay,
+                None,
+                None,
+                None,
+                None,
+                Some(material),
+            )
+            .await?;
+        }
+    }
     let daemon_argv = daemon.daemon_argv();
     // The daemon flags given explicitly (#391's raw `DaemonOpts`, before
     // settings fold in): what `up` compares against a running daemon's report.
