@@ -3,9 +3,11 @@
 //! `Conn` is the orchestration state every command's event loop manipulates. It reaches the host in exactly two ways: it renders lines to
 //! a terminal, and it reads the machine's own facts (settings, devices.json, the
 //! owner key, the rendezvous channel derivation, the relay policy, whether a
-//! link is a proven fleet device, and the capability store the gates read). This
-//! module is the seam: two traits the CLI implements over its real functions,
-//! handed to `Conn` as `Arc<dyn ...>` fields.
+//! link is a proven fleet device, the capability store the gates read, the
+//! consent queue, the capability store writes, the control socket, and the
+//! daemon-status snapshots). This module is the seam: two traits the CLI
+//! implements over its real functions, handed to `Conn` as `Arc<dyn ...>`
+//! fields.
 //!
 //! Why traits rather than the process-global function pointers
 //! `filament-transport::hooks` uses: those hooks are facts about the process
@@ -30,7 +32,11 @@ use filament_cap::capability::{
 };
 use filament_id::{DeviceCert, UserKey};
 use filament_overlay::Identity;
+use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::consent::{PendingRequest, RequestBar};
+use crate::control::Req;
 use crate::mesh::{L3Mode, MeshTunnel};
 
 /// Terminal tone, mirroring `cli::ui::Tone`. The crate carries the WORD (which
@@ -407,6 +413,117 @@ pub trait HostServices: Send + Sync + 'static {
     fn cap_gate_effective(&self, _gate: CapGate<'_>) -> GateDecision {
         GateDecision::Deny { cap_reason: None }
     }
+    /// Every pending consent request this host holds, parsed from its own
+    /// store. A refused action from an identified peer lands here until the
+    /// owner approves or denies it.
+    ///
+    /// An inert host has no consent queue, so it holds none: the loop answers
+    /// "no requests" instead of inventing one.
+    fn requests_load(&self) -> Vec<PendingRequest> {
+        Vec::new()
+    }
+    /// Persist the consent queue, in the host's own format and location.
+    ///
+    /// An inert host has nowhere to write it. This is a no-op rather than an
+    /// error because the caller's only recovery is a retry it cannot make; the
+    /// absent store is already visible as an empty
+    /// [`requests_load`](HostServices::requests_load).
+    fn requests_save(&self, _requests: &[PendingRequest]) {}
+    /// Apply the TTL and the device-store bar to `requests`, setting expired or
+    /// withdrawn statuses and persisting the queue when anything changed.
+    ///
+    /// HOST-BOUND: the bar reads this machine's device store and its
+    /// key-revocation list, and a change is a store write. An inert host has
+    /// neither, so there is nothing to expire and nothing to persist.
+    fn requests_expire(&self, _requests: &mut Vec<PendingRequest>) {}
+    /// Why `peer` cannot be let in by an approval, when it cannot: revoked
+    /// here, forgotten, or past its delegated access. `None` when it is barred
+    /// by nothing.
+    ///
+    /// HOST-BOUND: it reads the device store and the key-revocation list. An
+    /// inert host records no devices, so it answers `None`; an approval it
+    /// cannot act on still fails explicitly at
+    /// [`device_set_cap`](HostServices::device_set_cap).
+    fn request_bar(&self, _peer: &str) -> Option<RequestBar> {
+        None
+    }
+    /// Record a capability grant (`grant == true`) or revoke in this host's
+    /// device store, bounded by `expires` when given.
+    ///
+    /// HOST-BOUND: a store write. A host with no device store REFUSES with a
+    /// reason, so the loop rejects the approval instead of reporting a grant it
+    /// did not record.
+    fn device_set_cap(
+        &self,
+        _name: &str,
+        _capability: &str,
+        _grant: bool,
+        _expires: Option<u64>,
+    ) -> Result<(), String> {
+        Err("this host has no device store to record a grant in".to_string())
+    }
+    /// Issue the owner-signed bounded grant for `device`, returning whether one
+    /// was written. An uncertified device or a host with no owner key writes
+    /// nothing and returns `Ok(false)` in the CLI, which is why the result is
+    /// not merely success.
+    ///
+    /// HOST-BOUND: it signs with this machine's owner key and appends to the
+    /// capability store. A host with neither REFUSES with a reason.
+    fn issue_signed_bounded_grant(
+        &self,
+        _device: &str,
+        _capability: &str,
+        _expires: u64,
+    ) -> Result<bool, String> {
+        Err("this host has no owner-signed grant store".to_string())
+    }
+    /// The local control socket's path, when this host serves one.
+    ///
+    /// HOST-BOUND: the path is derived from the host's config directory (and
+    /// may be shortened for the kernel's socket-path limit). A host that serves
+    /// no control socket answers `None` rather than naming a path it will never
+    /// bind.
+    fn control_sock_path(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Bind this host's control socket and forward each parsed request to `tx`,
+    /// firing `ready` once the listener is accepting.
+    ///
+    /// HOST-BOUND: the library carries no Unix-socket server. A host that does
+    /// not implement it REFUSES, and the daemon refuses to call itself up
+    /// instead of starting a daemon no sibling command can reach.
+    async fn serve_control(
+        &self,
+        _tx: mpsc::UnboundedSender<Req>,
+        _ready: Option<oneshot::Sender<()>>,
+    ) -> Result<(), String> {
+        Err("this host serves no control socket".to_string())
+    }
+    /// The `signaling` object of a daemon status reply: this host's live link
+    /// to its signaling server.
+    ///
+    /// A host with no signaling link has nothing to report, so the inert answer
+    /// is JSON null. That is an explicit "no fact", never a fabricated
+    /// connected state.
+    fn signaling_snapshot(&self) -> Value {
+        Value::Null
+    }
+    /// The `launch` object of a daemon status reply: how this host was started,
+    /// in the effective form the host's own `up` comparison reads.
+    ///
+    /// HOST-BOUND: it reads this machine's environment and settings and names
+    /// this device. A host with no launch posture reports JSON null rather than
+    /// a made-up one.
+    fn launch_report(
+        &self,
+        _server: &str,
+        _dir: &Path,
+        _relay: bool,
+        _shell_user: Option<&str>,
+        _no_proxy_fallback: bool,
+    ) -> Value {
+        Value::Null
+    }
 }
 
 /// One capability gate query, as the peer loop shapes it. A struct rather than
@@ -631,5 +748,35 @@ mod tests {
         assert!(host.remove_mount("/tmp/m").is_err());
         let restored = host.restore_mounts("srv", false).await;
         assert!(restored.is_err());
+    }
+
+    #[tokio::test]
+    async fn nohost_has_no_consent_store_device_store_or_control_socket() {
+        let host = NoHost;
+        // A host with no consent store holds no requests and has nowhere to
+        // persist one: the loop lists none rather than inventing a queue.
+        assert!(host.requests_load().is_empty());
+        host.requests_save(&[]);
+        let mut requests = Vec::new();
+        host.requests_expire(&mut requests);
+        assert!(requests.is_empty());
+        assert_eq!(host.request_bar("alpha"), None);
+        // Device-store writes are refused with a reason, never reported as a
+        // grant that was not recorded.
+        let set = host.device_set_cap("alpha", "shell", true, Some(1));
+        assert!(set.is_err(), "{set:?}");
+        let signed = host.issue_signed_bounded_grant("alpha", "shell", 1);
+        assert!(signed.is_err(), "{signed:?}");
+        // No Unix-socket server and no path it would pretend to bind.
+        assert_eq!(host.control_sock_path(), None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(host.serve_control(tx, None).await.is_err());
+        // A status reply from a host with no signaling link and no launch
+        // posture says so with null, not with a fabricated connected state.
+        assert_eq!(host.signaling_snapshot(), Value::Null);
+        assert_eq!(
+            host.launch_report("s", Path::new("."), false, None, false),
+            Value::Null
+        );
     }
 }

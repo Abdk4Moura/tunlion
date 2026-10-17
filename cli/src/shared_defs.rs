@@ -13,7 +13,6 @@
 use crate::net::Transport;
 use crate::pake_ceremony::Ceremony;
 use crate::recv_files::IncomingFile;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap};
 use std::sync::{Arc, Mutex};
@@ -174,15 +173,10 @@ pub(crate) enum ShellPolicy {
     Only(std::collections::HashSet<String>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PendingRequest {
-    pub(crate) id: u64,
-    pub(crate) peer: String,
-    pub(crate) capability: String,
-    pub(crate) timestamp: u64,
-    pub(crate) status: String, // "pending", "approved", "denied", "expired"
-    pub(crate) granted_at: Option<u64>,
-}
+/// One pending consent request, moved to `filament-peerloop::consent` so the
+/// receive loop can name it without a CLI type. Re-exported here: every stored
+/// field and JSON key is unchanged.
+pub(crate) use filament_peerloop::consent::PendingRequest;
 
 pub(crate) const MAX_PENDING: usize = 100;
 

@@ -17,12 +17,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use filament_cap::capability::{ActionCounts, GateDecision, ShadowCounts};
+use filament_peerloop::consent::{PendingRequest, RequestBar};
 use filament_peerloop::host::{
     CapGate, HostServices, Level, LogSink, PersistedPrincipal, StorageFailure, Tone,
 };
 #[cfg(l3)]
 use filament_peerloop::mesh::MeshTunnel;
 use filament_peerloop::present::{Ask, Presentation, Progress};
+use tokio::sync::{mpsc, oneshot};
 
 /// The terminal `ui` module, as a [`LogSink`].
 pub(crate) struct CliLog;
@@ -266,6 +268,76 @@ impl HostServices for CliHost {
         max_offline: Option<u64>,
     ) -> u64 {
         crate::effective_principal_deadline(cert_expires, not_after, last_seen, max_offline).0
+    }
+    fn requests_load(&self) -> Vec<PendingRequest> {
+        crate::load_requests()
+    }
+    fn requests_save(&self, requests: &[PendingRequest]) {
+        crate::save_requests(requests);
+    }
+    fn requests_expire(&self, requests: &mut Vec<PendingRequest>) {
+        crate::expire_requests(requests);
+    }
+    fn request_bar(&self, peer: &str) -> Option<RequestBar> {
+        crate::request_bar(peer)
+    }
+    fn device_set_cap(
+        &self,
+        name: &str,
+        capability: &str,
+        grant: bool,
+        expires: Option<u64>,
+    ) -> Result<(), String> {
+        crate::device_set_cap(name, capability, grant, expires).map_err(|e| e.to_string())
+    }
+    fn issue_signed_bounded_grant(
+        &self,
+        device: &str,
+        capability: &str,
+        expires: u64,
+    ) -> Result<bool, String> {
+        crate::issue_signed_bounded_grant(device, capability, expires).map_err(|e| e.to_string())
+    }
+    #[cfg(unix)]
+    fn control_sock_path(&self) -> Option<std::path::PathBuf> {
+        Some(crate::ctl::control_sock_path())
+    }
+    #[cfg(not(unix))]
+    fn control_sock_path(&self) -> Option<std::path::PathBuf> {
+        // There is no control socket on this platform, so naming a path that
+        // will never be bound would be a lie.
+        None
+    }
+    #[cfg(unix)]
+    async fn serve_control(
+        &self,
+        tx: mpsc::UnboundedSender<filament_peerloop::control::Req>,
+        ready: Option<oneshot::Sender<()>>,
+    ) -> Result<(), String> {
+        crate::ctl::serve_at(crate::ctl::control_sock_path(), tx, ready)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    async fn serve_control(
+        &self,
+        _tx: mpsc::UnboundedSender<filament_peerloop::control::Req>,
+        _ready: Option<oneshot::Sender<()>>,
+    ) -> Result<(), String> {
+        Err("this platform has no control socket".to_string())
+    }
+    fn signaling_snapshot(&self) -> serde_json::Value {
+        crate::signaling_health::snapshot_json()
+    }
+    fn launch_report(
+        &self,
+        server: &str,
+        dir: &std::path::Path,
+        relay: bool,
+        shell_user: Option<&str>,
+        no_proxy_fallback: bool,
+    ) -> serde_json::Value {
+        crate::up_logs::launch_report(server, dir, relay, shell_user, no_proxy_fallback)
     }
 }
 

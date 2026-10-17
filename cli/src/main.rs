@@ -1382,19 +1382,9 @@ fn expire_requests(requests: &mut Vec<PendingRequest>) {
     }
 }
 
-/// Status of a request withdrawn because its device can no longer be let in.
-pub(crate) const REQUEST_WITHDRAWN: &str = "withdrawn";
-
-/// Why a device can neither file an access request nor have one approved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestBar {
-    /// Revoked here (`devices revoke`), or its key is refused (forgotten).
-    Revoked,
-    /// The invitation that admitted it ended at this time.
-    Expired(u64),
-    /// No record of it any more (`devices forget`).
-    Forgotten,
-}
+// The withdrawn status, the bar vocabulary and the refusal sentence moved to
+// `filament-peerloop::consent`; the receive loop names them without a CLI type.
+pub(crate) use filament_peerloop::consent::{REQUEST_WITHDRAWN, RequestBar};
 
 /// The device store as parsed records, or None when it is absent or
 /// unreadable (no opinion: nothing is withdrawn on a store we cannot read).
@@ -1434,25 +1424,9 @@ pub(crate) fn request_bar(peer: &str) -> Option<RequestBar> {
 }
 
 /// Why `requests approve` refuses a barred device, with the one command that
-/// actually restores its access. Pure.
-pub(crate) fn request_bar_refusal(id: u64, peer: &str, bar: RequestBar) -> String {
-    let w = crate::refusal::word(peer);
-    match bar {
-        RequestBar::Revoked => format!(
-            "request {id} is from '{peer}', which is revoked here; approving cannot let it in. \
-             To restore it, run:  tunlion devices restore {w}"
-        ),
-        RequestBar::Expired(at) => format!(
-            "request {id} is from '{peer}', whose access expired {}; approving cannot extend it. \
-             Only a fresh invitation admits it again:  tunlion add --for {w}",
-            format_approval_expiry(at)
-        ),
-        RequestBar::Forgotten => format!(
-            "request {id} is from '{peer}', which is no longer paired here (forgotten); approving cannot let it in. \
-             Pair it again with `tunlion add`"
-        ),
-    }
-}
+/// actually restores its access. Moved to `filament-peerloop::consent`; the
+/// receive loop prints the same sentence.
+pub(crate) use filament_peerloop::consent::request_bar_refusal;
 
 /// Withdraw every pending request from `peer` (it was revoked or forgotten).
 pub(crate) fn withdraw_requests_for(peer: &str) {
@@ -1559,11 +1533,9 @@ fn pending_request_count(value: Option<&Value>) -> usize {
 }
 
 
-fn format_approval_expiry(expires: u64) -> String {
-    chrono::DateTime::from_timestamp(expires as i64, 0)
-        .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| expires.to_string())
-}
+/// The absolute time an invitation or grant ends. Moved to
+/// `filament-peerloop::consent` and re-exported: the CLI prints the same text.
+pub(crate) use filament_peerloop::consent::format_approval_expiry;
 
 
 

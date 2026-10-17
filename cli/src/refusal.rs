@@ -386,13 +386,9 @@ pub(crate) fn from_frame(v: &Value, reason_key: &str) -> (Option<Code>, Option<S
 }
 
 /// Quote a device name for a copy-pasteable command when it needs it.
-pub(crate) fn word(s: &str) -> String {
-    if s.chars().any(|c| c.is_whitespace() || c == '\'' || c == '"') {
-        format!("'{}'", s.replace('\'', ""))
-    } else {
-        s.to_string()
-    }
-}
+/// A name as one command word. Moved to `filament-peerloop::consent`; every
+/// caller in this module keeps the same rule.
+pub(crate) use filament_peerloop::consent::word;
 
 /// The remedy for a refusal by `peer`: (what to do, the exact command, if any).
 /// The command is always one the CLI accepts (see the parse test below).
