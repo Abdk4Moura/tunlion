@@ -67,6 +67,9 @@ impl DaemonOpts {
             install_system: _,
             userspace,
             dir,
+            // Deliberately not forwarded to the daemon: the join happens in
+            // this process, before the daemon is spawned.
+            authkey_file: _,
             shell,
             shell_only,
             shell_program,
