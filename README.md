@@ -35,6 +35,8 @@ Or a package manager:
 
 Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `tunlion update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[tunlion.autumated.com](https://tunlion.autumated.com)** on both devices.
 
+The curl and PowerShell install scripts also provide `tl` as a short command. If another `tl` command is already on your `PATH`, the script leaves it untouched and tells you to use `tunlion` instead.
+
 ## Send a file
 
 ```sh

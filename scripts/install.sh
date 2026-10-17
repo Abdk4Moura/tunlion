@@ -16,6 +16,27 @@ INSTALL_DIR="${TUNLION_INSTALL_DIR:-$HOME/.local/bin}"
 say() { printf '\033[1mtunlion:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31mtunlion:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# `tl` is a convenience alias, not a globally reserved command. Preserve any
+# existing command found on PATH and only replace our own symlink on upgrades.
+install_tl_alias() {
+  alias_path="$INSTALL_DIR/tl"
+  existing_tl=$(command -v tl 2>/dev/null || true)
+  if [ -n "$existing_tl" ]; then
+    if [ "$existing_tl" = "$alias_path" ] && [ -L "$alias_path" ] && [ "$(readlink "$alias_path")" = "tunlion" ]; then
+      say "the 'tl' shortcut is already installed"
+    else
+      say "not installing 'tl': another command already uses that name ($existing_tl); use 'tunlion' or rename the existing command"
+    fi
+    return
+  fi
+  if [ -e "$alias_path" ] || [ -L "$alias_path" ]; then
+    say "not installing 'tl': leaving existing $alias_path untouched"
+    return
+  fi
+  ln -s tunlion "$alias_path"
+  say "installed the 'tl' shortcut beside tunlion"
+}
+
 # ----------------------------------------------------------- platform detect
 OS=$(uname -s)
 ARCH=$(uname -m)
@@ -86,6 +107,7 @@ tar -xzf "$TMP/$ASSET" -C "$TMP"
 [ -f "$TMP/tunlion" ] || die "archive $ASSET did not contain tunlion"
 install -m 755 "$TMP/tunlion" "$INSTALL_DIR/tunlion"
 say "installed $INSTALL_DIR/tunlion ($("$INSTALL_DIR/tunlion" --version 2>/dev/null || echo "$TAG"))"
+install_tl_alias
 
 # man page (best effort, never fatal)
 if command -v man >/dev/null 2>&1; then
