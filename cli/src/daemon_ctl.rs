@@ -1,31 +1,51 @@
-//! Daemon control-socket and warm-reuse subsystem, lifted out of `main.rs`.
+//! Daemon control-socket handlers that still need the CLI's tunnel and mount code.
 //!
-//! Two related jobs the long-lived `up` daemon does on its control socket:
-//! mount bookkeeping (`DaemonMounts` plus the mount/unmount/list/health
-//! handlers) and warm-link reuse (`warm_link_for` plus the warm
-//! open/pty/resize/bootstrap handlers, which ride a link the daemon already
-//! holds instead of paying for a cold establish).
+//! This file is the CLI half of what used to be one 910-line module (issue #465
+//! slice 3). The crate-owned half now lives in `filament_peerloop::daemon_ctl`:
+//! the reach liveness probes, `sshd_listening`, the warm `Ping`/`ListWarm`
+//! replies, the deferred `Bootstrap` sockets and `log_warm_miss`. They are
+//! re-exported below, so every daemon call site still resolves under
+//! `crate::daemon_ctl::`.
 //!
-//! Every item here already takes its inputs explicitly (`conn: &Conn`,
-//! `req: ctl::Req`, `&mut DaemonMounts`, `&mut PendingBootstraps`), so the move
-//! is a relocation plus the visibility the crate root needs -- no context
-//! struct, no closure capture, no ownership reshaping.
+//! What stayed, and why it stays here rather than being dragged across:
+//!   * `handle_warm_req` and the warm `Open`/`Pty`/`Resize` handlers take
+//!     `l2::Mux` and the verified-stream helpers. `l2` is a 7,000-line tunnel
+//!     implementation that is not in the peer-loop crate and is not host-bound:
+//!     it is the daemon's own stream multiplexer. Moving it is a different
+//!     slice.
+//!   * the mount handlers track sshfs children in `DaemonMounts` and write the
+//!     CLI's persistent mount record (`mount::add_mount`, `unmount_cmd_async`),
+//!     and `handle_mount` also bootstraps over `l2`. The host trait carries the
+//!     restore/query hooks, not the spawn-and-track store, so these handlers
+//!     stay next to the module that owns that store.
 //!
-//! cfg discipline: the `not(unix)`/`unix` halves of `handle_warm_req` and every
-//! `#[cfg(unix)]` item moved together, attributes included.
+//! Everything moved kept its body, its cfg gates and its replies. Only the
+//! naming changed: `ctl::` to the crate's `control::`, `ui::debug` to the
+//! injected `Conn::log`, and `crate::net` to `filament_transport::net`.
+
 use crate::Conn;
 use crate::ctl;
 use crate::l2;
 use crate::mount;
-use crate::net::{self, Ev};
+use crate::net::Ev;
 use crate::ui;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
 
+// The half whose inputs are crate-owned. Re-exported, not redefined.
+pub(crate) use filament_peerloop::daemon_ctl::{
+    liveness_answered, liveness_ping, liveness_pong, liveness_register, liveness_window,
+    sshd_listening,
+};
+#[cfg(unix)]
+pub(crate) use filament_peerloop::daemon_ctl::{
+    PendingBootstraps, complete_warm_bootstrap, handle_list_warm, handle_warm_bootstrap,
+    handle_warm_ping, log_warm_miss, reap_warm_bootstraps,
+};
 pub(crate) type WarmPtys = std::sync::Arc<std::sync::Mutex<HashMap<String, (String, u32)>>>;
 
 pub(crate) struct DaemonMountEntry {
@@ -355,220 +375,6 @@ pub(crate) async fn handle_mount_health(req: ctl::Req, daemon_mounts: &DaemonMou
     }
 }
 
-/// Is something listening on this host's own loopback `port` - i.e. an sshd a
-/// `tunlion shell --ssh` initiator could actually reach? A fast connect probe: a
-/// successful connect means a listener (we close it at once); refused/timeout
-/// means nothing is there. Reported in the shell-bootstrap ack so the initiator
-/// fails fast with a clear message instead of ssh hanging on a dead port.
-pub(crate) async fn sshd_listening(port: u16) -> bool {
-    // Probe localhost first (covers the common case: sshd bound to localhost or
-    // all interfaces). Then also try ::1 for dual-stack daemons that only bind
-    // IPv6 localhost.
-    let addrs: [(&str, std::net::SocketAddr); 2] = [
-        ("127.0.0.1", (std::net::Ipv4Addr::LOCALHOST, port).into()),
-        ("[::1]", (std::net::Ipv6Addr::LOCALHOST, port).into()),
-    ];
-    let rt = tokio::runtime::Handle::current();
-    for (_label, addr) in addrs {
-        let ok = rt
-            .spawn_blocking(move || {
-                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400))
-                    .is_ok()
-            })
-            .await
-            .unwrap_or(false);
-        if ok {
-            return true;
-        }
-    }
-    false
-}
-
-/// Outstanding `reach` liveness probes: nonce -> the waiter. A warm link is
-/// only reported once the PEER answers on it, because a link whose far end
-/// was stopped or killed -9 stays "alive" locally until QUIC's idle timeout
-/// (~22-29 s measured), and reach used to say ok, warm, verified, exit 0 for
-/// that whole window.
-static LIVENESS: std::sync::Mutex<Option<HashMap<u64, tokio::sync::oneshot::Sender<()>>>> =
-    std::sync::Mutex::new(None);
-
-/// The `reach-ping` a daemon sends on a held link; the peer answers with a
-/// `reach-pong` carrying the same `n`. An older peer ignores the unknown type,
-/// so its warm link simply does not confirm and reach falls back to the full
-/// probe, which works with any version.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
-pub(crate) fn liveness_ping(n: u64) -> Value {
-    json!({ "type": "reach-ping", "n": n })
-}
-
-/// The answer to a `reach-ping`, echoing its nonce.
-pub(crate) fn liveness_pong(ping: &Value) -> Value {
-    json!({ "type": "reach-pong", "n": ping["n"].clone() })
-}
-
-/// Register a probe; the receiver resolves when its pong arrives.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
-pub(crate) fn liveness_register() -> (u64, tokio::sync::oneshot::Receiver<()>) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if let Ok(mut m) = LIVENESS.lock() {
-        m.get_or_insert_with(HashMap::new).insert(n, tx);
-    }
-    (n, rx)
-}
-
-/// A `reach-pong` arrived: wake its waiter (an unknown or late nonce is
-/// ignored).
-pub(crate) fn liveness_answered(pong: &Value) {
-    let Some(n) = pong["n"].as_u64() else { return };
-    let tx = LIVENESS.lock().ok().and_then(|mut m| m.as_mut()?.remove(&n));
-    if let Some(tx) = tx {
-        let _ = tx.send(());
-    }
-}
-
-/// Forget a probe that timed out.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
-fn liveness_forget(n: u64) {
-    if let Ok(mut m) = LIVENESS.lock() {
-        if let Some(m) = m.as_mut() {
-            m.remove(&n);
-        }
-    }
-}
-
-/// How long a warm link has to answer `reach-ping` (TUNLION_REACH_PING_MS,
-/// default 1500 ms) before reach treats it as unconfirmed.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
-pub(crate) fn liveness_window() -> Duration {
-    let ms = std::env::var("TUNLION_REACH_PING_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(1500);
-    Duration::from_millis(ms)
-}
-
-/// Answer a `tunlion reach`: report the daemon's warm link to `peer` (route,
-/// remote address, RTT, verified name). Synchronous - every fact is local (quinn
-/// already measured the RTT/addr; the route is the link's own label/ICE state), so
-/// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
-/// miss `reject`s so the client falls back to a cold establish-probe.
-#[cfg(unix)]
-async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
-    let ctl::ReqKind::Ping { peer } = &req.kind else {
-        return;
-    };
-    let peer = peer.clone();
-    let Some((pid, t)) = warm_link_for(conn, &peer) else {
-        req.reject("no warm link").await;
-        return;
-    };
-    // WARM-HOLD: ping succeeded, mark peer as warm (note: we can't call
-    // note_warm_use here because conn is &Conn; the warm-hold tick will
-    // connect to this peer on the next cycle if it drops)
-    let link = conn.link(&pid);
-    let direct = link.map(|l| l.direct).unwrap_or(false);
-    let route = if direct {
-        link.map(|l| l.direct_route.to_string())
-            .unwrap_or_else(|| "direct".into())
-    } else if let Some(p) = link.and_then(|l| l.peer.clone()) {
-        p.route().await.unwrap_or_else(|| "relay".into())
-    } else {
-        "relay".to_string()
-    };
-    // Path detail: name the interface the link's local end sits on, classify the
-    // remote address, and (for webrtc) report the candidate types + whether the
-    // path is relayed. The daemon holds the link AND runs on the same box as the
-    // ping client, so it resolves local-ip -> interface locally; ping.rs just
-    // renders the fields. This is the data that answers "is it the tailnet?"
-    // (e.g. local 100.x on a tailscale0 iface) instead of inferring it.
-    let peer_ref = link.and_then(|l| l.peer.clone());
-    let path = net::describe_path(t.as_ref(), peer_ref.as_deref())
-        .await
-        .to_json();
-    let mut reply = json!({
-        "ok": true,
-        "warm": true,
-        "direct": direct,
-        "route": route,
-        "remote_addr": t.remote_addr().map(|a| a.to_string()),
-        "rtt_ms": t.rtt_ms(),
-        "verified": link.and_then(|l| l.verified_name.clone()),
-        "path": path,
-    });
-    // Confirm the far end is there before saying so: one reach-ping round
-    // trip, bounded. Spawned, so the event loop never waits on the peer (F8).
-    let (n, answered) = liveness_register();
-    let sent = t.send_control(&liveness_ping(n)).await.is_ok();
-    let window = liveness_window();
-    tokio::spawn(async move {
-        let t0 = Instant::now();
-        let ok = sent && matches!(tokio::time::timeout(window, answered).await, Ok(Ok(())));
-        if ok {
-            reply["alive_ms"] = json!(t0.elapsed().as_millis() as u64);
-            req.reply(&reply).await;
-        } else {
-            liveness_forget(n);
-            ui::debug(&format!(
-                "reach: warm link to '{peer}' did not answer a liveness ping in {}ms",
-                window.as_millis()
-            ));
-            req.reject("warm link did not answer").await;
-        }
-    });
-}
-
-/// Return only links the daemon already holds. This is deliberately passive:
-/// devices listing must never establish, ping, or otherwise wake a peer.
-#[cfg(unix)]
-pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
-    let links: Vec<Value> = conn
-        .links
-        .iter()
-        .filter_map(|(pid, link)| {
-            let name = link.verified_name.as_deref()?;
-            let transport = link.transport.as_ref()?;
-            // `devices` renders "online" from this list, so a link is listed
-            // only while its peer is demonstrably there (peer_present): a relay
-            // link to a stopped or wiped peer stays `is_alive()` and kept being
-            // shown "online, last seen just now".
-            if !link.trusted
-                || !peer_present(
-                    transport.is_alive(),
-                    link.direct,
-                    transport.heard_ms(),
-                    transport.idle_ms(),
-                )
-            {
-                return None;
-            }
-            Some(json!({
-                "name": name,
-                "warm": true,
-                "direct": link.direct,
-                "route": if link.direct { link.direct_route } else { "relay" },
-                "remote_addr": transport.remote_addr().map(|a| a.to_string()),
-                "rtt_ms": transport.rtt_ms(),
-                "verified": name,
-                "path": Value::Null,
-                "pid": pid,
-            }))
-        })
-        .collect();
-    req.reply(&json!({ "ok": true, "links": links })).await;
-}
-
 pub(crate) use crate::link_manager::peer_present;
 
 /// Resolve `peer` to a warm, trusted, alive link. Moved to
@@ -576,23 +382,6 @@ pub(crate) use crate::link_manager::peer_present;
 /// crate's transport pair, so the loop can call it without naming the CLI.
 #[cfg(unix)]
 pub(crate) use filament_peerloop::conn::warm_link_for;
-
-/// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
-/// is diagnosable (visible at `-v` / TUNLION_LOG=debug only).
-#[cfg(unix)]
-fn log_warm_miss(conn: &Conn, peer: &str) {
-    for (p, l) in conn.links.iter() {
-        ui::debug(&format!(
-            "warm-miss '{peer}': pid={p} name={:?} verified={:?} trusted={} has_transport={} alive={} direct={}",
-            l.name,
-            l.verified_name,
-            l.trusted,
-            l.transport.is_some(),
-            l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
-            l.direct,
-        ));
-    }
-}
 
 /// DEBUG: every link that names `peer`, and which one the warm path chose, so
 /// a slow warm open on a peer with more than one link is diagnosable.
@@ -795,116 +584,4 @@ async fn handle_warm_resize(
         }
     }
     req.accept().await; // close the client's short connection cleanly
-}
-
-/// Deferred ssh-bootstrap replies, keyed by the peer's link pid. A `Bootstrap`
-/// request can't be answered inline: the daemon sends `shell-bootstrap` over the
-/// warm link and the peer's `shell-bootstrap-ack` arrives LATER via this same
-/// event loop, so blocking here would deadlock. We stash the reply socket (with a
-/// deadline) and complete it from the `shell-bootstrap-ack`/`-deny` control arms,
-/// or reap it on timeout. A `Vec` per pid handles concurrent ssh to one peer (the
-/// ack is identical, so every waiter gets the same answer).
-#[cfg(unix)]
-pub(crate) type PendingBootstraps =
-    HashMap<String, Vec<(tokio::net::UnixStream, std::time::Instant)>>;
-
-/// Warm-reuse the ssh `shell-bootstrap`: install the client's managed `pubkey` on
-/// `peer` over the daemon's EXISTING link instead of a fresh cold establish, the
-/// big win for `tunlion shell --ssh` (pty already rode the warm link; the bootstrap was
-/// the last cold-establish left). Sends `shell-bootstrap` and STASHES the reply
-/// socket; the ack/deny handler completes it. A miss falls the client back to the
-/// cold `shell_bootstrap`.
-#[cfg(unix)]
-pub(crate) async fn handle_warm_bootstrap(
-    conn: &Conn,
-    pending: &mut PendingBootstraps,
-    req: ctl::Req,
-) {
-    let (peer, pubkey, ssh_port) = match &req.kind {
-        ctl::ReqKind::Bootstrap {
-            peer,
-            pubkey,
-            ssh_port,
-        } => (peer.clone(), pubkey.clone(), *ssh_port),
-        _ => return,
-    };
-    let Some((pid, t)) = warm_link_for(conn, &peer) else {
-        log_warm_miss(conn, &peer);
-        req.reject("no warm link to that peer").await;
-        return;
-    };
-    if t.send_control(
-        &json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey, "ssh_port": ssh_port }),
-    )
-    .await
-    .is_err()
-    {
-        req.reject("warm link send failed").await;
-        return;
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(12);
-    pending.entry(pid).or_default().push((req.sock, deadline));
-}
-
-/// Complete every stashed `Bootstrap` waiter for `pid` with `reply`. Called from
-/// the `shell-bootstrap-ack`/`-deny` arms; a no-op if none are pending (e.g. the
-/// peer re-acked, or the waiter was already reaped).
-#[cfg(unix)]
-pub(crate) async fn complete_warm_bootstrap(
-    pending: &mut PendingBootstraps,
-    pid: &str,
-    reply: &Value,
-) {
-    if let Some(waiters) = pending.remove(pid) {
-        for (mut sock, _) in waiters {
-            ctl::send_reply(&mut sock, reply).await;
-        }
-    }
-}
-
-/// Drop expired bootstrap waiters (peer never answered): closing the socket gives
-/// the client an EOF, which it reads as a miss and falls back to the cold path.
-#[cfg(unix)]
-pub(crate) fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
-    if pending.is_empty() {
-        return;
-    }
-    let now = std::time::Instant::now();
-    for waiters in pending.values_mut() {
-        waiters.retain(|(_, deadline)| *deadline > now);
-    }
-    pending.retain(|_, waiters| !waiters.is_empty());
-}
-
-#[cfg(test)]
-mod liveness_tests {
-    use super::*;
-
-    /// A pong echoing the ping's nonce wakes exactly that probe; a stray or
-    /// late pong wakes nothing.
-    #[tokio::test]
-    async fn a_pong_answers_its_own_ping_only() {
-        let (n, rx) = liveness_register();
-        let (m, mut other) = liveness_register();
-        let ping = liveness_ping(n);
-        assert_eq!(ping["type"], json!("reach-ping"));
-        let pong = liveness_pong(&ping);
-        assert_eq!(pong, json!({ "type": "reach-pong", "n": n }));
-        liveness_answered(&pong);
-        assert!(tokio::time::timeout(Duration::from_secs(1), rx).await.is_ok());
-        assert!(other.try_recv().is_err(), "probe {m} must still be waiting");
-        liveness_answered(&json!({ "type": "reach-pong", "n": 999_999_999u64 }));
-        liveness_answered(&json!({ "type": "reach-pong" }));
-        liveness_forget(m);
-        assert!(liveness_window() >= Duration::from_millis(1));
-    }
-
-    /// No answer means no confirmation: the probe times out, it is never
-    /// reported as alive.
-    #[tokio::test]
-    async fn silence_is_not_alive() {
-        let (n, rx) = liveness_register();
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx).await.is_err());
-        liveness_forget(n);
-    }
 }
