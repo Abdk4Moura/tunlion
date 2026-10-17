@@ -72,7 +72,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          BIN="cli/target/${{ matrix.target }}/release/tunlion"
+          BIN="target/${{ matrix.target }}/release/tunlion"
           # Per-chunk/per-frame profiling logging must stay compile-stripped (behind
           # the `debug-logs` feature) and MUST NOT ship in a default release build.
           # If any marker is present, a dev-debug log leaked - fail the release.
@@ -85,10 +85,10 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.target }}" == *musl* ]]; then
-            file "cli/target/${{ matrix.target }}/release/tunlion" | grep -qi "static" || { echo "not static!"; exit 1; }
+            file "target/${{ matrix.target }}/release/tunlion" | grep -qi "static" || { echo "not static!"; exit 1; }
           fi
           mkdir -p out
-          cp "cli/target/${{ matrix.target }}/release/tunlion" out/
+          cp "target/${{ matrix.target }}/release/tunlion" out/
           tar -C out -czf "tunlion-${{ matrix.target }}.tar.gz" tunlion
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -99,7 +99,7 @@ jobs:
           # loads it from its own directory. amd64 build for x86_64-pc-windows-msvc.
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path out | Out-Null
-          Copy-Item "cli/target/${{ matrix.target }}/release/tunlion.exe" out/
+          Copy-Item "target/${{ matrix.target }}/release/tunlion.exe" out/
           # Supply-chain integrity: pin the archive to its known SHA256 before
           # extracting anything, then require a valid WireGuard LLC Authenticode
           # signature on the DLL itself. Either check failing aborts the release.
