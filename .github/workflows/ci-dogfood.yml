@@ -1,0 +1,147 @@
+# Dogfood: run one CI job whose payload and artifacts travel over tunlion.
+#
+# Dispatch only, from scripts/ci-dogfood.sh, which mints a single-use runner
+# invitation, sets it as TUNLION_INVITE, and sends the payload once the device
+# shows up. Nothing here accepts an arbitrary command string: the payload
+# carries a job.json and the steps run exactly its declared `cmd`.
+#
+# Why the checkout is still here: the box has to get a tunlion binary from
+# somewhere, and building it from this repo is the bootstrap. Everything AFTER
+# that (the job payload, the outputs) travels over the mesh, not over GitHub.
+name: ci-dogfood
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_name:
+        description: "Name this box joins as (must match the invitation)"
+        required: true
+      host_name:
+        description: "Owner device to send the bundle back to"
+        required: true
+        default: "dovm"
+      payload_timeout_s:
+        description: "How long to wait for the payload to arrive"
+        required: false
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-dogfood-${{ inputs.runner_name }}
+  cancel-in-progress: true
+
+jobs:
+  job:
+    name: job on ${{ inputs.runner_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `runner` context is not available in a job-level `env:`, only in
+      # steps. Set the two paths the later steps share through GITHUB_ENV.
+      - name: Paths
+        run: |
+          echo "WORK=$RUNNER_TEMP/tunlion-work" >> "$GITHUB_ENV"
+          echo "TUNLION_BIN=$GITHUB_WORKSPACE/cli/target/release/tunlion" >> "$GITHUB_ENV"
+
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: ci-dogfood-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: ci-dogfood-
+
+      - name: Build tunlion (the bootstrap)
+        run: cargo build --release --locked --manifest-path cli/Cargo.toml
+
+      - name: Join the mesh
+        env:
+          INVITE: ${{ secrets.TUNLION_INVITE }}
+          RUNNER_NAME: ${{ inputs.runner_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INVITE:-}" ]; then
+            echo "::error::TUNLION_INVITE is not set; run scripts/ci-dogfood.sh, which mints it"
+            exit 2
+          fi
+          umask 077
+          INV="$RUNNER_TEMP/invitation"
+          printf '%s' "$INVITE" > "$INV"
+          chmod 600 "$INV"
+          "$TUNLION_BIN" join "$INV" --name "$RUNNER_NAME" --json --no-interactive
+          # The daemon receives into WORK and keeps the signaling link up; the
+          # owner can only send once this device is present.
+          "$TUNLION_BIN" up --detach --dir "$WORK" --json --no-interactive
+
+      - name: Wait for the job payload
+        env:
+          DEADLINE: ${{ inputs.payload_timeout_s }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          end=$(( $(date +%s) + DEADLINE ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            f=$(find "$WORK" -maxdepth 2 -type f -name 'payload-*.tar' -print -quit 2>/dev/null || true)
+            if [ -n "${f:-}" ]; then
+              echo "payload: $f"
+              echo "PAYLOAD=$f" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::no payload arrived within ${DEADLINE}s"
+          exit 6
+
+      - name: Run the declared job
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/job"
+          tar -xf "$PAYLOAD" -C "$RUNNER_TEMP/job"
+          cd "$RUNNER_TEMP/job"
+          python3 - <<'PY'
+          import json, subprocess, sys
+          spec = json.load(open("job.json"))
+          print("job:", spec.get("id"), "cmd:", spec.get("cmd"))
+          p = subprocess.run(spec["cmd"], timeout=int(spec.get("timeout_s", 900)))
+          print("exit:", p.returncode)
+          sys.exit(p.returncode)
+          PY
+          test -f out.tar
+
+      - name: Bundle the outputs with their hashes
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/job"
+          sha256sum out.tar > out.sha256
+          # One bundle: the artifact, its hash, and the job's own record.
+          tar -cf bundle.tar out.tar out.sha256 build-info.txt
+          sha256sum bundle.tar
+          echo "BUNDLE=$RUNNER_TEMP/job/bundle.tar" >> "$GITHUB_ENV"
+
+      - name: Send the bundle back over tunlion
+        env:
+          HOST_NAME: ${{ inputs.host_name }}
+        run: |
+          set -euo pipefail
+          "$TUNLION_BIN" send "$BUNDLE" --to "$HOST_NAME" --timeout 600 --json
+          echo "bundle sent to $HOST_NAME"
+
+      - name: Keep it as a workflow artifact too (belt and braces)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-dogfood-${{ inputs.runner_name }}
+          path: ${{ runner.temp }}/job/bundle.tar
+          if-no-files-found: warn
+
+      - name: Leave the mesh
+        if: always()
+        run: |
+          "$TUNLION_BIN" down -y || true
