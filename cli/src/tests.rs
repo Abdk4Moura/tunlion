@@ -2683,10 +2683,20 @@ fn hooks_that_nothing_calls() {
         hooks.len()
     );
 
-    // Call sites live across the cli sources.
+    // Call sites live across the cli sources AND the peer-loop crate the peer
+    // loop moved into (#465 slice 3): `webrtc_relay_only`, `no_defer` and
+    // `fail_adopt` are read by the moved `Conn`, so scanning only cli/src would
+    // report wired hooks as orphans.
     let mut all = String::new();
-    let dir = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
-    let mut stack = vec![std::path::PathBuf::from(dir)];
+    let roots = [
+        format!("{}/src", env!("CARGO_MANIFEST_DIR")),
+        format!(
+            "{}/../crates/filament-peerloop/src",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    ];
+    let mut stack: Vec<std::path::PathBuf> =
+        roots.into_iter().map(std::path::PathBuf::from).collect();
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
