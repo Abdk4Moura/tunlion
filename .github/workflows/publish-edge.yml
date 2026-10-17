@@ -1,0 +1,62 @@
+# Build the CLI once per main change and publish it as an artifact, so a CI box
+# can CONSUME a tunlion binary instead of checking out the repo and building it.
+# That is the difference between a dogfood and a compute farm: the box then needs
+# nothing but a key and a payload.
+#
+# Paths are narrow on purpose: docs-only or frontend-only pushes do not rebuild.
+name: publish-edge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cli/**"
+      - "crates/**"
+      - ".github/workflows/publish-edge.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-edge
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-unknown-linux-musl
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: publish-edge-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: publish-edge-
+
+      - name: Build
+        run: cargo build --release --locked --manifest-path cli/Cargo.toml --target x86_64-unknown-linux-musl
+
+      - name: Stage with a hash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp cli/target/x86_64-unknown-linux-musl/release/tunlion out/tunlion
+          ( cd out && sha256sum tunlion > SHA256SUMS )
+          file out/tunlion
+          cat out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunlion-edge
+          path: out/
+          if-no-files-found: error

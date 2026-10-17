@@ -1,13 +1,13 @@
 # Dogfood: run one CI job whose payload and artifacts travel over tunlion.
 #
-# Dispatch only, from scripts/ci-dogfood.sh, which mints a single-use runner
-# invitation, sets it as TUNLION_INVITE, and sends the payload once the device
-# shows up. Nothing here accepts an arbitrary command string: the payload
-# carries a job.json and the steps run exactly its declared `cmd`.
+# Dispatch only, from scripts/ci-dogfood.sh, which mints a single-use invitation,
+# sets it as TUNLION_INVITE, and sends the payload once the device shows up.
 #
-# Why the checkout is still here: the box has to get a tunlion binary from
-# somewhere, and building it from this repo is the bootstrap. Everything AFTER
-# that (the job payload, the outputs) travels over the mesh, not over GitHub.
+# The box does NOT check out this repo and does NOT build tunlion. It downloads
+# the binary from the last green `publish-edge` run and verifies its sha256, so
+# the only things this job needs are a key and a payload. Nothing here accepts
+# an arbitrary command string: the payload carries job.json and the steps run
+# exactly its declared `cmd`.
 name: ci-dogfood
 
 on:
@@ -27,6 +27,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-dogfood-${{ inputs.runner_name }}
@@ -38,29 +39,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-
-      # The `runner` context is not available in a job-level `env:`, only in
-      # steps. Set the two paths the later steps share through GITHUB_ENV.
-      - name: Paths
+      # No checkout. The binary comes from a published edge build, hash-checked.
+      - name: Fetch the tunlion binary (no repo, no build)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           echo "WORK=$RUNNER_TEMP/tunlion-work" >> "$GITHUB_ENV"
-          echo "TUNLION_BIN=$GITHUB_WORKSPACE/cli/target/release/tunlion" >> "$GITHUB_ENV"
-
-      - name: Toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            cli/target
-          key: ci-dogfood-${{ hashFiles('cli/Cargo.lock') }}
-          restore-keys: ci-dogfood-
-
-      - name: Build tunlion (the bootstrap)
-        run: cargo build --release --locked --manifest-path cli/Cargo.toml
+          api="repos/${GITHUB_REPOSITORY}/actions"
+          run=$(gh api "$api/workflows/publish-edge.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].id')
+          if [ -z "${run:-}" ] || [ "$run" = "null" ]; then
+            echo "::error::no successful publish-edge run on main: dispatch one, or push a cli/crates change"
+            exit 6
+          fi
+          id=$(gh api "$api/runs/${run}/artifacts" --jq '[.artifacts[] | select(.name=="tunlion-edge")][0].id')
+          if [ -z "${id:-}" ] || [ "$id" = "null" ]; then
+            echo "::error::publish-edge run $run has no tunlion-edge artifact"
+            exit 6
+          fi
+          gh api "$api/artifacts/${id}/zip" > "$RUNNER_TEMP/tunlion.zip"
+          mkdir -p "$RUNNER_TEMP/bin"
+          unzip -oq "$RUNNER_TEMP/tunlion.zip" -d "$RUNNER_TEMP/bin"
+          ( cd "$RUNNER_TEMP/bin" && sha256sum -c SHA256SUMS )
+          chmod +x "$RUNNER_TEMP/bin/tunlion"
+          "$RUNNER_TEMP/bin/tunlion" --version
+          echo "TUNLION_BIN=$RUNNER_TEMP/bin/tunlion" >> "$GITHUB_ENV"
 
       - name: Join and serve with one command
         env:

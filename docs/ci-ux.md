@@ -53,10 +53,16 @@ That works today. The rest of this file is what it costs.
 
 `ci-dogfood.yml` is dispatched by `scripts/ci-dogfood.sh`. The owner mints one
 single-use runner invitation, sets it as the `TUNLION_INVITE` secret, dispatches,
-waits for the device to appear, and sends a payload tarball. The box joins, runs
-`up --detach --dir`, waits for the payload, executes `job.json`'s declared
-`cmd`, bundles the outputs with their hashes, and sends one bundle back. The
-owner verifies `sha256sum -c` and prints the build info.
+waits until the device answers (`reach`, not `devices --json`), and sends a
+payload tarball. The box joins, runs `up --detach --dir`, waits for the payload,
+executes `job.json`'s declared `cmd`, bundles the outputs with their hashes, and
+sends one bundle back. The owner verifies `sha256sum -c` and prints the build
+info.
+
+The box no longer checks out this repo or builds tunlion. It downloads the
+binary from the last green `publish-edge` run and verifies its sha256, so the
+only inputs are a key and a payload. `publish-edge.yml` builds once per main
+change under the narrow `cli/**`, `crates/**` paths.
 
 The point is not that a CI box can build; it is that the transport, the admission,
 the execution and the return trip are all tunlion's, and the result is checkable
