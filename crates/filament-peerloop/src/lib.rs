@@ -26,8 +26,14 @@
 //! - presentation (`shown`, `label`, `display_name_of`, `link_kind`, the roster):
 //!   it renders, and rendering is the CLI's.
 //! - anything that reads settings, devices.json, the keystore or a `Paths`.
+//!
+//! `host` is the seam for those last two: it defines the `LogSink` and
+//! `HostServices` traits the peer loop asks through, plus host-free defaults,
+//! so `Conn` can carry an injected sink and host instead of importing the CLI.
+//! Nothing here calls back into the CLI; the CLI implements the traits.
 
 mod adoption;
+pub mod host;
 mod liveness;
 mod petname;
 mod retry;

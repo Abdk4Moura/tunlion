@@ -253,6 +253,10 @@ use recv_files::{
 /// the peer-link record, presence, the resilience/warm-hold bookkeeping, and
 /// the pure decisions over them. `Conn`/`impl Conn` still live here.
 mod conn;
+/// The CLI's implementations of `filament-peerloop`'s host traits, so the
+/// peer-loop state asks the host through injected interfaces rather than
+/// importing its functions. See `crates/filament-peerloop/src/host.rs`.
+mod host_impl;
 pub(crate) use conn::Conn;
 use conn::{AdoptSource, Presence, Rung, owner_pub_for_resources};
 /// These names' last non-test user was the `impl Conn` that moved into `conn.rs`;
@@ -2168,19 +2172,6 @@ impl Drop for TtyGuard {
 fn consent_token() -> &'static str {
     static T: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     T.get_or_init(fresh_secret)
-}
-
-/// C26: one-line colored peer status, static scrollback lines, the CLI's
-/// equivalent of the web UI's amber 'away' tile.
-///   ✓ deft-gibbon                    (connected)
-///   ● deft-gibbon  away, choosing a file
-///   ◌ deft-gibbon  reconnecting...
-fn peer_entry(name: &str, mark: &str, tone: ui::Tone, note: &str) -> String {
-    let mut s = format!("{} {}", ui::paint(tone, mark), ui::paint(ui::Tone::Bold, name));
-    if !note.is_empty() {
-        s.push_str(&format!("  {}", ui::paint(ui::Tone::Dim, note)));
-    }
-    s
 }
 
 fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {

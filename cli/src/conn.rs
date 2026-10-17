@@ -21,26 +21,43 @@
 //! ice_fallback_allowed, stuck_backoff / schedule_retry, the adoption matcher, and
 //! the petname rule. Every call site here and in the command modules is unchanged.
 //!
-//! BACK-EDGES -- what a future peer-loop carve still owes. This module calls
-//! back into `main.rs` for host- or config-bound helpers (see
-//! docs/design-libfilament.md, "the rule for what may leave"):
-//! `devices_load`, `load_owner_key`, `local_device_cert_path`,
-//! `resolve_peer_identity`, `peer_entry`, `is_self_uid`, `rejoin_unwarned`,
-//! `relay_banner`, `relay_forbidden`, and the FLEET/REJOIN constants.
-//! They belong to the CLI until they are injected rather than imported.
-use crate::direct;
+//! BACK-EDGES -- what a future peer-loop carve still owes. The terminal and the
+//! machine's own facts no longer appear here as imports: `Conn` carries
+//! `log: Arc<dyn LogSink>` and `host: Arc<dyn HostServices>` (traits defined in
+//! `filament-peerloop::host`, implemented over the real CLI functions in
+//! `cli/src/host_impl.rs`). Rendering (`ui::…`), config (`settings::get_str`),
+//! devices.json, the owner key, the rendezvous channel, the roster snapshot, the
+//! relay policy and the fleet-presence check all go through those fields now.
+//! Two helpers whose callers live in frozen modules (`recv_cmd`,
+//! `renewal_lifecycle`) are defined in `host_impl` and re-exported here.
+//!
+//! What is still imported, and why (see docs/design-libfilament.md, "the rule
+//! for what may leave"):
+//!   - `crate::resilience` / `crate::link_manager`: PURE policy, no host opinion;
+//!     they leave with `Conn` itself, not behind a trait.
+//!   - `crate::local` / `crate::holepunch`: async network binding (a TCP listener,
+//!     a STUN punch socket); their async surface does not fit a sync trait object.
+//!   - `resolve_peer_identity`: operates on the CLI `Link` type and is called from
+//!     frozen `recv_cmd`; the abstraction waits on the `Link` move.
+//!   - `crate::test_hooks` and the FLEET/REJOIN constants: process/test facts, not
+//!     host services.
 use crate::holepunch;
-use crate::net::{self, Ev, Peer, Transport};
 use crate::resilience;
-use crate::settings;
 use crate::test_hooks;
-use crate::ui;
 use crate::{
     FLEET_LINK_NAME, MAX_ATTEMPTS, REJOIN_WINDOW, STALL_MAX_REPAIRS, VERIFY_PROBE_SID,
-    devices_load, is_self_uid, load_owner_key, local_device_cert_path, peer_entry, rejoin_unwarned,
-    relay_banner, relay_forbidden, resolve_peer_identity,
+    resolve_peer_identity,
 };
-use crate::{fleet, identity};
+use filament_cap::capability::{BindingStrength, PrincipalKind};
+use filament_peerloop::host::{peer_entry, HostServices, Level, LogSink, Tone};
+use filament_transport::direct;
+use filament_transport::net::{self, Ev, Peer, Transport};
+
+/// Host helpers whose callers live in modules this slice may not edit
+/// (`recv_cmd`, `renewal_lifecycle`). They are DEFINED in `host_impl` (they
+/// render to the terminal and read the keystore) and re-exported here so every
+/// `crate::conn::…` call site keeps resolving unchanged.
+pub(crate) use crate::host_impl::{dropped_no_transport, owner_pub_for_resources};
 /// The host-free policy now lives in `filament-peerloop`; this module re-exports
 /// it so the ~200 call sites spread across the command modules stay unchanged.
 pub(crate) use filament_peerloop::{
@@ -190,12 +207,12 @@ pub(crate) struct Link {
     /// Identity cert user_pub (set when identity-expose is verified).
     pub(crate) identity_user_pub: Option<[u8; 32]>,
     /// Binding strength of the identity fields (set alongside them).
-    pub(crate) identity_binding: crate::capability::BindingStrength,
+    pub(crate) identity_binding: BindingStrength,
     /// Identity cert expiry (unix seconds). None = no cert resolved.
     pub(crate) identity_cert_expires: Option<u64>,
     /// Principal kind: OwnerDevice or Delegated { caps }. A Delegated
     /// principal CANNOT exist without its ceiling — the compiler enforces it.
-    pub(crate) principal_kind: crate::capability::PrincipalKind,
+    pub(crate) principal_kind: PrincipalKind,
 }
 
 impl Link {
@@ -242,9 +259,9 @@ impl Link {
     pub(crate) fn admit_fleet(&mut self, owner_pub: [u8; 32], device_pub: [u8; 32], expires: u64) {
         self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
-        self.identity_binding = crate::capability::BindingStrength::Proven;
+        self.identity_binding = BindingStrength::Proven;
         self.identity_cert_expires = Some(expires);
-        self.principal_kind = crate::capability::PrincipalKind::FleetDevice;
+        self.principal_kind = PrincipalKind::FleetDevice;
     }
 
     /// Identity bound by a verified fleet-hello: Proven possession of a cert
@@ -255,9 +272,11 @@ impl Link {
     /// into `trusted`, which also drives transfer auto-accept, vouching and the
     /// blanket `--shell` policy.
     pub(crate) fn fleet_proven(&self) -> bool {
-        crate::shell_gate::fleet_link_proven(
-            &self.principal_kind,
-            self.identity_binding,
+        // The rule lives in the crate (written once, shared with
+        // `shell_gate::fleet_link_proven`); this is only the field extraction.
+        filament_peerloop::host::fleet_link_proven(
+            matches!(&self.principal_kind, PrincipalKind::FleetDevice),
+            self.identity_binding == BindingStrength::Proven,
             self.identity_device_pub.is_some(),
             self.verified_name.is_some(),
         )
@@ -277,9 +296,9 @@ impl Link {
         // is denied shell/mount. This is the delegation grant.
         self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
-        self.identity_binding = crate::capability::BindingStrength::Proven;
+        self.identity_binding = BindingStrength::Proven;
         self.identity_cert_expires = Some(expires);
-        self.principal_kind = crate::capability::PrincipalKind::Delegated { caps };
+        self.principal_kind = PrincipalKind::Delegated { caps };
         // NOTE: deliberately do NOT set self.trusted. binding=Proven satisfies
         // cap_trust_floor under authoritative mode, and the auth-key caps ceiling
         // (auth_key_caps ∩ owner_effective) bounds the principal. Setting trusted
@@ -358,19 +377,6 @@ pub(crate) fn looks_like_session_id(label: &str) -> bool {
         && count(char::is_ascii_lowercase) >= 3
 }
 
-/// A peer's message needs a reply, but its link has no transport attached, so
-/// it is dropped. Say so. The sender cannot tell a dropped message from a slow
-/// one and waits out its own deadline: that is how the join hang looked from
-/// the joiner's side, and one line here would have named it on the owner's.
-/// Since the transports announce a link before reading it (net.rs
-/// `announce_then_read`, direct.rs `UnreadTransport`), this is reachable only
-/// for a link that went away between the frame being queued and handled.
-pub(crate) fn dropped_no_transport(pid: &str, what: &str) {
-    ui::say(&format!(
-        "tunlion: {what} from {pid} dropped: its link has no transport attached, so nothing was sent back"
-    ));
-}
-
 /// Is a dropped link's departure worth a line? Not when another link to a
 /// peer of the same name is still up: that was a stale duplicate, and "alpha
 /// left" beside "ok alpha" is a contradiction on one line. An unnamed link
@@ -379,12 +385,12 @@ pub(crate) fn departure_is_news<'a>(name: &str, remaining: impl IntoIterator<Ite
     name.is_empty() || !remaining.into_iter().any(|n| n == name)
 }
 
-fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
+fn presence_glyph(p: Presence, log: &dyn LogSink) -> (&'static str, Tone, &'static str) {
     match p {
-        Presence::Ready => (ui::glyph_ok(), ui::Tone::Ok, ""),
-        Presence::Away => ("●", ui::Tone::Warn, "away"),
-        Presence::Reconnecting => ("◌", ui::Tone::Warn, "reconnecting..."),
-        Presence::Connecting => ("◌", ui::Tone::Dim, "connecting..."),
+        Presence::Ready => (log.glyph_ok(), Tone::Ok, ""),
+        Presence::Away => ("●", Tone::Warn, "away"),
+        Presence::Reconnecting => ("◌", Tone::Warn, "reconnecting..."),
+        Presence::Connecting => ("◌", Tone::Dim, "connecting..."),
     }
 }
 
@@ -473,8 +479,8 @@ pub(crate) struct RejoinState {
 /// Auto-warm size guard: warm at most this many roster peers (see `warm-max`).
 /// Must stay under MAX_LINKS (16) so warm-all can never starve on-demand,
 /// inbound, or upgrade-probe links of link-table slots.
-fn warm_max() -> usize {
-    settings::get_str("warm-max", None)
+fn warm_max(host: &dyn HostServices) -> usize {
+    host.settings_get_str("warm-max")
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(12)
@@ -717,6 +723,14 @@ pub(crate) struct Conn {
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
     pub(crate) roster_absent: HashMap<String, u8>,
+    /// The injected terminal sink. Every line `Conn` renders goes through this
+    /// instead of `crate::ui`, so the host can be a test capture or a daemon
+    /// journal. See `filament_peerloop::host`.
+    pub(crate) log: Arc<dyn LogSink>,
+    /// The injected host facts. Every settings/devices/keystore/roster/relay
+    /// read goes through this instead of a CLI import, so this state has no
+    /// back-edge into the CLI and can later `git mv` into the crate.
+    pub(crate) host: Arc<dyn HostServices>,
 }
 
 /// The cached ICE config (see `Conn::ice_config`).
@@ -752,29 +766,12 @@ pub(crate) struct StuckRetry {
 /// owner-equivalence, the escalation `adopt_direct` fail-safes against and whose
 /// comment records a REVOKED device delivering a file. `None` keeps the old
 /// default, since it means the link vanished and that is a separate question.
-/// The owner public key that names this machine's resources.
-///
-/// Prefers the local user key (an owner device holds one), and falls back to the
-/// `user_pub` inside this device's own certificate (a joined device does not).
-/// Both are the SAME key: a device certificate is signed by the owner, and
-/// carries the owner's public half. Using only the first is a bug that silently
-/// disables capability resources on every fleet member.
-pub(crate) fn owner_pub_for_resources() -> Option<[u8; 32]> {
-    if let Ok(Some(k)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-        return Some(k.public_key_bytes());
-    }
-    let raw = std::fs::read_to_string(local_device_cert_path()).ok()?;
-    let record: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let cert = crate::identity::DeviceCert::from_json(&record["cert"])?;
-    Some(cert.user_pub)
-}
-
 pub(crate) fn upgrade_principal(
-    carried: &Option<(bool, crate::capability::PrincipalKind)>,
-) -> (bool, crate::capability::PrincipalKind) {
+    carried: &Option<(bool, PrincipalKind)>,
+) -> (bool, PrincipalKind) {
     match carried {
         Some((trusted, kind)) => (*trusted, kind.clone()),
-        None => (true, crate::capability::PrincipalKind::OwnerDevice),
+        None => (true, PrincipalKind::OwnerDevice),
     }
 }
 
@@ -853,6 +850,8 @@ impl Conn {
             stuck_retry: HashMap::new(),
             ice_cache: SharedIceCache::default(),
             roster_absent: HashMap::new(),
+            log: crate::host_impl::cli_log(),
+            host: crate::host_impl::cli_host(),
         }
     }
 
@@ -901,11 +900,10 @@ impl Conn {
     /// silently here; the next tick re-tries because `roster_pushed` still holds
     /// the old mark, so a lost push is not a fact we swallow.
     pub(crate) async fn roster_maintenance(&mut self) {
-        let Some(owner) = load_owner_key() else {
+        let Some(blob_json) = self.host.roster_snapshot_json() else {
             return;
         };
-        let now = identity::now_secs();
-        let Ok((blob, _changed)) = crate::roster::mint_roster(&owner, now) else {
+        let Ok(blob) = serde_json::from_str::<Value>(&blob_json) else {
             return;
         };
         let epoch = blob["epoch"].as_u64().unwrap_or(0);
@@ -937,9 +935,9 @@ impl Conn {
             // A failed push is a fact worth surfacing: a spoke that missed it
             // stays stale until the next successful push. Re-tried next tick.
             let missed = live.len() - pushed_to.len();
-            ui::say(&format!(
+            self.log.say(&format!(
                 "  {} roster push did not reach {missed} device(s); will retry",
-                ui::paint(ui::Tone::Warn, ui::glyph_warn())
+                self.log.paint(Tone::Warn, self.log.glyph_warn())
             ));
         }
         self.roster_pushed = Some((epoch, until, pushed_to));
@@ -1064,7 +1062,7 @@ impl Conn {
         // between two processes of one machine (loopback self-send is the
         // first thing every new user tries).
         self.roster.insert(peer_id.clone(), v.clone());
-        ui::debug(&format!(
+        self.log.debug(&format!(
             "tunlion: ADOPT peer={peer_id} source={source:?} want_active={want_active}"
         ));
 
@@ -1082,10 +1080,10 @@ impl Conn {
             if self.link_flowing(&old_sid) {
                 // Observable so a gate can assert the keep happened (true
                 // positive), not merely that no supersede line appeared.
-                ui::debug(&format!("{name} reconnected, keeping active link"));
+                self.log.debug(&format!("{name} reconnected, keeping active link"));
                 return Ok(self.is_active(&old_sid));
             }
-            ui::debug(&format!("{name} reconnected, superseding old link"));
+            self.log.debug(&format!("{name} reconnected, superseding old link"));
             let was_active = self.is_active(&old_sid);
             let secret = self
                 .links
@@ -1127,7 +1125,7 @@ impl Conn {
             .as_ref()
             .is_none_or(|binding| active_binding_matches(binding, &peer_id, peer_uid.as_deref()));
         if want_active && !binding_allows {
-            ui::debug("tunlion: ADOPT refused: peer is not the authenticated code sender");
+            self.log.debug("tunlion: ADOPT refused: peer is not the authenticated code sender");
         }
         if want_active
             && binding_allows
@@ -1249,7 +1247,7 @@ impl Conn {
     /// from the call sites the way a manual audit does.
     #[track_caller]
     pub(crate) fn drop_link(&mut self, pid: &str) {
-        ui::debug(&format!(
+        self.log.debug(&format!(
             "  drop_link({pid}) ordered by {}",
             std::panic::Location::caller()
         ));
@@ -1329,7 +1327,7 @@ impl Conn {
     /// Load configured warm-peers from settings. Called at daemon startup and
     /// at the top of each warm_hold_tick to stay in sync with runtime changes.
     pub(crate) fn load_warm_peers_config(&mut self) {
-        if let Some(setting) = settings::get_str("warm-peers", None) {
+        if let Some(setting) = self.host.settings_get_str("warm-peers") {
             self.warm_hold.configured.clear();
             for p in setting.split(',') {
                 let p = p.trim().to_string();
@@ -1361,12 +1359,12 @@ impl Conn {
     pub(crate) async fn warm_hold_tick(&mut self, auto_warm: bool) -> Vec<String> {
         // Reload configured peers from settings to stay in sync
         self.load_warm_peers_config();
-        let devices = devices_load();
+        let devices = self.host.devices_load();
         if auto_warm {
             let mut online: Vec<(String, Option<Instant>)> = devices
                 .iter()
                 .filter(|(name, secret)| {
-                    let channel = crate::channel_of(secret);
+                    let channel = self.host.channel_of(secret);
                     self.roster
                         .values()
                         .any(|v| v["channel"].as_str() == Some(channel.as_str()))
@@ -1378,7 +1376,7 @@ impl Conn {
                 .collect();
             // Change 4 size guard: over warm-max, keep the most recently USED peers
             // warm (never-used peers rank last; name tie-break keeps it deterministic).
-            let cap = warm_max();
+            let cap = warm_max(&*self.host);
             if online.len() > cap {
                 online.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 online.truncate(cap);
@@ -1388,14 +1386,14 @@ impl Conn {
             for name in &current {
                 if !self.warm_hold.auto.contains(name) {
                     self.warm_hold.auto.insert(name.clone());
-                    ui::debug(&format!("warm-hold: auto-warming peer '{name}'"));
+                    self.log.debug(&format!("warm-hold: auto-warming peer '{name}'"));
                 }
             }
             // Drop peers that went offline (or fell over the warm-max recency cut)
             self.warm_hold.auto.retain(|name| current.contains(name));
         } else {
             if !self.warm_hold.auto.is_empty() {
-                ui::debug("warm-hold: auto-warm off, clearing auto tier");
+                self.log.debug("warm-hold: auto-warm off, clearing auto tier");
                 self.warm_hold.auto.clear();
             }
         }
@@ -1406,7 +1404,7 @@ impl Conn {
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(&peer))
                 .cloned();
-            let channel = device.as_ref().map(|(_, s)| crate::channel_of(s));
+            let channel = device.as_ref().map(|(_, s)| self.host.channel_of(s));
             let decision = {
                 let links: Vec<WarmLinkView<'_>> = self
                     .links
@@ -1437,18 +1435,18 @@ impl Conn {
             };
             let pid = match decision {
                 WarmDecision::Skip { pid } => {
-                    ui::debug(&format!(
+                    self.log.debug(&format!(
                         "warm-hold: skip '{peer}' (link {pid} to it is live)"
                     ));
                     continue;
                 }
                 WarmDecision::Absent => {
-                    ui::trace(&format!("warm-hold: '{peer}' is not present, nothing to dial"));
+                    self.log.trace(&format!("warm-hold: '{peer}' is not present, nothing to dial"));
                     continue;
                 }
                 WarmDecision::Establish { pid } => pid,
             };
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "warm-hold: will establish '{peer}' via {pid} (no live link to it)"
             ));
             // Honor per-peer backoff; a dormant peer still gets one probe per
@@ -1476,12 +1474,12 @@ impl Conn {
             match result {
                 Ok(()) => {
                     self.warm_hold.note_success(&peer);
-                    ui::debug(&format!("warm-hold: established connection to '{peer}'"));
+                    self.log.debug(&format!("warm-hold: established connection to '{peer}'"));
                     connected.push(peer);
                 }
                 Err(e) => {
                     self.warm_hold.note_failure(&peer);
-                    ui::debug(&format!("warm-hold: failed to connect to '{peer}': {e}"));
+                    self.log.debug(&format!("warm-hold: failed to connect to '{peer}': {e}"));
                 }
             }
         }
@@ -1506,7 +1504,7 @@ impl Conn {
         }
         let removed = self.roster.remove(pid).is_some();
         if removed {
-            ui::debug(&format!("roster: forgot {pid} (known-peer-left)"));
+            self.log.debug(&format!("roster: forgot {pid} (known-peer-left)"));
         }
         removed
     }
@@ -1543,7 +1541,7 @@ impl Conn {
         for pid in &gone {
             self.roster.remove(pid);
             self.roster_absent.remove(pid);
-            ui::debug(&format!("roster: forgot {pid} (absent from two digests)"));
+            self.log.debug(&format!("roster: forgot {pid} (absent from two digests)"));
         }
         let roster = &self.roster;
         self.roster_absent.retain(|pid, _| roster.contains_key(pid));
@@ -1631,7 +1629,7 @@ impl Conn {
         // relay is the exception: without TURN it cannot work, so say why.
         if ice_fallback_allowed(self.relay_only) {
             if let Err(e) = &got {
-                ui::debug(&format!("{e:#}; continuing with STUN only, TURN when the config arrives"));
+                self.log.debug(&format!("{e:#}; continuing with STUN only, TURN when the config arrives"));
             }
             self.refresh_ice_config_off_loop();
             return Ok(stun_only_ice_config());
@@ -1692,7 +1690,7 @@ impl Conn {
         // request is already satisfied. Only the stuck-attempt rebuild may
         // replace a link that still counts as live (see `reestablish_stuck`).
         if replace == Replace::NeverLive && self.has_live_transport(&peer_id) {
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "tunlion: ESTABLISH-REFUSED peer={peer_id} caller={caller}: \
                  keeping its live link ({})",
                 self.link_kind(&peer_id)
@@ -1764,7 +1762,7 @@ impl Conn {
         // connect, honestly, by the user's own choice, instead of silently using
         // a middleman. (The ICE policy is left as-is: a relay-only policy with no
         // relay servers has no candidates and fails cleanly, which is the point.)
-        if relay_forbidden() {
+        if self.host.relay_forbidden() {
             cfg.ice_servers.retain(|s| net::is_stun_only(s));
         }
         // Bounded: building the peer connection is local work, but it is
@@ -1794,7 +1792,7 @@ impl Conn {
         // merely Disconnected can come back to Connected meanwhile. Same rule
         // as the guard at the top, applied at the moment of the drop.
         if replace == Replace::NeverLive && self.has_live_transport(&peer_id) {
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "tunlion: ESTABLISH-REFUSED peer={peer_id} caller={caller}: \
                  its link came back while building, keeping it ({})",
                 self.link_kind(&peer_id)
@@ -1828,12 +1826,12 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
-                identity_binding: crate::capability::BindingStrength::None,
+                identity_binding: BindingStrength::None,
                 identity_cert_expires: None,
-                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
+                principal_kind: PrincipalKind::OwnerDevice,
             },
         );
-        ui::debug(&format!(
+        self.log.debug(&format!(
             "tunlion: ESTABLISH peer={peer_id} caller={caller}"
         ));
         Ok(())
@@ -1956,7 +1954,7 @@ impl Conn {
             if !self.links.contains_key(pid) {
                 let info = json!({ "id": pid, "name": name });
                 if let Err(e) = self.establish_as(info, None).await {
-                    ui::debug(&format!("  re-establish for {pid} failed: {e}"));
+                    self.log.debug(&format!("  re-establish for {pid} failed: {e}"));
                 }
             }
             return;
@@ -2032,7 +2030,7 @@ impl Conn {
 
         // Check if target is same-machine peer (local transport).
         let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str());
-        let is_local = LOCAL_TCP_TRANSPORT && is_self_uid(&self.my_uid, peer_uid);
+        let is_local = LOCAL_TCP_TRANSPORT && self.host.is_self_uid(&self.my_uid, peer_uid);
 
         let (ep, port) = if is_local {
             // For local peers, we don't need a QUIC endpoint.
@@ -2051,7 +2049,7 @@ impl Conn {
                     // Keep the existing WebRTC link: direct_pending is not
                     // registered yet, so the fallback reaper has nothing to
                     // expire. The caller must retain a working path on failure.
-                    ui::debug(&format!(
+                    self.log.debug(&format!(
                         "tunlion: direct disabled (endpoint bind failed: {e}); WebRTC retained"
                     ));
                     return;
@@ -2113,7 +2111,7 @@ impl Conn {
         // The meeting place this dial is for. A daemon that has since FORGOTTEN
         // the secret behind it can then answer "not recognized" at once instead
         // of buffering an offer it can never match (recv_cmd, forgotten_channels).
-        offer["ch"] = json!(crate::channel_of(secret));
+        offer["ch"] = json!(self.host.channel_of(secret));
         if let Some(s) = my_srflx {
             offer["srflx"] = json!(s.to_string());
         }
@@ -2149,7 +2147,7 @@ impl Conn {
             .emit("signal", json!({ "to": pid, "data": offer.clone() }))
             .await;
         // TRACE, direct-offer / signaling detail.
-        ui::trace(&format!(
+        self.log.trace(&format!(
             "tunlion: {} sent to {name} ({pid}), port {} srflx {}",
             if probe {
                 "UPGRADE-PROBE-OFFER"
@@ -2223,7 +2221,7 @@ impl Conn {
         // Bug 2: replay any transport-offers that were buffered while we had
         // no DirectPending (the sender re-dialed after a mid-transfer death).
         if let Some((cands, srflx, server_public, proto)) = self.buffered_offers.remove(pid) {
-            ui::debug(&format!("replaying buffered transport-offer from {pid}"));
+            self.log.debug(&format!("replaying buffered transport-offer from {pid}"));
             self.on_transport_offer(pid, cands, srflx, server_public, proto);
         }
     }
@@ -2295,7 +2293,7 @@ impl Conn {
         // protocol and the direct link still forms). A refusal without a
         // sentence is just a support mystery; this is the sentence.
         if peer_proto < 2 {
-            crate::ui::say(&format!(
+            self.log.say(&format!(
                 "peer {peer_name} is running an older build without the direct address exchange; link still works, address supersession skipped"
             ));
         }
@@ -2335,6 +2333,9 @@ impl Conn {
                 Ev::DirectReady(pid, t, route)
             }
         };
+        // The race runs off the event loop, so it carries its own handle to the
+        // log sink rather than borrowing `self`.
+        let log = self.log.clone();
         tokio::spawn(async move {
             // Check for TCP localhost candidate (same-machine peer).
             for cand in &peer_cands {
@@ -2342,14 +2343,14 @@ impl Conn {
                     if v["type"] == "tcp-localhost" {
                         if let Some(port) = v["port"].as_u64() {
                             let addr = format!("127.0.0.1:{port}");
-                            ui::trace(&format!("tunlion: trying TCP localhost to {addr}"));
+                            log.trace(&format!("tunlion: trying TCP localhost to {addr}"));
                             match crate::local::LocalTransport::connect(&addr).await {
                                 Ok(t) => {
                                     let _ = tx.send(mk(pid_s, Arc::new(t), "local-tcp"));
                                     return;
                                 }
                                 Err(e) => {
-                                    ui::trace(&format!("tunlion: TCP localhost failed: {e}"));
+                                    log.trace(&format!("tunlion: TCP localhost failed: {e}"));
                                 }
                             }
                         }
@@ -2384,7 +2385,7 @@ impl Conn {
             if holepunch::holepunch_enabled() {
                 if let (Some(sock), Some(peer_srflx)) = (punch_sock, peer_srflx_addr) {
                     // TRACE, direct/hole-punch detail.
-                    ui::trace(&format!(
+                    log.trace(&format!(
                         "tunlion: rung-1 failed, attempting hole-punch to {peer_srflx}"
                     ));
                     if let Some(t) = holepunch::connect(
@@ -2422,7 +2423,7 @@ impl Conn {
     /// (`relay_committed` + a live link) and only when the prober is enabled and
     /// relay isn't forbidden, otherwise the probe offer is ignored.
     pub(crate) async fn answer_upgrade_probe(&mut self, pid: &str) {
-        if !net::upgrade_prober_enabled() || relay_forbidden() {
+        if !net::upgrade_prober_enabled() || self.host.relay_forbidden() {
             return;
         }
         if !self.resil.relay_committed.contains(pid) || !self.links.contains_key(pid) {
@@ -2466,10 +2467,10 @@ impl Conn {
                     .and_then(|v| v["name"].as_str().map(str::to_string))
                     .unwrap_or_default();
                 let paired = !claimed.is_empty()
-                    && devices_load()
+                    && self.host.devices_load()
                         .iter()
                         .any(|(n, _)| n.eq_ignore_ascii_case(&claimed));
-                fleet::rv().is_some() && !paired
+                self.host.fleet_rv_present() && !paired
             }
         };
         // A code-path promotion is authenticated by the one-time ceremony
@@ -2560,12 +2561,12 @@ impl Conn {
                     established_at: Some(Instant::now()),
                     identity_device_pub: None,
                     identity_user_pub: None,
-                    identity_binding: crate::capability::BindingStrength::None,
+                    identity_binding: BindingStrength::None,
                     identity_cert_expires: None,
                     principal_kind: if fleet {
-                        crate::capability::PrincipalKind::Delegated { caps: Vec::new() }
+                        PrincipalKind::Delegated { caps: Vec::new() }
                     } else {
-                        crate::capability::PrincipalKind::OwnerDevice
+                        PrincipalKind::OwnerDevice
                     },
                 },
             );
@@ -2697,7 +2698,7 @@ impl Conn {
         for pid in expired_probes {
             self.direct_pending.remove(&pid);
             // DEBUG, resilience internal (upgrade probe found no path).
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "tunlion: UPGRADE-PROBE for {pid} found no direct path in budget, staying on relay"
             ));
             self.mark_probe_failed(&pid);
@@ -2732,12 +2733,12 @@ impl Conn {
                     .as_ref()
                     .filter(|_| p.server_public_dialed.load(Ordering::Relaxed));
                 match attributed {
-                    Some(sp) => crate::ui::say(&format!(
+                    Some(sp) => self.log.say(&format!(
                         "falling back to relay: the public address from the server ({sp}) never answered"
                     )),
                     None => {
                         // DEBUG, resilience internal (direct→WebRTC fallback).
-                        ui::debug(&format!(
+                        self.log.debug(&format!(
                             "tunlion: DIRECT-FALLBACK for {}, no authenticated QUIC in budget, using WebRTC",
                             p.secret.0
                         ))
@@ -2806,8 +2807,8 @@ impl Conn {
         // hangs to RC=124 under the churn hook; fix (toggle unset) exits cleanly.
         if self.recv_done && !test_hooks::disable_modeb_drop() {
             let was_active = self.is_active(pid);
-            ui::debug(&ui::paint(
-                ui::Tone::Dim,
+            self.log.debug(&self.log.paint(
+                Tone::Dim,
                 &format!(
                     "dropping peer (connection {why} after completion, nothing left to fetch)"
                 ),
@@ -2818,11 +2819,11 @@ impl Conn {
         let attempts = l.attempts + 1;
         if attempts >= MAX_ATTEMPTS {
             let was_active = self.is_active(pid);
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "tunlion: STALL-LADDER-EXHAUSTED peer={pid} attempts={attempts} reason={why}"
             ));
-            ui::debug(&ui::paint(
-                ui::Tone::Dim,
+            self.log.debug(&self.log.paint(
+                Tone::Dim,
                 &format!("dropping peer (connection {why} after {attempts} attempts)"),
             ));
             self.suppressed_digest_adoptions.insert(pid.to_string());
@@ -2830,7 +2831,7 @@ impl Conn {
             return Ok(was_active);
         }
         // DEBUG, resilience internal (link retry).
-        ui::debug(&format!(
+        self.log.debug(&format!(
             "connection {why}, retrying ({}/{})",
             attempts + 1,
             MAX_ATTEMPTS
@@ -2889,7 +2890,7 @@ impl Conn {
         };
         let was_active = self.is_active(pid);
         if let Err(e) = self.reestablish_stuck(info).await {
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "connection retry for {pid} failed to build: {e}; counting it as an attempt"
             ));
             if let Some(l) = self.links.get_mut(pid) {
@@ -3180,7 +3181,7 @@ impl Conn {
         //     relay can't re-fire instant cutover every tick; the second stall on
         //     the relay path falls through to the bounded relay-stalled honesty.
         let warm_eligible = self.resil.warm_standby
-            && !relay_forbidden()
+            && !self.host.relay_forbidden()
             && !self.relay_only
             && !self.resil.warm_cutover.contains(pid);
         // The ladder DECISION (which rung) is pure and lives in resilience.rs; this
@@ -3189,7 +3190,7 @@ impl Conn {
             attempt,
             STALL_MAX_REPAIRS,
             warm_eligible,
-            relay_forbidden(),
+            self.host.relay_forbidden(),
             self.relay_only,
         ) {
             resilience::StallAction::WarmCutover => {
@@ -3197,8 +3198,8 @@ impl Conn {
                 // to the pre-designated warm relay standby instead of grinding the
                 // slow direct-repair rungs (intolerable for an interactive session).
                 // DEBUG, resilience internal; visible at -v / TUNLION_LOG=debug.
-                ui::debug(&ui::paint(
-                    ui::Tone::Warn,
+                self.log.debug(&self.log.paint(
+                    Tone::Warn,
                     "  transfer stalled, cutting over to the warm relay standby (instant failover)",
                 ));
                 self.resil.warm_cutover.insert(pid.to_string());
@@ -3215,8 +3216,8 @@ impl Conn {
                 // Rung (a): cheapest, re-issue on the same transport. The caller
                 // owns `outgoing` and does the actual re-offer; we just classify.
                 // DEBUG, resilience internal (rung (a) resume on the same link).
-                ui::debug(&ui::paint(
-                    ui::Tone::Warn,
+                self.log.debug(&self.log.paint(
+                    Tone::Warn,
                     "  transfer stalled, resuming on the same link",
                 ));
                 Rung::Resume
@@ -3224,8 +3225,8 @@ impl Conn {
             resilience::StallAction::ExhaustedRelayForbidden => {
                 // The hard direct-only promise: never silently fall to a relay.
                 // CRITICAL, a clean fatal path-decision the user must see (-q too).
-                ui::critical(&ui::paint(
-                    ui::Tone::Warn,
+                self.log.critical(&self.log.paint(
+                    Tone::Warn,
                     "  couldn't establish a direct path; relay disabled (--no-relay), \
                     partial kept on disk. Re-run to resume, or drop --no-relay to \
                      allow relay fallback.",
@@ -3236,8 +3237,8 @@ impl Conn {
                 // We already re-established over relay and it ALSO stalled: no harder
                 // rung. Stop honestly with the partial preserved.
                 // CRITICAL, a terminal honesty line the user must see (-q too).
-                ui::critical(&ui::paint(
-                    ui::Tone::Warn,
+                self.log.critical(&self.log.paint(
+                    Tone::Warn,
                     "  transfer still stalled on the relay route, partial kept on disk. \
                      Re-run to resume.",
                 ));
@@ -3247,8 +3248,8 @@ impl Conn {
                 // Rung (d): re-establish over the TURN relay, preserving the on-disk
                 // partial (C7 resume). Bounded: one escalation per episode.
                 // CRITICAL, P1's value-prop: the never-flaky promise kicking in.
-                ui::critical(&ui::paint(
-                    ui::Tone::Warn,
+                self.log.critical(&self.log.paint(
+                    Tone::Warn,
                     "  direct paths exhausted, falling back to the TURN relay",
                 ));
                 if let Some(st) = self.resil.stall_repairs.get_mut(pid) {
@@ -3260,8 +3261,8 @@ impl Conn {
             resilience::StallAction::Repair => {
                 // Rung (c): repair the transport IN PLACE under the live session.
                 // DEBUG, resilience internal (in-place repair).
-                ui::debug(&ui::paint(
-                    ui::Tone::Warn,
+                self.log.debug(&self.log.paint(
+                    Tone::Warn,
                     &format!(
                         "  transfer stalled, repairing the link in place (attempt {}/{})",
                         attempt, STALL_MAX_REPAIRS
@@ -3307,7 +3308,7 @@ impl Conn {
                 // This IS the fallback: swallowing its failure is how a lost
                 // direct race became a transfer with no link and no diagnostic.
                 if let Err(e) = self.establish_as(info, None).await {
-                    ui::debug(&format!("  WebRTC fallback for {pid} failed: {e}"));
+                    self.log.debug(&format!("  WebRTC fallback for {pid} failed: {e}"));
                 }
                 if was_active {
                     self.active = Some(pid.to_string());
@@ -3358,7 +3359,7 @@ impl Conn {
         // pair-proof still binds to the same device (set after establish creates
         // the Link below).
         if let Err(e) = self.establish_as(info, None).await {
-            ui::debug(&format!("  relay-only re-establish for {pid} failed: {e}"));
+            self.log.debug(&format!("  relay-only re-establish for {pid} failed: {e}"));
         }
         if let (Some(l), Some(ks)) = (self.links.get_mut(pid), known) {
             l.expected_secret = Some(ks);
@@ -3368,7 +3369,7 @@ impl Conn {
         }
         // Honest, loud: the user must know this session is now on a relay.
         // CRITICAL, the value-prop path label; shown even under -q.
-        ui::critical(&format!("  {}", relay_banner()));
+        self.log.critical(&format!("  {}", self.host.relay_banner()));
         // P5 (GAP-6): ARM the relay->direct upgrade prober for this peer. Relay is
         // a way-station, not a destination: while we serve on relay we keep probing
         // for a direct path and upgrade back the moment one is confirmed stable.
@@ -3381,8 +3382,8 @@ impl Conn {
                 .upgrade_probe
                 .entry(pid.to_string())
                 .or_insert_with(UpgradeProbe::armed);
-            ui::say(&ui::paint(
-                ui::Tone::Dim,
+            self.log.say(&self.log.paint(
+                Tone::Dim,
                 "  on relay, will keep trying for a direct path and upgrade automatically",
             ));
         }
@@ -3394,7 +3395,7 @@ impl Conn {
     /// interactive via `TUNLION_WARM_STANDBY=1`). Gated off by the kill switch
     /// and by `--no-relay` (which never reaches relay anyway).
     fn upgrade_eligible(&self) -> bool {
-        self.resil.warm_standby && net::upgrade_prober_enabled() && !relay_forbidden()
+        self.resil.warm_standby && net::upgrade_prober_enabled() && !self.host.relay_forbidden()
     }
 
     /// P5 (GAP-6): a portable network-change-ish event fired (a signaling
@@ -3402,7 +3403,7 @@ impl Conn {
     /// (reset its backoff to fire now), unless it's already mid-verify on a standby.
     /// Cheap and idempotent, the prober tick does the actual dialing.
     pub(crate) fn reprobe_on_network_event(&mut self) {
-        if !net::upgrade_prober_enabled() || relay_forbidden() {
+        if !net::upgrade_prober_enabled() || self.host.relay_forbidden() {
             return;
         }
         for up in self.resil.upgrade_probe.values_mut() {
@@ -3439,7 +3440,7 @@ impl Conn {
     /// disturbing it. Also detects a local interface change (`iface_snapshot`) and
     /// re-probes IMMEDIATELY, the "walked home onto wifi" trigger.
     pub(crate) async fn tick_upgrade_prober(&mut self) {
-        if !net::upgrade_prober_enabled() || relay_forbidden() {
+        if !net::upgrade_prober_enabled() || self.host.relay_forbidden() {
             return;
         }
         if self.resil.upgrade_probe.is_empty() {
@@ -3453,8 +3454,8 @@ impl Conn {
         if snap != self.resil.iface_snapshot {
             if !self.resil.iface_snapshot.is_empty() {
                 // DEBUG, resilience internal (upgrade-probe trigger).
-                ui::debug(&ui::paint(
-                    ui::Tone::Dim,
+                self.log.debug(&self.log.paint(
+                    Tone::Dim,
                     "  network changed, re-probing for a direct path now",
                 ));
                 for up in self.resil.upgrade_probe.values_mut() {
@@ -3516,8 +3517,8 @@ impl Conn {
                 continue;
             };
             // DEBUG, resilience internal (upgrade probe attempt).
-            ui::debug(&ui::paint(
-                ui::Tone::Dim,
+            self.log.debug(&self.log.paint(
+                Tone::Dim,
                 "  probing for a direct path (alongside the relay)...",
             ));
             // Pre-set the NEXT backoff deadline so a probe that silently makes no
@@ -3581,8 +3582,8 @@ impl Conn {
             // Discard the standby, stay on relay, back off (the no-flap guard).
             VerifyAction::Discard => {
                 // DEBUG, resilience internal (no-flap guard rejecting a standby).
-                ui::debug(&ui::paint(
-                    ui::Tone::Warn,
+                self.log.debug(&self.log.paint(
+                    Tone::Warn,
                     "  direct path connected but didn't hold, staying on relay (no flap)",
                 ));
                 self.direct_pending.remove(pid);
@@ -3650,8 +3651,8 @@ impl Conn {
             self.active = Some(pid.to_string());
         }
         // CRITICAL, P5's value-prop line: relay released, back on a direct path.
-        ui::critical(&ui::paint(
-            ui::Tone::Ok,
+        self.log.critical(&self.log.paint(
+            Tone::Ok,
             &format!("  upgraded back to a direct path (route: {route}), relay released"),
         ));
         // Re-offer unfinished transfers on the new direct transport (resume:true);
@@ -3673,7 +3674,7 @@ impl Conn {
         // (trusted, principal_kind) carried from the pre-upgrade link. None only
         // if the link vanished, where the previous defaults are kept so this
         // change stays scoped to the escalation it fixes.
-        carried: Option<(bool, crate::capability::PrincipalKind)>,
+        carried: Option<(bool, PrincipalKind)>,
     ) {
         let info = self
             .roster
@@ -3708,7 +3709,7 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
-                identity_binding: crate::capability::BindingStrength::None,
+                identity_binding: BindingStrength::None,
                 identity_cert_expires: None,
                 principal_kind: upgrade_principal(&carried).1,
             },
@@ -3742,8 +3743,8 @@ impl Conn {
         up.verify_started = None; // judge_upgrade_standby stamps it on first look
         up.verify_last_idle = u64::MAX;
         // DEBUG, resilience internal (upgrade verify window opening).
-        ui::debug(&ui::paint(
-            ui::Tone::Dim,
+        self.log.debug(&self.log.paint(
+            Tone::Dim,
             "  direct path connected, verifying it holds before upgrading...",
         ));
     }
@@ -3759,11 +3760,11 @@ impl Conn {
         };
         // C26: collect the announcement, print after the borrow ends so the
         // roster can read every link.
-        let mut announce: Option<(&'static str, ui::Tone, &'static str)> = None;
+        let mut announce: Option<(&'static str, Tone, &'static str)> = None;
         match s {
             "connected" => {
                 if l.presence == Presence::Reconnecting {
-                    announce = Some((ui::glyph_ok(), ui::Tone::Ok, "recovered"));
+                    announce = Some((self.log.glyph_ok(), Tone::Ok, "recovered"));
                 }
                 l.presence = Presence::Ready;
                 l.attempts = 0;
@@ -3778,7 +3779,7 @@ impl Conn {
                     }
                 } else {
                     l.presence = Presence::Reconnecting;
-                    announce = Some(("◌", ui::Tone::Warn, "reconnecting..."));
+                    announce = Some(("◌", Tone::Warn, "reconnecting..."));
                     Duration::from_secs(6)
                 };
                 if let Some(p) = &l.peer {
@@ -3797,7 +3798,7 @@ impl Conn {
             _ => {}
         }
         if let Some((mark, tone, note)) = announce {
-            ui::say(&self.roster(pid, mark, tone, note, "peer"));
+            self.log.say(&self.roster(pid, mark, tone, note, "peer"));
         }
     }
 
@@ -3829,11 +3830,11 @@ impl Conn {
         // not deferred, not rejoinable. They must re-enroll on reconnect.
         if matches!(
             self.link(&pid).map(|l| &l.principal_kind),
-            Some(crate::capability::PrincipalKind::Delegated { .. })
+            Some(PrincipalKind::Delegated { .. })
         ) {
             let name = self.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
             self.drop_link(&pid);
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "ephemeral device {name} disconnected, enrollment revoked"
             ));
             return false;
@@ -3856,7 +3857,7 @@ impl Conn {
                 .map(|l| l.name.clone())
                 .unwrap_or_else(|| "peer".into());
             // DEBUG, resilience internal (deferred drop while channel flowing).
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "{name} signaling left, data channel still flowing, deferring drop"
             ));
             return false;
@@ -3872,7 +3873,7 @@ impl Conn {
                 Some((apid, until)) if *apid == pid && *until > Instant::now() => {
                     until.duration_since(Instant::now()) + Duration::from_secs(15)
                 }
-                _ => rejoin_unwarned(),
+                _ => self.host.rejoin_unwarned(),
             };
             self.rejoin.waiting_rejoin = Some(Instant::now());
         }
@@ -3914,7 +3915,7 @@ impl Conn {
                 .map(|l| l.name.clone())
                 .unwrap_or_else(|| "peer".into());
             // DEBUG, resilience internal (deferred-leave reap).
-            ui::debug(&format!(
+            self.log.debug(&format!(
                 "{name} link went idle after deferred leave, dropping now"
             ));
             // Re-inject so the loop's own peer-left branch handles partials,
@@ -3963,15 +3964,18 @@ impl Conn {
         &self,
         pid: &str,
         mark: &str,
-        tone: ui::Tone,
+        tone: impl Into<Tone>,
         note: &str,
         fallback_name: &str,
     ) -> String {
+        // Frozen callers in `recv_cmd`/`send_cmd` still hand this a `ui::Tone`;
+        // the CLI glue implements `From<ui::Tone>` so those calls do not move.
+        let tone = tone.into();
         // A link with no name yet is labelled by its raw signaling id. That id
         // means nothing to a person (a first-time-user test read "ok alpha
         // ok 3f9c...e1" after `receive <code>`), so it shows only under -v:
         // the line names the peer it is about, and leaves unnamed others out.
-        let show_raw = ui::enabled(ui::Level::Debug);
+        let show_raw = self.log.enabled(Level::Debug);
         let mut links: Vec<(&String, &Link)> = self.links.iter().collect();
         links.sort_by(|a, b| a.1.name.cmp(&b.1.name));
         let mut parts = Vec::new();
@@ -3992,12 +3996,12 @@ impl Conn {
                 } else {
                     l.label()
                 };
-                parts.push(peer_entry(label, mark, tone, note));
+                parts.push(peer_entry(&*self.log, label, mark, tone, note));
             } else if unnamed && !show_raw {
                 continue;
             } else {
-                let (m, t, n) = presence_glyph(l.presence);
-                parts.push(peer_entry(l.label(), m, t, n));
+                let (m, t, n) = presence_glyph(l.presence, &*self.log);
+                parts.push(peer_entry(&*self.log, l.label(), m, t, n));
             }
         }
         if !seen {
@@ -4006,7 +4010,7 @@ impl Conn {
             } else {
                 fallback_name
             };
-            parts.push(peer_entry(label, mark, tone, note));
+            parts.push(peer_entry(&*self.log, label, mark, tone, note));
         }
         format!("  {}", parts.join("   "))
     }
@@ -4027,16 +4031,16 @@ impl Conn {
             Ok(net::SignalOutcome::Glare(offer)) => {
                 self.drop_link(from);
                 if let Err(e) = self.ensure_responder(from, &offer).await {
-                    ui::trace(&format!("signal: glare rebuild failed: {e} (recovering)"));
+                    self.log.trace(&format!("signal: glare rebuild failed: {e} (recovering)"));
                     return;
                 }
                 if let Some(p) = self.link(from).and_then(|l| l.peer.clone()) {
                     if let Err(e) = p.handle_signal(offer).await {
-                        ui::trace(&format!("signal failed to apply: {e} (recovering)"));
+                        self.log.trace(&format!("signal failed to apply: {e} (recovering)"));
                     }
                 }
             }
-            Err(e) => ui::trace(&format!("signal failed to apply: {e} (recovering)")),
+            Err(e) => self.log.trace(&format!("signal failed to apply: {e} (recovering)")),
         }
     }
 
@@ -4381,9 +4385,9 @@ mod warm_identity_tests {
             established_at: Some(Instant::now()),
             identity_device_pub: None,
             identity_user_pub: None,
-            identity_binding: crate::capability::BindingStrength::None,
+            identity_binding: BindingStrength::None,
             identity_cert_expires: None,
-            principal_kind: crate::capability::PrincipalKind::OwnerDevice,
+            principal_kind: PrincipalKind::OwnerDevice,
         }
     }
 

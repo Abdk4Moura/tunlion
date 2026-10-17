@@ -293,6 +293,8 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         stuck_retry: HashMap::new(),
         ice_cache: crate::conn::SharedIceCache::default(),
         roster_absent: HashMap::new(),
+        log: crate::host_impl::cli_log(),
+        host: crate::host_impl::cli_host(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
