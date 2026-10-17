@@ -32,6 +32,7 @@
 
 mod adoption;
 pub mod conn;
+pub mod control;
 pub mod holepunch;
 pub mod host;
 pub mod identity;

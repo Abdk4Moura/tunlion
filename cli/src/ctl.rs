@@ -46,13 +46,21 @@ pub fn reuse_disabled() -> bool {
     std::env::var("TUNLION_NO_WARM_REUSE").map(|v| v == "1").unwrap_or(false)
 }
 
+// The request/reply TYPES moved to the peer-loop crate (issue #465); the socket
+// server and every handler body stay here. Re-exported so every existing caller
+// (`crate::ctl::Req`, `crate::ctl::ReqKind`, `crate::ctl::send_reply`) resolves
+// to the same items it did before the move.
+pub use filament_peerloop::control::{Req, ReqKind};
+#[cfg(unix)]
+pub use filament_peerloop::control::send_reply;
+
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, daemon_responds, forward_probe, send_reply, serve_at, try_approve_request,
+    daemon_present, daemon_responds, forward_probe, serve_at, try_approve_request,
     try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
     try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
-    try_revocation_sync, try_unmount, try_wake, Req, ReqKind,
+    try_revocation_sync, try_unmount, try_wake,
 };
 
 #[cfg(not(unix))]
@@ -60,7 +68,6 @@ pub use stub::{
     daemon_present, daemon_responds, forward_probe, try_approve_request, try_cap_status,
     try_deny_request, try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping,
     try_reconfigure, try_revocation_sync, try_wake,
-    Req,
 };
 
 // --------------------------------------------------------------- unix impl ----
@@ -68,6 +75,7 @@ pub use stub::{
 mod imp {
     use super::{control_sock_path, reuse_disabled};
     use anyhow::{anyhow, Result};
+    use filament_peerloop::control::{Req, ReqKind};
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -630,133 +638,6 @@ mod imp {
 
     // ----------------------------------------------------------------- daemon -
 
-    /// What a warm-reuse client is asking the daemon to do over its warm link.
-    #[derive(Clone)]
-    pub enum ReqKind {
-        /// Open one raw L2 stream to `peer`'s localhost:`rport` (netcat/ssh/forward).
-        Open { peer: String, rport: u16 },
-        /// Dial `peer`'s OVERLAY address:`port` over L3 (reaches an `expose`d overlay
-        /// service; the daemon resolves the peer to its verified overlay addr). The
-        /// proxy `.mesh` path uses this as a FALLBACK after the L2 `Open`.
-        Dial { peer: String, port: u16 },
-        /// Open a PTY shell on `peer` (the warm pty fast path). `session` keys the
-        /// peer's persistent PTY so a later reconnect reattaches the same shell.
-        /// `cmd` is non-empty for one-shot exec (mirrors the cold pty-open cmd field).
-        Pty { peer: String, session: String, cols: u16, rows: u16, term: String, cmd: String },
-        /// Relay a window-size change to an already-open warm PTY (by `session`).
-        Resize { session: String, cols: u16, rows: u16 },
-        /// Run the ssh `shell-bootstrap` over the daemon's warm link instead of a
-        /// fresh cold establish: install our managed `pubkey` on `peer` and return
-        /// the peer's host keys + login. The reply is deferred (it awaits the
-        /// peer's ack via the event loop), so the daemon stashes the socket rather
-        /// than answering inline. `ssh_port` is the port `tunlion ssh` will dial
-        /// on the peer's loopback, so the peer can report whether an sshd is
-        /// actually listening there (else ssh would fail blindly).
-        Bootstrap { peer: String, pubkey: String, ssh_port: u16 },
-        /// Report the daemon's live link to `peer` for `tunlion ping`: route,
-        /// remote address, RTT, verified name. Answered INLINE (synchronous): all
-        /// the facts are local to the daemon (quinn's RTT/addr, the link table), so
-        /// unlike Bootstrap there is nothing to await from the peer.
-        Ping { peer: String },
-        /// Tell the running daemon a setting changed (`tunlion set`). The daemon
-        /// re-reads its prefs and applies `key` to its live state where it safely
-        /// can (drop-dir, shell policy/user, name, auto-extract), replying
-        /// `{"ok":true,"live":<bool>}`: `live:true` = applied without a restart;
-        /// `live:false` = the key is woven into startup (relay/server, or arming
-        /// the L2 acceptor from cold) and needs `tunlion up`. Answered INLINE.
-        Reconfigure { key: String },
-        /// Tell the daemon to re-read `expose.json` and reconcile its overlay
-        /// listeners (`tunlion expose`/`unexpose`). Answered INLINE with
-        /// `{"ok":true,"live":true,"count":<n>}` where `n` is the number of ports
-        /// now bound; `live:false` if L3 is not up in the daemon.
-        ReloadExpose,
-        /// A no-op that exists to WAKE the daemon loop. The mint sends it right
-        /// after writing armed.json so the per-iteration arm gate subscribes the
-        /// enrollment channel NOW, instead of on the loop's next idle tick. That
-        /// tick cost a joiner up to a second whenever it arrived fast (a phone
-        /// scanning the QR code, or a scripted add | join): it reached the empty
-        /// channel first and waited. armed.json stays the source of truth -- this
-        /// carries no state, so a platform without a control socket loses nothing
-        /// but the speed-up. Answered INLINE with `{"ok":true}`.
-        Wake,
-        /// A forget or revoke changed the device store: re-read it now, close
-        /// the links it ends, and reply `{"ok":true,"closed":<n>}` once done
-        /// (see revocation_live.rs). Handled inline in the daemon loop.
-        RevocationSync,
-        /// Gracefully restart to pick up an updated binary (`tunlion update`).
-        /// Handled INLINE: if supervised (systemd), reply then self-SIGTERM so the
-        /// supervisor restarts us cleanly; otherwise decline (don't exit into down).
-        Reload,
-        /// Mount a remote directory via sshfs through the daemon. The daemon
-        /// spawns sshfs, tracks the mount, and monitors its health centrally.
-        Mount { peer: String, remote: String, local: String, read_only: bool, auto_restore: bool, port: u16 },
-        /// Unmount a tunlion mount point by local path.
-        Unmount { target: String },
-        /// List all daemon-managed mounts and their health status.
-        ListMounts,
-        /// Check health of a specific mount by local path or mount ID.
-        MountHealth { target: String },
-        /// Return the daemon's live capability shadow counters (synchronous).
-        CapStatus,
-        /// Snapshot already-held warm links without probing peers.
-        ListWarm,
-        /// Broker a one-time private rendezvous with a fleet sibling.
-        ///
-        /// The daemon already holds a certificate-verified link to that sibling.
-        /// It mints a single-use secret, hands it over THAT link, and returns it
-        /// here. Both ends then meet on `channel_of(secret)`, where exactly two
-        /// parties exist, instead of the fleet channel where every sibling does.
-        FleetRendezvous { name: String },
-        /// List pending consent requests.
-        ListPending,
-        /// Approve a pending request by id.
-        ApproveRequest { id: u64, allow: String, expires: u64 },
-        /// Deny a pending request by id.
-        DenyRequest { id: u64 },
-    }
-
-    /// A parsed request handed to the daemon's event loop, which owns the link
-    /// table and the per-peer muxes. The loop dispatches on `kind` and then
-    /// `accept()`s (bridging `sock`) or `reject()`s.
-    pub struct Req {
-        pub kind: ReqKind,
-        pub sock: UnixStream,
-    }
-
-    impl Req {
-        /// Confirm the stream is opening; returns the socket for the bridge.
-        pub async fn accept(mut self) -> UnixStream {
-            let _ = self.sock.write_all(b"{\"ok\":true}\n").await;
-            let _ = self.sock.flush().await;
-            self.sock
-        }
-
-        /// Decline (no warm link / not permitted); the client falls back to a
-        /// fresh establish. Best-effort; the socket drops on return.
-        pub async fn reject(mut self, err: &str) {
-            let line = json!({ "ok": false, "err": err }).to_string();
-            let _ = self.sock.write_all(line.as_bytes()).await;
-            let _ = self.sock.write_all(b"\n").await;
-            let _ = self.sock.flush().await;
-        }
-
-        /// Answer a synchronous request (Ping) with one JSON line, then drop the
-        /// socket. For requests that report facts rather than handing off a stream.
-        pub async fn reply(mut self, v: &Value) {
-            send_reply(&mut self.sock, v).await;
-        }
-    }
-
-    /// Write one JSON reply line to a DEFERRED-reply socket (a `Bootstrap` request
-    /// whose `sock` the daemon stashed until the peer's ack arrived). Best-effort.
-    pub async fn send_reply(sock: &mut UnixStream, v: &Value) {
-        if let Ok(mut line) = serde_json::to_vec(v) {
-            line.push(b'\n');
-            let _ = sock.write_all(&line).await;
-            let _ = sock.flush().await;
-        }
-    }
-
     /// Bind the control socket and forward each parsed request to `tx` (the
     /// daemon event loop). Removes a stale socket file first; `daemon_alive()`
     /// already guards against two live daemons. Sets mode 0600.
@@ -1017,19 +898,8 @@ mod imp {
 #[cfg(not(unix))]
 mod stub {
     use serde_json::Value;
-    /// Warm-link reuse needs a unix-domain socket, which this platform lacks, so
-    /// `Req` is uninhabited: the daemon never spawns `serve`, the channel never
-    /// receives, and the fast paths (gated on `cfg(unix)`) never call `try_open`.
-    /// Keeping the type lets the daemon loop and handler compile unchanged.
-    pub enum Req {}
-
-    impl Req {
-        /// Uninhabited here, so this is never called; it exists so the daemon
-        /// loop's reply to a parked revocation-sync compiles on every target.
-        pub async fn reply(self, _v: &Value) {
-            match self {}
-        }
-    }
+    // `Req` (uninhabited on this platform) now comes from the peer-loop crate;
+    // see the re-export at the top of this file.
 
     /// No control socket here, so no daemon can be asked to apply a
     /// revocation now; `None` makes the command say it applies within a few
