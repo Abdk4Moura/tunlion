@@ -3010,7 +3010,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 last_up = std::time::Instant::now();
                 backoff = Duration::from_millis(300);
                 role = "reconnect";
-                eprint!("\r\n{}\r\n", crate::ui::paint(crate::ui::Tone::Dim, "[tunlion: link dropped, reconnecting...]"));
+                // The local terminal is the remote PTY display. Writing even to
+                // stderr here can overwrite a TUI row or split a partial escape
+                // sequence, so reconnect silently and keep it a byte-stream
+                // continuation. Connection diagnostics remain in trace logs.
                 continue;
             }
             Err(e) => {
@@ -3101,10 +3104,8 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 // on an older build with a shorter window answers the resume with
                 // "no such session", which ends cleanly.
                 if last_up.elapsed() > SESSION_DETACHED_IDLE.saturating_sub(Duration::from_secs(30)) {
-                    eprint!(
-                        "\r\n{}\r\n",
-                        crate::ui::paint(crate::ui::Tone::Dim, "[tunlion: session expired, reconnect window passed]")
-                    );
+                    drop(raw.take());
+                    crate::ui::say("shell session ended after the reconnect window expired");
                     return Ok(());
                 }
                 tokio::time::sleep(backoff).await;
