@@ -142,60 +142,6 @@ pub(crate) fn effective_term(requested: &str) -> String {
     }
 }
 
-/// Terminal-mode reset emitted to the client right AFTER a reattach replay.
-/// A TUI that gets cut off mid-run (link drop, then the app dies before it can
-/// emit its own disable) leaves the client terminal stuck in mouse-reporting
-/// mode: every trackpad move then spews escape codes onto the shell line, which
-/// also wedges readline so Ctrl-U / Alt-Backspace stop parsing. Clearing the
-/// mouse modes after the replay heals that; a TUI that is STILL alive re-enables
-/// the mouse on its next redraw. Deliberately ONLY mouse modes (X10/normal/
-/// button/any-motion + SGR + urxvt ext), never cursor-key or keypad modes, so a
-/// reattach never disturbs arrow keys.
-pub const PTY_REATTACH_RESET: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l";
-
-/// Scan a PTY output chunk for DEC private-mode SET/RST sequences that
-/// affect mouse tracking. Returns (modes_set, modes_reset) from this chunk.
-///
-/// CSI `ESC [ ? <num> h` = DECSET (enable); `l` = DECRST (disable).
-/// Multiple mode numbers separated by `;` are each evaluated.
-fn mouse_mode_changes(data: &[u8]) -> (Vec<u16>, Vec<u16>) {
-    let mut sets: Vec<u16> = Vec::new();
-    let mut resets: Vec<u16> = Vec::new();
-    let mut i = 0;
-    while i < data.len() {
-        if data[i] != b'\x1b' || i + 3 >= data.len() || data[i + 1] != b'[' || data[i + 2] != b'?' {
-            i += 1;
-            continue;
-        }
-        let start = i + 3;
-        let mut j = start;
-        while j < data.len() && (data[j].is_ascii_digit() || data[j] == b';') {
-            j += 1;
-        }
-        if j > start && j < data.len() && matches!(data[j], b'h' | b'l') {
-            let set = data[j] == b'h';
-            let nums: &str = std::str::from_utf8(&data[start..j]).unwrap_or("");
-            for part in nums.split(';') {
-                if let Ok(n) = part.parse::<u16>() {
-                    if matches!(n, 1000 | 1002 | 1003 | 1006 | 1015) {
-                        if set {
-                            if !sets.contains(&n) {
-                                sets.push(n);
-                            }
-                        } else {
-                            if !resets.contains(&n) {
-                                resets.push(n);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        i = j + 1;
-    }
-    (sets, resets)
-}
-
 /// A detached session (channel dropped, nobody reattached) is reaped after this.
 /// Long enough to ride out a mobile network handoff, a tab suspend or a laptop
 /// lid closed for a coffee, short enough that a closed laptop does not leave a
@@ -434,12 +380,11 @@ pub async fn spawn_pty_session(
         let mut bind: Option<OutBind> = Some(OutBind { transport, sid });
         let mut ring: VecDeque<u8> = VecDeque::new();
         // Total bytes of output this session has produced (everything that went
-        // through the ring, including the reattach mode heal). The ring holds
+        // through the ring). The ring holds
         // the last `ring.len()` of them, so it starts at `out_total - ring.len()`.
         let mut out_total: u64 = 0;
         let started = Instant::now();
         let mut detached_since: Option<Instant> = None;
-        let mut active_mouse_modes: Vec<u16> = Vec::new();
         // 5s tick to enforce the idle/lifetime caps without busy-waiting.
         let mut reaper = tokio::time::interval(Duration::from_secs(5));
         reaper.tick().await; // consume the immediate first tick
@@ -455,11 +400,6 @@ pub async fn spawn_pty_session(
             tokio::select! {
                 out = orx.recv() => match out {
                     Some(bytes) => {
-                        let (sets, resets) = mouse_mode_changes(&bytes);
-                        for m in sets {
-                            if !active_mouse_modes.contains(&m) { active_mouse_modes.push(m); }
-                        }
-                        active_mouse_modes.retain(|m| !resets.contains(m));
                         push_ring(&mut ring, &bytes, SESSION_BUFFER_CAP);
                         out_total += bytes.len() as u64;
                         if let Some(b) = &bind {
@@ -491,25 +431,13 @@ pub async fn spawn_pty_session(
                                 break;
                             }
                         }
-                        // Heal stuck mouse modes from a cut-off TUI, then
-                        // restore any modes the live PTY app had active so
-                        // the wheel still scrolls after a reconnect.
-                        if ok {
-                            // Always flush stuck modes first (safety net), then
-                            // re-enable modes the PTY app had on before detach.
-                            // The heal goes through the ring like any output, so
-                            // it has a place in the byte count a later reattach
-                            // resumes from.
-                            let mut heal = PTY_REATTACH_RESET.to_vec();
-                            for m in &active_mouse_modes {
-                                heal.extend_from_slice(format!("\x1b[?{m}h").as_bytes());
-                            }
-                            push_ring(&mut ring, &heal, SESSION_BUFFER_CAP);
-                            out_total += heal.len() as u64;
-                            if transport.send_frame(sid, 0, &heal).await.is_err() {
-                                ok = false;
-                            }
-                        }
+                        // Reattach is a byte-stream continuation, not a terminal
+                        // reset. The client retains its terminal across a drop;
+                        // only the remote app owns its modes. Injecting a reset
+                        // here disables live TUI mouse tracking (PTY reads can
+                        // split a mode sequence), or even splices an escape into
+                        // an unfinished CSI/OSC. Replay and future output must
+                        // join exactly, without synthetic bytes in between.
                         if ok {
                             bind = Some(OutBind { transport, sid });
                             detached_since = None;
@@ -5982,6 +5910,75 @@ mod h1_tests {
         assert_eq!(replay_skip(100, 40, Some(101)), 0, "claims unproduced bytes: whole ring");
         assert_eq!(replay_skip(100, 40, None), 0, "client did not say: whole ring");
         assert_eq!(replay_skip(10, 10, Some(4)), 4, "ring holds everything");
+    }
+
+    /// A reconnect must not guess terminal state from PTY read boundaries.
+    /// In particular an unfinished CSI/OSC must join its continuation exactly,
+    /// and a disable followed by an enable must not be reordered by a "heal".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reattach_preserves_terminal_mode_bytes_without_injecting_resets() {
+        let _slot_guard = PTY_SLOT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, (before, after)) in [
+            ("\x1b[?1000l\x1b[?1000h\x1b[?1006h", "READY"),
+            ("\x1b[?1000h\x1b[?1006", "hREADY"),
+            ("\x1b]0;partial title", "\x07READY"),
+            ("\x1b[?9h\x1b[?1005h", "READY"),
+        ].into_iter().enumerate() {
+            let sessions = PtySessions::new();
+            let ta = CapTransport::new();
+            let sid_a = L2_SID_BASE | 21;
+            let id = format!("mode-continuation-{index}");
+            let sess = spawn_pty_session(
+                sessions.clone(), id.clone(), ta.clone(), sid_a, 80, 24,
+                "xterm-256color",
+                vec![
+                    "/bin/sh".into(), "-c".into(),
+                    "stty -echo; printf '%s' \"$1\"; IFS= read -r line; printf '%s' \"$2\"; IFS= read -r line".into(),
+                    "pty-mode-test".into(), before.into(), after.into(),
+                ],
+                PtyGuard::try_acquire().expect("slot"), None, false,
+            ).await.expect("spawn");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while ta.bytes_for(sid_a).len() < before.len() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("initial output");
+            let seen = ta.bytes_for(sid_a);
+            assert_eq!(seen, before.as_bytes());
+
+            // Both commands use one FIFO. No sleep is needed to ensure detach
+            // precedes attach; the shell blocks until we send the continuation.
+            sess.detach();
+            let tb = CapTransport::new();
+            let sid_b = L2_SID_BASE | 22;
+            sess.attach(tb.clone(), sid_b, Some(seen.len() as u64));
+            sess.feed_input(b"continue\n".to_vec());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !tb.bytes_for(sid_b).ends_with(b"READY") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("continued output");
+            assert_eq!(tb.bytes_for(sid_b), after.as_bytes(), "case {index}: synthetic bytes on reattach");
+
+            // A second reconnect uses the same byte offsets and must not have
+            // any synthetic output in its replay ring either.
+            let tc = CapTransport::new();
+            let sid_c = L2_SID_BASE | 23;
+            sess.attach(tc.clone(), sid_c, Some(seen.len() as u64));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !tc.bytes_for(sid_c).ends_with(b"READY") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("second replay");
+            assert_eq!(tc.bytes_for(sid_c), after.as_bytes(), "case {index}: replay ring changed");
+            sess.end();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while sessions.get_live(&id).await.is_some() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("session cleanup");
+        }
     }
 
     /// The retry hint must be a command the CLI ACCEPTS, not just one containing
