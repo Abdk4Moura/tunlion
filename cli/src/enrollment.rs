@@ -246,6 +246,8 @@ pub(crate) async fn enroll_cmd(
         to_name,
         false,
         direct::direct_enabled(),
+        crate::host_impl::cli_log(),
+        crate::host_impl::cli_host(),
     );
 
     {
@@ -532,6 +534,8 @@ pub(crate) async fn enroll_and_send_cmd(
         to_name.clone(),
         false,
         direct::direct_enabled(),
+        crate::host_impl::cli_log(),
+        crate::host_impl::cli_host(),
     );
 
     {

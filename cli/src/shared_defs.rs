@@ -28,10 +28,10 @@ pub(crate) const HEAD_BYTES: u64 = 256 * 1024;
 /// blind default; a peer that announced `brb` (e.g. the browser opening a
 /// mobile file picker suspends the whole tab) gets its declared ttl instead,
 /// informed waits are both longer when promised and shorter when not.
-pub(crate) const REJOIN_WINDOW: Duration = Duration::from_secs(120);
+pub(crate) use filament_peerloop::limits::REJOIN_WINDOW;
 
 /// C3/C4: connection (re)establishment attempts before failing honestly.
-pub(crate) const MAX_ATTEMPTS: u32 = 5;
+pub(crate) use filament_peerloop::limits::MAX_ATTEMPTS;
 
 /// P1 (GAP-4): process-global "the user forbade relay" flag, set once from the
 /// `--no-relay` CLI flag at startup. Read by `Conn::relay_forbidden` so the
@@ -94,7 +94,7 @@ pub(crate) static FORCE_INTERACTIVE: std::sync::atomic::AtomicBool =
 /// Slightly above MAX_ATTEMPTS because a fresh direct dial needs BOTH ends to
 /// re-offer within one race budget, which can take a couple of aligned ticks;
 /// a re-dial is cheap, so a few extra are worth a deterministic recovery.
-pub(crate) const STALL_MAX_REPAIRS: u32 = 5;
+pub(crate) use filament_peerloop::limits::STALL_MAX_REPAIRS;
 
 /// P5 (GAP-6): reserved sid for the relay->direct upgrade VERIFY heartbeat. A
 /// real DATA frame on this sid lets the prober confirm the new direct path is
@@ -103,7 +103,7 @@ pub(crate) const STALL_MAX_REPAIRS: u32 = 5;
 /// the receiver has no `by_sid` entry for it, so the inbound chunk is dropped
 /// harmlessly (after stamping inbound activity, which is the point: symmetric
 /// verify). See `Conn::judge_upgrade_standby`.
-pub(crate) const VERIFY_PROBE_SID: u32 = 0x7FFF_FFFF;
+pub(crate) use filament_peerloop::limits::VERIFY_PROBE_SID;
 
 /// P4 (GAP-5): how many times the receiver re-requests a transfer whose
 /// whole-file sha256 didn't match on completion (truncated/corrupt) before it
@@ -157,7 +157,7 @@ pub(crate) const PRINCIPAL_STATE_REVOKED: &str = "revoked";
 /// Display name for a fleet link before its certificate names it. Contains a
 /// space and a colon so it cannot collide with a device petname, and it is never
 /// used as a capability key regardless.
-pub(crate) const FLEET_LINK_NAME: &str = "fleet: unverified";
+pub(crate) use filament_peerloop::limits::FLEET_LINK_NAME;
 
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
 /// may `tunlion shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is

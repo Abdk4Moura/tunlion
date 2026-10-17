@@ -16,27 +16,34 @@
 //! warm-hold machine below is the first proof: its ~95s re-dial cycle came from the
 //! same rule living in two places under two names.
 //!
-//! What is deliberately NOT here, and WHY:
-//! - `Conn` itself: it carries `Arc<dyn Transport>`, `Arc<Peer>`, a signaling
-//!   client and tokio channels, and every command's event loop manipulates it. It
-//!   moves in the next slice, on top of this crate.
-//! - `Link`: it holds a live transport, a WebRTC peer and an identity binding, and
-//!   one of its methods reads the shell gate. Its petname rule is here as the
-//!   `petname::LinkPetname` trait the CLI implements for it.
-//! - presentation (`shown`, `label`, `display_name_of`, `link_kind`, the roster):
-//!   it renders, and rendering is the CLI's.
-//! - anything that reads settings, devices.json, the keystore or a `Paths`.
+//! `Conn` and `Link` moved here in issue #465 slice 3, as a `git mv` from
+//! `cli/src/conn.rs`, together with the policy modules they own: `resilience`
+//! (the stall ladder), `link_manager` (placement and warm-cutover decisions),
+//! `local` (the loopback TCP transport) and `holepunch` (rung-2 STUN + UDP
+//! punch). `identity` carries `resolve_peer_identity`, which operates on `Link`.
 //!
-//! `host` is the seam for those last two: it defines the `LogSink` and
-//! `HostServices` traits the peer loop asks through, plus host-free defaults,
-//! so `Conn` can carry an injected sink and host instead of importing the CLI.
-//! Nothing here calls back into the CLI; the CLI implements the traits.
+//! What the crate still does NOT contain:
+//! - the command surface (`send_cmd`, `recv_cmd`, the daemons, the roster UI):
+//!   those decide what a person asked for and render it.
+//! - anything that reads settings, devices.json, the keystore or a `Paths`:
+//!   `host` defines the `LogSink` and `HostServices` traits the peer loop asks
+//!   through, plus host-free defaults, and the CLI implements them.
+//! Nothing here calls back into the CLI; the CLI depends on this crate.
 
 mod adoption;
+pub mod conn;
+pub mod holepunch;
 pub mod host;
-mod liveness;
+pub mod identity;
+pub mod limits;
+pub mod link_manager;
+pub mod liveness;
+pub mod local;
 mod petname;
+pub mod resilience;
 mod retry;
+#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+pub(crate) mod test_hooks;
 mod warm;
 
 pub use adoption::{

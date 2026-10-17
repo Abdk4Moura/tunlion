@@ -31,7 +31,7 @@ path = "src/main.rs"
 # filament-transport, and a bare `test-hooks = []` here enables nothing over
 # there: a feature is per-crate, so the freeze/unblock/flaky hooks the P1 and P5
 # gates inject with were compiled out even when the gates asked for them.
-test-hooks = ["filament-transport/test-hooks"]
+test-hooks = ["filament-transport/test-hooks", "filament-peerloop/test-hooks"]
 # Dev-debug logging (TRACE / STALL / worker-ports internals). Stripped from
 # default release builds so no debug strings reach the shipped binary.
 debug-logs = ["filament-transport/debug-logs"]
