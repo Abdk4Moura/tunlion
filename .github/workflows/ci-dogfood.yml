@@ -139,4 +139,5 @@ jobs:
 
       - name: Leave the mesh
         if: always()
-        run: "$TUNLION_BIN" down -y || true
+        run: |
+          "$TUNLION_BIN" down -y || true
