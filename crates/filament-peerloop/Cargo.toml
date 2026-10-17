@@ -34,6 +34,7 @@ anyhow = "1.0.102"
 async-trait = "0.1.89"
 filament-cap = { path = "../filament-cap", version = "0.1.1" }
 filament-id = { path = "../filament-id", version = "0.1.0" }
+filament-overlay = { path = "../filament-overlay", version = "0.1.0" }
 filament-signal = { path = "../filament-signal", version = "0.1.0" }
 filament-transport = { path = "../filament-transport", version = "0.1.0" }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

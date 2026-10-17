@@ -22,12 +22,16 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use filament_cap::capability::{
     ActionCounts, BindingStrength, CapOutcome, GateDecision, PrincipalKind, ShadowCounts,
 };
 use filament_id::{DeviceCert, UserKey};
+use filament_overlay::Identity;
+
+use crate::mesh::{L3Mode, MeshTunnel};
 
 /// Terminal tone, mirroring `cli::ui::Tone`. The crate carries the WORD (which
 /// role a span plays); the host decides what escapes, if any, that word means.
@@ -184,6 +188,14 @@ pub enum StorageFailure {
 /// `roster_snapshot_json` deliberately returns JSON TEXT, not a `serde_json`
 /// `Value`, so this crate keeps no serde dependency and the returned blob's
 /// ownership is unambiguous; the caller parses it exactly once.
+///
+/// The mesh, overlay-key, ssh-key and mount methods further down are the
+/// features an embedding host must opt into. Their inert defaults are honest,
+/// not permissive: they REFUSE with a reason (or, where the question is a
+/// yes/no, answer no) rather than pretend the feature exists. A host that
+/// implements none of them still runs the receive loop; it serves no overlay,
+/// installs no ssh key and restores no mount, and the loop says so.
+#[async_trait::async_trait]
 pub trait HostServices: Send + Sync + 'static {
     /// The current unix time in seconds, from the host's clock.
     fn now_secs(&self) -> u64 {
@@ -277,6 +289,90 @@ pub trait HostServices: Send + Sync + 'static {
     fn roster_snapshot_json(&self) -> Option<String>;
     /// Is there a fleet rendezvous value on this machine at all?
     fn fleet_rv_present(&self) -> bool;
+    /// This machine's short host label, as the mesh uses it for `<name>.mesh`.
+    ///
+    /// A host with no mesh endpoint may leave the empty default: the loop only
+    /// asks once an overlay is up, and an empty label is a true "no name"
+    /// rather than an invented one.
+    fn hostname(&self) -> String {
+        String::new()
+    }
+    /// Load, and on first use create, this machine's overlay identity key.
+    ///
+    /// HOST-BOUND: the key is a file the host owns, and generating one is a
+    /// write. A host that does not implement this REFUSES with a reason, so the
+    /// loop disables the crypto overlay and says why instead of claiming an
+    /// address it cannot prove. To get the overlay, implement this plus
+    /// [`l3_start`](HostServices::l3_start).
+    fn overlay_identity(&self) -> Result<Identity, String> {
+        Err("this host has no overlay key store".to_string())
+    }
+    /// This device's overlay public key, loading the identity as
+    /// [`overlay_identity`](HostServices::overlay_identity) does.
+    fn overlay_pubkey(&self) -> Result<[u8; 32], String> {
+        self.overlay_identity().map(|id| id.public_key_bytes())
+    }
+    /// Sign a device-possession proof with the overlay key.
+    fn overlay_sign_possession(&self, msg: &[u8]) -> Result<[u8; 64], String> {
+        self.overlay_identity().map(|id| id.sign(msg))
+    }
+    /// Start the mesh packet endpoint on `cidr` with this device's identity.
+    ///
+    /// HOST-BOUND: this creates a TUN device or a userspace netstack, which the
+    /// library cannot do (and an Android embedder would supply through
+    /// `VpnService`). A host that does not implement it REFUSES with a reason;
+    /// the receive loop then serves with no overlay (`L3 disabled: ...`) rather
+    /// than pretending a route exists. Implementing this and
+    /// [`hostname`](HostServices::hostname) is what turns the feature on.
+    fn l3_start(
+        &self,
+        _cidr: &str,
+        _mtu: u32,
+        _identity: Option<Identity>,
+        _mode: L3Mode,
+    ) -> Result<Arc<dyn MeshTunnel>, String> {
+        Err("this host has no mesh overlay endpoint".to_string())
+    }
+    /// The public host keys this machine's sshd offers a bootstrap peer.
+    ///
+    /// HOST-BOUND: they are this machine's own key files. The inert answer is
+    /// empty, which is a true "I have no host keys to vouch for", never a
+    /// fabricated list.
+    fn ssh_host_pubkeys(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Install the tunlion-managed block for `device` in this user's
+    /// authorized_keys.
+    ///
+    /// HOST-BOUND: it writes `$HOME/.ssh`. A host that does not implement it
+    /// REFUSES, and the receiving loop sends the peer an install-failed refusal
+    /// instead of an ack.
+    fn install_authorized_key(&self, _device: &str, _pubkey: &str) -> Result<(), String> {
+        Err("this host does not manage ssh authorized_keys".to_string())
+    }
+    /// Restore the auto-restore mounts this host recorded.
+    ///
+    /// HOST-BOUND: each mount is a FUSE/WinFsp device the host creates. A host
+    /// with no mount support REFUSES, and the receive loop logs the warning it
+    /// already logged on a restore failure, rather than reporting zero restored.
+    async fn restore_mounts(&self, _server: &str, _relay: bool) -> Result<(), String> {
+        Err("this host does not support mounts".to_string())
+    }
+    /// Is `local` a live mount point?
+    ///
+    /// HOST-BOUND: it reads the host's mount table. A host that cannot mount
+    /// answers `false`; that is a true "no mount of mine is live here", not a
+    /// claim that the path is useless.
+    fn is_mount_point(&self, _local: &str) -> bool {
+        false
+    }
+    /// Remove `local` from this host's mount table.
+    ///
+    /// HOST-BOUND. A host with no mount support REFUSES; the receive loop
+    /// already ignores this result while reaping a dead tracked mount.
+    fn remove_mount(&self, _local: &str) -> Result<(), String> {
+        Err("this host does not support mounts".to_string())
+    }
     /// Seed the owner's self genesis capability header and its ratchet when
     /// this machine has an owner key and the store lacks them. A store WRITE,
     /// so it belongs here; returns whether anything was written.
@@ -365,6 +461,7 @@ impl PersistedPrincipal {
 #[derive(Clone, Copy, Default)]
 pub struct NoHost;
 
+#[async_trait::async_trait]
 impl HostServices for NoHost {
     fn settings_get_str(&self, _key: &str) -> Option<String> {
         None
@@ -512,5 +609,27 @@ mod tests {
         assert!(!host.cap_authoritative());
         assert_eq!(host.cap_shadow_counts().la_authorized, 0);
         assert!(host.cap_action_counts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nohost_refuses_the_features_it_cannot_provide() {
+        let host = NoHost;
+        // Not permissive: every feature hook that could claim success refuses
+        // with a reason a caller can print, and the yes/no questions answer no.
+        assert_eq!(host.hostname(), "");
+        assert!(host.overlay_identity().is_err());
+        assert!(host.overlay_pubkey().is_err());
+        assert!(host.overlay_sign_possession(b"m").is_err());
+        assert!(host
+            .l3_start("fd00::1/128", 1280, None, L3Mode::Auto)
+            .is_err());
+        assert!(host.ssh_host_pubkeys().is_empty());
+        assert!(host
+            .install_authorized_key("dev", "ssh-ed25519 AAAA")
+            .is_err());
+        assert!(!host.is_mount_point("/tmp/m"));
+        assert!(host.remove_mount("/tmp/m").is_err());
+        let restored = host.restore_mounts("srv", false).await;
+        assert!(restored.is_err());
     }
 }

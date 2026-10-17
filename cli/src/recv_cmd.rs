@@ -26,17 +26,24 @@
 //!
 //! HOST FACTS: settings, the config directory, the keystore, the inbox
 //! permissions, the serving login name, the filesystem answers, the capability
-//! store, the authoritative-mode switch and the gate counters all arrive
+//! store, the authoritative-mode switch, the gate counters, the overlay key, the
+//! mesh packet endpoint, the ssh host keys and the mount hooks all arrive
 //! through the `HostServices` passed to `recv_cmd` (`host` here, `conn.host` in
 //! the split-out handlers), so a caller with no machine runs the same loop with
 //! `NoHost`. What stays a direct import is what the crates already own: the
-//! identity primitives (`filament-id`, imported as `identity`), transport, and
-//! the pure capability evaluation/token work (`filament-cap`, imported as
-//! `cap`). Those are crate calls, not host ones.
+//! identity primitives (`filament-id`, imported as `identity`), transport,
+//! overlay announce/address work (`filament-overlay`), the ssh key-line
+//! validator (`authkeys-managed`) and the pure capability evaluation/token work
+//! (`filament-cap`, imported as `cap`). Those are crate calls, not host ones.
 use crate::dlog;
 use crate::signaling_health;
 #[cfg(l3)]
-use crate::l3;
+use filament_overlay::Announce;
+use filament_overlay::{b64, unb64};
+#[cfg(l3)]
+use filament_peerloop::mesh::{
+    advertised_prefixes, installable_routes, sanitize_host, L3Mode, MeshTunnel, IFNAME,
+};
 #[cfg(l3)]
 use crate::{
     AdoptSource, Ceremony, Conn, DaemonMounts, Ev, IncomingFile, MAX_ATTEMPTS, MAX_VERIFY_FAILS,
@@ -54,14 +61,14 @@ use crate::{
     issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
     load_provisional_identity, load_requests, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
-    mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding, overlay,
+    mk_uid, mount_proto, net, next_ev, offer_question, out_binding,
     owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz,
     principal_ceiling_for, prompt_line, proof_for, protocol, pwrite_at, quiet_exit_window,
     record_range, regex_lite_code, relay_banner, resolve_peer_identity,
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
     respond_to_identity_challenge, safe_create_part, safe_incoming_name, safe_resume_part,
     save_requests, sdnotify, session, shell_argv, shutdown, spawn_session_pumps, sshd,
-    sshd_listening, sshkeys, store_provisional_identity, subnet_forward, sweep_completed_streams,
+    sshd_listening, store_provisional_identity, subnet_forward, sweep_completed_streams,
     test_hooks, ui, verify_incoming, with_devices_mut,
 };
 // Unix-only daemon-control names, gated exactly like their definitions in
@@ -1723,13 +1730,13 @@ pub(crate) async fn recv_cmd(
     // transport is installed, so a hello that races ahead of the link is not lost
     // (review fix #3).
     #[cfg(l3)]
-    let mut l3_seen: HashMap<String, overlay::Announce> = HashMap::new();
+    let mut l3_seen: HashMap<String, Announce> = HashMap::new();
     #[cfg(l3)]
-    let l3: Option<std::sync::Arc<l3::L3>> = if daemon {
+    let l3: Option<std::sync::Arc<dyn MeshTunnel>> = if daemon {
         match host.settings_get_str("tun-addr") {
             Some(setting) => {
                 let (cidr, identity) = if setting == "auto" {
-                    match overlay::load_identity() {
+                    match host.overlay_identity() {
                         Ok(id) => (format!("{}/128", id.addr()), Some(id)),
                         Err(e) => {
                             log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
@@ -1746,11 +1753,11 @@ pub(crate) async fn recv_cmd(
                     // default Auto; TUNLION_L3_USERSPACE / `up --userspace` force
                     // userspace (handled inside L3::start via the env).
                     let mode = match host.settings_get_str("l3-mode").as_deref() {
-                        Some("kernel") => l3::L3Mode::Kernel,
-                        Some("userspace") => l3::L3Mode::Userspace,
-                        _ => l3::L3Mode::Auto,
+                        Some("kernel") => L3Mode::Kernel,
+                        Some("userspace") => L3Mode::Userspace,
+                        _ => L3Mode::Auto,
                     };
-                    match l3::L3::start(&cidr, 1280, identity, mode) {
+                    match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
                             let addr = m.my_addr().map(|a| a.to_string()).unwrap_or(cidr);
 
@@ -1763,7 +1770,9 @@ pub(crate) async fn recv_cmd(
                             // Same reader the announce paths use, so what the
                             // kernel is told to forward and what the wire
                             // advertises cannot diverge.
-                            let advertised: Vec<String> = crate::l3::advertised_prefixes();
+                            let advertised: Vec<String> = advertised_prefixes(
+                                host.settings_get_str("advertise-routes").as_deref(),
+                            );
                             if !advertised.is_empty() {
                                 if m.is_userspace() {
                                     log.say(&log.paint(
@@ -1775,7 +1784,7 @@ pub(crate) async fn recv_cmd(
                                     ));
                                 } else {
                                     let snat = host.settings_get_bool("route-snat");
-                                    match subnet_forward::enable(l3::ifname(), &advertised, snat) {
+                                    match subnet_forward::enable(IFNAME, &advertised, snat) {
                                         Ok(_applied) => log.say(&format!(
                                             "  {} carrying {} for peers{}",
                                             log.paint(Tone::Ok, log.glyph_ok()),
@@ -1883,10 +1892,10 @@ pub(crate) async fn recv_cmd(
                                     v4
                                 ));
                                 // Show the .mesh name that resolves to this machine.
-                                let my_name = l3::hostname();
+                                let my_name = host.hostname();
                                 log.say(&format!(
                                     "    this machine resolves as {}{}",
-                                    l3::sanitize_host(&my_name),
+                                    sanitize_host(&my_name),
                                     ".mesh"
                                 ));
                             }
@@ -1894,19 +1903,18 @@ pub(crate) async fn recv_cmd(
                             // `<name>.mesh` resolves locally (not just peers).
                             // Uses the tunlion device name (from `tunlion set name`
                             // or hostname if unset), sanitized for DNS.
-                            if let Some(id) = m.identity_ref() {
-                                let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
-                                let v6 = id.addr();
-                                let v4 = Some(id.addr_v4());
-                                m.names_insert("__self__", &l3::sanitize_host(&my_name), v6, v4)
+                            if let Some((v6, v4_addr)) = m.identity_addrs() {
+                                let my_name = config_get("name").unwrap_or_else(|| host.hostname());
+                                let v4 = Some(v4_addr);
+                                m.names_insert("__self__", &sanitize_host(&my_name), v6, v4)
                                     .await;
                                 if !m.is_userspace() {
                                     m.refresh_hosts().await;
                                 }
                                 // Configure sshd to listen on overlay addresses if enabled.
                                 if host.settings_get_bool("sshd-overlay") {
-                                    let v6_str = id.addr().to_string();
-                                    let v4_str = id.addr_v4().to_string();
+                                    let v6_str = v6.to_string();
+                                    let v4_str = v4_addr.to_string();
                                     if let Err(e) = sshd::configure_sshd_overlay(&v6_str, &v4_str) {
                                         log.say(&log.paint(
                                             Tone::Warn,
@@ -2190,7 +2198,7 @@ pub(crate) async fn recv_cmd(
     }
 
     // Restore mounts that were marked with auto_restore.
-    if let Err(e) = mount::restore_mounts(server, relay).await {
+    if let Err(e) = host.restore_mounts(server, relay).await {
         log.say(&format!("warning: failed to restore mounts: {e}"));
     }
 
@@ -3377,7 +3385,7 @@ pub(crate) async fn recv_cmd(
                 .entries
                 .iter()
                 .filter_map(|(local, _entry)| {
-                    let is_alive = mount::is_mount_point(local);
+                    let is_alive = host.is_mount_point(local);
                     let path_exists = Path::new(local).exists();
                     if !path_exists {
                         Some(local.clone())
@@ -3398,7 +3406,7 @@ pub(crate) async fn recv_cmd(
                     if let Some(mut child) = daemon_mounts.children.remove(&local) {
                         let _ = child.kill().await;
                     }
-                    let _ = mount::remove_mount(&local);
+                    let _ = host.remove_mount(&local);
                 }
             }
         }
@@ -4881,7 +4889,7 @@ pub(crate) async fn recv_cmd(
                     let _ = t
                         .send_control(&json!({
                             "type": "l3-nonce",
-                            "nonce": crate::overlay::b64(&nonce),
+                            "nonce": b64(&nonce),
                         }))
                         .await;
                 }
@@ -5121,7 +5129,7 @@ pub(crate) async fn recv_cmd(
                     }
                 }
                 Some("l3-nonce") => {
-                    match v["nonce"].as_str().map(crate::overlay::unb64) {
+                    match v["nonce"].as_str().map(unb64) {
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
                             bind_theirs.insert(pid.clone(), nonce);
                             if let Some(t) = conn.transport_of(&pid) {
@@ -5369,7 +5377,7 @@ pub(crate) async fn recv_cmd(
                                         #[cfg(l3)]
                                         if let Some(l3) = l3.as_ref() {
                                             if l3
-                                                .rename_peer(&pid, &l3::sanitize_host(&shown))
+                                                .rename_peer(&pid, &sanitize_host(&shown))
                                                 .await
                                             {
                                                 l3.refresh_hosts().await;
@@ -5460,7 +5468,7 @@ pub(crate) async fn recv_cmd(
                         ));
                         continue;
                     }
-                    match overlay::Announce::from_json(&v) {
+                    match Announce::from_json(&v) {
                         Ok(ann) => {
                             l3_seen.insert(pid.clone(), ann.clone());
                             // Try to process immediately if transport is available.
@@ -5699,7 +5707,7 @@ pub(crate) async fn recv_cmd(
                                                         .collect();
                                                 let cap_entries = host.cap_store();
                                                 let cap_now = host.now_secs();
-                                                let ok = crate::l3::installable_routes(
+                                                let ok = installable_routes(
                                                     &advertised,
                                                     accept,
                                                     |cidr| {
@@ -6365,7 +6373,7 @@ pub(crate) async fn recv_cmd(
                     // peer can't inject extra authorized_keys lines. Enforced here
                     // AND again inside install_authorized_key (defense in depth).
                     if cert_only {
-                        let hostkeys = sshkeys::host_pubkeys();
+                        let hostkeys = host.ssh_host_pubkeys();
                         let login = host.serving_user().unwrap_or_else(|| "root".into());
                         let ssh_port = v["ssh_port"]
                             .as_u64()
@@ -6387,7 +6395,7 @@ pub(crate) async fn recv_cmd(
                             .await;
                         continue;
                     }
-                    let pubkey = match sshkeys::validate_pubkey(&pubkey) {
+                    let pubkey = match authkeys_managed::validate_pubkey(&pubkey) {
                         Ok(k) => k,
                         Err(e) => {
                             log.say(&format!(
@@ -6402,9 +6410,9 @@ pub(crate) async fn recv_cmd(
                             continue;
                         }
                     };
-                    match sshkeys::install_authorized_key(&device, &pubkey) {
+                    match host.install_authorized_key(&device, &pubkey) {
                         Ok(()) => {
-                            let hostkeys = sshkeys::host_pubkeys();
+                            let hostkeys = host.ssh_host_pubkeys();
                             let login = host.serving_user().unwrap_or_else(|| "root".into());
                             // Tell the initiator whether an sshd is actually
                             // listening on the port `tunlion shell --ssh` will dial here,
@@ -7066,7 +7074,7 @@ pub(crate) async fn recv_cmd(
                         // For identity layer, after introduction, generate nonce challenge to learn peer's identity (0x02 path)
                         // Challenge carries ONLY {nonce, receiver_device_pub} per correction A
                         // Receiver_device_pub is our own overlay key (always exists, not cert-or-zeros)
-                        if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
+                        if let Ok(own_dpub) = host.overlay_pubkey() {
                             if let Some(t) = conn.transport_of(&pid) {
                                 use ring::rand::{SecureRandom, SystemRandom};
                                 let rng = SystemRandom::new();
@@ -7116,7 +7124,7 @@ pub(crate) async fn recv_cmd(
                                     &sender_dpub,
                                     &recv_dpub_arr,
                                 );
-                                if let Ok(sig) = crate::overlay::overlay_sign_possession(&msg) {
+                                if let Ok(sig) = host.overlay_sign_possession(&msg) {
                                     // For introduce path, identity-expose goes over DIRECT A-B DTLS data channel (the introduced pair's OWN transport,
                                     // whose DTLS keys the introducer/hub does NOT know). This is E2E encrypted, so unsealed is actually FINE and BETTER than
                                     // sealing with HKDF(fresh_secret) (which introducer CAN open, since it minted fresh_secret). DTLS gives true A-B E2E,
@@ -7183,8 +7191,7 @@ pub(crate) async fn recv_cmd(
                                                             let chash =
                                                                 crate::identity::cert_hash(&cert);
                                                             if let Ok(own_dpub) =
-                                                                crate::overlay::overlay_pubkey_bytes(
-                                                                )
+                                                                host.overlay_pubkey()
                                                             {
                                                                 let sender_dpub = cert.device_pub;
                                                                 let receiver_dpub = own_dpub; // our own device_pub as receiver
