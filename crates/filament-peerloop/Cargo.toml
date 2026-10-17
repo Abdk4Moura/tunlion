@@ -32,6 +32,7 @@ debug-logs = []
 # behaviour match the CLI build these modules came from.
 anyhow = "1.0.102"
 async-trait = "0.1.89"
+bytes = "1.11.1"
 chrono = "0.4"
 filament-cap = { path = "../filament-cap", version = "0.1.1" }
 filament-id = { path = "../filament-id", version = "0.1.0" }

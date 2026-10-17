@@ -49,6 +49,19 @@ pub fn say(msg: &str) {
     }
 }
 
+/// A must-see line (printed even under `-q`). Default: discard, for the same
+/// reason as `say`: a library has no terminal, and a caller that wants the
+/// line installs a sink.
+static CRITICAL: OnceLock<LogFn> = OnceLock::new();
+pub fn set_critical(f: LogFn) {
+    let _ = CRITICAL.set(f);
+}
+pub fn critical(msg: &str) {
+    if let Some(f) = CRITICAL.get() {
+        f(msg)
+    }
+}
+
 /// Classify a remote IP (private, CGNAT, public, ...). Default: "?".
 pub type IpClassFn = fn(std::net::IpAddr) -> String;
 static IP_CLASS: OnceLock<IpClassFn> = OnceLock::new();

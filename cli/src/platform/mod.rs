@@ -591,39 +591,10 @@ pub fn own_process_group(cmd: &mut tokio::process::Command) {
 }
 
 /// The signals a served remote command can be sent as a whole tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TreeSignal {
-    /// The terminal went away (the initiator is gone).
-    Hangup,
-    /// The initiator's user pressed Ctrl-C.
-    Interrupt,
-    /// Asked to stop.
-    Terminate,
-    /// Ended now; cannot be caught.
-    Kill,
-}
-
-impl TreeSignal {
-    /// The wire name (`exec-signal`'s `signal`), shared by both ends.
-    pub fn wire(self) -> &'static str {
-        match self {
-            TreeSignal::Hangup => "HUP",
-            TreeSignal::Interrupt => "INT",
-            TreeSignal::Terminate => "TERM",
-            TreeSignal::Kill => "KILL",
-        }
-    }
-
-    pub fn from_wire(s: &str) -> Option<TreeSignal> {
-        Some(match s {
-            "HUP" => TreeSignal::Hangup,
-            "INT" => TreeSignal::Interrupt,
-            "TERM" => TreeSignal::Terminate,
-            "KILL" => TreeSignal::Kill,
-            _ => return None,
-        })
-    }
-}
+///
+/// It moved with `Mux`'s `exec_ctl` channel (its only carrier across the
+/// mux) and is re-exported here under its old path. The wire names are frozen.
+pub use filament_peerloop::l2::mux::TreeSignal;
 
 /// Signal every process in the group `pgid` leads (see [`own_process_group`]).
 /// Ok(false) when no process of that group exists any more. On Windows the

@@ -1197,6 +1197,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "chrono",
  "filament-cap",
  "filament-id",
