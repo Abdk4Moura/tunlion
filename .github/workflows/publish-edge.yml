@@ -33,6 +33,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add x86_64-unknown-linux-musl
+      # cc-rs needs x86_64-linux-musl-gcc for the C deps; the release
+      # workflow installs the same package.
+      - name: musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: actions/cache@v4
         with:
@@ -44,6 +48,8 @@ jobs:
           restore-keys: publish-edge-
 
       - name: Build
+        env:
+          TUNLION_BUILD_SHA: ${{ github.sha }}
         run: cargo build --release --locked --manifest-path cli/Cargo.toml --target x86_64-unknown-linux-musl
 
       - name: Stage with a hash
@@ -52,7 +58,8 @@ jobs:
           mkdir -p out
           cp cli/target/x86_64-unknown-linux-musl/release/tunlion out/tunlion
           ( cd out && sha256sum tunlion > SHA256SUMS )
-          file out/tunlion
+          file out/tunlion | grep -qi "static" || { echo "not a static binary"; exit 1; }
+          out/tunlion --version
           cat out/SHA256SUMS
 
       - uses: actions/upload-artifact@v4
