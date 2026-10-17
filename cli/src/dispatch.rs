@@ -1089,6 +1089,7 @@ pub(crate) async fn async_main() -> Result<()> {
             detach,
             userspace,
             dir,
+            authkey_file,
             shell,
             shell_only,
             shell_program,
@@ -1131,6 +1132,8 @@ pub(crate) async fn async_main() -> Result<()> {
                 },
                 &daemon,
                 dir,
+                &ui_caps,
+                authkey_file,
                 relay,
                 shell,
                 shell_only,
@@ -1435,7 +1438,15 @@ pub(crate) async fn async_main() -> Result<()> {
                 // has an unknown format".
                 crate::identity_flow::join_guided(&ui_caps, &server, relay, name, to).await
             } else {
-                join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to, None).await
+                // No code, no file, nothing to prompt at: the key may be in the
+                // environment. `TUNLION_AUTHKEY=... tunlion join` is the
+                // scripted spelling, and it keeps the material out of argv.
+                let material = if invite_file.is_none() && invite_fd.is_none() {
+                    crate::authkey::from_env_or_file(None)?
+                } else {
+                    None
+                };
+                join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to, material).await
             }
         }
         Cmd::Depart => depart_cmd(&server, relay).await,

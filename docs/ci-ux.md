@@ -68,20 +68,24 @@ on both ends.
    arrived within Ns" when no sender has offered anything by the deadline.
    `--timeout 0` waits without limit; it conflicts with `--keep-open`. This
    removes the `timeout(1)` wrapper from every caller.
-2. `receive --expect-sha256 <hex>` (and `--expect-name <name>`): refuse to report
+2. DONE: a key can be presented the way Tailscale presents one, without argv:
+   `TUNLION_AUTHKEY=... tunlion join` (or `tunlion up`, which joins first when
+   it has no identity). `--authkey-file -` reads stdin. No file has to be
+   written by the job.
+3. `receive --expect-sha256 <hex>` (and `--expect-name <name>`): refuse to report
    success unless the received bytes match. Removes hand-rolled verification.
-3. `up` has no `--json`. A CI box starts the daemon and then has to poll
+4. `up` has no `--json`. A CI box starts the daemon and then has to poll
    `status --json` to learn whether it came up, because `up --json` is refused as
    unimplemented (exit 2). Either give `up` a machine-readable result or make
    `up --detach` print the daemon pid and state.
-4. `tunlion wait <device> --timeout <secs>`: block until a named device is
+5. `tunlion wait <device> --timeout <secs>`: block until a named device is
    online. Removes the `devices --json` polling loop.
-5. `receive --json` should end with one object naming every file it wrote and its
+6. `receive --json` should end with one object naming every file it wrote and its
    sha256, so a caller has a manifest without hashing again.
-6. A cohort action: retire an invitation and stop renewal for every device it
+7. A cohort action: retire an invitation and stop renewal for every device it
    admitted. Today the record carries no provenance, so this needs the field
    first.
-7. A `tunlion job` verb wrapping (2)+(3)+(4) and the manifest, so the box side is
+8. A `tunlion job` verb wrapping (3)+(4)+(5) and the manifest, so the box side is
    one command instead of a script.
 
 ## What is deliberately out of scope

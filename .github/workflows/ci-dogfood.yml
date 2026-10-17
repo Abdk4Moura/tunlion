@@ -64,19 +64,17 @@ jobs:
 
       - name: Join the mesh
         env:
-          INVITE: ${{ secrets.TUNLION_INVITE }}
+          # Read from the environment, not an argv and not a file: the key is
+          # never echoed, never written by this job, and never visible in `ps`.
+          TUNLION_AUTHKEY: ${{ secrets.TUNLION_INVITE }}
           RUNNER_NAME: ${{ inputs.runner_name }}
         run: |
           set -euo pipefail
-          if [ -z "${INVITE:-}" ]; then
+          if [ -z "${TUNLION_AUTHKEY:-}" ]; then
             echo "::error::TUNLION_INVITE is not set; run scripts/ci-dogfood.sh, which mints it"
             exit 2
           fi
-          umask 077
-          INV="$RUNNER_TEMP/invitation"
-          printf '%s' "$INVITE" > "$INV"
-          chmod 600 "$INV"
-          "$TUNLION_BIN" join "$INV" --name "$RUNNER_NAME" --json --no-interactive
+          "$TUNLION_BIN" join --name "$RUNNER_NAME" --json --no-interactive
           # The daemon receives into WORK and keeps the signaling link up; the
           # owner can only send once this device is present.
           #

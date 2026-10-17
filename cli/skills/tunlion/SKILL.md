@@ -56,6 +56,24 @@ status of 3 looks like tunlion's 3; the reason line on stderr says which.
 
 ## Tasks
 
+### Set up a machine with an auth key (CI, a borrowed box)
+
+```bash
+# one command: join if this machine has no identity, then serve
+TUNLION_AUTHKEY=filament-invite:v2:... tunlion up --detach
+
+# or, when the join and the serve are separate steps
+TUNLION_AUTHKEY=filament-invite:v2:... tunlion join
+tunlion up --detach
+```
+
+The key may also come from `--authkey-file <path>` on `up` (use `-` for stdin).
+It is never accepted as an argument: argv is visible in `ps` and in shell
+history. `TUNLION_INVITE` is accepted as a second environment name. Without an
+identity and without a key, `up` still exits 9.
+
+To mint the key on the owner, see `tunlion add --for runner --reuse N --out`.
+
 ### Check what is available
 
 ```bash
