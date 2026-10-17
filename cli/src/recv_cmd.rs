@@ -29,15 +29,17 @@
 //!
 //! HOST FACTS: settings, the config directory, the keystore, the inbox
 //! permissions, the serving login name, the filesystem answers, the capability
-//! store, the authoritative-mode switch, the gate counters, the overlay key, the
-//! mesh packet endpoint, the ssh host keys and the mount hooks all arrive
-//! through the `HostServices` passed to `recv_cmd` (`host` here, `conn.host` in
-//! the split-out handlers), so a caller with no machine runs the same loop with
-//! `NoHost`. What stays a direct import is what the crates already own: the
-//! identity primitives (`filament-id`, imported as `identity`), transport,
-//! overlay announce/address work (`filament-overlay`), the ssh key-line
-//! validator (`authkeys-managed`) and the pure capability evaluation/token work
-//! (`filament-cap`, imported as `cap`). Those are crate calls, not host ones.
+//! store and its writes, the consent queue, the control socket, the daemon
+//! status snapshots, the authoritative-mode switch, the gate counters, the
+//! overlay key, the mesh packet endpoint, the ssh host keys and the mount hooks
+//! all arrive through the `HostServices` passed to `recv_cmd` (`host` here,
+//! `conn.host` in the split-out handlers), so a caller with no machine runs the
+//! same loop with `NoHost`. What stays a direct import is what the crates
+//! already own: the identity primitives (`filament-id`, imported as `identity`),
+//! transport, overlay announce/address work (`filament-overlay`), the ssh
+//! key-line validator (`authkeys-managed`) and the pure capability
+//! evaluation/token work (`filament-cap`, imported as `cap`). Those are crate
+//! calls, not host ones.
 use crate::dlog;
 use crate::signaling_health;
 #[cfg(l3)]
@@ -52,17 +54,17 @@ use crate::{
     AdoptSource, Ceremony, Conn, DaemonMounts, Ev, IncomingFile, MAX_ATTEMPTS, MAX_VERIFY_FAILS,
     PROVEN_CHALLENGE_DEADLINE, PakeInbound, PartMeta, Presence, RecvState, Rung, ShellPolicy,
     TtyGuard, WarmPtys, any_shell_grant, apply_reconfigure, cancelled, channel_of,
-    clear_provisional_identity, codeentry, command_arg, config_get, consent_token, ctl,
+    clear_provisional_identity, codeentry, command_arg, config_get, consent_token,
     daemon_alive, device_allows, device_capability_denied, device_cert_revoked,
-    device_name_for_pub, device_set_cap, devices_load, devices_path, devices_remove, devices_store,
+    device_name_for_pub, devices_load, devices_path, devices_remove, devices_store,
     devices_sweep_lapsed, devices_touch, devices_upsert_atomic, direct, direct_ok_for,
-    display_name, enqueue_if_requestable, exec_recv, expire_requests,
+    display_name, enqueue_if_requestable, exec_recv,
     expose, finalize_incoming, fleet, fleet_identity_pending, fleet_route_ok, fleet_shaped_link,
-    flush_inflight, fresh_secret, handle_auth_key_enroll_response, handle_cert_renew_ack,
+    flush_inflight, handle_auth_key_enroll_response, handle_cert_renew_ack,
     handle_identity_expose, handle_warm_req, human, identity, in_binding, interactive_allowed,
     interactive_requested, is_self_uid, issue_proven_challenge_and_hold,
-    issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
-    load_provisional_identity, load_requests, local_device_cert, mark_bounded_cap_source,
+    l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
+    load_provisional_identity, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
     mk_uid, mount_proto, net, next_ev, offer_question, out_binding,
     owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz,
@@ -70,7 +72,7 @@ use crate::{
     record_range, regex_lite_code, relay_banner, resolve_peer_identity,
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
     respond_to_identity_challenge, safe_create_part, safe_incoming_name, safe_resume_part,
-    save_requests, sdnotify, session, shell_argv, shutdown, spawn_session_pumps, sshd,
+    sdnotify, session, shell_argv, shutdown, spawn_session_pumps, sshd,
     sshd_listening, store_provisional_identity, subnet_forward, sweep_completed_streams,
     test_hooks, verify_incoming, with_devices_mut,
 };
@@ -80,17 +82,23 @@ use crate::{
 use crate::{
     PendingBootstraps, complete_warm_bootstrap, handle_list_mounts, handle_list_warm, handle_mount,
     handle_mount_health, handle_unmount, handle_warm_bootstrap, reap_warm_bootstraps,
-    warm_link_for,
 };
 use anyhow::{Context, Result, bail};
 use filament_cap::capability as cap;
-// The control socket's request/reply types live in the peer-loop crate; the
-// server (`ctl::serve_at`) and the socket path stay in `crate::ctl`.
+// The control socket's request/reply TYPES live in the peer-loop crate; the
+// server and the socket path arrive through `HostServices::serve_control` and
+// `HostServices::control_sock_path`. The consent wording is used by the unix
+// control-socket handlers only.
+#[cfg(unix)]
+use filament_peerloop::consent::{REQUEST_WITHDRAWN, request_bar_refusal};
+#[cfg(unix)]
+use filament_peerloop::conn::warm_link_for;
 use filament_peerloop::control::Req;
 #[cfg(unix)]
 use filament_peerloop::control::ReqKind;
 use filament_peerloop::host::{CapGate, HostServices, Level, LogSink, StorageFailure, Tone};
 use filament_peerloop::present::{Ask, Presentation};
+use filament_peerloop::secret::fresh_secret;
 use filament_peerloop::shell::ShellHost;
 use filament_transfer::{MAX_RECV_RANGES, chunk_fits_offer};
 use serde_json::{Value, json};
@@ -1447,10 +1455,9 @@ pub(crate) async fn recv_cmd(
             ctl_ready = Some(ready_rx);
             let ctl_tx = ctl_tx.clone();
             let log = log.clone();
+            let host = host.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    ctl::serve_at(crate::ctl::control_sock_path(), ctl_tx, Some(ready_tx)).await
-                {
+                if let Err(e) = host.serve_control(ctl_tx, Some(ready_tx)).await {
                     // LOUD, not trace. Without the control socket every
                     // daemon-backed feature degrades silently -- warm links,
                     // `requests`, instant invitations -- and other commands then
@@ -1517,7 +1524,8 @@ pub(crate) async fn recv_cmd(
                 if let Ok(Err(_)) = tokio::time::timeout(Duration::from_secs(5), ready).await {
                     bail!(
                         "the control socket {} could not be created; the daemon is not starting",
-                        crate::ctl::control_sock_path().display()
+                        host.control_sock_path()
+                            .map_or_else(|| "<none>".to_string(), |p| p.display().to_string())
                     );
                 }
             }
@@ -2502,8 +2510,9 @@ pub(crate) async fn recv_cmd(
                                 // The signaling link as the serving loop sees it, so
                                 // `status` and `doctor` can tell a daemon that answers
                                 // here but is off the server (or keeps dropping) from a
-                                // healthy one. See signaling_health.
-                                "signaling": signaling_health::snapshot_json(),
+                                // healthy one. The host reports it; null means it has
+                                // no signaling link to describe.
+                                "signaling": host.signaling_snapshot(),
                                 "summary": counts.summary(),
                                 // #244: the LIVE shell posture. `revoke <dev> shell`
                                 // reads this so it can say when the shell it just
@@ -2513,7 +2522,7 @@ pub(crate) async fn recv_cmd(
                                 // Every other daemon flag, so `up` over this
                                 // daemon can tell whether the flags it was
                                 // given are already in effect.
-                                "launch": crate::up_logs::launch_report(
+                                "launch": host.launch_report(
                                     server,
                                     &dir,
                                     relay,
@@ -2568,8 +2577,8 @@ pub(crate) async fn recv_cmd(
                                 }
                             }
                         } else if matches!(&req.kind, ReqKind::ListPending) {
-                            let mut requests = load_requests();
-                            expire_requests(&mut requests);
+                            let mut requests = host.requests_load();
+                            host.requests_expire(&mut requests);
                             req.reply(&json!({
                                 "ok": true,
                                 "requests": requests,
@@ -2578,31 +2587,31 @@ pub(crate) async fn recv_cmd(
                             let id = *id;
                             let allow = allow.clone();
                             let expires = *expires;
-                            let mut requests = load_requests();
-                            expire_requests(&mut requests);
+                            let mut requests = host.requests_load();
+                            host.requests_expire(&mut requests);
                             if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
                                 let peer = r.peer.clone();
                                 let cap = r.capability.clone();
-                                if let Some(bar) = crate::request_bar(&peer) {
+                                if let Some(bar) = host.request_bar(&peer) {
                                     // The gate refuses this device whatever is
                                     // granted; never record an approval for it.
-                                    r.status = crate::REQUEST_WITHDRAWN.to_string();
-                                    save_requests(&requests);
-                                    req.reject(&crate::request_bar_refusal(id, &peer, bar)).await;
+                                    r.status = REQUEST_WITHDRAWN.to_string();
+                                    host.requests_save(&requests);
+                                    req.reject(&request_bar_refusal(id, &peer, bar)).await;
                                 } else if cap != allow {
                                     req.reject(&format!("request {id} is for '{cap}', not '{allow}'")).await;
                                 } else if !cap::grant_active(expires, cap::now_secs()) {
                                     req.reject("grant expiry must be in the future").await;
-                                } else if let Err(e) = device_set_cap(&peer, &cap, true, Some(expires)) {
+                                } else if let Err(e) = host.device_set_cap(&peer, &cap, true, Some(expires)) {
                                     req.reject(&format!("grant failed: {e}")).await;
-                                } else if let Err(e) = issue_signed_bounded_grant(&peer, &cap, expires).and_then(|signed| {
-                                    if signed { mark_bounded_cap_source(&peer, &cap, "signed") } else { Ok(()) }
+                                } else if let Err(e) = host.issue_signed_bounded_grant(&peer, &cap, expires).and_then(|signed| {
+                                    if signed { mark_bounded_cap_source(&peer, &cap, "signed").map_err(|e| e.to_string()) } else { Ok(()) }
                                 }) {
                                     req.reject(&format!("signed grant failed: {e}")).await;
                                 } else {
                                     r.status = "approved".to_string();
                                     r.granted_at = Some(cap::now_secs());
-                                    save_requests(&requests);
+                                    host.requests_save(&requests);
                                     req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap, "expires": expires })).await;
                                 }
                             } else {
@@ -2610,11 +2619,11 @@ pub(crate) async fn recv_cmd(
                             }
                         } else if let ReqKind::DenyRequest { id } = &req.kind {
                             let id = *id;
-                            let mut requests = load_requests();
-                            expire_requests(&mut requests);
+                            let mut requests = host.requests_load();
+                            host.requests_expire(&mut requests);
                             if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
                                 r.status = "denied".to_string();
-                                save_requests(&requests);
+                                host.requests_save(&requests);
                                 req.reply(&json!({ "ok": true, "id": id })).await;
                             } else {
                                 req.reject(&format!("request {id} not found or not pending")).await;

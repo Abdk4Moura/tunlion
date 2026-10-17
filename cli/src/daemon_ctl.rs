@@ -571,47 +571,11 @@ pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
 
 pub(crate) use crate::link_manager::peer_present;
 
+/// Resolve `peer` to a warm, trusted, alive link. Moved to
+/// `filament-peerloop::conn`: it takes the crate's `Conn` and returns the
+/// crate's transport pair, so the loop can call it without naming the CLI.
 #[cfg(unix)]
-/// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
-/// same key the L2 cap gate uses) to a warm, trusted, alive link, preferring a
-/// direct one. The single resolver for every warm-reuse op (open + pty), so the
-/// eligibility rule lives in exactly one place. A miss means the caller falls
-/// back to a fresh establish, which is correct.
-pub(crate) fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn net::Transport>)> {
-    use crate::link_manager::{LinkObs, Placement, Work, place};
-    // Eligibility is "do I know WHO this link reaches", because the caller is
-    // asking to route a request AT that peer. `l.trusted` is a narrower thing:
-    // the legacy blanket-trust flag, which a fleet link deliberately never sets
-    // (its identity comes from a verified certificate, and `admit_delegated`
-    // avoids `trusted` precisely so it cannot leak into the legacy_ok gates).
-    // Testing only `trusted` made every fleet sibling ineligible for the warm
-    // path, so `shell`/`open` fell through to a cold dial for a peer we hold no
-    // secret for and reported it as unreachable while a healthy link sat right
-    // there. A Proven identity binding answers the actual question.
-    // NOTE: this decides ROUTING, not permission. What the peer may do to us is
-    // still decided by the capability gate on the receiving side.
-    let links: Vec<LinkObs<'_>> = conn
-        .links
-        .iter()
-        .map(|(pid, l)| LinkObs {
-            pid: pid.as_str(),
-            verified_name: l.verified_name.as_deref(),
-            identity_known: l.trusted
-                || l.identity_binding == crate::capability::BindingStrength::Proven,
-            has_transport: l.transport.is_some(),
-            alive: l.transport.as_ref().is_some_and(|t| t.is_alive()),
-            direct: l.direct,
-            idle_ms: l.transport.as_ref().map_or(u64::MAX, |t| t.idle_ms()),
-        })
-        .collect();
-    match place(Work::Interactive, peer, &links) {
-        Placement::Reuse { pid } => {
-            let t = conn.links.get(&pid)?.transport.clone()?;
-            Some((pid, t))
-        }
-        Placement::Establish => None,
-    }
-}
+pub(crate) use filament_peerloop::conn::warm_link_for;
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
 /// is diagnosable (visible at `-v` / TUNLION_LOG=debug only).

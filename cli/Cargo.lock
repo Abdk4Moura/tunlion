@@ -1197,13 +1197,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "filament-cap",
  "filament-id",
  "filament-overlay",
  "filament-signal",
  "filament-transport",
  "quinn",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "webrtc",
 ]
