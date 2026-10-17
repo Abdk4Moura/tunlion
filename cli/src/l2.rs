@@ -1543,9 +1543,23 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
             Ev::Chunk(_pid, sid, _offset, data) if is_l2_sid(sid) => {
                 mux.on_frame(sid, data).await;
             }
-            Ev::PcState(_, s) if s == "failed" || s == "closed" || s == "disconnected" => {
-                crate::ui::debug(&format!("tunlion: tunnel {s}, closing streams"));
-                mux.shutdown_all().await;
+            Ev::PcState(pid, s)
+                if s == "failed" || s == "closed" || s == "disconnected" =>
+            {
+                // ICE/WebRTC candidates race the direct QUIC transport and
+                // report state through the same event channel. A losing
+                // candidate's state is not evidence that this mux's selected
+                // transport died. Only its own liveness can retire the mux.
+                if !mux.transport().is_alive() {
+                    crate::ui::debug(&format!(
+                        "tunlion: tunnel {s} for {pid}, closing streams"
+                    ));
+                    mux.shutdown_all().await;
+                } else {
+                    crate::ui::trace(&format!(
+                        "tunlion: ignoring tunnel {s} for {pid}; selected transport is alive"
+                    ));
+                }
             }
             _ => {}
         }

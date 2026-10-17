@@ -8907,8 +8907,16 @@ pub(crate) async fn recv_cmd(
                 // L2: a dead/closed link must abort every tunnel stream it
                 // carried so no pump hangs on a peer that's gone (design §3.5).
                 if l2_enabled && (s == "failed" || s == "closed" || s == "disconnected") {
-                    if let Some(mux) = l2_muxes.remove(&pid) {
-                        mux.shutdown_all().await;
+                    // A peer id can have multiple racing candidates (direct
+                    // QUIC and WebRTC). State from a losing candidate must not
+                    // tear down the mux riding the selected, still-live path.
+                    let selected_transport_dead = l2_muxes
+                        .get(&pid)
+                        .is_some_and(|mux| !mux.transport().is_alive());
+                    if selected_transport_dead {
+                        if let Some(mux) = l2_muxes.remove(&pid) {
+                            mux.shutdown_all().await;
+                        }
                     }
                     // #4: a genuinely DEAD link (failed/closed) DETACHES its PTY
                     // sessions, it does NOT kill them. The shell keeps running and
@@ -8918,7 +8926,10 @@ pub(crate) async fn recv_cmd(
                     // rides out (no new pty-open follows), so detaching there would
                     // wedge a still-working session. The detached-idle / lifetime
                     // caps in the session task reap a session nobody returns to.
-                    if (s == "failed" || s == "closed") && !pty_bindings.is_empty() {
+                    if selected_transport_dead
+                        && (s == "failed" || s == "closed")
+                        && !pty_bindings.is_empty()
+                    {
                         if let Some(sid_map) = pty_bindings.remove(&pid) {
                             for session_id in sid_map.values() {
                                 if let Some(sess) = pty_sessions.get_live(session_id).await {
