@@ -1,7 +1,6 @@
 //! HOST INTERFACES: what the peer loop asks for instead of importing the CLI.
 //!
-//! `Conn` (in `cli/src/conn.rs`) is the orchestration state every command's event
-//! loop manipulates. It reaches the host in exactly two ways: it renders lines to
+//! `Conn` is the orchestration state every command's event loop manipulates. It reaches the host in exactly two ways: it renders lines to
 //! a terminal, and it reads the machine's own facts (settings, devices.json, the
 //! owner key, the rendezvous channel derivation, the relay policy, whether a
 //! link is a proven fleet device). This module is the seam: two traits the CLI
@@ -22,6 +21,9 @@
 
 use std::fmt;
 use std::time::Duration;
+
+use filament_cap::capability::PrincipalKind;
+use filament_id::DeviceCert;
 
 /// Terminal tone, mirroring `cli::ui::Tone`. The crate carries the WORD (which
 /// role a span plays); the host decides what escapes, if any, that word means.
@@ -155,6 +157,35 @@ impl LogSink for VecLog {
 /// `Value`, so this crate keeps no serde dependency and the returned blob's
 /// ownership is unambiguous; the caller parses it exactly once.
 pub trait HostServices: Send + Sync + 'static {
+    /// The current unix time in seconds, from the host's clock.
+    fn now_secs(&self) -> u64 {
+        0
+    }
+    /// The stored device certificate for `name`, valid or not. The peer loop
+    /// runs `verify` itself so the expiry rule stays in one place.
+    fn device_cert_for(&self, _name: &str) -> Option<DeviceCert> {
+        None
+    }
+    /// The persisted auth-key ceiling for `name`, when that record is a
+    /// delegated (joined) device.
+    fn principal_ceiling_for(&self, _name: &str) -> Option<Vec<String>> {
+        None
+    }
+    /// The persisted principal record for a device certificate.
+    fn persisted_principal_for_cert(&self, _cert: &DeviceCert) -> PersistedPrincipal {
+        PersistedPrincipal::owner()
+    }
+    /// `min(cert_expiry, not_after, last_seen + max_offline)`. The CLI owns the
+    /// three-clock composer; this trait only carries its answer.
+    fn principal_deadline(
+        &self,
+        cert_expires: u64,
+        _not_after: Option<u64>,
+        _last_seen: Option<u64>,
+        _max_offline: Option<u64>,
+    ) -> u64 {
+        cert_expires
+    }
     /// A `settings::get_str` lookup with no per-peer override: the configured
     /// value, or `None`.
     fn settings_get_str(&self, key: &str) -> Option<String>;
@@ -175,6 +206,31 @@ pub trait HostServices: Send + Sync + 'static {
     fn roster_snapshot_json(&self) -> Option<String>;
     /// Is there a fleet rendezvous value on this machine at all?
     fn fleet_rv_present(&self) -> bool;
+}
+
+/// The persisted principal record behind a device certificate: the kind plus
+/// the three clocks `principal_deadline` composes. A plain struct rather than a
+/// tuple so the crate and the host cannot disagree about ordering.
+#[derive(Clone, Debug)]
+pub struct PersistedPrincipal {
+    pub kind: PrincipalKind,
+    pub not_after: Option<u64>,
+    pub max_offline: Option<u64>,
+    pub last_seen: Option<u64>,
+}
+
+impl PersistedPrincipal {
+    /// A missing or malformed record FAILS CLOSED as a ceiling-less delegated
+    /// principal (denies everything), so a half-persisted record can never
+    /// silently become an owner.
+    pub fn owner() -> Self {
+        Self {
+            kind: PrincipalKind::OwnerDevice,
+            not_after: None,
+            max_offline: None,
+            last_seen: None,
+        }
+    }
 }
 
 /// An inert [`HostServices`]: no settings, no devices, no owner key, relay

@@ -1,17 +1,12 @@
-# filament-peerloop -- the host-free decision and policy layer of the peer loop.
+# filament-peerloop -- the peer loop's engine: connection state and the policy
+# over it, moved out of cli/src (issue #465, slice 3).
 #
-# Carved out of cli/src/conn.rs (issue #465, slice 3, "link the engine"). What
-# lives here is the warm-hold state machine, the link liveness/route predicates,
-# the adoption matcher and the petname rule. Each of them decides something about
-# the LINKS, and none has an opinion about how a peer was found, authenticated or
-# named, where files live on this machine, or how anything is rendered to a
-# terminal. That is the test docs/design-libfilament.md sets for what may leave
-# the CLI: the reusable, host-independent piece leaves; the ORCHESTRATION stays.
-#
-# `Conn` itself deliberately does NOT come with it. `Conn` carries
-# `Arc<dyn Transport>`, `Arc<Peer>`, a signaling client and tokio channels, and it
-# is what every command's event loop manipulates; it moves in the next slice, as
-# a `git mv`, once this policy is already a crate underneath it.
+# `Conn`, `Link` and the modules they own (resilience, link_manager, local,
+# holepunch, identity) live here. What is NOT here is the command surface
+# (`send_cmd`, `recv_cmd`, the daemons, the roster UI): those decide what a person
+# asked for and render it. The terminal and the machine's own facts arrive
+# through the injected `host::LogSink` and `host::HostServices`; the CLI
+# implements both and keeps thin re-export shims under the old module paths.
 #
 # This crate never calls back into the CLI, so there is no cycle.
 [package]
@@ -21,17 +16,34 @@ authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Abdk4Moura/tunlion"
-description = "Host-free policy for tunlion's peer loop: warm-hold, link liveness, adoption and the petname rule"
+description = "The peer loop's engine: connection state, warm-hold, liveness, adoption and the petname rule"
 readme = "README.md"
 keywords = ["p2p", "peer", "warm-hold", "liveness", "policy"]
 categories = ["network-programming"]
 
+[features]
+# Fault-injection hooks the peer-loop paths read. The CLI forwards its own
+# `test-hooks` feature here, so a gate build injects into the moved code too.
+test-hooks = []
+debug-logs = []
+
 [dependencies]
-# The event vocabulary `schedule_retry` posts into (`Ev::RetryLink`). This crate
-# is policy only: it opens nothing and sends nothing, it hands the caller a value
-# or arms a timer that posts a decision back to the caller's loop.
+# Versions copied verbatim from cli/Cargo.toml, so the dependency graph and
+# behaviour match the CLI build these modules came from.
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+filament-cap = { path = "../filament-cap", version = "0.1.1" }
+filament-id = { path = "../filament-id", version = "0.1.0" }
+filament-signal = { path = "../filament-signal", version = "0.1.0" }
 filament-transport = { path = "../filament-transport", version = "0.1.0" }
-# `schedule_retry` arms its backoff on a spawned task, never on the caller's
-# event loop: sleeping inline froze every control request behind the retry ladder
-# (measured 4008ms against 7-10ms normal). Only the three pieces that needs.
-tokio = { version = "1.52.3", features = ["rt", "time", "sync"] }
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["full"] }
+webrtc = "0.17.1"
+
+[dev-dependencies]
+# The moved tests: a fake signaling websocket (base64/ring) and the frozen
+# punch literal digest (sha2).
+base64 = "0.22"
+ring = "0.17"
+sha2 = "0.11.0"
