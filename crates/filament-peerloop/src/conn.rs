@@ -804,6 +804,7 @@ const LOCAL_TCP_TRANSPORT: bool = false;
 /// Moved here from `cli/src/daemon_ctl.rs` with its body unchanged: it takes a
 /// [`Conn`] and returns a transport pair, both of which this crate owns, so the
 /// only thing that changed is the path that names it.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn Transport>)> {
     // Eligibility is "do I know WHO this link reaches", because the caller is
     // asking to route a request AT that peer. `l.trusted` is a narrower thing:

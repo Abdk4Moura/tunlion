@@ -46,7 +46,8 @@ tokio = { version = "1.52.3", features = ["full"] }
 webrtc = "0.17.1"
 
 [dev-dependencies]
-# The moved tests: a fake signaling websocket (base64/ring) and the frozen
-# punch literal digest (sha2).
+# The moved tests: a fake signaling websocket (base64/ring). sha2, used by the
+# frozen punch literal digest, is a normal dependency now that fresh_secret
+# needs it.
 base64 = "0.22"
 ring = "0.17"

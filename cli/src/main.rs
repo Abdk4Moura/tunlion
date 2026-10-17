@@ -239,7 +239,7 @@ use daemon_ctl::{DaemonMounts, WarmPtys, handle_warm_req, sshd_listening};
 use daemon_ctl::{
     PendingBootstraps, complete_warm_bootstrap, handle_list_mounts, handle_list_warm,
     handle_mount, handle_mount_health, handle_unmount, handle_warm_bootstrap,
-    reap_warm_bootstraps, warm_link_for,
+    reap_warm_bootstraps,
 };
 mod recv_files;
 #[cfg(test)]
