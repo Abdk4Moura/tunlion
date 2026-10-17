@@ -1768,7 +1768,7 @@ pub(crate) async fn recv_cmd(
                                         Ok((listener, port, tok)) => {
                                             crate::proxy_state::record("127.0.0.1", port);
                                             let server = server.to_string();
-                                            let log = log.clone();
+                                            let proxy_log = log.clone();
                                             tokio::spawn(async move {
                                                 if let Err(e) = l2::proxy_serve(
                                                     &server,
@@ -1781,7 +1781,7 @@ pub(crate) async fn recv_cmd(
                                                 )
                                                 .await
                                                 {
-                                                    log.critical(&format!(
+                                                    proxy_log.critical(&format!(
                                                         "auto-proxy on 127.0.0.1:{port} stopped: {e}"
                                                     ));
                                                 }
