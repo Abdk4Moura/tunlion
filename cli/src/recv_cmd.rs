@@ -25,12 +25,14 @@
 //! sink, not here.
 //!
 //! HOST FACTS: settings, the config directory, the keystore, the inbox
-//! permissions, the serving login name and the filesystem answers all arrive
+//! permissions, the serving login name, the filesystem answers, the capability
+//! store, the authoritative-mode switch and the gate counters all arrive
 //! through the `HostServices` passed to `recv_cmd` (`host` here, `conn.host` in
 //! the split-out handlers), so a caller with no machine runs the same loop with
-//! `NoHost`. What stays a direct import is what the crate already owns: the
-//! identity primitives (`filament-id`, imported as `identity`), transport and
-//! capability calls. Those are crate calls, not host ones.
+//! `NoHost`. What stays a direct import is what the crates already own: the
+//! identity primitives (`filament-id`, imported as `identity`), transport, and
+//! the pure capability evaluation/token work (`filament-cap`, imported as
+//! `cap`). Those are crate calls, not host ones.
 use crate::dlog;
 use crate::signaling_health;
 #[cfg(l3)]
@@ -44,7 +46,7 @@ use crate::{
     daemon_alive, device_allows, device_capability_denied, device_cert_revoked,
     device_name_for_pub, device_set_cap, devices_load, devices_path, devices_remove, devices_store,
     devices_sweep_lapsed, devices_touch, devices_upsert_atomic, direct, direct_ok_for,
-    display_name, enqueue_if_requestable, ensure_self_genesis_header, exec_recv, expire_requests,
+    display_name, enqueue_if_requestable, exec_recv, expire_requests,
     expose, finalize_incoming, fleet, fleet_identity_pending, fleet_route_ok, fleet_shaped_link,
     flush_inflight, fresh_secret, handle_auth_key_enroll_response, handle_cert_renew_ack,
     handle_identity_expose, handle_warm_req, human, identity, in_binding, interactive_allowed,
@@ -71,7 +73,8 @@ use crate::{
     warm_link_for,
 };
 use anyhow::{Context, Result, bail};
-use filament_peerloop::host::{HostServices, Level, LogSink, StorageFailure, Tone};
+use filament_cap::capability as cap;
+use filament_peerloop::host::{CapGate, HostServices, Level, LogSink, StorageFailure, Tone};
 use filament_peerloop::shell::ShellHost;
 use filament_transfer::{MAX_RECV_RANGES, chunk_fits_offer};
 use serde_json::{Value, json};
@@ -138,7 +141,7 @@ impl ParkKind {
     /// The capability an explicit per-device deny would name for this kind.
     pub(crate) fn denied_cap(self) -> &'static str {
         match self {
-            ParkKind::Sync => crate::capability::CAP_TRANSFER,
+            ParkKind::Sync => cap::CAP_TRANSFER,
             _ => "shell",
         }
     }
@@ -188,11 +191,11 @@ pub(crate) enum SweepArm {
 pub(crate) fn sweep_arm(
     device_pub: [u8; 32],
     generation: u32,
-    live: Option<(crate::capability::BindingStrength, Option<[u8; 32]>, u32)>,
+    live: Option<(cap::BindingStrength, Option<[u8; 32]>, u32)>,
     now: Instant,
     deadline: Instant,
 ) -> SweepArm {
-    use crate::capability::BindingStrength;
+    use cap::BindingStrength;
     match live {
         Some((BindingStrength::Proven, Some(pub_), link_gen))
             if pub_ == device_pub && link_gen == generation =>
@@ -335,7 +338,7 @@ pub(crate) fn deny_is_proof_attributable(reason: &str) -> bool {
     let final_prefixes = [
         crate::capability::EXPIRED_PREFIX,
         crate::capability::CEILING_REASON,
-        crate::capability::REVOKED_REASON,
+        cap::REVOKED_REASON,
         "device revoked",
         "shell revoked for",
         "explicitly denied",
@@ -365,7 +368,7 @@ pub(crate) async fn park_on_deny(
 ) -> bool {
     let (binding_proven, device_pub, generation, name) = match conn.link(pid) {
         Some(l) => (
-            l.identity_binding == crate::capability::BindingStrength::Proven,
+            l.identity_binding == cap::BindingStrength::Proven,
             l.identity_device_pub,
             l.generation,
             l.verified_name.clone(),
@@ -535,7 +538,7 @@ async fn handle_forward_open(
             &mut *conn,
             &pid,
             &shell_policy,
-            crate::capability::CAP_SHELL,
+            cap::CAP_SHELL,
         );
         // Forward's auto-trust bound is the EXPOSE list (a scoped default,
         // mode-independent); the enrolment ceiling plays no part here.
@@ -683,7 +686,7 @@ async fn handle_forward_open(
 fn serving_off_refusal(conn: &Conn, pid: &str, off: crate::refusal::Code) -> crate::refusal::Refusal {
     let who = conn.link(pid).and_then(|l| l.verified_name.clone());
     let outside = who.as_deref().and_then(crate::principal_ceiling_for).is_some_and(|c| {
-        crate::pair_cmd::grant_vs_ceiling(Some(c.as_slice()), crate::capability::CAP_SHELL, false)
+        crate::pair_cmd::grant_vs_ceiling(Some(c.as_slice()), cap::CAP_SHELL, false)
             == crate::pair_cmd::GrantVsCeiling::OutsideCeiling
     });
     let code = if outside { crate::refusal::Code::Ceiling } else { off };
@@ -767,7 +770,7 @@ async fn handle_pty_open(
         &mut *conn,
         &pid,
         &shell_policy,
-        crate::capability::CAP_SHELL,
+        cap::CAP_SHELL,
     );
     if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
         // Settle-then-evaluate: park for re-drive on proof when this deny
@@ -1146,7 +1149,7 @@ pub(crate) async fn recv_cmd(
     // on next `up` and new ones born correct. Tautological; widens nothing.
     if daemon {
         if let Some(uk) = host.user_key() {
-            if ensure_self_genesis_header(&host.config_dir(), &uk) {
+            if host.ensure_self_genesis_header(&uk) {
                 log.debug("seeded owner self genesis capability header");
             }
         }
@@ -2381,8 +2384,8 @@ pub(crate) async fn recv_cmd(
                         } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
                             handle_mount_health(req, &daemon_mounts).await;
                         } else if matches!(&req.kind, ctl::ReqKind::CapStatus) {
-                            let counts = crate::capability::cap_shadow_counts();
-                            let action_counts = crate::capability::cap_action_counts();
+                            let counts = host.cap_shadow_counts();
+                            let action_counts = host.cap_action_counts();
                             req.reply(&json!({
                                 "ok": true,
                                 "counts": {
@@ -2490,7 +2493,7 @@ pub(crate) async fn recv_cmd(
                                     req.reject(&crate::request_bar_refusal(id, &peer, bar)).await;
                                 } else if cap != allow {
                                     req.reject(&format!("request {id} is for '{cap}', not '{allow}'")).await;
-                                } else if !crate::capability::grant_active(expires, crate::capability::now_secs()) {
+                                } else if !cap::grant_active(expires, cap::now_secs()) {
                                     req.reject("grant expiry must be in the future").await;
                                 } else if let Err(e) = device_set_cap(&peer, &cap, true, Some(expires)) {
                                     req.reject(&format!("grant failed: {e}")).await;
@@ -2500,7 +2503,7 @@ pub(crate) async fn recv_cmd(
                                     req.reject(&format!("signed grant failed: {e}")).await;
                                 } else {
                                     r.status = "approved".to_string();
-                                    r.granted_at = Some(crate::capability::now_secs());
+                                    r.granted_at = Some(cap::now_secs());
                                     save_requests(&requests);
                                     req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap, "expires": expires })).await;
                                 }
@@ -4547,7 +4550,7 @@ pub(crate) async fn recv_cmd(
                                     (
                                         l.identity_device_pub.is_some(),
                                         l.identity_binding
-                                            == crate::capability::BindingStrength::Proven,
+                                            == cap::BindingStrength::Proven,
                                     )
                                 })
                                 .unwrap_or((false, false));
@@ -4650,7 +4653,7 @@ pub(crate) async fn recv_cmd(
                     .map(|l| {
                         (
                             l.identity_device_pub.is_some(),
-                            l.identity_binding == crate::capability::BindingStrength::Proven,
+                            l.identity_binding == cap::BindingStrength::Proven,
                         )
                     })
                     .unwrap_or((false, false));
@@ -4661,7 +4664,7 @@ pub(crate) async fn recv_cmd(
                 // would then decide a legacy-trusted offer with
                 // cert_revoked_for(None)=false, letting a revoked device push a
                 // transfer before its revoked cert resolves.
-                let needs_challenge = if crate::capability::cap_authoritative() {
+                let needs_challenge = if host.cap_authoritative() {
                     idev_known && !proven
                 } else {
                     recv_code_path && !idev_known
@@ -4678,7 +4681,7 @@ pub(crate) async fn recv_cmd(
                         &mut identity_nonces,
                     )
                     .await;
-                    if crate::capability::cap_authoritative() {
+                    if host.cap_authoritative() {
                         log.say(&format!(
                             "  identity challenge sent to {pid}, holding until Proven or timeout"
                         ));
@@ -5551,7 +5554,6 @@ pub(crate) async fn recv_cmd(
                                                 )
                                                 .map(|v| v == "on" || v == "true")
                                                 .unwrap_or(false);
-                                                let config_dir = host.config_dir();
                                                 // The OWNER's public key, which is
                                                 // not the same as holding the
                                                 // owner's signing key.
@@ -5631,11 +5633,12 @@ pub(crate) async fn recv_cmd(
                                                                 .map(str::to_string)
                                                         })
                                                         .collect();
+                                                let config_dir = host.config_dir();
                                                 let ok = crate::l3::installable_routes(
                                                     &advertised,
                                                     accept,
                                                     |cidr| {
-                                                        if crate::capability::cidr_within_any(
+                                                        if cap::cidr_within_any(
                                                             cidr,
                                                             &ceiling_routes,
                                                         ) {
@@ -5645,7 +5648,7 @@ pub(crate) async fn recv_cmd(
                                                             return false;
                                                         };
                                                         let Ok(res) =
-                                                            crate::capability::route_resource_id(
+                                                            cap::route_resource_id(
                                                                 &pk, cidr,
                                                             )
                                                         else {
@@ -5655,12 +5658,12 @@ pub(crate) async fn recv_cmd(
                                                             crate::capability::cap_authorize(
                                                                 &config_dir,
                                                                 &res,
-                                                                crate::capability::CAP_ROUTE,
+                                                                cap::CAP_ROUTE,
                                                                 idev.as_ref(),
                                                                 iusr.as_ref(),
                                                                 None,
                                                             ),
-                                                            crate::capability::CapOutcome::Authorized
+                                                            cap::CapOutcome::Authorized
                                                         )
                                                     },
                                                 );
@@ -6167,13 +6170,13 @@ pub(crate) async fn recv_cmd(
                     // shortly and let the loop drain. The hold entry clears on
                     // Proven OR at the 3s deadline, so this self-terminates and
                     // the re-injected bootstrap is then decided for real.
-                    if crate::capability::cap_authoritative() {
+                    if host.cap_authoritative() {
                         let challenge_in_flight =
                             st.pending_proven.lock().unwrap().contains_key(&pid);
                         let proven = conn
                             .link(&pid)
                             .map(|l| {
-                                l.identity_binding == crate::capability::BindingStrength::Proven
+                                l.identity_binding == cap::BindingStrength::Proven
                             })
                             .unwrap_or(false);
                         if challenge_in_flight && !proven {
@@ -6210,7 +6213,7 @@ pub(crate) async fn recv_cmd(
                         let outcome = crate::capability::cap_authorize(
                             &host.config_dir(),
                             "self",
-                            crate::capability::CAP_SHELL,
+                            cap::CAP_SHELL,
                             idev,
                             iusr,
                             ak_caps,
@@ -6219,7 +6222,7 @@ pub(crate) async fn recv_cmd(
                             let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
                                 &host.config_dir(),
                                 "self",
-                                crate::capability::CAP_SHELL,
+                                cap::CAP_SHELL,
                                 idev,
                                 iusr,
                                 ak_caps,
@@ -6233,23 +6236,23 @@ pub(crate) async fn recv_cmd(
                                 .as_deref()
                                 .map(|n| device_capability_denied(n, "shell"))
                                 .unwrap_or(false);
-                            crate::capability::cap_gate_effective(
-                                legacy_ok,
-                                &outcome,
-                                crate::capability::CAP_SHELL,
-                                "self",
-                                idev,
-                                iusr,
+                            host.cap_gate_effective(CapGate {
+                                legacy_allowed: legacy_ok,
+                                outcome: &outcome,
+                                action: cap::CAP_SHELL,
+                                resource: "self",
+                                device_pub: idev,
+                                user_pub: iusr,
                                 binding,
-                                expires,
-                                ak_caps,
-                                own_user.as_ref(),
-                                false,
-                                has_grant,
+                                cert_expires: expires,
+                                auth_key_caps: ak_caps,
+                                own_user_pub: own_user.as_ref(),
+                                scoped_in_bounds: false,
+                                has_explicit_grant: has_grant,
                                 cert_revoked,
                                 denied,
-                                false,
-                            )
+                                ceiling_authorizes: false,
+                            })
                         }
                     };
                     if !granted.allowed() {
@@ -6528,22 +6531,19 @@ pub(crate) async fn recv_cmd(
                     let (authorized, read_only) = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
+                        let authoritative = host.cap_authoritative();
                         let outcome = crate::capability::cap_authorize(
                             &host.config_dir(),
                             "self",
-                            crate::capability::CAP_MOUNT,
+                            cap::CAP_MOUNT,
                             idev,
                             iusr,
                             ak_caps,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize mount (pair-proof vs device-key).
-                        let outcome = crate::capability::cap_trust_floor(
-                            &outcome,
-                            trusted,
-                            binding,
-                            crate::capability::cap_authoritative(),
-                        );
+                        let outcome =
+                            cap::cap_trust_floor(&outcome, trusted, binding, authoritative);
                         // Fleet scope: a same-owner Proven device may mount WITHOUT a
                         // grant ONLY read-only, within the share root (scoped_in_bounds
                         // = within_share). An auto-trusted fleet mount is served
@@ -6551,7 +6551,7 @@ pub(crate) async fn recv_cmd(
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
                             &host.config_dir(),
                             "self",
-                            crate::capability::CAP_MOUNT,
+                            cap::CAP_MOUNT,
                             idev,
                             iusr,
                             ak_caps,
@@ -6574,7 +6574,7 @@ pub(crate) async fn recv_cmd(
                         let _ = within_share;
                         let mount_scoped_default = false;
                         let read_only = same_owner
-                            && binding == crate::capability::BindingStrength::Proven
+                            && binding == cap::BindingStrength::Proven
                             && mount_scoped_default
                             && !has_grant;
                         // The legacy input, which IS the verdict in shadow mode:
@@ -6586,8 +6586,8 @@ pub(crate) async fn recv_cmd(
                             .as_deref()
                             .map(|n| {
                                 (
-                                    device_allows(n, crate::capability::CAP_MOUNT),
-                                    device_capability_denied(n, crate::capability::CAP_MOUNT),
+                                    device_allows(n, cap::CAP_MOUNT),
+                                    device_capability_denied(n, cap::CAP_MOUNT),
                                 )
                             })
                             .unwrap_or((false, false));
@@ -6597,23 +6597,23 @@ pub(crate) async fn recv_cmd(
                             has_grant,
                             denied,
                         );
-                        let d = crate::capability::cap_gate_effective(
-                            legacy_ok,
-                            &outcome,
-                            crate::capability::CAP_MOUNT,
-                            "self",
-                            idev,
-                            iusr,
+                        let d = host.cap_gate_effective(CapGate {
+                            legacy_allowed: legacy_ok,
+                            outcome: &outcome,
+                            action: cap::CAP_MOUNT,
+                            resource: "self",
+                            device_pub: idev,
+                            user_pub: iusr,
                             binding,
-                            expires,
-                            ak_caps,
-                            own_user.as_ref(),
-                            mount_scoped_default,
-                            has_grant,
+                            cert_expires: expires,
+                            auth_key_caps: ak_caps,
+                            own_user_pub: own_user.as_ref(),
+                            scoped_in_bounds: mount_scoped_default,
+                            has_explicit_grant: has_grant,
                             cert_revoked,
                             denied,
-                            false,
-                        );
+                            ceiling_authorizes: false,
+                        });
                         (d, read_only)
                     };
                     if !authorized.allowed() {
@@ -6878,13 +6878,13 @@ pub(crate) async fn recv_cmd(
                         // idempotent — if DirectReady already challenged this pid the call is a
                         // no-op and does not clobber the in-flight nonce. The transport exists by
                         // construction (this handler was reached by a control message on it).
-                        if crate::capability::cap_authoritative() {
+                        if host.cap_authoritative() {
                             let needs_proven = conn
                                 .link(&pid)
                                 .map(|l| {
                                     l.identity_device_pub.is_some()
                                         && l.identity_binding
-                                            != crate::capability::BindingStrength::Proven
+                                            != cap::BindingStrength::Proven
                                 })
                                 .unwrap_or(false);
                             if needs_proven {
@@ -7142,7 +7142,7 @@ pub(crate) async fn recv_cmd(
                                                                             if let Some(l) = conn.link_mut(&pid) {
                                                                                 l.identity_device_pub = Some(cert.device_pub);
                                                                                 l.identity_user_pub = Some(cert.user_pub);
-                                                                                l.identity_binding = crate::capability::BindingStrength::Proven;
+                                                                                l.identity_binding = cap::BindingStrength::Proven;
                                                                                 l.identity_cert_expires = Some(cert.expires);
                                                                             }
                                                                             // The peer by name, not its raw signaling id.
@@ -7345,7 +7345,7 @@ pub(crate) async fn recv_cmd(
                             .map(|l| {
                                 (
                                     l.identity_binding
-                                        == crate::capability::BindingStrength::Proven,
+                                        == cap::BindingStrength::Proven,
                                     l.identity_device_pub.is_some(),
                                     l.presence == Presence::Ready,
                                 )
@@ -7368,7 +7368,7 @@ pub(crate) async fn recv_cmd(
                                 deadline.elapsed() < RECV_IDENTITY_HOLD_DEADLINE
                             }
                         } else {
-                            crate::capability::cap_authoritative() && challenge_in_flight && !proven
+                            host.cap_authoritative() && challenge_in_flight && !proven
                         };
                         if hold {
                             let rtx = tx.clone();
@@ -7424,25 +7424,22 @@ pub(crate) async fn recv_cmd(
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under TUNLION_CAP_AUTHORITATIVE.
+                    let authoritative = host.cap_authoritative();
                     let (ok, xfer_deny_reason, xfer_gate) = {
                         let az = peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
                             &host.config_dir(),
                             "self",
-                            crate::capability::CAP_TRANSFER,
+                            cap::CAP_TRANSFER,
                             idev,
                             iusr,
                             ak_caps,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize transfer (pair-proof vs device-key).
-                        let outcome = crate::capability::cap_trust_floor(
-                            &outcome,
-                            link_trusted,
-                            binding,
-                            crate::capability::cap_authoritative(),
-                        );
+                        let outcome =
+                            cap::cap_trust_floor(&outcome, link_trusted, binding, authoritative);
                         // Fleet transfer scope, enforced by construction and VERIFIED
                         // here (not hardcoded `true`, which asserted a bound nothing
                         // checked). The offered name is basename-only (see ~14095:
@@ -7461,32 +7458,32 @@ pub(crate) async fn recv_cmd(
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
                             &host.config_dir(),
                             "self",
-                            crate::capability::CAP_TRANSFER,
+                            cap::CAP_TRANSFER,
                             idev,
                             iusr,
                             ak_caps,
                         );
                         // No deny list is consulted on the transfer path today;
                         // false preserves that exactly.
-                        let d = crate::capability::cap_gate_effective(
-                            legacy_ok,
-                            &outcome,
-                            crate::capability::CAP_TRANSFER,
-                            "self",
-                            idev,
-                            iusr,
+                        let d = host.cap_gate_effective(CapGate {
+                            legacy_allowed: legacy_ok,
+                            outcome: &outcome,
+                            action: cap::CAP_TRANSFER,
+                            resource: "self",
+                            device_pub: idev,
+                            user_pub: iusr,
                             binding,
-                            expires,
-                            ak_caps,
-                            own_user.as_ref(),
+                            cert_expires: expires,
+                            auth_key_caps: ak_caps,
+                            own_user_pub: own_user.as_ref(),
                             scoped_in_bounds,
-                            has_grant,
+                            has_explicit_grant: has_grant,
                             cert_revoked,
-                            false,
-                            false,
-                        );
+                            denied: false,
+                            ceiling_authorizes: false,
+                        });
                         let reason =
-                            if let crate::capability::GateDecision::Deny { cap_reason } = &d {
+                            if let cap::GateDecision::Deny { cap_reason } = &d {
                                 cap_reason.clone()
                             } else {
                                 None
@@ -7495,17 +7492,14 @@ pub(crate) async fn recv_cmd(
                             "transfer-gate: from={sender_name} allowed={} legacy_ok={legacy_ok} trusted={link_trusted} binding={binding:?} own_user={} has_grant={has_grant} in_bounds={scoped_in_bounds} revoked={cert_revoked} authoritative={} reason={:?}",
                             d.allowed(),
                             own_user.is_some(),
-                            crate::capability::cap_authoritative(),
+                            authoritative,
                             reason
                         ));
                         (d.allowed(), reason, d)
                     };
                     // Under authoritative, a capability Deny hard-declines
                     // immediately: no prompt, skip the accept path entirely.
-                    if let Some(reason) = crate::capability::transfer_gate_decision(
-                        &xfer_gate,
-                        crate::capability::cap_authoritative(),
-                    ) {
+                    if let Some(reason) = cap::transfer_gate_decision(&xfer_gate, authoritative) {
                         log.say(&log.paint(
                             Tone::Dim,
                             &format!("  declined {name} from {sender_name} ({reason})",),
@@ -9015,7 +9009,7 @@ mod settle_tests {
     /// generation check) without noticing.
     #[test]
     fn sweep_arms_cover_fire_and_each_stale_way() {
-        use crate::capability::BindingStrength as B;
+        use cap::BindingStrength as B;
         let now = Instant::now();
         let past = now + Duration::from_secs(3);
         let deadline = now + Duration::from_secs(2);
@@ -9139,6 +9133,7 @@ fn note_refusal(
 #[cfg(test)]
 mod expiry_redrive_tests {
     use super::{deny_is_proof_attributable, policy_decline_msg};
+    use filament_cap::capability as cap;
 
     /// The lab defect: an exec denied because the guest's invitation had ended
     /// was parked "for identity proof", then RE-DRIVEN and run once the peer
@@ -9149,7 +9144,7 @@ mod expiry_redrive_tests {
         for reason in [
             crate::capability::expired_reason(1_760_000_000),
             crate::capability::CEILING_REASON.to_string(),
-            crate::capability::REVOKED_REASON.to_string(),
+            cap::REVOKED_REASON.to_string(),
             "device revoked".to_string(),
             "shell revoked for 'b' here".to_string(),
             "explicitly denied by owner (deniedCaps)".to_string(),
