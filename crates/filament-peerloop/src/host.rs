@@ -413,6 +413,36 @@ pub trait HostServices: Send + Sync + 'static {
     fn cap_gate_effective(&self, _gate: CapGate<'_>) -> GateDecision {
         GateDecision::Deny { cap_reason: None }
     }
+    /// Is this device's certificate revoked in the host's own store? Keyed by
+    /// the resolved device key, never by a display name. An inert host records
+    /// no revocations, so it answers no.
+    fn cert_revoked_for(&self, _device_pub: Option<&[u8; 32]>) -> bool {
+        false
+    }
+    /// The delegated access this host's device record grants, read fresh at the
+    /// gate. `None` means the record is not a delegated principal, which is
+    /// also the inert answer: a host with no device store has admitted no
+    /// guest, so no guest deadline is being enforced.
+    fn delegated_access_for(&self, _device_pub: &[u8; 32]) -> Option<DelegatedAccess> {
+        None
+    }
+    /// Has the owner explicitly denied this capability to `name`? A revoke is a
+    /// decision, so the gate reads it before any policy default. An inert host
+    /// records no denies.
+    fn device_capability_denied(&self, _name: &str, _capability: &str) -> bool {
+        false
+    }
+    /// Does this device's store record grant `capability` to `name`? An inert
+    /// host records no devices, so it grants nothing.
+    fn device_allows(&self, _name: &str, _capability: &str) -> bool {
+        false
+    }
+    /// Does the persisted, owner-signed enrolment ceiling cover `action` for
+    /// this device key? Read fresh, never cached; an inert host has no ceiling
+    /// and so covers nothing.
+    fn ceiling_covers_action(&self, _device_pub: Option<&[u8; 32]>, _action: &str) -> bool {
+        false
+    }
     /// Every pending consent request this host holds, parsed from its own
     /// store. A refused action from an identified peer lands here until the
     /// owner approves or denies it.
@@ -523,6 +553,22 @@ pub trait HostServices: Send + Sync + 'static {
         _no_proxy_fallback: bool,
     ) -> Value {
         Value::Null
+    }
+}
+
+/// The delegated access a host's device record grants: the ceiling it was
+/// admitted with and the one moment its access ends. The gate needs only these
+/// two facts; the host composes the deadline from its own three clocks.
+#[derive(Clone, Debug)]
+pub struct DelegatedAccess {
+    pub ceiling: Vec<String>,
+    pub deadline: u64,
+}
+
+impl DelegatedAccess {
+    /// Past the deadline the device has no access at all.
+    pub fn expired(&self, now: u64) -> bool {
+        now >= self.deadline
     }
 }
 
@@ -726,6 +772,15 @@ mod tests {
         assert!(!host.cap_authoritative());
         assert_eq!(host.cap_shadow_counts().la_authorized, 0);
         assert!(host.cap_action_counts().is_empty());
+        // The gate's store reads answer inertly: no revocation, no delegated
+        // guest, no deny, no grant, no ceiling. None of them can turn a
+        // refusal into an allow.
+        assert!(!host.cert_revoked_for(Some(&[0u8; 32])));
+        assert!(host.delegated_access_for(&[0u8; 32]).is_none());
+        assert!(!host.device_capability_denied("alpha", "shell"));
+        assert!(!host.device_allows("alpha", "shell"));
+        assert!(!host.ceiling_covers_action(Some(&[0u8; 32]), "shell"));
+        assert!(!host.ceiling_covers_action(None, "shell"));
     }
 
     #[tokio::test]

@@ -158,20 +158,10 @@ pub(crate) const PRINCIPAL_STATE_REVOKED: &str = "revoked";
 /// used as a capability key regardless.
 pub(crate) use filament_peerloop::limits::FLEET_LINK_NAME;
 
-/// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
-/// may `tunlion shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
-/// always enforced separately, this is purely the capability side.
-#[derive(Clone, Debug)]
-pub(crate) enum ShellPolicy {
-    /// Default: only devices explicitly `grant`ed the `shell` cap.
-    Granted,
-    /// `up --shell`: any paired device. M-2: this INTENTIONALLY grants every
-    /// proof-verified paired device, including ones introduced later via
-    /// pair-intro. Use `Only`/`--shell-only` to scope it.
-    All,
-    /// `up --shell-only a,b`: only these petnames auto-shell; others need a grant.
-    Only(std::collections::HashSet<String>),
-}
+// The auto-shell policy moved to `filament_peerloop::shell_gate` with the gate
+// that applies it (issue #465). Re-exported here so every CLI caller and the
+// `crate::ShellPolicy` re-export keep resolving.
+pub(crate) use filament_peerloop::shell_gate::ShellPolicy;
 
 /// One pending consent request, moved to `filament-peerloop::consent` so the
 /// receive loop can name it without a CLI type. Re-exported here: every stored
@@ -219,14 +209,8 @@ pub(crate) enum ServiceManager {
 /// drifted in whitespace, which is the usual sign of paste.
 ///
 /// Owned, not borrowed, so a caller can hold it while still using `conn`.
-pub(crate) struct PeerAuthz {
-    pub(crate) idev: Option<[u8; 32]>,
-    pub(crate) iusr: Option<[u8; 32]>,
-    pub(crate) binding: crate::capability::BindingStrength,
-    pub(crate) expires: Option<u64>,
-    pub(crate) cert_revoked: bool,
-    pub(crate) ak_caps: Option<Vec<String>>,
-}
+// `PeerAuthz` and its resolver moved with the gate (issue #465).
+pub(crate) use filament_peerloop::shell_gate::PeerAuthz;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountPlan {

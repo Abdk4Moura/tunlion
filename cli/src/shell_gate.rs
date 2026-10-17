@@ -1,211 +1,48 @@
-//! The single shell gate shared by pty-open, exec-open, and ssh-sign.
+//! CLI shim over `filament_peerloop::shell_gate`.
 //!
-//! Both paths resolve the same inputs (link trust, device naming, legacy
-//! store checks, capability inputs) and then the same verdict: the
-//! capability engine's `granted.allowed()`, unconditionally -- no shadow /
-//! authoritative split, no legacy fallback. Under the old split a revoked
-//! certificate was still allowed whenever legacy checks passed, so exec
-//! could be MORE permissive than a shell; the engine itself already denies
-//! revoked certs absolutely (both modes), the split only hid it.
+//! The single shell gate moved into the peer-loop crate in issue #465 slice 3.
+//! The module name stays because pty-open, exec-open, forward, ssh-sign and the
+//! devices view already import it; the types and the gathering function are
+//! re-exported under their old names.
 //!
-//! `exec_gate_decision` and `pty_gate_decision` are deliberately separate
-//! one-line entry points over one core: the cross-path equivalence test
-//! calls both for every matrix cell, so any future per-path divergence
-//! (the exact regression that motivated this module) turns red instead of
-//! shipping silently.
+//! The four verdict entry points keep their one-argument signatures here. The
+//! crate takes the host explicitly so an embedder can supply its own; the CLI
+//! has exactly one `HostServices` implementation (`host_impl::CliHost`), so the
+//! wrappers bind it and every call site stays byte-identical. This is a binding,
+//! not a second decision: the core, the fold and the policy site are the
+//! crate's.
+#![allow(unused_imports)]
 
-use crate::capability::{BindingStrength, CapOutcome, GateDecision};
-use crate::conn::Conn;
+use filament_cap::capability::{BindingStrength, CapOutcome, GateDecision, PrincipalKind};
 
-/// Gathered gate inputs: link-derived + store-derived + policy, pre-decision.
-/// Plain data (no Conn), so the matrix test can fabricate every cell.
-pub(crate) struct ShellGateInputs {
-    pub trusted: bool,
-    pub denied: bool,
-    pub policy_allows: bool,
-    pub store_allows: bool,
-    pub outcome: CapOutcome,
-    pub idev: Option<[u8; 32]>,
-    pub iusr: Option<[u8; 32]>,
-    pub binding: BindingStrength,
-    pub expires: Option<u64>,
-    pub ak_caps: Option<Vec<String>>,
-    pub own_user: Option<[u8; 32]>,
-    pub has_grant: bool,
-    pub cert_revoked: bool,
-    /// The gated action, threaded from gather through decide so no shell
-    /// literal can drift between callers. All current callers pass CAP_SHELL.
-    pub action: String,
-    /// Whether the peer's persisted, owner-signed enrolment ceiling covers
-    /// the gated action. Gathered fresh (never cached) via
-    /// `ceiling_covers_action`, keyed by verified device identity. Feeds the
-    /// engine's `ceiling_authorizes`, which decides only under authoritative
-    /// mode (shadow must decide exactly as it did before this feature).
-    pub ceiling_covers: bool,
-    /// The SCOPE-DEFAULT class for this open (transfer into the drop dir,
-    /// forward to an exposed port). Distinct from the ceiling: this class has
-    /// always auto-authorized same-owner Proven devices in BOTH modes.
-    /// False for the shell-class paths, which are deliberate-tier.
-    pub scoped_default: bool,
-}
+pub(crate) use filament_peerloop::shell_gate::{
+    PeerAuthz, ShellGateInputs, ShellPolicy, exec_gate_decision as gate_exec_decision,
+    fleet_link_proven, forward_gate_decision as gate_forward_decision,
+    gather_shell_gate_inputs, peer_authz, pty_gate_decision as gate_pty_decision,
+    ssh_gate_decision as gate_ssh_decision,
+};
 
-/// Gather from live state. Both call sites use this; nothing gate-relevant
-/// is resolved anywhere else, so the three paths cannot drift in inputs.
-pub(crate) fn gather_shell_gate_inputs(
-    conn: &mut Conn,
-    pid: &str,
-    shell_policy: &crate::ShellPolicy,
-    action: &str,
-) -> (Option<String>, ShellGateInputs) {
-    // Eval item 4: a fleet sibling (met by fleet-hello, no pair secret) is
-    // born `trusted: false` and stays so, so `grant <sibling> shell` on a
-    // member recorded a grant the fold could never honour while the caps
-    // view (which assumes an authenticated link) said EFFECTIVE yes. A
-    // proven fleet link satisfies the record-grant term; the blanket
-    // `--shell` policy still speaks for PAIRED devices only.
-    let (pair_trusted, fleet_proven) = conn
-        .link(pid)
-        .map(|l| (l.trusted, l.fleet_proven()))
-        .unwrap_or((false, false));
-    let trusted = pair_trusted || fleet_proven;
-    let dev = conn.link(pid).and_then(|l| l.verified_name.clone());
-    let (denied, policy_allows, store_allows) = match dev.as_deref() {
-        Some(n) => (
-            crate::device_capability_denied(n, action),
-            pair_trusted && shell_policy.auto_allows(n),
-            crate::device_allows(n, action),
-        ),
-        None => (false, false, false),
-    };
-    let az = crate::peer_authz(conn, pid);
-    let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-    let outcome = crate::capability::cap_authorize(
-        &crate::settings::config_dir(),
-        "self",
-        action,
-        idev,
-        iusr,
-        ak_caps,
-    );
-    let ceiling_covers = crate::identity_state::ceiling_covers_action(idev, action);
-    let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-        &crate::settings::config_dir(),
-        "self",
-        action,
-        idev,
-        iusr,
-        ak_caps,
-    );
-    let inputs = ShellGateInputs {
-        trusted,
-        denied,
-        policy_allows,
-        store_allows,
-        outcome,
-        idev: idev.copied(),
-        iusr: iusr.copied(),
-        binding,
-        expires,
-        ak_caps: ak_caps.map(|s| s.to_vec()),
-        own_user,
-        has_grant,
-        cert_revoked,
-        ceiling_covers,
-        scoped_default: false,
-        action: action.to_string(),
-    };
-    (dev, inputs)
-}
-
-/// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
-/// identity is Proven and whose local name came from that proven key. The RULE
-/// itself now lives in `filament-peerloop` (written once, shared with the peer
-/// loop); this is the enum-shaped wrapper so the callers and tests here keep
-/// their signatures.
-pub(crate) fn fleet_link_proven(
-    kind: &crate::capability::PrincipalKind,
-    binding: BindingStrength,
-    has_device_pub: bool,
-    has_verified_name: bool,
-) -> bool {
-    filament_peerloop::host::fleet_link_proven(
-        matches!(kind, crate::capability::PrincipalKind::FleetDevice),
-        binding == BindingStrength::Proven,
-        has_device_pub,
-        has_verified_name,
-    )
-}
-
-/// Shared verdict core: legacy folds trust the same way for both paths, then
-/// the capability verdict decides alone. Returns the engine's cap reason
-/// when it names one; each call site applies its own fallback wording for
-/// the reason-less case (pty and exec historically differ there, preserved).
-fn decide(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
-    decide_with_legacy(
-        inputs,
-        inputs.trusted && !inputs.denied && (inputs.policy_allows || inputs.store_allows),
-    )
-}
-
-/// Verdict core with a caller-supplied legacy fold. exec/pty/ssh-sign use
-/// the shell fold above; the forward path passes its own blanket fold
-/// (blanket L2 mode admits trusted peers with no shell policy behind it,
-/// which the shell fold cannot express -- dropping it would newly deny
-/// default setups in shadow). Same engine, same inputs otherwise.
-fn decide_with_legacy(inputs: &ShellGateInputs, legacy_ok: bool) -> Result<(), Option<String>> {
-    // Two auto-trust classes travel separately: `scoped_default` (mode
-    // independent, pre-existing) and `ceiling_covers` (authoritative-only
-    // for the decision; counted as would-allow in shadow so the ceiling
-    // population is not mistaken for breakage).
-    let granted = crate::capability::cap_gate_effective(
-        legacy_ok,
-        &inputs.outcome,
-        &inputs.action,
-        "self",
-        inputs.idev.as_ref(),
-        inputs.iusr.as_ref(),
-        inputs.binding,
-        inputs.expires,
-        inputs.ak_caps.as_deref(),
-        inputs.own_user.as_ref(),
-        inputs.scoped_default,
-        inputs.has_grant,
-        inputs.cert_revoked,
-        inputs.denied,
-        inputs.ceiling_covers,
-    );
-    match granted {
-        GateDecision::Allow => Ok(()),
-        GateDecision::Deny { cap_reason } => Err(cap_reason),
-    }
-}
-
-/// Exec-open's entry point: delegates to the shared core (no local logic).
+/// Exec-open's verdict, with the CLI's host bound.
 pub(crate) fn exec_gate_decision(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
-    decide(inputs)
+    gate_exec_decision(inputs, &crate::host_impl::CliHost)
 }
 
-/// Pty-open's entry point: delegates to the shared core (no local logic).
+/// Pty-open's verdict, with the CLI's host bound.
 pub(crate) fn pty_gate_decision(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
-    decide(inputs)
+    gate_pty_decision(inputs, &crate::host_impl::CliHost)
 }
 
-/// Forward-open's entry point: same shared core, but the caller supplies
-/// the legacy fold (see above) and overrides `ceiling_covers` with its
-/// expose.json bound before calling. A forward --stdio to an exposed sshd
-/// is shell-equivalent in reach.
+/// Forward-open's verdict, with the caller's legacy fold and the CLI's host.
 pub(crate) fn forward_gate_decision(
     inputs: &ShellGateInputs,
     legacy_ok: bool,
 ) -> Result<(), Option<String>> {
-    decide_with_legacy(inputs, legacy_ok)
+    gate_forward_decision(inputs, legacy_ok, &crate::host_impl::CliHost)
 }
 
-/// SSH-sign's entry point: the certificate signer asks the same gate before
-/// signing (a cert is B's statement about A, so the shell grant gates it
-/// like any shell-class open). Delegates to the shared core (no local logic).
+/// SSH-sign's verdict, with the CLI's host bound.
 pub(crate) fn ssh_gate_decision(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
-    decide(inputs)
+    gate_ssh_decision(inputs, &crate::host_impl::CliHost)
 }
 
 #[cfg(test)]
