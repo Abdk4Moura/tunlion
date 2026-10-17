@@ -35,6 +35,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LM = os.path.join(ROOT, "crates", "filament-peerloop", "src", "link_manager.rs")
 DC = os.path.join(ROOT, "cli", "src", "daemon_ctl.rs")
+CONN = os.path.join(ROOT, "crates", "filament-peerloop", "src", "conn.rs")
 
 
 def source_stale_ms():
@@ -146,12 +147,18 @@ def check_verify(max_ticks=6):
 
 
 def check_structure():
-    dc = open(DC, encoding="utf-8").read()
-    m = re.search(r"fn warm_link_for\(.*?\n}\n", dc, re.S)
+    # The resolver moved with `Conn` into the crate; the guard follows it. The
+    # rule it checks is unchanged: warm reuse must go through `place`, and the
+    # stale window must live in link_manager.rs.
+    conn_src = open(CONN, encoding="utf-8").read()
+    m = re.search(r"fn warm_link_for\(.*?\n}\n", conn_src, re.S)
     if not m or "place(" not in m.group(0):
         raise SystemExit("S2: warm_link_for no longer goes through link_manager::place")
-    if "WARM_RELAY_STALE_MS" in dc:
-        raise SystemExit("S2: daemon_ctl.rs has its own stale window again; the rule must live in link_manager.rs")
+    dc = open(DC, encoding="utf-8").read()
+    if "fn warm_link_for" in dc:
+        raise SystemExit("S2: daemon_ctl.rs defines a second warm-link resolver")
+    if "WARM_RELAY_STALE_MS" in dc or "WARM_RELAY_STALE_MS" in conn_src:
+        raise SystemExit("S2: a warm-link caller has its own stale window again; the rule must live in link_manager.rs")
 
 
 def main():

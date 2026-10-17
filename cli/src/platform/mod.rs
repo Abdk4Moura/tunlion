@@ -3663,6 +3663,43 @@ pub fn control_socket_path(preferred: &Path, config_dir: &Path) -> PathBuf {
     }
 }
 
+/// Bind and serve this build's control socket, forwarding each parsed request
+/// to `tx` and firing `ready` once accepting.
+///
+/// PLATFORM BOUND: the control socket is a Unix-domain socket, so the server is
+/// unix-only (see `ctl`). This portable wrapper is the one place host glue can
+/// call; the non-unix arm refuses with the same sentence the host trait's inert
+/// default uses.
+#[cfg(unix)]
+pub(crate) async fn serve_control(
+    tx: tokio::sync::mpsc::UnboundedSender<filament_peerloop::control::Req>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
+    crate::ctl::serve_at(crate::ctl::control_sock_path(), tx, ready).await
+}
+#[cfg(not(unix))]
+pub(crate) async fn serve_control(
+    _tx: tokio::sync::mpsc::UnboundedSender<filament_peerloop::control::Req>,
+    _ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
+    anyhow::bail!("this platform has no control socket")
+}
+
+/// The control socket this build serves, or `None` where the platform has no
+/// Unix-domain socket server.
+///
+/// PLATFORM BOUND: the cfg lives HERE by design. Host glue calls this portable
+/// function and carries no platform branch. `None` is honest, not a disabled
+/// path: no server exists to bind.
+#[cfg(unix)]
+pub(crate) fn control_sock_path_if_served() -> Option<PathBuf> {
+    Some(crate::ctl::control_sock_path())
+}
+#[cfg(not(unix))]
+pub(crate) fn control_sock_path_if_served() -> Option<PathBuf> {
+    None
+}
+
 /// Prepare the directory a socket is about to be bound in: create it 0700 when
 /// missing, then insist it is a real directory owned by this user that nobody
 /// else can write. A directory of ours that is group- or world-writable (a

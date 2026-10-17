@@ -298,33 +298,17 @@ impl HostServices for CliHost {
     ) -> Result<bool, String> {
         crate::issue_signed_bounded_grant(device, capability, expires).map_err(|e| e.to_string())
     }
-    #[cfg(unix)]
     fn control_sock_path(&self) -> Option<std::path::PathBuf> {
-        Some(crate::ctl::control_sock_path())
+        crate::platform::control_sock_path_if_served()
     }
-    #[cfg(not(unix))]
-    fn control_sock_path(&self) -> Option<std::path::PathBuf> {
-        // There is no control socket on this platform, so naming a path that
-        // will never be bound would be a lie.
-        None
-    }
-    #[cfg(unix)]
     async fn serve_control(
         &self,
         tx: mpsc::UnboundedSender<filament_peerloop::control::Req>,
         ready: Option<oneshot::Sender<()>>,
     ) -> Result<(), String> {
-        crate::ctl::serve_at(crate::ctl::control_sock_path(), tx, ready)
+        crate::platform::serve_control(tx, ready)
             .await
             .map_err(|e| e.to_string())
-    }
-    #[cfg(not(unix))]
-    async fn serve_control(
-        &self,
-        _tx: mpsc::UnboundedSender<filament_peerloop::control::Req>,
-        _ready: Option<oneshot::Sender<()>>,
-    ) -> Result<(), String> {
-        Err("this platform has no control socket".to_string())
     }
     fn signaling_snapshot(&self) -> serde_json::Value {
         crate::signaling_health::snapshot_json()
