@@ -5596,6 +5596,7 @@ mod h1_tests {
         controls: StdMutex<Vec<Value>>,
         alive: bool,
         idle: u64,
+        alive_checks: std::sync::atomic::AtomicUsize,
     }
     impl MockTransport {
         fn new() -> Arc<Self> {
@@ -5609,6 +5610,7 @@ mod h1_tests {
                 controls: StdMutex::new(Vec::new()),
                 alive,
                 idle,
+                alive_checks: std::sync::atomic::AtomicUsize::new(0),
             })
         }
     }
@@ -5634,11 +5636,75 @@ mod h1_tests {
             !self.alive
         }
         fn is_alive(&self) -> bool {
+            self.alive_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.alive
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    /// A PcState event can come from a losing WebRTC candidate after the direct
+    /// transport has won. It must not tear down streams on the selected mux;
+    /// the same event must tear them down once that selected transport is dead.
+    #[tokio::test]
+    async fn losing_pc_state_does_not_shutdown_live_selected_mux() {
+        let selected = MockTransport::new_with_alive(true);
+        let mux = Mux::new(selected.clone());
+        let sid = L2_SID_BASE | 0x123;
+        let mut stream = mux.register_stream(sid).await.expect("register stream");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
+
+        // This candidate is not the selected transport represented by `mux`.
+        tx.send(Ev::PcState("losing-candidate".into(), "disconnected".into()))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while selected.alive_checks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pump did not process losing candidate state");
+        assert_eq!(mux.live_streams().await, 1, "losing candidate tore down selected mux");
+        mux.on_frame(sid, Bytes::from_static(b"still-live")).await;
+        assert_eq!(
+            stream.recv().await,
+            Some(Some(Bytes::from_static(b"still-live"))),
+            "stream remains usable after losing candidate state"
+        );
+
+        // A PcState notification while the selected transport is dead does
+        // retire the mux, even though its event pid is another candidate.
+        let dead_transport = MockTransport::new_with_alive(false);
+        let dead_selected = Mux::new(dead_transport.clone());
+        let _dead_stream = dead_selected
+            .register_stream(sid + 1)
+            .await
+            .expect("register dead-link stream");
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel();
+        let dead_pump = tokio::spawn(pump_initiator(dead_rx, dead_selected.clone()));
+        dead_tx
+            .send(Ev::PcState("candidate".into(), "failed".into()))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dead_transport
+                .alive_checks
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pump did not process dead selected transport state");
+        assert_eq!(dead_selected.live_streams().await, 0, "dead selected transport retained streams");
+
+        drop(tx);
+        drop(dead_tx);
+        let _ = pump.await;
+        let _ = dead_pump.await;
     }
 
     #[test]
