@@ -277,6 +277,8 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         digest_deferred: HashMap::new(),
+        channel_digest_absent: HashMap::new(),
+        room_digest_absent: HashMap::new(),
         recv_done: false,
         direct_pending: HashMap::new(),
         buffered_offers: HashMap::new(),
