@@ -65,7 +65,7 @@ use crate::{
     l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
     load_provisional_identity, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
-    mk_uid, mount_proto, net, next_ev, offer_question, out_binding,
+    mk_uid, net, next_ev, offer_question, out_binding,
     owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz,
     principal_ceiling_for, prompt_line, proof_for, protocol, pwrite_at, quiet_exit_window,
     record_range, regex_lite_code, relay_banner, resolve_peer_identity,
@@ -6753,212 +6753,14 @@ async fn recv_run(
                     continue;
                 }
                 Some("mount-open") if l2_enabled => {
-                    let Some(t) = conn.transport_of(&pid) else {
-                        crate::conn::dropped_no_transport(&pid, "mount-open");
-                        continue;
-                    };
-                    // wire_sid rejects a missing OR out-of-range sid instead of
-                    // defaulting to 0 / wrapping into a forged is_l2_sid value.
-                    let Some(sid) = l2::wire_sid(&v) else {
-                        continue;
-                    };
-                    if !l2::is_l2_sid(sid) {
-                        continue;
-                    }
-                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    // Decode the requested root up front and CONFINE it to the
-                    // share root (mount_gate.rs): a relative root resolves
-                    // against the share root, and anything that lands outside
-                    // it (`/`, `..`, a symlink out) is refused below in BOTH
-                    // modes. The peer names a path; only the owner's `share`
-                    // setting decides what is servable.
-                    let root_encoded = v["root"].as_str().unwrap_or(".");
-                    let requested_root = mount_proto::path_decode(root_encoded)
-                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let confined_root = crate::mount_gate::confine_mount_root(
+                    crate::mount_recv::handle_mount_open(
+                        &mut conn,
+                        &pid,
+                        &v,
+                        &mut l2_muxes,
                         &crate::fleet_share_root(),
-                        &requested_root,
-                    );
-                    let within_share = confined_root.is_some();
-                    let verified = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                    // Capability layer for mount evaluated unconditionally (shadow
-                    // samples the legacy-allowed population); legacy (trusted) stands
-                    // in shadow, cap gates under TUNLION_CAP_AUTHORITATIVE.
-                    let (authorized, read_only) = {
-                        let az = peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let store = host.cap_store();
-                        let now = host.now_secs();
-                        let authoritative = host.cap_authoritative();
-                        let outcome = cap::authorize_in(
-                            &store,
-                            "self",
-                            cap::CAP_MOUNT,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        // Trust floor: under authoritative, an untrusted link
-                        // must never authorize mount (pair-proof vs device-key).
-                        let outcome =
-                            cap::cap_trust_floor(&outcome, trusted, binding, authoritative);
-                        // Fleet scope: a same-owner Proven device may mount WITHOUT a
-                        // grant ONLY read-only, within the share root (scoped_in_bounds
-                        // = within_share). An auto-trusted fleet mount is served
-                        // READ-ONLY; an explicit `mount` grant keeps its rw behavior.
-                        let (own_user, has_grant) = cap::fleet_inputs_in(
-                            &store,
-                            "self",
-                            cap::CAP_MOUNT,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        let same_owner = match (iusr, own_user.as_ref()) {
-                            (Some(u), Some(o)) => u == o,
-                            _ => false,
-                        };
-                        // #42 HOLD-OUT (advisor call): the mount scoped-DEFAULT is not
-                        // shipped in this release. It is not drivable today (tunlion
-                        // mount has no --auth-key, and an OwnerDevice cannot reach
-                        // Proven), so its scope enforcement (within_share /
-                        // path_within_canonical + the read-only EROFS path) has NEVER
-                        // been exercised end-to-end — shipping it would make the first
-                        // real user its first test, and publish a capability no path can
-                        // reach. Until mount is auth-key-drivable AND rig-verified
-                        // (including a write attempt that MUST return EROFS), a fleet
-                        // mount requires an EXPLICIT grant (deliberate tier). `within_share`
-                        // stays computed so re-enabling #42 is a one-line flip back.
-                        let _ = within_share;
-                        let mount_scoped_default = false;
-                        let read_only = same_owner
-                            && binding == cap::BindingStrength::Proven
-                            && mount_scoped_default
-                            && !has_grant;
-                        // The legacy input, which IS the verdict in shadow mode:
-                        // a trusted link is not enough, the device must hold
-                        // `mount` (record grant or owner-signed grant) and carry
-                        // no recorded deny. Before this it was `trusted` alone,
-                        // so a transfer-only device got a read-write mount.
-                        let (record_grants, denied) = verified
-                            .as_deref()
-                            .map(|n| {
-                                (
-                                    device_allows(n, cap::CAP_MOUNT),
-                                    device_capability_denied(n, cap::CAP_MOUNT),
-                                )
-                            })
-                            .unwrap_or((false, false));
-                        let legacy_ok = crate::mount_gate::mount_legacy_allowed(
-                            trusted,
-                            record_grants,
-                            has_grant,
-                            denied,
-                        );
-                        let d = host.cap_gate_effective(CapGate {
-                            legacy_allowed: legacy_ok,
-                            outcome: &outcome,
-                            action: cap::CAP_MOUNT,
-                            resource: "self",
-                            device_pub: idev,
-                            user_pub: iusr,
-                            binding,
-                            cert_expires: expires,
-                            auth_key_caps: ak_caps,
-                            own_user_pub: own_user.as_ref(),
-                            scoped_in_bounds: mount_scoped_default,
-                            has_explicit_grant: has_grant,
-                            cert_revoked,
-                            denied,
-                            ceiling_authorizes: false,
-                        });
-                        (d, read_only)
-                    };
-                    if !authorized.allowed() {
-                        let who = conn
-                            .link(&pid)
-                            .and_then(|l| l.verified_name.clone())
-                            .unwrap_or_else(|| "<unverified>".into());
-                        // Operator-side diagnostic in BOTH modes, so a mount refusal
-                        // is never invisible on the default (shadow) path and never
-                        // reads as a transport failure. The peer-facing string stays a
-                        // coarse category and leaks no authz internals.
-                        log.say(&format!(
-                            "mount: refused for '{who}': {}",
-                            authorized.deny_reason("not authorized (mount capability required)")
-                        ));
-                        enqueue_if_requestable(&who, "mount");
-                        // An expiry or revocation says so; anything else stays
-                        // the coarse category that leaks no authz internals.
-                        let deny = authorized.deny_reason("");
-                        let close = match crate::refusal::Refusal::final_cause(
-                            (!deny.is_empty()).then_some(deny),
-                            verified.clone(),
-                        ) {
-                            Some(r) => r.close_frame(sid),
-                            None => json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" }),
-                        };
-                        let _ = t.send_control(&close).await;
-                        continue;
-                    }
-                    let Some(root_path) = confined_root else {
-                        let who = verified.clone().unwrap_or_else(|| "<unverified>".into());
-                        log.say(&format!(
-                            "mount: refused for '{who}': {} is outside the share root {} (set `share` in the config to serve another directory)",
-                            requested_root.display(),
-                            crate::fleet_share_root().display()
-                        ));
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: path is outside the share root" })).await;
-                        continue;
-                    };
-                    let mut caps = mount_proto::mount_caps_for_root(&root_path);
-                    // A read-only fleet share advertises zero writable size so a
-                    // well-behaved client sees it is read-only; the server also
-                    // hard-rejects every write with EROFS regardless of the ack.
-                    if read_only {
-                        caps.max_write_size = 0;
-                    }
-                    let mux = l2_muxes
-                        .entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
-                        .clone();
-                    if mux.at_stream_cap().await {
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
-                        continue;
-                    }
-                    // Collision-safe: refuse (don't displace) if the peer named an
-                    // already-live sid; otherwise a forward's read pump would be
-                    // orphaned and its inbound frames redirected to this mount.
-                    let Some(rx) = mux.register_stream(sid).await else {
-                        let _ = t
-                            .send_control(
-                                &json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }),
-                            )
-                            .await;
-                        continue;
-                    };
-                    let _ = t
-                        .send_control(
-                            &json!({ "type": "mount-open-ack", "sid": sid, "caps": caps }),
-                        )
-                        .await;
-                    let transport = t.clone();
-                    let spawn_sid = sid;
-                    let proto_version = caps.protocol_version;
-                    // #235: hand the peer's device key down so the live session can re-ask
-                    // the gate. Resolved above for the open decision; the same value.
-                    let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
-                    mount_proto::spawn_mount_server(
-                        root_path,
-                        transport,
-                        spawn_sid,
-                        rx,
-                        proto_version,
-                        read_only,
-                        spawn_idev,
-                    );
+                    )
+                    .await;
                 }
                 Some("pty-resize") if l2_enabled => {
                     let Some(sid) = l2::wire_sid(&v) else {
