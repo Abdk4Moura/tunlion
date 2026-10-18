@@ -6233,8 +6233,6 @@ async fn recv_run(
                     }
                     continue;
                 }
-                // exec-open when serving is off: refuse loudly like l2-open, so
-                // the caller errors instead of hanging on a silent drop.
                 // NOTE: keep this arm ABOVE the `#[cfg(unix)]` comment block
                 // below. That attribute belongs to `shell-bootstrap`, and an
                 // outer attribute binds to the NEXT arm regardless of any

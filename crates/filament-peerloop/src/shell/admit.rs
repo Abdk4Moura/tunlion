@@ -342,6 +342,7 @@ mod tests {
     enum Verdict {
         Allow,
         Deny(Option<String>),
+        Proven,
     }
 
     // The policy site is injected, not reimplemented here: the test host records
@@ -349,6 +350,7 @@ mod tests {
     // own gate suites cover the full capability/store matrix.
     struct TestHost {
         verdict: Verdict,
+        cert_revoked: AtomicBool,
         record_grant: AtomicBool,
         denied: AtomicBool,
         ceiling_covers: AtomicBool,
@@ -361,6 +363,7 @@ mod tests {
         fn new(verdict: Verdict) -> Arc<Self> {
             Arc::new(Self {
                 verdict,
+                cert_revoked: AtomicBool::new(false),
                 record_grant: AtomicBool::new(false),
                 denied: AtomicBool::new(false),
                 ceiling_covers: AtomicBool::new(false),
@@ -414,6 +417,9 @@ mod tests {
         fn device_allows(&self, _name: &str, _capability: &str) -> bool {
             self.record_grant.load(Ordering::Relaxed)
         }
+        fn cert_revoked_for(&self, _device_pub: Option<&[u8; 32]>) -> bool {
+            self.cert_revoked.load(Ordering::Relaxed)
+        }
         fn device_capability_denied(&self, _name: &str, _capability: &str) -> bool {
             self.denied.load(Ordering::Relaxed)
         }
@@ -436,6 +442,10 @@ mod tests {
                 Verdict::Deny(reason) => cap::GateDecision::Deny {
                     cap_reason: reason.clone(),
                 },
+                Verdict::Proven if _gate.binding == BindingStrength::Proven => {
+                    cap::GateDecision::Allow
+                }
+                Verdict::Proven => cap::GateDecision::Deny { cap_reason: None },
             }
         }
     }
@@ -716,6 +726,8 @@ mod tests {
         let host = TestHost::new(Verdict::Deny(None));
         let t = Arc::new(CaptureTransport::default());
         let (mut conn, _far) = connection(host.clone(), t.clone(), Some("phone")).await;
+        let log = Arc::new(VecLog::new());
+        conn.log = log.clone();
         let policy = ShellPolicy::Granted;
 
         let out = admit_pty_open(
@@ -750,6 +762,7 @@ mod tests {
         );
         assert!(host.enqueues().is_empty(), "the caller asks once");
         assert_eq!(host.gates(), 2);
+        assert!(log.take().is_empty(), "denial tells belong to the caller");
     }
 
     #[tokio::test]
@@ -787,6 +800,8 @@ mod tests {
         let host = TestHost::new(Verdict::Allow);
         let t = Arc::new(CaptureTransport::default());
         let (mut conn, _far) = connection(host.clone(), t.clone(), Some("phone")).await;
+        let log = Arc::new(VecLog::new());
+        conn.log = log.clone();
         let policy = ShellPolicy::Granted;
         let called = AtomicBool::new(false);
         let out = admit_pty_open(
@@ -813,6 +828,13 @@ mod tests {
             })]
         );
         assert!(host.enqueues().is_empty());
+        assert_eq!(
+            log.take(),
+            vec![(
+                crate::host::Level::Info,
+                format!("l2: pty refused: {USER_DROP_REASON}")
+            )]
+        );
 
         // A gate deny wins: the closure is never called.
         let host = TestHost::new(Verdict::Deny(None));
@@ -877,23 +899,155 @@ mod tests {
         assert!(t.controls.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn denial_frames_preserve_all_shell_causes_without_tells() {
+        let expired = crate::refusal::expired_reason(1);
+        for (reason, denied, cert_revoked, code, err) in [
+            (
+                None,
+                false,
+                false,
+                "not-granted",
+                "shell not granted to 'phone' here".to_string(),
+            ),
+            (
+                None,
+                true,
+                false,
+                "revoked",
+                "shell revoked for 'phone' here".to_string(),
+            ),
+            (
+                None,
+                false,
+                true,
+                "cert-revoked",
+                "device revoked".to_string(),
+            ),
+            (
+                Some(CEILING_REASON.to_string()),
+                false,
+                false,
+                "ceiling",
+                CEILING_REASON.to_string(),
+            ),
+            (Some(expired.clone()), false, false, "expired", expired),
+        ] {
+            let host = TestHost::new(Verdict::Deny(reason.clone()));
+            host.denied.store(denied, Ordering::Relaxed);
+            host.cert_revoked.store(cert_revoked, Ordering::Relaxed);
+            let t = Arc::new(CaptureTransport::default());
+            let (mut conn, _far) = connection(host.clone(), t.clone(), Some("phone")).await;
+            let log = Arc::new(VecLog::new());
+            conn.log = log.clone();
+            let policy = ShellPolicy::Granted;
+            let expected = json!({
+                "type": "l2-close", "sid": SID, "code": code, "err": err, "as": "phone",
+            });
+            let ShellAdmission::Denied(d) = admit_pty_open(
+                &mut conn,
+                PID,
+                &pty_frame(json!({})),
+                &cfg(&policy, true),
+                || panic!("denied before user-drop"),
+            )
+            .await
+            else {
+                panic!("expected pty denial")
+            };
+            assert_eq!(
+                d.reason,
+                reason.as_deref().unwrap_or("no shell cap / untrusted")
+            );
+            assert_eq!(d.refusal.close_frame(SID), expected);
+            let ShellAdmission::Denied(d) =
+                admit_exec_open(&mut conn, PID, &exec_frame(json!({})), &cfg(&policy, true)).await
+            else {
+                panic!("expected exec denial")
+            };
+            assert_eq!(d.reason, d.refusal.reason);
+            assert_eq!(d.refusal.close_frame(SID), expected);
+            assert_eq!(host.gates(), 2);
+            assert!(host.enqueues().is_empty());
+            assert!(t.controls.lock().unwrap().is_empty());
+            assert!(log.take().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_exec_frames_never_authorize_or_send() {
+        let host = TestHost::new(Verdict::Allow);
+        let t = Arc::new(CaptureTransport::default());
+        let (mut conn, _far) = connection(host.clone(), t.clone(), Some("phone")).await;
+        let policy = ShellPolicy::Granted;
+        for extra in [
+            json!({"argv": null}),
+            json!({"argv": []}),
+            json!({"argv": [42]}),
+            json!({"argv": "true"}),
+            json!({"err_sid": null}),
+            json!({"err_sid": 1}),
+            json!({"err_sid": 0x1_8000_0000u64}),
+            json!({"sid": null}),
+        ] {
+            assert!(matches!(
+                admit_exec_open(&mut conn, PID, &exec_frame(extra), &cfg(&policy, true),).await,
+                ShellAdmission::Ignored
+            ));
+        }
+        assert_eq!(host.gates(), 0);
+        assert!(t.controls.lock().unwrap().is_empty());
+        assert!(host.enqueues().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serving_off_with_no_verified_name_does_not_ask() {
+        for name in [None, Some("")] {
+            let host = TestHost::new(Verdict::Allow);
+            let t = Arc::new(CaptureTransport::default());
+            let (mut conn, _far) = connection(host.clone(), t.clone(), name).await;
+            let policy = ShellPolicy::Granted;
+            admit_exec_open(&mut conn, PID, &exec_frame(json!({})), &cfg(&policy, false)).await;
+            assert!(host.enqueues().is_empty());
+            assert_eq!(host.gates(), 0);
+            let mut expected = json!({
+                "type": "l2-close", "sid": SID, "err": SHELL_OFF_REASON, "code": "shell-off",
+            });
+            if let Some(name) = name {
+                expected["as"] = json!(name);
+            }
+            assert_eq!(*t.controls.lock().unwrap(), vec![expected]);
+        }
+    }
+
     /// The regression: a parked exec-open re-driven after serving was turned
     /// off used to re-enter the handler and be SERVED. Every re-drive now
     /// passes here, where the current `serving` is read.
     #[tokio::test]
     async fn a_parked_exec_redrive_after_l2_off_is_refused_not_served() {
-        let host = TestHost::new(Verdict::Allow);
+        let host = TestHost::new(Verdict::Proven);
         let t = Arc::new(CaptureTransport::default());
         let (mut conn, _far) = connection(host.clone(), t.clone(), Some("phone")).await;
         let policy = ShellPolicy::Granted;
         let frame = exec_frame(json!({}));
 
+        conn.links.get_mut(PID).unwrap().identity_binding = BindingStrength::Inferred;
         let out = admit_exec_open(&mut conn, PID, &frame, &cfg(&policy, true)).await;
-        assert!(matches!(out, ShellAdmission::Admitted { .. }));
+        assert!(matches!(out, ShellAdmission::Denied(_)));
+        assert!(
+            t.controls.lock().unwrap().is_empty(),
+            "caller may park the denied frame"
+        );
+        conn.links.get_mut(PID).unwrap().identity_binding = BindingStrength::Proven;
 
         // The same stored frame, re-driven with the switch off.
         let out = admit_exec_open(&mut conn, PID, &frame, &cfg(&policy, false)).await;
         assert!(matches!(out, ShellAdmission::Ignored));
+        assert_eq!(
+            host.gates(),
+            1,
+            "serving-off re-drive must not reach authorization"
+        );
         assert_eq!(
             *t.controls.lock().unwrap(),
             vec![json!({
@@ -916,5 +1070,12 @@ mod tests {
         .await;
         assert!(matches!(out, ShellAdmission::Ignored));
         assert_eq!(t.controls.lock().unwrap().len(), 2);
+        let out = admit_exec_open(&mut conn, PID, &frame, &cfg(&policy, true)).await;
+        assert!(matches!(out, ShellAdmission::Admitted { .. }));
+        assert_eq!(
+            host.gates(),
+            2,
+            "serving-on re-drive gathers a fresh verdict"
+        );
     }
 }

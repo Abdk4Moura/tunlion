@@ -19,7 +19,9 @@
 use crate::conn::Conn;
 use crate::l2;
 use crate::net::Transport;
-use filament_peerloop::shell::exec::ExecOpen;
+// Keep the old parser/type paths available while admission owns their use.
+#[allow(unused_imports)]
+pub(crate) use filament_peerloop::shell::exec::{ExecOpen, parse_exec_open};
 use crate::platform::TreeSignal;
 use anyhow::Result;
 use serde_json::{Value, json};
