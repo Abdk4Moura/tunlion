@@ -158,6 +158,24 @@ re-subscribed before the post-reconnect digest is acted on, so a transient
 presence gap cannot look like departure. This is a separate site from #498's
 `PcState` teardown.
 
+A second, intermittent link-drop signal appeared in the concurrent stage on
+run 1 (not run 2): `warm-pick` chose the just-created one-shot `exec` link
+(`lMt35…`, age 24 ms) over the long-lived daemon link (`qjJB…`, age 156 s),
+then the verification timed out:
+
+```
+12:33:14Z warm-pick 'soak-b': pid=lMt35… chosen=true direct=true alive=true age_ms=Some(24)
+12:33:16Z tunlion: warm link to 'soak-b' is a zombie (warm link unresponsive after 2500ms (zombie)); dropping + establishing fresh
+12:33:16Z   drop_link(lMt35…) ordered by cli/src/recv_cmd.rs:4153:26
+```
+
+The shells kept their PIDs and the forward succeeded on the cold fallback, so
+this is a transient link-selection drop, not a shell loss. Proposed fix: in
+`warm_link_for`/`place`, prefer the **longest-lived** live link (or exclude a
+link owned by a one-shot exec client) instead of taking the last equal link.
+The user's report explicitly couples drops with a second connection/exec, so
+this is kept in the harness as a finding rather than filtered out.
+
 ## Assumptions and honest limits
 
 - **Linux only.** The harness uses Unix PTYs, process groups, SIGTERM, and
