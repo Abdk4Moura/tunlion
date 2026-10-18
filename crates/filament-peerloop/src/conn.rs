@@ -161,21 +161,27 @@ const PEER_BUILD_BUDGET: Duration = Duration::from_secs(5);
 /// before it closes the QUIC connection under them.
 const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// A link absent from a channel/room digest is retired only after its transport
-/// has been idle this long. Presence is best-effort and a signaling reconnect
+/// has been quiet this long. Presence is best-effort and a signaling reconnect
 /// gives the peer a new sid, so the old sid vanishes from the digest while its
-/// data channel is still the one carrying a shell. While the peer is active we
-/// defer (adoption supersedes it onto the new sid once it goes idle); this bound
-/// starts when peer activity stops, so a genuinely departed peer cannot sit in
-/// the table forever. Peer activity is `Conn::digest_link_active`, which prefers
-/// peer-originated `heard_ms` for relay/DataChannel links (their keepalives are
-/// OUR writes). Direct QUIC has no `heard_ms`; its `idle_ms` includes our writes,
-/// so a direct link we keep writing to stays deferred until the transport itself
-/// reports dead. That path is transport-bounded, not grace-bounded.
+/// data channel is still the one carrying a shell. The grace is for the
+/// transport shapes where "quiet" can still mean a peer that is there (a relay
+/// path between keepalives) or where no transport exists yet.
+///
+/// It is NOT the bound for a DIRECT link. Direct QUIC has no `heard_ms` and its
+/// `idle_ms` includes our own writes, but `is_alive`/`is_dead` are the
+/// transport's own verdict (7 s keepalive, 21 s idle timeout). An idle shell is
+/// a healthy direct link, so it is kept for as long as the connection is alive;
+/// the grace must not retire it 30 s after a signaling reconnect. When QUIC
+/// reports the connection dead/closed, retirement is immediate. That path is
+/// transport-bounded, not grace-bounded.
+///
+/// `Conn::digest_link_active` is the decision: direct -> transport liveness;
+/// relay/DataChannel -> peer-originated `heard_ms`; anything else -> idle.
 const DIGEST_ABSENT_IDLE_GRACE: Duration = Duration::from_secs(30);
-/// "Moving enough to call the peer present" for digest retirement, in ms.
-/// Mirrors `link_flowing`'s default (`TUNLION_ADOPT_ACTIVE_MS`) for transports
-/// that do not track peer-originated traffic. Peer-tracked transports go through
-/// `link_manager::relay_peer_live` instead; see `Conn::digest_link_active`.
+/// "Moving enough to call the peer present" for digest retirement, in ms, for a
+/// relay/DataChannel transport that does not track peer-originated traffic.
+/// Direct QUIC does NOT use this clock (its liveness is transport-bounded); see
+/// `Conn::digest_link_active`.
 const DIGEST_ACTIVE_MS: u64 = 3_000;
 
 /// Which signaling surface owns a link, and therefore which digest may judge
@@ -678,13 +684,13 @@ pub struct Conn {
     /// deferred sid can't leave a stale blocker.
     pub deferred_left: HashMap<String, Value>,
     /// Digest reconcile deferral: sid -> when its live transport was first seen
-    /// absent from a digest while not moving bytes. A signaling reconnect gives
-    /// the peer a fresh sid, so the old sid disappears from `channel_peers`
-    /// while its direct link still serves a shell; dropping it there is the
-    /// PR512 tear-down. While the peer is active this is refreshed (activity is
-    /// evidence of presence); once it goes quiet the clock runs for
-    /// `DIGEST_ABSENT_IDLE_GRACE` before the reconcile may retire it. Cleared
-    /// when the sid reappears, when the link is dropped, and on a fresh
+    /// absent from a digest while it could not yet be called departed. A
+    /// signaling reconnect gives the peer a fresh sid, so the old sid disappears
+    /// from `channel_peers` while its direct link still serves a shell; dropping
+    /// it there is the PR512 tear-down. A live direct link is deferred for as
+    /// long as QUIC says the connection is alive; a relay link while it still
+    /// hears the peer, then for `DIGEST_ABSENT_IDLE_GRACE` after that stops.
+    /// Cleared when the sid reappears, when the link is dropped, and on a fresh
     /// signaling sid. Not used by `on_peer_left`, which keeps its own payload
     /// (`deferred_left`) because a peer-left is a real roster departure.
     pub digest_deferred: HashMap<String, Instant>,
@@ -4109,10 +4115,12 @@ impl Conn {
         candidate && self.digest_absent_retirable_at(pid, now)
     }
 
-    /// May the caller retire a link that missed two digests? Dead transport:
-    /// yes, at once. Alive and active: no, defer. Alive but quiet: only after
-    /// `DIGEST_ABSENT_IDLE_GRACE` from when it went quiet. Adoption supersedes
-    /// the old sid onto the new one when the data channel is no longer busy.
+    /// May the caller retire a link that missed two digests? Dead/closed
+    /// transport: yes, at once. A live DIRECT link: no, for as long as its QUIC
+    /// connection is alive (an idle shell is not a departed peer; the transport
+    /// idle/dead verdict is the bound). A live relay: no while it is still
+    /// hearing the peer, then `DIGEST_ABSENT_IDLE_GRACE` from when that stopped.
+    /// A transport-less/peer-only link still gets the bounded grace.
     ///
     /// `has_live_transport` deliberately counts an in-progress WebRTC peer
     /// (#246) even before a transport exists, so a dead primary beside a still
@@ -4127,9 +4135,20 @@ impl Conn {
             self.digest_deferred.remove(pid);
             return true;
         }
+        // A direct link whose QUIC connection has closed is gone NOW, even if
+        // the transport's `dead` flag has not latched yet. `has_live_transport`
+        // asks the weaker `!is_dead()`; for a direct primary it is the stricter
+        // `is_alive()` that says whether the shell can still be served. Without
+        // this, a closed-but-not-yet-dead QUIC link would sit out the 30 s grace.
+        if self.links.get(pid).is_some_and(|l| {
+            l.direct && l.transport.as_ref().is_some_and(|t| !t.is_alive())
+        }) {
+            self.digest_deferred.remove(pid);
+            return true;
+        }
         if self.digest_link_active(pid) {
-            // A moving channel outranks a missing presence entry. Refresh the
-            // idle clock so the grace starts when the link really goes quiet.
+            // A live transport outranks a missing presence entry. Refresh the
+            // clock so the grace starts if/when the link really goes quiet.
             self.digest_deferred.insert(pid.to_string(), now);
             return false;
         }
@@ -4143,16 +4162,22 @@ impl Conn {
 
     /// Is the PEER demonstrably active on this link right now?
     ///
-    /// Deliberately not `link_flowing` (which backs supersede/peer-left): relay
-    /// and DataChannel keepalives are OUR writes and stamp `idle_ms`, so a relay
-    /// link to a wiped or SIGSTOPped peer can read "flowing" forever. Where the
-    /// transport tracks `heard_ms`, that stamp is peer-only and the shared
-    /// `link_manager::relay_peer_live` rule decides; it stops advancing when the
-    /// peer does. Direct QUIC does not track `heard_ms`; it is judged on
-    /// `idle_ms` (which includes our writes) and `is_dead`. A direct link we keep
-    /// writing to can therefore stay deferred until QUIC declares it dead:
-    /// bounded by the transport, not by this grace. Relay/DataChannel is the
-    /// reporting case and is bounded here.
+    /// Three transport shapes, deliberately:
+    ///
+    /// * **Direct QUIC** has no peer-originated `heard_ms`. Its `idle_ms` is
+    ///   stamped by our own writes too, so a quiet shell and a busy transfer are
+    ///   indistinguishable by bytes. Use the transport's own liveness instead:
+    ///   `is_alive()` (and not `is_dead()`) is the QUIC 7 s keepalive / 21 s
+    ///   idle verdict. An alive link is kept for as long as it is alive; a
+    ///   closed/dead one retires at once (see `digest_absent_retirable_at`).
+    /// * **Relay/DataChannel** keepalives are OUR writes and stamp `idle_ms`, so
+    ///   a link to a wiped or SIGSTOPped peer can read busy forever. Its
+    ///   `heard_ms` is peer-only; the shared `link_manager::relay_peer_live`
+    ///   rule bounds it, and silence still reaches the grace and retires.
+    /// * **Untracked** transports fall back to idle for compatibility.
+    ///
+    /// This is intentionally not `link_flowing` (which backs supersede/peer-left
+    /// and must keep its byte-movement meaning).
     fn digest_link_active(&self, pid: &str) -> bool {
         let Some(l) = self.links.get(pid) else {
             return false;
@@ -4160,8 +4185,12 @@ impl Conn {
         let Some(t) = l.transport.as_ref() else {
             return false;
         };
-        if t.is_dead() {
+        if t.is_dead() || !t.is_alive() {
             return false;
+        }
+        if l.direct {
+            // Transport-bounded: no 30 s idle cutoff for a live direct link.
+            return true;
         }
         if let Some(peer_live) = crate::link_manager::relay_peer_live(t.heard_ms()) {
             return peer_live;
@@ -4602,42 +4631,43 @@ mod warm_identity_tests {
         /// `None` = transport does not track peer-originated traffic (direct
         /// QUIC); `Some` = relay/DataChannel-style `heard_ms`.
         heard: Option<u64>,
+        /// The explicit `dead` flag, separate from `alive`: a QUIC connection
+        /// can report closed (`is_alive` false) before that flag latches.
+        reported_dead: bool,
     }
     impl FakeQuic {
-        fn live() -> Arc<Self> {
+        fn with(idle_ms: u64, heard: Option<u64>, alive: bool, reported_dead: bool) -> Arc<Self> {
             Arc::new(FakeQuic {
-                alive: AtomicBool::new(true),
+                alive: AtomicBool::new(alive),
                 closes: AtomicUsize::new(0),
-                idle_ms: u64::MAX,
-                heard: None,
+                idle_ms,
+                heard,
+                reported_dead,
             })
+        }
+        fn live() -> Arc<Self> {
+            Self::with(u64::MAX, None, true, false)
         }
         /// A transport that is actively moving bytes (idle 0ms).
         fn flowing() -> Arc<Self> {
-            Arc::new(FakeQuic {
-                alive: AtomicBool::new(true),
-                closes: AtomicUsize::new(0),
-                idle_ms: 0,
-                heard: None,
-            })
+            Self::with(0, None, true, false)
         }
         /// A relay link whose OWN keepalive writes keep `idle_ms` near zero
         /// while the peer has sent nothing (`heard_ms` is old).
         fn relay_writes_only() -> Arc<Self> {
-            Arc::new(FakeQuic {
-                alive: AtomicBool::new(true),
-                closes: AtomicUsize::new(0),
-                idle_ms: 0,
-                heard: Some(u64::MAX),
-            })
+            Self::with(0, Some(u64::MAX), true, false)
+        }
+        /// A relay link whose peer-originated `heard_ms` is fresh.
+        fn relay_heard(heard_ms: u64) -> Arc<Self> {
+            Self::with(u64::MAX, Some(heard_ms), true, false)
         }
         fn dead() -> Arc<Self> {
-            Arc::new(FakeQuic {
-                alive: AtomicBool::new(false),
-                closes: AtomicUsize::new(0),
-                idle_ms: u64::MAX,
-                heard: Some(u64::MAX),
-            })
+            Self::with(u64::MAX, Some(u64::MAX), false, true)
+        }
+        /// QUIC has closed the connection (`is_alive` false) but the `dead`
+        /// flag has not latched yet (`is_dead` false).
+        fn closed_not_dead() -> Arc<Self> {
+            Self::with(u64::MAX, None, false, false)
         }
     }
     #[async_trait::async_trait]
@@ -4658,7 +4688,7 @@ mod warm_identity_tests {
             self.alive.load(Ordering::Relaxed)
         }
         fn is_dead(&self) -> bool {
-            !self.alive.load(Ordering::Relaxed)
+            self.reported_dead || !self.alive.load(Ordering::Relaxed)
         }
         fn idle_ms(&self) -> u64 {
             if self.is_dead() {
@@ -5093,28 +5123,71 @@ mod warm_identity_tests {
         assert!(conn.links.contains_key("sid-dead"), "the caller owns the drop");
     }
 
-    /// An alive but idle link is neither kept forever nor dropped on the spot:
-    /// the deferral window is bounded and starts when it stops flowing, leaving
-    /// time for adoption to move the shell onto the peer's new sid.
+    /// An idle but ALIVE direct shell link is transport-bounded, not
+    /// grace-bounded: a signaling reconnect makes its old sid absent from the
+    /// digest, but retiring it 30 s later would drop the shell the establish
+    /// fix just kept. It survives past the grace and stays retired only when
+    /// QUIC says the connection is gone.
     #[tokio::test]
-    async fn digest_absence_retires_an_idle_link_after_the_bounded_grace() {
+    async fn digest_absence_keeps_an_idle_alive_direct_link_past_the_grace() {
         let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::live(); // alive, idle_ms u64::MAX (never wrote)
         conn.links.insert(
             "sid-idle".into(),
-            direct_link("sid-idle", "x", "user@x", FakeQuic::live()),
+            direct_link("sid-idle", "x", "user@x", t.clone()),
         );
         let t0 = Instant::now();
         assert!(!conn.digest_absent_retirable_at("sid-idle", t0));
-        assert!(conn.digest_deferred.contains_key("sid-idle"));
         assert!(!conn.digest_absent_retirable_at(
             "sid-idle",
             t0 + DIGEST_ABSENT_IDLE_GRACE - Duration::from_millis(1)
         ));
-        assert!(conn.digest_absent_retirable_at(
+        assert!(
+            !conn.digest_absent_retirable_at(
+                "sid-idle",
+                t0 + DIGEST_ABSENT_IDLE_GRACE
+            ),
+            "an alive direct link was retired by the digest grace"
+        );
+        assert!(!conn.digest_absent_retirable_at(
             "sid-idle",
+            t0 + Duration::from_secs(60 * 60)
+        ));
+        assert!(conn.links.contains_key("sid-idle"));
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+    }
+
+    /// The other side of the transport bound: once QUIC reports the direct
+    /// connection closed, retirement is immediate, even if `is_dead` has not
+    /// latched. No half-closed zombie waits out the grace.
+    #[tokio::test]
+    async fn digest_absence_retires_a_closed_direct_transport_immediately() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::closed_not_dead();
+        assert!(!t.is_alive() && !t.is_dead(), "fixture: closed before dead");
+        conn.links.insert(
+            "sid-closed".into(),
+            direct_link("sid-closed", "x", "user@x", t.clone()),
+        );
+        assert!(conn.digest_absent_retirable_at("sid-closed", Instant::now()));
+        assert!(conn.links.contains_key("sid-closed"), "the caller owns the drop");
+    }
+
+    /// Relay/DataChannel remains peer-originated: a fresh `heard_ms` keeps an
+    /// otherwise-idle relay link; a silent one still reaches the bounded grace.
+    #[tokio::test]
+    async fn digest_relay_busy_is_bounded_by_heard_not_idle() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert(
+            "sid-relay".into(),
+            direct_link("sid-relay", "x", "user@x", FakeQuic::relay_heard(2_000)),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-relay", t0));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-relay",
             t0 + DIGEST_ABSENT_IDLE_GRACE
         ));
-        assert!(!conn.digest_deferred.contains_key("sid-idle"));
     }
 
     /// Presence returning clears the clock. Without the clear, the second call
@@ -5123,9 +5196,11 @@ mod warm_identity_tests {
     #[tokio::test]
     async fn digest_present_clears_the_deferral_clock() {
         let (mut conn, _far, _rx) = test_conn().await;
+        // A relay link with a silent peer is grace-bounded (direct links are
+        // transport-bounded, so they would never reach this clock).
         conn.links.insert(
             "sid-idle".into(),
-            direct_link("sid-idle", "x", "user@x", FakeQuic::live()),
+            direct_link("sid-idle", "x", "user@x", FakeQuic::relay_writes_only()),
         );
         let t0 = Instant::now();
         assert!(!conn.digest_absent_retirable_at("sid-idle", t0));
@@ -5152,9 +5227,11 @@ mod warm_identity_tests {
     #[tokio::test]
     async fn reset_digest_reconcile_starts_a_fresh_window() {
         let (mut conn, _far, _rx) = test_conn().await;
+        // Grace-bounded relay shape: direct alive links are transport-bounded
+        // and would never start this window.
         conn.links.insert(
             "sid-idle".into(),
-            direct_link("sid-idle", "x", "user@x", FakeQuic::live()),
+            direct_link("sid-idle", "x", "user@x", FakeQuic::relay_writes_only()),
         );
         let t0 = Instant::now();
         assert!(!conn.digest_note_at(
@@ -5210,7 +5287,10 @@ mod warm_identity_tests {
     #[tokio::test]
     async fn channel_loop_does_not_reset_a_room_links_grace() {
         let (mut conn, _far, _rx) = test_conn().await;
-        let mut room = direct_link("sid-room", "room", "user@room", FakeQuic::live());
+        // Quiet relay shape, so the 30 s grace is what this surface test
+        // measures (an alive direct link is transport-bounded instead).
+        let mut room =
+            direct_link("sid-room", "room", "user@room", FakeQuic::relay_writes_only());
         room.expected_secret = None; // room-sourced: no pair channel
         conn.links.insert("sid-room".into(), room);
         conn.links.insert(
