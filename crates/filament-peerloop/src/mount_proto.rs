@@ -2224,9 +2224,9 @@ mod tests {
         let frames = transport.frames.lock().unwrap();
         let (header, _) = decode_frame(&frames[0]);
         let resp: Value = serde_json::from_slice(header).unwrap();
-        assert_eq!(resp["id"], 5);
-        assert_eq!(resp["status"], "err");
-        assert_eq!(resp["value"]["code"], EACCES);
+        assert_eq!(resp["id"].as_u64(), Some(5));
+        assert_eq!(resp["status"].as_str(), Some("err"));
+        assert_eq!(resp["value"]["code"].as_i64(), Some(EACCES as i64));
         assert_eq!(
             *transport.controls.lock().unwrap(),
             vec![serde_json::json!({"type": "l2-close", "sid": 9, "err": "device revoked"})]
