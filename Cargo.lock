@@ -1308,6 +1308,8 @@ dependencies = [
  "filament-overlay",
  "filament-signal",
  "filament-transport",
+ "hex",
+ "libc",
  "quinn",
  "ring",
  "serde",

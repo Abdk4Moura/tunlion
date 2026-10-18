@@ -43,6 +43,7 @@ pub mod consent;
 pub mod control;
 pub mod daemon_ctl;
 pub mod driver;
+pub mod fs_at;
 pub mod holepunch;
 pub mod host;
 pub mod identity;
@@ -51,6 +52,7 @@ pub mod limits;
 pub mod link_manager;
 pub mod liveness;
 pub mod local;
+pub mod mount_proto;
 #[cfg(feature = "mesh")]
 pub mod mesh;
 mod petname;

@@ -164,15 +164,17 @@ pub(crate) async fn handle_mount_open(
     let proto_version = caps.protocol_version;
     // Keep the admitted identity for the existing per-request live-cut check.
     let spawn_idev = conn.link(pid).and_then(|l| l.identity_device_pub);
-    mount_proto::spawn_mount_server(
-        root_path,
+    mount_proto::spawn_mount_server(mount_proto::MountServerConfig {
+        root: root_path,
         transport,
-        spawn_sid,
-        rx,
-        proto_version,
+        sid: spawn_sid,
+        stream: rx,
+        protocol_version: proto_version,
         read_only,
-        spawn_idev,
-    );
+        device_pub: spawn_idev,
+        host: host.clone(),
+        log: log.clone(),
+    });
 }
 
 #[cfg(test)]
