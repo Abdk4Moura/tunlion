@@ -45,8 +45,12 @@ That works today. The rest of this file is what it costs.
 4. **One job, then exit.** `receive` is one-shot by default (good), but there is
    no "wait for one payload from this sender, for at most N seconds, and tell me
    what arrived".
-5. **A way to wait for a peer.** The owner cannot say "block until the runner
-   joins". It polls `tunlion devices --json`. That is a loop in every script.
+5. DONE: `tunlion reach <device> --timeout <secs>` is the readiness check. It
+   returns success only after a warm link answers or a cold probe establishes
+   communication, and exits 6 when the peer cannot be reached by the deadline.
+   Do not use `devices --json`'s `online` field for sendability: a connected but
+   idle peer can report `online: false`. The dogfood uses `reach` directly; a
+   separate `wait` verb would duplicate this behavior.
 6. **Cleanup.** A dead box leaves a record the owner must forget, and an
    invitation cohort has no single "retire this file and stop its renewals"
    action.
@@ -92,21 +96,13 @@ on both ends.
    `status --json` to learn whether it came up, because `up --json` is refused as
    unimplemented (exit 2). Either give `up` a machine-readable result or make
    `up --detach` print the daemon pid and state.
-5. `tunlion wait <device> --timeout <secs>`: block until a named device answers.
-   Today a caller polls `devices --json` and reads `online`, which is NOT
-   sendability: a connected daemon that is not mid-transfer reports
-   `online: false` and `status: idle`, while `reach` succeeds. That trap cost the
-   first single-command dogfood a 15-minute timeout on a box that had been up
-   for five minutes (`lastSeen` 11:37:23, daemon stopped 11:37:27). One verb
-   should answer "can I send to it yet", so no caller has to learn the
-   difference between online, idle and reachable.
-6. `receive --json` should end with one object naming every file it wrote and its
+5. `receive --json` should end with one object naming every file it wrote and its
    sha256, so a caller has a manifest without hashing again.
-7. A cohort action: retire an invitation and stop renewal for every device it
+6. A cohort action: retire an invitation and stop renewal for every device it
    admitted. Today the record carries no provenance, so this needs the field
    first.
-8. A `tunlion job` verb wrapping (3)+(4)+(5) and the manifest, so the box side is
-   one command instead of a script.
+7. A `tunlion job` verb wrapping `reach` plus the pinned receive, machine-readable
+   startup, and manifest, so the box side is one command instead of a script.
 
 ## What is deliberately out of scope
 
