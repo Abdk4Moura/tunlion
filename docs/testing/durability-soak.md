@@ -124,6 +124,40 @@ If the harness exposes a real bug: report the failing check, the exact log
 lines, the binary sha, and a proposed fix. Do not "fix" the assertion to make it
 green, and do not change production code in the harness PR.
 
+## Finding from the first CI run (2026-10-18)
+
+The first two-run CI execution was **red in the signaling stage only**; the
+stable, concurrent, and intentional-drop stages passed. Both runs reproduced a
+live direct link being torn down on a **signaling reconnect**, with both shell
+clients reattaching. This is the class of event the report describes, and it is
+kept as a failure rather than excused.
+
+Concrete evidence (run 1, `daemon-b.log`; run 2 is the same shape):
+
+```
+12:12:19Z   drop_link(RNjtxf4seDFiqLDvAAAB) ordered by cli/src/recv_cmd.rs:4271:30
+12:12:19Z   o soak-a  left, still listening
+12:12:21Z l2: link closed cleanly peer=RNjtxf4seDFiqLDvAAAB primary=true frames=140 (connection lost)
+12:12:22Z l2: pty REATTACHED to 'soak-a', 120x40
+```
+
+Immediately before the drop the same daemon logged
+`warm-hold: skip 'soak-a' (link ... live)`, and the link's route was
+`direct over lo` — so presence was momentarily absent while the transport was
+alive and carrying a shell. The drop site is the **channel-digest reconcile**
+loop in `cli/src/recv_cmd.rs` (`for pid in channel_gone { ... conn.drop_link(&pid); }`),
+which fires after two consecutive digest misses. Unlike `on_peer_left`, it does
+not consult the transport's liveness or `link_flowing`, and it has no deferral
+path. A signaling reconnect can therefore retire a healthy direct link.
+
+Proposed fix (NOT applied here; this PR is test-only): make the digest
+reconcile liveness-aware, the way `on_peer_left` is. Do not drop a link whose
+transport is alive and flowing; defer it and let `reap_deferred` decide when it
+is genuinely idle/dead. Also verify that the known-device channels are
+re-subscribed before the post-reconnect digest is acted on, so a transient
+presence gap cannot look like departure. This is a separate site from #498's
+`PcState` teardown.
+
 ## Assumptions and honest limits
 
 - **Linux only.** The harness uses Unix PTYs, process groups, SIGTERM, and
