@@ -1,0 +1,65 @@
+name: Peerloop mesh boundary
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peerloop-mesh-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
+  graph:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test graph checker
+        run: python3 -m unittest discover -s scripts -p test_check_peerloop_mesh_graph.py
+      - name: Selected peerloop roots (host and both Android ABIs)
+        run: python3 scripts/check_peerloop_mesh_graph.py --output-dir mesh-graphs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: peerloop-mesh-graphs
+          path: mesh-graphs
+
+  compile:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    name: peerloop (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [minimal, default]
+    env:
+      # Separate jobs and target directories prevent workspace/CLI feature
+      # unification from hiding a broken mesh-disabled build.
+      CARGO_TARGET_DIR: target/peerloop-${{ matrix.profile }}
+      CARGO_INCREMENTAL: "0"
+      PROFILE: ${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile all peerloop targets and retain source tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=()
+          if [[ "$PROFILE" == minimal ]]; then
+            flags+=(--no-default-features)
+          fi
+          cargo check --locked -p filament-peerloop --all-targets "${flags[@]}"
+          cargo test --locked -p filament-peerloop --lib "${flags[@]}"
+          cargo test --locked -p filament-peerloop --doc "${flags[@]}"

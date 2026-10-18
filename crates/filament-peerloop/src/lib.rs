@@ -35,6 +35,8 @@
 //!   transfer bars, the clipboard, a raw-mode echo).
 //! Nothing here calls back into the CLI; the CLI depends on this crate.
 
+#![cfg_attr(not(feature = "mesh"), doc = include_str!("mesh_disabled.md"))]
+
 mod adoption;
 pub mod conn;
 pub mod consent;
@@ -49,6 +51,7 @@ pub mod limits;
 pub mod link_manager;
 pub mod liveness;
 pub mod local;
+#[cfg(feature = "mesh")]
 pub mod mesh;
 mod petname;
 pub mod present;
