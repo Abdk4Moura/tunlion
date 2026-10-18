@@ -53,6 +53,9 @@ on:
   pull_request:
     paths:
       - 'cli/src/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'cli/tests/*revoke-gates.sh'
       - 'cli/tests/ssh-ca-gates.sh'
       - 'cli/tests/pty-resume-gates.sh'

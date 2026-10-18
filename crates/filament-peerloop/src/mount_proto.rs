@@ -2112,4 +2112,125 @@ mod tests {
         assert!(json.contains("\"bin\":true"));
     }
 
+
+    // ------------------------------------------------ moved host/log seam
+    //
+    // The live-session recheck moved with the server, but its verdict and
+    // cadence are the injected host's. A cut must still answer the in-flight
+    // request as a DENIAL (a FUSE client parks forever otherwise), then close
+    // with the host's reason.
+
+    #[derive(Default)]
+    struct CutTransport {
+        controls: std::sync::Mutex<Vec<Value>>,
+        frames: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for CutTransport {
+        async fn send_control(&self, msg: &Value) -> anyhow::Result<()> {
+            self.controls.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, payload: &[u8]) -> anyhow::Result<()> {
+            self.frames.lock().unwrap().push(payload.to_vec());
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            64 * 1024
+        }
+        fn is_alive(&self) -> bool {
+            true
+        }
+        fn is_dead(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A host that cuts every check, immediately.
+    struct CutHost;
+
+    #[async_trait::async_trait]
+    impl crate::host::HostServices for CutHost {
+        fn settings_get_str(&self, key: &str) -> Option<String> {
+            crate::host::NoHost.settings_get_str(key)
+        }
+        fn devices_load(&self) -> Vec<(String, String)> {
+            crate::host::NoHost.devices_load()
+        }
+        fn is_self_uid(&self, a: &str, b: Option<&str>) -> bool {
+            crate::host::NoHost.is_self_uid(a, b)
+        }
+        fn rejoin_unwarned(&self) -> std::time::Duration {
+            crate::host::NoHost.rejoin_unwarned()
+        }
+        fn relay_banner(&self) -> String {
+            crate::host::NoHost.relay_banner()
+        }
+        fn relay_forbidden(&self) -> bool {
+            crate::host::NoHost.relay_forbidden()
+        }
+        fn channel_of(&self, secret: &str) -> String {
+            crate::host::NoHost.channel_of(secret)
+        }
+        fn roster_snapshot_json(&self) -> Option<String> {
+            crate::host::NoHost.roster_snapshot_json()
+        }
+        fn fleet_rv_present(&self) -> bool {
+            false
+        }
+        fn revoke_recheck_interval(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+        fn live_session_cut(&self, _idev: Option<&[u8; 32]>) -> Option<crate::host::LiveCut> {
+            Some(crate::host::LiveCut {
+                cause: crate::host::LiveCutCause::Revoked,
+                reason: "device revoked".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_cut_answers_eacces_then_closes_with_the_host_reason() {
+        let transport = Arc::new(CutTransport::default());
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_mount_server(MountServerConfig {
+            root: PathBuf::from("."),
+            transport: transport.clone(),
+            sid: 9,
+            stream: rx,
+            protocol_version: 2,
+            read_only: false,
+            device_pub: Some([7; 32]),
+            host: Arc::new(CutHost),
+            log: Arc::new(crate::host::NoLog),
+        });
+        let req = MountRequest {
+            id: 5,
+            bin: None,
+            op: MountOp::GetAttr { path: path_encode(std::path::Path::new("")) },
+        };
+        let mut payload = serde_json::to_vec(&req).unwrap();
+        payload.push(b'\n');
+        tx.send(Some(Bytes::from(payload))).await.unwrap();
+        handle.await.unwrap();
+
+        let frames = transport.frames.lock().unwrap();
+        let (header, _) = decode_frame(&frames[0]);
+        let resp: Value = serde_json::from_slice(header).unwrap();
+        assert_eq!(resp["id"], 5);
+        assert_eq!(resp["status"], "err");
+        assert_eq!(resp["value"]["code"], EACCES);
+        assert_eq!(
+            *transport.controls.lock().unwrap(),
+            vec![serde_json::json!({"type": "l2-close", "sid": 9, "err": "device revoked"})]
+        );
+    }
+
 }

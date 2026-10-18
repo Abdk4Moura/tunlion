@@ -6871,7 +6871,10 @@ async fn recv_run(
                     continue;
                 }
                 Some("mount-open") if l2_enabled => {
-                    crate::mount_recv::handle_mount_open(
+                    // The endpoint returns the serving task so a future driver
+                    // can join it; binding and dropping it here is today's
+                    // detached behaviour, unchanged.
+                    let _mount_server = crate::mount_recv::handle_mount_open(
                         &mut conn,
                         &pid,
                         &v,

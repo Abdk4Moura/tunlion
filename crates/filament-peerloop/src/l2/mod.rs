@@ -14,6 +14,14 @@
 
 pub mod mux;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// The per-peer mux table the receive driver owns. Every L2 sector (mount,
+/// forward, pty, exec, sync) receives THIS map: one SID namespace and one
+/// close/ack path per link, never a private mux.
+pub type MuxMap = HashMap<String, Arc<mux::Mux>>;
+
 pub use mux::{
     ExecCtl, L2_SID_BASE, MAX_STREAMS_PER_LINK, Mux, OpenOutcome, OpenVerdict, PipeItem,
     TreeSignal, is_l2_sid, serve_stream, wire_sid,
