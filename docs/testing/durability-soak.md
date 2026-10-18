@@ -213,6 +213,30 @@ purpose and no transport code was changed to hide it.
 - **Bounded, not a 24h soak.** `--runs N` repeats the same scenario; it does not
   become a long-duration memory/fd soak.
 
+## Browser web shell
+
+The browser has its own deterministic reattach gate, separate from this native
+soak: `frontend/tests/pty-reattach.spec.cjs` drives the real `WebTerminal` in
+Chromium over fake links backed by one device-side session that replays like
+the CLI acceptor. It asserts the stable session id across every link swap, that
+the first open carries no `resume_from`, that a reattach carries exactly the
+bytes the terminal already showed, that output produced during the outage
+arrives once and in order, that an ICE blip on the same link reattaches with
+the same count, and that no reconnect/status notice is written into the
+terminal byte stream.
+
+The browser's own roster digest reconcile is liveness-aware for the same reason
+as the server's #513 fix: a live data channel survives a peer briefly missing
+from a signaling digest, and only a genuinely dead link is retired after two
+misses (unit test: `frontend/src/net/app/__tests__/recovery.test.mjs`). The
+browser's `pty-open` is the shared CLI `handle_pty_open`, so #513/#514 apply to
+web-shell links too: no separate acceptor bypasses them.
+
+What this does not cover: a real Chromium tab against a freshly built daemon
+across an actual network cut. That remains manual (the launch-matrix B11 cell is
+the closest harness), and should be run on real hardware once per release. Do
+not read the fake-link gate as a substitute.
+
 ### Still manual: Windows <-> Linux over a real network
 
 Not replaceable on one Linux runner. The manual matrix, when a Windows and a

@@ -18,7 +18,7 @@ import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename
 import { mintWords, mintCreatedNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
-import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink } from '../net/app/recovery.js'
+import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink, linkIsLive, reconcileDigest } from '../net/app/recovery.js'
 import { shouldAutoAccept, offersCoveredNow } from '../net/app/accept.js'
 import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
 import { localHelperEnabled } from '../net/app/localHelper.js'
@@ -586,30 +586,29 @@ export function useTunlion() {
         // C30 phase 2: the server's roster rode in on the sync digest, a
         // missed peer-joined/left self-corrects here. Channel-introduced
         // links are exempt (room-independent); absence must hold for TWO
-        // consecutive digests (one can race a join in flight).
-        const present = new Set(digestPeers.map((p) => p.id))
-        for (const p of digestPeers) {
-          if (p.id && !linksRef.current.has(p.id)) {
-            tel('digest-adopt', { peer: String(p.id).slice(-6) })
-            makeLinkRef.current?.({ id: p.id, name: p.name, uid: p.uid })
-          }
+        // consecutive digests (one can race a join in flight) AND the link's
+        // own transport must be gone. A signaling reconnect can omit a peer
+        // whose data channel is still carrying a shell (#513); dropping it on
+        // presence alone would tear down exactly the live link the daemon now
+        // defers. Decision is pure in net/app/recovery.js.
+        const verdict = reconcileDigest({
+          peers: digestPeers,
+          present: new Set(digestPeers.map((p) => p.id)),
+          links: [...linksRef.current].map(([id, l]) => ({ id, live: linkIsLive(l) })),
+          channelPids: new Set(expectedSecretRef.current.keys()),
+          misses: digestAbsentRef.current,
+        })
+        digestAbsentRef.current = verdict.misses
+        for (const p of verdict.adopt) {
+          tel('digest-adopt', { peer: String(p.id).slice(-6) })
+          makeLinkRef.current?.({ id: p.id, name: p.name, uid: p.uid })
         }
-        for (const [pid] of [...linksRef.current]) {
-          if (expectedSecretRef.current.has(pid)) continue // channel link
-          if (present.has(pid)) {
-            digestAbsentRef.current.delete(pid)
-            continue
-          }
-          const n = (digestAbsentRef.current.get(pid) || 0) + 1
-          digestAbsentRef.current.set(pid, n)
-          if (n >= 2) {
-            digestAbsentRef.current.delete(pid)
-            tel('digest-drop', { peer: pid.slice(-6) })
-            linksRef.current.get(pid)?.close()
-            linksRef.current.delete(pid)
-            removePeer(pid)
-            setPendingKeeps((prev) => prev.filter((k) => k.peerId !== pid))
-          }
+        for (const pid of verdict.drops) {
+          tel('digest-drop', { peer: pid.slice(-6) })
+          linksRef.current.get(pid)?.close()
+          linksRef.current.delete(pid)
+          removePeer(pid)
+          setPendingKeeps((prev) => prev.filter((k) => k.peerId !== pid))
         }
       })
       sessionRef.current = session
