@@ -293,7 +293,7 @@ pub async fn admit_forward_open(
 mod tests {
     use super::*;
     use crate::conn::{Link, Presence};
-    use crate::host::{CapGate, NoHost, NoLog};
+    use crate::host::{CapGate, HostServices, NoHost, NoLog};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};

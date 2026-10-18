@@ -4,17 +4,15 @@
 //! open an L2 stream at all, and whether the operator's per-device allowlist
 //! covers a non-loopback `host:port`. The allowlist PATH and loader stay here,
 //! because `{config_dir}/l2-allow.json` is this machine's configuration; the
-//! library takes the parsed document instead. Every old name still resolves, so
-//! the receive path and its tests do not move.
+//! library takes the parsed document instead. The allowlist matcher keeps its
+//! CLI name for the receive path; the open gate is called directly from the
+//! library by forward admission and the gate matrix.
 
 use crate::devices_store::devices_path;
 use serde_json::Value;
 use std::path::PathBuf;
 
-// `l2_open_allowed` is still named by the CLI gate matrix test; the forward
-// admission calls it through the library directly.
-#[allow(unused_imports)]
-pub(crate) use filament_peerloop::l2::policy::{l2_open_allowed, l2_target_allowed_in};
+pub(crate) use filament_peerloop::l2::policy::l2_target_allowed_in;
 
 /// Opt-in non-loopback forward allowlist: `{config_dir}/l2-allow.json`. Absent or
 /// malformed file => no entries => loopback-only (the default SSRF posture).
@@ -37,29 +35,15 @@ pub(crate) fn l2_target_allowed(device: &str, host: &str, port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{l2_open_allowed, l2_target_allowed_in};
+    use super::l2_target_allowed_in;
     use filament_peerloop::l2::policy;
     use serde_json::json;
 
-    /// The old CLI names must resolve to the library rules, not a second copy
-    /// that can drift. Re-exports make this true today; the matrix keeps a
-    /// future hand-written duplicate from passing unnoticed.
+    /// The CLI allowlist name must resolve to the library rule, not a second
+    /// copy that can drift. The open gate itself is called directly by the gate
+    /// matrix now, and lives with its own tests in `l2::policy`.
     #[test]
-    fn cli_names_are_the_library_policy() {
-        for blanket in [false, true] {
-            for peer_has_shell in [false, true] {
-                for denied in [false, true] {
-                    assert_eq!(
-                        l2_open_allowed(blanket, peer_has_shell, denied),
-                        policy::l2_open_allowed(blanket, peer_has_shell, denied)
-                    );
-                }
-            }
-        }
-        assert!(l2_open_allowed(true, false, false));
-        assert!(!l2_open_allowed(false, false, false));
-        assert!(!l2_open_allowed(true, true, true));
-
+    fn cli_allowlist_name_is_the_library_policy() {
         let allow = json!({
             "laptop": ["10.0.0.5:5432", "192.168.1.10:*"],
             "*": ["db.internal:5432"]
