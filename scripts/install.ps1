@@ -43,6 +43,19 @@ Set-StrictMode -Version Latest
 
 $Repo = 'Abdk4Moura/tunlion'
 
+# First line of the managed `tl` launcher. The release ZIP ships the same file
+# (packaging/windows/tl.cmd); this marker is how install and uninstall tell our
+# launcher from a user's unrelated `tl.cmd`.
+$TlMarker = '@rem Tunlion tl launcher. Managed by scripts/install.ps1.'
+# Fallback for archives that predate the packaged launcher. Keep byte-for-byte
+# content in step with packaging/windows/tl.cmd (the shape check proves it).
+$TlLauncherContent = @'
+@rem Tunlion tl launcher. Managed by scripts/install.ps1.
+@echo off
+"%~dp0tunlion.exe" %*
+exit /b %errorlevel%
+'@
+
 function Say([string]$m) { Write-Host "tunlion: $m" -ForegroundColor Cyan }
 function Die([string]$m) { Write-Host "tunlion: $m" -ForegroundColor Red; exit 1 }
 
@@ -158,11 +171,16 @@ function Remove-FileWithRetry([string]$path) {
     Die "could not remove $path (still in use); close tunlion and retry"
 }
 
+function Test-TlLauncherOwned([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    $firstLine = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue
+    return ($firstLine -eq $TlMarker)
+}
+
 function Remove-TlLauncher([string]$dir) {
     $path = Join-Path $dir 'tl.cmd'
     if (-not (Test-Path -LiteralPath $path)) { return }
-    $firstLine = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue
-    if ($firstLine -eq '@rem Tunlion tl launcher. Managed by scripts/install.ps1.') {
+    if (Test-TlLauncherOwned $path) {
         Remove-FileWithRetry $path
     } else {
         Say "leaving $path alone because it is not the Tunlion-managed launcher"
@@ -311,33 +329,49 @@ try {
     }
     $exe = Join-Path $InstallDir 'tunlion.exe'
     if (-not (Test-Path -LiteralPath $exe)) { Die 'install failed: tunlion.exe not found in the archive' }
+
+    # --------------------------------------------------------- short command
+    # `tl` is convenient but not globally reserved. Never overwrite a command
+    # already discoverable in this shell; a same-directory launcher from an
+    # older Tunlion install (proven by its ownership marker) is the only one we
+    # may replace. Prefer the launcher packaged in the ZIP so this installer
+    # and the portable archive cannot drift; archives that predate it get the
+    # byte-identical embedded fallback.
+    $TlLauncher = Join-Path $InstallDir 'tl.cmd'
+    $existingTl = Get-Command tl -ErrorAction SilentlyContinue | Select-Object -First 1
+    $existingTlPath = if ($existingTl -and $existingTl.CommandType -eq 'Application') {
+        $existingTl.Source
+    } else { $null }
+    $targetTlExists = Test-Path -LiteralPath $TlLauncher
+    $targetTlOwned = $targetTlExists -and (Test-TlLauncherOwned $TlLauncher)
+    # Textual path equality. A Windows 8.3 short path to our own launcher would
+    # look foreign here; skipping the refresh is the conservative choice, since
+    # we must never replace a command we cannot positively identify as ours.
+    $existingTlIsTarget = $existingTlPath -and ($existingTlPath -ieq $TlLauncher)
+    $installTl = $false
+    if (-not $existingTl -or ($existingTlIsTarget -and $targetTlOwned)) {
+        if (-not $targetTlExists -or $targetTlOwned) { $installTl = $true }
+    }
+    if ($installTl) {
+        $packagedTl = Join-Path $extract 'tl.cmd'
+        if (Test-Path -LiteralPath $packagedTl) {
+            if (-not (Test-TlLauncherOwned $packagedTl)) {
+                Die "install failed: the archive's tl.cmd is not a Tunlion-managed launcher"
+            }
+            Copy-Item -LiteralPath $packagedTl -Destination $TlLauncher -Force
+        } else {
+            Set-Content -LiteralPath $TlLauncher -Value $TlLauncherContent -Encoding Ascii -Force
+        }
+        Say "installed the 'tl' shortcut beside tunlion.exe"
+    } else {
+        $existingTlName = if ($existingTlPath) { $existingTlPath } elseif ($existingTl) { $existingTl.Name } else { $TlLauncher }
+        Say "not installing 'tl': another command already uses that name ($existingTlName); use 'tunlion' or rename the existing command"
+    }
+
     $ver = (& $exe --version 2>$null) -join ' '
     Say "installed $exe ($(if ($ver) { $ver } else { $Tag }))"
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-}
-
-# ----------------------------------------------------------- short command
-# `tl` is convenient but not globally reserved. Never overwrite a command
-# already discoverable in this shell; a same-directory launcher from an older
-# Tunlion install is the only existing command we own and may replace.
-$TlLauncher = Join-Path $InstallDir 'tl.cmd'
-$existingTl = Get-Command tl -ErrorAction SilentlyContinue | Select-Object -First 1
-$existingTlPath = if ($existingTl -and $existingTl.CommandType -eq 'Application') {
-    $existingTl.Source
-} else { $null }
-$ownsExistingTl = $existingTlPath -and ($existingTlPath -ieq $TlLauncher)
-if (-not $existingTl -or $ownsExistingTl) {
-    @'
-@rem Tunlion tl launcher. Managed by scripts/install.ps1.
-@echo off
-"%~dp0tunlion.exe" %*
-exit /b %errorlevel%
-'@ | Set-Content -LiteralPath $TlLauncher -Encoding Ascii
-    Say "installed the 'tl' shortcut beside tunlion.exe"
-} else {
-    $existingTlName = if ($existingTlPath) { $existingTlPath } else { $existingTl.Name }
-    Say "not installing 'tl': another command already uses that name ($existingTlName); use 'tunlion' or rename the existing command"
 }
 
 # ------------------------------------------------------------------- PATH

@@ -113,6 +113,16 @@ jobs:
           if ($sig.Status -ne "Valid") { throw "wintun.dll Authenticode not Valid: $($sig.Status)" }
           if ($sig.SignerCertificate.Subject -notmatch "WireGuard LLC") { throw "wintun.dll not signed by WireGuard LLC: $($sig.SignerCertificate.Subject)" }
           Copy-Item $dll out/
+          # Ship the managed `tl` shortcut in the portable ZIP too. This is the
+          # same file scripts/install.ps1 copies (and recognises by its first
+          # line), so a manual unzip gets `tl` without the installer and the
+          # installer never invents a second, divergent launcher.
+          $tl = "packaging/windows/tl.cmd"
+          if (-not (Test-Path -LiteralPath $tl)) { throw "missing $tl" }
+          if ((Get-Content -LiteralPath $tl -TotalCount 1) -ne '@rem Tunlion tl launcher. Managed by scripts/install.ps1.') {
+            throw "$tl does not have the Tunlion ownership marker"
+          }
+          Copy-Item -LiteralPath $tl -Destination out/
           Compress-Archive -Path "out/*" -DestinationPath "tunlion-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v4
         with:

@@ -33,9 +33,15 @@ Or a package manager:
 | **Cargo** (Rust) | `cargo install filament-cli` |
 | **npm** (Node) | `npm i -g @abdk4moura/filament-cli` |
 
-Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `tunlion update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[tunlion.autumated.com](https://tunlion.autumated.com)** on both devices.
+Homebrew and npm install `tl` too. Homebrew reports a link conflict and leaves
+an existing `tl` in its bin directory in place; npm writes both shims into its
+global prefix and can replace an existing `tl` there. Only the curl/PowerShell
+installers check your `PATH` and leave a pre-existing `tl` untouched. Cargo and
+winget expose only `tunlion`: winget can carry several portable aliases, but a
+`.cmd` cannot be a portable nested file, so `tl` comes from the Windows release
+ZIP or PowerShell installer instead.
 
-The curl and PowerShell install scripts also provide `tl` as a short command. If another `tl` command is already on your `PATH`, the script leaves it untouched and tells you to use `tunlion` instead.
+Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `tunlion update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[tunlion.autumated.com](https://tunlion.autumated.com)** on both devices.
 
 ## Send a file
 

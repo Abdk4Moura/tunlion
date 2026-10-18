@@ -25,10 +25,14 @@ class Tunlion < Formula
 
   def install
     bin.install "tunlion"
+    # `tl` is a convenience alias; it resolves to the canonical binary, so
+    # `tl update` and `tl --version` behave exactly like `tunlion ...`.
+    bin.install_symlink "tunlion" => "tl"
     generate_completions_from_executable(bin/"tunlion", "completions")
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/tunlion --version")
+    assert_match version.to_s, shell_output("#{bin}/tl --version")
   end
 end
