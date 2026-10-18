@@ -819,7 +819,7 @@ class Run:
         self.note("both directions granted shell")
         self.wait_warm_links()
 
-    def wait_warm_links(self) -> None:
+    def wait_warm_links(self, start_from: dict[str, int] | None = None) -> None:
         """Wait until each daemon holds a link, BEFORE any shell starts.
 
         The intentional-drop stage kills the initiator daemon, so the shell MUST
@@ -836,7 +836,8 @@ class Run:
 
         def wait_one(label: str, peer: str, d: Daemon) -> None:
             pat = rf"warm-hold: (?:established connection to|skip) '{re.escape(peer)}'"
-            m = wait_regex(d.log_path, pat, timeout=75, proc=d.proc)
+            start = 0 if start_from is None else start_from.get(label, 0)
+            m = wait_regex(d.log_path, pat, start=start, timeout=75, proc=d.proc)
             if not m:
                 raise Failure(
                     f"daemon {label} never held a warm link to {peer}; refusing to "
@@ -1187,10 +1188,20 @@ class Run:
         self.assert_pid_state(s1, pid1, state1, "signaling")
         self.assert_pid_state(s2, pid2, state2, "signaling")
 
-    def stage_intentional_drop(self, s1: PtySession, pid1: int, state1: str,
-                               s2: PtySession) -> None:
-        self.note("drop: ending the reverse shell before the initiator daemon restart")
+    def stage_intentional_drop(self, s1: PtySession, s2: PtySession) -> None:
+        # A client that has already cold-reconnected (as both may have after the
+        # signaling flap) no longer rides the initiator daemon's warm link, so
+        # killing that daemon would prove nothing. Close both stage shells and
+        # establish a FRESH warm shell for the drop, then verify the warm link
+        # before the kill. This is what makes "kill the initiator" a valid test.
+        self.note("drop: closing the signaling-stage shells")
+        s1.close(grace=12)
         s2.close(grace=12)
+        d_before = self.daemon_snapshot()
+        self.wait_warm_links(start_from=d_before)
+        state_drop = f"sd{secrets.token_hex(4)}"
+        s_drop = self.new_shell("drop-a-to-b", self.cfg_a, "soak-a", "soak-b")
+        pid_drop = self.establish(s_drop, state_drop)
         # The session host is B. Killing A's daemon destroys the link but NOT the
         # PTY or its process on B. That is the property under test.
         d0 = self.daemon_snapshot()
@@ -1212,16 +1223,17 @@ class Run:
             m is not None,
             "no 'pty REATTACHED' at the session host within 90s\n"
             f"--- daemon-b.log ---\n{tail(self.daemon_b.log_path)}\n"
-            f"--- shell-a-to-b ---\n{tail(s1.transcript)}",
+            f"--- shell-drop ---\n{tail(s_drop.transcript)}",
         )
-        self.assert_pid_state(s1, pid1, state1, "drop")
+        self.assert_pid_state(s_drop, pid_drop, state_drop, "drop")
         # Explicitly prove the client is usable after the reattach, not merely
         # that a log line exists.
         self.check(
             "drop: shell answered a fresh command after reattach",
-            s1.activity("postdrop", timeout=30),
-            f"no activity after reattach\n--- transcript ---\n{tail(s1.transcript)}",
+            s_drop.activity("postdrop", timeout=30),
+            f"no activity after reattach\n--- transcript ---\n{tail(s_drop.transcript)}",
         )
+        s_drop.close(grace=12)
 
     # ---- teardown / summary ----------------------------------------------
 
@@ -1319,9 +1331,7 @@ def run_once(base: Path, bin_path: Path, args: argparse.Namespace, index: int) -
         run.stage_stable(s1, pid1, state1, s2, pid2, state2)
         run.stage_concurrent(s1, pid1, state1, s2, pid2, state2)
         run.stage_signaling_flap(s1, pid1, state1, s2, pid2, state2)
-        run.stage_intentional_drop(s1, pid1, state1, s2)
-
-        s1.close(grace=12)
+        run.stage_intentional_drop(s1, s2)
         result = "pass" if all(c["ok"] for c in run.checks) else "fail"
     except Failure as e:
         error = str(e)
