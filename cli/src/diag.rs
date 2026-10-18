@@ -328,7 +328,10 @@ fn write_jsonl(v: &Value) {
 fn beacon(server: &str, body: Value) {
     let url = format!("{server}/api/telemetry");
     tokio::spawn(async move {
-        let Ok(client) = filament_transport::http::client_builder()
+        let Ok(builder) = filament_transport::http::client_builder() else {
+            return;
+        };
+        let Ok(client) = builder
             .timeout(std::time::Duration::from_secs(2))
             .build()
         else {

@@ -9,18 +9,22 @@
 
 /// A `reqwest::ClientBuilder` with this platform's TLS trust configured.
 ///
-/// Panics if the platform verifier cannot initialize its trust store.
+/// Returns the TLS initialization error if the platform trust store cannot load.
 /// TLS uses ring regardless of the process-default rustls provider, without
 /// installing or replacing that default.
-pub fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().tls_backend_preconfigured(tls_config())
+///
+/// The preconfigured backend owns TLS policy, including ALPN. Later reqwest TLS
+/// options (roots, identity, versions, SNI, verification, key logging) do not
+/// reconfigure it. HTTP version preference methods do not rewrite its fixed
+/// `h2`/`http/1.1` ALPN list. Ordinary timeout, DNS, proxy and header options work.
+pub fn client_builder() -> Result<reqwest::ClientBuilder, rustls::Error> {
+    Ok(reqwest::Client::builder().tls_backend_preconfigured(tls_config()?))
 }
 
-fn tls_config() -> rustls::ClientConfig {
+fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default TLS versions");
+        .with_safe_default_protocol_versions()?;
     #[cfg(target_os = "android")]
     let builder = builder.with_root_certificates(rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -31,14 +35,13 @@ fn tls_config() -> rustls::ClientConfig {
     let builder = builder
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(
-            rustls_platform_verifier::Verifier::new(provider)
-                .expect("platform TLS verifier initialization failed"),
+            rustls_platform_verifier::Verifier::new(provider)?,
         ));
     let mut cfg = builder.with_no_client_auth();
     // reqwest preserves preconfigured ALPN. Match its default HTTP/2 + HTTP/1.1
     // configuration rather than silently losing HTTP/2 on desktop.
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    cfg
+    Ok(cfg)
 }
 
 #[cfg(test)]
