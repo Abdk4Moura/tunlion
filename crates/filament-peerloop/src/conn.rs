@@ -4779,16 +4779,6 @@ mod warm_identity_tests {
         fn heard_ms(&self) -> Option<u64> {
             self.heard
         }
-        fn idle_ms(&self) -> u64 {
-            if self.is_dead() {
-                u64::MAX
-            } else {
-                self.idle_ms
-            }
-        }
-        fn heard_ms(&self) -> Option<u64> {
-            self.heard_ms
-        }
         fn force_close(&self) {
             self.closes.fetch_add(1, Ordering::Relaxed);
             self.alive.store(false, Ordering::Relaxed);
