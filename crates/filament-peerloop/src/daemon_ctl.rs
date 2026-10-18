@@ -4,7 +4,8 @@
 //! half of the control surface whose inputs are already crate-owned: the reach
 //! liveness probes, `sshd_listening`, the warm `Ping` and `ListWarm` replies,
 //! and the deferred `Bootstrap` reply sockets. Each takes the crate's `Conn`
-//! and `control::Req` and returns a control-worded answer; the terminal is
+//! and `control::Req` (the reach ping also takes the calling invocation's
+//! `LivenessProbes`) and returns a control-worded answer; the terminal is
 //! reached through `Conn::log`, which is the injected `LogSink`.
 //!
 //! What stayed in the CLI, and why: `handle_warm_req` and the `Open`/`Pty`/
@@ -53,13 +54,167 @@ pub async fn sshd_listening(port: u16) -> bool {
     false
 }
 
-/// Outstanding `reach` liveness probes: nonce -> the waiter. A warm link is
-/// only reported once the PEER answers on it, because a link whose far end
-/// was stopped or killed -9 stays "alive" locally until QUIC's idle timeout
-/// (~22-29 s measured), and reach used to say ok, warm, verified, exit 0 for
-/// that whole window.
-static LIVENESS: std::sync::Mutex<Option<HashMap<u64, tokio::sync::oneshot::Sender<()>>>> =
-    std::sync::Mutex::new(None);
+/// Outstanding `reach` liveness probes owned by ONE daemon/control invocation.
+///
+/// A warm link is only reported once the PEER answers on it, because a link
+/// whose far end was stopped or killed -9 stays "alive" locally until QUIC's
+/// idle timeout (~22-29 s measured), and reach used to say ok, warm, verified,
+/// exit 0 for that whole window.
+///
+/// This used to be a process-global map plus a process-global nonce counter.
+/// Two engines in one process therefore shared waiter state: a `reach-pong`
+/// delivered by either receive loop could wake the other engine's probe, and
+/// neither engine's shutdown could reap the other's waiters. The registry is
+/// now an ordinary value. The owner (the receive/control loop) creates one and
+/// passes a `&LivenessProbes` to the ping handler and to the pong arm; clones
+/// are cheap handles to the same table, so a spawned probe task can hold its
+/// own copy while the loop keeps dispatching.
+///
+/// Nonces come from a process-wide counter, so a nonce is unique across every
+/// registry in the process even though each registry keeps its own waiter
+/// table. That is what makes cross-engine delivery safe: the same pong cannot
+/// find a waiter in two registries. The woken probe is still narrowed to the
+/// peer/link (`pid`) it was sent on, so a pong with a matching number on the
+/// wrong link or from the wrong peer is ignored.
+#[derive(Clone)]
+pub struct LivenessProbes {
+    state: std::sync::Arc<LivenessState>,
+}
+
+struct LivenessState {
+    /// nonce -> the bound waiter. Guarded by `Arc` above: this map belongs to
+    /// the invocation, never to the process.
+    waiters: std::sync::Mutex<HashMap<u64, Waiter>>,
+}
+
+struct Waiter {
+    peer: String,
+    pid: String,
+    tx: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Allocate a nonce that no other registry in this process will hand out.
+/// The waiter MAP stays invocation-owned; only the number space is shared, so
+/// a pong for one engine's probe can never match another engine's waiter.
+fn next_liveness_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Default for LivenessProbes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LivenessProbes {
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(LivenessState {
+                waiters: std::sync::Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Register a probe bound to the peer and link pid it is sent on. The
+    /// returned waiter owns the table entry: its receiver resolves when the
+    /// matching pong arrives, and dropping it (timeout, cancellation, or an
+    /// aborted task) removes the entry.
+    pub fn register(&self, peer: &str, pid: &str) -> LivenessWait {
+        let nonce = next_liveness_nonce();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                nonce,
+                Waiter {
+                    peer: peer.to_string(),
+                    pid: pid.to_string(),
+                    tx,
+                },
+            );
+        LivenessWait {
+            probes: self.clone(),
+            nonce,
+            rx,
+        }
+    }
+
+    /// A `reach-pong` arrived on link `pid`. Wake its waiter only when the
+    /// nonce, the link AND the peer the link names all match; an unknown,
+    /// late, peer-mismatched or other-link pong - or one on a link that no
+    /// longer names its peer - is ignored and leaves any waiter intact.
+    /// Returns whether a live waiter was woken (a send that fails because its
+    /// receiver is already gone returns `false`).
+    pub fn answered(&self, peer: Option<&str>, pid: &str, pong: &Value) -> bool {
+        let Some(nonce) = pong["n"].as_u64() else {
+            return false;
+        };
+        let tx = {
+            let mut waiters = self
+                .state
+                .waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let matches = waiters.get(&nonce).is_some_and(|w| {
+                w.pid == pid && peer.is_some_and(|p| w.peer.eq_ignore_ascii_case(p))
+            });
+            if matches {
+                waiters.remove(&nonce).map(|w| w.tx)
+            } else {
+                None
+            }
+        };
+        tx.is_some_and(|tx| tx.send(()).is_ok())
+    }
+
+    /// How many probes this invocation still has outstanding. Observability
+    /// for tests and logs; it never reaches the control reply formats.
+    pub fn outstanding(&self) -> usize {
+        self.state
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    fn forget(&self, nonce: u64) {
+        self.state
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&nonce);
+    }
+}
+
+/// One outstanding probe. Not `Clone`: exactly one task awaits it, and dropping
+/// the wait is what unregisters the nonce.
+pub struct LivenessWait {
+    probes: LivenessProbes,
+    nonce: u64,
+    rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl LivenessWait {
+    pub fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    /// Resolve when the matching pong arrives. A closed channel (the registry
+    /// dropped the sender) also returns `false`, never a false positive.
+    pub async fn answered(&mut self) -> bool {
+        (&mut self.rx).await.is_ok()
+    }
+}
+
+impl Drop for LivenessWait {
+    fn drop(&mut self) {
+        self.probes.forget(self.nonce);
+    }
+}
 
 /// The `reach-ping` a daemon sends on a held link; the peer answers with a
 /// `reach-pong` carrying the same `n`. An older peer ignores the unknown type,
@@ -75,43 +230,6 @@ pub fn liveness_ping(n: u64) -> Value {
 /// The answer to a `reach-ping`, echoing its nonce.
 pub fn liveness_pong(ping: &Value) -> Value {
     json!({ "type": "reach-pong", "n": ping["n"].clone() })
-}
-
-/// Register a probe; the receiver resolves when its pong arrives.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
-pub fn liveness_register() -> (u64, tokio::sync::oneshot::Receiver<()>) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if let Ok(mut m) = LIVENESS.lock() {
-        m.get_or_insert_with(HashMap::new).insert(n, tx);
-    }
-    (n, rx)
-}
-
-/// A `reach-pong` arrived: wake its waiter (an unknown or late nonce is
-/// ignored).
-pub fn liveness_answered(pong: &Value) {
-    let Some(n) = pong["n"].as_u64() else { return };
-    let tx = LIVENESS.lock().ok().and_then(|mut m| m.as_mut()?.remove(&n));
-    if let Some(tx) = tx {
-        let _ = tx.send(());
-    }
-}
-
-/// Forget a probe that timed out.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
-fn liveness_forget(n: u64) {
-    if let Ok(mut m) = LIVENESS.lock() {
-        if let Some(m) = m.as_mut() {
-            m.remove(&n);
-        }
-    }
 }
 
 /// How long a warm link has to answer `reach-ping` (TUNLION_REACH_PING_MS,
@@ -133,8 +251,11 @@ pub fn liveness_window() -> Duration {
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
 /// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
 /// miss `reject`s so the client falls back to a cold establish-probe.
+///
+/// `probes` is the calling invocation's registry; the pong is routed back to it
+/// by the same receive loop, never through process-wide state.
 #[cfg(unix)]
-pub async fn handle_warm_ping(conn: &Conn, req: control::Req) {
+pub async fn handle_warm_ping(conn: &Conn, probes: &LivenessProbes, req: control::Req) {
     let control::ReqKind::Ping { peer } = &req.kind else {
         return;
     };
@@ -178,18 +299,19 @@ pub async fn handle_warm_ping(conn: &Conn, req: control::Req) {
     });
     // Confirm the far end is there before saying so: one reach-ping round
     // trip, bounded. Spawned, so the event loop never waits on the peer (F8).
-    let (n, answered) = liveness_register();
-    let sent = t.send_control(&liveness_ping(n)).await.is_ok();
+    let mut probe = probes.register(&peer, &pid);
+    let sent = t.send_control(&liveness_ping(probe.nonce())).await.is_ok();
     let window = liveness_window();
     let log = conn.log.clone();
     tokio::spawn(async move {
         let t0 = Instant::now();
-        let ok = sent && matches!(tokio::time::timeout(window, answered).await, Ok(Ok(())));
+        let ok = sent && matches!(tokio::time::timeout(window, probe.answered()).await, Ok(true));
         if ok {
             reply["alive_ms"] = json!(t0.elapsed().as_millis() as u64);
             req.reply(&reply).await;
         } else {
-            liveness_forget(n);
+            // Drop the waiter before answering so a late pong cannot find it.
+            drop(probe);
             log.debug(&format!(
                 "reach: warm link to '{peer}' did not answer a liveness ping in {}ms",
                 window.as_millis()
@@ -339,31 +461,170 @@ pub fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
 mod liveness_tests {
     use super::*;
 
+    fn pong_reply(nonce: u64) -> Value {
+        json!({ "type": "reach-pong", "n": nonce })
+    }
+
     /// A pong echoing the ping's nonce wakes exactly that probe; a stray or
     /// late pong wakes nothing.
     #[tokio::test]
     async fn a_pong_answers_its_own_ping_only() {
-        let (n, rx) = liveness_register();
-        let (m, mut other) = liveness_register();
+        let probes = LivenessProbes::new();
+        let mut first = probes.register("alice", "pid-a");
+        let mut second = probes.register("alice", "pid-a");
+        let n = first.nonce();
         let ping = liveness_ping(n);
         assert_eq!(ping["type"], json!("reach-ping"));
         let pong = liveness_pong(&ping);
         assert_eq!(pong, json!({ "type": "reach-pong", "n": n }));
-        liveness_answered(&pong);
-        assert!(tokio::time::timeout(Duration::from_secs(1), rx).await.is_ok());
-        assert!(other.try_recv().is_err(), "probe {m} must still be waiting");
-        liveness_answered(&json!({ "type": "reach-pong", "n": 999_999_999u64 }));
-        liveness_answered(&json!({ "type": "reach-pong" }));
-        liveness_forget(m);
+        assert!(probes.answered(Some("alice"), "pid-a", &pong));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), first.answered()).await,
+            Ok(true)
+        ));
+        assert!(
+            !probes.answered(Some("alice"), "pid-a", &pong),
+            "a pong answers one waiter, never a second probe"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), second.answered())
+                .await
+                .is_err(),
+            "probe {} must still be waiting",
+            second.nonce()
+        );
+        assert_eq!(probes.outstanding(), 1);
+        assert!(!probes.answered(Some("alice"), "pid-a", &pong_reply(999_999_999)));
+        assert!(!probes.answered(Some("alice"), "pid-a", &json!({ "type": "reach-pong" })));
+        assert!(!probes.answered(Some("alice"), "pid-a", &pong_reply(0)));
+        assert_eq!(probes.outstanding(), 1);
         assert!(liveness_window() >= Duration::from_millis(1));
     }
 
-    /// No answer means no confirmation: the probe times out, it is never
-    /// reported as alive.
+    /// A probe belongs to the peer and link it was sent on. A pong carrying the
+    /// right nonce but delivered for another peer, another link, or a link with
+    /// no peer identity left leaves the waiter intact.
     #[tokio::test]
-    async fn silence_is_not_alive() {
-        let (n, rx) = liveness_register();
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx).await.is_err());
-        liveness_forget(n);
+    async fn a_pong_must_match_the_bound_peer_and_link() {
+        let probes = LivenessProbes::new();
+        let mut wait = probes.register("Alice", "pid-a");
+        let pong = pong_reply(wait.nonce());
+        assert!(
+            !probes.answered(Some("bob"), "pid-a", &pong),
+            "another peer's pong must not complete this probe"
+        );
+        assert!(
+            !probes.answered(Some("alice"), "pid-b", &pong),
+            "the same nonce on another link must not complete this probe"
+        );
+        assert!(
+            !probes.answered(None, "pid-a", &pong),
+            "a link that no longer names its peer cannot confirm a probe"
+        );
+        assert_eq!(probes.outstanding(), 1);
+        assert!(
+            probes.answered(Some("alice"), "pid-a", &pong),
+            "peer names match case-insensitively, exactly as warm selection does"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), wait.answered()).await,
+            Ok(true)
+        ));
+        assert_eq!(probes.outstanding(), 0);
+    }
+
+    /// Two engines in one process each own a registry, and probe nonces are
+    /// unique across both. A pong is therefore accepted by at most one
+    /// registry; delivering it to the other one is rejected and leaves the
+    /// first engine's probe outstanding.
+    #[tokio::test]
+    async fn same_process_registries_are_isolated() {
+        let engine_a = LivenessProbes::new();
+        let engine_b = LivenessProbes::new();
+        let mut probe_a = engine_a.register("alice", "pid-a");
+        let mut probe_b = engine_b.register("alice", "pid-a");
+        assert_ne!(
+            probe_a.nonce(),
+            probe_b.nonce(),
+            "nonces must be unique across registry instances"
+        );
+        let pong_a = pong_reply(probe_a.nonce());
+        let pong_b = pong_reply(probe_b.nonce());
+
+        // B's pong is foreign to A: it matches no waiter there.
+        assert!(!engine_a.answered(Some("alice"), "pid-a", &pong_b));
+        assert_eq!(engine_a.outstanding(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), probe_a.answered())
+                .await
+                .is_err(),
+            "B's pong must not complete A's probe"
+        );
+
+        // B's own registry accepts it; A is still outstanding.
+        assert!(engine_b.answered(Some("alice"), "pid-a", &pong_b));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), probe_b.answered()).await,
+            Ok(true)
+        ));
+        assert_eq!(engine_b.outstanding(), 0);
+        assert_eq!(engine_a.outstanding(), 1);
+
+        // A's pong is foreign to B for the same reason.
+        assert!(!engine_b.answered(Some("alice"), "pid-a", &pong_a));
+
+        // A's own registry accepts it; only now does A wake.
+        assert!(engine_a.answered(Some("alice"), "pid-a", &pong_a));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), probe_a.answered()).await,
+            Ok(true)
+        ));
+        assert_eq!(engine_a.outstanding(), 0);
+    }
+
+    /// Dropping a waiter (timeout, cancellation, task teardown) unregisters it;
+    /// a pong that arrives afterwards finds nothing.
+    #[tokio::test]
+    async fn dropping_a_waiter_forgets_the_probe() {
+        let probes = LivenessProbes::new();
+        let wait = probes.register("alice", "pid-a");
+        let n = wait.nonce();
+        drop(wait);
+        assert_eq!(probes.outstanding(), 0);
+        assert!(
+            !probes.answered(Some("alice"), "pid-a", &pong_reply(n)),
+            "a late pong cannot wake a dropped waiter"
+        );
+    }
+
+    /// Letting the probe time out and dropping the wait leaves no entry behind.
+    #[tokio::test]
+    async fn a_timed_out_probe_leaves_no_waiter() {
+        let probes = LivenessProbes::new();
+        let mut wait = probes.register("alice", "pid-a");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), wait.answered())
+                .await
+                .is_err(),
+            "silence must never confirm a probe"
+        );
+        drop(wait);
+        assert_eq!(probes.outstanding(), 0);
+    }
+
+    /// Cancelling the task that owns a probe drops its waiter too (the pattern
+    /// `handle_warm_ping` relies on when its spawned task goes away).
+    #[tokio::test]
+    async fn cancelling_the_probe_task_forgets_the_probe() {
+        let probes = LivenessProbes::new();
+        let wait = probes.register("alice", "pid-a");
+        let held = tokio::spawn(async move {
+            let _wait = wait;
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(probes.outstanding(), 1);
+        held.abort();
+        let _ = held.await;
+        assert_eq!(probes.outstanding(), 0);
     }
 }

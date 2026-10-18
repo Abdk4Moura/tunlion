@@ -38,8 +38,7 @@ use tokio::sync::mpsc;
 
 // The half whose inputs are crate-owned. Re-exported, not redefined.
 pub(crate) use filament_peerloop::daemon_ctl::{
-    liveness_answered, liveness_ping, liveness_pong, liveness_register, liveness_window,
-    sshd_listening,
+    LivenessProbes, liveness_pong, sshd_listening,
 };
 #[cfg(unix)]
 pub(crate) use filament_peerloop::daemon_ctl::{
@@ -71,6 +70,7 @@ pub(crate) async fn handle_warm_req(
     _conn: &Conn,
     _l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     _warm_ptys: &WarmPtys,
+    _probes: &LivenessProbes,
     _tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
 ) {
@@ -82,6 +82,7 @@ pub(crate) async fn handle_warm_req(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     warm_ptys: &WarmPtys,
+    probes: &LivenessProbes,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
 ) {
@@ -92,7 +93,7 @@ pub(crate) async fn handle_warm_req(
         ctl::ReqKind::Dial { .. } => req.reject("dial not handled here").await,
         ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
         ctl::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
-        ctl::ReqKind::Ping { .. } => handle_warm_ping(conn, req).await,
+        ctl::ReqKind::Ping { .. } => handle_warm_ping(conn, probes, req).await,
         // Bootstrap is dispatched before this (it defers its reply), so it never
         // reaches here; reject defensively so a future caller falls back to cold.
         ctl::ReqKind::Bootstrap { .. } => req.reject("bootstrap not handled here").await,

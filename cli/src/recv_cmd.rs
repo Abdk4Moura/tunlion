@@ -63,7 +63,7 @@ use crate::{
     handle_identity_expose, handle_warm_req, human, identity, in_binding, interactive_allowed,
     interactive_requested, is_self_uid, issue_proven_challenge_and_hold,
     l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
-    load_provisional_identity, local_device_cert, mark_bounded_cap_source,
+    LivenessProbes, load_provisional_identity, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
     mk_uid, mount_proto, net, next_ev, offer_question, out_binding,
     owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz,
@@ -2176,6 +2176,13 @@ async fn recv_run(
     let mut settle_ticks: u32 = 0;
     // Warm-pty session -> (pid, sid), so a `pty-resize` op relays to the right stream.
     let warm_ptys: WarmPtys = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Outstanding `reach` liveness probes for THIS loop. A pong is routed back
+    // only into the registry owned by the loop that sent the ping, bound to the
+    // link it arrived on and the peer that link names, so a pong for another
+    // probe cannot complete this loop's waiter. The loop's handle is dropped on
+    // exit; a probe still in flight holds its own handle and removes itself
+    // when it answers or its bounded window expires.
+    let liveness = LivenessProbes::new();
     // Warm ssh-bootstrap reply sockets awaiting the peer's ack (see PendingBootstraps).
     #[cfg(unix)]
     let mut pending_bootstrap: PendingBootstraps = HashMap::new();
@@ -2775,11 +2782,11 @@ async fn recv_run(
                             if let ReqKind::Pty { peer, .. } = &req.kind {
                                 conn.note_warm_use(peer);
                             }
-                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
+                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &liveness, &tx, req).await;
                         }
                     }
                     #[cfg(not(unix))]
-                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
+                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &liveness, &tx, req).await;
                 }
                 None
             }
@@ -6281,7 +6288,13 @@ async fn recv_run(
                         let _ = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
                     }
                 }
-                Some("reach-pong") => crate::daemon_ctl::liveness_answered(&v),
+                Some("reach-pong") => {
+                    // Only THIS loop's registry, bound to the link the pong
+                    // actually arrived on and the peer that link names. A pong
+                    // on another engine's link cannot complete this probe.
+                    let peer = conn.links.get(&pid).and_then(|l| l.verified_name.as_deref());
+                    liveness.answered(peer, &pid, &v);
+                }
                 Some("l2-open-ack") => {
                     if let Some(sid) = l2::wire_sid(&v) {
                         if let Some(mux) = l2_muxes.get(&pid) {
