@@ -174,8 +174,8 @@ const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const DIGEST_ABSENT_IDLE_GRACE: Duration = Duration::from_secs(30);
 /// "Moving enough to call the peer present" for digest retirement, in ms.
 /// Mirrors `link_flowing`'s default (`TUNLION_ADOPT_ACTIVE_MS`) for transports
-/// that do not track peer-originated traffic. Peer-tracked transports use
-/// `WARM_RELAY_STALE_MS` instead; see `Conn::digest_link_active`.
+/// that do not track peer-originated traffic. Peer-tracked transports go through
+/// `link_manager::relay_peer_live` instead; see `Conn::digest_link_active`.
 const DIGEST_ACTIVE_MS: u64 = 3_000;
 
 /// Which signaling surface owns a link, and therefore which digest may judge
@@ -4204,13 +4204,14 @@ impl Conn {
     ///
     /// Deliberately not `link_flowing` (which backs supersede/peer-left): relay
     /// and DataChannel keepalives are OUR writes and stamp `idle_ms`, so a relay
-    /// link to a wiped or SIGSTOPped peer can read "flowing" forever. `heard_ms`
-    /// is stamped only by the peer, so it stops advancing when the peer does;
-    /// `WARM_RELAY_STALE_MS` is the existing relay-silence bound. Direct QUIC
-    /// does not track `heard_ms`; it is judged on `idle_ms` (which includes our
-    /// writes) and `is_dead`. A direct link we keep writing to can therefore
-    /// stay deferred until QUIC declares it dead: bounded by the transport, not
-    /// by this grace. Relay/DataChannel is the reporting case and is bounded here.
+    /// link to a wiped or SIGSTOPped peer can read "flowing" forever. Where the
+    /// transport tracks `heard_ms`, that stamp is peer-only and the shared
+    /// `link_manager::relay_peer_live` rule decides; it stops advancing when the
+    /// peer does. Direct QUIC does not track `heard_ms`; it is judged on
+    /// `idle_ms` (which includes our writes) and `is_dead`. A direct link we keep
+    /// writing to can therefore stay deferred until QUIC declares it dead:
+    /// bounded by the transport, not by this grace. Relay/DataChannel is the
+    /// reporting case and is bounded here.
     fn digest_link_active(&self, pid: &str) -> bool {
         let Some(l) = self.links.get(pid) else {
             return false;
@@ -4221,10 +4222,10 @@ impl Conn {
         if t.is_dead() {
             return false;
         }
-        match t.heard_ms() {
-            Some(h) => h < crate::link_manager::WARM_RELAY_STALE_MS,
-            None => t.idle_ms() < DIGEST_ACTIVE_MS,
+        if let Some(peer_live) = crate::link_manager::relay_peer_live(t.heard_ms()) {
+            return peer_live;
         }
+        t.idle_ms() < DIGEST_ACTIVE_MS
     }
 
     /// The sid is present again in a digest: nothing is deferred for it. The
