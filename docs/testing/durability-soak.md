@@ -17,7 +17,7 @@ One process-level, single-host (loopback) scenario per `run`:
 | stage | what happens | what must hold |
 |---|---|---|
 | setup | isolated backend + flaky signaling proxy, two config dirs, reciprocal same-owner pair secret, two `up` daemons with `TUNLION_L2=1`, explicit `grant` both ways; log offsets are taken **before** the second client exists | both daemons serve; prerequisites missing = exit 2 |
-| simultaneous | two real `tunlion shell` clients in opposite directions, each on a real PTY | both remote PIDs exist; shell state marker round-trips; the first shell is re-checked after the second joins and the setup window shows no reattach/drop |
+| simultaneous | two real `tunlion shell` clients in opposite directions, each on a real PTY; each uses a pinned `TUNLION_SHELL_SESSION` and proves it rode the daemon's warm link | both remote PIDs exist; shell state marker round-trips; the first shell is re-checked after the second joins and the setup window shows no reattach/drop |
 | stable | 60% idle, 40% active (default 150s total; active probe every 5s) | **zero** unsolicited `pty REATTACHED`, `drop_link(`, mux `closing streams`, supersede, warm-hold re-establish, or client reconnect; same PIDs/state at the end |
 | concurrent | `exec` A->B, `exec` B->A, and a real `forward` TCP stream (loopback echo target) while both shells are live | all three succeed; both shells keep the same PID; daemons stay quiet |
 | signaling flap | existing `runner/sim/flaky_proxy.py` severs every client<->backend TCP for ~8s, then heals; shells are probed every second | the daemons log a real `signaling reconnected`; both shells answer across the outage; no reattach/drop; the post-heal 12s idle window must not reap the link |
