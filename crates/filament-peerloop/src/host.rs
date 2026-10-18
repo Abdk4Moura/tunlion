@@ -510,6 +510,14 @@ pub trait HostServices: Send + Sync + 'static {
     fn request_bar(&self, _peer: &str) -> Option<RequestBar> {
         None
     }
+    /// Record one pending consent request for a refused open.
+    ///
+    /// The host owns the unverified/empty-name filter, the capability filter,
+    /// the [`request_bar`](Self::request_bar) check, TTL expiry, dedup, bounded
+    /// eviction, persistence and any notify hook. This is the missing WRITE
+    /// side of the queue the library already reads; it is deliberately one
+    /// method, not a sector-hooks trait. An inert host records nothing.
+    fn enqueue_request_if_requestable(&self, _peer: &str, _capability: &str) {}
     /// Record a capability grant (`grant == true`) or revoke in this host's
     /// device store, bounded by `expires` when given.
     ///

@@ -43,6 +43,7 @@ pub mod consent;
 pub mod control;
 pub mod daemon_ctl;
 pub mod driver;
+pub mod fs_at;
 pub mod holepunch;
 pub mod host;
 pub mod identity;
@@ -51,10 +52,13 @@ pub mod limits;
 pub mod link_manager;
 pub mod liveness;
 pub mod local;
+pub mod mount;
+pub mod mount_proto;
 #[cfg(feature = "mesh")]
 pub mod mesh;
 mod petname;
 pub mod present;
+pub mod refusal;
 pub mod resilience;
 mod retry;
 pub mod secret;
@@ -68,7 +72,7 @@ mod warm;
 pub use adoption::{
     AdoptSource, active_binding_matches, match_adoption_source, peer_targetable,
 };
-pub use liveness::{direct_permitted, ice_fallback_allowed, link_dead_for, link_has_live_for};
+pub use liveness::{RevokeRecheck, direct_permitted, ice_fallback_allowed, link_dead_for, link_has_live_for};
 pub use petname::{LinkPetname, link_petname};
 pub use retry::{schedule_retry, stuck_backoff};
 pub use warm::{WarmBackoff, WarmHold};

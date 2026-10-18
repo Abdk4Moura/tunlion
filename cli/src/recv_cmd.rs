@@ -837,13 +837,15 @@ async fn handle_pty_open(
         // refusal. The fallback stays coarse on purpose.
         // With a precise code and our name for the peer, so its remedy is
         // the one that applies (a missing grant is not "serving is off").
-        let refusal = crate::refusal::Refusal::from_shell_gate(
-            gate_inputs.cert_revoked,
-            gate_inputs.denied,
-            cap_reason.as_deref(),
-            dev.clone(),
-        )
-        .with_reinvite_for(gate_inputs.idev.as_ref());
+        let refusal = crate::refusal::with_reinvite_for(
+            crate::refusal::Refusal::from_shell_gate(
+                gate_inputs.cert_revoked,
+                gate_inputs.denied,
+                cap_reason.as_deref(),
+                dev.clone(),
+            ),
+            gate_inputs.idev.as_ref(),
+        );
         let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
@@ -6869,7 +6871,10 @@ async fn recv_run(
                     continue;
                 }
                 Some("mount-open") if l2_enabled => {
-                    crate::mount_recv::handle_mount_open(
+                    // The endpoint returns the serving task so a future driver
+                    // can join it; binding and dropping it here is today's
+                    // detached behaviour, unchanged.
+                    let _mount_server = crate::mount_recv::handle_mount_open(
                         &mut conn,
                         &pid,
                         &v,

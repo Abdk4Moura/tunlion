@@ -4,7 +4,7 @@
 //! These 28 items were the last block of definitions left in the crate root. They
 //! are consts and statics (limits, wire markers, env-gated test knobs), and small
 //! structs/enums that several modules exchange: RecvState, PeerAuthz, ServiceManager,
-//! ShellPolicy, RevokeRecheck, DeadlineClock, PendingRequest, PartMeta, UiCapability,
+//! ShellPolicy, DeadlineClock, PendingRequest, PartMeta, UiCapability,
 //! TtyGuard, MountPlan, SendOutcome.
 //!
 //! NO item here carries a cfg attribute, so every re-export in the crate root is
@@ -132,20 +132,6 @@ pub(crate) enum DeadlineClock {
     AbsoluteStop,
     /// The liveness budget (`last_seen + effective_max_offline`).
     LivenessBudget,
-}
-
-/// Re-checks a live session's authorization on a bounded interval, so a revoked
-/// peer loses a long-lived stream (mount, pty, l2) without re-reading the device
-/// store per operation. The interval-and-verdict decision lives here, once,
-/// instead of being re-derived in each serve loop where it can drift (the shape
-/// of #226 and #228).
-///
-/// The caller MUST deliver the denial in a form its client can act on, then
-/// close. Returning silently is not enough: a client that just stops receiving
-/// parks where no signal lands (see #235's FUSE D-state).
-pub(crate) struct RevokeRecheck {
-    pub(crate) last: std::time::Instant,
-    pub(crate) interval: std::time::Duration,
 }
 
 /// Terminal principal states written to `principalState` on a device record.

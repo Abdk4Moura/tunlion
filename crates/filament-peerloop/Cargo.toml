@@ -35,6 +35,8 @@ debug-logs = []
 # behaviour match the CLI build these modules came from.
 anyhow = "1.0.102"
 async-trait = "0.1.89"
+# The mount protocol's path encoding: raw unix bytes, lossy UTF-8 elsewhere.
+base64 = "0.22"
 bytes = "1.11.1"
 chrono = "0.4"
 filament-cap = { path = "../filament-cap", version = "0.1.1" }
@@ -49,9 +51,13 @@ sha2 = "0.11.0"
 tokio = { version = "1.52.3", features = ["full"] }
 webrtc = "0.17.1"
 
+# The mount server's directory-relative ("*at") calls are POSIX; the non-unix
+# arm is std-only (Windows mounts go through WinFsp). Same version as the CLI.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-# The moved tests: a fake signaling websocket (base64/ring). sha2, used by the
-# frozen punch literal digest, is a normal dependency now that fresh_secret
-# needs it.
-base64 = "0.22"
+# The moved tests: a fake signaling websocket (ring) and capability-store JSON
+# fixtures keyed by hex device keys.
 ring = "0.17"
+hex = "0.4"

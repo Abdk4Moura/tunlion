@@ -184,7 +184,7 @@ mod file_io;
 pub(crate) use file_io::{parse_duration_secs, parse_invitation, parse_mint_ttl, pidfile, read_owner_only_fd, write_owner_only_fd, write_owner_only_file, write_pidfile};
 /// Shared limits, wire constants and small types.
 mod shared_defs;
-pub(crate) use shared_defs::{DEFAULT_SERVER, DeadlineClock, FLEET_LINK_NAME, FORCE_INTERACTIVE, MAX_ATTEMPTS, MAX_PENDING, MAX_VERIFY_FAILS, MountPlan, NO_INTERACTIVE, NO_RELAY, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, PartMeta, PeerAuthz, PendingRequest, REJOIN_WINDOW, REPO, REQUEST_TTL_SECS, RecvState, RevokeRecheck, STALL_MAX_REPAIRS, SendOutcome, ServiceManager, ShellPolicy, TtyGuard, VERIFY_PROBE_SID};
+pub(crate) use shared_defs::{DEFAULT_SERVER, DeadlineClock, FLEET_LINK_NAME, FORCE_INTERACTIVE, MAX_ATTEMPTS, MAX_PENDING, MAX_VERIFY_FAILS, MountPlan, NO_INTERACTIVE, NO_RELAY, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, PartMeta, PeerAuthz, PendingRequest, REJOIN_WINDOW, REPO, REQUEST_TTL_SECS, RecvState, STALL_MAX_REPAIRS, SendOutcome, ServiceManager, ShellPolicy, TtyGuard, VERIFY_PROBE_SID};
 #[cfg(test)]
 pub(crate) use shared_defs::HEAD_BYTES;
 /// Shell authority helpers and daemon/service probes.
@@ -998,34 +998,6 @@ async fn link_fingerprints(conn: &conn::Conn, pid: &str) -> Option<(String, Stri
 
 
 
-impl RevokeRecheck {
-    pub(crate) fn new() -> Self {
-        Self {
-            last: std::time::Instant::now(),
-            interval: revoke_recheck_interval(),
-        }
-    }
-
-    /// The re-check interval. Timer-driven loops (pty, l2) build a ticker at this
-    /// cadence and re-ask the verdict directly; the request-shaped mount uses
-    /// [`Self::cut`] instead.
-    pub(crate) fn interval(&self) -> std::time::Duration {
-        self.interval
-    }
-
-    /// True when the interval has elapsed AND the peer is now revoked. The
-    /// caller re-checks at its natural cadence (per request for mount); the
-    /// interval bound inside keeps that cadence cheap.
-    /// Why the live session must end now (revoked, or its invitation ended),
-    /// checked at most once per interval. None also while the interval runs.
-    pub(crate) fn cut(&mut self, idev: Option<&[u8; 32]>) -> Option<crate::identity_state::LiveCut> {
-        if self.last.elapsed() < self.interval {
-            return None;
-        }
-        self.last = std::time::Instant::now();
-        crate::identity_state::live_session_cut(idev)
-    }
-}
 
 
 
