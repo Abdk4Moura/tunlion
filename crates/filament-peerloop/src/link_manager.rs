@@ -68,6 +68,16 @@ pub struct LinkObs<'a> {
     pub direct: bool,
     /// Milliseconds since the transport last moved bytes either way.
     pub idle_ms: u64,
+    /// Milliseconds since the link was established (`Link::established_at`).
+    /// This is the only lifetime signal a link carries: nothing on it records
+    /// WHY it was dialled, and a one-shot `exec` client proves the same pair
+    /// identity as the long-lived daemon it runs next to. So placement uses age,
+    /// not a purpose bit, to keep a freshly-created one-shot link from
+    /// displacing the stable link the daemon already holds.
+    ///
+    /// `None` means the lifetime is unknown; it ranks as the youngest, so an
+    /// unknown-age link never outranks one we know has lived longer.
+    pub age_ms: Option<u64>,
 }
 
 /// Where a request goes.
@@ -95,16 +105,35 @@ pub fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
 
 /// Place `work` for `peer` on the given links. Pure.
 ///
-/// Every eligible link qualifies; a direct one is preferred over a relayed one.
-/// Among equals the last one in iteration order wins, which is exactly what the
-/// resolver this replaced (`max_by_key` over the link table) did.
+/// Every eligible link qualifies; a direct one is preferred over a relayed one
+/// (P6). Among links of the same kind the LONGEST-LIVED one wins. That is the
+/// durability rule: a one-shot `exec` client opens a fresh link to the same
+/// device and proves the same identity, so without a lifetime preference it can
+/// be selected (HashMap order is `last-equal`) and then close under the work it
+/// was given. Nothing in `Link` says whether it was dialled by a daemon or by a
+/// one-shot command, so age is the available signal; see `LinkObs::age_ms`.
+///
+/// Ties are broken by the lexicographically smallest pid, not by iteration
+/// order, so the same link set always yields the same placement.
 pub fn place(_work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement {
     links
         .iter()
         .filter(|l| eligible(l, peer))
-        .max_by_key(|l| l.direct as u8)
+        .max_by(|a, b| {
+            a.direct
+                .cmp(&b.direct)
+                .then_with(|| age_rank(a).cmp(&age_rank(b)))
+                // Reversed so `max_by` picks the SMALLEST pid on a full tie.
+                .then_with(|| b.pid.cmp(a.pid))
+        })
         .map(|l| Placement::Reuse { pid: l.pid.to_string() })
         .unwrap_or(Placement::Establish)
+}
+
+/// A link's lifetime for placement. Unknown ranks as youngest (0 ms), so it
+/// cannot displace a link we know has been alive longer.
+fn age_rank(l: &LinkObs<'_>) -> u64 {
+    l.age_ms.unwrap_or(0)
 }
 
 /// Is the PEER on this link demonstrably there right now? What `devices` may
@@ -280,6 +309,7 @@ mod tests {
             alive: true,
             direct: false,
             idle_ms: 0,
+            age_ms: Some(0),
         }
     }
 
@@ -343,6 +373,87 @@ mod tests {
             assert_eq!(
                 place(Work::Interactive, "laptop", &links),
                 Placement::Reuse { pid: "d".into() }
+            );
+        }
+    }
+
+    #[test]
+    fn one_shot_exec_link_does_not_displace_the_long_lived_daemon_link() {
+        // Shape from the PR512 soak: a just-created one-shot exec link (24 ms)
+        // and the daemon's stable link (156 s) both eligible for the same peer.
+        let mut daemon = obs("daemon", Some("laptop"));
+        daemon.direct = true;
+        daemon.age_ms = Some(156_000);
+        let mut exec = obs("exec", Some("laptop"));
+        exec.direct = true;
+        exec.age_ms = Some(24);
+        for links in [
+            [exec.clone(), daemon.clone()],
+            [daemon.clone(), exec.clone()],
+        ] {
+            assert_eq!(
+                place(Work::Interactive, "laptop", &links),
+                Placement::Reuse { pid: "daemon".into() }
+            );
+        }
+    }
+
+    #[test]
+    fn direct_eligibility_still_beats_an_older_relay() {
+        // P6 is primary: age only orders links of the same kind, so a young
+        // direct one-shot still wins over an old relay that is eligible.
+        let mut relay = obs("relay", Some("laptop"));
+        relay.age_ms = Some(900_000);
+        let mut direct = obs("exec", Some("laptop"));
+        direct.direct = true;
+        direct.age_ms = Some(24);
+        assert_eq!(
+            place(Work::Interactive, "laptop", &[relay, direct]),
+            Placement::Reuse { pid: "exec".into() }
+        );
+    }
+
+    #[test]
+    fn an_older_but_dead_or_quiet_link_is_not_selected_over_a_live_one() {
+        let mut quiet = obs("old-relay", Some("laptop"));
+        quiet.age_ms = Some(900_000);
+        quiet.idle_ms = WARM_RELAY_STALE_MS;
+        let mut dead = obs("dead-direct", Some("laptop"));
+        dead.direct = true;
+        dead.age_ms = Some(900_000);
+        dead.alive = false;
+        let mut live = obs("new-relay", Some("laptop"));
+        live.age_ms = Some(1);
+        assert_eq!(
+            place(Work::Interactive, "laptop", &[quiet, dead, live]),
+            Placement::Reuse { pid: "new-relay".into() }
+        );
+    }
+
+    #[test]
+    fn lifetime_ties_are_deterministic_and_unknown_age_ranks_youngest() {
+        let mut a = obs("a", Some("laptop"));
+        a.age_ms = Some(5_000);
+        let mut b = obs("b", Some("laptop"));
+        b.age_ms = Some(5_000);
+        // Same direct-ness and age: the smallest pid wins whatever the order.
+        for links in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
+            assert_eq!(
+                place(Work::Interactive, "laptop", &links),
+                Placement::Reuse { pid: "a".into() }
+            );
+        }
+        let mut unknown = obs("unknown", Some("laptop"));
+        unknown.age_ms = None;
+        let mut known = obs("known", Some("laptop"));
+        known.age_ms = Some(1);
+        for links in [
+            [unknown.clone(), known.clone()],
+            [known.clone(), unknown.clone()],
+        ] {
+            assert_eq!(
+                place(Work::Interactive, "laptop", &links),
+                Placement::Reuse { pid: "known".into() }
             );
         }
     }
