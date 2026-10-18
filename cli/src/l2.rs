@@ -2418,6 +2418,21 @@ pub(crate) fn normalize_stdin_chunk(
     state.push(input)
 }
 
+/// Queue data from a successful, nonzero stdin read. A suppressed split-CRLF
+/// tail can normalize to nothing: do not queue that as the bridge's EOF sentinel.
+fn queue_stdin_chunk(
+    state: &mut CookedNewlines,
+    input: &[u8],
+    cooked: bool,
+    tx: &mpsc::UnboundedSender<Vec<u8>>,
+) -> std::result::Result<(), mpsc::error::SendError<Vec<u8>>> {
+    let chunk = normalize_stdin_chunk(state, input, cooked);
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    tx.send(chunk)
+}
+
 /// Remove terminal mouse reports from `input`: SGR (`ESC [ < b ; x ; y M|m`),
 /// urxvt (`ESC [ b ; x ; y M`) and the original X10 form (`ESC [ M` and three
 /// bytes). Everything else, keystrokes and other escape sequences, is kept.
@@ -2557,12 +2572,12 @@ pub(crate) fn spawn_stdin_reader(
                     break;
                 }
                 Ok(n) => {
-                    let chunk = normalize_stdin_chunk(
+                    if queue_stdin_chunk(
                         &mut newlines,
                         &buf[..n],
                         cooked.load(Ordering::Acquire),
-                    );
-                    if tx.send(chunk).is_err() {
+                        &tx,
+                    ).is_err() {
                         break; // the client hung up
                     }
                 }
@@ -6778,6 +6793,25 @@ mod terminal_reset_tests {
         assert_eq!(state.push(b"a\r"), b"a\r".to_vec());
         assert!(state.push(b"").is_empty());
         assert_eq!(state.push(b"\nb"), b"b".to_vec(), "the CRLF stays one Enter");
+    }
+
+    #[test]
+    fn suppressed_split_lf_is_not_queued_as_eof() {
+        use super::{CookedNewlines, queue_stdin_chunk};
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = CookedNewlines::default();
+        queue_stdin_chunk(&mut state, b"a\r", true, &tx).unwrap();
+        // CR is emitted immediately, without waiting for the next read.
+        assert_eq!(rx.try_recv().unwrap(), b"a\r".to_vec());
+        queue_stdin_chunk(&mut state, b"\n", true, &tx).unwrap();
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+        queue_stdin_chunk(&mut state, b"b\n", true, &tx).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), b"b\r".to_vec());
+        queue_stdin_chunk(&mut state, b"raw\n\r\n", false, &tx).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), b"raw\n\r\n".to_vec());
+        // The actual EOF path still sends exactly one empty sentinel.
+        tx.send(Vec::new()).unwrap();
+        assert!(rx.try_recv().unwrap().is_empty());
     }
 
     /// The reader honors its flag: raw/piped input passes LF and CR through
