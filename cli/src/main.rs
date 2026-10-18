@@ -55,6 +55,7 @@ mod l2;
 mod proxy_state;
 mod mount;
 mod mount_proto;
+mod mount_recv;
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 mod mount_fuse;
 #[cfg(all(target_os = "windows", feature = "mount-windows"))]

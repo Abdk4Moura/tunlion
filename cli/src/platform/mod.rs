@@ -3104,10 +3104,14 @@ pub fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        // Windows distinguishes a file target from a directory target and the caller does not always
-        // know which it means, so try both.
-        std::os::windows::fs::symlink_file(target, link)
-            .or_else(|_| std::os::windows::fs::symlink_dir(target, link))
+        // Creating a file-typed link to an existing directory can succeed, but
+        // that link cannot be traversed as a directory. Do not treat successful
+        // creation as proof that the target type matched.
+        if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
