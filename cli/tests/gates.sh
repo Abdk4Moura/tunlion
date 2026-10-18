@@ -620,10 +620,11 @@ fi
 # --------------------------------------------------------------- gate 11 ----
 say "11: same-uid rejoin supersede (C6) — frozen receiver replaced by same device"
 D="$WORK/g11"; mkdir -p "$D"
-# #28: the same-uid supersede now only fires for an IDLE link — an actively
-# flowing one is preserved (a live signaling reconnect must not tear down a
-# transfer). A frozen receiver goes idle, so it still supersedes; we pin the
-# idle threshold low and sleep past it after the freeze to keep that
+# #28: the same-uid supersede preserves an actively flowing link (a live
+# signaling reconnect must not tear down a transfer) and also preserves a
+# quiet-but-alive idle link. A frozen receiver is different: it has a transfer
+# in flight and no bytes are moving, so it still supersedes. We pin the idle
+# threshold low and sleep past it after the freeze to keep the stall signal
 # deterministic regardless of how fast the replacement joins.
 # -v on the sender: "superseding old link" is a DEBUG (resilience-internal) line.
 # The freeze must land mid-transfer; see gate 2 for the stall.
