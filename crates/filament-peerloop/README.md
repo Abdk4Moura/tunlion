@@ -45,3 +45,26 @@ The command surface stays in the CLI: `send_cmd`, `recv_cmd`, the daemons, the
 roster UI and every decision about what a person asked for. The CLI keeps thin
 re-export shims under the old module paths, so no call site had to move with the
 state.
+
+## Cargo features
+
+`mesh` is enabled by default for compatibility with the CLI and existing library
+consumers. It enables the optional `filament-overlay` dependency, the `mesh`
+module (including route policy and endpoint traits), and the mesh hostname,
+overlay-key and L3 endpoint methods on `HostServices`.
+
+Use `default-features = false` to exclude that code, API and dependency. Common
+identity, authorization, transport link-route selection and shared L2 stream
+multiplexing remain available. Existing consumers that disabled defaults must
+now explicitly enable `features = ["mesh"]` if they use those APIs. Cargo
+features are additive: selecting the CLI alongside a reduced consumer enables
+mesh for both, so exclusion checks must select peerloop alone.
+
+This is not a complete engine/route/platform feature matrix: CLI mesh dispatch,
+TUN adapters and route effects remain CLI-owned, and `tunlion-core` remains
+identity-only. Further sector cuts belong with their actual driver owners.
+
+CI runs `scripts/check_peerloop_mesh_graph.py` for isolated host and Android
+graphs, compiles/tests peerloop with defaults and without them, and checks the
+mesh-disabled API examples. No dependency versions or lockfile changes are
+needed for this boundary.

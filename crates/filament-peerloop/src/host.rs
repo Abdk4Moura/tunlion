@@ -24,6 +24,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "mesh")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,12 +32,14 @@ use filament_cap::capability::{
     ActionCounts, BindingStrength, CapOutcome, GateDecision, PrincipalKind, ShadowCounts,
 };
 use filament_id::{DeviceCert, UserKey};
+#[cfg(feature = "mesh")]
 use filament_overlay::Identity;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::consent::{PendingRequest, RequestBar};
 use crate::control::Req;
+#[cfg(feature = "mesh")]
 use crate::mesh::{L3Mode, MeshTunnel};
 
 /// Terminal tone, mirroring `cli::ui::Tone`. The crate carries the WORD (which
@@ -216,8 +219,12 @@ pub enum StorageFailure {
 /// `Value`, so this crate keeps no serde dependency and the returned blob's
 /// ownership is unambiguous; the caller parses it exactly once.
 ///
-/// The mesh, overlay-key, ssh-key and mount methods further down are the
-/// features an embedding host must opt into. Their inert defaults are honest,
+/// The mesh and overlay-key methods exist only with the `mesh` Cargo feature
+/// (enabled by default). Disabling it removes those ports and the mesh module,
+/// not common identity, authorization or stream multiplexing.
+///
+/// The mesh, overlay-key, ssh-key and mount methods further down are host
+/// effects an embedding host must opt into. Their inert defaults are honest,
 /// not permissive: they REFUSE with a reason (or, where the question is a
 /// yes/no, answer no) rather than pretend the feature exists. A host that
 /// implements none of them still runs the receive loop; it serves no overlay,
@@ -321,6 +328,7 @@ pub trait HostServices: Send + Sync + 'static {
     /// A host with no mesh endpoint may leave the empty default: the loop only
     /// asks once an overlay is up, and an empty label is a true "no name"
     /// rather than an invented one.
+    #[cfg(feature = "mesh")]
     fn hostname(&self) -> String {
         String::new()
     }
@@ -331,15 +339,18 @@ pub trait HostServices: Send + Sync + 'static {
     /// loop disables the crypto overlay and says why instead of claiming an
     /// address it cannot prove. To get the overlay, implement this plus
     /// [`l3_start`](HostServices::l3_start).
+    #[cfg(feature = "mesh")]
     fn overlay_identity(&self) -> Result<Identity, String> {
         Err("this host has no overlay key store".to_string())
     }
     /// This device's overlay public key, loading the identity as
     /// [`overlay_identity`](HostServices::overlay_identity) does.
+    #[cfg(feature = "mesh")]
     fn overlay_pubkey(&self) -> Result<[u8; 32], String> {
         self.overlay_identity().map(|id| id.public_key_bytes())
     }
     /// Sign a device-possession proof with the overlay key.
+    #[cfg(feature = "mesh")]
     fn overlay_sign_possession(&self, msg: &[u8]) -> Result<[u8; 64], String> {
         self.overlay_identity().map(|id| id.sign(msg))
     }
@@ -351,6 +362,7 @@ pub trait HostServices: Send + Sync + 'static {
     /// the receive loop then serves with no overlay (`L3 disabled: ...`) rather
     /// than pretending a route exists. Implementing this and
     /// [`hostname`](HostServices::hostname) is what turns the feature on.
+    #[cfg(feature = "mesh")]
     fn l3_start(
         &self,
         _cidr: &str,
@@ -844,13 +856,6 @@ mod tests {
         let host = NoHost;
         // Not permissive: every feature hook that could claim success refuses
         // with a reason a caller can print, and the yes/no questions answer no.
-        assert_eq!(host.hostname(), "");
-        assert!(host.overlay_identity().is_err());
-        assert!(host.overlay_pubkey().is_err());
-        assert!(host.overlay_sign_possession(b"m").is_err());
-        assert!(host
-            .l3_start("fd00::1/128", 1280, None, L3Mode::Auto)
-            .is_err());
         assert!(host.ssh_host_pubkeys().is_empty());
         assert!(host
             .install_authorized_key("dev", "ssh-ed25519 AAAA")
@@ -864,6 +869,19 @@ mod tests {
         assert!(host.connect_local_stream("127.0.0.1", 22).await.is_err());
         assert!(host.live_session_cut(Some(&[0u8; 32])).is_none());
         assert_eq!(host.revoke_recheck_interval(), Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "mesh")]
+    #[test]
+    fn nohost_refuses_mesh_endpoints_and_overlay_keys() {
+        let host = NoHost;
+        assert_eq!(host.hostname(), "");
+        assert!(host.overlay_identity().is_err());
+        assert!(host.overlay_pubkey().is_err());
+        assert!(host.overlay_sign_possession(b"m").is_err());
+        assert!(host
+            .l3_start("fd00::1/128", 1280, None, L3Mode::Auto)
+            .is_err());
     }
 
     #[tokio::test]
