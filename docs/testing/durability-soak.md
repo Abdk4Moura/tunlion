@@ -21,10 +21,12 @@ One process-level, single-host (loopback) scenario per `run`:
 | stable | 60% idle, 40% active (default 150s total; active probe every 5s) | **zero** unsolicited `pty REATTACHED`, `drop_link(`, mux `closing streams`, supersede, warm-hold re-establish, or client reconnect; same PIDs/state at the end |
 | concurrent | `exec` A->B, `exec` B->A, and a real `forward` TCP stream (loopback echo target) while both shells are live | all three succeed; both shells keep the same PID; daemons stay quiet |
 | signaling flap | existing `runner/sim/flaky_proxy.py` severs every client<->backend TCP for ~8s, then heals; shells are probed every second | the daemons log a real `signaling reconnected`; both shells answer across the outage; no reattach/drop; the post-heal 12s idle window must not reap the link |
-| intentional drop | the reverse shell is closed; the **initiator** daemon is SIGTERM'd and restarted (the peer hosting the PTY stays up) | peer logs `pty REATTACHED`; **same remote shell PID**, same shell variable state, `/proc/<pid>` alive, and a fresh command works |
+| intentional drop | the reverse shell is closed; the **initiator** daemon is SIGKILL'd and restarted (the peer hosting the PTY stays up) | peer logs `pty REATTACHED`; **same remote shell PID**, same shell variable state, `/proc/<pid>` alive, and a fresh command works |
 
-The intentional drop is a daemon restart rather than a packet filter because it
-is deterministic and exercises the real client reconnect/reattach loop. It
+The intentional drop is a hard daemon kill + restart rather than a packet filter
+because it is deterministic and exercises the real client reconnect/reattach
+loop; SIGKILL avoids a graceful shutdown sending stream-close frames that a
+real network loss would not. It
 destroys the link, not the session host, which is the property reported broken.
 The signaling flap is a real socket sever through the existing fixture, not a
 simulated log line.
