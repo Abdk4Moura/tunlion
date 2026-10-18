@@ -1307,6 +1307,7 @@ dependencies = [
  "filament-id",
  "filament-overlay",
  "filament-signal",
+ "filament-transfer",
  "filament-transport",
  "hex",
  "libc",

@@ -18,8 +18,9 @@
 //! leaves the directory already landed outside the root.
 //!
 //! This module is filesystem-local and has no opinion about the peer, the
-//! transport, consent, or the UI. The sync handler stays in the CLI; it calls
-//! these helpers and keeps the stateful protocol.
+//! transport, consent, or the UI. `peerloop::sync` calls [`resolve_root`] for
+//! inbound admission; the CLI keeps the stateful protocol and the write/delete
+//! helpers below.
 
 use std::path::{Path, PathBuf};
 

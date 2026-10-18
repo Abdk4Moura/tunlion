@@ -2959,16 +2959,20 @@ async fn recv_run(
                         .await;
                     }
                     ParkKind::Sync => {
-                        let mux = l2_muxes
-                            .entry(p.pid.clone())
-                            .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
-                            .clone();
+                        // The re-drive re-checks transport under its own label;
+                        // admission then resolves it again from the same link.
+                        if conn.transport_of(&p.pid).is_none() {
+                            crate::conn::dropped_no_transport(
+                                &p.pid,
+                                &format!("parked {:?} open", p.kind),
+                            );
+                            continue;
+                        }
                         crate::sync_cmd::handle_sync_open(
                             &mut conn,
                             &p.pid,
-                            t,
-                            mux,
                             &p.v,
+                            &mut l2_muxes,
                             &dir,
                             &mut parked_opens,
                         )
@@ -6661,25 +6665,22 @@ async fn recv_run(
                     .await;
                     continue;
                 }
-                // Directory sync: bounds + transfer gate + serve, all in the
-                // module. Not gated on l2_enabled: it is a transfer, admitted by
-                // the same capability a file-offer from this peer would be, and
-                // parked on an unproven-identity deny like the shell-class opens.
+                // Directory sync: admission (bounds + transfer gate) is the
+                // peerloop endpoint; the CLI still parks a deny and serves the
+                // stateful protocol. Not gated on l2_enabled: it is a transfer,
+                // admitted by the same capability a file-offer from this peer
+                // would be, and parked on an unproven-identity deny like the
+                // shell-class opens.
                 Some("sync-open") => {
-                    let Some(t) = conn.transport_of(&pid) else {
+                    if conn.transport_of(&pid).is_none() {
                         crate::conn::dropped_no_transport(&pid, "sync-open");
                         continue;
-                    };
-                    let mux = l2_muxes
-                        .entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
-                        .clone();
+                    }
                     crate::sync_cmd::handle_sync_open(
                         &mut conn,
                         &pid,
-                        t,
-                        mux,
                         &v,
+                        &mut l2_muxes,
                         &dir,
                         &mut parked_opens,
                     )
