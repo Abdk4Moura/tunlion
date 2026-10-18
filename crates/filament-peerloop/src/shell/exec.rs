@@ -172,10 +172,24 @@ mod tests {
 
     #[test]
     fn parse_rejects_absurd_frames() {
-        let many: Vec<Value> = (0..200).map(|i| json!(format!("a{i}"))).collect();
-        assert!(parse_exec_open(&json!({"argv": many})).is_none());
-        let big = "x".repeat(40 * 1024);
-        assert!(parse_exec_open(&json!({"argv": ["ok", big]})).is_none());
+        // All companion fields are valid: rejection must come from the bound
+        // under test, not (for example) a missing required stderr sid.
+        let mut frame = json!({
+            "type": "exec-open", "sid": crate::l2::L2_SID_BASE,
+            "err_sid": crate::l2::L2_SID_BASE + 1,
+            "cwd": "/tmp", "env": ["OK=1"], "tty": false,
+            "argv": vec!["arg"; MAX_ARGV],
+        });
+        let req = parse_exec_open(&frame).expect("MAX_ARGV arguments are accepted");
+        assert_eq!(req.argv.len(), MAX_ARGV);
+        frame["argv"] = json!(vec!["arg"; MAX_ARGV + 1]);
+        assert!(parse_exec_open(&frame).is_none(), "MAX_ARGV + 1 must refuse");
+
+        frame["argv"] = json!(["ok", "x".repeat(MAX_ARG_LEN)]);
+        let req = parse_exec_open(&frame).expect("MAX_ARG_LEN bytes are accepted");
+        assert_eq!(req.argv[1].len(), MAX_ARG_LEN);
+        frame["argv"] = json!(["ok", "x".repeat(MAX_ARG_LEN + 1)]);
+        assert!(parse_exec_open(&frame).is_none(), "MAX_ARG_LEN + 1 must refuse");
     }
 
     /// An open that promises heartbeats carries `alive_ms`; one that does not

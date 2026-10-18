@@ -1023,6 +1023,8 @@ mod tests {
     /// The regression: a parked exec-open re-driven after serving was turned
     /// off used to re-enter the handler and be SERVED. Every re-drive now
     /// passes here, where the current `serving` is read.
+    /// This exercises the endpoint with a stored frame and a changed binding;
+    /// it does not exercise the CLI's actual parking queue or sweep.
     #[tokio::test]
     async fn a_parked_exec_redrive_after_l2_off_is_refused_not_served() {
         let host = TestHost::new(Verdict::Proven);
