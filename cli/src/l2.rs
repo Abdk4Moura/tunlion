@@ -2322,6 +2322,14 @@ fn reset_terminal_modes(phase: LocalTerminalReset) {
 /// a terminal an earlier session left in mouse mode reports every mouse move,
 /// and those must not reach the new shell as if typed. Runs once, when raw
 /// mode is first entered; what is left goes out first through `pending`.
+///
+/// The bytes are also restored from cooked-mode line discipline to what a raw
+/// terminal would have sent (`normalize_cooked_newlines`): Enter reached us as
+/// LF, and a Windows ConPTY shell treats LF as "insert a newline in the edit
+/// buffer", not "submit". That left the first typed command sitting behind a
+/// `>>` continuation prompt until a later raw-mode CR arrived; its output then
+/// appeared late (and out of order) with that command. Unix ttys map CR back to
+/// LF via ICRNL, so normalizing is safe there too.
 fn scrub_typeahead(
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
@@ -2330,10 +2338,36 @@ fn scrub_typeahead(
     while let Ok(chunk) = stdin_rx.try_recv() {
         queued.extend_from_slice(&chunk);
     }
-    let kept = strip_mouse_reports(&queued);
+    let kept = normalize_cooked_newlines(&strip_mouse_reports(&queued));
     if !kept.is_empty() {
         *pending = Some(kept);
     }
+}
+
+/// Undo the terminal's cooked-mode line-ending translation for input typed
+/// before raw mode: Enter arrives as LF (`ICRNL`) or CRLF (a Windows console
+/// read), while a raw terminal sends the CR a remote PTY expects. `\n` and
+/// `\r\n` each become one `\r`; a lone `\r` is already right. This is not
+/// applied to piped stdin, where LF is the script's own line ending, nor to
+/// raw-mode input, where a deliberate Ctrl+J must reach a remote TUI unchanged.
+pub(crate) fn normalize_cooked_newlines(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        match input[i] {
+            b'\r' => {
+                out.push(b'\r');
+                // CRLF is ONE Enter, not Enter followed by a stray newline.
+                if input.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b'\n' => out.push(b'\r'),
+            byte => out.push(byte),
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Remove terminal mouse reports from `input`: SGR (`ESC [ < b ; x ; y M|m`),
@@ -2446,7 +2480,17 @@ enum PtyOutcome {
 /// to whichever attach is current over an mpsc channel. An empty Vec is the EOF
 /// sentinel (matches the `send_frame(sid, &[])` FIN convention). The thread ends on
 /// EOF/error; on a clean session exit the process exits right after, reaping it.
-pub(crate) fn spawn_stdin_reader() -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+///
+/// `cooked` is true until the caller has put the terminal in raw mode. While it
+/// is true, each chunk is normalized from cooked-mode line endings before it is
+/// queued, so a line submitted in the same instant raw mode is enabled cannot
+/// slip through as LF (the race `scrub_typeahead` alone would leave open). The
+/// caller clears the flag AFTER `enable_raw_mode`, never before: a chunk read
+/// across the switch is then normalized unnecessarily (harmless, CR is left
+/// alone) instead of shipped with the LF that stalls a ConPTY shell.
+pub(crate) fn spawn_stdin_reader(
+    cooked: Arc<AtomicBool>,
+) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     std::thread::spawn(move || {
         use std::io::Read;
@@ -2459,7 +2503,11 @@ pub(crate) fn spawn_stdin_reader() -> tokio::sync::mpsc::UnboundedReceiver<Vec<u
                     break;
                 }
                 Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    let mut chunk = buf[..n].to_vec();
+                    if cooked.load(Ordering::Acquire) {
+                        chunk = normalize_cooked_newlines(&chunk);
+                    }
+                    if tx.send(chunk).is_err() {
                         break; // the client hung up
                     }
                 }
@@ -2507,6 +2555,7 @@ async fn pty_attach_once(
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
     received: &mut u64,
+    cooked: &Arc<AtomicBool>,
 ) -> Result<PtyOutcome> {
     // Bound the connect so an unreachable peer fails with a clear message
     // instead of hanging forever. Override with TUNLION_CONNECT_SECS.
@@ -2631,6 +2680,10 @@ async fn pty_attach_once(
     if interactive && raw.is_none() {
         scrub_typeahead(stdin_rx, pending);
         *raw = Some(RawGuard::enable()?);
+        // Only now is new input raw. Clearing the flag AFTER enabling the mode
+        // means a chunk read across the switch was normalized (safe) rather
+        // than passed through as the cooked LF that stalls PSReadLine.
+        cooked.store(false, Ordering::Release);
     }
 
     // Forward terminal resizes to the remote PTY (acceptor handles `pty-resize`).
@@ -2769,6 +2822,7 @@ async fn try_warm_pty(
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
     received: &mut u64,
+    cooked: &Arc<AtomicBool>,
 ) -> Option<Result<()>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     // `Err(Some(reason))` means the DAEMON answered. A `refused:` reason is the
@@ -2797,6 +2851,7 @@ async fn try_warm_pty(
                 Ok(g) => *raw = Some(g),
                 Err(e) => return Some(Err(e)),
             }
+            cooked.store(false, Ordering::Release);
         }
         // Forward SIGWINCH as a `resize` control op (a fresh short connection each time).
         let session_owned = session.to_string();
@@ -2879,7 +2934,12 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // per-attach reader leaks and swallows input after a reconnect (see
     // `spawn_stdin_reader`). `pending` carries input pulled just as a link died so
     // the reattach re-sends it instead of losing the keystroke.
-    let mut stdin_rx = spawn_stdin_reader();
+    //
+    // `cooked` says the terminal has not reached raw mode yet, so the reader can
+    // restore Enter to CR for typeahead. A piped stdin (non-interactive) is never
+    // normalized: its LF is the script's own line ending.
+    let cooked = Arc::new(AtomicBool::new(interactive));
+    let mut stdin_rx = spawn_stdin_reader(cooked.clone());
     let mut pending: Option<Vec<u8>> = None;
 
     // WARM FAST PATH: if the local `up` daemon already holds a (verified, direct)
@@ -2933,6 +2993,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
             &mut stdin_rx,
             &mut pending,
             &mut received,
+            &cooked,
         )
         .await
         {
@@ -2970,6 +3031,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
             &mut stdin_rx,
             &mut pending,
             &mut received,
+            &cooked,
         )
         .await
         {
@@ -6576,5 +6638,43 @@ mod terminal_reset_tests {
         // Not a mouse report: two fields, or no terminator yet.
         assert_eq!(strip_mouse_reports(b"\x1b[1;5A"), b"\x1b[1;5A".to_vec());
         assert_eq!(strip_mouse_reports(b"\x1b[<35;84"), b"\x1b[<35;84".to_vec());
+    }
+
+    /// Cooked-mode line endings are restored to the CR a raw terminal sends.
+    /// Enter in a cooked local tty arrives as LF; a Windows ConPTY shell inserts
+    /// that as a new edit line instead of submitting, so the command waits behind
+    /// `>>` until a later CR. CRLF is one Enter, and a lone CR must stay one.
+    #[test]
+    fn cooked_typeahead_newlines_become_cr() {
+        use super::normalize_cooked_newlines;
+        assert_eq!(normalize_cooked_newlines(b"echo A\n"), b"echo A\r".to_vec());
+        assert_eq!(normalize_cooked_newlines(b"echo A\r\n"), b"echo A\r".to_vec());
+        assert_eq!(normalize_cooked_newlines(b"echo A\r"), b"echo A\r".to_vec());
+        assert_eq!(
+            normalize_cooked_newlines(b"a\nb\r\nc\r\n"),
+            b"a\rb\rc\r".to_vec(),
+            "each cooked line ending is exactly one Enter"
+        );
+        assert_eq!(
+            normalize_cooked_newlines(b"\x1b[A\n\x1b[<35;84;9M\n"),
+            b"\x1b[A\r\x1b[<35;84;9M\r".to_vec(),
+            "escape sequences pass through untouched"
+        );
+        assert_eq!(normalize_cooked_newlines(b""), Vec::<u8>::new());
+    }
+
+    /// The whole typeahead scrub (mouse removal + newline restoration), as the
+    /// client uses it before entering raw mode. This is the regression cell: with
+    /// the LF left in place, a Windows shell never ran the first typed command.
+    #[test]
+    fn typeahead_scrub_restores_enter_and_strips_mouse() {
+        use super::scrub_typeahead;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tx.send(b"echo one\n".to_vec()).unwrap();
+        tx.send(b"echo two\r\n".to_vec()).unwrap();
+        tx.send(b"\x1b[<35;84;9M".to_vec()).unwrap();
+        let mut pending = None;
+        scrub_typeahead(&mut rx, &mut pending);
+        assert_eq!(pending.as_deref(), Some(b"echo one\recho two\r".as_slice()));
     }
 }
