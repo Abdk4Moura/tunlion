@@ -105,6 +105,7 @@ jobs:
           free -m
 
       - name: Run the durability soak
+        timeout-minutes: 22
         env:
           DURABILITY_WORK_ROOT: /tmp/tunlion-durability-soak
         run: |
