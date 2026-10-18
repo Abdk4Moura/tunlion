@@ -80,6 +80,15 @@ fn load_from(p: &std::path::Path) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+// The data file is atomically replaced, so lock a stable sidecar rather than
+// its inode. The in-process mutex alone cannot coordinate separate senders.
+fn writer_lock(p: &std::path::Path) -> anyhow::Result<crate::platform::DevicesFileLock> {
+    if let Some(parent) = p.parent() {
+        crate::platform::create_private_dir_all(parent)?;
+    }
+    crate::platform::DevicesFileLock::acquire_at(&p.with_extension("json.lock"))
+}
+
 /// Every stored record, oldest first.
 pub(crate) fn load() -> Vec<Value> {
     load_from(&path())
@@ -92,6 +101,7 @@ pub(crate) fn append(records: &[Record]) {
     }
     let _g = LOCK.lock();
     let p = path();
+    let Ok(_writer_lock) = writer_lock(&p) else { return };
     let all = appended(load_from(&p), records);
     if let Ok(body) = serde_json::to_string(&Value::Array(all)) {
         let _ = crate::platform::SecretFile::write_str(&p, &body);
@@ -105,6 +115,7 @@ pub(crate) fn append_values(values: Vec<Value>) {
     }
     let _g = LOCK.lock();
     let p = path();
+    let Ok(_writer_lock) = writer_lock(&p) else { return };
     let mut all = load_from(&p);
     all.extend(values);
     if all.len() > MAX_RECORDS {
@@ -246,5 +257,98 @@ mod tests {
         assert!(v["error"].as_str().unwrap().contains("no space"), "{v}");
         let line = human_line(v);
         assert!(line.contains("failed: no space left"), "{line}");
+    }
+
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Writer(std::process::Child);
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // A separate process is essential: the existing Mutex already serializes
+    // threads, but concurrent `send --code` processes share transfers.json.
+    #[test]
+    #[ignore = "subprocess helper invoked by concurrent_process_append_preserves_both_outcomes"]
+    fn history_writer_child() {
+        let dir = PathBuf::from(std::env::var_os("TUNLION_HISTORY_TEST_DIR").unwrap());
+        std::fs::write(dir.join("writer-ready"), b"ready").unwrap();
+        match std::env::var("TUNLION_HISTORY_TEST_MODE").unwrap().as_str() {
+            "records" => append(&[rec(2)]),
+            "values" => append_values(vec![rec(2).to_json()]),
+            other => panic!("unknown writer mode: {other}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_process_append_preserves_both_outcomes() {
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        for mode in ["records", "values"] {
+            let dir = Fixture(std::env::temp_dir().join(format!(
+                "tunlion-history-lock-{}-{}-{mode}",
+                std::process::id(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            )));
+            std::fs::create_dir(&dir.0).unwrap();
+            let history = dir.0.join("transfers.json");
+            crate::platform::SecretFile::write_str(&history, "[]").unwrap();
+            // Hold the same stable sidecar used by a cooperating writer. The
+            // worker must wait BEFORE loading history. While it waits, publish
+            // our outcome; its subsequent append must preserve both records.
+            let lock = crate::platform::DevicesFileLock::acquire_at(
+                &dir.0.join("transfers.json.lock"),
+            ).unwrap();
+            let mut writer = Writer(crate::platform::command(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "transfer_history::tests::history_writer_child"])
+                .env("TUNLION_CONFIG_DIR", &dir.0)
+                .env("TUNLION_HISTORY_TEST_DIR", &dir.0)
+                .env("TUNLION_HISTORY_TEST_MODE", mode)
+                .spawn().unwrap());
+            let ready_deadline = Instant::now() + Duration::from_secs(10);
+            while !dir.0.join("writer-ready").exists() {
+                assert!(writer.0.try_wait().unwrap().is_none(), "writer exited before readiness");
+                assert!(Instant::now() < ready_deadline, "writer never became ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // This is a controlled lock-contention test, not a probabilistic
+            // burst of writes. On the unfixed path the child completes while we
+            // hold the sidecar, then our ordered replace loses its outcome.
+            let blocked_deadline = Instant::now() + Duration::from_secs(2);
+            let premature = loop {
+                if let Some(status) = writer.0.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= blocked_deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            crate::platform::SecretFile::write_str(
+                &history, &serde_json::to_string(&vec![rec(1).to_json()]).unwrap(),
+            ).unwrap();
+            drop(lock);
+            let finish_deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = writer.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < finish_deadline, "writer did not finish after unlock");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success(), "{mode} writer failed: {status}");
+            assert_eq!(
+                load_from(&history), vec![rec(1).to_json(), rec(2).to_json()],
+                "{mode}: writer completed while sidecar held: {premature:?}; lost an outcome",
+            );
+            assert!(premature.is_none(), "{mode}: writer bypassed the process lock");
+        }
     }
 }
