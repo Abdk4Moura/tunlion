@@ -146,7 +146,7 @@ mod tests {
                                             // blanketed -- N4 pins the l2_open_allowed rule.
                                             let f_blanket = forward_gate_decision(
                                                 &inputs,
-                                                crate::l2_policy::l2_open_allowed(
+                                                filament_peerloop::l2::policy::l2_open_allowed(
                                                     true,
                                                     inputs.store_allows,
                                                     inputs.denied,
