@@ -317,7 +317,7 @@ async fn exec_once(
         (_sig, code) = interrupted.as_mut() => return Ok(code),
     };
     guard.forget();
-    let mux = l2::Mux::new(t.clone());
+    let mux = l2::Mux::new(t.clone(), crate::host_impl::cli_host());
     let sid = mux.alloc_sid();
     // Register BOTH inbound pipes before the open goes out: bytes or a close
     // racing the ack must find a pipe, same discipline as pty's open waiter.

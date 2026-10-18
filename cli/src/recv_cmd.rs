@@ -678,7 +678,7 @@ async fn handle_forward_open(
         };
         let mux = l2_muxes
             .entry(pid.clone())
-            .or_insert_with(|| l2::Mux::new(t.clone()))
+            .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
             .clone();
         match mux.accept_control(&v, trusted, allow_nonloopback).await {
             l2::OpenVerdict::Accept {
@@ -894,7 +894,7 @@ async fn handle_pty_open(
     let resume = v["resume"].as_bool().unwrap_or(false);
     let mux = l2_muxes
         .entry(pid.clone())
-        .or_insert_with(|| l2::Mux::new(t.clone()))
+        .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
         .clone();
     // #4 REATTACH: a live session for this id means a reconnect.
     // Rebind its output to THIS link+sid and replay its buffer; do
@@ -2926,7 +2926,7 @@ pub(crate) async fn recv_cmd(
                     ParkKind::Exec => {
                         let mux = l2_muxes
                             .entry(p.pid.clone())
-                            .or_insert_with(|| l2::Mux::new(t.clone()))
+                            .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
                             .clone();
                         exec_recv::handle_exec_open(
                             &mut conn,
@@ -2969,7 +2969,7 @@ pub(crate) async fn recv_cmd(
                     ParkKind::Sync => {
                         let mux = l2_muxes
                             .entry(p.pid.clone())
-                            .or_insert_with(|| l2::Mux::new(t.clone()))
+                            .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
                             .clone();
                         crate::sync_cmd::handle_sync_open(
                             &mut conn,
@@ -6587,7 +6587,7 @@ pub(crate) async fn recv_cmd(
                     };
                     let mux = l2_muxes
                         .entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
                         .clone();
                     exec_recv::handle_exec_open(
                         &mut conn,
@@ -6613,7 +6613,7 @@ pub(crate) async fn recv_cmd(
                     };
                     let mux = l2_muxes
                         .entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
                         .clone();
                     crate::sync_cmd::handle_sync_open(
                         &mut conn,
@@ -6828,7 +6828,7 @@ pub(crate) async fn recv_cmd(
                     }
                     let mux = l2_muxes
                         .entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
                         .clone();
                     if mux.at_stream_cap().await {
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;

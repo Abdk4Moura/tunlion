@@ -103,8 +103,7 @@ pub enum OpenOutcome {
 pub struct Mux {
     transport: Arc<dyn Transport>,
     /// The host this mux asks for its two edges: the acceptor's local dial and
-    /// the live-session cut. Taken from the process host installed at startup,
-    /// or the inert [`NoHost`](crate::host::NoHost) when nothing was installed.
+    /// the live-session cut. Owned by this instance and supplied by its caller.
     host: Arc<dyn HostServices>,
     streams: Mutex<HashMap<u32, StreamHandle>>,
     next_sid: AtomicU32,
@@ -139,14 +138,24 @@ pub struct Mux {
 }
 
 impl Mux {
-    /// A mux over `t` that asks the process host installed at startup (or the
-    /// inert [`NoHost`](crate::host::NoHost) when nothing was installed).
-    pub fn new(t: Arc<dyn Transport>) -> Arc<Self> {
-        Self::with_host(t, crate::host::process_host())
+    /// A mux over `t` with an explicitly owned host. When attached to a `Conn`,
+    /// pass that connection's host. For inert behavior, explicitly pass
+    /// `Arc::new(NoHost)`; there is no process-wide host or implicit fallback.
+    ///
+    /// ```compile_fail
+    /// use filament_peerloop::l2::mux::Mux;
+    /// use filament_transport::net::Transport;
+    /// use std::sync::Arc;
+    /// fn missing_host(transport: Arc<dyn Transport>) {
+    ///     let _ = Mux::new(transport);
+    /// }
+    /// ```
+    pub fn new(t: Arc<dyn Transport>, host: Arc<dyn HostServices>) -> Arc<Self> {
+        Self::with_host(t, host)
     }
 
     /// A mux with a host chosen by the caller, for an embedder that carries one
-    /// per session rather than installing a process-wide answer.
+    /// per session. Equivalent to [`Self::new`].
     pub fn with_host(t: Arc<dyn Transport>, host: Arc<dyn HostServices>) -> Arc<Self> {
         Arc::new(Mux {
             transport: t,
@@ -935,10 +944,117 @@ mod tests {
     fn open_msg(sid: u32) -> Value {
         json!({ "type": "l2-open", "sid": sid, "host": "127.0.0.1", "rport": 9 })
     }
+
+    /// Distinct host answers must survive simultaneous mux ownership, including
+    /// constructing a later inert mux. No process install or test serialization.
+    struct NamedHost(&'static str);
+
+    #[async_trait]
+    impl HostServices for NamedHost {
+        fn settings_get_str(&self, key: &str) -> Option<String> {
+            NoHost.settings_get_str(key)
+        }
+        fn devices_load(&self) -> Vec<(String, String)> {
+            NoHost.devices_load()
+        }
+        fn is_self_uid(&self, my_uid: &str, peer_uid: Option<&str>) -> bool {
+            NoHost.is_self_uid(my_uid, peer_uid)
+        }
+        fn rejoin_unwarned(&self) -> Duration {
+            NoHost.rejoin_unwarned()
+        }
+        fn relay_banner(&self) -> String {
+            NoHost.relay_banner()
+        }
+        fn relay_forbidden(&self) -> bool {
+            NoHost.relay_forbidden()
+        }
+        fn channel_of(&self, secret: &str) -> String {
+            NoHost.channel_of(secret)
+        }
+        fn roster_snapshot_json(&self) -> Option<String> {
+            NoHost.roster_snapshot_json()
+        }
+        fn fleet_rv_present(&self) -> bool {
+            NoHost.fleet_rv_present()
+        }
+        async fn connect_local_stream(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> std::io::Result<tokio::net::TcpStream> {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, self.0))
+        }
+        fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<crate::host::LiveCut> {
+            idev.map(|_| crate::host::LiveCut {
+                cause: LiveCutCause::Revoked,
+                reason: self.0.to_string(),
+            })
+        }
+        fn revoke_recheck_interval(&self) -> Duration {
+            Duration::from_millis(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_muxes_dial_through_their_own_hosts_without_fallback() {
+        let ta = MockTransport::new();
+        let tb = MockTransport::new();
+        let inert_transport = MockTransport::new();
+        let a = Mux::new(ta.clone(), Arc::new(NamedHost("host-a")));
+        let b = Mux::with_host(tb.clone(), Arc::new(NamedHost("host-b")));
+        let inert = Mux::new(inert_transport.clone(), Arc::new(NoHost));
+        let sid = L2_SID_BASE | 12;
+        let ra = a.register(sid).await.unwrap();
+        let rb = b.register(sid).await.unwrap();
+        let ri = inert.register(sid).await.unwrap();
+        tokio::join!(
+            a.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, ra, None),
+            b.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, rb, None),
+            inert.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, ri, None),
+        );
+        for (mux, transport, reason) in [
+            (a, ta, "host-a"),
+            (b, tb, "host-b"),
+            (inert, inert_transport, "does not open local sockets"),
+        ] {
+            assert_eq!(mux.live_streams().await, 0);
+            let controls = transport.controls.lock().unwrap();
+            assert_eq!(controls.len(), 1, "failed dial must close, never ack");
+            assert_eq!(controls[0]["type"], "l2-close");
+            assert!(controls[0]["err"].as_str().unwrap().contains(reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_muxes_recheck_live_sessions_with_their_own_hosts() {
+        let ta = MockTransport::new();
+        let tb = MockTransport::new();
+        let a = Mux::new(ta.clone(), Arc::new(NamedHost("cut-a")));
+        let b = Mux::new(tb.clone(), Arc::new(NamedHost("cut-b")));
+        let sid = L2_SID_BASE | 13;
+        let ra = a.register(sid).await.unwrap();
+        let rb = b.register(sid).await.unwrap();
+        let (_client_a, socket_a) = tokio::io::duplex(64);
+        let (_client_b, socket_b) = tokio::io::duplex(64);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                serve_stream(a.clone(), sid, socket_a, ra, true, None, Some([1; 32])),
+                serve_stream(b.clone(), sid, socket_b, rb, true, None, Some([1; 32])),
+            );
+        })
+        .await
+        .expect("both hosts must independently terminate their live streams");
+        for (mux, transport, reason) in [(a, ta, "cut-a"), (b, tb, "cut-b")] {
+            assert_eq!(mux.live_streams().await, 0);
+            let controls = transport.controls.lock().unwrap();
+            assert!(controls.iter().any(|v| v["type"] == "l2-close" && v["err"] == reason));
+        }
+    }
     #[tokio::test]
     async fn on_frame_resets_full_pipe_instead_of_parking() {
         let t = MockTransport::new();
-        let mux = Mux::new(t.clone());
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
         let sid = L2_SID_BASE | 77;
         let _rx = mux.register_stream(sid).await.expect("fresh sid registers");
         // Fill the 256-slot pipe with NOBODY reading (stalled consumer).
@@ -978,7 +1094,7 @@ mod tests {
     /// an `l2-close{err:"too many streams"}`, and does NOT register the stream.
     #[tokio::test]
     async fn per_link_stream_cap_refuses_over_limit() {
-        let mux = Mux::new(MockTransport::new());
+        let mux = Mux::new(MockTransport::new(), Arc::new(NoHost));
         // Fill to the cap with accepted opens (they register pipes).
         for i in 0..MAX_STREAMS_PER_LINK as u32 {
             let sid = L2_SID_BASE | (i + 1);
@@ -1021,7 +1137,7 @@ mod tests {
     /// single structural chokepoint that refuses it.
     #[tokio::test]
     async fn register_refuses_duplicate_live_sid() {
-        let mux = Mux::new(MockTransport::new());
+        let mux = Mux::new(MockTransport::new(), Arc::new(NoHost));
         let sid = L2_SID_BASE | 42;
         let mut rx1 = mux.register(sid).await.expect("first register succeeds");
         assert_eq!(mux.live_streams().await, 1);
@@ -1054,7 +1170,7 @@ mod tests {
     /// now the chokepoint so every stream type inherits the protection.
     #[tokio::test]
     async fn accept_control_denies_open_on_live_foreign_sid() {
-        let mux = Mux::new(MockTransport::new());
+        let mux = Mux::new(MockTransport::new(), Arc::new(NoHost));
         let sid = L2_SID_BASE | 7;
         // A pty/mount claims S via register_stream (a path that never touches the
         // `accepted` map, so the l2-open acceptor cannot see it there).
@@ -1123,7 +1239,7 @@ mod tests {
         assert_eq!(wire_sid(&json!({ "type": "l2-open" })), None);
     }
 
-    /// The seam's inert semantics: a host that installed nothing cannot be made
+    /// The seam's inert semantics: an explicitly inert host cannot be made
     /// to dial a peer-named target. The refusal takes the same `l2-close` path a
     /// failed dial always took, and the open is never acked.
     #[tokio::test]
@@ -1208,7 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn serve_stream_tears_down_on_transport_death_with_idle_client() {
         let t = KillableTransport::new();
-        let mux = Mux::new(t.clone());
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
         let sid = L2_SID_BASE | 7;
         let rx = mux.register(sid).await.expect("fresh sid registers");
         // A duplex pair: one half is the bridge's "client socket", the other we keep
