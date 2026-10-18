@@ -25,8 +25,8 @@ use serde_json::Value;
 // old path through this re-export; the remedy/explain text below stays here,
 // because it names commands only the CLI accepts.
 pub(crate) use filament_peerloop::refusal::{
-    Code, Refusal, Reinvite, code_from_reason, expires_text, from_frame, name_from_reason,
-    reinvite_from_frame, reinvite_from_reason, reinvite_suffix,
+    Code, Refusal, Reinvite, UNRECOGNIZED_REASON, code_from_reason, expires_text, from_frame,
+    name_from_reason, reinvite_from_frame, reinvite_from_reason, reinvite_suffix,
 };
 
 /// For an expiry, attach the re-invite the owner can run (read from this
