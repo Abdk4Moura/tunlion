@@ -176,6 +176,26 @@ link owned by a one-shot exec client) instead of taking the last equal link.
 The user's report explicitly couples drops with a second connection/exec, so
 this is kept in the harness as a finding rather than filtered out.
 
+### Final run on the rebased harness (f532c250)
+
+Run [39128450639](https://github.com/Abdk4Moura/tunlion/actions/runs/39128450639)
+executed 2/2 runs with the fresh-warm-drop-shell sequence. The result is
+unambiguous:
+
+- `setup`, `stable`, `concurrent`: **zero** PTY reattach/drop/teardown events in
+  both runs. The intermittent warm-pick zombie did not recur.
+- `drop`: **passed** in both runs. The fresh warm shell survived a SIGKILL of
+  the initiating daemon with the **same PID and shell state**, `/proc` alive,
+  `pty REATTACHED` at the peer, and a fresh command answered.
+- `signaling`: **failed** in both runs. Each shell logged `pty REATTACHED`
+  after the flap, and one activity probe failed (the clients were briefly
+  disconnected). Drop counts in that window: daemon-a 2, daemon-b 3 (run 1),
+  daemon-a 2, daemon-b 3 (run 2).
+
+So the stable/concurrent/drop properties hold in this fixture; the
+signaling-reconnect teardown is the reproducible finding. The job is red on
+purpose and no transport code was changed to hide it.
+
 ## Assumptions and honest limits
 
 - **Linux only.** The harness uses Unix PTYs, process groups, SIGTERM, and
