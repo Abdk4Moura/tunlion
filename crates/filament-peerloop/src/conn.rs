@@ -4694,25 +4694,30 @@ mod warm_identity_tests {
         heard_ms: Option<u64>,
         /// The explicit `dead` flag, separate from `alive`: a QUIC connection
         /// can report closed (`is_alive` false) before that flag latches.
-        reported_dead: bool,
+        dead_flag: bool,
+        /// True for the fixture where `is_alive` is false but the transport has
+        /// not reported `is_dead` yet (a QUIC close before the flag latches).
+        closed_not_dead: bool,
     }
     impl FakeQuic {
+        fn with_activity(idle_ms: u64, heard_ms: Option<u64>) -> Arc<Self> {
+            Self::with(idle_ms, heard_ms, true, false, false)
+        }
         fn with(
             idle_ms: u64,
             heard_ms: Option<u64>,
             alive: bool,
-            reported_dead: bool,
+            dead_flag: bool,
+            closed_not_dead: bool,
         ) -> Arc<Self> {
             Arc::new(FakeQuic {
                 alive: AtomicBool::new(alive),
                 closes: AtomicUsize::new(0),
                 idle_ms,
                 heard_ms,
-                reported_dead,
+                dead_flag,
+                closed_not_dead,
             })
-        }
-        fn with_activity(idle_ms: u64, heard_ms: Option<u64>) -> Arc<Self> {
-            Self::with(idle_ms, heard_ms, true, false)
         }
         /// The quiet default: alive, never moved a byte.
         fn live() -> Arc<Self> {
@@ -4738,12 +4743,12 @@ mod warm_identity_tests {
             Self::with_activity(u64::MAX, Some(heard_ms))
         }
         fn dead() -> Arc<Self> {
-            Self::with(u64::MAX, Some(u64::MAX), false, true)
+            Self::with(u64::MAX, Some(u64::MAX), false, true, false)
         }
         /// QUIC has closed the connection (`is_alive` false) but the `dead`
         /// flag has not latched yet (`is_dead` false).
         fn closed_not_dead() -> Arc<Self> {
-            Self::with(u64::MAX, None, false, false)
+            Self::with(u64::MAX, None, false, false, true)
         }
     }
     #[async_trait::async_trait]
@@ -4764,7 +4769,7 @@ mod warm_identity_tests {
             self.alive.load(Ordering::Relaxed)
         }
         fn is_dead(&self) -> bool {
-            self.reported_dead || !self.alive.load(Ordering::Relaxed)
+            self.dead_flag || (!self.alive.load(Ordering::Relaxed) && !self.closed_not_dead)
         }
         fn idle_ms(&self) -> u64 {
             if self.is_dead() {
@@ -4820,6 +4825,16 @@ mod warm_identity_tests {
     fn linked_direct(pid: &str, petname: &str, uid: &str, t: Arc<dyn Transport>) -> Link {
         let mut l = direct_link(pid, petname, &format!("user@{petname}"), t);
         l.uid = Some(uid.to_string());
+        l
+    }
+
+    /// The same link record on a non-direct (WebRTC/DataChannel/relay)
+    /// transport. `digest_link_active` keys the transport-bounded direct rule
+    /// on `direct`, so a relay fixture must not be built by `direct_link`.
+    fn relay_link(pid: &str, petname: &str, display: &str, t: Arc<dyn Transport>) -> Link {
+        let mut l = direct_link(pid, petname, display, t);
+        l.direct = false;
+        l.direct_route = "relay";
         l
     }
 
@@ -5182,7 +5197,7 @@ mod warm_identity_tests {
     #[tokio::test]
     async fn flowing_inflight_link_is_kept_on_same_uid_reconnect() {
         let (mut conn, _far, _rx) = test_conn().await;
-        let t = FakeQuic::live(); // idle_ms 0: bytes are moving
+        let t = FakeQuic::idle(0); // bytes are moving
         conn.links
             .insert("sid-old".into(), linked_direct("sid-old", "soak-b", "uid-b", t.clone()));
         conn.bind_active("sid-old");
@@ -5468,7 +5483,7 @@ mod warm_identity_tests {
         let (mut conn, _far, _rx) = test_conn().await;
         conn.links.insert(
             "sid-relay".into(),
-            direct_link("sid-relay", "x", "user@x", FakeQuic::relay_heard(2_000)),
+            relay_link("sid-relay", "x", "user@x", FakeQuic::relay_heard(2_000)),
         );
         let t0 = Instant::now();
         assert!(!conn.digest_absent_retirable_at("sid-relay", t0));
@@ -5488,7 +5503,7 @@ mod warm_identity_tests {
         // transport-bounded, so they would never reach this clock).
         conn.links.insert(
             "sid-idle".into(),
-            direct_link("sid-idle", "x", "user@x", FakeQuic::relay_writes_only()),
+            relay_link("sid-idle", "x", "user@x", FakeQuic::relay_writes_only()),
         );
         let t0 = Instant::now();
         assert!(!conn.digest_absent_retirable_at("sid-idle", t0));
@@ -5519,7 +5534,7 @@ mod warm_identity_tests {
         // and would never start this window.
         conn.links.insert(
             "sid-idle".into(),
-            direct_link("sid-idle", "x", "user@x", FakeQuic::relay_writes_only()),
+            relay_link("sid-idle", "x", "user@x", FakeQuic::relay_writes_only()),
         );
         let t0 = Instant::now();
         assert!(!conn.digest_note_at(
@@ -5578,7 +5593,7 @@ mod warm_identity_tests {
         // Quiet relay shape, so the 30 s grace is what this surface test
         // measures (an alive direct link is transport-bounded instead).
         let mut room =
-            direct_link("sid-room", "room", "user@room", FakeQuic::relay_writes_only());
+            relay_link("sid-room", "room", "user@room", FakeQuic::relay_writes_only());
         room.expected_secret = None; // room-sourced: no pair channel
         conn.links.insert("sid-room".into(), room);
         conn.links.insert(
@@ -5644,7 +5659,7 @@ mod warm_identity_tests {
         let (mut conn, _far, _rx) = test_conn().await;
         conn.links.insert(
             "sid-relay".into(),
-            direct_link("sid-relay", "x", "user@x", FakeQuic::relay_writes_only()),
+            relay_link("sid-relay", "x", "user@x", FakeQuic::relay_writes_only()),
         );
         let t0 = Instant::now();
         assert!(!conn.digest_absent_retirable_at("sid-relay", t0));
