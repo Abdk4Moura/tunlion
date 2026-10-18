@@ -19,17 +19,35 @@ change `Core::start`: that still returns `EngineNotLinked`.
   ordinary return and error all reach `RecvCleanup::finish` before returning a
   `DriverOutcome`. Compatibility `Ev::Interrupted` also requests the same latch;
   OS signals do not depend on draining the event queue.
-- State, Conn, the current signaling client (including after reconnect), and the
-  control-listener task are retained outside the cancellable future. Cleanup
-  aborts **and joins** that listener, flushes admitted receive entries using the
-  existing best-effort partial parking, closes links, yields for close frames,
-  and bounds signaling disconnect to one second. The driver's local TTY guard
-  restores the terminal when the future is dropped. CLI signal exit removes
-  daemon pid/ready markers; ordinary daemon return retains up_cmd's cleanup.
+- State, Conn, the current signaling client (including after reconnect), the
+  control-listener task, and the daemon stall observer are retained outside the
+  cancellable future. Cleanup aborts **and joins** the control listener, stops
+  and joins the stall observer before the potentially slow flush, flushes
+  admitted receive entries using the existing best-effort partial parking,
+  closes links, yields for close frames, and bounds signaling disconnect to one
+  second. The driver's local TTY guard restores the terminal when the future is
+  dropped. CLI signal exit removes daemon pid/ready markers; ordinary daemon
+  return retains up_cmd's cleanup.
 
 Return proves completion of **this epilogue**, not a fully stopped engine. The
 caller must await the driver; arbitrarily dropping its supervisor is not an
 async cleanup API. Panics are not converted to a cleaned-up engine outcome.
+
+## The stall observer is now invocation-owned
+
+`cli/src/recv_lifecycle.rs::LoopWatchdog` replaces the process-global
+`loop_watchdog` module in `cli/src/recv_cmd.rs`. The heartbeat, `Once` latch and
+forever thread are gone: `RecvCleanup` owns the observer, `recv_run` starts it on
+the first daemon tick, and the cleanup epilogue stops it **before** `flush_inflight`.
+That ordering matters: the loop intentionally stops turning while cleanup runs,
+so the old forever thread could report a false "event loop stalled" during a slow
+flush and retained the first invocation's `LogSink` for the process lifetime.
+
+Stopping drops a wake channel (a sleeping observer wakes immediately) and joins
+it through `spawn_blocking` with a one-second bound. A timeout does not cancel the
+thread; it has already been asked to stop and exits as soon as its log sink
+returns. Dropping the owner without `stop` also disconnect-wakes the thread but
+does not join it, so the explicit epilogue remains the completion proof.
 
 ## Readiness is deliberately NOT migrated
 
@@ -53,9 +71,18 @@ it). Only then should a readiness input/result be exposed for the driver.
   stuck cleanup after its grace. It does not prove an OS-thread deadline during
   scheduler starvation. The receive adapter no longer uses LAST_SIGNAL; other
   commands keep their existing process-global signal policy.
-- `loop_watchdog` remains a process-global forever thread. Config hooks, consent
-  tokens, pid/ready markers, systemd notifications and presentation are still
-  CLI/process concerns. This driver is **not embeddable** merely with NoHost.
+- `cli/src/recv_cmd.rs::recv_run`'s daemon-only
+  `#[cfg(l3)]` auto-proxy `tokio::spawn(l2::proxy_serve(...))` (inside the
+  userspace-L3 branch) is still detached. It owns the bound SOCKS listener and
+  the `proxy_state` record; `l2::proxy_serve` in `cli/src/l2.rs` then spawns
+  per-connection handlers and an optional HTTP listener that are not owned by
+  the invocation. Cancellation currently leaves all of them to process exit.
+- The short-lived spawns inside the loop (identity-hold timers, deferred
+  re-injection, the route-label observer) are still fire-and-forget; they hold
+  `Arc`s for up to `PROVEN_CHALLENGE_DEADLINE`, not OS resources.
+- Config hooks, consent tokens, pid/ready markers, systemd notifications and
+  presentation are still CLI/process concerns. This driver is **not embeddable**
+  merely with NoHost.
 - Control connection children, signaling mapping/read pumps (including during
   cancelled connect), session pumps, retry/transport reader tasks, mux/sector
   resources and asynchronous peer-close work are not comprehensively collected
@@ -77,8 +104,9 @@ later work; Android must not launch the CLI as its engine.
 
 Focused in-memory tests cover latched/repeated cancellation, pre-poll precedence,
 two independently cancelled/returning invocations, cancellation while awaiting
-work, ordinary errors, task-destructor completion before return, and control
-readiness success/drop/timeout. CLI tests call the real receive return seam for
+work, ordinary errors, task-destructor completion before return, control
+readiness success/drop/timeout, and the stall observer's stop/join (including
+the never-started case). CLI tests call the real receive return seam for
 pre-cancellation and validation failure without filesystem/network setup or
 process exit. These are not integration proof of all-resource shutdown.
 
