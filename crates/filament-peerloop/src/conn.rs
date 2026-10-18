@@ -848,9 +848,10 @@ const LOCAL_TCP_TRANSPORT: bool = false;
 
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
 /// same key the L2 cap gate uses) to a warm, trusted, alive link, preferring a
-/// direct one. The single resolver for every warm-reuse op (open + pty), so the
-/// eligibility rule lives in exactly one place. A miss means the caller falls
-/// back to a fresh establish, which is correct.
+/// direct one and then the longest-lived (so a fresh one-shot `exec` link cannot
+/// displace the daemon's stable link). The single resolver for every warm-reuse
+/// op (open + pty), so the eligibility rule lives in exactly one place. A miss
+/// means the caller falls back to a fresh establish, which is correct.
 ///
 /// Moved here from `cli/src/daemon_ctl.rs` with its body unchanged: it takes a
 /// [`Conn`] and returns a transport pair, both of which this crate owns, so the
@@ -879,6 +880,7 @@ pub fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn Transpo
             alive: l.transport.as_ref().is_some_and(|t| t.is_alive()),
             direct: l.direct,
             idle_ms: l.transport.as_ref().map_or(u64::MAX, |t| t.idle_ms()),
+            age_ms: l.established_at.map(|t| t.elapsed().as_millis() as u64),
         })
         .collect();
     match place(Work::Interactive, peer, &links) {
