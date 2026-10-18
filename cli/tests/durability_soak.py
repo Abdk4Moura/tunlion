@@ -502,8 +502,14 @@ class PtySession:
         self._cleanup()
 
     def _cleanup(self) -> None:
+        # Idempotent: teardown may run after close(), and closing an already
+        # closed fd number is not an OSError waiting to happen — the number may
+        # since have been reused by a socket or log file.
+        if self.master < 0:
+            return
+        fd, self.master = self.master, -1
         try:
-            os.close(self.master)
+            os.close(fd)
         except OSError:
             pass
 
