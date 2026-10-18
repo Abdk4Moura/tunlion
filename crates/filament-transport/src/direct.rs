@@ -305,19 +305,19 @@ fn parse_rule_list(csv: &str) -> Vec<CidrRule> {
 
 /// Read one iface setting, per-peer aware. For the membership store
 /// ("interfaces"), returns the raw JSON. For prefer, reads from config.
-fn read_iface_setting(key: &str, peer: Option<&str>) -> String {
+fn read_iface_setting(context: &crate::TransportContext, key: &str, peer: Option<&str>) -> String {
     if key == "interfaces" {
-        return crate::hooks::raw_membership(peer);
+        return context.membership(peer);
     }
-    crate::hooks::settings_get_str(key, peer).unwrap_or_default()
+    context.setting(key, peer).unwrap_or_default()
 }
 
 /// Filter local IPs for candidate gathering using membership (avoid/only store)
 /// and arrangement (prefer ordering). Membership decides which IPs are ELIGIBLE;
 /// prefer only orders the survivors.
-fn filter_local_ips(ips: Vec<IpAddr>, peer: Option<&str>) -> Vec<IpAddr> {
+fn filter_local_ips(context: &crate::TransportContext, ips: Vec<IpAddr>, peer: Option<&str>) -> Vec<IpAddr> {
     // --- membership: eligible set from the shared interfaces store ---
-    let membership_raw = read_iface_setting("interfaces", peer);
+    let membership_raw = read_iface_setting(context, "interfaces", peer);
     let (membership_mode, membership_items) = parse_membership(&membership_raw);
     let avoid_rules = if membership_mode == "avoid" {
         parse_rule_list(&membership_items)
@@ -331,7 +331,7 @@ fn filter_local_ips(ips: Vec<IpAddr>, peer: Option<&str>) -> Vec<IpAddr> {
     };
 
     // --- arrangement: prefer ordering (soft by default) ---
-    let prefer = read_iface_setting("prefer", peer);
+    let prefer = read_iface_setting(context, "prefer", peer);
     let prefer_rules = parse_rule_list(&prefer);
 
     // If no rules at all, pass through unchanged
@@ -457,29 +457,27 @@ pub fn local_ip_snapshot() -> Vec<String> {
 /// override always wins and never touches the network.
 const PUBIP_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-struct PubIpEntry {
+pub(crate) struct PubIpEntry {
     server: String,
     ip: IpAddr,
     at: std::time::Instant,
 }
 
-static PUBIP_CACHE: std::sync::OnceLock<Mutex<Option<PubIpEntry>>> = std::sync::OnceLock::new();
 
 /// Our public IP as OBSERVED by an authenticated peer (#237): the peer saw us
 /// connect from this address, so it is the only source NOT chosen by the party
 /// under suspicion (the signaling server). It SUPERSEDES the `/api/whoami`
-/// assertion (the `PUBIP_CACHE` above, including the `warm_public_ip` pre-warm
-/// at daemon start): once a peer has seen us, the server's guess is ignored.
-/// Empty until a peer has actually connected to us.
-static PEER_OBSERVED_IP: std::sync::OnceLock<Mutex<Option<IpAddr>>> = std::sync::OnceLock::new();
+/// assertion (the context-owned public-IP cache, including the
+/// `warm_public_ip` pre-warm at daemon start): once a peer has seen us, the
+/// server's guess is ignored. Empty until a peer has actually connected to us.
 
 /// The address an authenticated peer observed us connecting from, if any.
-pub async fn observed_public_ip() -> Option<IpAddr> {
-    *PEER_OBSERVED_IP.get_or_init(|| Mutex::new(None)).lock().await
+pub async fn observed_public_ip(context: &crate::TransportContext) -> Option<IpAddr> {
+    *context.observed_ip().lock().await
 }
 
-async fn record_observed_ip(ip: IpAddr) {
-    *PEER_OBSERVED_IP.get_or_init(|| Mutex::new(None)).lock().await = Some(ip);
+async fn record_observed_ip(context: &crate::TransportContext, ip: IpAddr) {
+    *context.observed_ip().lock().await = Some(ip);
 }
 
 /// Pure freshness test, split out so the TTL/server-match logic is unit-testable
@@ -489,13 +487,13 @@ fn pubip_fresh(cached_server: &str, age: std::time::Duration, want_server: &str,
     cached_server == want_server && age < ttl
 }
 
-async fn public_ip(server: &str) -> Option<IpAddr> {
+async fn public_ip(context: &crate::TransportContext, server: &str) -> Option<IpAddr> {
     if let Ok(v) = std::env::var("TUNLION_PUBLIC_IP") {
         if let Ok(ip) = v.trim().parse::<IpAddr>() {
             return Some(ip);
         }
     }
-    let cache = PUBIP_CACHE.get_or_init(|| Mutex::new(None));
+    let cache = context.public_ip_cache();
     // Read the cache under a short-held lock (NEVER across the await below).
     {
         let guard = cache.lock().await;
@@ -528,8 +526,8 @@ async fn public_ip(server: &str) -> Option<IpAddr> {
 /// so its FIRST incoming connect answers the transport-offer without an inline
 /// `/api/whoami` round trip (subsequent connects already hit the warm cache).
 /// Best-effort: a failure leaves the cache empty and the normal lazy path runs.
-pub async fn warm_public_ip(server: &str) {
-    let _ = public_ip(server).await;
+pub async fn warm_public_ip(context: &crate::TransportContext, server: &str) {
+    let _ = public_ip(context, server).await;
 }
 
 /// Format an addr as a candidate string; v6 gets brackets so `[ip]:port` parses.
@@ -603,14 +601,14 @@ fn dials_claimed(claimed: Option<SocketAddr>, cand: &str) -> bool {
 /// The relay fallback carries that value to name it at the decision, so the
 /// attribution can never name an address the candidate set did not contain.
 /// `peer` is optional — when provided, per-peer avoid/prefer overrides are read.
-pub async fn gather_candidates(server: &str, port: u16) -> (Vec<String>, Option<String>) {
+pub async fn gather_candidates(context: &crate::TransportContext, server: &str, port: u16) -> (Vec<String>, Option<String>) {
     let peer: Option<&str> = None; // per-peer filter not yet wired from callers
     if loopback_only() {
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
         return (vec![cand_str(lo, port)], None);
     }
     let all_local = local_ips();
-    let ips = filter_local_ips(all_local.clone(), peer);
+    let ips = filter_local_ips(context, all_local.clone(), peer);
     let mut cands: Vec<String> = ips.into_iter().map(|ip| cand_str(ip, port)).collect();
     if cands.is_empty() && !all_local.is_empty() {
         crate::hooks::debug("iface filter removed ALL host candidates; connectivity may fail");
@@ -622,10 +620,10 @@ pub async fn gather_candidates(server: &str, port: u16) -> (Vec<String>, Option<
         // warm pre-warm cache. whoami is only a bootstrap hint for FIRST
         // contact, before any peer has observed us; a wrong answer there costs
         // one slow connection instead of a standing downgrade.
-        let observed = observed_public_ip().await;
+        let observed = observed_public_ip(context).await;
         let pip = match observed {
             Some(ip) => Some(ip),
-            None => public_ip(server).await,
+            None => public_ip(context, server).await,
         };
         if let Some(pip) = pip {
             let s = cand_str(pip, port);
@@ -1972,6 +1970,7 @@ fn preferred_connection(is_dialer: bool, answerer: bool) -> bool {
 /// the one we actually listen on). `peer_cands` are the peer's advertised
 /// `ip:port` strings. `secret` is the pair secret (known-device only, rung 1).
 pub async fn race_connect(
+    context: &crate::TransportContext,
     endpoint: Endpoint,
     peer_cands: Vec<String>,
     secret: &str,
@@ -1984,7 +1983,7 @@ pub async fn race_connect(
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
 ) -> Option<UnreadTransport> {
-    race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed).await
+    race_connect_labeled(context, endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed).await
 }
 
 /// Same race, but with the route label parameterized so rung-2 (hole-punch) can
@@ -2004,6 +2003,7 @@ pub async fn race_connect(
 /// only about an address it dialed - never about a label that merely appeared
 /// on the wire.
 pub async fn race_connect_labeled(
+    context: &crate::TransportContext,
     endpoint: Endpoint,
     peer_cands: Vec<String>,
     secret: &str,
@@ -2042,6 +2042,7 @@ pub async fn race_connect_labeled(
 
     // One future that resolves to an authenticated (conn, send, recv) or errors.
     async fn auth_conn(
+        context: &crate::TransportContext,
         conn: quinn::Connection,
         tkey: [u8; 32],
         is_dialer: bool,
@@ -2054,7 +2055,7 @@ pub async fn race_connect_labeled(
         // Only when BOTH ends agreed (proto >= 2 in their transport-offers),
         // so a mixed old/new fleet skips the frame on both sides instead of
         // hanging or misaligning the stream.
-        exchange_observed_address(&conn, is_dialer, &mut s, &mut r, exchange).await?;
+        exchange_observed_address(context, &conn, is_dialer, &mut s, &mut r, exchange).await?;
         Ok((conn, s, r, is_dialer))
     }
 
@@ -2070,6 +2071,7 @@ pub async fn race_connect_labeled(
     /// protocol, so an old peer links fine and a clear refusal is surfaced by
     /// the caller (on_transport_offer) instead.
     async fn exchange_observed_address(
+        context: &crate::TransportContext,
         conn: &quinn::Connection,
         is_dialer: bool,
         send: &mut SendStream,
@@ -2101,7 +2103,7 @@ pub async fn race_connect_labeled(
                 Ok(Ok(buf)) => {
                     if let Ok(s) = std::str::from_utf8(&buf) {
                         if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                            record_observed_ip(ip).await;
+                            record_observed_ip(context, ip).await;
                             crate::hooks::trace(&format!("tunlion: peer observed us from {ip}; supersedes whoami"));
                         }
                     }
@@ -2139,7 +2141,7 @@ pub async fn race_connect_labeled(
         futs.push(Box::pin(async move {
             let incoming = ep.accept().await.ok_or_else(|| anyhow!("endpoint closed"))?;
             let conn = incoming.await.context("accept handshake")?;
-            auth_conn(conn, tkey, false, exchange).await
+            auth_conn(context, conn, tkey, false, exchange).await
         }));
     }
 
@@ -2162,7 +2164,7 @@ pub async fn race_connect_labeled(
                 .connect(addr, "filament-direct")
                 .context("connect")?;
             let conn = connecting.await.context("dial handshake")?;
-            auth_conn(conn, tkey, true, exchange).await
+            auth_conn(context, conn, tkey, true, exchange).await
         }));
     }
 
@@ -2632,8 +2634,9 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            record_observed_ip("192.0.2.55".parse().unwrap()).await;
-            let (cands, adopted) = gather_candidates("http://127.0.0.1:1", 4242).await;
+            let context = crate::TransportContext::default();
+            record_observed_ip(&context, "192.0.2.55".parse().unwrap()).await;
+            let (cands, adopted) = gather_candidates(&context, "http://127.0.0.1:1", 4242).await;
             assert!(
                 cands.iter().any(|c| c.starts_with("192.0.2.55:4242")),
                 "the peer-observed address must be advertised and whoami bypassed, got: {cands:?}"
@@ -2642,6 +2645,204 @@ mod tests {
                 adopted.is_none(),
                 "a peer-observed address must not be reported as server-asserted, got: {adopted:?}"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod instance_context_tests {
+    //! Two roots in one process, evaluated at the same time. Every read comes
+    //! from the context passed in, never from a process-global installation.
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct Reads {
+        setting: AtomicUsize,
+        membership: AtomicUsize,
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "fil-instance-context-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read_config(path: &Path, key: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()?.lines().find_map(|line| {
+            let (k, v) = line.split_once(char::is_whitespace)?;
+            (k == key).then(|| v.trim().to_string())
+        })
+    }
+
+    // The production CLI adapter decodes the on-disk `prefer` store
+    // (`{"o": "...", "s": ...}`) before handing the value to the transport
+    // callback; `filter_local_ips` therefore receives a plain order list. These
+    // fixtures hold that decoded contract. The CLI adapter test asserts the
+    // JSON-to-order decoding itself, so bypassing it cannot leave these tests
+    // green while production prefer ordering is broken.
+
+    fn disk_context(root: &Path) -> (crate::TransportContext, Arc<Reads>) {
+        let reads = Arc::new(Reads::default());
+        let setting_reads = reads.clone();
+        let membership_reads = reads.clone();
+        let config = root.join("config");
+        let peer_config = root.join("config-peer");
+        let membership = root.join("membership");
+        let peer_membership = root.join("membership-peer");
+        let context = crate::TransportContext::new(
+            Some(root.join("signaling-dns.json")),
+            move |key, peer| {
+                setting_reads.setting.fetch_add(1, Ordering::Relaxed);
+                read_config(if peer.is_some() { &peer_config } else { &config }, key)
+            },
+            move |peer| {
+                membership_reads.membership.fetch_add(1, Ordering::Relaxed);
+                std::fs::read_to_string(if peer.is_some() {
+                    &peer_membership
+                } else {
+                    &membership
+                })
+                .unwrap_or_default()
+            },
+        );
+        (context, reads)
+    }
+
+    fn write(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    const IPS: [&str; 4] = ["10.1.2.3", "192.168.1.2", "172.16.1.1", "127.0.0.1"];
+
+    fn candidates(context: &crate::TransportContext, peer: Option<&str>) -> Vec<String> {
+        filter_local_ips(context, IPS.iter().map(|s| s.parse().unwrap()).collect(), peer)
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn distinct_roots_keep_membership_and_prefer_independent_and_live() {
+        let a_root = temp_root("a");
+        let b_root = temp_root("b");
+        write(&a_root.join("config"), "prefer 192.168.0.0/16\n");
+        write(
+            &a_root.join("membership"),
+            "{\"m\":\"only\",\"i\":\"10.0.0.0/8,192.168.0.0/16\"}",
+        );
+        write(&a_root.join("config-peer"), "prefer 172.16.0.0/12\n");
+        write(
+            &a_root.join("membership-peer"),
+            "{\"m\":\"avoid\",\"i\":\"10.0.0.0/8\"}",
+        );
+        write(&b_root.join("config"), "prefer 172.16.0.0/12\n");
+        write(
+            &b_root.join("membership"),
+            "{\"m\":\"only\",\"i\":\"10.0.0.0/8,172.16.0.0/12\"}",
+        );
+        write(&b_root.join("config-peer"), "prefer 192.168.0.0/16\n");
+        write(
+            &b_root.join("membership-peer"),
+            "{\"m\":\"avoid\",\"i\":\"172.16.0.0/12\"}",
+        );
+
+        let (a, a_reads) = disk_context(&a_root);
+        let (b, b_reads) = disk_context(&b_root);
+
+        // Both expectations invert the input order (`10`, `192`, `172`, `loop`),
+        // so they fail if `prefer` is ignored rather than merely filtered.
+        assert_eq!(
+            candidates(&a, None),
+            vec!["192.168.1.2", "10.1.2.3", "127.0.0.1"]
+        );
+        assert_eq!(
+            candidates(&b, None),
+            vec!["172.16.1.1", "10.1.2.3", "127.0.0.1"]
+        );
+        // Production still gathers with peer=None; the peer-aware callback path
+        // is exercised explicitly and stays independent per root. Both peer
+        // expectations again put a later input address first.
+        assert_eq!(
+            candidates(&a, Some("dovm")),
+            vec!["172.16.1.1", "192.168.1.2", "127.0.0.1"]
+        );
+        assert_eq!(
+            candidates(&b, Some("dovm")),
+            vec!["192.168.1.2", "10.1.2.3", "127.0.0.1"]
+        );
+        assert!(a_reads.setting.load(Ordering::Relaxed) > 0);
+        assert!(a_reads.membership.load(Ordering::Relaxed) > 0);
+        assert!(b_reads.setting.load(Ordering::Relaxed) > 0);
+        assert!(b_reads.membership.load(Ordering::Relaxed) > 0);
+
+        // Live read: changing A's files changes only A.
+        write(&a_root.join("config"), "prefer 10.0.0.0/8\n");
+        write(
+            &a_root.join("membership"),
+            "{\"m\":\"only\",\"i\":\"10.0.0.0/8,172.16.0.0/12\"}",
+        );
+        assert_eq!(
+            candidates(&a, None),
+            vec!["10.1.2.3", "172.16.1.1", "127.0.0.1"]
+        );
+        assert_eq!(
+            candidates(&b, None),
+            vec!["172.16.1.1", "10.1.2.3", "127.0.0.1"]
+        );
+
+        // Concurrent interleaving must not cross the roots either.
+        std::thread::scope(|scope| {
+            let a = a.clone();
+            let b = b.clone();
+            let ta = scope.spawn(move || candidates(&a, None));
+            let tb = scope.spawn(move || candidates(&b, None));
+            assert_eq!(
+                ta.join().unwrap(),
+                vec!["10.1.2.3", "172.16.1.1", "127.0.0.1"]
+            );
+            assert_eq!(
+                tb.join().unwrap(),
+                vec!["172.16.1.1", "10.1.2.3", "127.0.0.1"]
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+    }
+
+    #[test]
+    fn observed_and_public_ip_caches_are_owned_by_one_context() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let a = crate::TransportContext::default();
+            let a_clone = a.clone();
+            let b = crate::TransportContext::default();
+            let observed: IpAddr = "192.0.2.55".parse().unwrap();
+            record_observed_ip(&a, observed).await;
+            assert_eq!(observed_public_ip(&a).await, Some(observed));
+            assert_eq!(observed_public_ip(&a_clone).await, Some(observed));
+            assert_eq!(observed_public_ip(&b).await, None);
+
+            *a.public_ip_cache().lock().await = Some(PubIpEntry {
+                server: "https://signal.example".into(),
+                ip: "203.0.113.9".parse().unwrap(),
+                at: std::time::Instant::now(),
+            });
+            assert!(a.public_ip_cache().lock().await.is_some());
+            assert!(b.public_ip_cache().lock().await.is_none());
         });
     }
 }

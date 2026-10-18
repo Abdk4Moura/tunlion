@@ -717,9 +717,10 @@ pub(crate) async fn bring_up_to_known(
     // lifecycle's "establishing" begins at the FIRST candidate).
     let mut entered_establishing = false;
 
-    let cfg = net::fetch_config(server).await?;
+    let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
+    let cfg = net::fetch_config(&transport_context, server).await?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let mut sio = net::connect_signaling(server, tx.clone()).await?;
+    let mut sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
 
     let my_uid = crate::mk_uid("l2");
     // A solo room keeps strangers out; presence-channel subscription is how we
@@ -914,7 +915,7 @@ pub(crate) async fn bring_up_to_known(
                         match crate::direct::bind_endpoint() {
                             Ok((ep, port)) => {
                                 direct_cands =
-                                    Some(crate::direct::gather_candidates(server, port).await);
+                                    Some(crate::direct::gather_candidates(&transport_context, server, port).await);
                                 endpoint = Some(ep);
                                 // TRACE, direct-offer detail.
                                 crate::ui::trace(&format!(
@@ -988,7 +989,7 @@ pub(crate) async fn bring_up_to_known(
                     welcome_silent_ticks += 1;
                     if welcome_silent_ticks >= 2 {
                         welcome_silent_ticks = 0;
-                        if let Ok(fresh) = net::reconnect_signaling(server, tx.clone()).await {
+                        if let Ok(fresh) = net::reconnect_signaling(&transport_context, server, tx.clone()).await {
                             let _ = sio.disconnect().await;
                             sio = fresh;
                         }
@@ -1115,8 +1116,10 @@ pub(crate) async fn bring_up_to_known(
                             continue;
                         };
                         let tx = tx.clone();
+                        let transport_context = transport_context.clone();
                         tokio::spawn(async move {
                             if let Some(t) = crate::direct::race_connect_labeled(
+                                &transport_context,
                                 ep,
                                 peer_cands,
                                 &secret,

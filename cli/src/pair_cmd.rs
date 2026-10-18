@@ -408,8 +408,9 @@ pub(crate) async fn pair_cmd(
         None => None,
     };
     let my_uid = mk_uid("p");
+    let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
     // Meta must exist for pairing; an unguessable solo room keeps strangers
     // out (the daemon's trick), the pair-claim moves people, not the room.
     let solo = format!("pairc-{}", fresh_secret());
@@ -496,6 +497,7 @@ pub(crate) async fn pair_cmd(
     }
 
     let mut conn = Conn::for_command(
+        transport_context,
         server,
         sio.clone(),
         tx.clone(),

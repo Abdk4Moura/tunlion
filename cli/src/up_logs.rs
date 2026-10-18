@@ -533,14 +533,19 @@ pub(crate) async fn up_cmd(
         };
         ui::say(&warning);
     }
+    // The daemon's configuration/discovery state is bound to this root. The
+    // pre-warm below and the receive loop share this same instance, so the
+    // public address discovered here is the one its first gather uses.
+    let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     // Pre-resolve our public IP off the critical path so the FIRST incoming
     // connect answers the transport-offer without an inline `/api/whoami` round
     // trip (the acceptor's gather is what the initiator waits on during
     // establishing). Best-effort, backgrounded so it never delays daemon start.
     {
         let server = server.to_string();
+        let context = transport_context.clone();
         tokio::spawn(async move {
-            direct::warm_public_ip(&server).await;
+            direct::warm_public_ip(&context, &server).await;
         });
     }
     // Startup shell-key reconciliation. GATED on authoritative: in shadow the cap
@@ -591,6 +596,7 @@ pub(crate) async fn up_cmd(
         shell_policy,
         shell_user,
         no_proxy_fallback,
+        transport_context,
         crate::host_impl::cli_log(),
         crate::host_impl::cli_host(),
     )
@@ -1432,6 +1438,7 @@ pub(crate) fn signaling_backoff(attempt: u32) -> Duration {
 /// A server URL that cannot be valid is refused at once rather than retried,
 /// so a typo in `--server` is not reported as a network outage forever.
 pub(crate) async fn connect_signaling_patiently(
+    context: &filament_transport::TransportContext,
     server: &str,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
 ) -> Result<filament_signal::Client> {
@@ -1440,7 +1447,7 @@ pub(crate) async fn connect_signaling_patiently(
     }
     let mut attempt: u32 = 0;
     loop {
-        match crate::net::connect_signaling(server, tx.clone()).await {
+        match crate::net::connect_signaling(context, server, tx.clone()).await {
             Ok(client) => {
                 if attempt > 0 {
                     ui::say(&format!(

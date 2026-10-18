@@ -110,7 +110,11 @@ Next:
 
    So the carve is a log facade plus four small injected traits, not a rewrite.
    (Correction 2026-10-16: the earlier text here said `Conn` lives in
-   `main.rs`; it is `cli/src/conn.rs:1055`.) `Conn` is the harder half: it carries link state, adoption policy and
+   `main.rs`; it is `cli/src/conn.rs:1055`.)
+   (Correction 2026-10-18: the `settings::get_str`/`raw_membership` and
+   `config_path` rows above are stale. Those three correctness hooks were
+   removed and replaced by an explicit per-engine `TransportContext`; the log
+   and descriptive-probe hooks remain process-wide.) `Conn` is the harder half: it carries link state, adoption policy and
    presentation together, and it is what the eight event loops all manipulate,
    so it should be split as part of step 4 rather than dragged out whole here.
 

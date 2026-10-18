@@ -349,8 +349,10 @@ pub fn endpoint_from_socket(sock: UdpSocket) -> Result<Endpoint> {
 /// (`UnreadTransport::announce`), or None (caller steps to WebRTC).
 ///
 /// `punch_sock` ownership is moved in: on success it lives inside the quinn
-/// endpoint; on failure it is dropped (mapping released).
+/// endpoint; on failure it is dropped (mapping released). `context` is the
+/// originating `Conn`'s instance state; this function never builds a default.
 pub async fn connect(
+    context: &filament_transport::TransportContext,
     punch_sock: UdpSocket,
     peer_srflx: SocketAddr,
     secret: &str,
@@ -389,6 +391,7 @@ pub async fn connect(
 
     // rung-1's race, UNCHANGED but for the route label.
     direct::race_connect_labeled(
+        context,
         endpoint,
         vec![peer_srflx.to_string()],
         secret,

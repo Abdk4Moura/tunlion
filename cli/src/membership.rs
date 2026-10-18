@@ -66,8 +66,9 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
     let sig = crate::overlay::overlay_sign_possession(msg.as_bytes())?;
 
     let my_uid = mk_uid("d");
+    let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
     let owner_chan = channel_of(&owner_secret);
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.room = Some(format!("depart-{}", fresh_secret()));
@@ -82,6 +83,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
         .await;
 
     let mut conn = Conn::for_command(
+        transport_context,
         server,
         sio.clone(),
         tx.clone(),
@@ -225,8 +227,9 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
     let (b_name, b_sec) = find(b).ok_or_else(|| anyhow!("'{b}' is not a known device"))?;
 
     let my_uid = mk_uid("s");
+    let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
     let solo = format!("intro-{}", fresh_secret());
     // C30: the session repairs whatever these emits lose, and under gate L
     // they are the emits the loss shim adversarially drops.
@@ -252,6 +255,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
     ));
 
     let mut conn = Conn {
+        transport_context,
         server: server.to_string(),
         sio: sio.clone(),
         tx: tx.clone(),
