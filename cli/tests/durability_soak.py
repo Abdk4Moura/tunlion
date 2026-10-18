@@ -469,18 +469,29 @@ class PtySession:
 
     def activity(self, nonce: str, timeout: float = 20.0) -> bool:
         # The typed line contains the literal `$$`, so the echoed input cannot
-        # satisfy the digit-only output pattern.
+        # satisfy the digit-only output pattern. Every probe also gets a fresh
+        # tag: after a reattach the peer replays its output ring, and a marker
+        # reused from before the drop would match the REPLAY and falsely pass.
+        tag = f"DURACT{nonce}{secrets.token_hex(2)}"
         return (
             self.command(
-                f'echo "DUR_ACT_{nonce}_$$_END"',
-                rf"DUR_ACT_{re.escape(nonce)}_(\d+)_END",
+                f'echo "{tag}_$$_END"',
+                rf"{re.escape(tag)}_(\d+)_END",
                 timeout=timeout,
             )
             is not None
         )
 
     def pid(self, timeout: float = 30.0) -> int:
-        m = self.command('echo "DUR_PID_$$_END"', r"DUR_PID_(\d+)_END", timeout=timeout)
+        # Fresh tag per call for the same replay reason: the post-drop check
+        # must prove a NEW command ran, not that the replayed ring contained an
+        # old PID marker. The typed line has `$$`, so echo cannot match digits.
+        tag = f"DURPID{secrets.token_hex(4)}"
+        m = self.command(
+            f'echo "{tag}_$$_END"',
+            rf"{re.escape(tag)}_(\d+)_END",
+            timeout=timeout,
+        )
         if not m:
             raise Failure(
                 f"{self.label}: no remote PID marker in {timeout}s\n"
@@ -489,10 +500,14 @@ class PtySession:
         return int(m.group(1))
 
     def state(self, nonce: str, timeout: float = 30.0) -> bool:
+        # The fresh tag is outside the `${DUR_STATE}` expansion, so the echoed
+        # input cannot match; only the executed command can emit tag + the
+        # expected value.
+        tag = f"DURSTATE{secrets.token_hex(4)}"
         return (
             self.command(
-                'echo "DUR_STATE_${DUR_STATE}_END"',
-                rf"DUR_STATE_({re.escape(nonce)})_END",
+                f'echo "{tag}_STATE_${{DUR_STATE}}_END"',
+                rf"{re.escape(tag)}_STATE_({re.escape(nonce)})_END",
                 timeout=timeout,
             )
             is not None
