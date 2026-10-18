@@ -1139,49 +1139,11 @@ mod drop_dir_tests {
 }
 
 
-/// Lexically normalize a path (resolve `.`/`..` without touching the FS) so a
-/// scope check can't be defeated by `share/../../etc`. Returns the normalized
-/// component vector.
-fn lexical_normalize(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        use std::path::Component::*;
-        match comp {
-            ParentDir => {
-                out.pop();
-            }
-            CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-/// True when `path`, lexically normalized, is within (or equal to) `root`. Used
-/// to bound a fleet transfer landing path to the drop dir. A relative or
-/// non-normalizable request fails closed (not within), so it falls through to
-/// explicit-grant. LEXICAL is correct here because the landing path may not
-/// exist yet (file about to be received); the actual symlink protection lives
-/// in safe_create_part/safe_resume_part (O_NOFOLLOW|O_EXCL) at the write site.
-fn path_within(root: &Path, path: &Path) -> bool {
-    let root_n = lexical_normalize(root);
-    let path_n = lexical_normalize(path);
-    !root_n.as_os_str().is_empty() && path_n.starts_with(&root_n)
-}
-
-/// True when `path`, canonicalized (symlinks resolved), is within `root`.
-/// Used to bound a fleet mount REQUEST to the share root. Both paths must
-/// exist on disk (canonicalize fails on non-existent paths). A symlink at
-/// the mount root or requested path escaping the share root is refused.
-fn path_within_canonical(root: &Path, path: &Path) -> bool {
-    let Ok(root_c) = root.canonicalize() else {
-        return false;
-    };
-    let Ok(path_c) = path.canonicalize() else {
-        return false;
-    };
-    !root_c.as_os_str().is_empty() && path_c.starts_with(&root_c)
-}
+// Path confinement now lives in filament-transfer so the sync receiver and the
+// other call sites test the same implementation. This re-export keeps the old
+// `crate::path_within` path resolving; the canonical probe's remaining caller is
+// the test module, which imports it directly.
+pub(crate) use filament_transfer::path_bounds::path_within;
 
 
 

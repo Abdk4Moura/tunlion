@@ -306,40 +306,9 @@ pub fn tighten_new_dir(dir: &Path) {
     }
 }
 
-/// Create the receiving inbox (the drop dir, `~/Tunlion` by default) and any
-/// missing parent, owner-only (0700 on unix). Peers write into it, so it is not
-/// a shared folder: before this it took the process umask (0777 & ~umask), and
-/// under umask 0 anyone on the machine could plant or swap files in it. An
-/// inbox that already exists is left as the user set it. Windows: the
-/// profile's inherited ACL already makes it owner-only; nothing to set.
-pub fn create_inbox_dir(dir: &Path) -> std::io::Result<()> {
-    create_dirs_with_mode(dir, 0o700)
-}
-
-/// Create directories for content received or synced from a peer, under
-/// `inbox` (created owner-only first when missing). Content directories take
-/// the ordinary 0755 masked by the umask, matching received files (0644 masked
-/// by the umask, `publish_received_file`): never world-writable, and private in
-/// practice because the inbox above them is 0700.
-pub fn create_content_dirs(inbox: &Path, dir: &Path) -> std::io::Result<()> {
-    if !inbox.exists() {
-        create_inbox_dir(inbox)?;
-    }
-    create_dirs_with_mode(dir, 0o755)
-}
-
-fn create_dirs_with_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().recursive(true).mode(mode).create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mode;
-        std::fs::create_dir_all(dir)
-    }
-}
+// The inbox/content directory creation moved to filament-transfer with the
+// receiver's path bounds. Re-exported so every existing caller keeps its path.
+pub use filament_transfer::path_bounds::{create_content_dirs, create_inbox_dir};
 
 /// Keep the config dir owner-only on EVERY start, not just at the one-time
 /// migration: it holds keys, grants and the proxy token, and a dir someone

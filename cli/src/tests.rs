@@ -12,6 +12,7 @@
 //! the body contains raw and multi-line string literals whose contents must not
 //! move. That is verified by diffing rustfmt(original) against rustfmt(this file).
 use super::*;
+use filament_transfer::path_bounds::path_within_canonical;
 
 /// TUNLION_CONFIG_DIR is process-global, so tests that point it at their
 /// own temp dir must not run concurrently with each other (a second test
