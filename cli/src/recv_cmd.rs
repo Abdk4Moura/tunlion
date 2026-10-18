@@ -62,7 +62,7 @@ use crate::{
     flush_inflight, handle_auth_key_enroll_response, handle_cert_renew_ack,
     handle_identity_expose, handle_warm_req, human, identity, in_binding, interactive_allowed,
     interactive_requested, is_self_uid, issue_proven_challenge_and_hold,
-    l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
+    l2, link_fingerprints, link_nonce,
     LivenessProbes, load_provisional_identity, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
     mk_uid, net, next_ev, offer_question, out_binding,
@@ -96,6 +96,7 @@ use filament_peerloop::control::Req;
 #[cfg(unix)]
 use filament_peerloop::control::ReqKind;
 use filament_peerloop::host::{CapGate, HostServices, Level, LogSink, StorageFailure, Tone};
+use filament_peerloop::l2::forward;
 use filament_peerloop::present::{Ask, Presentation};
 use filament_peerloop::secret::fresh_secret;
 use filament_peerloop::shell::ShellHost;
@@ -474,9 +475,13 @@ pub(crate) async fn park_on_deny(
     true
 }
 
-/// Accept one `l2-open` forward frame: validate, shell-gate (expose bound),
-/// dial and serve. Extracted verbatim from the recv loop arm so unsettled
-/// opens can be parked and re-driven through this same function.
+/// Accept one `l2-open` forward frame by delegating admission to the library.
+///
+/// The endpoint owns the gate, expose bound, allowlist answer, raw-trusted mux
+/// check and capacity/collision ordering. This wrapper keeps the two things
+/// that are the receive driver's: the caller-owned parking map and the dial
+/// task (`Mux::dial_and_serve`). A parked forward open is re-driven straight
+/// into this same function, so every input is re-gathered.
 async fn handle_forward_open(
     conn: &mut Conn,
     pid: String,
@@ -486,231 +491,73 @@ async fn handle_forward_open(
     l2_enabled: bool,
     parked: &mut Vec<ParkedOpen>,
 ) {
-    // The live arm denies an l2-open when serving is off BEFORE the handler is
-    // reached, so this reads as redundant -- but a PARKED open is re-driven
-    // straight into this function, bypassing that guard. Applying it here keeps
-    // "re-drive re-gathers every input" true for the L2 switch too (a policy
-    // reload that turns L2 off cannot be outrun by an open that parked while it
-    // was on), and the denial is byte-identical to the live arm's so the peer
-    // gets one reason for one cause.
-    //
-    // THE GUARD APPLIES TO OPENS ONLY. This is the establishment stall that held
-    // the gate suite red from 2026-09-18: the guard was written as `!l2_enabled`
-    // alone, while the live arm it claims to mirror is
-    // `l2_enabled || type == "l2-close"`. So it ALSO caught the peer's `l2-close`
-    // for a stream WE opened -- which is the one message a node with L2 off must
-    // still act on, exactly as the live arm's own comment explains. The close was
-    // admitted by the dispatch, then discarded here before `on_close`, so:
-    //
-    //   - the stream was never dropped and its pipe never closed;
-    //   - the warm bridge (dc_to_socket) never ended, so the local client's
-    //     socket stayed ESTABLISHED and `tunlion shell <peer> -- cmd` hung after
-    //     printing the command's output (roster gate B, shell-gates gateA2);
-    //   - and this branch answered the close with an l2-close{TUNNEL_OFF} of its
-    //     own, which is the unexplained "rx l2-close <- <delegate>" in the
-    //     acceptor's log.
-    //
-    // Every delegate daemon runs with L2 off unless it serves shells itself, so
-    // this hit every daemon-mediated one-shot from a delegate.
-    if !l2_enabled && v["type"].as_str() != Some("l2-close") {
-        if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
-            let _ = t
-                .send_control(&json!({
-                    "type": "l2-close",
-                    "sid": sid,
-                    "err": crate::capability::TUNNEL_OFF_REASON,
-                }))
-                .await;
-        }
-        return;
-    }
-
-    // TODO(diag acceptor): emit a diag::Attempt with role
-    // "acceptor" for this l2-open->l2-open-ack round trip. Deferred
-    // because the acceptor has no per-connect span here: this fires
-    // on an ALREADY-established shared link inside the big up/recv
-    // loop (the link's bring-up lives in the file-transfer/recv
-    // machinery upstream), so a clean span would mean threading an
-    // Attempt through the whole loop. The initiator path (l2.rs) is
-    // fully instrumented and is the side that exhibits the stall.
-    let Some(t) = conn.transport_of(&pid) else {
-        crate::conn::dropped_no_transport(&pid, "forward open");
-        return;
+    // Host/config inputs stay here: the endpoint reads no environment or file.
+    let l2_forced = std::env::var("TUNLION_L2")
+        .map(|x| x == "1")
+        .unwrap_or(false);
+    let is_exposed = |port: u16| crate::expose::load().iter().any(|b| b.port == port);
+    let target_allowed =
+        |name: &str, host: &str, port: u16| crate::l2_policy::l2_target_allowed(name, host, port);
+    let cfg = forward::ForwardConfig {
+        shell_policy,
+        l2_enabled,
+        l2_forced,
+        is_exposed: &is_exposed,
+        target_allowed: &target_allowed,
     };
-    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-    // Per-device authorization for a NEW open (an l2-close just
-    // tears a stream down, so it is never gated here). In a blanket
-    // mode any trusted peer may open; in grant-only mode the opening
-    // peer must hold the shell grant itself.
-    let mut l2_deny_reason: Option<String> = None;
-    // Ports arrive as u64; a value that does not fit u16 is not
-    // addressable, so deny rather than truncate it into a different
-    // (possibly exposed) port. Parsed BEFORE the gate (and before any
-    // park): an out-of-range port is not an identity question, so it must
-    // keep its own immediate verdict.
-    let parsed_port = v["rport"]
-        .as_u64()
-        .or_else(|| v["port"].as_u64())
-        .and_then(|p| u16::try_from(p).ok());
-    let (reach_port, port_ok) = match parsed_port {
-        Some(p) => (p, true),
-        None => {
-            l2_deny_reason = Some("port out of range".to_string());
-            (0, false)
+    match forward::admit_forward_open(conn, &pid, v, l2_muxes, &cfg).await {
+        forward::ForwardAdmission::Accepted {
+            sid,
+            host,
+            port,
+            rx,
+            mux,
+        } => {
+            // The peer's device key, resolved again for the live stream's
+            // revocation re-check (the gate resolved the same value).
+            let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+            tokio::spawn(mux.dial_and_serve(sid, host, port, rx, spawn_idev));
         }
-    };
-    let authorized = v["type"].as_str() != Some("l2-open") || {
-        // Fourth shell-gated path, through the shared gather
-        // and verdict core like pty/exec/ssh-sign. Two path-
-        // specific pieces stay HERE, not in the gate: the
-        // legacy fold (blanket L2 mode has no shell-gate
-        // equivalent -- dropping it would newly deny default
-        // setups in shadow) and the bound (expose.json, not
-        // the enrolment ceiling). A forward --stdio to an
-        // exposed sshd is shell-equivalent in reach (any byte
-        // stream, incl. an ssh session).
-        let (_dev, mut gate_inputs) = crate::shell_gate::gather_shell_gate_inputs(
-            &mut *conn,
-            &pid,
-            &shell_policy,
-            cap::CAP_SHELL,
-        );
-        // Forward's auto-trust bound is the EXPOSE list (a scoped default,
-        // mode-independent); the enrolment ceiling plays no part here.
-        gate_inputs.scoped_default =
-            reach_port != 0 && crate::expose::load().iter().any(|b| b.port == reach_port);
-        gate_inputs.ceiling_covers = false;
-        let legacy_ok = {
-            let blanket = shell_policy.enables_l2()
-                || std::env::var("TUNLION_L2")
-                    .map(|x| x == "1")
-                    .unwrap_or(false);
-            let (peer_has_shell, peer_denied) = conn
-                .link(&pid)
-                .and_then(|l| l.verified_name.as_deref())
-                .map(|n| {
-                    (
-                        device_allows(n, "shell"),
-                        device_capability_denied(n, "shell"),
-                    )
-                })
-                .unwrap_or((false, false));
-            l2_open_allowed(blanket, peer_has_shell, peer_denied)
-        };
-        let d = crate::shell_gate::forward_gate_decision(&gate_inputs, legacy_ok);
-        if let Err(Some(r)) = &d {
-            l2_deny_reason = Some(r.clone());
-        }
-        // port_ok is ANDed last: an out-of-range port denies
-        // even for a granted peer (there is nothing valid to
-        // open), while keeping the recorded reason specific.
-        d.is_ok() && port_ok
-    };
-    if !authorized {
-        // wire_sid (not a wrapping cast) so the l2-close we echo
-        // back names the real sid; 0 only if absent/out-of-range.
-        let sid = l2::wire_sid(&v).unwrap_or(0);
-        // Settle-then-evaluate: the verdict above may rest on stale
-        // (unproven) identity. Park for re-drive on proof when the deny
-        // is attributable to it; otherwise the live verdict stands.
-        if port_ok
-            && l2::is_l2_sid(sid)
-            && park_on_deny(
-                parked,
-                conn,
-                &pid,
-                ParkKind::Forward,
-                &t,
-                sid,
-                v,
-                l2_deny_reason
-                    .as_deref()
-                    .unwrap_or("device not granted shell"),
-            )
-            .await
-        {
-            return;
-        }
-        let diag = l2_deny_reason
-            .as_deref()
-            .unwrap_or("device not granted shell");
-        conn.log.say(&format!("l2: refused stream {sid:#x}: {diag}"));
-        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
-        // The gate's own cause when it is final (expired, revoked): a revoked
-        // device used to be told "device lacks shell grant", which sent it to
-        // ask for a grant that could not help.
-        let close = match crate::refusal::Refusal::final_cause(l2_deny_reason.as_deref(), who.clone()) {
-            Some(mut r) => {
-                if r.code == crate::refusal::Code::Expired {
-                    r.reinvite = conn
-                        .link(&pid)
-                        .and_then(|l| l.identity_device_pub)
-                        .and_then(|d| crate::identity_state::reinvite_for(&d));
+        forward::ForwardAdmission::Denied(d) => {
+            // Settle-then-evaluate: the verdict above may rest on stale
+            // (unproven) identity. Park for re-drive on proof when the deny is
+            // attributable to it; otherwise the live verdict stands.
+            if let Some(p) = &d.park {
+                if park_on_deny(
+                    parked,
+                    conn,
+                    &pid,
+                    ParkKind::Forward,
+                    &d.transport,
+                    p.sid,
+                    v,
+                    &p.reason,
+                )
+                .await
+                {
+                    return;
                 }
-                r.close_frame(sid)
             }
-            None => {
-                let mut close = json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" });
-                crate::refusal::Refusal::new(crate::refusal::Code::NotGranted, who).annotate(&mut close);
-                close
-            }
-        };
-        let _ = t.send_control(&close).await;
-    } else {
-        // Opt-in gateway: if the target is non-loopback, allow it
-        // only when the operator's l2-allow.json lists it for this
-        // device (or "*"). Loopback ignores this (always allowed).
-        let allow_nonloopback = {
-            let host = v["host"].as_str().unwrap_or("127.0.0.1");
-            // Same truncation rule as the gate above: an
-            // out-of-range port matches no allowlist entry.
-            let port = v["rport"]
-                .as_u64()
-                .or_else(|| v["port"].as_u64())
-                .and_then(|p| u16::try_from(p).ok())
-                .unwrap_or(0);
-            let name = conn
-                .link(&pid)
-                .and_then(|l| l.verified_name.clone())
-                .unwrap_or_default();
-            l2_target_allowed(&name, host, port)
-        };
-        let mux = l2_muxes
-            .entry(pid.clone())
-            .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
-            .clone();
-        match mux.accept_control(&v, trusted, allow_nonloopback).await {
-            l2::OpenVerdict::Accept {
-                sid,
-                host,
-                port,
-                rx,
-            } => {
-                // The peer's device key, resolved again for the live
-                // stream's revocation re-check (the gate above resolved
-                // the same value for the open decision).
-                let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
-                tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx, spawn_idev));
-            }
-            l2::OpenVerdict::Deny { sid, err } => {
-                // Log refused dials at INFO (visible by default,
-                // suppressed under -q) - a refused SSRF/port-scan or
-                // untrusted/over-cap open is a security event the
-                // operator should see, mirroring the
-                // shell-bootstrap-deny path (`log.say`). Normal
-                // initiators always dial 127.0.0.1, so this is silent
-                // in normal operation and only fires on an anomaly.
-                conn.log.say(&format!("l2: refused stream {sid:#x}: {err}"));
-                let _ = t
-                    .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
-                    .await;
-            }
-            l2::OpenVerdict::Ignore => {}
+            conn.log
+                .say(&format!("l2: refused stream {:#x}: {}", d.sid, d.reason));
+            let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+            let close = d.close_frame(who, || {
+                conn.link(&pid)
+                    .and_then(|l| l.identity_device_pub)
+                    .and_then(|d| crate::identity_state::reinvite_for(&d))
+            });
+            let _ = d.transport.send_control(&close).await;
         }
+        forward::ForwardAdmission::Refused(r) => {
+            // Log refused dials at INFO (visible by default, suppressed under
+            // -q) - a refused SSRF/port-scan or untrusted/over-cap open is a
+            // security event the operator should see.
+            conn.log
+                .say(&format!("l2: refused stream {:#x}: {}", r.sid, r.reason));
+            let _ = r.transport.send_control(&r.close).await;
+        }
+        forward::ForwardAdmission::Ignored => {}
     }
-    // A PTY stream closing frees its resize channel, handled by
-    // the mux's `on_close`/`drop_stream` (H-1: resizer is owned by
-    // the mux now, so it can't leak past the stream).
 }
 
 /// The refusal for a shell-class open while serving is OFF here (`off` is

@@ -11,6 +11,9 @@ use crate::devices_store::devices_path;
 use serde_json::Value;
 use std::path::PathBuf;
 
+// `l2_open_allowed` is still named by the CLI gate matrix test; the forward
+// admission calls it through the library directly.
+#[allow(unused_imports)]
 pub(crate) use filament_peerloop::l2::policy::{l2_open_allowed, l2_target_allowed_in};
 
 /// Opt-in non-loopback forward allowlist: `{config_dir}/l2-allow.json`. Absent or

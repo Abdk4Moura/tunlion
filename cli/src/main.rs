@@ -175,9 +175,8 @@ pub(crate) use runtime_support::{add_pending_request, is_light_command, next_ev,
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows")))]
 pub(crate) use runtime_support::unmount_fuse;
 /// L2 allow/open policy (the pure rules live in `filament_peerloop::l2::policy`;
-/// this module keeps the allowlist file loader and the old names).
+/// this module keeps the allowlist file loader).
 mod l2_policy;
-pub(crate) use l2_policy::{l2_open_allowed, l2_target_allowed};
 /// Owner-only files, pidfile and small parsers.
 mod file_io;
 pub(crate) use file_io::{parse_duration_secs, parse_invitation, parse_mint_ttl, pidfile, read_owner_only_fd, write_owner_only_fd, write_owner_only_file, write_pidfile};
