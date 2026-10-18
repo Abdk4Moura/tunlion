@@ -126,6 +126,20 @@ pub fn peer_present(alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u
         }
 }
 
+/// Peer-originated liveness for a relay/DataChannel link. `heard_ms` is stamped
+/// only by the PEER (see `Transport::heard_ms`); our own relay keepalive writes
+/// stamp `idle_ms` but not this. `Some(true)` means the peer was heard inside
+/// the one stale window above, `Some(false)` means it has gone silent past it,
+/// and `None` means the transport does not track peer-only silence (direct
+/// QUIC), so the caller must apply its own transport-bounded rule.
+///
+/// This is the same rule as `peer_present` for tracked transports, exposed
+/// without the `alive`/`direct` inputs so a caller that has already judged
+/// transport liveness does not restate the window.
+pub fn relay_peer_live(heard_ms: Option<u64>) -> Option<bool> {
+    heard_ms.map(|heard| heard < WARM_RELAY_STALE_MS)
+}
+
 // ============================================================================
 // WARM-HOLD: should a link to a warm-tier device be dialled this tick?
 // ============================================================================
@@ -362,6 +376,13 @@ mod tests {
         assert!(peer_present(true, true, None, u64::MAX));
         assert!(!peer_present(true, false, None, WARM_RELAY_STALE_MS));
         assert!(!peer_present(false, true, Some(0), 0));
+    }
+
+    #[test]
+    fn relay_peer_live_is_the_one_stale_window_without_our_own_writes() {
+        assert_eq!(relay_peer_live(Some(WARM_RELAY_STALE_MS - 1)), Some(true));
+        assert_eq!(relay_peer_live(Some(WARM_RELAY_STALE_MS)), Some(false));
+        assert_eq!(relay_peer_live(None), None);
     }
 
     #[test]
