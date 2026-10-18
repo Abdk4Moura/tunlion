@@ -160,6 +160,14 @@ const PEER_BUILD_BUDGET: Duration = Duration::from_secs(5);
 /// How long `drop_link` lets a dropped link's last frames reach the peer
 /// before it closes the QUIC connection under them.
 const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// A link absent from a channel/room digest is retired only after its transport
+/// has been idle this long. Presence is best-effort and a signaling reconnect
+/// gives the peer a new sid, so the old sid vanishes from the digest while its
+/// data channel is still the one carrying a shell. While the link moves bytes we
+/// defer (adoption supersedes it onto the new sid once it goes idle); this bound
+/// starts when it stops moving bytes, so a genuinely departed peer cannot sit
+/// in the table forever.
+const DIGEST_ABSENT_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 pub struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
@@ -651,6 +659,17 @@ pub struct Conn {
     /// is reaped harmlessly once done. Cleared in drop_link so a supersede of a
     /// deferred sid can't leave a stale blocker.
     pub deferred_left: HashMap<String, Value>,
+    /// Digest reconcile deferral: sid -> when its live transport was first seen
+    /// absent from a digest while not moving bytes. A signaling reconnect gives
+    /// the peer a fresh sid, so the old sid disappears from `channel_peers`
+    /// while its direct link still serves a shell; dropping it there is the
+    /// PR512 tear-down. While the link flows this is refreshed (a moving channel
+    /// is evidence of presence); once it goes idle the clock runs for
+    /// `DIGEST_ABSENT_IDLE_GRACE` before the reconcile may retire it. Cleared
+    /// when the sid reappears, when the link is dropped, and on a fresh
+    /// signaling sid. Not used by `on_peer_left`, which keeps its own payload
+    /// (`deferred_left`) because a peer-left is a real roster departure.
+    pub digest_deferred: HashMap<String, Instant>,
     /// Gate-18 Mode B: set TRUE by the recv loop, each tick, exactly when the
     /// transfer is COMPLETE and nothing is in flight (`completed>0 &&
     /// by_sid.is_empty() && !keep_open`). When it holds, `on_stuck` DROPS a
@@ -890,6 +909,7 @@ impl Conn {
             },
             chunk_size: net::MAX_DC_PAYLOAD,
             deferred_left: HashMap::new(),
+            digest_deferred: HashMap::new(),
             recv_done: false,
             direct_pending: HashMap::new(),
             buffered_offers: HashMap::new(),
@@ -1387,6 +1407,7 @@ impl Conn {
         // stale entry blocking adoption. Invariant: deferred_left only ever
         // holds sids that are still live links.
         self.deferred_left.remove(pid);
+        self.digest_deferred.remove(pid);
         self.buffered_offers.remove(pid);
         self.stuck_retry.remove(pid);
         if let Some(old) = self.links.remove(pid) {
@@ -4063,6 +4084,58 @@ impl Conn {
         }
     }
 
+    /// Digest reconcile decision: may the caller retire a link whose sid was
+    /// absent from two consecutive channel/room digests?
+    ///
+    /// The digest describes SIGNALING presence, but the data channel is
+    /// independent. A signaling reconnect gives the peer a new sid, so the old
+    /// sid legitimately drops out of `channel_peers` while the direct link is
+    /// still the one carrying a shell. `on_peer_left` already defers that case
+    /// (`deferred_left` + `reap_deferred`); digest reconcile did not, and tore
+    /// those links down (PR512, `cli/src/recv_cmd.rs` reconcile loop).
+    ///
+    /// Follow the same shape here, without a second payload: while the link has
+    /// a live transport and is moving bytes, defer. Adoption supersedes it onto
+    /// the new sid when it goes idle, or the reconcile retires it once it has
+    /// been idle for `DIGEST_ABSENT_IDLE_GRACE`. A dead transport is retirable
+    /// at once — no unbounded grace for a peer that is actually gone.
+    pub fn digest_absent_retirable(&mut self, pid: &str) -> bool {
+        self.digest_absent_retirable_at(pid, Instant::now())
+    }
+
+    fn digest_absent_retirable_at(&mut self, pid: &str, now: Instant) -> bool {
+        if !self.has_live_transport(pid) {
+            self.digest_deferred.remove(pid);
+            return true;
+        }
+        if self.link_flowing(pid) {
+            // A moving channel outranks a missing presence entry. Refresh the
+            // idle clock so the grace starts when the link really goes quiet.
+            self.digest_deferred.insert(pid.to_string(), now);
+            return false;
+        }
+        let first = *self.digest_deferred.entry(pid.to_string()).or_insert(now);
+        if now.saturating_duration_since(first) >= DIGEST_ABSENT_IDLE_GRACE {
+            self.digest_deferred.remove(pid);
+            return true;
+        }
+        false
+    }
+
+    /// The sid is present again in a digest: nothing is deferred for it. The
+    /// next absence starts a fresh grace window.
+    pub fn digest_present(&mut self, pid: &str) {
+        self.digest_deferred.remove(pid);
+    }
+
+    /// A fresh signaling sid invalidates the previous digest window. The peer is
+    /// re-subscribing on its own new sid at the same time, so an absence window
+    /// that started before the reconnect (or the first digest after it) must not
+    /// carry over and retire a link that never stopped flowing.
+    pub fn reset_digest_deferrals(&mut self) {
+        self.digest_deferred.clear();
+    }
+
     /// #28 exit reconciliation: true when every remaining link is one we're only
     /// holding open for its deferred-drop reap (vacuously true with no links). A
     /// link in `deferred_left` is a peer whose signaling already left; once all
@@ -4490,6 +4563,18 @@ mod warm_identity_tests {
                 closes: AtomicUsize::new(0),
                 idle_ms,
                 heard_ms,
+            })
+        }
+        /// A transport that is actively moving bytes (idle 0ms).
+        fn flowing() -> Arc<Self> {
+            Self::with_activity(0, None)
+        }
+        fn dead() -> Arc<Self> {
+            Arc::new(FakeQuic {
+                alive: AtomicBool::new(false),
+                closes: AtomicUsize::new(0),
+                idle_ms: u64::MAX,
+                heard_ms: Some(u64::MAX),
             })
         }
     }
@@ -5116,6 +5201,102 @@ mod warm_identity_tests {
         assert_eq!(gone, vec!["sid-ch".to_string(), "sid-room".to_string()]);
         assert!(conn.roster.contains_key("sid-here"));
         assert!(conn.roster_absent.is_empty());
+    }
+
+    // --- digest reconcile liveness (PR512) --------------------------------
+
+    /// The failure: a channel digest miss on a signaling reconnect retired a
+    /// direct link that was still moving a shell's bytes. While the transport
+    /// flows, the reconcile must defer, however long the miss persists: a
+    /// moving data channel is stronger evidence than a missing presence entry.
+    #[tokio::test]
+    async fn digest_absence_defers_a_flowing_live_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::flowing();
+        conn.links.insert(
+            "sid-old".into(),
+            direct_link("sid-old", "x", "user@x", t.clone()),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-old", t0));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-old",
+            t0 + Duration::from_secs(60 * 60)
+        ));
+        assert!(conn.links.contains_key("sid-old"));
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+    }
+
+    /// The other side of the contract: a dead transport is a departure. The
+    /// reconcile retires it at once, with no grace at all.
+    #[tokio::test]
+    async fn digest_absence_retires_a_dead_link_immediately() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert(
+            "sid-dead".into(),
+            direct_link("sid-dead", "x", "user@x", FakeQuic::dead()),
+        );
+        assert!(conn.digest_absent_retirable_at("sid-dead", Instant::now()));
+        assert!(conn.links.contains_key("sid-dead"), "the caller owns the drop");
+    }
+
+    /// An alive but idle link is neither kept forever nor dropped on the spot:
+    /// the deferral window is bounded and starts when it stops flowing, leaving
+    /// time for adoption to move the shell onto the peer's new sid.
+    #[tokio::test]
+    async fn digest_absence_retires_an_idle_link_after_the_bounded_grace() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert(
+            "sid-idle".into(),
+            direct_link("sid-idle", "x", "user@x", FakeQuic::live()),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-idle", t0));
+        assert!(conn.digest_deferred.contains_key("sid-idle"));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + DIGEST_ABSENT_IDLE_GRACE - Duration::from_millis(1)
+        ));
+        assert!(conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + DIGEST_ABSENT_IDLE_GRACE
+        ));
+        assert!(!conn.digest_deferred.contains_key("sid-idle"));
+    }
+
+    /// Presence returning, and a fresh signaling sid, both restart the clock:
+    /// a gap that straddles the reconnect cannot be carried into the new one.
+    #[tokio::test]
+    async fn digest_present_and_reconnect_reset_the_deferral_clock() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert(
+            "sid-idle".into(),
+            direct_link("sid-idle", "x", "user@x", FakeQuic::live()),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-idle", t0));
+        conn.digest_present("sid-idle");
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + Duration::from_secs(29)
+        ));
+        conn.reset_digest_deferrals();
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + Duration::from_secs(30)
+        ));
+        assert!(conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + Duration::from_secs(30) + DIGEST_ABSENT_IDLE_GRACE
+        ));
+    }
+
+    /// A sid absent after its link was already dropped stays retirable: the
+    /// deferral map is not a link registry and cannot resurrect a dead peer.
+    #[tokio::test]
+    async fn digest_absence_with_no_link_is_retirable() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        assert!(conn.digest_absent_retirable("sid-never-linked"));
     }
 
     /// The event-loop gate: a mini loop that dispatches Stuck/RetryLink to
