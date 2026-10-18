@@ -47,3 +47,45 @@ export const REBUILD_STATES = ['failed', 'closed', 'disconnected']
 export function shouldRebuildLink(connectionState) {
   return REBUILD_STATES.includes(connectionState)
 }
+
+// Is this PeerLink still a live data path? Signaling presence and the data
+// channel are independent: a roster digest can briefly omit a peer (our own
+// signaling reconnect, the peer re-subscribing on a fresh sid) while its
+// WebRTC channel is still open and carrying a shell. This is the browser half
+// of the server's #513 rule; it lets digest reconcile tell "absent from the
+// roster" from "the link is gone". Same shape as WebTerminal's down check.
+export function linkIsLive(link) {
+  const ch = link && link.channel
+  if (!ch || ch.readyState !== 'open') return false
+  const pc = link && link.pc
+  return !pc || pc.connectionState === 'connected'
+}
+
+// C30 phase 2 digest reconcile, as a pure decision.
+//
+// `peers` is the roster in the sync ack; `links` is [{id, live}] for every
+// PeerLink we hold; `channelPids` are channel-introduced known-device links
+// (room-independent by design). A room link absent from TWO consecutive
+// digests is a missed peer-left and may be retired — but only when its own
+// transport is not alive. An alive link is deferred indefinitely: presence
+// gaps are not a data-plane failure (#513), and a peer that really went away
+// closes its channel, which makes the next miss actionable.
+//
+// Returns { adopt, drops, misses }: new peers to link, link ids to retire, and
+// the next consecutive-miss map (fresh for present/channel/live links, so a
+// transient absence never leaves a half-armed drop).
+export function reconcileDigest({ peers, present, links, channelPids, misses, threshold = 2 }) {
+  const linked = new Set((links || []).map((l) => l && l.id).filter(Boolean))
+  const adopt = (peers || []).filter((p) => p && p.id && !linked.has(p.id))
+  const absent = misses instanceof Map ? misses : new Map()
+  const next = new Map()
+  const drops = []
+  for (const l of links || []) {
+    if (!l || !l.id) continue
+    if (present.has(l.id) || channelPids.has(l.id) || l.live) continue
+    const n = (absent.get(l.id) || 0) + 1
+    if (n >= threshold) drops.push(l.id)
+    else next.set(l.id, n)
+  }
+  return { adopt, drops, misses: next }
+}

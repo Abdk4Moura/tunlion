@@ -95,11 +95,22 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   await page.waitForFunction(() => window.__h.opens().length === 3, null, { timeout: 5000 })
     .catch(() => fail('no reattach after the same link recovered'));
   await wait(300);
-  const o3 = (await page.evaluate(() => window.__h.opens()))[2];
+  const allOpens = await page.evaluate(() => window.__h.opens());
+  const o3 = allOpens[2];
   if (o3.resumeFrom !== shownMid) fail(`recovered-link reattach resume_from=${o3.resumeFrom}, shown ${shownMid}`);
+  if (allOpens.some((o) => o.session !== allOpens[0].session)) fail('a reconnect changed the stable PTY session id');
   const lines2 = ((await page.evaluate(() => window.__h.delivered())).match(/LINE-\d+/g) || []).map((l) => +l.slice(5));
   if (JSON.stringify(lines2) !== JSON.stringify(Array.from({ length: 12 }, (_, i) => i + 1))) fail(`after the ICE blip the terminal got ${JSON.stringify(lines2)}`);
   ok(`same link recovered: reattached with resume_from=${shownMid}, LINE-1..LINE-12 each once`);
+
+  // A reconnect is a byte-stream continuation, not a status message. Nothing
+  // the transport did may be printed into the user's terminal (the native CLI
+  // had the same rule after #496); only the session's own output belongs here.
+  const wireText = await page.evaluate(() => window.__h.delivered());
+  if (/reconnect|link .*lost|tunlion:|session ended/i.test(wireText)) {
+    fail(`the terminal received a reconnect/status notice: ${JSON.stringify(wireText.match(/.{0,40}(?:reconnect|link .*lost|tunlion:|session ended).{0,40}/i)?.[0])}`);
+  }
+  ok('no reconnect/status notice was written into the terminal');
 
   const bar = await page.evaluate(() => window.__h.bar());
   if (/reconnecting/.test(bar)) fail(`the bar still says reconnecting after the reattach: "${bar}"`);
