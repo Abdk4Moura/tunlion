@@ -1,10 +1,9 @@
 //! The receive command (`tunlion recv`) and its event loop, lifted out of `main.rs`.
 //!
-//! One unit, moved without splitting the body: the setup phase that builds the
-//! connection, then the single `loop` + `select!` that drives it. Nothing inside was
-//! rewritten, so the 13 `tokio::spawn` captures, the borrows that live across the 243
-//! awaits, and all 28 in-body cfg regions (`unix`, `l3`, `not(unix)`, `not(l3)`) behave
-//! exactly as they did at the crate root.
+//! The existing setup + dispatch body stays together. `recv_cmd` adapts process
+//! signals and exit policy; `recv_driver` supplies invocation-local cancellation
+//! and a cleanup-return boundary. This is not yet an embeddable engine: stdin,
+//! ambient configuration and lower-layer detached work still have process scope.
 //!
 //! Everything it calls stays where it was and is imported here -- notably the thirty
 //! helpers shared with the send path, `daemon_alive` included. Nothing was promoted for
@@ -72,7 +71,7 @@ use crate::{
     record_range, regex_lite_code, relay_banner, resolve_peer_identity,
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
     respond_to_identity_challenge, safe_create_part, safe_incoming_name, safe_resume_part,
-    sdnotify, session, shell_argv, shutdown, spawn_session_pumps, sshd,
+    sdnotify, session, shell_argv, spawn_session_pumps, sshd,
     sshd_listening, store_provisional_identity, subnet_forward, sweep_completed_streams,
     test_hooks, verify_incoming, with_devices_mut,
 };
@@ -1225,7 +1224,128 @@ mod receive_expected_sha256_tests {
     }
 }
 
+/// CLI process adapter. The driver below returns after its owned cleanup;
+/// only this adapter translates cancellation into the CLI signal exit policy.
 pub(crate) async fn recv_cmd(
+    server: &str,
+    code: Option<String>,
+    dir: PathBuf,
+    yes: bool,
+    room: Option<String>,
+    to: Option<String>,
+    keep_open: bool,
+    timeout: Option<u64>,
+    expect_sha256: Option<String>,
+    relay: bool,
+    remember: Option<String>,
+    daemon: bool,
+    output: Option<String>,
+    shell_policy: ShellPolicy,
+    shell_user: Option<String>,
+    no_proxy_fallback: bool,
+    log: Arc<dyn LogSink>,
+    host: Arc<dyn HostServices>,
+) -> Result<()> {
+    use filament_peerloop::driver::{Cancellation, DriverOutcome};
+    let stop = Cancellation::default();
+    let mut signals = crate::recv_lifecycle::Signals::install(stop.clone())?;
+    let outcome = recv_driver(
+        server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
+        relay, remember, daemon, output, shell_policy, shell_user,
+        no_proxy_fallback, log.clone(), host, &stop,
+    ).await;
+    signals.stop().await;
+    match outcome {
+        DriverOutcome::Returned(result) => result,
+        DriverOutcome::Cancelled => {
+            if daemon {
+                log.say(&format!(
+                    "  {} stopped serving; `tunlion up` starts again",
+                    log.paint(Tone::Dim, "·")
+                ));
+                crate::file_io::remove_pidfile();
+            } else {
+                log.say(&format!(
+                    "  {} interrupted, partials kept; run the same command to resume",
+                    log.paint(Tone::Warn, "!")
+                ));
+            }
+            crate::exit_codes::interrupted_exit(signals.code());
+        }
+    }
+}
+
+/// Cancellation/cleanup-return seam for the existing driver, still CLI-bound.
+/// Return means only the resources in RecvCleanup have completed their epilogue.
+/// In particular it does NOT mean all detached/blocking work has been joined.
+async fn recv_driver(
+    server: &str,
+    code: Option<String>,
+    dir: PathBuf,
+    yes: bool,
+    room: Option<String>,
+    to: Option<String>,
+    keep_open: bool,
+    timeout: Option<u64>,
+    expect_sha256: Option<String>,
+    relay: bool,
+    remember: Option<String>,
+    daemon: bool,
+    output: Option<String>,
+    shell_policy: ShellPolicy,
+    shell_user: Option<String>,
+    no_proxy_fallback: bool,
+    log: Arc<dyn LogSink>,
+    host: Arc<dyn HostServices>,
+    stop: &filament_peerloop::driver::Cancellation,
+) -> filament_peerloop::driver::DriverOutcome<Result<()>> {
+    let mut cleanup = RecvCleanup::default();
+    let outcome = stop.run(recv_run(
+        server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
+        relay, remember, daemon, output, shell_policy, shell_user,
+        no_proxy_fallback, log, host, stop, &mut cleanup,
+    )).await;
+    cleanup.finish().await;
+    // A signal received during cleanup still has its signal-specific outcome.
+    if stop.is_cancelled() {
+        filament_peerloop::driver::DriverOutcome::Cancelled
+    } else {
+        outcome
+    }
+}
+
+/// Resources retained when the inline driver is cancelled at ANY yielding
+/// await, including setup/maintenance (not just next_ev). This is deliberately
+/// not an owner of all lower-layer tasks or a durable/no-thread stop promise.
+#[derive(Default)]
+struct RecvCleanup {
+    state: Option<RecvState>,
+    conn: Option<Conn>,
+    signaling: Option<filament_signal::Client>,
+    tasks: crate::recv_lifecycle::Tasks,
+}
+
+impl RecvCleanup {
+    async fn finish(&mut self) {
+        // Stop accepting control work before closing links. Joining aborted
+        // tasks ensures their listener futures are dropped before we return.
+        self.tasks.stop().await;
+        if let Some(st) = &mut self.state {
+            flush_inflight(&mut st.by_sid).await;
+        }
+        if let Some(conn) = &mut self.conn {
+            conn.close_links_for_exit();
+        }
+        tokio::task::yield_now().await;
+        if let Some(sio) = self.signaling.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
+        }
+        self.conn.take();
+        self.state.take();
+    }
+}
+
+async fn recv_run(
     server: &str,
     mut code: Option<String>,
     mut dir: PathBuf,
@@ -1258,6 +1378,8 @@ pub(crate) async fn recv_cmd(
     // filesystem). The CLI hands it `CliHost`; a caller with no host hands it
     // `NoHost` and every read resolves to the inert default.
     host: Arc<dyn HostServices>,
+    stop: &filament_peerloop::driver::Cancellation,
+    cleanup: &mut RecvCleanup,
 ) -> Result<()> {
     if let Some(expected) = expect_sha256.as_deref() {
         if !valid_sha256(expected) {
@@ -1299,7 +1421,8 @@ pub(crate) async fn recv_cmd(
             codeentry::Outcome::Cancelled => return Err(cancelled()),
             // Ctrl-C is an interrupt, not a choice: 130, as a shell reports it.
             codeentry::Outcome::Interrupted => {
-                crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+                stop.cancel();
+                return std::future::pending().await;
             }
         }
     }
@@ -1368,6 +1491,7 @@ pub(crate) async fn recv_cmd(
     } else {
         net::connect_signaling(server, tx.clone()).await?
     };
+    cleanup.signaling = Some(sio.clone());
 
     let mut paired = code.is_some();
     // Set when the sender cancels a transfer because it could not read its own
@@ -1390,7 +1514,7 @@ pub(crate) async fn recv_cmd(
     // points at `tunlion add` / `tunlion join`, which run the SPAKE2 ceremony.
     // Receive-side transfer/consent state, grouped out of this function's locals
     // (still a plain local; no handler extraction yet). See `RecvState`.
-    let mut st = RecvState {
+    let st = cleanup.state.insert(RecvState {
         by_sid: HashMap::new(),
         verify_fails: HashMap::new(),
         completed: 0usize,
@@ -1402,7 +1526,7 @@ pub(crate) async fn recv_cmd(
         recv_pending_offers: HashMap::new(),
         recv_cers: HashMap::new(),
         recv_deadlines: HashMap::new(),
-    };
+    });
     let mut devices = devices_load(); // channel -> identity lookup for proofs
     // C30: the convergent session repairs whatever the one-shot emits below
     // lose, room membership, channel subscriptions, the lease. The emits
@@ -1505,7 +1629,7 @@ pub(crate) async fn recv_cmd(
             let ctl_tx = ctl_tx.clone();
             let log = log.clone();
             let host = host.clone();
-            tokio::spawn(async move {
+            cleanup.tasks.push(tokio::spawn(async move {
                 if let Err(e) = host.serve_control(ctl_tx, Some(ready_tx)).await {
                     // LOUD, not trace. Without the control socket every
                     // daemon-backed feature degrades silently -- warm links,
@@ -1526,7 +1650,7 @@ pub(crate) async fn recv_cmd(
                          instant invitations cannot reach this daemon, so it will not start"
                     ));
                 }
-            });
+            }));
         }
     }
     #[cfg(not(unix))]
@@ -1568,11 +1692,11 @@ pub(crate) async fn recv_cmd(
             // a sibling `mint` that arms right after this line must not race a
             // socket that is not listening yet.
             if let Some(ready) = ctl_ready.take() {
-                // Ok(Err(_)): the server task ended without ever signalling ready,
-                // i.e. it could not create the socket (it said why, above).
-                if let Ok(Err(_)) = tokio::time::timeout(Duration::from_secs(5), ready).await {
+                // Both a dropped sender and timeout fail startup. Neither is
+                // evidence that the control socket is accepting requests.
+                if let Err(reason) = crate::recv_lifecycle::control_ready(ready, Duration::from_secs(5)).await {
                     bail!(
-                        "the control socket {} could not be created; the daemon is not starting",
+                        "the control socket {} could not be created ({reason:?}); the daemon is not starting",
                         host.control_sock_path()
                             .map_or_else(|| "<none>".to_string(), |p| p.display().to_string())
                     );
@@ -1682,7 +1806,7 @@ pub(crate) async fn recv_cmd(
             .unwrap_or(false);
     let mut l2_enabled = l2_launch || any_shell_grant();
 
-    let mut conn = Conn::for_command(
+    let mut conn = cleanup.conn.insert(Conn::for_command(
         server,
         sio.clone(),
         tx.clone(),
@@ -1709,49 +1833,18 @@ pub(crate) async fn recv_cmd(
     // The CLI's terminal: sticky line, waiting questions, transfer bars, OSC 52
     // and the raw-mode echo. The loop drives them through `Presentation` so the
     // same body runs with no screen at all (a library consumer, a journal).
-    .with_presentation(crate::host_impl::cli_screen());
+    .with_presentation(crate::host_impl::cli_screen()));
     // WARM-HOLD: load configured warm-peers at daemon startup
     if daemon {
         conn.load_warm_peers_config();
     }
-    // SIGINT/SIGTERM: route a graceful Ev::Interrupted through the loop AND arm a
-    // signal-owned force-exit watchdog. The watchdog is the guarantee: if the
-    // event loop is wedged on a stuck peer transport (a WebRTC data-channel write
-    // against a frozen/half-open peer, or a send_frame parked on backpressure that
-    // never drains), the graceful Interrupted is never processed and the daemon
-    // would otherwise ignore the signal until systemd SIGKILLs it ~90s later. The
-    // watchdog force-exits within the bounded grace regardless of loop state; a
-    // dropped link is an ordinary disconnect to the peer's resilience layer.
-    {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown::note_signal(crate::exit_codes::INTERRUPTED);
-            shutdown::arm_force_exit(crate::exit_codes::INTERRUPTED, shutdown::grace());
-            let _ = tx.send(Ev::Interrupted);
-        });
-    }
-    #[cfg(unix)]
-    {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            if let Ok(mut term) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            {
-                term.recv().await;
-                // SIGTERM exits 143, not 130: the documented taxonomy
-                // (exit_codes.rs) reports the signal that actually arrived.
-                shutdown::note_signal(crate::exit_codes::TERMINATED);
-                shutdown::arm_force_exit(crate::exit_codes::TERMINATED, shutdown::grace());
-                let _ = tx.send(Ev::Interrupted);
-            }
-        });
-    }
+    // Signal listeners belong to the outer CLI adapter, active during startup
+    // too. Cancellation is out of band from this invocation's event queue.
     // C29: the stdin owner also runs for an INTERACTIVE daemon (a terminal-
     // attached `tunlion up` is a session); `up --install` under systemd has
     // no tty, so headless daemons stay stdin-free.
     let interactive = !daemon || std::io::stdin().is_terminal();
-    let tty_guard = if interactive && std::io::stdin().is_terminal() {
+    let _tty_guard = if interactive && std::io::stdin().is_terminal() {
         Some(TtyGuard::raw())
     } else {
         None
@@ -3218,6 +3311,7 @@ pub(crate) async fn recv_cmd(
                 match net::reconnect_signaling(server, tx.clone()).await {
                     Ok(new_sio) => {
                         sio = new_sio;
+                        cleanup.signaling = Some(sio.clone());
                         conn.sio = sio.clone();
                         // C30: a fresh sid voids everything the server held,
                         // re-assert room + channels on the next tick. Re-fire
@@ -8814,44 +8908,10 @@ pub(crate) async fn recv_cmd(
                 }
             }
             Ev::Interrupted => {
-                flush_inflight(&mut st.by_sid).await;
-                // One string served two situations. "partials kept; run the
-                // same command to resume" is exactly right for an interrupted
-                // transfer and meaningless for a daemon, which has no partials
-                // to keep: Ctrl-C out of `tunlion up` printed a transfer's
-                // recovery advice. Observed on two machines. The daemon's own
-                // banner already says "Ctrl-C or `tunlion down` to stop", so
-                // say the thing that banner promised.
-                if daemon {
-                    log.say(&format!(
-                        "  {} stopped serving; `tunlion up` starts again",
-                        log.paint(Tone::Dim, "·")
-                    ));
-                } else {
-                    log.say(&format!(
-                        "  {} interrupted, partials kept; run the same command to resume",
-                        log.paint(Tone::Warn, "!")
-                    ));
-                }
-                if let Some(g) = &tty_guard {
-                    g.restore(); // process::exit skips Drop
-                }
-                // Tell every peer this instance is gone: close each link's QUIC
-                // connection. A peer that is not told keeps a live-looking link
-                // to this dead instance for QUIC's 30s idle timeout and routes
-                // warm opens into it. The close frames go out from the endpoint
-                // task while the signaling disconnect below is awaited, so this
-                // adds no wait of its own: a fixed sleep here delayed the exit
-                // enough that a daemon restarted right after `kill` on the same
-                // config found the old one still running (gates 14 then 14b).
-                conn.close_links_for_exit();
-                tokio::task::yield_now().await;
-                // Best-effort, BOUNDED: a wedged signaling socket must not turn the
-                // graceful exit into the very hang the watchdog exists to catch.
-                // The signal task already armed a force-exit; cap the disconnect so
-                // we exit cleanly on our own well inside that grace.
-                let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-                crate::exit_codes::interrupted_exit(shutdown::signal_code());
+                stop.cancel();
+                // Let the supervisor drop this future, then run the SAME
+                // cleanup epilogue as ordinary return and setup failure.
+                return std::future::pending().await;
             }
             // P0 (GAP-1): the inbound transfer stalled (zero bytes, link alive).
             // The receiver participates in the SYMMETRIC direct-QUIC repair: it
@@ -9114,6 +9174,43 @@ pub(crate) async fn recv_cmd(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use filament_peerloop::driver::{Cancellation, DriverOutcome};
+    use filament_peerloop::host::{NoHost, NoLog};
+
+    async fn invalid_receive(stop: &Cancellation) -> DriverOutcome<Result<()>> {
+        // Validation precedes filesystem/network/UI setup, so this exercises
+        // the actual return seam without a backend or process signal adapter.
+        recv_driver(
+            "https://unused.invalid", None, PathBuf::new(), false, None, None,
+            false, None, Some("invalid".into()), false, None, false, None,
+            ShellPolicy::Granted, None, false, Arc::new(NoLog), Arc::new(NoHost), stop,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn driver_setup_failure_returns_without_a_process_exit() {
+        match invalid_receive(&Cancellation::default()).await {
+            DriverOutcome::Returned(Err(error)) => {
+                assert!(error.to_string().contains("--expect-sha256"));
+            }
+            other => panic!("expected validation failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn driver_pre_cancel_is_local_and_returns_after_cleanup() {
+        let first = Cancellation::default();
+        first.cancel();
+        assert!(matches!(invalid_receive(&first).await, DriverOutcome::Cancelled));
+        // Another invocation still runs validation, not cancellation.
+        assert!(matches!(invalid_receive(&Cancellation::default()).await,
+            DriverOutcome::Returned(Err(_))));
     }
 }
 
