@@ -788,7 +788,8 @@ class Run:
         already exists (the peer connected first).
         """
         pairs = (("a", "soak-b", self.daemon_a), ("b", "soak-a", self.daemon_b))
-        for label, peer, d in pairs:
+
+        def wait_one(label: str, peer: str, d: Daemon) -> None:
             pat = rf"warm-hold: (?:established connection to|skip) '{re.escape(peer)}'"
             m = wait_regex(d.log_path, pat, timeout=75, proc=d.proc)
             if not m:
@@ -798,6 +799,16 @@ class Run:
                     "would then kill the wrong side\n"
                     f"--- daemon-{label}.log ---\n{tail(d.log_path)}"
                 )
+
+        # Wait for BOTH at once, not one after the other: a relay link that has
+        # been idle past the warm-reuse staleness window is deliberately not
+        # reused, and a sequential wait would add that idle time to the second
+        # daemon's link.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(wait_one, label, peer, d) for label, peer, d in pairs]
+            for f in futs:
+                f.result()
+        for label, peer, _d in pairs:
             self.note(f"daemon {label}: warm link to {peer} is present")
 
     # ---- shell helpers ----------------------------------------------------
@@ -1241,12 +1252,22 @@ def run_once(base: Path, bin_path: Path, args: argparse.Namespace, index: int) -
         run.start_fixture()
         state1 = f"s1{secrets.token_hex(4)}"
         state2 = f"s2{secrets.token_hex(4)}"
+        # Snapshot BEFORE the second client exists: the owner's report is that a
+        # second connection can tear down the first. A window that starts only
+        # after both are established would miss exactly that failure.
+        d_setup = run.daemon_snapshot()
+        c_setup = run.session_snapshot()
         s1 = run.new_shell("a-to-b", run.cfg_a, "soak-a", "soak-b")
         s2 = run.new_shell("b-to-a", run.cfg_b, "soak-b", "soak-a")
         # Both clients are already running before either is awaited, so the
         # shells really are concurrent rather than sequential.
         pid1 = run.establish(s1, state1)
         pid2 = run.establish(s2, state2)
+        run.check_quiet("setup", d_setup, c_setup, daemon_patterns=QUIET_DAEMON_SESSION)
+        # Re-check the FIRST shell after the second has joined. Its own establish
+        # marker was taken before that connection existed.
+        run.assert_pid_state(s1, pid1, state1, "setup")
+        run.assert_pid_state(s2, pid2, state2, "setup")
         run.check("setup: two simultaneous native shells established", True)
         run.note("both shells established; entering stable window")
 
