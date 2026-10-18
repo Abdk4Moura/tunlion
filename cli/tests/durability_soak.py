@@ -33,7 +33,7 @@ WHAT IT ASSERTS (all failures, never skips)
 HOW LOSS IS INDUCED
   - signaling: runner/sim/flaky_proxy.py (existing, stdlib-only) in front of the
     local backend, toggled by its down-flag. This is a real socket sever.
-  - link/session: SIGTERM the initiator daemon process. The remote PTY and its
+  - link/session: SIGKILL the initiator daemon process. The remote PTY and its
     process stay on the peer daemon; the client's own reconnect loop has to get
     back to it. This is stronger and more deterministic than a lucky packet drop,
     and it exercises the same reattach path a WAN loss uses.
@@ -45,7 +45,7 @@ WHAT IT DOES NOT COVER
     docs/testing/durability-soak.md).
   - It is not a 24h soak. It is bounded and repeatable; `--runs N` repeats it.
 
-Stdlib only. Linux only (pty, process groups, SIGTERM semantics). Usage:
+Stdlib only. Linux only (pty, process groups, signal semantics). Usage:
 
   TUNLION_BIN=/path/to/tunlion python3 cli/tests/durability_soak.py \
       --stable-secs 150 --runs 2
@@ -326,8 +326,29 @@ class Daemon:
         except OSError:
             return 0
 
+    def kill_hard(self) -> None:
+        """SIGKILL, to model link loss rather than a clean daemon shutdown.
+
+        A graceful SIGTERM can send stream-close control frames before exiting;
+        a real WAN drop does not. The intentional-drop stage must destroy the
+        link, not politely close the PTY, so it uses this.
+        """
+        if self.proc is None or self.proc.poll() is not None:
+            self._close_fh()
+            return
+        log(f"{self.name}: SIGKILL daemon (pid {self.proc.pid})")
+        try:
+            self.proc.kill()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        self._close_fh()
+
     def force_restart_setup(self) -> None:
-        """Remove stale runtime files after an intentional SIGTERM.
+        """Remove stale runtime files after the hard kill.
 
         The graceful path removes these itself; a SIGKILL or a crash leaves a
         stale control socket/pidfile. Removing them is a harness setup action,
@@ -574,6 +595,7 @@ class Run:
         self.checks: list[dict] = []
         self.evidence: dict = {}
         self._harness_log = (self.dir / "harness.log").open("a", buffering=1)
+        self._log_lock = threading.Lock()
         self.procs: list[subprocess.Popen] = []
         self.daemons: list[Daemon] = []
         self.sessions: list[PtySession] = []
@@ -586,9 +608,11 @@ class Run:
     # ---- logging / checks -------------------------------------------------
 
     def note(self, msg: str) -> None:
-        log(msg)
-        self._harness_log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        self._harness_log.flush()
+        # `exec`/`forward` run in worker threads during the concurrent stage.
+        with self._log_lock:
+            log(msg)
+            self._harness_log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            self._harness_log.flush()
 
     def check(self, name: str, ok: bool, detail: str = "") -> bool:
         entry = {"name": name, "ok": bool(ok), "detail": detail}
@@ -1155,8 +1179,8 @@ class Run:
         # The session host is B. Killing A's daemon destroys the link but NOT the
         # PTY or its process on B. That is the property under test.
         d0 = self.daemon_snapshot()
-        self.note("drop: SIGTERM initiator daemon A (session host B stays alive)")
-        self.daemon_a.stop(grace=10, kill_group=False)
+        self.note("drop: SIGKILL initiator daemon A (session host B stays alive)")
+        self.daemon_a.kill_hard()
         self.daemon_a.force_restart_setup()
         time.sleep(1)
         self.daemon_a.start()
@@ -1342,7 +1366,7 @@ def main() -> int:
 
     if not sys.platform.startswith("linux"):
         print(
-            "PREREQUISITE: this harness drives Unix PTYs, process groups and SIGTERM; "
+            "PREREQUISITE: this harness drives Unix PTYs, process groups and signals; "
             "it is Linux-only. Windows<->Linux is the documented manual matrix, not a skip.",
             file=sys.stderr,
         )
