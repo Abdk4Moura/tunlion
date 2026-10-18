@@ -613,8 +613,12 @@ mod tests {
         let (mut conn, _far) = connection(host.clone(), t.clone(), true, true, Some("phone")).await;
         let mut muxes = MuxMap::new();
 
+        // This tests only the admission-to-caller park inputs, NOT an actual
+        // park/prove/re-drive through the CLI receive loop. That loop and its
+        // durable-record/budget checks stay CLI-owned; its existing settle
+        // tests cover pure sweep decisions, not this full integration flow.
         // Shadow mode with no cap reason falls back to the legacy deny. The
-        // caller parks on `park`, raises the request and sends the close.
+        // caller decides whether to park, or raise the request and send close.
         let out = admit_sync_open(&mut conn, PID, &open("inbox", SID), &mut muxes, &share.0).await;
         let SyncAdmission::Denied(d) = out else {
             panic!("a shadow deny must reach the caller for parking");
@@ -800,9 +804,25 @@ mod tests {
         let share = Share::new();
         let outside = Share::new();
         let link = share.0.join("escape");
-        if symlink(&outside.0, &link).is_err() {
+        #[cfg(any(unix, windows))]
+        symlink(&outside.0, &link).unwrap_or_else(|e| {
+            panic!(
+                "must create the directory-symlink escape fixture ({link:?} -> {:?}): {e}. \
+                 On Windows enable Developer Mode or grant SeCreateSymbolicLinkPrivilege; \
+                 supported CI targets must run this arm, not skip it.",
+                outside.0
+            )
+        });
+        #[cfg(not(any(unix, windows)))]
+        {
+            eprintln!("note: this platform has no directory symlinks; symlink escape arm skipped");
             return;
         }
+        assert_eq!(
+            link.canonicalize().unwrap(),
+            outside.0.canonicalize().unwrap(),
+            "the escape fixture must resolve to the outside directory"
+        );
         let t = Arc::new(CaptureTransport::default());
         let host = TestHost::new(false, Verdict::Allow);
         let (mut conn, _far) = connection(host.clone(), t.clone(), true, true, None).await;
