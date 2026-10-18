@@ -53,23 +53,12 @@ pub(crate) struct Plan {
     pub extra: Vec<String>,
 }
 
-/// A relative path that cannot leave its root: no absolute, no `..`, no `.`,
-/// no control bytes, no backslash. `None` means refuse.
-pub(crate) fn safe_relpath(s: &str) -> Option<PathBuf> {
-    if s.is_empty() || s.len() > 4096 || s.chars().any(|c| c.is_control() || c == '\\') {
-        return None;
-    }
-    // Textual, not `Path::components()`: that normalizes an interior `.` away,
-    // and a path the peer spelled with one is a path we refuse, not tidy.
-    let mut out = PathBuf::new();
-    for seg in s.split('/') {
-        if seg.is_empty() || seg == "." || seg == ".." {
-            return None;
-        }
-        out.push(seg);
-    }
-    Some(out)
-}
+// Destination confinement and manifest-name bounds now live in
+// filament-transfer. Re-exported so the handler and its remaining tests keep
+// the old paths; the stateful protocol stays here.
+pub(crate) use filament_transfer::path_bounds::{
+    bound_parent, delete_within, manifest_paths_are_bounded, resolve_root, safe_relpath,
+};
 
 fn hex(d: &[u8]) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
@@ -692,46 +681,6 @@ fn authorize_sync(conn: &mut Conn, pid: &str, in_bounds: bool) -> Result<String,
     Ok(who)
 }
 
-/// Bound the requested root to the drop directory: relative, or absolute under
-/// it; every existing ancestor canonical-within before anything is created,
-/// and the result canonical-within after. With `create` false (a dry run) a
-/// missing root is returned as is and nothing touches the disk.
-pub(crate) fn resolve_root(drop_dir: &Path, req: &str, create: bool) -> Result<PathBuf, String> {
-    let outside = || "remote dir is outside this device's drop directory".to_string();
-    let rel = match req.trim() {
-        "" | "." => PathBuf::new(),
-        r if Path::new(r).is_absolute() => {
-            let inside = Path::new(r).strip_prefix(drop_dir).map_err(|_| outside())?;
-            if inside.as_os_str().is_empty() {
-                PathBuf::new()
-            } else {
-                safe_relpath(&inside.to_string_lossy()).ok_or_else(outside)?
-            }
-        }
-        r => safe_relpath(r).ok_or_else(outside)?,
-    };
-    let target = drop_dir.join(&rel);
-    if !crate::path_within(drop_dir, &target) {
-        return Err(outside());
-    }
-    let mut probe = target.clone();
-    while !probe.exists() {
-        probe = probe.parent().map(Path::to_path_buf).ok_or_else(outside)?;
-    }
-    if !crate::path_within_canonical(drop_dir, &probe) {
-        return Err(outside());
-    }
-    if !create && !target.exists() {
-        return Ok(target);
-    }
-    crate::platform::create_content_dirs(drop_dir, &target)
-        .map_err(|e| format!("cannot create remote dir: {e}"))?;
-    if !crate::path_within_canonical(drop_dir, &target) {
-        return Err(outside());
-    }
-    target.canonicalize().map_err(|e| e.to_string())
-}
-
 /// `peer:/abs/path` as the peer reported it, else the request as typed with
 /// where it is relative to (an older peer does not report the path).
 fn sync_destination(peer: &str, remote_dir: &str, dest: Option<&str>) -> String {
@@ -830,7 +779,7 @@ async fn serve_sync(
         bail!("expected a manifest");
     }
     let files: Vec<Entry> = serde_json::from_value(m["files"].take())?;
-    if files.iter().any(|e| safe_relpath(&e.p).is_none()) {
+    if !manifest_paths_are_bounded(files.iter().map(|e| e.p.as_str())) {
         bail!("manifest names an unsafe path");
     }
     let r = root.to_path_buf();
@@ -867,88 +816,6 @@ async fn serve_sync(
             other => bail!("unexpected sync record {other:?}"),
         }
     }
-}
-
-/// Create `parent` under `root`, refusing a symlinked ancestor. `path_within`
-/// is LEXICAL, so it cannot see a symlinked DIRECTORY already sitting inside
-/// the root: `root/sub -> /etc` makes `sub/passwd` a lexically-clean path that
-/// writes outside, and `safe_relpath` cannot see it either (it only reads the
-/// string). So bound the parent by canonical path the way `resolve_root` bounds
-/// the root: every existing ancestor first, then the parent once it exists.
-/// Nothing is written before both hold.
-fn bound_parent(root: &Path, parent: &Path) -> Result<()> {
-    refuse_symlinked_ancestors(root, parent)?;
-    let mut probe = parent.to_path_buf();
-    while !probe.exists() {
-        probe = match probe.parent() {
-            Some(p) => p.to_path_buf(),
-            None => bail!("path escapes the remote dir"),
-        };
-    }
-    if !crate::path_within_canonical(root, &probe) {
-        bail!("path escapes the remote dir");
-    }
-    crate::platform::create_content_dirs(root, parent)?;
-    if !crate::path_within_canonical(root, parent) {
-        bail!("path escapes the remote dir");
-    }
-    Ok(())
-}
-
-/// Remove `root/rel` for `sync --delete`, under the SAME containment rule the
-/// writes use. `path_within` is lexical and `symlink_metadata` only looks at
-/// the last component, so `root/sub -> /elsewhere` used to make `sub/f` a
-/// deletable path that removed `/elsewhere/f`. Here every ancestor below the
-/// root must exist and not be a symlink, the parent must canonicalize inside
-/// the root, and the target itself must be a regular file (a symlink is never
-/// followed). Creates nothing. Returns whether a file was removed.
-fn delete_within(root: &Path, rel: &Path) -> bool {
-    let target = root.join(rel);
-    if !crate::path_within(root, &target) {
-        return false;
-    }
-    let Some(parent) = target.parent() else { return false };
-    if refuse_symlinked_ancestors(root, parent).is_err() {
-        return false;
-    }
-    // A parent that does not exist holds nothing to delete.
-    if !parent.is_dir() || !crate::path_within_canonical(root, parent) {
-        return false;
-    }
-    let is_file = std::fs::symlink_metadata(&target).map(|md| md.is_file()).unwrap_or(false);
-    is_file && std::fs::remove_file(&target).is_ok()
-}
-
-/// Refuse any symlinked component of `parent` below `root` (root itself is not
-/// walked, so a root reached through a symlink stays legitimate). Shared by the
-/// write path (`bound_parent`) and the delete path (`delete_within`).
-fn refuse_symlinked_ancestors(root: &Path, parent: &Path) -> Result<()> {
-    // REFUSE BEFORE CREATING. Every component of `parent` below `root` is checked for
-    // symlinks before anything is created, because the checks below can only report what
-    // they find: `create_dir_all` follows a symlinked parent, so a refusal issued after it
-    // leaves the directory already landed outside the root. A post-hoc refusal is a hole
-    // with a message attached, which is what this arm found on Windows and what it would
-    // have found on Unix had the fixture asserted on the symlink's target itself.
-    //
-    // The predicate is `symlink_metadata` and `is_symlink`, deliberately NOT canonicalize:
-    // Windows returns verbatim `\\?\` paths from canonicalize, so a within-root decision
-    // built on it can miss on one platform while passing on another. `root` itself is not
-    // walked, so a root reached through a symlink stays legitimate.
-    if let Ok(rel) = parent.strip_prefix(root) {
-        let mut walked = root.to_path_buf();
-        for c in rel.components() {
-            walked.push(c.as_os_str());
-            match std::fs::symlink_metadata(&walked) {
-                Ok(md) if md.file_type().is_symlink() => {
-                    bail!("path escapes the remote dir: {walked:?} is a symlink")
-                }
-                Ok(_) => {}
-                // Does not exist yet, so nothing below it can be a symlink either.
-                Err(_) => break,
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Land one file: copy the existing target (if any) to `.part`, write the
@@ -1084,14 +951,6 @@ mod tests {
     }
 
     #[test]
-    fn relpaths_that_could_escape_are_refused() {
-        for bad in ["", "/etc/passwd", "../x", "a/../../b", "./a", "a/./b", "a/", "a//b", "a\\b", "a\0b"] {
-            assert!(safe_relpath(bad).is_none(), "{bad:?}");
-        }
-        assert_eq!(safe_relpath("a/b/c.txt").unwrap(), PathBuf::from("a/b/c.txt"));
-    }
-
-    #[test]
     fn chunk_hashes_cover_the_file_and_agree_with_the_whole_digest() {
         let d = tmp("hash");
         let p = d.join("f");
@@ -1147,64 +1006,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_root_is_bounded_to_the_drop_dir() {
-        let d = tmp("root");
-        assert_eq!(resolve_root(&d, "dry", false).unwrap(), d.join("dry"));
-        assert!(!d.join("dry").exists(), "a dry run creates nothing");
-        assert_eq!(resolve_root(&d, "inbox/photos", true).unwrap(), d.join("inbox/photos").canonicalize().unwrap());
-        assert_eq!(resolve_root(&d, "", true).unwrap(), d.canonicalize().unwrap());
-        assert_eq!(resolve_root(&d, &d.join("abs").to_string_lossy(), true).unwrap(), d.join("abs").canonicalize().unwrap());
-        for bad in ["../out", "/etc", "a/../../b"] {
-            assert!(resolve_root(&d, bad, true).is_err(), "{bad}");
-            assert!(resolve_root(&d, bad, false).is_err(), "{bad}");
-        }
-        if crate::platform::symlink(Path::new("/tmp"), &d.join("esc")).is_ok() {
-            assert!(resolve_root(&d, "esc/x", true).is_err(), "symlink escape must be refused");
-        } else {
-            crate::ui::say("note: this platform would not create a symlink; the escape arm is skipped");
-        }
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// `safe_relpath` reads a string and `path_within` is lexical, so neither
-    /// can see a symlinked DIRECTORY planted inside the root. `bound_parent` is
-    /// what refuses it, and this is the case that proves it: `sub` is a clean
-    /// relative segment and `sub/x` a clean relative path, yet it resolves out.
-    #[test]
-    fn a_symlinked_parent_inside_the_root_cannot_be_written_through() {
-        let root = tmp("bound");
-        let out = tmp("bound-outside");
-        std::fs::create_dir_all(root.join("real/deep")).unwrap();
-        assert!(bound_parent(&root, &root.join("real/deep")).is_ok());
-        // A parent that does not exist yet is created, and stays inside.
-        assert!(bound_parent(&root, &root.join("fresh/deeper")).is_ok());
-        assert!(root.join("fresh/deeper").is_dir());
-        assert!(safe_relpath("sub/x").is_some(), "the string itself is clean");
-        if crate::platform::symlink(&out, &root.join("sub")).is_ok() {
-            assert!(crate::path_within(&root, &root.join("sub/x")), "lexically inside");
-            assert!(
-                bound_parent(&root, &root.join("sub")).is_err(),
-                "a symlinked parent must be refused"
-            );
-            assert!(
-                bound_parent(&root, &root.join("sub/x")).is_err(),
-                "and so must a path under it"
-            );
-            // The assertion that discriminates is on the file BELOW the symlink, not on the
-            // target directory itself: `tmp()` already created the target, so asserting that
-            // the target does not exist tests the fixture rather than the product. On Windows
-            // the pre-fix code created `x` here (its first check is defeated by canonicalize's
-            // verbatim paths) and this is the assertion that caught it, while on Unix the old
-            // canonical re-check already refused before creating anything below the symlink.
-            assert!(!out.join("x").exists(), "nothing was created outside the root");
-        } else {
-            crate::ui::say("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&out);
-    }
-
-    #[test]
     fn files_left_on_the_peer_are_reported_not_silent() {
         assert_eq!(kept_on_peer_line(0, "box"), None);
         assert_eq!(
@@ -1215,31 +1016,6 @@ mod tests {
             kept_on_peer_line(3, "box").as_deref(),
             Some("  3 files exist only on 'box' (not deleted; use --delete to remove)")
         );
-    }
-
-    /// `sync --delete` must use the same containment as the writes: a
-    /// symlinked directory inside the root pointing outside is not a way to
-    /// delete files outside it.
-    #[test]
-    fn delete_does_not_follow_a_symlinked_dir_out_of_the_root() {
-        let root = tmp("del");
-        let out = tmp("del-outside");
-        std::fs::write(out.join("victim"), b"keep me").unwrap();
-        std::fs::create_dir_all(root.join("real")).unwrap();
-        std::fs::write(root.join("real/gone"), b"x").unwrap();
-        assert!(delete_within(&root, Path::new("real/gone")), "a plain file inside is deleted");
-        assert!(!root.join("real/gone").exists());
-        assert!(!delete_within(&root, Path::new("missing/f")), "nothing to delete, nothing created");
-        assert!(!root.join("missing").exists());
-        if crate::platform::symlink(&out, &root.join("sub")).is_ok() {
-            assert!(crate::path_within(&root, &root.join("sub/victim")), "lexically inside");
-            assert!(!delete_within(&root, Path::new("sub/victim")), "a symlinked parent must be refused");
-            assert_eq!(std::fs::read(out.join("victim")).unwrap(), b"keep me", "the outside file survives");
-        } else {
-            crate::ui::say("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

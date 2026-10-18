@@ -27,6 +27,12 @@
 
 use std::path::PathBuf;
 
+/// Destination confinement for the receiving end of a transfer: relative-name
+/// reduction, drop-directory bounds, ancestor canonicalization and the
+/// delete-within rule. Pure/filesystem-local; the protocol handler stays in
+/// the CLI.
+pub mod path_bounds;
+
 /// Positional write that does not lose bytes.
 ///
 /// `write_at` / `seek_write` may write fewer bytes than requested. The original
