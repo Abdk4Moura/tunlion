@@ -804,6 +804,17 @@
       "issue": "https://github.com/Abdk4Moura/tunlion/issues/316",
       "owner": "claude-advisor",
       "expires": "2026-10-18"
+    },
+    {
+      "path": "cli/tests/durability_soak.py",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion python3 cli/tests/durability_soak.py --runs 1 --stable-secs 150",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     }
   ],
   "verdict_debt": [
