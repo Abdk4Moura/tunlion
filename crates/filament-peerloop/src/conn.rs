@@ -5192,7 +5192,7 @@ mod warm_identity_tests {
     #[tokio::test]
     async fn flowing_inflight_link_is_kept_on_same_uid_reconnect() {
         let (mut conn, _far, _rx) = test_conn().await;
-        let t = FakeQuic::live(); // idle_ms 0: bytes are moving
+        let t = FakeQuic::flowing(); // idle_ms 0: bytes are moving
         conn.links
             .insert("sid-old".into(), linked_direct("sid-old", "soak-b", "uid-b", t.clone()));
         conn.bind_active("sid-old");
