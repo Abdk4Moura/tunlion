@@ -398,12 +398,13 @@ mod tests {
     #[tokio::test]
     async fn grant_never_bypasses_path_confinement() {
         let share = Share::new();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("/", share.0.join("escape")).unwrap();
+        let outside = Share::new();
+        let linked = crate::platform::symlink(&outside.0, &share.0.join("escape")).is_ok();
         for authoritative in [false, true] {
             let mut roots = vec![Path::new("/"), Path::new("..")];
-            #[cfg(unix)]
-            roots.push(Path::new("escape"));
+            if linked {
+                roots.push(Path::new("escape"));
+            }
             for root in roots {
                 let t = Arc::new(CaptureTransport::default());
                 let (mut conn, _far) = connection(TestHost::new(true, authoritative), t.clone()).await;
@@ -440,7 +441,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn success_acks_caps_and_serves_the_canonical_root_on_the_shared_mux() {
         let share = Share::new();
@@ -448,14 +448,18 @@ mod tests {
         std::fs::create_dir(&inside).unwrap();
         std::fs::write(inside.join("marker"), b"canonical").unwrap();
         let alias = share.0.join("alias");
-        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+        // Use the platform fixture's capability probe, like sync_cmd's tests:
+        // Windows may lack symlink privilege. Still exercise successful serving
+        // and caps there; capable hosts additionally exercise alias retargeting.
+        let linked = crate::platform::symlink(&inside, &alias).is_ok();
         let t = Arc::new(CaptureTransport::default());
         let (mut conn, _far) = connection(TestHost::new(true, true), t.clone()).await;
         let mux = l2::Mux::new(t.clone(), conn.host.clone());
         let other_sid = SID + 1;
         let mut other = mux.register_stream(other_sid).await.unwrap();
         let mut muxes = HashMap::from([(PID.into(), mux.clone())]);
-        handle_mount_open(&mut conn, PID, &open(Path::new("alias")), &mut muxes, &share.0).await;
+        let requested = if linked { "alias" } else { "inside/../inside" };
+        handle_mount_open(&mut conn, PID, &open(Path::new(requested)), &mut muxes, &share.0).await;
         assert_eq!(*t.controls.lock().unwrap(), vec![json!({
             "type": "mount-open-ack", "sid": SID,
             "caps": mount_proto::mount_caps_for_root(&inside.canonicalize().unwrap()),
@@ -463,8 +467,11 @@ mod tests {
         assert!(Arc::ptr_eq(muxes.get(PID).unwrap(), &mux));
         // Retarget the requested alias after admission. A server holding that
         // path rather than the canonical confined root cannot find our marker.
-        std::fs::remove_file(&alias).unwrap();
-        std::os::unix::fs::symlink("/", &alias).unwrap();
+        let outside = Share::new();
+        if linked {
+            std::fs::remove_file(&alias).unwrap();
+            crate::platform::symlink(&outside.0, &alias).unwrap();
+        }
         let request = mount_proto::MountRequest {
             id: 42, bin: None,
             op: mount_proto::MountOp::GetAttr { path: mount_proto::path_encode(Path::new("marker")) },
