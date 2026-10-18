@@ -278,15 +278,26 @@ pub async fn connect(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> Res
         .map_err(|_| anyhow!("signaling handshake timed out after {CONNECT_TIMEOUT:?}"))?
 }
 
+fn tls_config() -> rustls::ClientConfig {
+    // Match tokio-tungstenite 0.28's Mozilla trust store and default TLS versions,
+    // but never install or inherit a process-global crypto provider.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .with_root_certificates(rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        })
+        .with_no_client_auth()
+}
+
 async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> Result<Client> {
-    // Idempotent, and the reason the CLI can skip this for local-only commands:
-    // whoever opens TLS first installs the provider, so no call site has to
-    // remember to. `.ok()` because "already installed" is the normal case.
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let url = ws_url(base_url)?;
-    let (stream, _resp) = tokio_tungstenite::connect_async(&url)
-        .await
-        .with_context(|| format!("websocket connect to {url}"))?;
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config()));
+    let (stream, _resp) =
+        tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector))
+            .await
+            .with_context(|| format!("websocket connect to {url}"))?;
     let (writer, mut reader) = stream.split();
     let writer: Writer = Arc::new(Mutex::new(writer));
 
@@ -402,6 +413,9 @@ async fn read_loop(
     };
     let _ = tx.send(Incoming::Down { conn, reason });
 }
+
+#[cfg(test)]
+mod tls_tests;
 
 #[cfg(test)]
 mod tests {

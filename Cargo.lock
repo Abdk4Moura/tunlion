@@ -1330,11 +1330,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "rcgen",
  "rustls",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -1355,6 +1357,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "serde_json",
  "sha2 0.11.0",
  "socket2 0.5.10",
