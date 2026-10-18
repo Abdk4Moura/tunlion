@@ -80,6 +80,15 @@ fn load_from(p: &std::path::Path) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+// The data file is atomically replaced, so lock a stable sidecar rather than
+// its inode. The in-process mutex alone cannot coordinate separate senders.
+fn writer_lock(p: &std::path::Path) -> anyhow::Result<crate::platform::DevicesFileLock> {
+    if let Some(parent) = p.parent() {
+        crate::platform::create_private_dir_all(parent)?;
+    }
+    crate::platform::DevicesFileLock::acquire_at(&p.with_extension("json.lock"))
+}
+
 /// Every stored record, oldest first.
 pub(crate) fn load() -> Vec<Value> {
     load_from(&path())
@@ -92,6 +101,7 @@ pub(crate) fn append(records: &[Record]) {
     }
     let _g = LOCK.lock();
     let p = path();
+    let Ok(_writer_lock) = writer_lock(&p) else { return };
     let all = appended(load_from(&p), records);
     if let Ok(body) = serde_json::to_string(&Value::Array(all)) {
         let _ = crate::platform::SecretFile::write_str(&p, &body);
@@ -105,6 +115,7 @@ pub(crate) fn append_values(values: Vec<Value>) {
     }
     let _g = LOCK.lock();
     let p = path();
+    let Ok(_writer_lock) = writer_lock(&p) else { return };
     let mut all = load_from(&p);
     all.extend(values);
     if all.len() > MAX_RECORDS {
