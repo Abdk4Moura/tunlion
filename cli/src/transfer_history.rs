@@ -306,7 +306,7 @@ mod tests {
             let lock = crate::platform::DevicesFileLock::acquire_at(
                 &dir.0.join("transfers.json.lock"),
             ).unwrap();
-            let mut writer = Writer(std::process::Command::new(std::env::current_exe().unwrap())
+            let mut writer = Writer(crate::platform::command(std::env::current_exe().unwrap())
                 .args(["--ignored", "--exact", "transfer_history::tests::history_writer_child"])
                 .env("TUNLION_CONFIG_DIR", &dir.0)
                 .env("TUNLION_HISTORY_TEST_DIR", &dir.0)
