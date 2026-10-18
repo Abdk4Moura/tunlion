@@ -1,0 +1,41 @@
+name: packaging
+
+# Cheap, Rust-free checks for the install surfaces that ship `tl`.
+# The release itself is still built/tested by cli-release.yml and capability-ci.yml.
+on:
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "Formula/**"
+      - "scripts/install.ps1"
+      - ".github/workflows/cli-release.yml"
+      - ".github/workflows/packaging.yml"
+      - "README.md"
+  push:
+    branches: ["main"]
+    paths:
+      - "packaging/**"
+      - "Formula/**"
+      - "scripts/install.ps1"
+      - ".github/workflows/cli-release.yml"
+      - ".github/workflows/packaging.yml"
+      - "README.md"
+
+permissions:
+  contents: read
+
+jobs:
+  package-shape:
+    name: package shape (brew, npm, Windows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Formula / npm / Windows / winget shape
+        run: python3 packaging/check-package-shape.py
+      - name: npm launcher tests
+        working-directory: packaging/npm
+        run: npm test

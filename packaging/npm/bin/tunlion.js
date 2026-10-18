@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict'
 // Thin launcher: exec the real tunlion binary (downloaded into ./vendor by the
-// postinstall) with the same args, stdio, and exit code.
+// postinstall) with the same args, stdio, and exit code. npm maps BOTH
+// `tunlion` and `tl` to this file, so the two commands are one implementation.
 const { spawnSync } = require('child_process')
 const fs = require('fs')
 const { binaryPath } = require('../scripts/paths')

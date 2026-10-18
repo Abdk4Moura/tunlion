@@ -3,10 +3,12 @@
   "version": "0.0.0",
   "description": "Send files and reach your devices, peer to peer — no upload, no account. The CLI for tunlion.autumated.com.",
   "bin": {
-    "tunlion": "bin/tunlion.js"
+    "tunlion": "bin/tunlion.js",
+    "tl": "bin/tunlion.js"
   },
   "scripts": {
-    "postinstall": "node scripts/postinstall.js"
+    "postinstall": "node scripts/postinstall.js",
+    "test": "node --test test/package.test.js"
   },
   "files": [
     "bin/",

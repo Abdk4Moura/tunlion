@@ -4,6 +4,9 @@ PackageVersion: "@VERSION@"
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
+  # PortableCommandAlias can expose only ONE command name per nested file.
+  # `tunlion` is canonical here; `tl` is provided by the release ZIP's managed
+  # tl.cmd and by scripts/install.ps1, not by the winget alias.
   - RelativeFilePath: tunlion.exe
     PortableCommandAlias: tunlion
 Installers:

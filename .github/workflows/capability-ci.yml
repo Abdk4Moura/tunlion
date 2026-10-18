@@ -242,8 +242,9 @@ jobs:
             throw 'all-users DryRun did not name the Machine PATH target'
           }
 
-          # 3. Build the same shape as the release asset: tunlion.exe plus
-          #    wintun.dll, and a SHA256SUMS the installer verifies.
+          # 3. Build the same shape as the release asset: tunlion.exe,
+          #    wintun.dll, and the managed tl.cmd, plus a SHA256SUMS the
+          #    installer verifies.
           $payload = Join-Path $tempRoot 'payload'
           New-Item -ItemType Directory -Force -Path $payload | Out-Null
           # The CLI may be its own package (cli/target) or, after a workspace
@@ -258,6 +259,7 @@ jobs:
           # A stand-in DLL: this proves the installer lays both files side by
           # side. It is never loaded (that needs Administrator).
           Set-Content -Path (Join-Path $payload 'wintun.dll') -Value 'test stand-in' -Encoding Ascii
+          Copy-Item -LiteralPath (Join-Path $PWD 'packaging/windows/tl.cmd') -Destination $payload
           $asset = 'tunlion-x86_64-pc-windows-msvc.zip'
           $zip = Join-Path $tempRoot $asset
           Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $zip
@@ -280,6 +282,10 @@ jobs:
             }
             if ((Get-Content -LiteralPath $tlLauncher -TotalCount 1) -ne '@rem Tunlion tl launcher. Managed by scripts/install.ps1.') {
               throw 'tl.cmd does not have the Tunlion ownership marker'
+            }
+            if ((Get-FileHash -LiteralPath $tlLauncher).Hash -ne
+                (Get-FileHash -LiteralPath (Join-Path $payload 'tl.cmd')).Hash) {
+              throw 'installer did not reuse the tl.cmd packaged in the archive'
             }
             $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
             if (($userPath -split ';') -notcontains $userDir) {
@@ -314,6 +320,30 @@ jobs:
               Write-Host 'OK: an existing tl command is preserved and the shortcut is skipped'
             } finally {
               $env:Path = $savedPath
+              $env:TUNLION_INSTALL_DIR = $savedInstallDir
+            }
+
+            # A non-Tunlion tl.cmd already sitting in the install dir (but not
+            # on PATH yet) is also preserved: the ownership marker, not the
+            # filename alone, decides whether the installer may replace it.
+            $targetCollisionDir = Join-Path $tempRoot 'target-collision-install'
+            New-Item -ItemType Directory -Force -Path $targetCollisionDir | Out-Null
+            $foreignTl = Join-Path $targetCollisionDir 'tl.cmd'
+            '@echo off' | Set-Content -LiteralPath $foreignTl -Encoding Ascii
+            'echo foreign tl' | Add-Content -LiteralPath $foreignTl -Encoding Ascii
+            $foreignHash = (Get-FileHash -LiteralPath $foreignTl).Hash
+            $savedInstallDir = $env:TUNLION_INSTALL_DIR
+            try {
+              $env:TUNLION_INSTALL_DIR = $targetCollisionDir
+              $targetCollisionOut = Run-Installer -InstallerArgs @('-Archive', $zip)
+              if ($targetCollisionOut -notmatch "not installing 'tl'") {
+                throw 'installer did not warn about a non-Tunlion tl.cmd in the install dir'
+              }
+              if ((Get-FileHash -LiteralPath $foreignTl).Hash -ne $foreignHash) {
+                throw 'installer overwrote a non-Tunlion tl.cmd in the install dir'
+              }
+              Write-Host 'OK: a non-Tunlion tl.cmd in the install dir is preserved'
+            } finally {
               $env:TUNLION_INSTALL_DIR = $savedInstallDir
             }
 
