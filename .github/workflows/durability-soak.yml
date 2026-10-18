@@ -1,0 +1,127 @@
+# Shell/link durability soak — TEST-ONLY, manual dispatch.
+#
+# Why this is not on every PR: the point is a bounded *time* window. The owner
+# reports a native shell reconnecting roughly every two minutes, and a second
+# connection/exec killing a live shell. A 2-5 minute observation cannot be
+# squeezed into the per-PR budget without either shortening it below the
+# failure period or making every PR wait. So this runs on dispatch, or on a PR
+# that actually edits the harness/fixture files themselves.
+#
+# It asserts product behaviour, not build success:
+#   - two simultaneous native shells, opposite directions
+#   - idle + active stable windows with NO unsolicited reattach/link drop
+#   - an exec in each direction AND a real forward stream while both shells live
+#   - a real signaling-socket sever with the shells staying up
+#   - an intentional initiator-daemon restart, after which the SAME remote
+#     shell PID and shell state must survive and PTY-reattach on the peer
+#
+# Missing prerequisites (binary, backend deps, fixture) are failures, never
+# skips. See docs/testing/durability-soak.md for the evidence and the manual
+# Windows<->Linux matrix this cannot cover on one Linux runner.
+
+name: Durability soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Repeat the whole scenario N times"
+        required: true
+        default: 2
+        type: number
+      stable_secs:
+        description: "Stable idle+active window, seconds (must exceed the reported ~120s churn period)"
+        required: true
+        default: 150
+        type: number
+  pull_request:
+    # Deliberately narrow: only a change to the harness itself re-runs the soak.
+    # Normal PRs still carry the ordinary test/gates workflows.
+    paths:
+      - "cli/tests/durability_soak.py"
+      - "scripts/durability-soak.sh"
+      - ".github/workflows/durability-soak.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: durability-soak-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  soak:
+    name: shell/link soak (linux, loopback)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same pinned set the existing gates use. The soak starts its own
+      # backend; if these are absent the harness exits 2 on a missing
+      # prerequisite rather than pretending the run was clean.
+      - name: Backend deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      # --features test-hooks is the existing gate binary. This harness does not
+      # require a hook for its assertions, but building the same way the other
+      # resilience gates do keeps the two from drifting and makes a future hook
+      # available without a second build.
+      - name: Build the soak binary
+        working-directory: cli
+        run: cargo build --release --features test-hooks
+
+      - name: Record the binary and the host
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/tunlion"
+          "$BIN" --version
+          sha256sum "$BIN"
+          uname -a
+          nproc
+          free -m
+
+      - name: Run the durability soak
+        timeout-minutes: 22
+        env:
+          DURABILITY_WORK_ROOT: /tmp/tunlion-durability-soak
+        run: |
+          set -euo pipefail
+          python3 cli/tests/durability_soak.py \
+            --bin "$PWD/target/release/tunlion" \
+            --runs "${{ github.event.inputs.runs || 2 }}" \
+            --stable-secs "${{ github.event.inputs.stable_secs || 150 }}"
+
+      # Every run dir carries daemon/client transcripts, summary.json, and the
+      # exact binary sha. Upload even on failure: the logs ARE the finding.
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: durability-soak-${{ github.run_id }}
+          path: /tmp/tunlion-durability-soak
+          if-no-files-found: error
+          retention-days: 14
