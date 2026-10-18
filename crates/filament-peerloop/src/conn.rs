@@ -1051,7 +1051,8 @@ impl Conn {
     /// * A dead, absent or half-closed transport is never kept. `peer_present`
     ///   additionally rejects a relay link that stopped hearing the peer: relay
     ///   has no QUIC keepalive, only the 5 s application keepalive, so 8 s of
-    ///   silence is a dead path (`WARM_RELAY_STALE_MS`).
+    ///   silence is a dead path (the relay stale window is owned by the link
+    ///   manager, not repeated here).
     /// * A transfer that is IN FLIGHT is protected only while it is moving. If
     ///   it has gone quiet, the reconnect is the recovery path: that is the
     ///   frozen-receiver supersede gate 11 asserts. Without this clause an idle
