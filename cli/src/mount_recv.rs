@@ -305,6 +305,7 @@ mod tests {
         let (sio, far) = filament_signal::Client::loopback().await.unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut conn = Conn::for_command(
+            filament_transport::TransportContext::default(),
             "http://127.0.0.1:9", sio, tx, "me".into(), false, None, false, false,
             Arc::new(NoLog), host.clone(),
         );
