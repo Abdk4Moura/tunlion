@@ -239,7 +239,7 @@ use renewal_lifecycle::{
 // DaemonMounts/WarmPtys/sshd_listening exist on every target (handle_warm_req
 // has a not(unix) stub); the rest are unix-only, so they need the gate their
 // definitions carry. Call sites stay byte-identical to the monolith.
-use daemon_ctl::{DaemonMounts, WarmPtys, handle_warm_req, sshd_listening};
+use daemon_ctl::{DaemonMounts, LivenessProbes, WarmPtys, handle_warm_req, sshd_listening};
 #[cfg(unix)]
 use daemon_ctl::{
     PendingBootstraps, complete_warm_bootstrap, handle_list_mounts, handle_list_warm,
