@@ -1,5 +1,17 @@
 use super::*;
 
+fn test_process() -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.args(["--ignored", "--nocapture"]);
+    command
+}
+
 #[tokio::test]
 async fn total_timeout_bounds_tls_and_namespace_handshakes() {
     async fn stalled_handshake(tls: bool) {
@@ -44,13 +56,8 @@ async fn total_timeout_bounds_tls_and_namespace_handshakes() {
 #[test]
 fn provider_isolation_in_fresh_processes() {
     for mode in ["absent", "distinct"] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tls_tests::provider_worker",
-                "--ignored",
-                "--nocapture",
-            ])
+        let output = test_process()
+            .args(["--exact", "tls_tests::provider_worker"])
             .env("FILAMENT_SIGNAL_TLS_TEST_PROVIDER", mode)
             .output()
             .unwrap();

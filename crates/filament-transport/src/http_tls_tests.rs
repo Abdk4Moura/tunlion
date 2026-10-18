@@ -1,15 +1,22 @@
 use super::*;
 
+fn test_process() -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.args(["--ignored", "--nocapture"]);
+    command
+}
+
 #[test]
 fn provider_isolation_in_fresh_processes() {
     for mode in ["absent", "distinct"] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "http::tls_tests::provider_worker",
-                "--ignored",
-                "--nocapture",
-            ])
+        let output = test_process()
+            .args(["--exact", "http::tls_tests::provider_worker"])
             .env("FILAMENT_HTTP_TLS_TEST_PROVIDER", mode)
             .output()
             .unwrap();
@@ -165,13 +172,8 @@ fn empty_trust_store_returns_error_in_fresh_processes() {
     let file = dir.join("empty.pem");
     std::fs::write(&file, "").unwrap();
     let outputs = ["empty-absent", "empty-distinct"].map(|mode| {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "http::tls_tests::provider_worker",
-                "--ignored",
-                "--nocapture",
-            ])
+        let output = test_process()
+            .args(["--exact", "http::tls_tests::provider_worker"])
             .env("FILAMENT_HTTP_TLS_TEST_PROVIDER", mode)
             .env("SSL_CERT_FILE", &file)
             .env("SSL_CERT_DIR", &dir)
