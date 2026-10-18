@@ -23,44 +23,15 @@
 
 pub use filament_cap::capability::*;
 
-/// Shell serving is OFF on the acceptor: it was started without `--shell` and
-/// no device holds a shell grant there. The fix is the grant (serving turns on
-/// live when the first one lands); the old wording sent people to
-/// `tunlion up --shell`, which refuses without `--i-know` and was never needed.
-/// Older peers still send that wording, so recognise the stable prefix
-/// ([`SHELL_OFF_PREFIX`]), never the whole sentence.
-pub const SHELL_OFF_REASON: &str =
-    "shell serving is off there (no device holds a shell grant on it)";
-/// The part of [`SHELL_OFF_REASON`] every build has sent.
-pub const SHELL_OFF_PREFIX: &str = "shell serving is off there";
-
-/// The L2 tunnel acceptor is OFF on the peer entirely, so `forward`, `netcat`
-/// and the ssh bootstrap have nothing to open against. Like SHELL_OFF_REASON
-/// this is not a capability problem and a grant does not help.
-pub const TUNNEL_OFF_REASON: &str =
-    "tunnelling is off there (no device holds a shell grant on it, and forwarding rides that grant)";
-/// The part of [`TUNNEL_OFF_REASON`] every build has sent.
-pub const TUNNEL_OFF_PREFIX: &str = "tunnelling is off there";
-
-/// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
-/// ceiling, so any hint built on this reason must not prescribe one: the fix is a
-/// fresh invitation that includes the capability.
-pub const CEILING_REASON: &str = "this capability is outside the device's invitation ceiling";
-
-/// The device's access ENDED: the invitation that admitted it carried an end
-/// time and that time has passed. Distinct from the ceiling on purpose: the
-/// capability may well be inside the ceiling, it simply expired, and the fix
-/// is a fresh invitation, not a wider one. Every reason built on this starts
-/// with [`EXPIRED_PREFIX`], which is what an initiator recognises.
-pub const EXPIRED_PREFIX: &str = "access expired";
-
-/// The canonical expiry reason, naming WHEN in UTC to the second.
-pub fn expired_reason(at: u64) -> String {
-    let when = chrono::DateTime::from_timestamp(at as i64, 0)
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| at.to_string());
-    format!("{EXPIRED_PREFIX} at {when}: the invitation that admitted this device has ended")
-}
+// The canonical refusal wording moved to `filament_peerloop::refusal` with the
+// mount endpoint, which builds the same reasons without a terminal. Re-exported
+// here so every `crate::capability::SHELL_OFF_REASON`-style call site (and the
+// CLI's own remedy text) resolves unchanged.
+pub use filament_peerloop::refusal::{
+    CEILING_REASON, EXPIRED_PREFIX, SHELL_OFF_PREFIX, SHELL_OFF_REASON, TUNNEL_OFF_PREFIX,
+    TUNNEL_OFF_REASON, UNRECOGNIZED_REASON, USER_DROP_REASON, expired_at_from_reason,
+    expired_reason, not_granted_reason, revoked_reason,
+};
 
 /// [`expired_reason`], plus what the invitation allowed and for how long when
 /// this (the acceptor's) store has the device's record. EVERY refusal path
@@ -74,15 +45,6 @@ pub fn expired_reason_for(at: u64, device_pub: Option<&[u8; 32]>) -> String {
         r.push_str(&crate::refusal::reinvite_suffix(&ri));
     }
     r
-}
-
-/// The expiry time named in an [`expired_reason`], when it parses. Pure.
-pub fn expired_at_from_reason(reason: &str) -> Option<u64> {
-    let rest = reason.trim().strip_prefix(EXPIRED_PREFIX)?.trim_start().strip_prefix("at ")?;
-    let stamp = rest.get(..23)?; // "YYYY-MM-DD HH:MM:SS UTC"
-    chrono::NaiveDateTime::parse_from_str(stamp.trim_end_matches(" UTC"), "%Y-%m-%d %H:%M:%S")
-        .ok()
-        .map(|t| t.and_utc().timestamp().max(0) as u64)
 }
 
 use serde_json::Value;

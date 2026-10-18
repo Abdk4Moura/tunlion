@@ -300,6 +300,12 @@ impl HostServices for CliHost {
     fn request_bar(&self, peer: &str) -> Option<RequestBar> {
         crate::request_bar(peer)
     }
+    fn enqueue_request_if_requestable(&self, peer: &str, capability: &str) {
+        // The CLI keeps its unverified/empty-name filter, capability filter,
+        // bar check, TTL, dedup, eviction, persistence and notify hook. The
+        // library only names the moment a refused open becomes a request.
+        crate::enqueue_if_requestable(peer, capability);
+    }
     fn device_set_cap(
         &self,
         name: &str,
@@ -431,9 +437,9 @@ pub(crate) fn cli_host() -> Arc<dyn HostServices> {
 /// Defined here (re-exported from `conn`) because its callers include frozen
 /// modules; it renders through `ui` directly, which is exactly the host's job.
 pub(crate) fn dropped_no_transport(pid: &str, what: &str) {
-    crate::ui::say(&format!(
-        "tunlion: {what} from {pid} dropped: its link has no transport attached, so nothing was sent back"
-    ));
+    // The sentence moved with the mount admission; the sink is the one thing
+    // the library must not name itself.
+    filament_peerloop::conn::dropped_no_transport(&CliLog, pid, what);
 }
 
 /// The owner public key that names this machine's resources.

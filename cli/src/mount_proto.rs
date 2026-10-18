@@ -666,7 +666,11 @@ pub fn spawn_mount_server(
     idev: Option<[u8; 32]>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut recheck = crate::RevokeRecheck::new();
+        // The recheck mechanism moved to peerloop; the verdict and cadence are
+        // still this host's (`live_session_cut` / `revoke_recheck_interval`).
+        let mut recheck = filament_peerloop::liveness::RevokeRecheck::new(
+            crate::revoke_recheck_interval(),
+        );
         let mut open_files: HashMap<u64, (std::fs::File, PathBuf)> = HashMap::new();
         let mut next_fh: u64 = 1;
         let mut buf = Vec::new();
@@ -722,13 +726,13 @@ pub fn spawn_mount_server(
                 // Re-ask the gate, rate-limited by the shared interval helper so a
                 // read-heavy mount does not re-read the device store per operation
                 // (#235).
-                if let Some(cut) = recheck.cut(idev.as_ref()) {
-                    let cut_reason = cut.reason_for(idev.as_ref());
+                if let Some(cut) = recheck.cut(&crate::host_impl::CliHost, idev.as_ref()) {
+                    let cut_reason = cut.reason.clone();
                     crate::ui::critical(&format!(
                         "mount: peer {}, closing the live session (sid {sid})",
-                        match cut {
-                            crate::identity_state::LiveCut::Revoked => "revoked",
-                            crate::identity_state::LiveCut::Expired(_) => "access expired",
+                        match cut.cause {
+                            filament_peerloop::host::LiveCutCause::Revoked => "revoked",
+                            filament_peerloop::host::LiveCutCause::Expired => "access expired",
                         }
                     ));
                     // Answer the in-flight request before tearing the stream

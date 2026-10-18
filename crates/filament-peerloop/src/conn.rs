@@ -364,6 +364,15 @@ pub fn offline_hint(peer: &str) -> String {
     format!("tunlion: {peer} doesn't seem to be online. Is `tunlion up` running there?")
 }
 
+/// The one wording for an inbound open that arrived on a link with no
+/// transport: nothing can be sent back, so it is logged and dropped. The caller
+/// supplies the sink, so this carries the sentence and not the terminal.
+pub fn dropped_no_transport(log: &dyn LogSink, pid: &str, what: &str) {
+    log.say(&format!(
+        "tunlion: {what} from {pid} dropped: its link has no transport attached, so nothing was sent back"
+    ));
+}
+
 /// C26: per-peer presence for the static status roster.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Presence {

@@ -559,13 +559,15 @@ pub(crate) async fn authorize_exec(
     crate::shell_gate::exec_gate_decision(&inputs)
         .map(|()| dev.clone().unwrap_or_else(|| pid.to_string()))
         .map_err(|r| {
-            crate::refusal::Refusal::from_shell_gate(
-                inputs.cert_revoked,
-                inputs.denied,
-                r.as_deref(),
-                dev.clone(),
+            crate::refusal::with_reinvite_for(
+                crate::refusal::Refusal::from_shell_gate(
+                    inputs.cert_revoked,
+                    inputs.denied,
+                    r.as_deref(),
+                    dev.clone(),
+                ),
+                inputs.idev.as_ref(),
             )
-            .with_reinvite_for(inputs.idev.as_ref())
         })
 }
 
@@ -1032,9 +1034,11 @@ pub(crate) async fn serve_exec(
                         "err": reason,
                     });
                     if let Some(crate::identity_state::LiveCut::Expired(at)) = cut {
-                        crate::refusal::Refusal::expired(at, authz.dev_name.clone(), None)
-                            .with_reinvite_for(authz.idev.as_ref())
-                            .annotate(&mut close);
+                        let r = crate::refusal::with_reinvite_for(
+                            crate::refusal::Refusal::expired(at, authz.dev_name.clone(), None),
+                            authz.idev.as_ref(),
+                        );
+                        r.annotate(&mut close);
                     }
                     let _ = t.send_control(&close).await;
                     mux.drop_stream(sid).await;
