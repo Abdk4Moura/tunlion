@@ -86,6 +86,13 @@ pub fn safe_relpath(s: &str) -> Option<PathBuf> {
     Some(out)
 }
 
+/// The receiver's manifest gate: every name in a manifest must survive
+/// [`safe_relpath`]. A manifest carrying one unsafe name is refused as a whole,
+/// before the receiver compares it with what is on disk or writes anything.
+pub fn manifest_paths_are_bounded<'a>(paths: impl IntoIterator<Item = &'a str>) -> bool {
+    paths.into_iter().all(|p| safe_relpath(p).is_some())
+}
+
 /// Bound the requested root to the drop directory: relative, or absolute under
 /// it; every existing ancestor canonical-within before anything is created,
 /// and the result canonical-within after. With `create` false (a dry run) a
@@ -275,25 +282,33 @@ mod tests {
         d
     }
 
-    /// Directory symlinks, checked rather than assumed: creating one on Windows
-    /// needs SeCreateSymbolicLinkPrivilege (or Developer Mode). Tests that need a
-    /// link skip the arm, with a note, when the platform refuses.
-    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    /// Directory symlinks, checked rather than assumed. Unix always supports
+    /// them. Windows needs SeCreateSymbolicLinkPrivilege (or Developer Mode),
+    /// which the Windows CI runner has; a failure there is a test failure, not
+    /// a skip, or the Windows arm would silently stop covering the escape.
+    /// Other platforms have no directory symlink and skip visibly.
+    fn symlink_dir(target: &Path, link: &Path) -> Option<()> {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(target, link)
+                .expect("unix must create a directory symlink for the escape arm");
+            Some(())
         }
         #[cfg(windows)]
         {
-            std::os::windows::fs::symlink_dir(target, link)
+            match std::os::windows::fs::symlink_dir(target, link) {
+                Ok(()) => Some(()),
+                Err(e) => panic!(
+                    "Windows CI must create a directory symlink ({link:?} -> {target:?}): {e}. \
+                     The Windows symlink arm would otherwise be skipped silently."
+                ),
+            }
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (target, link);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "no directory symlinks on this platform",
-            ))
+            eprintln!("note: this platform has no directory symlinks; symlink escape arm skipped");
+            None
         }
     }
 
@@ -319,12 +334,13 @@ mod tests {
         );
     }
 
-    /// The manifest is admitted only if EVERY name survives `safe_relpath`.
-    /// This is the receiver-side bound, before it compares or writes anything.
+    /// This is the receiver's actual manifest gate (`manifest_paths_are_bounded`,
+    /// called from `serve_sync`), not just `safe_relpath` in isolation: one
+    /// unsafe name refuses the whole manifest before anything is written.
     #[test]
-    fn manifest_names_are_bounded_before_any_write() {
-        let names = ["docs/a.txt", "photos/2026/one.jpg"];
-        assert!(names.iter().all(|p| safe_relpath(p).is_some()));
+    fn every_manifest_name_must_survive_the_manifest_gate() {
+        let good = ["docs/a.txt", "photos/2026/one.jpg"];
+        assert!(manifest_paths_are_bounded(good));
         for bad in [
             "docs/../../etc/passwd",
             "/etc/passwd",
@@ -332,10 +348,7 @@ mod tests {
             "docs//a",
         ] {
             assert!(
-                names
-                    .iter()
-                    .chain([bad].iter())
-                    .any(|p| safe_relpath(p).is_none()),
+                !manifest_paths_are_bounded(["docs/a.txt", bad]),
                 "a manifest carrying {bad:?} must be refused"
             );
         }
@@ -362,15 +375,15 @@ mod tests {
             assert!(resolve_root(&d, bad, true).is_err(), "{bad}");
             assert!(resolve_root(&d, bad, false).is_err(), "{bad}");
         }
-        if symlink_dir(Path::new("/tmp"), &d.join("esc")).is_ok() {
+        let escape = tmp("root-escape");
+        if symlink_dir(&escape, &d.join("esc")).is_some() {
             assert!(
                 resolve_root(&d, "esc/x", true).is_err(),
                 "symlink escape must be refused"
             );
-        } else {
-            eprintln!("note: this platform would not create a symlink; the escape arm is skipped");
         }
         let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&escape);
     }
 
     /// Absolute requests are accepted only when they are already under the drop
@@ -420,7 +433,7 @@ mod tests {
         assert!(path_within_canonical(&root, &root));
         assert!(path_within_canonical(&root, &docs));
         assert!(!path_within_canonical(&root, &outside));
-        if symlink_dir(&outside, &root.join("evil")).is_ok() {
+        if symlink_dir(&outside, &root.join("evil")).is_some() {
             assert!(path_within(&root, &root.join("evil")), "lexically inside");
             assert!(
                 !path_within_canonical(&root, &root.join("evil")),
@@ -450,7 +463,7 @@ mod tests {
             safe_relpath("sub/x").is_some(),
             "the string itself is clean"
         );
-        if symlink_dir(&out, &root.join("sub")).is_ok() {
+        if symlink_dir(&out, &root.join("sub")).is_some() {
             assert!(path_within(&root, &root.join("sub/x")), "lexically inside");
             assert!(
                 bound_parent(&root, &root.join("sub")).is_err(),
@@ -501,7 +514,7 @@ mod tests {
             !delete_within(&root, Path::new("../victim")),
             "a traversal name is refused before the filesystem"
         );
-        if symlink_dir(&out, &root.join("sub")).is_ok() {
+        if symlink_dir(&out, &root.join("sub")).is_some() {
             assert!(
                 path_within(&root, &root.join("sub/victim")),
                 "lexically inside"

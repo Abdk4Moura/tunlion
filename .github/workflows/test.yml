@@ -206,6 +206,14 @@ jobs:
         working-directory: cli
         shell: bash
         run: cargo test --release
+      # `cargo test` in cli/ builds path dependencies but does not run their
+      # tests. The Linux job has the explicit local-crates loop; without this
+      # step the Windows-specific arms in a path dependency would run nowhere.
+      # `filament-transfer::path_bounds` holds the sync receiver's symlink
+      # confinement, including the Windows directory-symlink escape test.
+      - name: Test the transfer crate (Windows path bounds)
+        shell: bash
+        run: cargo test --release --manifest-path crates/filament-transfer/Cargo.toml
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats

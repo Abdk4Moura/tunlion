@@ -57,7 +57,7 @@ pub(crate) struct Plan {
 // filament-transfer. Re-exported so the handler and its remaining tests keep
 // the old paths; the stateful protocol stays here.
 pub(crate) use filament_transfer::path_bounds::{
-    bound_parent, delete_within, resolve_root, safe_relpath,
+    bound_parent, delete_within, manifest_paths_are_bounded, resolve_root, safe_relpath,
 };
 
 fn hex(d: &[u8]) -> String {
@@ -779,7 +779,7 @@ async fn serve_sync(
         bail!("expected a manifest");
     }
     let files: Vec<Entry> = serde_json::from_value(m["files"].take())?;
-    if files.iter().any(|e| safe_relpath(&e.p).is_none()) {
+    if !manifest_paths_are_bounded(files.iter().map(|e| e.p.as_str())) {
         bail!("manifest names an unsafe path");
     }
     let r = root.to_path_buf();
