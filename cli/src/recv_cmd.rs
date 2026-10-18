@@ -2165,6 +2165,12 @@ async fn recv_run(
     // digests before a drop (one digest can race a join in flight).
     let mut digest_absent: HashMap<String, u8> = HashMap::new();
     let mut channel_digest_absent: HashMap<String, u8> = HashMap::new();
+    // A fresh signaling sid is not evidence of absence. The server applies our
+    // re-subscribe as part of that same `sync`, while the PEER is still
+    // re-subscribing on its own new sid, so the first digest on the new socket
+    // can legitimately omit it. Skip one digest and start both windows over;
+    // otherwise a miss from before the flap plus this one retires a live link.
+    let mut digest_epoch_fresh = false;
     let mut digest_alone = false;
     // C30 phase 3: link mini-sync, state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
@@ -3330,6 +3336,15 @@ async fn recv_run(
                         // re-assert room + channels on the next tick. Re-fire
                         // the fast-path join/subscribe immediately too.
                         sess.invalidate();
+                        // The re-subscribe below (and the `sync` emitted by
+                        // `sess.tick`) puts every known-device channel back on
+                        // the new socket BEFORE any digest is acted on. The
+                        // first digest is still skipped as an absence signal:
+                        // the peer's own new sid may not have resubscribed yet.
+                        digest_epoch_fresh = true;
+                        digest_absent.clear();
+                        channel_digest_absent.clear();
+                        conn.reset_digest_deferrals();
                         if let Some(room) = sess.room.clone() {
                             sess.emit(
                                 &sio,
@@ -4217,6 +4232,11 @@ async fn recv_run(
             // the roster it carries, missed peer-joined/left self-correct.
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
+                    // Take the flag before any reconcile work: exactly the first
+                    // digest on a fresh signaling sid is exempt from absence
+                    // counting (adoption below still runs, so a new sid is
+                    // picked up immediately).
+                    let digest_fresh = std::mem::take(&mut digest_epoch_fresh);
                     let channel_peers = roster.channel_peers;
                     let channel_present: std::collections::HashSet<String> = channel_peers
                         .iter()
@@ -4259,7 +4279,8 @@ async fn recv_run(
                             }
                         }
                     }
-                    let mut channel_gone = Vec::new();
+                    let mut channel_absent: Vec<String> = Vec::new();
+                    let mut channel_live: Vec<String> = Vec::new();
                     for (pid, link) in &conn.links {
                         let channel_link = link
                             .expected_secret
@@ -4269,13 +4290,40 @@ async fn recv_run(
                             })
                             .unwrap_or(false);
                         if channel_link && !channel_present.contains(pid) {
-                            let count = channel_digest_absent.entry(pid.clone()).or_insert(0);
-                            *count += 1;
-                            if *count >= 2 {
-                                channel_gone.push(pid.clone());
+                            if digest_fresh {
+                                // The peer's new sid has not necessarily
+                                // re-subscribed yet; this absence proves nothing.
+                                channel_digest_absent.remove(pid);
+                            } else {
+                                let count = channel_digest_absent.entry(pid.clone()).or_insert(0);
+                                *count += 1;
+                                if *count >= 2 {
+                                    channel_absent.push(pid.clone());
+                                }
                             }
                         } else {
                             channel_digest_absent.remove(pid);
+                            channel_live.push(pid.clone());
+                        }
+                    }
+                    for pid in channel_live {
+                        conn.digest_present(&pid);
+                    }
+                    // Two absent digests is the hysteresis for a missed
+                    // peer-left; it is not yet evidence that the DATA channel is
+                    // gone. Defer while the link still has a live, moving
+                    // transport (a signaling reconnect's new sid) and let the
+                    // bounded idle grace decide. `drop_link` remains the only
+                    // retirement path, so departure/revocation are unchanged.
+                    let mut channel_gone = Vec::new();
+                    for pid in channel_absent {
+                        if conn.digest_absent_retirable(&pid) {
+                            channel_gone.push(pid);
+                        } else {
+                            log.debug(&format!(
+                                "tunlion: '{}' missing from channel digest, link still live; deferring drop",
+                                conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default()
+                            ));
                         }
                     }
                     for pid in channel_gone {
@@ -4313,7 +4361,8 @@ async fn recv_run(
                     // known room-sourced link absent ×2 → a peer-left we
                     // never received (channel-introduced links are exempt:
                     // room-independent by design)
-                    let mut gone: Vec<String> = Vec::new();
+                    let mut room_absent: Vec<String> = Vec::new();
+                    let mut room_live: Vec<String> = Vec::new();
                     for (pid, l) in &conn.links {
                         // "Channel-introduced" is the property that matters here,
                         // and `expected_secret.is_some()` was only ever a PROXY for
@@ -4326,13 +4375,36 @@ async fn recv_run(
                             || fleet_pending.contains(pid)
                             || fleet_verified.contains(pid);
                         if !channel_introduced && !present.contains(pid) {
-                            let c = digest_absent.entry(pid.clone()).or_insert(0);
-                            *c += 1;
-                            if *c >= 2 {
-                                gone.push(pid.clone());
+                            if digest_fresh {
+                                digest_absent.remove(pid);
+                            } else {
+                                let c = digest_absent.entry(pid.clone()).or_insert(0);
+                                *c += 1;
+                                if *c >= 2 {
+                                    room_absent.push(pid.clone());
+                                }
                             }
                         } else {
                             digest_absent.remove(pid);
+                            if !channel_introduced {
+                                room_live.push(pid.clone());
+                            }
+                        }
+                    }
+                    for pid in room_live {
+                        conn.digest_present(&pid);
+                    }
+                    // Same liveness gate as the channel reconcile above: a room
+                    // digest miss is signaling evidence, not a transport fact.
+                    let mut gone: Vec<String> = Vec::new();
+                    for pid in room_absent {
+                        if conn.digest_absent_retirable(&pid) {
+                            gone.push(pid);
+                        } else {
+                            log.debug(&format!(
+                                "tunlion: '{}' missing from room digest, link still live; deferring drop",
+                                conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default()
+                            ));
                         }
                     }
                     for pid in gone {
