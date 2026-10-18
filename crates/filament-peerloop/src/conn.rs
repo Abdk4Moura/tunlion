@@ -160,6 +160,38 @@ const PEER_BUILD_BUDGET: Duration = Duration::from_secs(5);
 /// How long `drop_link` lets a dropped link's last frames reach the peer
 /// before it closes the QUIC connection under them.
 const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// A link absent from a channel/room digest is retired only after its transport
+/// has been quiet this long. Presence is best-effort and a signaling reconnect
+/// gives the peer a new sid, so the old sid vanishes from the digest while its
+/// data channel is still the one carrying a shell. The grace is for the
+/// transport shapes where "quiet" can still mean a peer that is there (a relay
+/// path between keepalives) or where no transport exists yet.
+///
+/// It is NOT the bound for a DIRECT link. Direct QUIC has no `heard_ms` and its
+/// `idle_ms` includes our own writes, but `is_alive`/`is_dead` are the
+/// transport's own verdict (7 s keepalive, 21 s idle timeout). An idle shell is
+/// a healthy direct link, so it is kept for as long as the connection is alive;
+/// the grace must not retire it 30 s after a signaling reconnect. When QUIC
+/// reports the connection dead/closed, retirement is immediate. That path is
+/// transport-bounded, not grace-bounded.
+///
+/// `Conn::digest_link_active` is the decision: direct -> transport liveness;
+/// relay/DataChannel -> peer-originated `heard_ms`; anything else -> idle.
+const DIGEST_ABSENT_IDLE_GRACE: Duration = Duration::from_secs(30);
+/// "Moving enough to call the peer present" for digest retirement, in ms, for a
+/// relay/DataChannel transport that does not track peer-originated traffic.
+/// Direct QUIC does NOT use this clock (its liveness is transport-bounded); see
+/// `Conn::digest_link_active`.
+const DIGEST_ACTIVE_MS: u64 = 3_000;
+
+/// Which signaling surface owns a link, and therefore which digest may judge
+/// its absence. A channel-introduced link is room-independent: only
+/// `channel_peers` speaks about it. A room-sourced link is the converse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DigestSurface {
+    Channel,
+    Room,
+}
 
 pub struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
@@ -651,6 +683,24 @@ pub struct Conn {
     /// is reaped harmlessly once done. Cleared in drop_link so a supersede of a
     /// deferred sid can't leave a stale blocker.
     pub deferred_left: HashMap<String, Value>,
+    /// Digest reconcile deferral: sid -> when its live transport was first seen
+    /// absent from a digest while it could not yet be called departed. A
+    /// signaling reconnect gives the peer a fresh sid, so the old sid disappears
+    /// from `channel_peers` while its direct link still serves a shell; dropping
+    /// it there is the PR512 tear-down. A live direct link is deferred for as
+    /// long as QUIC says the connection is alive; a relay link while it still
+    /// hears the peer, then for `DIGEST_ABSENT_IDLE_GRACE` after that stops.
+    /// Cleared when the sid reappears, when the link is dropped, and on a fresh
+    /// signaling sid. Not used by `on_peer_left`, which keeps its own payload
+    /// (`deferred_left`) because a peer-left is a real roster departure.
+    pub digest_deferred: HashMap<String, Instant>,
+    /// Per-surface digest hysteresis, kept with `digest_deferred` so a link is
+    /// always judged by the digest that OWNS it. A channel-introduced link must
+    /// never be ticked by the room surface (and vice versa): the other surface
+    /// is legitimately missing it, and clearing its clock there turned the
+    /// bounded deferral into an eternal one. Values are consecutive misses.
+    pub channel_digest_absent: HashMap<String, u8>,
+    pub room_digest_absent: HashMap<String, u8>,
     /// Gate-18 Mode B: set TRUE by the recv loop, each tick, exactly when the
     /// transfer is COMPLETE and nothing is in flight (`completed>0 &&
     /// by_sid.is_empty() && !keep_open`). When it holds, `on_stuck` DROPS a
@@ -888,6 +938,9 @@ impl Conn {
             },
             chunk_size: net::MAX_DC_PAYLOAD,
             deferred_left: HashMap::new(),
+            digest_deferred: HashMap::new(),
+            channel_digest_absent: HashMap::new(),
+            room_digest_absent: HashMap::new(),
             recv_done: false,
             direct_pending: HashMap::new(),
             buffered_offers: HashMap::new(),
@@ -1328,6 +1381,9 @@ impl Conn {
         // stale entry blocking adoption. Invariant: deferred_left only ever
         // holds sids that are still live links.
         self.deferred_left.remove(pid);
+        self.digest_deferred.remove(pid);
+        self.channel_digest_absent.remove(pid);
+        self.room_digest_absent.remove(pid);
         self.buffered_offers.remove(pid);
         self.stuck_retry.remove(pid);
         if let Some(old) = self.links.remove(pid) {
@@ -4004,11 +4060,171 @@ impl Conn {
         }
     }
 
+    /// Digest reconcile decision for ONE link on the surface that owns it.
+    ///
+    /// The digest describes SIGNALING presence, but the data channel is
+    /// independent. A signaling reconnect gives the peer a new sid, so the old
+    /// sid legitimately drops out of `channel_peers` while the direct link is
+    /// still the one carrying a shell. `on_peer_left` already defers that case
+    /// (`deferred_left` + `reap_deferred`); digest reconcile did not, and tore
+    /// those links down (PR512, `cli/src/recv_cmd.rs` reconcile loop).
+    ///
+    /// Hysteresis and deferral stay on `surface`: a link is offered to exactly
+    /// one digest. Presence there (or a fresh signaling sid) clears both its
+    /// miss count and its clock; absence counts two consecutive misses, then
+    /// defers while the link is alive and active (see
+    /// `digest_absent_retirable_at`). Returns true when the caller may retire
+    /// the link now.
+    pub fn digest_note(
+        &mut self,
+        pid: &str,
+        surface: DigestSurface,
+        present: bool,
+        fresh: bool,
+    ) -> bool {
+        self.digest_note_at(pid, surface, present, fresh, Instant::now())
+    }
+
+    fn digest_note_at(
+        &mut self,
+        pid: &str,
+        surface: DigestSurface,
+        present: bool,
+        fresh: bool,
+        now: Instant,
+    ) -> bool {
+        let candidate = {
+            let counts = match surface {
+                DigestSurface::Channel => &mut self.channel_digest_absent,
+                DigestSurface::Room => &mut self.room_digest_absent,
+            };
+            if present || fresh {
+                counts.remove(pid);
+                false
+            } else {
+                let count = counts.entry(pid.to_string()).or_insert(0);
+                *count += 1;
+                *count >= 2
+            }
+        };
+        if present || fresh {
+            // Only the owning surface may clear this link's clock.
+            self.digest_deferred.remove(pid);
+            return false;
+        }
+        candidate && self.digest_absent_retirable_at(pid, now)
+    }
+
+    /// May the caller retire a link that missed two digests? Dead/closed
+    /// transport: yes, at once. A live DIRECT link: no, for as long as its QUIC
+    /// connection is alive (an idle shell is not a departed peer; the transport
+    /// idle/dead verdict is the bound). A live relay: no while it is still
+    /// hearing the peer, then `DIGEST_ABSENT_IDLE_GRACE` from when that stopped.
+    /// A transport-less/peer-only link still gets the bounded grace.
+    ///
+    /// `has_live_transport` deliberately counts an in-progress WebRTC peer
+    /// (#246) even before a transport exists, so a dead primary beside a still
+    /// live peer model gets this bounded grace rather than an immediate drop.
+    /// That is a delay, not an exemption: the grace still runs.
+    pub fn digest_absent_retirable(&mut self, pid: &str) -> bool {
+        self.digest_absent_retirable_at(pid, Instant::now())
+    }
+
+    fn digest_absent_retirable_at(&mut self, pid: &str, now: Instant) -> bool {
+        if !self.has_live_transport(pid) {
+            self.digest_deferred.remove(pid);
+            return true;
+        }
+        // A direct link whose QUIC connection has closed is gone NOW, even if
+        // the transport's `dead` flag has not latched yet. `has_live_transport`
+        // asks the weaker `!is_dead()`; for a direct primary it is the stricter
+        // `is_alive()` that says whether the shell can still be served. Without
+        // this, a closed-but-not-yet-dead QUIC link would sit out the 30 s grace.
+        if self.links.get(pid).is_some_and(|l| {
+            l.direct && l.transport.as_ref().is_some_and(|t| !t.is_alive())
+        }) {
+            self.digest_deferred.remove(pid);
+            return true;
+        }
+        if self.digest_link_active(pid) {
+            // A live transport outranks a missing presence entry. Refresh the
+            // clock so the grace starts if/when the link really goes quiet.
+            self.digest_deferred.insert(pid.to_string(), now);
+            return false;
+        }
+        let first = *self.digest_deferred.entry(pid.to_string()).or_insert(now);
+        if now.saturating_duration_since(first) >= DIGEST_ABSENT_IDLE_GRACE {
+            self.digest_deferred.remove(pid);
+            return true;
+        }
+        false
+    }
+
+    /// Is the PEER demonstrably active on this link right now?
+    ///
+    /// Three transport shapes, deliberately:
+    ///
+    /// * **Direct QUIC** has no peer-originated `heard_ms`. Its `idle_ms` is
+    ///   stamped by our own writes too, so a quiet shell and a busy transfer are
+    ///   indistinguishable by bytes. Use the transport's own liveness instead:
+    ///   `is_alive()` (and not `is_dead()`) is the QUIC 7 s keepalive / 21 s
+    ///   idle verdict. An alive link is kept for as long as it is alive; a
+    ///   closed/dead one retires at once (see `digest_absent_retirable_at`).
+    /// * **Relay/DataChannel** keepalives are OUR writes and stamp `idle_ms`, so
+    ///   a link to a wiped or SIGSTOPped peer can read busy forever. Its
+    ///   `heard_ms` is peer-only; the shared `link_manager::relay_peer_live`
+    ///   rule bounds it, and silence still reaches the grace and retires.
+    /// * **Untracked** transports fall back to idle for compatibility.
+    ///
+    /// This is intentionally not `link_flowing` (which backs supersede/peer-left
+    /// and must keep its byte-movement meaning).
+    fn digest_link_active(&self, pid: &str) -> bool {
+        let Some(l) = self.links.get(pid) else {
+            return false;
+        };
+        let Some(t) = l.transport.as_ref() else {
+            return false;
+        };
+        if t.is_dead() || !t.is_alive() {
+            return false;
+        }
+        if l.direct {
+            // Transport-bounded: no 30 s idle cutoff for a live direct link.
+            return true;
+        }
+        if let Some(peer_live) = crate::link_manager::relay_peer_live(t.heard_ms()) {
+            return peer_live;
+        }
+        t.idle_ms() < DIGEST_ACTIVE_MS
+    }
+
+    /// The sid is present again in a digest: nothing is deferred for it. The
+    /// next absence starts a fresh grace window.
+    pub fn digest_present(&mut self, pid: &str) {
+        self.digest_deferred.remove(pid);
+    }
+
+    /// A fresh signaling sid invalidates the previous digest window. The peer is
+    /// re-subscribing on its own new sid at the same time, so an absence window
+    /// that started before the reconnect (or the first digest after it) must not
+    /// carry over and retire a link that never stopped flowing.
+    pub fn reset_digest_reconcile(&mut self) {
+        self.digest_deferred.clear();
+        self.channel_digest_absent.clear();
+        self.room_digest_absent.clear();
+    }
+
     /// #28 exit reconciliation: true when every remaining link is one we're only
     /// holding open for its deferred-drop reap (vacuously true with no links). A
     /// link in `deferred_left` is a peer whose signaling already left; once all
     /// transfers are complete it protects nothing, so it must not delay exit by
     /// the full deferral window.
+    ///
+    /// `digest_deferred` is deliberately NOT counted here. Unlike a peer-left,
+    /// a digest miss can be a presence gap while the peer is still active on the
+    /// data channel; a one-shot receiver that already completed a file must not
+    /// exit out from under a sender that may offer another. The bounded grace
+    /// and the normal quiet/Mode-B exits retire it.
     pub fn only_deferred_links(&self) -> bool {
         self.links
             .keys()
@@ -4410,13 +4626,58 @@ mod warm_identity_tests {
     struct FakeQuic {
         alive: AtomicBool,
         closes: AtomicUsize,
+        /// `u64::MAX` = never moved a byte (the Transport default).
+        idle_ms: u64,
+        /// `None` = transport does not track peer-originated traffic (direct
+        /// QUIC); `Some` = relay/DataChannel-style `heard_ms`.
+        heard: Option<u64>,
+        /// The explicit `dead` flag, separate from `alive`: a QUIC connection
+        /// can report closed (`is_alive` false) before that flag latches.
+        dead_flag: bool,
+        /// True for the fixture where `is_alive` is false but the transport has
+        /// not reported `is_dead` yet (a QUIC close before the flag latches).
+        closed_not_dead: bool,
     }
     impl FakeQuic {
-        fn live() -> Arc<Self> {
+        fn with(
+            idle_ms: u64,
+            heard: Option<u64>,
+            alive: bool,
+            dead_flag: bool,
+            closed_not_dead: bool,
+        ) -> Arc<Self> {
             Arc::new(FakeQuic {
-                alive: AtomicBool::new(true),
+                alive: AtomicBool::new(alive),
                 closes: AtomicUsize::new(0),
+                idle_ms,
+                heard,
+                dead_flag,
+                closed_not_dead,
             })
+        }
+        fn live() -> Arc<Self> {
+            Self::with(u64::MAX, None, true, false, false)
+        }
+        /// A transport that is actively moving bytes (idle 0ms).
+        fn flowing() -> Arc<Self> {
+            Self::with(0, None, true, false, false)
+        }
+        /// A relay link whose OWN keepalive writes keep `idle_ms` near zero
+        /// while the peer has sent nothing (`heard_ms` is old).
+        fn relay_writes_only() -> Arc<Self> {
+            Self::with(0, Some(u64::MAX), true, false, false)
+        }
+        /// A relay link whose peer-originated `heard_ms` is fresh.
+        fn relay_heard(heard_ms: u64) -> Arc<Self> {
+            Self::with(u64::MAX, Some(heard_ms), true, false, false)
+        }
+        fn dead() -> Arc<Self> {
+            Self::with(u64::MAX, Some(u64::MAX), false, true, false)
+        }
+        /// QUIC has closed the connection (`is_alive` false) but the `dead`
+        /// flag has not latched yet (`is_dead` false).
+        fn closed_not_dead() -> Arc<Self> {
+            Self::with(u64::MAX, None, false, false, true)
         }
     }
     #[async_trait::async_trait]
@@ -4437,7 +4698,16 @@ mod warm_identity_tests {
             self.alive.load(Ordering::Relaxed)
         }
         fn is_dead(&self) -> bool {
-            !self.alive.load(Ordering::Relaxed)
+            self.dead_flag || (!self.alive.load(Ordering::Relaxed) && !self.closed_not_dead)
+        }
+        fn idle_ms(&self) -> u64 {
+            if self.is_dead() {
+                return u64::MAX;
+            }
+            self.idle_ms
+        }
+        fn heard_ms(&self) -> Option<u64> {
+            self.heard
         }
         fn force_close(&self) {
             self.closes.fetch_add(1, Ordering::Relaxed);
@@ -4474,6 +4744,16 @@ mod warm_identity_tests {
             principal_kind: PrincipalKind::OwnerDevice,
             host: Arc::new(crate::host::NoHost),
         }
+    }
+
+    /// The same link record on a non-direct (WebRTC/DataChannel/relay)
+    /// transport. `digest_link_active` keys the transport-bounded direct rule
+    /// on `direct`, so a relay fixture must not be built by `direct_link`.
+    fn relay_link(pid: &str, petname: &str, display: &str, t: Arc<dyn Transport>) -> Link {
+        let mut l = direct_link(pid, petname, display, t);
+        l.direct = false;
+        l.direct_route = "relay";
+        l
     }
 
     /// The host facts these tests need: the devices a warm-hold tick would dial.
@@ -4824,6 +5104,347 @@ mod warm_identity_tests {
         assert_eq!(gone, vec!["sid-ch".to_string(), "sid-room".to_string()]);
         assert!(conn.roster.contains_key("sid-here"));
         assert!(conn.roster_absent.is_empty());
+    }
+
+    // --- digest reconcile liveness (PR512) --------------------------------
+
+    /// The failure: a channel digest miss on a signaling reconnect retired a
+    /// direct link that was still moving a shell's bytes. While the transport
+    /// flows, the reconcile must defer, however long the miss persists: a
+    /// moving data channel is stronger evidence than a missing presence entry.
+    #[tokio::test]
+    async fn digest_absence_defers_a_flowing_live_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::flowing();
+        conn.links.insert(
+            "sid-old".into(),
+            direct_link("sid-old", "x", "user@x", t.clone()),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-old", t0));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-old",
+            t0 + Duration::from_secs(60 * 60)
+        ));
+        assert!(conn.links.contains_key("sid-old"));
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+    }
+
+    /// The other side of the contract: a dead transport is a departure. The
+    /// reconcile retires it at once, with no grace at all.
+    #[tokio::test]
+    async fn digest_absence_retires_a_dead_link_immediately() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert(
+            "sid-dead".into(),
+            direct_link("sid-dead", "x", "user@x", FakeQuic::dead()),
+        );
+        assert!(conn.digest_absent_retirable_at("sid-dead", Instant::now()));
+        assert!(conn.links.contains_key("sid-dead"), "the caller owns the drop");
+    }
+
+    /// An idle but ALIVE direct shell link is transport-bounded, not
+    /// grace-bounded: a signaling reconnect makes its old sid absent from the
+    /// digest, but retiring it 30 s later would drop the shell the establish
+    /// fix just kept. It survives past the grace and stays retired only when
+    /// QUIC says the connection is gone.
+    #[tokio::test]
+    async fn digest_absence_keeps_an_idle_alive_direct_link_past_the_grace() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::live(); // alive, idle_ms u64::MAX (never wrote)
+        conn.links.insert(
+            "sid-idle".into(),
+            direct_link("sid-idle", "x", "user@x", t.clone()),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-idle", t0));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + DIGEST_ABSENT_IDLE_GRACE - Duration::from_millis(1)
+        ));
+        assert!(
+            !conn.digest_absent_retirable_at(
+                "sid-idle",
+                t0 + DIGEST_ABSENT_IDLE_GRACE
+            ),
+            "an alive direct link was retired by the digest grace"
+        );
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + Duration::from_secs(60 * 60)
+        ));
+        assert!(conn.links.contains_key("sid-idle"));
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+    }
+
+    /// The other side of the transport bound: once QUIC reports the direct
+    /// connection closed, retirement is immediate, even if `is_dead` has not
+    /// latched. No half-closed zombie waits out the grace.
+    #[tokio::test]
+    async fn digest_absence_retires_a_closed_direct_transport_immediately() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::closed_not_dead();
+        assert!(!t.is_alive() && !t.is_dead(), "fixture: closed before dead");
+        conn.links.insert(
+            "sid-closed".into(),
+            direct_link("sid-closed", "x", "user@x", t.clone()),
+        );
+        assert!(conn.digest_absent_retirable_at("sid-closed", Instant::now()));
+        assert!(conn.links.contains_key("sid-closed"), "the caller owns the drop");
+    }
+
+    /// Relay/DataChannel remains peer-originated: a fresh `heard_ms` keeps an
+    /// otherwise-idle relay link; a silent one still reaches the bounded grace.
+    #[tokio::test]
+    async fn digest_relay_busy_is_bounded_by_heard_not_idle() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert(
+            "sid-relay".into(),
+            relay_link("sid-relay", "x", "user@x", FakeQuic::relay_heard(2_000)),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-relay", t0));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-relay",
+            t0 + DIGEST_ABSENT_IDLE_GRACE
+        ));
+    }
+
+    /// Presence returning clears the clock. Without the clear, the second call
+    /// at exactly `t0 + GRACE` would already be retirable; with it, that moment
+    /// is merely the new first absence, and only a full fresh window retires.
+    #[tokio::test]
+    async fn digest_present_clears_the_deferral_clock() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        // A relay link with a silent peer is grace-bounded (direct links are
+        // transport-bounded, so they would never reach this clock).
+        conn.links.insert(
+            "sid-idle".into(),
+            relay_link("sid-idle", "x", "user@x", FakeQuic::relay_writes_only()),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-idle", t0));
+        assert!(conn.digest_deferred.contains_key("sid-idle"));
+        conn.digest_present("sid-idle");
+        assert!(!conn.digest_deferred.contains_key("sid-idle"));
+        // A no-op `digest_present` would return true here (30s since t0).
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + DIGEST_ABSENT_IDLE_GRACE
+        ));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + DIGEST_ABSENT_IDLE_GRACE + Duration::from_secs(29)
+        ));
+        assert!(conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + DIGEST_ABSENT_IDLE_GRACE + DIGEST_ABSENT_IDLE_GRACE
+        ));
+    }
+
+    /// A fresh signaling sid discards both the miss counters and the clock, so
+    /// a gap straddling the reconnect cannot be carried into the new one.
+    #[tokio::test]
+    async fn reset_digest_reconcile_starts_a_fresh_window() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        // Grace-bounded relay shape: direct alive links are transport-bounded
+        // and would never start this window.
+        conn.links.insert(
+            "sid-idle".into(),
+            relay_link("sid-idle", "x", "user@x", FakeQuic::relay_writes_only()),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_note_at(
+            "sid-idle",
+            DigestSurface::Room,
+            false,
+            false,
+            t0
+        ));
+        assert!(!conn.digest_note_at(
+            "sid-idle",
+            DigestSurface::Room,
+            false,
+            false,
+            t0 + Duration::from_secs(1)
+        ));
+        assert!(conn.digest_deferred.contains_key("sid-idle"));
+        assert_eq!(conn.room_digest_absent.get("sid-idle"), Some(&2));
+
+        conn.reset_digest_reconcile();
+        assert!(conn.digest_deferred.is_empty());
+        assert!(conn.room_digest_absent.is_empty());
+        assert!(conn.channel_digest_absent.is_empty());
+
+        assert!(!conn.digest_note_at(
+            "sid-idle",
+            DigestSurface::Room,
+            false,
+            false,
+            t0 + Duration::from_secs(30)
+        ));
+        assert!(!conn.digest_note_at(
+            "sid-idle",
+            DigestSurface::Room,
+            false,
+            false,
+            t0 + Duration::from_secs(31)
+        ));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + Duration::from_secs(60)
+        ));
+        assert!(conn.digest_absent_retirable_at(
+            "sid-idle",
+            t0 + Duration::from_secs(61)
+        ));
+    }
+
+    /// BLOCKER regression: the channel surface is ticked every digest for its
+    /// own link, and must not clear the clock of a room-sourced link that is
+    /// idle but alive. Before the fix every non-channel link went through the
+    /// channel surface's `digest_present`, restarting the room grace forever.
+    #[tokio::test]
+    async fn channel_loop_does_not_reset_a_room_links_grace() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        // Quiet relay shape, so the 30 s grace is what this surface test
+        // measures (an alive direct link is transport-bounded instead).
+        let mut room =
+            relay_link("sid-room", "room", "user@room", FakeQuic::relay_writes_only());
+        room.expected_secret = None; // room-sourced: no pair channel
+        conn.links.insert("sid-room".into(), room);
+        conn.links.insert(
+            "sid-ch".into(),
+            direct_link("sid-ch", "ch", "user@ch", FakeQuic::live()),
+        );
+
+        let t0 = Instant::now();
+        // Two room misses make it a candidate and start the idle grace.
+        assert!(!conn.digest_note_at(
+            "sid-room",
+            DigestSurface::Room,
+            false,
+            false,
+            t0
+        ));
+        assert!(!conn.digest_note_at(
+            "sid-room",
+            DigestSurface::Room,
+            false,
+            false,
+            t0 + Duration::from_secs(1)
+        ));
+        assert!(conn.digest_deferred.contains_key("sid-room"));
+
+        // The channel loop runs on every digest. Its own link is present; the
+        // room link must not be touched by it.
+        assert!(!conn.digest_note_at(
+            "sid-ch",
+            DigestSurface::Channel,
+            true,
+            false,
+            t0 + Duration::from_secs(10)
+        ));
+        assert!(
+            conn.digest_deferred.contains_key("sid-room"),
+            "the channel surface cleared a room-sourced link's clock"
+        );
+
+        // 29s after the first deferral: still inside the bounded grace.
+        assert!(!conn.digest_note_at(
+            "sid-room",
+            DigestSurface::Room,
+            false,
+            false,
+            t0 + Duration::from_secs(30)
+        ));
+        // 30s after it: retirable, exactly as the room surface alone would.
+        assert!(conn.digest_note_at(
+            "sid-room",
+            DigestSurface::Room,
+            false,
+            false,
+            t0 + Duration::from_secs(31)
+        ));
+    }
+
+    /// Relay/DataChannel keepalives are OUR writes and stamp `idle_ms`; a
+    /// wiped peer can look busy forever. Retirement prefers `heard_ms` (what
+    /// the PEER sent), so it still reaches the bounded grace and retires.
+    #[tokio::test]
+    async fn digest_absence_is_bounded_on_a_relay_link_that_only_writes() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert(
+            "sid-relay".into(),
+            relay_link("sid-relay", "x", "user@x", FakeQuic::relay_writes_only()),
+        );
+        let t0 = Instant::now();
+        assert!(!conn.digest_absent_retirable_at("sid-relay", t0));
+        assert!(conn.digest_deferred.contains_key("sid-relay"));
+        assert!(!conn.digest_absent_retirable_at(
+            "sid-relay",
+            t0 + DIGEST_ABSENT_IDLE_GRACE - Duration::from_millis(1)
+        ));
+        assert!(conn.digest_absent_retirable_at(
+            "sid-relay",
+            t0 + DIGEST_ABSENT_IDLE_GRACE
+        ));
+    }
+
+    /// Dropping a link discharges its digest bookkeeping with the link itself.
+    #[tokio::test]
+    async fn drop_link_clears_digest_deferral_and_counters() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::live();
+        let mut l = direct_link("sid-idle", "x", "user@x", t.clone());
+        l.expected_secret = None;
+        conn.links.insert("sid-idle".into(), l);
+        let t0 = Instant::now();
+        assert!(!conn.digest_note_at(
+            "sid-idle",
+            DigestSurface::Room,
+            false,
+            false,
+            t0
+        ));
+        assert!(!conn.digest_note_at(
+            "sid-idle",
+            DigestSurface::Room,
+            false,
+            false,
+            t0 + Duration::from_secs(1)
+        ));
+        assert!(conn.digest_deferred.contains_key("sid-idle"));
+        assert_eq!(conn.room_digest_absent.get("sid-idle"), Some(&2));
+
+        conn.drop_link("sid-idle");
+        assert!(!conn.digest_deferred.contains_key("sid-idle"));
+        assert!(!conn.room_digest_absent.contains_key("sid-idle"));
+        assert!(!conn.channel_digest_absent.contains_key("sid-idle"));
+    }
+
+    /// A sid absent after its link was already dropped stays retirable: the
+    /// deferral map is not a link registry and cannot resurrect a dead peer.
+    #[tokio::test]
+    async fn digest_absence_with_no_link_is_retirable() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        assert!(conn.digest_absent_retirable("sid-never-linked"));
+    }
+
+    /// Exit reconciliation still does NOT treat a digest-deferred link as
+    /// discharged: a presence gap can coexist with an active sender that may
+    /// offer more work. Only a real peer-left is safe to exit past.
+    #[tokio::test]
+    async fn only_deferred_links_ignores_digest_deferrals() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert(
+            "sid-idle".into(),
+            direct_link("sid-idle", "x", "user@x", FakeQuic::live()),
+        );
+        conn.digest_deferred.insert("sid-idle".into(), Instant::now());
+        assert!(!conn.only_deferred_links());
+        conn.deferred_left.insert("sid-idle".into(), json!({}));
+        assert!(conn.only_deferred_links());
     }
 
     /// The event-loop gate: a mini loop that dispatches Stuck/RetryLink to
