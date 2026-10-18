@@ -120,12 +120,23 @@ socket reconnect mid-transfer must not kill the live channel. #28 has two
 triggers on the CLI side, both now closed (the browser keep-connected half is
 a separate change, commit `a55e494`):
 
-- **Supersede trigger** (`maybe_adopt`, ~1161): the reconnect arrives as a new
-  sid carrying the same uid. If the existing link is still flowing
-  (`link_flowing` — `idle_ms()` below `TUNLION_ADOPT_ACTIVE_MS`, default 3s),
-  the reconnect is cosmetic; KEEP the old link ("keeping active link") instead
-  of superseding. A frozen-alive peer (gate 11) stops stamping activity, reads
-  idle, and still supersedes. **Verified by:** gate 11b.
+- **Supersede trigger** (`maybe_adopt`): the reconnect arrives as a new sid
+  carrying the same uid. The reconnect is cosmetic unless the old link's
+  **transport** can no longer carry bytes; KEEP the old link ("keeping active
+  link") and do not create a link for the new sid. The test is
+  `old_link_survives_reconnect`: `is_alive()`/`is_dead()` plus
+  `peer_present` (which also requires a relay link to still hear the peer's 5 s
+  keepalive), **not** `link_flowing` alone. A shell sitting idle at a prompt is
+  alive even though no byte moved for minutes; using the 3 s flow window as the
+  keep test dropped its pty on the next signaling reconnect (the ~2-minute drop
+  in the acceptance soak). A link with a transfer **in flight** is protected
+  only while it is moving, so a frozen-alive peer (gate 11) still supersedes.
+  The deferral is bounded by transport liveness: direct QUIC notices a departed
+  peer at its 21 s idle timeout, a relay path fails `peer_present` after 8 s of
+  silence, and the daemon's 8 s dead-link sweep plus the warm-hold tick rebuild
+  under the new sid. **Verified by:** gate 11b (flowing), gate 11 (frozen
+  in-flight), and the `idle_alive_link_survives_a_cosmetic_same_uid_reconnect`
+  unit gate.
 
 - **peer-left trigger / DEFERRED DROP** (`on_peer_left` + `reap_deferred`): the
   server fires `peer-left` for the OLD sid while the channel stays alive.

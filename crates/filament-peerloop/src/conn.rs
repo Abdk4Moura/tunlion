@@ -48,7 +48,7 @@ use crate::identity::resolve_peer_identity;
 use crate::limits::{
     FLEET_LINK_NAME, MAX_ATTEMPTS, REJOIN_WINDOW, STALL_MAX_REPAIRS, VERIFY_PROBE_SID,
 };
-use crate::link_manager::{LinkObs, Placement, Work, place};
+use crate::link_manager::{LinkObs, Placement, Work, peer_present, place};
 use crate::present::{NoScreen, Presentation};
 use crate::resilience;
 use crate::test_hooks;
@@ -1019,11 +1019,14 @@ impl Conn {
     /// The data channel is independent of the signaling socket, so when a
     /// same-uid reconnect arrives as a new sid, superseding must NOT tear down
     /// an old link that's still flowing. A frozen-alive peer (gate 11's
-    /// SIGSTOP'd receiver) stops stamping activity, so it reads as not-flowing
-    /// and the supersede proceeds as before. Threshold is overridable for
-    /// deterministic gating (TUNLION_ADOPT_ACTIVE_MS); the 3 s default sits
-    /// well above a healthy sub-100 ms inter-frame gap so a transient ICE blip
-    /// can't masquerade as idle and let a spurious supersede through.
+    /// SIGSTOP'd receiver) stops stamping activity, so it reads as not-flowing.
+    /// This is deliberately NOT the whole keep test any more: an idle shell is
+    /// also not-flowing but is not broken. `old_link_survives_reconnect` asks
+    /// the transport, and uses this only to protect an in-flight transfer.
+    /// Threshold is overridable for deterministic gating
+    /// (TUNLION_ADOPT_ACTIVE_MS); the 3 s default sits well above a healthy
+    /// sub-100 ms inter-frame gap so a transient ICE blip can't masquerade as
+    /// idle and let a spurious supersede through.
     fn link_flowing(&self, pid: &str) -> bool {
         let threshold = std::env::var("TUNLION_ADOPT_ACTIVE_MS")
             .ok()
@@ -1032,6 +1035,57 @@ impl Conn {
         self.transport_of(pid)
             .map(|t| t.idle_ms() < threshold)
             .unwrap_or(false)
+    }
+
+    /// C6/#28: may a same-uid reconnect leave `pid`'s existing link in place?
+    ///
+    /// This asks whether the TRANSPORT is still usable, not whether bytes moved
+    /// in the last three seconds. `link_flowing` alone used to answer this, so
+    /// every quiet-but-healthy link read as supersedable: a cosmetic signaling
+    /// reconnect dropped an idle shell's direct link and the pty had to
+    /// reattach. A shell that is sitting at a prompt is idle, not dead, and
+    /// signaling is independent of the data plane.
+    ///
+    /// Two constraints keep the old behaviour where it was earning its keep:
+    ///
+    /// * A dead, absent or half-closed transport is never kept. `peer_present`
+    ///   additionally rejects a relay link that stopped hearing the peer: relay
+    ///   has no QUIC keepalive, only the 5 s application keepalive, so 8 s of
+    ///   silence is a dead path (`WARM_RELAY_STALE_MS`).
+    /// * A transfer that is IN FLIGHT is protected only while it is moving. If
+    ///   it has gone quiet, the reconnect is the recovery path: that is the
+    ///   frozen-receiver supersede gate 11 asserts. Without this clause an idle
+    ///   shell and a SIGSTOPped receiver would look identical here.
+    ///
+    /// The deferral is bounded by the transport, not by a timer we invent.
+    /// Direct QUIC closes a departed peer at its 21 s idle timeout (7 s
+    /// keepalive); a relay path stops passing `peer_present` after 8 s without
+    /// the peer's keepalive. The daemon's 8 s dead-link sweep then drops the
+    /// link and the next KnownPeer/warm-hold tick rebuilds it under the new sid.
+    /// A fixed grace shorter than the idle lifetime would recreate this bug; a
+    /// longer one would be an arbitrary number of minutes.
+    fn old_link_survives_reconnect(&self, pid: &str) -> bool {
+        let Some(l) = self.links.get(pid) else {
+            return false;
+        };
+        let Some(t) = l.transport.as_ref() else {
+            return false;
+        };
+        // `is_alive` and `is_dead` answer different questions on a direct link:
+        // a primary whose peer ended its send half is still "alive" for writes
+        // but can never receive again, so it must not survive a reconnect.
+        let alive = t.is_alive() && !t.is_dead();
+        let usable = alive && peer_present(alive, l.direct, t.heard_ms(), t.idle_ms());
+        if !usable {
+            return false;
+        }
+        if self.link_flowing(pid) {
+            return true; // actively moving bytes: #28's original keep
+        }
+        // Quiet. With nothing in flight this is an idle link, not a broken one.
+        // With a transfer in flight and no bytes moving it is stalled, and the
+        // reconnect should replace it.
+        !self.resil.in_flight_since.contains_key(pid)
     }
 
     /// Attach a freshly-opened channel to its link and mark the peer Ready.
@@ -1145,13 +1199,15 @@ impl Conn {
             .find(|(sid, l)| l.uid.is_some() && l.uid == peer_uid && **sid != peer_id)
             .map(|(sid, _)| sid.clone());
         if let Some(old_sid) = stale {
-            // #28: the same device reconnected its signaling socket (fresh sid).
-            // If its existing data channel is still flowing, the reconnect is
-            // cosmetic, superseding would tear down an active transfer. Keep the
-            // old link; once it goes idle a later roster/presence event supersedes.
-            if self.link_flowing(&old_sid) {
+            // #28/C6: the same device reconnected its signaling socket (fresh
+            // sid). That is COSMETIC while the old link's transport can still
+            // carry bytes: an idle shell at a prompt is alive, even though no
+            // byte moved recently. Only a dead/absent/quiet-relay transport, or
+            // a transfer that went quiet mid-flight, justifies a supersede.
+            if self.old_link_survives_reconnect(&old_sid) {
                 // Observable so a gate can assert the keep happened (true
-                // positive), not merely that no supersede line appeared.
+                // positive), not merely that no supersede line appeared. The
+                // old sid keeps serving and no link is created for the new sid.
                 self.log.debug(&format!("{name} reconnected, keeping active link"));
                 return Ok(self.is_active(&old_sid));
             }
@@ -4408,16 +4464,31 @@ mod warm_identity_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// A direct-QUIC-shaped transport whose liveness and close are observable.
+    /// A direct-QUIC-shaped transport whose liveness, activity and close are
+    /// observable. `idle_ms`/`heard_ms` let a test model a link that is quiet
+    /// but alive (an idle shell) without pretending it is dead.
     struct FakeQuic {
         alive: AtomicBool,
         closes: AtomicUsize,
+        idle_ms: u64,
+        heard_ms: Option<u64>,
     }
     impl FakeQuic {
         fn live() -> Arc<Self> {
+            Self::with_activity(0, None)
+        }
+        fn idle(idle_ms: u64) -> Arc<Self> {
+            Self::with_activity(idle_ms, None)
+        }
+        fn relay(idle_ms: u64, heard_ms: u64) -> Arc<Self> {
+            Self::with_activity(idle_ms, Some(heard_ms))
+        }
+        fn with_activity(idle_ms: u64, heard_ms: Option<u64>) -> Arc<Self> {
             Arc::new(FakeQuic {
                 alive: AtomicBool::new(true),
                 closes: AtomicUsize::new(0),
+                idle_ms,
+                heard_ms,
             })
         }
     }
@@ -4440,6 +4511,16 @@ mod warm_identity_tests {
         }
         fn is_dead(&self) -> bool {
             !self.alive.load(Ordering::Relaxed)
+        }
+        fn idle_ms(&self) -> u64 {
+            if self.is_dead() {
+                u64::MAX
+            } else {
+                self.idle_ms
+            }
+        }
+        fn heard_ms(&self) -> Option<u64> {
+            self.heard_ms
         }
         fn force_close(&self) {
             self.closes.fetch_add(1, Ordering::Relaxed);
@@ -4476,6 +4557,13 @@ mod warm_identity_tests {
             principal_kind: PrincipalKind::OwnerDevice,
             host: Arc::new(crate::host::NoHost),
         }
+    }
+
+    /// A direct link carrying the uid a same-device reconnect is matched on.
+    fn linked_direct(pid: &str, petname: &str, uid: &str, t: Arc<dyn Transport>) -> Link {
+        let mut l = direct_link(pid, petname, &format!("user@{petname}"), t);
+        l.uid = Some(uid.to_string());
+        l
     }
 
     /// The host facts these tests need: the devices a warm-hold tick would dial.
@@ -4745,6 +4833,207 @@ mod warm_identity_tests {
         );
         tokio::time::sleep(DROP_CLOSE_GRACE + Duration::from_millis(300)).await;
         assert_eq!(t.closes.load(Ordering::Relaxed), 1, "the dropped transport was not closed");
+    }
+
+    /// The acceptance-soak regression: a shell sitting idle at a prompt has
+    /// moved no bytes for minutes, but its direct transport is still alive. A
+    /// cosmetic signaling reconnect (same uid, new sid) must keep that link and
+    /// must not create a second one for the new sid. Pre-fix `link_flowing`
+    /// called the quiet link supersedable and dropped the pty.
+    #[tokio::test]
+    async fn idle_alive_link_survives_a_cosmetic_same_uid_reconnect() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::idle(120_000);
+        assert!(t.idle_ms() >= 120_000, "the fixture must model a long-idle link");
+        conn.links
+            .insert("sid-old".into(), linked_direct("sid-old", "soak-b", "uid-b", t.clone()));
+        conn.bind_active("sid-old");
+
+        let active = conn
+            .maybe_adopt(
+                &json!({ "id": "sid-new", "name": "user@soak-b", "uid": "uid-b" }),
+                true,
+            )
+            .await
+            .expect("keeping an idle link is not an error");
+
+        assert!(active, "the kept link is still the active one");
+        assert!(conn.is_active("sid-old"), "active moved off the surviving link");
+        assert!(conn.links.contains_key("sid-old"), "the idle shell link was dropped");
+        assert_eq!(conn.links["sid-old"].generation, 7, "the idle link was replaced");
+        assert!(!conn.links.contains_key("sid-new"), "keep path created a duplicate link");
+        assert_eq!(conn.links.len(), 1, "keep path left more than one link");
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0, "the idle transport was closed");
+    }
+
+    /// The other half of the rule: a dead transport is not preserved. The new
+    /// sid supersedes it and the pair secret carries forward.
+    #[tokio::test]
+    async fn dead_old_link_is_superseded_on_same_uid_reconnect() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::live();
+        t.alive.store(false, Ordering::Relaxed);
+        conn.links
+            .insert("sid-old".into(), linked_direct("sid-old", "soak-b", "uid-b", t.clone()));
+        conn.bind_active("sid-old");
+
+        let active = conn
+            .maybe_adopt(
+                &json!({ "id": "sid-new", "name": "user@soak-b", "uid": "uid-b" }),
+                true,
+            )
+            .await
+            .expect("rebuild over a dead link");
+
+        assert!(active, "establish_as did not make the replacement active");
+        assert!(!conn.links.contains_key("sid-old"), "the dead link survived");
+        assert!(conn.links.contains_key("sid-new"), "no replacement link");
+        assert!(conn.is_active("sid-new"));
+        assert_eq!(
+            conn.links["sid-new"].expected_secret.as_ref().map(|(n, _)| n.as_str()),
+            Some("soak-b"),
+            "the pair binding must carry across the supersede"
+        );
+    }
+
+    /// A link with no transport at all has nothing to keep, even if its peer
+    /// object still claims to be connecting.
+    #[tokio::test]
+    async fn transportless_old_link_is_superseded_on_same_uid_reconnect() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let mut old = linked_direct("sid-old", "soak-b", "uid-b", FakeQuic::live());
+        old.transport = None;
+        conn.links.insert("sid-old".into(), old);
+        conn.bind_active("sid-old");
+
+        let active = conn
+            .maybe_adopt(
+                &json!({ "id": "sid-new", "name": "user@soak-b", "uid": "uid-b" }),
+                true,
+            )
+            .await
+            .expect("rebuild over a transportless link");
+
+        assert!(active);
+        assert!(!conn.links.contains_key("sid-old"), "the transportless link survived");
+        assert!(conn.links.contains_key("sid-new"), "no replacement link");
+        assert!(conn.is_active("sid-new"));
+    }
+
+    /// #28's flowing case must not change: an in-flight transfer that is still
+    /// moving bytes keeps the old link across the reconnect (gate 11b).
+    #[tokio::test]
+    async fn flowing_inflight_link_is_kept_on_same_uid_reconnect() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::live(); // idle_ms 0: bytes are moving
+        conn.links
+            .insert("sid-old".into(), linked_direct("sid-old", "soak-b", "uid-b", t.clone()));
+        conn.bind_active("sid-old");
+        conn.resil
+            .in_flight_since
+            .insert("sid-old".into(), Instant::now());
+
+        let active = conn
+            .maybe_adopt(
+                &json!({ "id": "sid-new", "name": "user@soak-b", "uid": "uid-b" }),
+                true,
+            )
+            .await
+            .expect("keeping a flowing link is not an error");
+
+        assert!(active);
+        assert!(conn.is_active("sid-old"));
+        assert!(conn.links.contains_key("sid-old"), "the flowing link was dropped");
+        assert!(!conn.links.contains_key("sid-new"), "keep path created a duplicate link");
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+    }
+
+    /// Gate 11's frozen receiver: the transport is still alive but an in-flight
+    /// transfer has stopped moving. That is a stall, not an idle shell, so the
+    /// reconnect must supersede it. This is why an in-flight check remains.
+    #[tokio::test]
+    async fn frozen_inflight_link_is_still_superseded() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::idle(60_000); // alive transport, no byte progress
+        conn.links
+            .insert("sid-old".into(), linked_direct("sid-old", "soak-b", "uid-b", t.clone()));
+        conn.bind_active("sid-old");
+        conn.resil
+            .in_flight_since
+            .insert("sid-old".into(), Instant::now());
+
+        let active = conn
+            .maybe_adopt(
+                &json!({ "id": "sid-new", "name": "user@soak-b", "uid": "uid-b" }),
+                true,
+            )
+            .await
+            .expect("rebuild a frozen transfer");
+
+        assert!(active, "establish_as did not make the replacement active");
+        assert!(!conn.links.contains_key("sid-old"), "the frozen link was kept");
+        assert!(conn.links.contains_key("sid-new"), "no replacement link");
+        assert!(conn.is_active("sid-new"));
+    }
+
+    /// A relay link has no QUIC keepalive, so `peer_present` uses the peer's 5 s
+    /// application keepalive. A quiet but heard peer is an idle link and is
+    /// kept; a peer that stopped being heard is a dead path and is superseded.
+    #[tokio::test]
+    async fn relay_idle_link_is_kept_only_while_the_peer_is_still_heard() {
+        for (heard_ms, expect_keep) in [(2_000u64, true), (30_000u64, false)] {
+            let (mut conn, _far, _rx) = test_conn().await;
+            let t = FakeQuic::relay(120_000, heard_ms);
+            let mut old = linked_direct("sid-old", "soak-b", "uid-b", t.clone());
+            old.direct = false; // relay/DataChannel link
+            conn.links.insert("sid-old".into(), old);
+            conn.bind_active("sid-old");
+
+            let active = conn
+                .maybe_adopt(
+                    &json!({ "id": "sid-new", "name": "user@soak-b", "uid": "uid-b" }),
+                    true,
+                )
+                .await
+                .expect("relay adoption");
+
+            assert!(active, "heard={heard_ms}");
+            if expect_keep {
+                assert!(conn.links.contains_key("sid-old"), "a heard relay link was dropped");
+                assert!(!conn.links.contains_key("sid-new"), "keep path created a duplicate link");
+                assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+            } else {
+                assert!(!conn.links.contains_key("sid-old"), "a silent relay link was kept");
+                assert!(conn.links.contains_key("sid-new"), "no replacement link");
+                assert!(conn.is_active("sid-new"));
+            }
+        }
+    }
+
+    /// The same-device keep rule must never reuse a link belonging to a
+    /// different identity. A different uid is a different device (or a changed
+    /// identity): it gets its own link rather than silently inheriting this
+    /// one's transport, secret and trust.
+    #[tokio::test]
+    async fn different_uid_is_not_reused_as_the_same_device() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::idle(120_000);
+        conn.links
+            .insert("sid-old".into(), linked_direct("sid-old", "someone-else", "uid-other", t.clone()));
+        conn.bind_active("sid-old");
+
+        conn.maybe_adopt(
+            &json!({ "id": "sid-new", "name": "user@soak-b", "uid": "uid-b" }),
+            true,
+        )
+        .await
+        .expect("adopt a different identity");
+
+        assert!(conn.links.contains_key("sid-old"), "another identity's link was dropped");
+        assert_eq!(conn.links["sid-old"].generation, 7);
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+        assert!(conn.links.contains_key("sid-new"), "the new identity got no link");
+        assert_eq!(conn.links.len(), 2, "an identity change must not reuse the old link");
     }
 
     #[tokio::test]
