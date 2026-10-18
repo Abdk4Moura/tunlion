@@ -104,9 +104,22 @@ def main() -> int:
         errors.append(f"{rel}: must expose exactly the canonical tunlion alias, got {aliases}")
 
     # ------------------------------------------------------------ user docs
-    readme = read("README.md")
-    for needle in ("`tl`", "winget", "release ZIP"):
-        require("README.md", readme, needle)
+    # Exact paragraph: the installers do NOT all preserve an existing `tl`, and
+    # winget's reason for exposing one alias is that a .cmd cannot be a portable
+    # nested file. A wording change must revisit those claims deliberately.
+    readme_tl = (
+        "Homebrew and npm install `tl` too. Homebrew reports a link conflict and "
+        "leaves an existing `tl` in its bin directory in place; npm writes both "
+        "shims into its global prefix and can replace an existing `tl` there. "
+        "Only the curl/PowerShell installers check your `PATH` and leave a "
+        "pre-existing `tl` untouched. Cargo and winget expose only `tunlion`: "
+        "winget can carry several portable aliases, but a `.cmd` cannot be a "
+        "portable nested file, so `tl` comes from the Windows release ZIP or "
+        "PowerShell installer instead."
+    )
+    readme = " ".join(read("README.md").split())
+    if " ".join(readme_tl.split()) not in readme:
+        errors.append("README.md: the `tl` install-scope paragraph changed; re-check the brew/npm/winget caveats")
 
     if errors:
         for err in errors:

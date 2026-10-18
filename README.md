@@ -33,12 +33,13 @@ Or a package manager:
 | **Cargo** (Rust) | `cargo install filament-cli` |
 | **npm** (Node) | `npm i -g @abdk4moura/filament-cli` |
 
-Homebrew, npm, and the curl/PowerShell installers also provide `tl` as a short
-command for the same binary. If a different `tl` is already on your `PATH`, the
-installers leave it untouched and tell you to use `tunlion`. Cargo and winget
-install only `tunlion`: winget's portable alias supports one command name, so
-`tl` is not provided through `winget`; the Windows release ZIP and PowerShell
-installer do install it.
+Homebrew and npm install `tl` too. Homebrew reports a link conflict and leaves
+an existing `tl` in its bin directory in place; npm writes both shims into its
+global prefix and can replace an existing `tl` there. Only the curl/PowerShell
+installers check your `PATH` and leave a pre-existing `tl` untouched. Cargo and
+winget expose only `tunlion`: winget can carry several portable aliases, but a
+`.cmd` cannot be a portable nested file, so `tl` comes from the Windows release
+ZIP or PowerShell installer instead.
 
 Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `tunlion update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[tunlion.autumated.com](https://tunlion.autumated.com)** on both devices.
 

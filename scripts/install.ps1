@@ -344,6 +344,9 @@ try {
     } else { $null }
     $targetTlExists = Test-Path -LiteralPath $TlLauncher
     $targetTlOwned = $targetTlExists -and (Test-TlLauncherOwned $TlLauncher)
+    # Textual path equality. A Windows 8.3 short path to our own launcher would
+    # look foreign here; skipping the refresh is the conservative choice, since
+    # we must never replace a command we cannot positively identify as ours.
     $existingTlIsTarget = $existingTlPath -and ($existingTlPath -ieq $TlLauncher)
     $installTl = $false
     if (-not $existingTl -or ($existingTlIsTarget -and $targetTlOwned)) {
@@ -357,7 +360,7 @@ try {
             }
             Copy-Item -LiteralPath $packagedTl -Destination $TlLauncher -Force
         } else {
-            Set-Content -LiteralPath $TlLauncher -Value $TlLauncherContent -Encoding Ascii
+            Set-Content -LiteralPath $TlLauncher -Value $TlLauncherContent -Encoding Ascii -Force
         }
         Say "installed the 'tl' shortcut beside tunlion.exe"
     } else {
