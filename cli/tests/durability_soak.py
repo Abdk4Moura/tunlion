@@ -1197,6 +1197,14 @@ class Run:
         self.note("drop: closing the signaling-stage shells")
         s1.close(grace=12)
         s2.close(grace=12)
+        # Clear the link table too. The concurrent stage leaves short-lived
+        # exec/forward links behind; warm-pick's newest-link tie-break can
+        # select one of those for the drop shell, which would test the wrong
+        # link again. A clean A restart leaves only the fresh daemon link.
+        self.note("drop: restarting initiator daemon A cleanly to clear one-shot links")
+        self.daemon_a.stop(grace=10, kill_group=True)
+        self.daemon_a.force_restart_setup()
+        self.daemon_a.start()
         d_before = self.daemon_snapshot()
         self.wait_warm_links(start_from=d_before)
         state_drop = f"sd{secrets.token_hex(4)}"
