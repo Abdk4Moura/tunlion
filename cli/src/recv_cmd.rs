@@ -1250,10 +1250,12 @@ pub(crate) async fn recv_cmd(
     use filament_peerloop::driver::{Cancellation, DriverOutcome};
     let stop = Cancellation::default();
     let mut signals = crate::recv_lifecycle::Signals::install(stop.clone())?;
+    let mut cleanup = RecvCleanup::default();
     let outcome = recv_driver(
         server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
         relay, remember, daemon, output, shell_policy, shell_user,
         no_proxy_fallback, transport_context, log.clone(), host, &stop,
+        &mut cleanup,
     ).await;
     signals.stop().await;
     match outcome {
@@ -1300,12 +1302,12 @@ async fn recv_driver(
     log: Arc<dyn LogSink>,
     host: Arc<dyn HostServices>,
     stop: &filament_peerloop::driver::Cancellation,
+    cleanup: &mut RecvCleanup,
 ) -> filament_peerloop::driver::DriverOutcome<Result<()>> {
-    let mut cleanup = RecvCleanup::default();
     let outcome = stop.run(recv_run(
         server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
         relay, remember, daemon, output, shell_policy, shell_user,
-        no_proxy_fallback, transport_context, log, host, stop, &mut cleanup,
+        no_proxy_fallback, transport_context, log, host, stop, cleanup,
     )).await;
     cleanup.finish().await;
     // A signal received during cleanup still has its signal-specific outcome.
@@ -1319,6 +1321,8 @@ async fn recv_driver(
 /// Resources retained when the inline driver is cancelled at ANY yielding
 /// await, including setup/maintenance (not just next_ev). This is deliberately
 /// not an owner of all lower-layer tasks or a durable/no-thread stop promise.
+/// `watchdog` owns one diagnostic OS thread plus its stop handle; it does not
+/// own receive-driver work.
 #[derive(Default)]
 struct RecvCleanup {
     state: Option<RecvState>,
@@ -1328,17 +1332,38 @@ struct RecvCleanup {
     watchdog: crate::recv_lifecycle::LoopWatchdog,
 }
 
+/// Test-only observation of the production cleanup order. The no-op in normal
+/// builds keeps `finish` honest: tests assert what it actually awaits.
+#[cfg(test)]
+thread_local! {
+    static CLEANUP_PHASES: std::cell::RefCell<Vec<&'static str>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+#[cfg(test)]
+fn note_cleanup_phase(phase: &'static str) {
+    CLEANUP_PHASES.with(|phases| phases.borrow_mut().push(phase));
+}
+
+#[cfg(not(test))]
+fn note_cleanup_phase(_phase: &'static str) {}
+
 impl RecvCleanup {
     async fn finish(&mut self) {
-        // The loop is intentionally no longer turning. Stop its stall observer
-        // before the (possibly slow) flush, so cleanup cannot be reported as a
-        // live-loop stall, and release the log sink it retained.
+        // The loop is intentionally no longer turning. Ask its stall observer
+        // to stop before the (possibly slow) flush, so cleanup cannot be
+        // reported as a live-loop stall. This is a best-effort one-second
+        // join: a `Detached` outcome leaves the observer and its blocking
+        // waiter alive (still holding the log sink) until they finish.
         let _ = self.watchdog.stop().await;
+        note_cleanup_phase("watchdog");
         // Stop accepting control work before closing links. Joining aborted
         // tasks ensures their listener futures are dropped before we return.
         self.tasks.stop().await;
+        note_cleanup_phase("tasks");
         if let Some(st) = &mut self.state {
             flush_inflight(&mut st.by_sid).await;
+            note_cleanup_phase("flush");
         }
         if let Some(conn) = &mut self.conn {
             conn.close_links_for_exit();
@@ -9009,7 +9034,10 @@ mod lifecycle_tests {
     use filament_peerloop::driver::{Cancellation, DriverOutcome};
     use filament_peerloop::host::{NoHost, NoLog};
 
-    async fn invalid_receive(stop: &Cancellation) -> DriverOutcome<Result<()>> {
+    async fn invalid_receive_with(
+        stop: &Cancellation,
+        cleanup: &mut RecvCleanup,
+    ) -> DriverOutcome<Result<()>> {
         // Validation precedes filesystem/network/UI setup, so this exercises
         // the actual return seam without a backend or process signal adapter.
         recv_driver(
@@ -9017,8 +9045,13 @@ mod lifecycle_tests {
             false, None, Some("invalid".into()), false, None, false, None,
             ShellPolicy::Granted, None, false,
             filament_transport::TransportContext::default(),
-            Arc::new(NoLog), Arc::new(NoHost), stop,
+            Arc::new(NoLog), Arc::new(NoHost), stop, cleanup,
         ).await
+    }
+
+    async fn invalid_receive(stop: &Cancellation) -> DriverOutcome<Result<()>> {
+        let mut cleanup = RecvCleanup::default();
+        invalid_receive_with(stop, &mut cleanup).await
     }
 
     #[tokio::test]
@@ -9039,6 +9072,81 @@ mod lifecycle_tests {
         // Another invocation still runs validation, not cancellation.
         assert!(matches!(invalid_receive(&Cancellation::default()).await,
             DriverOutcome::Returned(Err(_))));
+    }
+
+    fn empty_recv_state() -> RecvState {
+        RecvState {
+            by_sid: HashMap::new(),
+            verify_fails: HashMap::new(),
+            completed: 0,
+            ever_received: false,
+            pending: Default::default(),
+            pending_proven: Arc::new(Mutex::new(HashMap::new())),
+            question_open: Arc::new(AtomicBool::new(false)),
+            question_shown: Instant::now(),
+            recv_pending_offers: HashMap::new(),
+            recv_cers: HashMap::new(),
+            recv_deadlines: HashMap::new(),
+        }
+    }
+
+    /// Records the task destructor inside the cleanup order vector.
+    struct PhaseDrop;
+    impl Drop for PhaseDrop {
+        fn drop(&mut self) {
+            super::note_cleanup_phase("task_drop");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_stops_a_started_watchdog_before_tasks_and_flush() {
+        super::CLEANUP_PHASES.with(|phases| phases.borrow_mut().clear());
+        let mut cleanup = RecvCleanup {
+            watchdog: crate::recv_lifecycle::LoopWatchdog::for_test(),
+            ..RecvCleanup::default()
+        };
+        cleanup.watchdog.tick(Arc::new(NoLog));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        cleanup.tasks.push(tokio::spawn(async move {
+            let _guard = PhaseDrop;
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        entered_rx.await.unwrap();
+        // `Some` makes finish enter the flush stage (an empty map parks nothing).
+        cleanup.state = Some(empty_recv_state());
+        cleanup.finish().await;
+        assert_eq!(
+            super::CLEANUP_PHASES.with(|phases| phases.borrow().clone()),
+            vec!["watchdog", "task_drop", "tasks", "flush"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_then_cleanup_stops_a_started_watchdog() {
+        super::CLEANUP_PHASES.with(|phases| phases.borrow_mut().clear());
+        let mut cleanup = RecvCleanup {
+            watchdog: crate::recv_lifecycle::LoopWatchdog::for_test(),
+            ..RecvCleanup::default()
+        };
+        let log = Arc::new(NoLog);
+        let weak = Arc::downgrade(&log);
+        cleanup.watchdog.tick(log);
+        let stop = Cancellation::default();
+        stop.cancel();
+        // The real driver seam: cancellation resolves, then its cleanup runs.
+        assert!(matches!(
+            invalid_receive_with(&stop, &mut cleanup).await,
+            DriverOutcome::Cancelled
+        ));
+        assert!(
+            weak.upgrade().is_none(),
+            "cleanup joined the started watchdog and released its sink"
+        );
+        assert_eq!(
+            super::CLEANUP_PHASES.with(|phases| phases.borrow().clone()),
+            vec!["watchdog", "tasks"]
+        );
     }
 }
 
