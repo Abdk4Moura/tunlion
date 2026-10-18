@@ -1,17 +1,7 @@
-//! Host hooks: the few things the transport genuinely cannot answer itself.
-//!
-//! A transport should not know where this machine keeps config files, how a user
-//! configured membership, or how to draw a line on a terminal. It also cannot
-//! enumerate local interfaces without shelling out, which is host business.
-//!
-//! Rather than reach for those, the crate asks. The CLI installs its answers once
-//! at startup; anything not installed has a safe default, so a library consumer
-//! that installs nothing still gets a working transport with no diagnostics.
-//!
-//! This is deliberately function pointers rather than a trait object threaded
-//! through every call site: the hooks are process-global facts, and threading a
-//! `&dyn Host` through 4,000 lines of connection code would be a far larger
-//! change than the coupling it removes.
+//! Shared process diagnostics and descriptive machine probes only.
+//! First-installed sinks are shared across engines, not isolated log routing.
+//! Configuration and discovery state belong to `TransportContext`; no probe
+//! here may consult configuration to make membership/eligibility decisions.
 
 use std::sync::OnceLock;
 
@@ -91,34 +81,4 @@ pub fn set_resolve_iface_name(f: ResolveIfaceFn) {
 }
 pub fn resolve_iface_name(addr: &str) -> String {
     RESOLVE_IFACE.get().map(|f| f(addr)).unwrap_or_else(|| "?".into())
-}
-
-/// User configuration. Default: unset, i.e. every default applies.
-pub type SettingsGetFn = fn(&str, Option<&str>) -> Option<String>;
-static SETTINGS_GET: OnceLock<SettingsGetFn> = OnceLock::new();
-pub fn set_settings_get_str(f: SettingsGetFn) {
-    let _ = SETTINGS_GET.set(f);
-}
-pub fn settings_get_str(key: &str, peer: Option<&str>) -> Option<String> {
-    SETTINGS_GET.get().and_then(|f| f(key, peer))
-}
-
-pub type MembershipFn = fn(Option<&str>) -> String;
-static MEMBERSHIP: OnceLock<MembershipFn> = OnceLock::new();
-pub fn set_raw_membership(f: MembershipFn) {
-    let _ = MEMBERSHIP.set(f);
-}
-pub fn raw_membership(peer: Option<&str>) -> String {
-    MEMBERSHIP.get().map(|f| f(peer)).unwrap_or_default()
-}
-
-/// Where a named config file lives. Default: the current directory, which is
-/// only ever used by a consumer that installed no hook at all.
-pub type ConfigPathFn = fn(&str) -> std::path::PathBuf;
-static CONFIG_PATH: OnceLock<ConfigPathFn> = OnceLock::new();
-pub fn set_config_path(f: ConfigPathFn) {
-    let _ = CONFIG_PATH.set(f);
-}
-pub fn config_path(name: &str) -> std::path::PathBuf {
-    CONFIG_PATH.get().map(|f| f(name)).unwrap_or_else(|| std::path::PathBuf::from(name))
 }

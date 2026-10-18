@@ -617,6 +617,7 @@ pub struct DirectPending {
 }
 
 pub struct Conn {
+    pub transport_context: filament_transport::TransportContext,
     pub server: String,
     pub sio: filament_signal::Client,
     pub tx: mpsc::UnboundedSender<Ev>,
@@ -848,7 +849,12 @@ impl Conn {
     /// `TUNLION_WARM_STANDBY` override (via `net::warm_standby_override`) can
     /// still force either way. NOTE: the long-lived `up` daemon loop keeps its
     /// own literal on purpose, it is a different (non-command) session.
+    ///
+    /// `transport_context` is the engine-owned transport settings/membership/DNS
+    /// and public-IP state for every foreground and detached task this session
+    /// starts. `HostServices` remains a separate (partly process-root) seam.
     pub fn for_command(
+        transport_context: filament_transport::TransportContext,
         server: &str,
         sio: filament_signal::Client,
         tx: mpsc::UnboundedSender<Ev>,
@@ -861,6 +867,7 @@ impl Conn {
         host: Arc<dyn HostServices>,
     ) -> Self {
         Conn {
+            transport_context,
             server: server.to_string(),
             sio,
             tx,
@@ -1677,7 +1684,7 @@ impl Conn {
                 return Ok(cfg);
             }
         }
-        let got = match tokio::time::timeout(ICE_CONFIG_BUDGET, net::fetch_config(&self.server)).await {
+        let got = match tokio::time::timeout(ICE_CONFIG_BUDGET, net::fetch_config(&self.transport_context, &self.server)).await {
             Ok(Ok(cfg)) => {
                 lock_ice(&self.ice_cache).cfg = Some((Instant::now(), cfg.clone()));
                 return Ok(cfg);
@@ -1713,8 +1720,9 @@ impl Conn {
         }
         let cache = self.ice_cache.clone();
         let server = self.server.clone();
+        let context = self.transport_context.clone();
         tokio::spawn(async move {
-            let got = net::fetch_config(&server).await;
+            let got = net::fetch_config(&context, &server).await;
             let mut cache = lock_ice(&cache);
             cache.refreshing = false;
             if let Ok(cfg) = got {
@@ -2162,7 +2170,7 @@ impl Conn {
                 }
             };
             let ((cands, server_public), srflx) =
-                tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut);
+                tokio::join!(direct::gather_candidates(&self.transport_context, &self.server, port), srflx_fut);
             (cands, server_public, srflx)
         };
 
@@ -2295,7 +2303,7 @@ impl Conn {
     /// rung-2: bind a raw punch socket and discover its srflx via STUN against
     /// the ICE config's STUN server. Returns (raw socket, srflx) or None.
     async fn gather_srflx(&self) -> Option<(std::net::UdpSocket, std::net::SocketAddr)> {
-        let cfg = net::fetch_config(&self.server).await.ok()?;
+        let cfg = net::fetch_config(&self.transport_context, &self.server).await.ok()?;
         let stun_urls: Vec<String> = cfg
             .ice_servers
             .iter()
@@ -2402,6 +2410,7 @@ impl Conn {
         // The race runs off the event loop, so it carries its own handle to the
         // log sink rather than borrowing `self`.
         let log = self.log.clone();
+        let context = self.transport_context.clone();
         tokio::spawn(async move {
             // Check for TCP localhost candidate (same-machine peer).
             for cand in &peer_cands {
@@ -2427,6 +2436,7 @@ impl Conn {
             // derived inside the race from both endpoint identity tuples, so the
             // connector and offer-receiver cannot drift via caller literals.
             if let Some(t) = direct::race_connect(
+                &context,
                 ep,
                 peer_cands,
                 &secret,
@@ -2455,6 +2465,7 @@ impl Conn {
                         "tunlion: rung-1 failed, attempting hole-punch to {peer_srflx}"
                     ));
                     if let Some(t) = holepunch::connect(
+                        &context,
                         sock,
                         peer_srflx,
                         &secret,
@@ -4281,6 +4292,7 @@ mod relay_privacy_tests {
                 .expect("connect to the fake signaling endpoint");
             let (tx, _rx) = mpsc::unbounded_channel::<Ev>();
             let mut conn = Conn::for_command(
+                filament_transport::TransportContext::default(),
                 &url,
                 sio.clone(),
                 tx,
@@ -4526,6 +4538,7 @@ mod warm_identity_tests {
         // Port 9 (discard) on loopback: a config GET that does escape the cache
         // fails fast instead of hanging.
         let conn = Conn::for_command(
+            filament_transport::TransportContext::default(),
             "http://127.0.0.1:9",
             sio,
             tx,

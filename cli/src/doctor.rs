@@ -434,11 +434,12 @@ fn timing_json(t: &diag::PhaseTiming) -> Value {
 // ===================================================== preflight (no device) ==
 
 async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
+    let context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     // #2 (parallelism): the signaling reachability probe and the STUN probe are
     // independent network round-trips; run them CONCURRENTLY so the preflight's
     // wall-clock is the slower of the two, not their sum (on a slow link that is
     // ~2.7s + ~0.9s sequential -> ~2.7s).
-    let (sig, ice) = tokio::join!(check_signaling(server), check_stun(server));
+    let (sig, ice) = tokio::join!(check_signaling(&context, server), check_stun(&context, server));
     let ifaces = list_interfaces();
     let history = diag::summarize(HISTORY_LIMIT);
     // Local file read (fast, no IO worth joining): sshd CA trust presence.
@@ -608,10 +609,10 @@ fn print_history(h: &diag::Summary) {
 
 /// Timed GET {server}/api/config (reuses net::http_get_json). Returns the round
 /// trip in ms on success.
-async fn check_signaling(server: &str) -> std::result::Result<u64, String> {
+async fn check_signaling(context: &filament_transport::TransportContext, server: &str) -> std::result::Result<u64, String> {
     let url = format!("{server}/api/config");
     let start = std::time::Instant::now();
-    match crate::net::http_get_json(&url).await {
+    match crate::net::http_get_json(context, &url).await {
         Ok(_) => Ok(start.elapsed().as_millis() as u64),
         Err(e) => Err(e.to_string()),
     }
@@ -626,9 +627,9 @@ enum IceResult {
 /// One STUN binding to learn the srflx address: fetch the config's iceServers,
 /// pick a stun: url, bind a UDP socket, send a Binding request, classify the
 /// reflexive address. Reuses holepunch::{stun_srflx, stun_server_addr}.
-async fn check_stun(server: &str) -> IceResult {
+async fn check_stun(context: &filament_transport::TransportContext, server: &str) -> IceResult {
     // Pull the stun urls from the live config (the same source a connect uses).
-    let cfg = match crate::net::fetch_config(server).await {
+    let cfg = match crate::net::fetch_config(context, server).await {
         Ok(c) => c,
         Err(e) => return IceResult::Failed(format!("config fetch: {e}")),
     };

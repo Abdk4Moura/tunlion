@@ -25,7 +25,6 @@ use quinn::{Connection, RecvStream, SendStream};
 use filament_signal::Client;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -920,10 +919,6 @@ fn dns_timeout_ms() -> u64 {
         .unwrap_or(DNS_TIMEOUT_MS_DEFAULT)
 }
 
-fn dns_cache_path() -> PathBuf {
-    crate::hooks::config_path("signaling-dns.json")
-}
-
 /// Pull `host` and `port` out of an `http(s)://` URL for resolution. Returns the
 /// conventional port for the scheme when none is given. Pure (no I/O) so the
 /// parse is unit-testable.
@@ -972,8 +967,9 @@ pub(crate) fn cached_addrs_from_doc(doc: &Value, host: &str, port: u16) -> Vec<S
         .unwrap_or_default()
 }
 
-fn read_cached_addrs(host: &str, port: u16) -> Vec<SocketAddr> {
-    let Ok(text) = std::fs::read_to_string(dns_cache_path()) else {
+fn read_cached_addrs(context: &crate::TransportContext, host: &str, port: u16) -> Vec<SocketAddr> {
+    let Some(path) = context.dns_cache_path() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     let Ok(doc) = serde_json::from_str::<Value>(&text) else {
@@ -984,11 +980,11 @@ fn read_cached_addrs(host: &str, port: u16) -> Vec<SocketAddr> {
 
 /// Persist the freshly-resolved IPs for `host` (best-effort, never fatal). Reads
 /// the existing doc so other hosts' entries survive.
-fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
+fn write_cached_addrs(context: &crate::TransportContext, host: &str, addrs: &[SocketAddr]) {
     if addrs.is_empty() {
         return;
     }
-    let path = dns_cache_path();
+    let Some(path) = context.dns_cache_path() else { return };
     if let Some(dir) = path.parent() {
         if !dir.is_dir() {
             let _ = std::fs::create_dir_all(dir);
@@ -1037,36 +1033,65 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
 /// "resolve normally" (caller omits the override and lets reqwest resolve).
 /// Side effect: a successful fresh lookup also warms the OS resolver cache, so a
 /// socket.io connect that resolves the same host moments later hits warm cache.
-pub(crate) async fn resolve_warm(host: &str, port: u16) -> Vec<SocketAddr> {
+pub(crate) async fn resolve_warm(context: &crate::TransportContext, host: &str, port: u16) -> Vec<SocketAddr> {
+    resolve_warm_with(
+        context,
+        host,
+        port,
+        Duration::from_millis(dns_race_ms()),
+        Duration::from_millis(dns_timeout_ms()),
+        |host: String| async move {
+            match tokio::net::lookup_host(host).await {
+                Ok(it) => it.collect(),
+                Err(_) => Vec::new(),
+            }
+        },
+    )
+    .await
+}
+
+/// The resolver is a parameter so a test can hold the fresh lookup and prove the
+/// detached writer captures the context it was started with, without real DNS.
+async fn resolve_warm_with<F, Fut>(
+    context: &crate::TransportContext,
+    host: &str,
+    port: u16,
+    race: Duration,
+    timeout: Duration,
+    lookup: F,
+) -> Vec<SocketAddr>
+where
+    F: FnOnce(String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Vec<SocketAddr>> + Send + 'static,
+{
     // Skip the dance for an IP literal: nothing to resolve or cache.
     if host.parse::<IpAddr>().is_ok() {
         return Vec::new();
     }
-    let cached = read_cached_addrs(host, port);
+    let cached = read_cached_addrs(context, host, port);
     let host_owned = format!("{host}:{port}");
     let host_for_cache = host.to_string();
+    let context = context.clone();
     let fresh = tokio::spawn(async move {
-        let lookup = tokio::net::lookup_host(host_owned);
-        match tokio::time::timeout(Duration::from_millis(dns_timeout_ms()), lookup).await {
-            Ok(Ok(it)) => {
-                let addrs: Vec<SocketAddr> = it.collect();
+        match tokio::time::timeout(timeout, lookup(host_owned)).await {
+            Ok(addrs) => {
                 if !addrs.is_empty() {
-                    write_cached_addrs(&host_for_cache, &addrs);
+                    write_cached_addrs(&context, &host_for_cache, &addrs);
                 }
                 addrs
             }
-            _ => Vec::new(),
+            Err(_) => Vec::new(),
         }
     });
 
     let result = if cached.is_empty() {
         // Nothing to fall back to: take whatever fresh resolution returns
-        // (bounded inside the task by dns_timeout_ms). Empty => caller resolves
+        // (bounded inside the task by the timeout). Empty => caller resolves
         // normally as a last resort.
         fresh.await.unwrap_or_default()
     } else {
         // Have a fallback: give fresh DNS a short head start, else use the cache.
-        match tokio::time::timeout(Duration::from_millis(dns_race_ms()), fresh).await {
+        match tokio::time::timeout(race, fresh).await {
             Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
             // Fresh lost the race (still resolving) or failed: use the cache now.
             // The spawned task keeps running and refreshes the cache when it lands.
@@ -1114,8 +1139,8 @@ pub fn is_stun_only(s: &RTCIceServer) -> bool {
 
 /// C5: callers fetch this fresh before EVERY peer connection, TURN
 /// credentials are expiry-stamped HMACs and go stale in long-lived processes.
-pub async fn fetch_config(server: &str) -> Result<ServerConfig> {
-    let body: Value = http_get_json(&format!("{server}/api/config")).await?;
+pub async fn fetch_config(context: &crate::TransportContext, server: &str) -> Result<ServerConfig> {
+    let body: Value = http_get_json(context, &format!("{server}/api/config")).await?;
     let mut ice_servers = Vec::new();
     if let Some(arr) = body["iceServers"].as_array() {
         for s in arr {
@@ -1141,15 +1166,15 @@ pub async fn fetch_config(server: &str) -> Result<ServerConfig> {
     })
 }
 
-pub async fn fetch_auto_room(server: &str) -> Result<String> {
-    let body: Value = http_get_json(&format!("{server}/api/room")).await?;
+pub async fn fetch_auto_room(context: &crate::TransportContext, server: &str) -> Result<String> {
+    let body: Value = http_get_json(context, &format!("{server}/api/room")).await?;
     body["room"]
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("no room in /api/room response"))
 }
 
-pub async fn http_get_json(url: &str) -> Result<Value> {
+pub async fn http_get_json(context: &crate::TransportContext, url: &str) -> Result<Value> {
     // rust_socketio already pulls in reqwest; reuse it instead of adding a dep.
     // 3 quick attempts: establish() refetches config per connection attempt
     // (C5), and one blip of the API mustn't kill a transfer in progress.
@@ -1161,7 +1186,7 @@ pub async fn http_get_json(url: &str) -> Result<Value> {
     let host_port = host_port_from_url(url);
     let overrides = match &host_port {
         Some((host, port)) => {
-            let addrs = resolve_warm(host, *port).await;
+            let addrs = resolve_warm(context, host, *port).await;
             (!addrs.is_empty()).then(|| (host.clone(), addrs))
         }
         None => None,
@@ -1199,7 +1224,7 @@ pub async fn http_get_json(url: &str) -> Result<Value> {
 
 // ---------------------------------------------------------------- signaling --
 
-pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
+pub async fn connect_signaling(context: &crate::TransportContext, server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
     // Warm the OS resolver cache before rust_socketio resolves the host itself.
     // rust_socketio's builder takes only a URL string (no DNS-override or custom
     // client hook), so we cannot steer its connect at a cached IP the way the
@@ -1210,7 +1235,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
     // ~5 s cold stall. In nearly every connect path `fetch_config` runs first and
     // has already warmed the cache, this just covers the socket.io-first paths.
     if let Some((host, port)) = host_port_from_url(server) {
-        let _ = resolve_warm(&host, port).await;
+        let _ = resolve_warm(context, &host, port).await;
     }
 
     // ONE channel instead of a dozen boxed callbacks. Every handler this
@@ -1262,8 +1287,8 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
 /// module re-asserts room + channel subscriptions on the next tick. Returns the
 /// new `Client` to swap into the loop's `conn.sio` / `sess` emit target. The
 /// caller owns the backoff (so it can also keep ticking the rest of the loop).
-pub async fn reconnect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
-    connect_signaling(server, tx).await
+pub async fn reconnect_signaling(context: &crate::TransportContext, server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
+    connect_signaling(context, server, tx).await
 }
 
 /// Silence-watchdog heartbeat: an ACK'd `sync` round-trip that proves the
@@ -2530,6 +2555,149 @@ mod tests {
         assert!(roster_from_ack(&[json!({"peers": "oops"})]).is_empty());
         // No payload values at all.
         assert!(roster_from_ack(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod context_cache_tests {
+    //! Same-process isolation for the signalling DNS cache. Each context owns
+    //! one explicit file; no test consults the working directory or a global.
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "fil-dns-context-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn context(root: &Path) -> crate::TransportContext {
+        crate::TransportContext::new(
+            Some(root.join("signaling-dns.json")),
+            |_: &str, _: Option<&str>| None,
+            |_: Option<&str>| String::new(),
+        )
+    }
+
+    fn seed(root: &Path, ip: &str) {
+        std::fs::write(
+            root.join("signaling-dns.json"),
+            json!({ "api.example.test": [ip] }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn each_root_reads_and_writes_only_its_own_cache() {
+        let a_root = temp_root("a");
+        let b_root = temp_root("b");
+        seed(&a_root, "192.0.2.10");
+        seed(&b_root, "198.51.100.20");
+        let a = context(&a_root);
+        let b = context(&b_root);
+
+        assert_eq!(
+            read_cached_addrs(&a, "api.example.test", 443),
+            vec!["192.0.2.10:443".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            read_cached_addrs(&b, "api.example.test", 443),
+            vec!["198.51.100.20:443".parse::<SocketAddr>().unwrap()]
+        );
+
+        write_cached_addrs(&a, "api.example.test", &["203.0.113.30:443".parse().unwrap()]);
+        assert_eq!(
+            read_cached_addrs(&a, "api.example.test", 443),
+            vec!["203.0.113.30:443".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            read_cached_addrs(&b, "api.example.test", 443),
+            vec!["198.51.100.20:443".parse::<SocketAddr>().unwrap()],
+            "A's write must not touch B"
+        );
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+    }
+
+    #[test]
+    fn default_context_never_reads_or_writes_a_file() {
+        let c = crate::TransportContext::default();
+        assert!(c.dns_cache_path().is_none());
+        assert!(read_cached_addrs(&c, "api.example.test", 443).is_empty());
+        write_cached_addrs(&c, "api.example.test", &["192.0.2.1:443".parse().unwrap()]);
+        assert!(read_cached_addrs(&c, "api.example.test", 443).is_empty());
+    }
+
+    #[test]
+    fn detached_refresh_writes_the_origin_context_not_another() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let a_root = temp_root("refresh-a");
+            let b_root = temp_root("refresh-b");
+            seed(&a_root, "192.0.2.10");
+            seed(&b_root, "198.51.100.20");
+            let a = context(&a_root);
+            let b = context(&b_root);
+
+            // Hold the "fresh" lookup until after the cached address has won
+            // this context's race. No real DNS, no internet timing.
+            let (release, held) = tokio::sync::oneshot::channel::<()>();
+            let lookup = move |_host: String| async move {
+                let _ = held.await;
+                vec!["203.0.113.30:443".parse::<SocketAddr>().unwrap()]
+            };
+            let got = resolve_warm_with(
+                &a,
+                "api.example.test",
+                443,
+                Duration::from_millis(5),
+                Duration::from_secs(5),
+                lookup,
+            )
+            .await;
+            assert_eq!(
+                got,
+                vec!["192.0.2.10:443".parse::<SocketAddr>().unwrap()],
+                "the cache must win while the fresh lookup is held"
+            );
+            assert_eq!(
+                read_cached_addrs(&b, "api.example.test", 443),
+                vec!["198.51.100.20:443".parse::<SocketAddr>().unwrap()]
+            );
+
+            release.send(()).unwrap();
+            let fresh = "203.0.113.30:443".parse::<SocketAddr>().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if read_cached_addrs(&a, "api.example.test", 443).contains(&fresh) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("detached refresh did not update its origin context");
+
+            assert_eq!(
+                read_cached_addrs(&b, "api.example.test", 443),
+                vec!["198.51.100.20:443".parse::<SocketAddr>().unwrap()],
+                "the detached write must stay on A's root"
+            );
+
+            let _ = std::fs::remove_dir_all(&a_root);
+            let _ = std::fs::remove_dir_all(&b_root);
+        });
     }
 }
 

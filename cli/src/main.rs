@@ -273,6 +273,7 @@ use conn::{
     upgrade_principal,
 };
 mod settings;
+mod transport_context;
 /// L3 TUN data plane (serve_tun). Linux-only: it uses /dev/net/tun + TUNSETIFF,
 /// which macOS (also `unix`) lacks, so gate on `target_os`, not `unix`.
 #[cfg(l3)]
@@ -1833,8 +1834,7 @@ enum BareTarget {
 }
 
 
-/// Install the CLI's answers to the transport's host questions. One place, so
-/// there is no doubt about what the transport can and cannot see.
+/// Install shared diagnostics and descriptive probes, never correctness state.
 fn install_transport_hooks() {
     use filament_transport::hooks;
     hooks::set_trace(|m| ui::trace(m));
@@ -1843,9 +1843,6 @@ fn install_transport_hooks() {
     hooks::set_critical(|m| ui::critical(m));
     hooks::set_ip_class(|ip| doctor::ip_class(ip));
     hooks::set_iface_for_ip(|ip| doctor::iface_for_ip(ip));
-    hooks::set_settings_get_str(|k, p| settings::get_str(k, p));
-    hooks::set_raw_membership(|p| settings::raw_membership(p));
-    hooks::set_config_path(|n| platform::Paths::config_path(n));
     hooks::set_resolve_iface_name(|addr| {
         if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
             for iface in interact::enumerate_interfaces() {

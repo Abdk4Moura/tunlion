@@ -437,7 +437,11 @@ fn peer_path() -> PathBuf {
 }
 
 fn global_get(store: &str) -> Option<String> {
-    std::fs::read_to_string(global_path()).ok()?.lines().find_map(|l| {
+    global_get_at(&config_dir(), store)
+}
+
+fn global_get_at(root: &Path, store: &str) -> Option<String> {
+    std::fs::read_to_string(root.join("config")).ok()?.lines().find_map(|l| {
         let (k, v) = l.split_once(char::is_whitespace)?;
         (k == store && !v.trim().is_empty()).then(|| v.trim().to_string())
     })
@@ -489,7 +493,11 @@ fn global_remove(store: &str) -> Result<bool> {
 }
 
 fn peer_load() -> serde_json::Map<String, Value> {
-    std::fs::read_to_string(peer_path())
+    peer_load_at(&config_dir())
+}
+
+fn peer_load_at(root: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(root.join("peerconf"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.as_object().cloned())
@@ -503,7 +511,11 @@ fn peer_save(m: &serde_json::Map<String, Value>) -> Result<()> {
 }
 
 fn peer_get(device: &str, store: &str) -> Option<String> {
-    peer_load()
+    peer_get_at(&config_dir(), device, store)
+}
+
+fn peer_get_at(root: &Path, device: &str, store: &str) -> Option<String> {
+    peer_load_at(root)
         .get(device)?
         .get(store)?
         .as_str()
@@ -542,6 +554,10 @@ fn effective_default(s: &Setting) -> String {
 /// Resolve the effective value of a setting and where it came from.
 /// `peer` is consulted only for `GlobalOrPeer` settings.
 pub fn resolve(s: &Setting, peer: Option<&str>) -> (String, Origin) {
+    resolve_at(&config_dir(), s, peer)
+}
+
+fn resolve_at(root: &Path, s: &Setting, peer: Option<&str>) -> (String, Origin) {
     if let Some(ev) = s.env {
         if let Ok(v) = std::env::var(ev) {
             if !v.is_empty() {
@@ -551,12 +567,12 @@ pub fn resolve(s: &Setting, peer: Option<&str>) -> (String, Origin) {
     }
     if let Some(p) = peer {
         if s.scope == ScopeKind::GlobalOrPeer {
-            if let Some(v) = peer_get(p, s.store) {
+            if let Some(v) = peer_get_at(root, p, s.store) {
                 return (decode_membership(s, v), Origin::Peer(p.to_string()));
             }
         }
     }
-    if let Some(v) = global_get(s.store) {
+    if let Some(v) = global_get_at(root, s.store) {
         return (decode_membership(s, v), Origin::Global);
     }
     (effective_default(s), Origin::Default)
@@ -618,19 +634,24 @@ pub fn prefer_strength(peer: Option<&str>) -> &'static str {
 
 /// Read the RAW store value (no decode) for the interfaces membership config.
 /// Returns the JSON string or empty so the filter can parse mode+items directly.
-pub fn raw_membership(peer: Option<&str>) -> String {
+/// `root` is the explicit engine root; there is no ambient-root variant here.
+pub(crate) fn raw_membership_at(root: &Path, peer: Option<&str>) -> String {
     if let Some(p) = peer {
-        if let Some(v) = peer_get(p, "interfaces") {
+        if let Some(v) = peer_get_at(root, p, "interfaces") {
             return v;
         }
     }
-    global_get("interfaces").unwrap_or_default()
+    global_get_at(root, "interfaces").unwrap_or_default()
 }
 
 /// Effective string for a key, or None when it resolves to the empty default.
 pub fn get_str(key: &str, peer: Option<&str>) -> Option<String> {
+    get_str_at(&config_dir(), key, peer)
+}
+
+pub(crate) fn get_str_at(root: &Path, key: &str, peer: Option<&str>) -> Option<String> {
     let s = find(key)?;
-    let (v, origin) = resolve(s, peer);
+    let (v, origin) = resolve_at(root, s, peer);
     match origin {
         Origin::Default if v.is_empty() => None,
         _ => Some(v),

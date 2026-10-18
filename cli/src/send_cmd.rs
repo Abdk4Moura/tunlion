@@ -395,12 +395,13 @@ pub(crate) async fn send_cmd(
     // What "nobody connected" means depends on who we were waiting for. Only a
     // code can be opened in a browser; a device name is another tunlion.
     let peer_hint = no_peer_hint(to.as_deref(), use_code, room.as_deref());
+    let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     let room = match room {
         Some(r) => r,
-        None => net::fetch_auto_room(server).await?,
+        None => net::fetch_auto_room(&transport_context, server).await?,
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
     // C30: the convergent session repairs room/channel/lease state the
     // one-shot emits lose (the fast path stays for old servers + latency);
     // under gate L these initial emits are exactly what the shim drops.
@@ -634,6 +635,7 @@ pub(crate) async fn send_cmd(
     }
 
     let mut conn = Conn::for_command(
+        transport_context,
         server,
         sio.clone(),
         tx.clone(),

@@ -10,16 +10,18 @@
 //!
 //! Nothing here knows how to draw on a terminal, where this machine keeps config
 //! files, how the user configured membership, or how to enumerate local
-//! interfaces. It used to know all four. Those are asked through `hooks`, each
-//! with a safe default, so a consumer that installs none still gets a working
-//! transport with diagnostics discarded.
+//! interfaces. Every correctness read arrives through an explicit
+//! [`TransportContext`] owned by the calling engine; `hooks` is limited to
+//! process-wide diagnostics and descriptive probes with safe defaults.
 //!
 //! That separation is why this could become a crate at all, and it was done as
-//! its own step, verified live, BEFORE the files moved: the transport is what
-//! tunlion's reliability rests on, and a half-verified transport is worse than
-//! a coupled one.
+//! its own step, before the files moved: the transport is what tunlion's
+//! reliability rests on, and a half-verified transport is worse than a coupled
+//! one.
 
 pub mod direct;
+mod context;
+pub use context::TransportContext;
 pub mod hooks;
 pub mod http;
 pub mod net;

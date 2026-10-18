@@ -215,8 +215,9 @@ pub(crate) async fn enroll_cmd(
     }
 
     let my_uid = mk_uid("e");
+    let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
 
     // Join enrollment rendezvous channel derived from the owner's key
     // FINGERPRINT: the compact invitation carries only the 8-byte fp (#186),
@@ -238,6 +239,7 @@ pub(crate) async fn enroll_cmd(
         .await;
 
     let mut conn = Conn::for_command(
+        transport_context,
         server,
         sio.clone(),
         tx.clone(),
@@ -511,8 +513,9 @@ pub(crate) async fn enroll_and_send_cmd(
 
     let enroll_chan = crate::ephemeral::enroll_channel_fp(&ak.issuer_fp);
     let my_uid = mk_uid("a");
+    let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.channels = vec![enroll_chan.clone()];
     sess.room = Some(format!("enrollup-{}", fresh_secret()));
@@ -526,6 +529,7 @@ pub(crate) async fn enroll_and_send_cmd(
         .await;
 
     let mut conn = Conn::for_command(
+        transport_context,
         server,
         sio.clone(),
         tx.clone(),

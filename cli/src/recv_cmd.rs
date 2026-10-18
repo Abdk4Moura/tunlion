@@ -1243,6 +1243,7 @@ pub(crate) async fn recv_cmd(
     shell_policy: ShellPolicy,
     shell_user: Option<String>,
     no_proxy_fallback: bool,
+    transport_context: filament_transport::TransportContext,
     log: Arc<dyn LogSink>,
     host: Arc<dyn HostServices>,
 ) -> Result<()> {
@@ -1252,7 +1253,7 @@ pub(crate) async fn recv_cmd(
     let outcome = recv_driver(
         server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
         relay, remember, daemon, output, shell_policy, shell_user,
-        no_proxy_fallback, log.clone(), host, &stop,
+        no_proxy_fallback, transport_context, log.clone(), host, &stop,
     ).await;
     signals.stop().await;
     match outcome {
@@ -1295,6 +1296,7 @@ async fn recv_driver(
     shell_policy: ShellPolicy,
     shell_user: Option<String>,
     no_proxy_fallback: bool,
+    transport_context: filament_transport::TransportContext,
     log: Arc<dyn LogSink>,
     host: Arc<dyn HostServices>,
     stop: &filament_peerloop::driver::Cancellation,
@@ -1303,7 +1305,7 @@ async fn recv_driver(
     let outcome = stop.run(recv_run(
         server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
         relay, remember, daemon, output, shell_policy, shell_user,
-        no_proxy_fallback, log, host, stop, &mut cleanup,
+        no_proxy_fallback, transport_context, log, host, stop, &mut cleanup,
     )).await;
     cleanup.finish().await;
     // A signal received during cleanup still has its signal-specific outcome.
@@ -1370,6 +1372,9 @@ async fn recv_run(
     // means the PTY runs as the up-process user (documented root risk).
     mut shell_user: Option<String>,
     no_proxy_fallback: bool,
+    // Configuration and discovery state bound to this daemon's config root.
+    // Every signaling/config/ICE path below uses this same instance.
+    transport_context: filament_transport::TransportContext,
     // Where this loop says what it is doing. The CLI hands it the terminal
     // sink; a caller with no terminal hands it `NoLog` and every line below
     // still formats, but nothing is printed.
@@ -1487,9 +1492,9 @@ async fn recv_run(
     // The daemon waits for the network instead of exiting (see
     // `connect_signaling_patiently`); a one-shot receive still fails fast.
     let mut sio = if daemon {
-        crate::up_logs::connect_signaling_patiently(server, tx.clone()).await?
+        crate::up_logs::connect_signaling_patiently(&transport_context, server, tx.clone()).await?
     } else {
-        net::connect_signaling(server, tx.clone()).await?
+        net::connect_signaling(&transport_context, server, tx.clone()).await?
     };
     cleanup.signaling = Some(sio.clone());
 
@@ -1755,7 +1760,7 @@ async fn recv_run(
             recv_pake_template = None; // local-network listen, no ephemeral PAKE
             let room = match &room {
                 Some(r) => r.clone(),
-                None => net::fetch_auto_room(server).await?,
+                None => net::fetch_auto_room(&transport_context, server).await?,
             };
             // C22: proactive affordance, tell the user what they CAN do,
             // cargo-style gutter, before they have to guess.
@@ -1807,6 +1812,7 @@ async fn recv_run(
     let mut l2_enabled = l2_launch || any_shell_grant();
 
     let mut conn = cleanup.conn.insert(Conn::for_command(
+        transport_context.clone(),
         server,
         sio.clone(),
         tx.clone(),
@@ -3308,7 +3314,7 @@ async fn recv_run(
                 // Drop the old client (no-op if already gone). Its close, when
                 // it lands, carries the old id and is ignored above.
                 let _ = sio.disconnect().await;
-                match net::reconnect_signaling(server, tx.clone()).await {
+                match net::reconnect_signaling(&transport_context, server, tx.clone()).await {
                     Ok(new_sio) => {
                         sio = new_sio;
                         cleanup.signaling = Some(sio.clone());
@@ -8991,7 +8997,9 @@ mod lifecycle_tests {
         recv_driver(
             "https://unused.invalid", None, PathBuf::new(), false, None, None,
             false, None, Some("invalid".into()), false, None, false, None,
-            ShellPolicy::Granted, None, false, Arc::new(NoLog), Arc::new(NoHost), stop,
+            ShellPolicy::Granted, None, false,
+            filament_transport::TransportContext::default(),
+            Arc::new(NoLog), Arc::new(NoHost), stop,
         ).await
     }
 

@@ -212,16 +212,14 @@ pub(crate) async fn async_main() -> Result<()> {
     // purpose: skipping it for local-only commands was tried and measured at
     // exactly zero (6.7ms either way), so the conditional bought nothing and
     // would have put a branch in front of crypto initialisation for free.
-    // `filament_signal::connect` also installs it, idempotently, so no call
-    // site has to remember.
+    // Transport HTTP and filament-signal now build explicit ring TLS configs;
+    // this remains for unrelated CLI dependencies (see #506).
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    // Tell the transport how to reach this host. It no longer reaches sideways
-    // into the CLI for terminal output, settings, config paths or interface
-    // enumeration; it asks, and these are our answers. Every hook has a safe
-    // default, so a library consumer that installs none still gets a working
-    // transport with the diagnostics discarded.
+    // Install shared diagnostics and descriptive probes only. Configuration,
+    // membership and discovery state are passed explicitly as a
+    // `TransportContext` by each command/daemon bootstrap.
     install_transport_hooks();
     // #161 probe scope: mark this process as a live flow so the gate's
     // ordering-window probe fires here (and in the harness) but not in unit
@@ -740,6 +738,8 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 }
                 let remember_name = remember.clone();
+                let transport_context =
+                    crate::transport_context::for_root(&settings::config_dir())?;
                 let res = recv_cmd(
                     &server,
                     code,
@@ -757,6 +757,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     ShellPolicy::Granted,
                     None,
                     false,
+                    transport_context,
                     crate::host_impl::cli_log(),
                     crate::host_impl::cli_host(),
                 )

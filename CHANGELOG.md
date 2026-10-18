@@ -6,6 +6,15 @@ the GitHub release notes.
 
 ## [Unreleased]
 
+### Breaking
+
+- `filament-transport` removes the process-global correctness hooks
+  `hooks::set_settings_get_str`, `hooks::set_raw_membership` and
+  `hooks::set_config_path` together with their getters. Pass an explicit
+  `TransportContext` to the transport config/discovery APIs instead; its DNS
+  cache path defaults to `None`, never the current directory. The shared
+  diagnostic hooks (`trace`, `debug`, `say`, `critical`) remain process-wide.
+
 ## [0.9.0]
 
 ### Added
