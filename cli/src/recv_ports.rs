@@ -1028,6 +1028,7 @@ pub(crate) async fn cli_park_on_deny(
         &revoked,
         &delegated,
         &denied,
+        crate::identity_state::gate_settle_ms(),
         parked,
         conn,
         pid,

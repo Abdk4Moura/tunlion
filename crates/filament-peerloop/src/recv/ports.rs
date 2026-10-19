@@ -24,7 +24,7 @@ use crate::host::HostServices;
 use crate::l2::Mux;
 use crate::mesh::MeshTunnel;
 use crate::recv::{IncomingFile, RecvReport};
-use crate::shell::ShellPolicy;
+use crate::shell_gate::ShellPolicy;
 use crate::sync::serving::SyncServeTask;
 use async_trait::async_trait;
 use filament_id::{DeviceCert, IntroScope};
@@ -95,16 +95,6 @@ pub trait RecvIdentity: Send + Sync {
     fn hold_expired(&self, held: Instant) -> bool;
     /// Re-issue a challenge for a parked open.
     async fn resend_identity_challenge(
-        &self,
-        conn: &Conn,
-        pid: &str,
-        t: &Arc<dyn Transport>,
-        pending_proven: &Arc<std::sync::Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
-        identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
-    );
-    fn gate_settle_ms(&self) -> u64;
-    fn hold_expired(&self, held: Instant) -> bool;
-    fn resend_identity_challenge(
         &self,
         conn: &Conn,
         pid: &str,

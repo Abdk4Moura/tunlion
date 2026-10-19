@@ -1315,6 +1315,7 @@ dependencies = [
  "filament-transport",
  "hex",
  "libc",
+ "getrandom",
  "quinn",
  "ring",
  "serde",

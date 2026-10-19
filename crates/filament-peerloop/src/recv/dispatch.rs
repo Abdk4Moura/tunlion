@@ -22,7 +22,7 @@ use crate::host::{CapGate, HostServices, Level, LogSink, StorageFailure, Tone};
 use crate::l2::{self, Mux};
 use crate::limits::MAX_ATTEMPTS;
 use crate::mesh::MeshTunnel;
-#[cfg(l3)]
+#[cfg(feature = "mesh")]
 use crate::mesh::{
     accept_advertised, advertised_prefixes, sanitize_host, L3Mode, RouteAcceptance, RoutePolicy,
     IFNAME,
@@ -44,7 +44,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use filament_cap::capability as cap;
 use filament_fleet as fleet;
 use filament_id as identity;
-#[cfg(l3)]
+#[cfg(feature = "mesh")]
 use filament_overlay::Announce;
 use filament_overlay::{b64, unb64};
 use filament_pair as pake;
@@ -313,6 +313,7 @@ pub async fn park_on_deny(
     revoked: &dyn Fn(&[u8; 32]) -> bool,
     delegated_expired: &dyn Fn(&[u8; 32]) -> bool,
     denied: &dyn Fn(&str, &str) -> bool,
+    settle_ms: u64,
     parked: &mut Vec<ParkedOpen>,
     conn: &Conn,
     pid: &str,
@@ -374,7 +375,7 @@ pub async fn park_on_deny(
         deny_unsettled(t, sid, kind, "identity settling, retry", conn.log.as_ref()).await;
         return true;
     }
-    let ms = ports.identity.gate_settle_ms();
+    let ms = settle_ms;
     parked.push(ParkedOpen {
         pid: pid.to_string(),
         device_pub,
@@ -1463,9 +1464,9 @@ async fn recv_run(
     // `l3_seen`: last announce received per pid, replayed once a datagram-capable
     // transport is installed, so a hello that races ahead of the link is not lost
     // (review fix #3).
-    #[cfg(l3)]
+    #[cfg(feature = "mesh")]
     let mut l3_seen: HashMap<String, Announce> = HashMap::new();
-    #[cfg(l3)]
+    #[cfg(feature = "mesh")]
     let l3: Option<std::sync::Arc<dyn MeshTunnel>> = if daemon {
         match host.settings_get_str("tun-addr") {
             Some(setting) => {
@@ -2031,7 +2032,7 @@ async fn recv_run(
             if let Some(since) = report.since_last_refusal() {
                 let sender_gone = conn.rejoin.waiting_rejoin.is_some() || conn.links.is_empty();
                 if sender_gone || since >= Duration::from_secs(3) {
-                    if let Some(e) = crate::recv::report::refused_outcome(&report) {
+                    if let Some(e) = report.refused_outcome() {
                         conn.present.clear_sticky();
                         let _ =
                             tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
@@ -2146,7 +2147,7 @@ async fn recv_run(
                             // to its VERIFIED overlay address ourselves, dial it over
                             // L3, and bridge the ctl socket to it. Spawned so the
                             // long-lived splice never blocks the event loop.
-                            #[cfg(l3)]
+                            #[cfg(feature = "mesh")]
                             if let ReqKind::Dial { peer, port } = &req.kind {
                                 let (peer, port) = (peer.clone(), *port);
                                 match l3.as_ref() {
@@ -2193,7 +2194,7 @@ async fn recv_run(
                                     None => req.reject("L3 overlay is not up").await,
                                 }
                             }
-                            #[cfg(not(l3))]
+                            #[cfg(not(feature = "mesh"))]
                             req.reject("L3 overlay not supported on this build").await;
                         } else if matches!(&req.kind, ReqKind::Bootstrap { .. }) {
                             ports.daemon.warm_bootstrap(&conn, &tx, req).await;
@@ -2269,7 +2270,7 @@ async fn recv_run(
                             // meet a known device on a shared secret. Its
                             // authenticity is inherited from the link it travelled
                             // over, which was verified by certificate.
-                            match warm_link_for(&conn, &name) {
+                            match crate::conn::warm_link_for(&conn, &name) {
                                 Some((pid, t)) => {
                                     let secret = fresh_secret();
                                     let sent = t
@@ -2313,7 +2314,7 @@ async fn recv_run(
                                     // granted; never record an approval for it.
                                     r.status = REQUEST_WITHDRAWN.to_string();
                                     host.requests_save(&requests);
-                                    req.reject(&request_bar_refusal(id, &peer, bar)).await;
+                                    req.reject(&crate::consent::request_bar_refusal(id, &peer, bar)).await;
                                 } else if cap != allow {
                                     req.reject(&format!("request {id} is for '{cap}', not '{allow}'")).await;
                                 } else if !cap::grant_active(expires, cap::now_secs()) {
@@ -2530,15 +2531,19 @@ async fn recv_run(
                 // transport, which is exactly when the old nonce is dead.
                 let nonce_alive = identity_nonces
                     .get(&p.pid)
-                    .map(|(_, issued, _)| {
-                        now.duration_since(*issued) < ports.identity.PROVEN_CHALLENGE_DEADLINE
-                    })
+                    .map(|(_, issued, _)| now.duration_since(*issued) < PROVEN_CHALLENGE_DEADLINE)
                     .unwrap_or(false);
                 if held_same_link && nonce_alive {
                     if retry_due {
                         if ports
                             .identity
-                            .resend_identity_challenge(&conn, &p.pid, &identity_nonces)
+                            .resend_identity_challenge(
+                                &conn,
+                                &p.pid,
+                                &t,
+                                &st.pending_proven,
+                                &mut identity_nonces,
+                            )
                             .await
                         {
                             log.debug(&format!(
@@ -2575,7 +2580,7 @@ async fn recv_run(
                     .map(|(_, d)| *d)
                     .unwrap_or_else(Instant::now);
                 tokio::spawn(async move {
-                    tokio::time::sleep(ports.identity.PROVEN_CHALLENGE_DEADLINE).await;
+                    tokio::time::sleep(PROVEN_CHALLENGE_DEADLINE).await;
                     let mut m = pending.lock().unwrap();
                     if m.get(&hold_pid).map(|(_, d)| *d) == Some(installed) {
                         m.remove(&hold_pid);
@@ -2585,7 +2590,11 @@ async fn recv_run(
             for p in fire {
                 log.say(&format!("l2: {:?} open proven; re-driving", p.kind));
                 let Some(t) = conn.transport_of(&p.pid) else {
-                    crate::conn::dropped_no_transport(&p.pid, &format!("parked {:?} open", p.kind));
+                    crate::conn::dropped_no_transport(
+                        log.as_ref(),
+                        &p.pid,
+                        &format!("parked {:?} open", p.kind),
+                    );
                     continue;
                 };
                 match p.kind {
@@ -2641,6 +2650,7 @@ async fn recv_run(
                         }
                         if conn.transport_of(&p.pid).is_none() {
                             crate::conn::dropped_no_transport(
+                                log.as_ref(),
                                 &p.pid,
                                 &format!("parked {:?} open", p.kind),
                             );
@@ -3238,7 +3248,7 @@ async fn recv_run(
                         if crate::recv::revocation::link_must_close(
                             &facts,
                             &revoked_secrets,
-                            &ports.daemon.key_listed,
+                            &|p: &[u8; 32]| ports.daemon.key_listed(p),
                         ) {
                             // Forgotten (its secret removed) reads "not
                             // recognized", as every later open is answered;
@@ -3248,7 +3258,7 @@ async fn recv_run(
                             if !secret_gone
                                 && l.identity_device_pub
                                     .as_ref()
-                                    .is_some_and(ports.daemon.key_listed)
+                                    .is_some_and(|p| ports.daemon.key_listed(p))
                             {
                                 key_revoked.insert(pid.clone());
                             }
@@ -3300,7 +3310,7 @@ async fn recv_run(
                     // An overlay route is the one thing a revoked device keeps
                     // without opening anything, so it goes with the revocation
                     // (this is the explicit forget path `remove_by_pid` is for).
-                    #[cfg(l3)]
+                    #[cfg(feature = "mesh")]
                     for pid in &unrouted {
                         l3_seen.remove(pid);
                         if let Some(m) = l3.as_ref() {
@@ -3350,7 +3360,7 @@ async fn recv_run(
                     log.say(&format!(
                         "access for '{label}' ended (its invitation expired): refusing it from here on"
                     ));
-                    #[cfg(l3)]
+                    #[cfg(feature = "mesh")]
                     {
                         l3_seen.remove(&pid);
                         if let Some(m) = l3.as_ref() {
@@ -3759,7 +3769,7 @@ async fn recv_run(
                     // stale route just drops datagrams (the inner TCP pauses) until
                     // the swap. The cached announce is dropped so the peer's next
                     // announce is treated fresh.
-                    #[cfg(l3)]
+                    #[cfg(feature = "mesh")]
                     l3_seen.remove(&pid);
                     // Fleet auto-mesh: forget this peer's verification too. A
                     // reconnect gets a NEW sid and must re-prove its certificate
@@ -4772,7 +4782,7 @@ async fn recv_run(
                         "fleet-hello decision pid={pid}: rv={} pending={} shaped={} verified={} cb={} secret={:?}",
                         ports.identity.fleet_rv().is_some(),
                         fleet_pending.contains(&pid),
-                        crate::recv::fleet::shaped_link(&conn, &pid),
+                        crate::recv::fleet::shaped_link(&conn, &pid, ports.identity.fleet_rv().as_deref()),
                         fleet_verified.contains(&pid),
                         t.channel_binding().is_some(),
                         conn.link(&pid)
@@ -4784,7 +4794,11 @@ async fn recv_run(
                 if !fleet_verified.contains(&pid)
                     && ports.identity.fleet_rv().is_some()
                     && (fleet_pending.contains(&pid)
-                        || crate::recv::fleet::shaped_link(&conn, &pid))
+                        || crate::recv::fleet::shaped_link(
+                            &conn,
+                            &pid,
+                            ports.identity.fleet_rv().as_deref(),
+                        ))
                 {
                     // Mark it, so the L3 gate and the drop-cleanup track this link
                     // even when it arrived via warm-hold rather than presence.
@@ -4802,7 +4816,7 @@ async fn recv_run(
                         }
                     }
                 }
-                #[cfg(l3)]
+                #[cfg(feature = "mesh")]
                 if let Some(l3) = l3.as_ref() {
                     if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
                         if let Some(ann) = l3.make_announce(&cb) {
@@ -5023,7 +5037,7 @@ async fn recv_run(
                                 if let Some(cb) =
                                     out_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
                                 {
-                                    #[cfg(l3)]
+                                    #[cfg(feature = "mesh")]
                                     if let Some(l3) = l3.as_ref() {
                                         if let Some(ann) = l3.make_announce(&cb) {
                                             let _ = t.send_control(&ann.to_json()).await;
@@ -5139,7 +5153,7 @@ async fn recv_run(
                                     // that arrived while this link was unverified
                                     // was DROPPED (below), so without this the
                                     // route would never form.
-                                    #[cfg(l3)]
+                                    #[cfg(feature = "mesh")]
                                     if let Some(l3) = l3.as_ref() {
                                         if let Some(t) = conn.transport_of(&pid) {
                                             if let Some(ann) = l3.make_announce(&cb) {
@@ -5268,7 +5282,7 @@ async fn recv_run(
                                         // MagicDNS entry still reads as the placeholder.
                                         // Correct it now that the certificate has named
                                         // the device.
-                                        #[cfg(l3)]
+                                        #[cfg(feature = "mesh")]
                                         if let Some(l3) = l3.as_ref() {
                                             if l3.rename_peer(&pid, &sanitize_host(&shown)).await {
                                                 l3.refresh_hosts().await;
@@ -5345,7 +5359,7 @@ async fn recv_run(
                         _ => log.debug("fleet-rendezvous: ignored a malformed secret"),
                     }
                 }
-                #[cfg(l3)]
+                #[cfg(feature = "mesh")]
                 Some("l3-announce") if l3.is_some() => {
                     // A fleet link that has not proven its certificate gets NO
                     // overlay route, and its announce is not even cached for
@@ -6141,7 +6155,7 @@ async fn recv_run(
                 }
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {
-                        crate::conn::dropped_no_transport(&pid, "shell-bootstrap");
+                        crate::conn::dropped_no_transport(log.as_ref(), &pid, "shell-bootstrap");
                         continue;
                     };
                     // #30 GAP 2 (shell): honor the pending_proven hold. If a
@@ -6432,7 +6446,7 @@ async fn recv_run(
                         continue;
                     }
                     if conn.transport_of(&pid).is_none() {
-                        crate::conn::dropped_no_transport(&pid, "sync-open");
+                        crate::conn::dropped_no_transport(log.as_ref(), &pid, "sync-open");
                         continue;
                     }
                     if let Some((sid, task)) = ports
@@ -6463,7 +6477,7 @@ async fn recv_run(
                 // the handler sends its own cert/refusal replies.
                 Some("ssh-sign-request") => {
                     let Some(t) = conn.transport_of(&pid) else {
-                        crate::conn::dropped_no_transport(&pid, "ssh-sign-request");
+                        crate::conn::dropped_no_transport(log.as_ref(), &pid, "ssh-sign-request");
                         continue;
                     };
                     ports
@@ -6967,7 +6981,7 @@ async fn recv_run(
                 }
                 Some("file-offer") => {
                     let Some(t) = conn.transport_of(&pid) else {
-                        crate::conn::dropped_no_transport(&pid, "file-offer");
+                        crate::conn::dropped_no_transport(log.as_ref(), &pid, "file-offer");
                         continue;
                     };
                     // L1-a (shared-room hardened): on the code path, accept bytes
@@ -9035,7 +9049,7 @@ async fn stdout_delivered(
 fn refuse_failed_write(
     inc: IncomingFile,
     dir: &Path,
-    wf: &crate::recv::files::WriteFailure,
+    wf: &crate::recv::WriteFailure,
     from: &str,
     daemon: bool,
     report: &RecvReport,
@@ -9065,7 +9079,7 @@ fn refuse_failed_write(
     let id = inc.id.clone();
     let part = inc.part_path.clone();
     drop(inc);
-    crate::recv::files::discard_partial(&part);
+    crate::recv::discard_partial(&part);
     (id, token, msg)
 }
 
