@@ -190,8 +190,23 @@ impl RecvIdentity for CliRecv {
     ) -> Result<bool> {
         crate::roster::verify_and_store_roster(blob, owner_pub, now)
     }
-    fn verify_depart(&self, device_pub: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
-        crate::membership::verify_depart(device_pub, msg, sig)
+    fn verify_depart(&self, device_pub: &[u8; 32], msg: &str, sig: &[u8; 64]) -> bool {
+        crate::membership::verify_depart(device_pub, msg, sig).is_ok()
+    }
+    fn fleet_channel(&self) -> Option<String> {
+        crate::fleet::channel()
+    }
+    fn fleet_rv(&self) -> Option<String> {
+        crate::fleet::rv()
+    }
+    fn is_fleet_channel(&self, ch: &str) -> bool {
+        crate::fleet::is_fleet_channel(ch)
+    }
+    fn make_fleet_hello(&self, cb: &[u8], name: &str) -> Result<Value> {
+        crate::fleet::make_hello(cb, name)
+    }
+    fn fleet_owner_pub(&self) -> Option<[u8; 32]> {
+        crate::fleet::my_owner_pub()
     }
 }
 
@@ -277,7 +292,7 @@ impl RecvStore for CliRecv {
     fn sanitize_device_name(&self, name: &str) -> String {
         crate::identity_state::sanitize_device_name(name)
     }
-    fn devices_find_by_device_pub(&self, device_pub: &[u8; 32]) -> Option<String> {
+    fn devices_find_by_device_pub(&self, device_pub: &[u8; 32]) -> Option<Value> {
         crate::device_view::devices_find_by_device_pub(device_pub)
     }
     fn any_shell_grant(&self) -> bool {
@@ -877,8 +892,8 @@ impl RecvDaemon for CliRecv {
     ) -> Result<bool> {
         crate::roster::verify_and_store_roster(blob, owner_pub, now)
     }
-    fn verify_depart(&self, device_pub: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
-        crate::membership::verify_depart(device_pub, msg, sig)
+    fn verify_depart(&self, device_pub: &[u8; 32], msg: &str, sig: &[u8; 64]) -> bool {
+        crate::membership::verify_depart(device_pub, msg, sig).is_ok()
     }
     fn fleet_share_root(&self) -> PathBuf {
         crate::fleet_support::fleet_share_root()
@@ -944,9 +959,6 @@ impl RecvDaemon for CliRecv {
     }
     fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
         crate::link_manager::peer_present(alive, direct, heard_ms, idle_ms)
-    }
-    fn liveness_pong(v: &Value) -> Value {
-        filament_peerloop::daemon_ctl::liveness_pong(v)
     }
     fn daemon_alive(&self) -> Option<u32> {
         crate::daemon_alive()

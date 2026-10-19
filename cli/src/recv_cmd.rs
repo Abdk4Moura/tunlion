@@ -77,6 +77,7 @@ pub(crate) async fn recv_cmd(
             Box::new(crate::recv_ports::CliRecv::new(engine_log.clone())),
             Box::new(crate::recv_ports::CliRecv::new(engine_log.clone())),
             Arc::new(crate::recv_ports::CliPrompt),
+            crate::host_impl::cli_screen(),
             env,
         );
         let mut cleanup = RecvCleanup::default();

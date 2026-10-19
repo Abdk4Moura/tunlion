@@ -12,11 +12,13 @@
 //! [`LogSink`](crate::host::LogSink), and the remaining host-bound sectors
 //! through the narrow traits in [`crate::recv::ports`].
 
+use crate::adoption::AdoptSource;
 use crate::conn::{Conn, DigestSurface, Presence, Promotion, Rung};
+use crate::consent::REQUEST_WITHDRAWN;
 use crate::control::{Req, ReqKind};
 use crate::daemon_ctl::sshd_listening;
 use crate::driver::DriverOutcome;
-use crate::host::{CapGate, HostServices, Level, LogSink, Tone};
+use crate::host::{CapGate, HostServices, Level, LogSink, StorageFailure, Tone};
 use crate::l2::{self, Mux};
 use crate::limits::MAX_ATTEMPTS;
 use crate::mesh::MeshTunnel;
@@ -49,6 +51,7 @@ use filament_pair as pake;
 use filament_proto as protocol;
 use filament_signal::Client as SignalClient;
 use filament_transfer::{chunk_fits_offer, MAX_RECV_RANGES};
+use filament_transport::direct;
 use filament_transport::net::{self, Ev, Transport};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -59,6 +62,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+
+/// Set when `--remember <name>` actually stored a record this run.
+pub static REMEMBER_STORED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// How long the event loop waits, after writing a delivery-ack, for the peer to
 /// acknowledge it at the transport. Short on purpose: the ack is already queued
@@ -281,8 +288,8 @@ pub fn policy_decline_msg(id: &str, reason: Option<&str>) -> Value {
 pub fn deny_is_proof_attributable(reason: &str) -> bool {
     let r = reason.trim();
     let final_prefixes = [
-        filament_cap::capability::EXPIRED_PREFIX,
-        filament_cap::capability::CEILING_REASON,
+        crate::refusal::EXPIRED_PREFIX,
+        crate::refusal::CEILING_REASON,
         cap::REVOKED_REASON,
         "device revoked",
         "shell revoked for",
@@ -386,7 +393,7 @@ pub async fn park_on_deny(
 
 /// The refusal for a shell-class open while serving is OFF here (`off` is
 /// ShellOff or TunnelOff). The ceiling-aware decision and the one consent ask
-/// moved to `filament_peerloop::shell::off` with the admission endpoint; this
+/// moved to `crate::shell::off` with the admission endpoint; this
 /// keeps the old call-site name for `l2-open` and `shell-bootstrap`, and is not
 /// a second rule.
 fn serving_off_refusal(
@@ -394,7 +401,7 @@ fn serving_off_refusal(
     pid: &str,
     off: crate::refusal::Code,
 ) -> crate::refusal::Refusal {
-    filament_peerloop::shell::off::serving_off_refusal(conn, pid, off)
+    crate::shell::off::serving_off_refusal(conn, pid, off)
 }
 
 /// Whether an offer is accepted without asking, before the capability layer.
@@ -505,7 +512,7 @@ pub async fn drive(
     stop: &crate::driver::Cancellation,
     readiness: &crate::driver::Readiness,
     cleanup: &mut RecvCleanup,
-) -> filament_peerloop::driver::DriverOutcome<Result<()>> {
+) -> DriverOutcome<Result<()>> {
     let outcome = stop
         .run(recv_run(
             server,
@@ -527,6 +534,7 @@ pub async fn drive(
             transport_context,
             log.clone(),
             host,
+            ports,
             report,
             stop,
             readiness,
@@ -580,9 +588,7 @@ pub struct RecvCleanup {
 }
 
 #[derive(Clone, Default)]
-struct SyncTasks(
-    Arc<Mutex<HashMap<(String, u32), filament_peerloop::sync::serving::SyncServeTask>>>,
-);
+struct SyncTasks(Arc<Mutex<HashMap<(String, u32), crate::sync::serving::SyncServeTask>>>);
 
 /// Owns the blocking `pwrite_at`/stdout writers admitted by this invocation.
 ///
@@ -700,7 +706,7 @@ fn report_writer_join(
 struct InflightGuard {
     inflight: Arc<AtomicI64>,
     end_seen: Arc<AtomicBool>,
-    completion: Arc<filament_peerloop::recv::CompletionGate>,
+    completion: Arc<crate::recv::CompletionGate>,
     tx: mpsc::UnboundedSender<Ev>,
     write_err: Arc<Mutex<Option<crate::recv::WriteFailure>>>,
     pid: String,
@@ -752,7 +758,7 @@ impl SyncTasks {
         &self,
         pid: String,
         sid: u32,
-        task: filament_peerloop::sync::serving::SyncServeTask,
+        task: crate::sync::serving::SyncServeTask,
         log: &dyn LogSink,
     ) {
         let key = (pid, sid);
@@ -920,6 +926,7 @@ async fn recv_run(
     // filesystem). The CLI hands it `CliHost`; a caller with no host hands it
     // `NoHost` and every read resolves to the inert default.
     host: Arc<dyn HostServices>,
+    mut ports: RecvPorts,
     report: RecvReport,
     stop: &crate::driver::Cancellation,
     readiness: &crate::driver::Readiness,
@@ -1096,7 +1103,7 @@ async fn recv_run(
         // SAME owner key find each other with no pairwise pairing. Presence there
         // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
         // and docs/design-fleet-automesh.md.
-        if let Some(fc) = fleet::channel() {
+        if let Some(fc) = ports.identity.fleet_channel() {
             if !sess.channels.contains(&fc) {
                 sess.channels.push(fc);
             }
@@ -1277,7 +1284,7 @@ async fn recv_run(
             // sess.channels, so anything pushed onto sess.channels before this
             // point is discarded.) Presence here authorizes nothing; admission
             // runs on the certificate. See cli/src/fleet.rs.
-            if let Some(fc) = fleet::channel() {
+            if let Some(fc) = ports.identity.fleet_channel() {
                 if !c.contains(&fc) {
                     c.push(fc);
                 }
@@ -1383,7 +1390,7 @@ async fn recv_run(
         // The CLI's terminal: sticky line, waiting questions, transfer bars, OSC 52
         // and the raw-mode echo. The loop drives them through `Presentation` so the
         // same body runs with no screen at all (a library consumer, a journal).
-        .with_presentation(conn.present.clone()),
+        .with_presentation(ports.present.clone()),
     );
     // WARM-HOLD: load configured warm-peers at daemon startup
     if daemon {
@@ -1768,7 +1775,7 @@ async fn recv_run(
     // on the next tick. Existing channels and live links are untouched.
     let mut known_channels: std::collections::HashSet<String> =
         devices.iter().map(|(_, s)| host.channel_of(s)).collect();
-    known_channels.extend(fleet::channel());
+    known_channels.extend(ports.identity.fleet_channel());
     let mut last_devices_scan = Instant::now();
     // Fleet auto-mesh link state, keyed by peer sid.
     //   pending  dialed off the fleet channel, certificate NOT yet proven. Such a
@@ -3248,7 +3255,7 @@ async fn recv_run(
                             doomed.push((pid.clone(), l.shown().to_string()));
                         } else if crate::recv::revocation::route_must_withdraw(
                             l.identity_device_pub.as_ref(),
-                            &device_cert_revoked,
+                            &|p: &[u8; 32]| ports.identity.device_cert_revoked(p),
                         ) {
                             unrouted.push(pid.clone());
                         }
@@ -3310,7 +3317,7 @@ async fn recv_run(
                         .filter(|l| {
                             crate::recv::revocation::route_must_withdraw(
                                 l.identity_device_pub.as_ref(),
-                                &device_cert_revoked,
+                                &|p: &[u8; 32]| ports.identity.device_cert_revoked(p),
                             )
                         })
                         .count();
@@ -3355,7 +3362,7 @@ async fn recv_run(
             }
             let mut new_chans: Vec<String> = Vec::new();
             for (n, s) in host.devices_load() {
-                let ch = channel_of(&s);
+                let ch = host.channel_of(&s);
                 if known_channels.insert(ch.clone()) {
                     log.say(&format!("new device '{n}' paired, now reachable"));
                     devices.push((n, s));
@@ -3861,7 +3868,9 @@ async fn recv_run(
                                 .expected_secret
                                 .as_ref()
                                 .map(|(_, secret)| {
-                                    sess.channels.iter().any(|ch| ch == &channel_of(secret))
+                                    sess.channels
+                                        .iter()
+                                        .any(|ch| ch == &host.channel_of(secret))
                                 })
                                 .unwrap_or(false);
                             let present = channel_link.then(|| channel_present.contains(pid));
@@ -4203,7 +4212,10 @@ async fn recv_run(
                             crate::recv::revocation::bind_brokered_link(l, &broker);
                         }
                     }
-                } else if fleet::is_fleet_channel(v["channel"].as_str().unwrap_or("")) {
+                } else if ports
+                    .identity
+                    .is_fleet_channel(v["channel"].as_str().unwrap_or(""))
+                {
                     // Fleet auto-mesh: a device is present on our fleet meeting
                     // point. We hold NO pair secret for it, so this is the
                     // secretless presence path (same shape as the enrollment
@@ -4229,7 +4241,7 @@ async fn recv_run(
                     // both sides run the same comparison and get opposite answers,
                     // so exactly one dials and the other accepts.
                     if conn.my_id < pid {
-                        if let Some(rv) = fleet::rv() {
+                        if let Some(rv) = ports.identity.fleet_rv() {
                             conn.start_direct_fleet(&pid, &rv).await;
                         }
                     }
@@ -4755,10 +4767,10 @@ async fn recv_run(
                 // Only for a node that is actually IN a fleet: this fires on every
                 // ChannelReady, and a user with no fleet has nothing to diagnose
                 // here. It is what made the dial-glare visible, so it stays.
-                if fleet::rv().is_some() {
+                if ports.identity.fleet_rv().is_some() {
                     log.debug(&format!(
                         "fleet-hello decision pid={pid}: rv={} pending={} shaped={} verified={} cb={} secret={:?}",
-                        fleet::rv().is_some(),
+                        ports.identity.fleet_rv().is_some(),
                         fleet_pending.contains(&pid),
                         crate::recv::fleet::shaped_link(&conn, &pid),
                         fleet_verified.contains(&pid),
@@ -4770,7 +4782,7 @@ async fn recv_run(
                 // H1: a DataChannel's binding folds in its DTLS fingerprints.
                 let link_fps = link_fingerprints(&conn, &pid).await;
                 if !fleet_verified.contains(&pid)
-                    && fleet::rv().is_some()
+                    && ports.identity.fleet_rv().is_some()
                     && (fleet_pending.contains(&pid)
                         || crate::recv::fleet::shaped_link(&conn, &pid))
                 {
@@ -4778,7 +4790,10 @@ async fn recv_run(
                     // even when it arrived via warm-hold rather than presence.
                     fleet_pending.insert(pid.clone());
                     if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
-                        match fleet::make_hello(&cb, &ports.env.display_name) {
+                        match ports
+                            .identity
+                            .make_fleet_hello(&cb, &ports.env.display_name)
+                        {
                             Ok(hello) => {
                                 fleet_greeted.insert(pid.clone());
                                 let _ = t.send_control(&hello).await;
@@ -5022,8 +5037,9 @@ async fn recv_run(
                                     // `fleet_greeted` here would leave it waiting
                                     // forever for a proof we refuse to re-send.
                                     if !fleet_verified.contains(&pid) {
-                                        if let Ok(hello) =
-                                            fleet::make_hello(&cb, &ports.env.display_name)
+                                        if let Ok(hello) = ports
+                                            .identity
+                                            .make_fleet_hello(&cb, &ports.env.display_name)
                                         {
                                             fleet_greeted.insert(pid.clone());
                                             let _ = t.send_control(&hello).await;
@@ -5050,7 +5066,7 @@ async fn recv_run(
                     let cb = conn
                         .transport_of(&pid)
                         .and_then(|t| in_binding(&t, &pid, &bind_ours, link_fps.as_ref()));
-                    let owner = fleet::my_owner_pub();
+                    let owner = ports.identity.fleet_owner_pub();
                     match (cb, owner) {
                         (Some(cb), Some(owner)) => {
                             match fleet::verify_hello(&v, &cb, &owner, identity::now_secs()) {
@@ -5111,8 +5127,9 @@ async fn recv_run(
                                     // Answer once, so a mutual hello terminates.
                                     if fleet_greeted.insert(pid.clone()) {
                                         if let Some(t) = conn.transport_of(&pid) {
-                                            if let Ok(hello) =
-                                                fleet::make_hello(&cb, &ports.env.display_name)
+                                            if let Ok(hello) = ports
+                                                .identity
+                                                .make_fleet_hello(&cb, &ports.env.display_name)
                                             {
                                                 let _ = t.send_control(&hello).await;
                                             }
@@ -5859,7 +5876,7 @@ async fn recv_run(
                         .iter()
                         .map(|(_, secret)| channel_of(secret))
                         .collect();
-                    if let Some(fc) = fleet::channel() {
+                    if let Some(fc) = ports.identity.fleet_channel() {
                         if !sess.channels.contains(&fc) {
                             sess.channels.push(fc);
                         }
@@ -5985,7 +6002,7 @@ async fn recv_run(
                 // L2: it opens nothing and only proves this end is here.
                 Some("reach-ping") => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        let _ = t.send_control(&RecvDaemon::liveness_pong(&v)).await;
+                        let _ = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
                     }
                 }
                 Some("reach-pong") => {
@@ -7492,9 +7509,7 @@ async fn recv_run(
                                     full: offer_full.clone(),
                                     inflight: Arc::new(AtomicI64::new(0)),
                                     end_seen: Arc::new(AtomicBool::new(false)),
-                                    completion: Arc::new(
-                                        filament_peerloop::recv::CompletionGate::default(),
-                                    ),
+                                    completion: Arc::new(crate::recv::CompletionGate::default()),
                                     ack_sid: 0,
                                     last_tick: 0,
                                     bar: conn.present.progress("(stdout)", size),
@@ -7711,9 +7726,7 @@ async fn recv_run(
                             full: effective_full,
                             inflight: Arc::new(AtomicI64::new(0)),
                             end_seen: Arc::new(AtomicBool::new(false)),
-                            completion: Arc::new(
-                                filament_peerloop::recv::CompletionGate::default(),
-                            ),
+                            completion: Arc::new(crate::recv::CompletionGate::default()),
                             ack_sid: 0,
                             last_tick: 0,
                             bar,
@@ -8840,6 +8853,10 @@ async fn recv_run(
 /// The shared cancellation error.
 pub fn cancelled() -> anyhow::Error {
     anyhow::anyhow!("cancelled")
+}
+
+fn link_nonce() -> Vec<u8> {
+    hex::decode(fresh_secret()).unwrap_or_else(|_| fresh_secret().into_bytes())
 }
 
 // ---- pure helpers moved with the loop ----

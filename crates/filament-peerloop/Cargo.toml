@@ -45,6 +45,7 @@ debug-logs = []
 # Versions copied verbatim from cli/Cargo.toml, so the dependency graph and
 # behaviour match the CLI build these modules came from.
 anyhow = "1.0.102"
+authkeys-managed = { path = "../authkeys-managed", version = "0.1.2" }
 async-trait = "0.1.89"
 # The mount protocol's path encoding: raw unix bytes, lossy UTF-8 elsewhere.
 base64 = "0.22"

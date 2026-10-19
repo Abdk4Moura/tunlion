@@ -129,7 +129,12 @@ pub trait RecvIdentity: Send + Sync {
         owner_pub: &[u8; 32],
         now: u64,
     ) -> anyhow::Result<bool>;
-    fn verify_depart(&self, device_pub: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool;
+    fn verify_depart(&self, device_pub: &[u8; 32], msg: &str, sig: &[u8; 64]) -> bool;
+    fn fleet_channel(&self) -> Option<String>;
+    fn fleet_rv(&self) -> Option<String>;
+    fn is_fleet_channel(&self, ch: &str) -> bool;
+    fn make_fleet_hello(&self, cb: &[u8], name: &str) -> anyhow::Result<Value>;
+    fn fleet_owner_pub(&self) -> Option<[u8; 32]>;
 }
 
 /// The devices store and capability writes: the mutating half the receive
@@ -184,7 +189,7 @@ pub trait RecvStore: Send + Sync {
     fn owner_signed_cap_ops(&self) -> Vec<Value>;
     fn mark_lapsed_now(&self, device_pub: &[u8; 32]) -> Option<String>;
     fn sanitize_device_name(&self, name: &str) -> String;
-    fn devices_find_by_device_pub(&self, device_pub: &[u8; 32]) -> Option<String>;
+    fn devices_find_by_device_pub(&self, device_pub: &[u8; 32]) -> Option<Value>;
     fn any_shell_grant(&self) -> bool;
 }
 
@@ -342,7 +347,6 @@ pub trait RecvDaemon: Send + Sync {
     async fn reach_ping(&mut self, conn: &Conn, pid: &str, v: &Value);
     async fn reach_pong(&mut self, conn: &Conn, pid: &str, v: &Value);
     fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool;
-    fn liveness_pong(v: &Value) -> Value;
     async fn warm_bootstrap(
         &mut self,
         conn: &Conn,
@@ -362,7 +366,7 @@ pub trait RecvDaemon: Send + Sync {
         owner_pub: &[u8; 32],
         now: u64,
     ) -> anyhow::Result<bool>;
-    fn verify_depart(&self, device_pub: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool;
+    fn verify_depart(&self, device_pub: &[u8; 32], msg: &str, sig: &[u8; 64]) -> bool;
     fn fleet_share_root(&self) -> PathBuf;
     fn mark_daemon_ready(&mut self);
     fn record_proxy(&self, bind: &str, port: u16);
@@ -417,6 +421,7 @@ pub struct RecvPorts {
     pub servers: Box<dyn RecvServers>,
     pub daemon: Box<dyn RecvDaemon>,
     pub prompt: Arc<dyn RecvPrompt>,
+    pub present: Arc<dyn crate::present::Presentation>,
     pub env: RecvEnv,
 }
 
@@ -427,6 +432,7 @@ impl RecvPorts {
         servers: Box<dyn RecvServers>,
         daemon: Box<dyn RecvDaemon>,
         prompt: Arc<dyn RecvPrompt>,
+        present: Arc<dyn crate::present::Presentation>,
         env: RecvEnv,
     ) -> Self {
         Self {
@@ -435,6 +441,7 @@ impl RecvPorts {
             servers,
             daemon,
             prompt,
+            present,
             env,
         }
     }

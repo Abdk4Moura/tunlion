@@ -46,8 +46,7 @@ pub(crate) static NO_RELAY: std::sync::atomic::AtomicBool =
 /// Set when `--remember <name>` actually stored a record this run (send or
 /// receive), cleared when the other side declined it. Read once the transfer
 /// is over so `--remember` is never silently a no-op.
-pub(crate) static REMEMBER_STORED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub(crate) use filament_peerloop::recv::dispatch::REMEMBER_STORED;
 
 /// The name a sending `--remember` stored under, until the receiver's answer
 /// settles it. The sender says ONE outcome: it used to print "remembered this
