@@ -561,51 +561,12 @@ async fn handle_forward_open(
 }
 
 /// The refusal for a shell-class open while serving is OFF here (`off` is
-/// ShellOff or TunnelOff). Its remedy is a grant, which is wrong for a
-/// delegated device whose invitation ceiling excludes shell: `grant` refuses
-/// exactly that, so the device was handed a command that would fail. Such a
-/// device gets the ceiling refusal instead, whose remedy is the re-enrolment.
+/// ShellOff or TunnelOff). The ceiling-aware decision and the one consent ask
+/// moved to `filament_peerloop::shell::off` with the admission endpoint; this
+/// keeps the old call-site name for `l2-open` and `shell-bootstrap`, and is not
+/// a second rule.
 fn serving_off_refusal(conn: &Conn, pid: &str, off: crate::refusal::Code) -> crate::refusal::Refusal {
-    let who = conn.link(pid).and_then(|l| l.verified_name.clone());
-    let outside = who.as_deref().and_then(crate::principal_ceiling_for).is_some_and(|c| {
-        crate::pair_cmd::grant_vs_ceiling(Some(c.as_slice()), cap::CAP_SHELL, false)
-            == crate::pair_cmd::GrantVsCeiling::OutsideCeiling
-    });
-    let code = if outside { crate::refusal::Code::Ceiling } else { off };
-    // A proven device asking for a shell on a machine that serves none is
-    // exactly what the owner's Asks list is for. Only the gate path used to
-    // record it, and that path is not reached while serving is off (plain
-    // `tunlion up`, the default), so the ask was refused and forgotten: the
-    // owner never saw it (launch matrix D06).
-    if let Some(peer) = serving_off_ask(&code, who.as_deref()) {
-        enqueue_if_requestable(peer, "shell");
-    }
-    crate::refusal::Refusal::new(code, who)
-}
-
-/// The device whose refused shell open becomes an ask, if any. Pure. Only a
-/// proven device, and only when granting could change the answer: a ceiling
-/// refusal cannot be lifted by a grant, so it asks nothing.
-fn serving_off_ask<'a>(code: &crate::refusal::Code, who: Option<&'a str>) -> Option<&'a str> {
-    match code {
-        crate::refusal::Code::ShellOff => who.filter(|w| !w.is_empty()),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod serving_off_ask_tests {
-    use super::serving_off_ask;
-    use crate::refusal::Code;
-
-    #[test]
-    fn a_proven_device_refused_while_serving_is_off_becomes_an_ask() {
-        assert_eq!(serving_off_ask(&Code::ShellOff, Some("dcode")), Some("dcode"));
-        // Unproven: nobody to ask on behalf of.
-        assert_eq!(serving_off_ask(&Code::ShellOff, None), None);
-        // A ceiling refusal cannot be granted away, so it is not an ask.
-        assert_eq!(serving_off_ask(&Code::Ceiling, Some("dinv")), None);
-    }
+    filament_peerloop::shell::off::serving_off_refusal(conn, pid, off)
 }
 
 /// Accept one `pty-open` frame: validate, shell-gate, attach or spawn,
@@ -623,123 +584,65 @@ async fn handle_pty_open(
     l2_enabled: bool,
     parked: &mut Vec<ParkedOpen>,
 ) {
-    let Some(t) = conn.transport_of(&pid) else {
-        crate::conn::dropped_no_transport(&pid, "pty open");
-        return;
-    };
-    // #219: the acceptor is OFF (plain `up`, no --shell/--shell-only,
-    // no TUNLION_L2). The peer is visibly up but cannot serve a
-    // shell, and dropping the open silently made `shell` hang with
-    // no output. Say so, so the initiator errors instead of waiting.
-    if !l2_enabled {
-        let sid = l2::wire_sid(&v).unwrap_or(0);
-        let refusal = serving_off_refusal(conn, &pid, crate::refusal::Code::ShellOff);
-        let _ = t.send_control(&refusal.close_frame(sid)).await;
-        return;
-    }
-    // wire_sid rejects a missing OR out-of-range sid instead of
-    // defaulting to 0 / wrapping into a forged is_l2_sid value.
-    let Some(sid) = l2::wire_sid(&v) else {
-        return;
-    };
-    if !l2::is_l2_sid(sid) {
-        return;
-    }
-    // One shared shell gate (same function, same inputs as
-    // exec-open): gather, then the pty entry point. The tells
-    // below stay local; only the verdict is shared.
-    let (dev, gate_inputs) = crate::shell_gate::gather_shell_gate_inputs(
-        &mut *conn,
+    let admission = filament_peerloop::shell::admit::admit_pty_open(
+        conn,
         &pid,
-        &shell_policy,
-        cap::CAP_SHELL,
-    );
-    if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
-        // Settle-then-evaluate: park for re-drive on proof when this deny
-        // is attributable to the unproven binding; else the live verdict.
-        if park_on_deny(
-            parked,
-            conn,
-            &pid,
-            ParkKind::Pty,
-            &t,
+        v,
+        &filament_peerloop::shell::admit::ShellAdmissionConfig {
+            policy: shell_policy,
+            serving: l2_enabled,
+        },
+        || {
+            shell_user.is_some()
+                && crate::shell_root_note().is_empty()
+                && shell_argv(None, shell_user.as_deref()).1
+        },
+    )
+    .await;
+    let (t, sid, dev, device_pub, plan) = match admission {
+        filament_peerloop::shell::admit::ShellAdmission::Admitted {
+            transport,
             sid,
-            v,
-            cap_reason.as_deref().unwrap_or("no shell cap / untrusted"),
-        )
-        .await
-        {
+            device,
+            device_pub,
+            plan,
+        } => (transport, sid, device, device_pub, plan),
+        filament_peerloop::shell::admit::ShellAdmission::Ignored => return,
+        filament_peerloop::shell::admit::ShellAdmission::Denied(d) => {
+            // Settle-then-evaluate: park for re-drive on proof when this deny
+            // is attributable to the unproven binding; else the live verdict.
+            if park_on_deny(
+                parked,
+                conn,
+                &pid,
+                ParkKind::Pty,
+                &d.transport,
+                d.sid,
+                v,
+                &d.reason,
+            )
+            .await
+            {
+                return;
+            }
+            let who = d.device.as_deref().unwrap_or("<unverified>");
+            conn.log.say(&format!("l2: pty refused: {who}: {}", d.reason));
+            enqueue_if_requestable(who, "shell");
+            // The refusal already carries the precise code and our name for
+            // the peer (a missing grant is not "serving is off"); the caller
+            // adds the invite details exactly where it did before.
+            let refusal =
+                crate::refusal::with_reinvite_for(d.refusal, d.device_pub.as_ref());
+            let _ = d.transport.send_control(&refusal.close_frame(d.sid)).await;
             return;
         }
-        let who = dev.as_deref().unwrap_or("<unverified>");
-        conn.log.say(&format!(
-            "l2: pty refused: {who}: {}",
-            cap_reason.as_deref().unwrap_or("no shell cap / untrusted")
-        ));
-        enqueue_if_requestable(who, "shell");
-        // Carry the specific cap reason (e.g. CEILING_REASON,
-        // "device revoked") to the peer; the generic string was
-        // produced and then thrown away before it crossed the wire,
-        // so the initiator read an empty success instead of the
-        // refusal. The fallback stays coarse on purpose.
-        // With a precise code and our name for the peer, so its remedy is
-        // the one that applies (a missing grant is not "serving is off").
-        let refusal = crate::refusal::with_reinvite_for(
-            crate::refusal::Refusal::from_shell_gate(
-                gate_inputs.cert_revoked,
-                gate_inputs.denied,
-                cap_reason.as_deref(),
-                dev.clone(),
-            ),
-            gate_inputs.idev.as_ref(),
-        );
-        let _ = t.send_control(&refusal.close_frame(sid)).await;
-        return;
-    }
-    // A configured user drop (`--shell-user`, or `set shell-user` applied
-    // live) needs root for runuser. Without it the spawn "succeeds" into a
-    // shell that dies at once with runuser's own complaint; refuse up front
-    // and say which setting is the problem. `shell_argv(..).1` is false where
-    // the platform ignores --shell-user entirely (nothing to drop to there).
-    if shell_user.is_some()
-        && crate::shell_root_note().is_empty()
-        && shell_argv(None, shell_user.as_deref()).1
-    {
-        let refusal =
-            crate::refusal::Refusal::new(crate::refusal::Code::UserDropUnavailable, dev.clone());
-        conn.log.say(&format!("l2: pty refused: {}", refusal.reason));
-        let _ = t.send_control(&refusal.close_frame(sid)).await;
-        return;
-    }
-    let cols = v["cols"].as_u64().unwrap_or(80) as u16;
-    let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-    // #4: a stable, client-chosen session id binds reconnects to
-    // the same persistent PTY. DEVICE-SCOPED: prefixed with the
-    // verified device so a client id from device A can never
-    // address device B's session (no cross-device collision or
-    // hijack) - the random per-invocation client id then only
-    // needs to be unique per device. Absent (older client) -> a
-    // per-sid id that never reattaches (old behavior).
-    let session_id = match v["session"]
-        .as_str()
-        .filter(|s| !s.is_empty() && s.len() <= 128)
-    {
-        Some(s) => format!("{}\u{1}{}", dev.as_deref().unwrap_or(&pid), s),
-        None => format!("{pid}:{sid:#x}"),
     };
-    // $TERM forwarded by the client (so the remote matches the
-    // user's actual terminal); validated + capped, sane default.
-    let term = v["term"]
-        .as_str()
-        .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_graphic()))
-        .unwrap_or("xterm-256color")
-        .to_string();
-    // One-shot command (non-empty when pty one-shot was requested).
-    let pty_cmd = v["cmd"].as_str().unwrap_or("").to_string();
-    // RESUME-ONLY (warm-drop fall-through): the client wants to
-    // REATTACH an existing session and never start a fresh shell, so a
-    // clean warm exit can't turn into a surprise re-login.
-    let resume = v["resume"].as_bool().unwrap_or(false);
+    let session_id = plan.session;
+    let term = plan.term;
+    let pty_cmd = plan.cmd;
+    let resume = plan.resume;
+    let cols = plan.cols;
+    let rows = plan.rows;
     let mux = l2_muxes
         .entry(pid.clone())
         .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
@@ -773,7 +676,7 @@ async fn handle_pty_open(
             .await;
         // How much output the client already has, so only the missed part is
         // replayed (absent from older clients and the browser: replay all).
-        sess.attach(t.clone(), sid, v["resume_from"].as_u64());
+        sess.attach(t.clone(), sid, plan.resume_from);
         sess.resize(cols, rows);
         pty_bindings
             .entry(pid.clone())
@@ -844,13 +747,12 @@ async fn handle_pty_open(
     } else {
         shell_host.exec_cmd_args(&pty_cmd)
     };
-    // The peer's device key, resolved again for the live session's
-    // revocation re-check (the gate above resolved the same value for
-    // the open decision; this is that same value).
-    let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+    // The peer's device key, from the admission that just decided (the gate
+    // resolved the same value for the open decision; no second lookup).
+    let spawn_idev = device_pub;
     // Ceiling-admitted (covered, grantless) sessions must die
     // when the ceiling narrows; grant-admitted ones ignore it.
-    let admitted_via_ceiling = gate_inputs.ceiling_covers && !gate_inputs.has_grant;
+    let admitted_via_ceiling = plan.admitted_via_ceiling;
     match l2::spawn_pty_session(
         pty_sessions.clone(),
         session_id.clone(),
@@ -2916,18 +2818,14 @@ async fn recv_run(
                 };
                 match p.kind {
                     ParkKind::Exec => {
-                        let mux = l2_muxes
-                            .entry(p.pid.clone())
-                            .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
-                            .clone();
                         exec_recv::handle_exec_open(
                             &mut conn,
                             &p.pid,
-                            t,
-                            mux,
                             &p.v,
                             &shell_policy,
                             &shell_user,
+                            &mut l2_muxes,
+                            l2_enabled,
                             &mut parked_opens,
                         )
                         .await;
@@ -6335,16 +6233,6 @@ async fn recv_run(
                     }
                     continue;
                 }
-                // exec-open when serving is off: refuse loudly like l2-open, so
-                // the caller errors instead of hanging on a silent drop.
-                Some("exec-open") if !l2_enabled => {
-                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
-                        let refusal =
-                            serving_off_refusal(&conn, &pid, crate::refusal::Code::ShellOff);
-                        let _ = t.send_control(&refusal.close_frame(sid)).await;
-                    }
-                    continue;
-                }
                 // NOTE: keep this arm ABOVE the `#[cfg(unix)]` comment block
                 // below. That attribute belongs to `shell-bootstrap`, and an
                 // outer attribute binds to the NEXT arm regardless of any
@@ -6640,22 +6528,14 @@ async fn recv_run(
                     continue;
                 }
                 Some("exec-open") => {
-                    let Some(t) = conn.transport_of(&pid) else {
-                        crate::conn::dropped_no_transport(&pid, "exec-open");
-                        continue;
-                    };
-                    let mux = l2_muxes
-                        .entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
-                        .clone();
                     exec_recv::handle_exec_open(
                         &mut conn,
                         &pid,
-                        t,
-                        mux,
                         &v,
                         &shell_policy,
                         &shell_user,
+                        &mut l2_muxes,
+                        l2_enabled,
                         &mut parked_opens,
                     )
                     .await;
