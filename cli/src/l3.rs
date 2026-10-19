@@ -758,12 +758,18 @@ impl L3 {
             let mut installed = self.exit_route_installed.lock().await;
             if defaults.is_empty() {
                 if *installed {
-                    if let Err(e) = crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan())
-                    {
-                        crate::ui::debug(&format!("  could not withdraw the exit route: {e}"));
+                    match reconcile_installed_flag(&mut installed, false, || {
+                        crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan())
+                            .map_err(|e| e.to_string())
+                    }) {
+                        Ok(true) => {
+                            crate::ui::say("  exit route withdrawn; traffic uses the ordinary path again");
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            crate::ui::debug(&format!("  could not withdraw the exit route: {e}"));
+                        }
                     }
-                    *installed = false;
-                    crate::ui::say("  exit route withdrawn; traffic uses the ordinary path again");
                 }
                 return;
             }
@@ -1379,6 +1385,25 @@ where
     errors
 }
 
+/// Apply an exit-route state transition, committing the tracked state only when
+/// the OS operation succeeds. A failed teardown therefore remains pending for
+/// the next route reconciliation.
+fn reconcile_installed_flag<F>(
+    installed: &mut bool,
+    desired: bool,
+    apply: F,
+) -> Result<bool, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    if *installed == desired {
+        return Ok(false);
+    }
+    apply()?;
+    *installed = desired;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod route_reconcile_tests {
     use super::reconcile_installed_routes;
@@ -1422,6 +1447,27 @@ mod route_reconcile_tests {
         assert!(errors.is_empty());
         assert_eq!(delete_calls, 2);
         assert!(!installed.contains("192.0.2.0/24"));
+    }
+
+    #[test]
+    fn failed_exit_route_teardown_remains_pending_and_retries() {
+        let mut installed = true;
+        let mut teardown_calls = 0;
+
+        let result = reconcile_installed_flag(&mut installed, false, || {
+            teardown_calls += 1;
+            Err("simulated teardown failure".to_string())
+        });
+        assert_eq!(result, Err("simulated teardown failure".to_string()));
+        assert!(installed, "failure must preserve the believed-installed state");
+
+        let result = reconcile_installed_flag(&mut installed, false, || {
+            teardown_calls += 1;
+            Ok(())
+        });
+        assert_eq!(result, Ok(true));
+        assert_eq!(teardown_calls, 2);
+        assert!(!installed, "successful retry clears the pending teardown");
     }
 }
 
