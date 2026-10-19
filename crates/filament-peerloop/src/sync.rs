@@ -624,7 +624,7 @@ pub mod serving {
         {
             let _ = (record, commit_state);
             discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
-            bail!("sync file receive is disabled on Windows until ancestor-safe handle-relative staging is available");
+            bail!("Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed");
         }
         #[cfg(not(windows))]
         {
@@ -1013,7 +1013,11 @@ pub mod serving {
             let replies = outgoing_json(&transport);
             assert_eq!(replies[1]["type"], "file-ack");
             assert_eq!(replies[1]["ok"], false);
-            assert!(replies[1]["err"].as_str().unwrap().contains("disabled on Windows"));
+            let reason = replies[1]["err"].as_str().unwrap();
+            assert_eq!(
+                reason,
+                "Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed",
+            );
             assert_eq!(mux.live_streams().await, 0);
         }
 
