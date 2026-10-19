@@ -15,6 +15,19 @@ the GitHub release notes.
   cache path defaults to `None`, never the current directory. The shared
   diagnostic hooks (`trace`, `debug`, `say`, `critical`) remain process-wide.
 
+### Fixed
+
+- The first command typed into `tunlion shell` before the remote prompt appears
+  now runs when Enter is pressed. Input typed ahead is captured while the local
+  terminal is still in cooked mode, where Enter arrives as LF; a Windows ConPTY
+  shell (PowerShell/PSReadLine) treats LF as a new line in the edit buffer
+  rather than a submit, so the command sat behind a `>>` continuation prompt and
+  its output only appeared, out of order, after a later command. Typeahead now
+  restores the CR a raw terminal sends. Piped stdin and raw-mode keystrokes are
+  unchanged, including a deliberate Ctrl-J to a remote TUI. With a tty stdin
+  and a piped stdout (where raw mode is never entered) the same restoration
+  applies for the whole session, and a CRLF split across reads stays one Enter.
+
 ## [0.9.0]
 
 ### Added
