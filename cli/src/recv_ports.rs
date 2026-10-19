@@ -963,6 +963,26 @@ impl RecvDaemon for CliRecv {
     fn daemon_alive(&self) -> Option<u32> {
         crate::daemon_alive()
     }
+    async fn start_proxy(
+        &mut self,
+        server: &str,
+        relay: bool,
+    ) -> std::result::Result<(u16, Vec<String>), String> {
+        let (listener, port) = l2::bind_auto_proxy(1080).await?;
+        let tok = l2::proxy_token().map_err(|e| format!("cannot create its token: {e}"))?;
+        self.record_proxy("127.0.0.1", port);
+        let server = server.to_string();
+        tokio::spawn(async move {
+            if let Err(e) =
+                l2::proxy_serve(&server, listener, "127.0.0.1", port, 0, relay, tok.into()).await
+            {
+                // A proxy that stops is reported on the daemon log; the loop
+                // does not own its lifetime.
+                eprintln!("auto-proxy on 127.0.0.1:{port} stopped: {e}");
+            }
+        });
+        Ok((port, l2::proxy_usage_lines("127.0.0.1", port)))
+    }
     fn sdnotify_ready(&self) {
         crate::sdnotify::ready()
     }

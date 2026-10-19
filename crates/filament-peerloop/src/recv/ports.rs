@@ -386,6 +386,12 @@ pub trait RecvDaemon: Send + Sync {
     /// Start the optional overlay servers (sshd overlay, subnet forward).
     async fn start_overlay_servers(&mut self, host: &dyn HostServices) -> Vec<String>;
     fn daemon_alive(&self) -> Option<u32>;
+    /// Bind/spawn the userspace SOCKS5 proxy; returns its port and usage lines.
+    async fn start_proxy(
+        &mut self,
+        server: &str,
+        relay: bool,
+    ) -> std::result::Result<(u16, Vec<String>), String>;
     fn sdnotify_ready(&self);
     fn sdnotify_status(&self, status: &str);
     fn sdnotify_watchdog(&self);
@@ -435,24 +441,6 @@ impl RecvPorts {
             env,
         }
     }
-}
-
-/// Wind down the sync serve tasks the dispatch admitted. Kept here because it
-/// is loop state, not a host fact.
-pub(crate) async fn track_sync_task(
-    tasks: &Arc<std::sync::Mutex<HashMap<(String, u32), SyncServeTask>>>,
-    pid: String,
-    sid: u32,
-    task: SyncServeTask,
-    log: &dyn crate::host::LogSink,
-) {
-    let key = (pid, sid);
-    let previous = tasks.lock().unwrap().remove(&key);
-    if let Some(previous) = previous {
-        previous.cancel();
-        crate::recv::dispatch::report_sync_join(log, &key.0, key.1, previous.join().await);
-    }
-    tasks.lock().unwrap().insert(key, task);
 }
 
 /// Unused imports that keep the public signatures readable.

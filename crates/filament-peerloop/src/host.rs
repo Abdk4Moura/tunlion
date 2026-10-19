@@ -333,8 +333,10 @@ pub trait HostServices: Send + Sync + 'static {
         Err("auto-extract is not available on this host".to_string())
     }
     /// Append the receiver's structured transfer-history record.
+    #[cfg(feature = "dispatch")]
     fn record_received_file(&self, _record: &crate::recv::files::ReceivedFileRecord) {}
     /// Append one line to the daemon's upload log, if it keeps one.
+    #[cfg(feature = "dispatch")]
     fn append_receive_log(&self, _line: &str) {}
     /// Every known device as `(petname, rendezvous secret)`.
     fn devices_load(&self) -> Vec<(String, String)>;

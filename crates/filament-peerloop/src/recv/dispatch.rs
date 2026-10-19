@@ -878,7 +878,7 @@ impl RecvCleanup {
     }
 }
 
-fn report_sync_join(
+pub fn report_sync_join(
     log: &dyn LogSink,
     pid: &str,
     sid: u32,
@@ -1559,35 +1559,8 @@ async fn recv_run(
                                     // Bind FIRST, then say what is true. Another daemon
                                     // (another HOME on this machine) or a hand-started
                                     // proxy may hold 1080 already.
-                                    let bound = match l2::bind_auto_proxy(1080).await {
-                                        Ok((listener, port)) => match l2::proxy_token() {
-                                            Ok(tok) => Ok((listener, port, tok)),
-                                            Err(e) => Err(format!("cannot create its token: {e}")),
-                                        },
-                                        Err(why) => Err(why),
-                                    };
-                                    match bound {
-                                        Ok((listener, port, tok)) => {
-                                            ports.daemon.record_proxy("127.0.0.1", port);
-                                            let server = server.to_string();
-                                            let proxy_log = log.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(e) = l2::proxy_serve(
-                                                    &server,
-                                                    listener,
-                                                    "127.0.0.1",
-                                                    port,
-                                                    0,
-                                                    relay,
-                                                    tok.into(),
-                                                )
-                                                .await
-                                                {
-                                                    proxy_log.critical(&format!(
-                                                        "auto-proxy on 127.0.0.1:{port} stopped: {e}"
-                                                    ));
-                                                }
-                                            });
+                                    match ports.daemon.start_proxy(&server, relay).await {
+                                        Ok((port, lines)) => {
                                             let note = if port == 1080 {
                                                 String::new()
                                             } else {
@@ -1597,10 +1570,7 @@ async fn recv_run(
                                                 "  {} started SOCKS5 proxy on 127.0.0.1:{port}{note} (set your tools' proxy to this)",
                                                 log.paint(Tone::Ok, log.glyph_ok())
                                             ));
-                                            // The proxy opens mesh streams as this owner, so it
-                                            // requires the password in the token file; the
-                                            // proxy's own banner prints how to pass it.
-                                            for line in l2::proxy_usage_lines("127.0.0.1", port) {
+                                            for line in lines {
                                                 log.say(&format!("  {line}"));
                                             }
                                         }
@@ -2162,7 +2132,7 @@ async fn recv_run(
                                             // black-hole the SYN, and an unbounded dial held
                                             // the proxy's client with no reply at all.
                                             let t0 = std::time::Instant::now();
-                                            match tokio::time::timeout(l2::OVERLAY_DIAL_BOUND, m.dial(addr, port)).await {
+                                            match tokio::time::timeout(OVERLAY_DIAL_BOUND, m.dial(addr, port)).await {
                                                 Ok(Ok(mut stream)) => {
                                                     // An exposed port's overlay listener completes
                                                     // the handshake before `expose` dials what is
@@ -2170,11 +2140,11 @@ async fn recv_run(
                                                     // Settle first: the peer closing at once means
                                                     // nothing listens there (SOCKS 0x05), and the
                                                     // proxy must not say "granted" and then hold.
-                                                    let window = l2::overlay_settle_window(t0.elapsed());
+                                                    let window = overlay_settle_window(t0.elapsed());
                                                     let mut first = vec![0u8; 16 * 1024];
                                                     let got = match tokio::time::timeout(window, tokio::io::AsyncReadExt::read(&mut stream, &mut first)).await {
                                                         Ok(Ok(0)) | Ok(Err(_)) => {
-                                                            req.reject(l2::OVERLAY_TARGET_CLOSED).await;
+                                                            req.reject(OVERLAY_TARGET_CLOSED).await;
                                                             return;
                                                         }
                                                         Ok(Ok(n)) => n,
@@ -2187,7 +2157,7 @@ async fn recv_run(
                                                     let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
                                                 }
                                                 Ok(Err(e)) => req.reject(&format!("overlay dial failed: {e}")).await,
-                                                Err(_) => req.reject(l2::OVERLAY_DIAL_TIMED_OUT).await,
+                                                Err(_) => req.reject(OVERLAY_DIAL_TIMED_OUT).await,
                                             }
                                         });
                                     }
@@ -5327,7 +5297,7 @@ async fn recv_run(
                 Some("fleet-rendezvous") if fleet_verified.contains(&pid) => {
                     match v["secret"].as_str() {
                         Some(sec) if hex::decode(sec).map(|b| b.len()).ok() == Some(32) => {
-                            let ch = channel_of(sec);
+                            let ch = host.channel_of(sec);
                             // Who brokered it, as PROVEN on this link by its
                             // fleet-hello. A link verified but missing any of
                             // these is not one to accept a meeting place from.
@@ -5462,12 +5432,9 @@ async fn recv_run(
                                                     // For promote, use Device-scope as fixed convention for pair
                                                     let scope =
                                                         filament_id::IntroScope::Device.to_byte();
-                                                    match with_devices_mut(|arr| {
-                                                        identity::apply_peer_identity(
-                                                            arr, &who, &prov_cert, scope,
-                                                        )
-                                                        .map_err(|e| anyhow::anyhow!("{}", e))
-                                                    }) {
+                                                    match ports.store.promote_provisional_identity(
+                                                        &who, &prov_cert, scope,
+                                                    ) {
                                                         Ok(_) => {
                                                             // Write durable anchor only after overlay assertion passes
                                                             ports
@@ -5888,7 +5855,7 @@ async fn recv_run(
                     devices = host.devices_load();
                     sess.channels = devices
                         .iter()
-                        .map(|(_, secret)| channel_of(secret))
+                        .map(|(_, secret)| host.channel_of(secret))
                         .collect();
                     if let Some(fc) = ports.identity.fleet_channel() {
                         if !sess.channels.contains(&fc) {
@@ -6780,9 +6747,9 @@ async fn recv_run(
                     };
                     if let Some(iname) = stored {
                         devices.push((iname.clone(), isec.clone()));
-                        sess.channels.push(channel_of(&isec)); // C30
+                        sess.channels.push(host.channel_of(&isec)); // C30
                         sess.touch();
-                        sio.emit("subscribe", json!({ "channels": [channel_of(&isec)] }))
+                        sio.emit("subscribe", json!({ "channels": [host.channel_of(&isec)] }))
                             .await
                             .ok();
                         log.say(&format!(
@@ -8871,6 +8838,17 @@ pub fn cancelled() -> anyhow::Error {
 
 fn link_nonce() -> Vec<u8> {
     hex::decode(fresh_secret()).unwrap_or_else(|_| fresh_secret().into_bytes())
+}
+
+const OVERLAY_DIAL_BOUND: Duration = Duration::from_secs(3);
+const OVERLAY_DIAL_TIMED_OUT: &str = "overlay dial timed out";
+const OVERLAY_TARGET_CLOSED: &str =
+    "overlay dial refused: nothing is listening behind the exposed port there";
+const OVERLAY_SETTLE_MAX: Duration = Duration::from_millis(1500);
+
+fn overlay_settle_window(handshake: Duration) -> Duration {
+    (handshake * 2 + Duration::from_millis(150))
+        .clamp(Duration::from_millis(250), OVERLAY_SETTLE_MAX)
 }
 
 // ---- pure helpers moved with the loop ----
