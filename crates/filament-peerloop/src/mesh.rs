@@ -18,6 +18,9 @@ use std::sync::Arc;
 use filament_overlay::Announce;
 use filament_transport::net::Transport;
 
+pub mod route;
+pub use route::{RouteAcceptance, RoutePolicy, accept_advertised};
+
 /// The TUN interface name the daemon creates for the overlay.
 pub const IFNAME: &str = "tunlion0";
 
