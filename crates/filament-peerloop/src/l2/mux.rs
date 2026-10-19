@@ -1032,6 +1032,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "forward-server")]
     #[tokio::test]
     async fn simultaneous_muxes_dial_through_their_own_hosts_without_fallback() {
         let ta = MockTransport::new();
@@ -1128,6 +1129,7 @@ mod tests {
 
     /// H-1: the per-link stream cap refuses opens beyond MAX_STREAMS_PER_LINK with
     /// an `l2-close{err:"too many streams"}`, and does NOT register the stream.
+    #[cfg(feature = "forward-server")]
     #[tokio::test]
     async fn per_link_stream_cap_refuses_over_limit() {
         let mux = Mux::new(MockTransport::new(), Arc::new(NoHost));
@@ -1204,6 +1206,7 @@ mod tests {
     /// `accepted` guard); a later `l2-open` naming the SAME S must be DENIED
     /// ("sid in use") rather than displace the pre-existing stream. `register` is
     /// now the chokepoint so every stream type inherits the protection.
+    #[cfg(feature = "forward-server")]
     #[tokio::test]
     async fn accept_control_denies_open_on_live_foreign_sid() {
         let mux = Mux::new(MockTransport::new(), Arc::new(NoHost));
@@ -1278,6 +1281,7 @@ mod tests {
     /// The seam's inert semantics: an explicitly inert host cannot be made
     /// to dial a peer-named target. The refusal takes the same `l2-close` path a
     /// failed dial always took, and the open is never acked.
+    #[cfg(feature = "forward-server")]
     #[tokio::test]
     async fn inert_host_refuses_a_peer_requested_dial() {
         let t = MockTransport::new();
