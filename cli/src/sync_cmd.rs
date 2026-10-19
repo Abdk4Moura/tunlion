@@ -547,7 +547,7 @@ pub(crate) async fn handle_sync_open(
     v: &Value,
     muxes: &mut l2::MuxMap,
     drop_dir: &Path,
-    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
+    parked: &mut Vec<filament_peerloop::recv::dispatch::ParkedOpen>,
 ) -> Option<(u32, sync::serving::SyncServeTask)> {
     match sync::admit_sync_open(conn, pid, v, muxes, drop_dir).await {
         SyncAdmission::Accepted(a) => {

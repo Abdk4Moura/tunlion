@@ -56,7 +56,16 @@ use sha2::{Digest, Sha256};
 use crate::host::StorageFailure;
 use crate::present::{Progress as ProgressBar, human};
 
+pub mod ceremony;
+pub mod dispatch;
+pub mod events;
+pub mod files;
+pub mod fleet;
+pub mod lifecycle;
+pub mod ports;
 pub mod report;
+pub mod revocation;
+pub mod signaling_health;
 pub mod transfer_truth;
 
 // Re-exported at the receive module root so the CLI shim (and library callers)

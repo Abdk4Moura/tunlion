@@ -282,6 +282,13 @@ pub trait HostServices: Send + Sync + 'static {
     fn settings_get_bool(&self, _key: &str) -> bool {
         false
     }
+    /// The same boolean lookup with an optional per-peer override.
+    fn settings_get_bool_for(&self, key: &str, peer: Option<&str>) -> bool {
+        match peer {
+            None => self.settings_get_bool(key),
+            Some(_) => self.settings_get_bool(key),
+        }
+    }
     /// The owner user key, when this machine holds one. A joined device holds
     /// no user signing key, so this is `None` there.
     fn user_key(&self) -> Option<UserKey> {
@@ -306,6 +313,29 @@ pub trait HostServices: Send + Sync + 'static {
     fn storage_failure(&self, _e: &std::io::Error) -> Option<StorageFailure> {
         None
     }
+    /// Create a private directory (owner-only on unix) for a receive inbox
+    /// that was deleted while the daemon ran.
+    fn create_private_dir(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
+    /// Publish a finalized receive: the `.part` already holds the bytes; the
+    /// host applies the ordinary create mode through the handle before rename.
+    fn publish_received_file(&self, _file: &std::fs::File) -> std::io::Result<()> {
+        Ok(())
+    }
+    /// Extract an archive after a received file was stored, when the host's
+    /// settings ask for it. `Err` is a rendered reason, never fatal to storage.
+    fn extract_received_archive(
+        &self,
+        _path: &Path,
+        _dir: &Path,
+    ) -> std::result::Result<usize, String> {
+        Err("auto-extract is not available on this host".to_string())
+    }
+    /// Append the receiver's structured transfer-history record.
+    fn record_received_file(&self, _record: &crate::recv::files::ReceivedFileRecord) {}
+    /// Append one line to the daemon's upload log, if it keeps one.
+    fn append_receive_log(&self, _line: &str) {}
     /// Every known device as `(petname, rendezvous secret)`.
     fn devices_load(&self) -> Vec<(String, String)>;
     /// Same install (our own daemon / another process of this device)?

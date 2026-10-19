@@ -511,7 +511,7 @@ pub(crate) async fn handle_ssh_sign(
     t: std::sync::Arc<dyn crate::net::Transport>,
     v: &serde_json::Value,
     shell_policy: &crate::ShellPolicy,
-    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
+    parked: &mut Vec<filament_peerloop::recv::dispatch::ParkedOpen>,
 ) {
     // Refusals are GENERIC on the wire: every deny looks identical out
     // there, so a refused peer cannot oracle which check failed. The detail
