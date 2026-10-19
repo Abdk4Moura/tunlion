@@ -517,6 +517,89 @@ pub fn stdout_put(
     s.put(pos, data).map(|()| 1)
 }
 
+/// Exactly-once completion handshake between a stream's `file-end` control
+/// frame and its last background writer.
+///
+/// `inflight` and `end_seen` alone have a lost-wakeup window: the last writer
+/// can drop `inflight` to zero and read `end_seen == false` after file-end read
+/// `inflight > 0` but before it stored `end_seen = true`. Both sides then defer
+/// to the other and the sid never completes.
+///
+/// File-end observes `inflight` on arrival; when writers were present it
+/// publishes `end_seen` and then takes a fresh observation instead of trusting
+/// the arrival one. The last writer decrements `inflight` and then re-reads
+/// `end_seen` (the classic Dekker store/load order, here with `SeqCst`).
+/// Whichever side observes the completed state claims the single completion
+/// through `queued`. File-end still returns `true` on the no-writer fast path;
+/// `false` means it deferred to the last writer or another side already
+/// claimed.
+#[derive(Default)]
+pub struct CompletionGate {
+    queued: AtomicBool,
+}
+
+impl CompletionGate {
+    /// File-end arrival. Observes the writers once, publishes `end_seen`, and
+    /// then takes a fresh observation before claiming. The second observation
+    /// is what closes the old read-then-store lost wakeup: a last writer may
+    /// have drained and checked `end_seen` between the arrival observation and
+    /// the publish.
+    pub fn file_end(&self, inflight: &AtomicI64, end_seen: &AtomicBool) -> bool {
+        self.file_end_with(inflight, end_seen, || {})
+    }
+
+    /// [`Self::file_end`] with a scheduling seam between the arrival
+    /// observation and the publish. Production passes a no-op. The regression
+    /// test uses it to run the last writer in the exact old window; reverting
+    /// to trusting the first observation makes that test claim zero.
+    fn file_end_with(
+        &self,
+        inflight: &AtomicI64,
+        end_seen: &AtomicBool,
+        between_observation_and_publish: impl FnOnce(),
+    ) -> bool {
+        let observed = inflight.load(Ordering::SeqCst);
+        if observed == 0 {
+            // No writer existed when file-end arrived: publish and claim the
+            // inline fast path without a second observation.
+            end_seen.store(true, Ordering::SeqCst);
+            return self.claim();
+        }
+        between_observation_and_publish();
+        // Publish before the decisive check. The old order trusted `observed`
+        // and deferred, so a writer that drained in between saw end_seen still
+        // false and never queued a completion.
+        end_seen.store(true, Ordering::SeqCst);
+        if inflight.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
+        self.claim()
+    }
+
+    /// Last-writer arrival, after `inflight.fetch_sub(1, SeqCst)` returned
+    /// `prev`. Claims only when that writer was the last and file-end had
+    /// already been observed.
+    pub fn last_writer(&self, prev: i64, end_seen: &AtomicBool) -> bool {
+        if prev != 1 || !end_seen.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.claim()
+    }
+
+    /// Reset for a verify re-request that puts the stream back into `by_sid`:
+    /// the next file-end/last-writer pair is a new completion opportunity.
+    pub fn reset(&self, end_seen: &AtomicBool) {
+        end_seen.store(false, Ordering::SeqCst);
+        self.queued.store(false, Ordering::SeqCst);
+    }
+
+    fn claim(&self) -> bool {
+        self.queued
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
+
 /// One incoming file being assembled on this side.
 ///
 /// Field-by-field the state the receive loop manipulates: the counters a
@@ -555,6 +638,10 @@ pub struct IncomingFile {
     /// if inflight writes are still pending. The last finishing writer checks
     /// this flag and emits Ev::MaybeComplete if both conditions are met.
     pub end_seen: Arc<AtomicBool>,
+    /// Shared with writer tasks: makes the file-end/last-writer completion
+    /// decision exactly-once even when both sides observe the other as
+    /// not-yet-arrived. See [`CompletionGate`].
+    pub completion: Arc<CompletionGate>,
     /// The sid to use in the delivery-ack message. Set from the file-end
     /// control frame; read by the MaybeComplete handler for the ack.
     pub ack_sid: u32,
@@ -879,6 +966,64 @@ mod tests {
         let mut h = Sha256::new();
         h.update(data);
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Regression for the file-end/last-writer lost wakeup. In the old order
+    /// file-end observed `inflight == 1`, the last writer drained to zero and
+    /// read `end_seen == false` (so it emitted nothing), then file-end stored
+    /// `end_seen` and returned "deferred": zero completions, and the SID hung.
+    ///
+    /// The seam runs the writer in exactly that window. New ordering publishes
+    /// end_seen before taking the decisive observation, so it must claim here;
+    /// reverting to trusting the arrival observation makes this assertion fail.
+    #[test]
+    fn completion_gate_does_not_lose_file_end_when_last_writer_finishes() {
+        let inflight = AtomicI64::new(1);
+        let end_seen = AtomicBool::new(false);
+        let gate = CompletionGate::default();
+
+        let mut completions = 0;
+        let file_end_claimed = gate.file_end_with(&inflight, &end_seen, || {
+            // Old file-end's arrival observation was inflight == 1. The last
+            // writer drains and checks end_seen while it is still unpublished.
+            let prev = inflight.fetch_sub(1, Ordering::SeqCst);
+            assert_eq!(prev, 1, "one last writer drains");
+            if gate.last_writer(prev, &end_seen) {
+                completions += 1;
+            }
+            assert_eq!(
+                completions, 0,
+                "the writer cannot complete before end_seen is published"
+            );
+        });
+        if file_end_claimed {
+            completions += 1;
+        }
+        assert!(
+            file_end_claimed,
+            "file-end must claim after the last writer drained in the old window"
+        );
+        assert!(
+            end_seen.load(Ordering::SeqCst),
+            "file-end published end_seen"
+        );
+        // The writer side cannot claim a second completion for the same end.
+        if gate.last_writer(1, &end_seen) {
+            completions += 1;
+        }
+        assert_eq!(completions, 1, "exactly one completion");
+    }
+
+    /// End-before-write fast path: file-end arrives with no writer, publishes
+    /// end_seen and claims inline exactly once.
+    #[test]
+    fn completion_gate_claims_end_before_write_inline() {
+        let inflight = AtomicI64::new(0);
+        let end_seen = AtomicBool::new(false);
+        let gate = CompletionGate::default();
+        assert!(gate.file_end(&inflight, &end_seen));
+        assert!(end_seen.load(Ordering::SeqCst));
+        assert!(!gate.last_writer(1, &end_seen), "no second completion");
     }
 
     const HEAD_BYTES: u64 = 256 * 1024;

@@ -1178,6 +1178,28 @@ impl WriterTasks {
         }
     }
 
+    /// Join this stream's writers before a verify re-request re-arms its
+    /// completion gate. A post-decrement writer that has not yet reached its
+    /// claim would otherwise be able to claim the next generation. At an
+    /// inflight==0 retry point these writers have finished their bytes and are
+    /// only returning, so this is bounded.
+    async fn join_sid(&self, pid: &str, sid: u32, log: &dyn LogSink) {
+        let ids: Vec<u64> = self
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, task)| task.pid == pid && task.sid == sid)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let task = self.tasks.lock().unwrap().remove(&id);
+            if let Some(task) = task {
+                report_writer_join(log, &task.pid, task.sid, task.handle.await);
+            }
+        }
+    }
+
     /// Await every remaining write. Never aborts: the write was admitted and
     /// must finish (or panic) before the caller flushes or finalizes its state.
     async fn join_all(&self, log: &dyn LogSink) {
@@ -1215,6 +1237,7 @@ fn report_writer_join(
 struct InflightGuard {
     inflight: Arc<AtomicI64>,
     end_seen: Arc<AtomicBool>,
+    completion: Arc<filament_peerloop::recv::CompletionGate>,
     tx: mpsc::UnboundedSender<Ev>,
     write_err: Arc<Mutex<Option<crate::recv_files::WriteFailure>>>,
     pid: String,
@@ -1236,8 +1259,10 @@ impl Drop for InflightGuard {
                 });
             }
         }
-        let prev = self.inflight.fetch_sub(1, Ordering::Relaxed);
-        if prev == 1 && self.end_seen.load(Ordering::Relaxed) {
+        // SeqCst pairs with CompletionGate::file_end's store/load order so the
+        // file-end and this last writer cannot both miss the other.
+        let prev = self.inflight.fetch_sub(1, Ordering::SeqCst);
+        if self.completion.last_writer(prev, &self.end_seen) {
             let _ = self.tx.send(Ev::MaybeComplete(self.pid.clone(), self.sid));
         }
     }
@@ -7941,6 +7966,9 @@ async fn recv_run(
                                     full: offer_full.clone(),
                                     inflight: Arc::new(AtomicI64::new(0)),
                                     end_seen: Arc::new(AtomicBool::new(false)),
+                                    completion: Arc::new(
+                                        filament_peerloop::recv::CompletionGate::default(),
+                                    ),
                                     ack_sid: 0,
                                     last_tick: 0,
                                     bar: conn.present.progress("(stdout)", size),
@@ -8112,6 +8140,9 @@ async fn recv_run(
                             full: effective_full,
                             inflight: Arc::new(AtomicI64::new(0)),
                             end_seen: Arc::new(AtomicBool::new(false)),
+                            completion: Arc::new(
+                                filament_peerloop::recv::CompletionGate::default(),
+                            ),
                             ack_sid: 0,
                             last_tick: 0,
                             bar,
@@ -8191,19 +8222,16 @@ async fn recv_run(
                         continue;
                     }
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                    // If background writes are still in-flight, defer to
-                    // Ev::MaybeComplete from the last finishing writer.
+                    // Exactly-once completion: the gate records end_seen and
+                    // then checks inflight under SeqCst. If a writer drained
+                    // the stream between those steps, this side claims the
+                    // completion instead of both sides deferring forever.
                     let process_now = {
                         match st.by_sid.get_mut(&(pid.clone(), sid)) {
                             None => false, // unknown stream
                             Some(inc) => {
                                 inc.ack_sid = sid;
-                                if inc.inflight.load(Ordering::Relaxed) > 0 {
-                                    inc.end_seen.store(true, Ordering::Relaxed);
-                                    false // deferred to MaybeComplete
-                                } else {
-                                    true // inflight == 0, process now
-                                }
+                                inc.completion.file_end(&inc.inflight, &inc.end_seen)
                             }
                         }
                     };
@@ -8367,7 +8395,8 @@ async fn recv_run(
                                         inc.file = Arc::new(f.into_std().await);
                                     }
                                 }
-                                inc.end_seen.store(false, Ordering::Relaxed);
+                                writer_tasks.join_sid(&pid, sid, log.as_ref()).await;
+                                inc.completion.reset(&inc.end_seen);
                                 st.by_sid.insert((pid.clone(), sid), inc);
                                 if let Some(t) = conn.transport_of(&pid) {
                                     let _ = t
@@ -8534,7 +8563,8 @@ async fn recv_run(
                                     let _ = f.sync_all();
                                 })
                                 .await;
-                                inc.end_seen.store(false, Ordering::Relaxed);
+                                writer_tasks.join_sid(&pid, sid, log.as_ref()).await;
+                                inc.completion.reset(&inc.end_seen);
                                 st.by_sid.insert((pid.clone(), sid), inc);
                                 if let Some(t) = conn.transport_of(&pid) {
                                     let _ = t
@@ -8628,11 +8658,12 @@ async fn recv_run(
                         ));
                         continue;
                     }
-                    inc.inflight.fetch_add(1, Ordering::Relaxed);
+                    inc.inflight.fetch_add(1, Ordering::SeqCst);
                     let file = Arc::clone(&inc.file);
                     let stdout_sink = inc.stdout.clone();
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
+                    let completion = Arc::clone(&inc.completion);
                     let ranges = Arc::clone(&inc.ranges);
                     let received = Arc::clone(&inc.received);
                     let write_err = Arc::clone(&inc.write_err);
@@ -8647,6 +8678,7 @@ async fn recv_run(
                         let _inflight = InflightGuard {
                             inflight,
                             end_seen,
+                            completion,
                             tx,
                             write_err: Arc::clone(&write_err),
                             pid: pid_c,
@@ -9339,7 +9371,11 @@ mod lifecycle_tests {
         // The writer is provably still inside its blocking call, and cleanup
         // has recorded only the pre-writer stage, never the flush.
         let phases = trace.lock().unwrap().clone();
-        assert_eq!(phases, vec!["watchdog"], "cleanup advanced past the writer join");
+        assert_eq!(
+            phases,
+            vec!["watchdog"],
+            "cleanup advanced past the writer join"
+        );
         assert!(
             finished_rx.try_recv().is_err(),
             "finish returned while an admitted write was still running"
@@ -9407,6 +9443,167 @@ mod lifecycle_tests {
         })
         .await
         .expect("completed running writer is reaped");
+    }
+
+    /// A verify re-request must join this stream's writers before re-arming
+    /// its completion gate; otherwise a post-decrement writer could claim the
+    /// next generation.
+    #[tokio::test]
+    async fn verify_retry_joins_stream_writers_before_reset() {
+        let writers = WriterTasks::default();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        writers.spawn("peer".into(), 7, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        });
+        started_rx.await.unwrap();
+
+        let joiner = {
+            let writers = writers.clone();
+            tokio::spawn(async move {
+                writers.join_sid("peer", 7, &NoLog).await;
+                writers
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !writers.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("join_sid took the stream's writer handle");
+        assert!(
+            !joiner.is_finished(),
+            "join_sid must wait for the stream's writer"
+        );
+        release_tx.send(()).unwrap();
+        let writers = joiner.await.expect("join task");
+        assert!(
+            writers.is_empty(),
+            "the stream's writer is joined and drained"
+        );
+    }
+
+    fn completion_writer(
+        inflight: &Arc<AtomicI64>,
+        end_seen: &Arc<AtomicBool>,
+        completion: &Arc<filament_peerloop::recv::CompletionGate>,
+        tx: mpsc::UnboundedSender<Ev>,
+    ) -> InflightGuard {
+        InflightGuard {
+            inflight: Arc::clone(inflight),
+            end_seen: Arc::clone(end_seen),
+            completion: Arc::clone(completion),
+            tx,
+            write_err: Arc::new(Mutex::new(None)),
+            pid: "peer".into(),
+            sid: 7,
+        }
+    }
+
+    /// Write-before-end: the last writer drains completely before file-end
+    /// arrives. File-end must take the inline fast path and publish end_seen.
+    /// (The old read-then-store window itself is forced inside
+    /// `CompletionGate::file_end` by the library regression test.)
+    #[test]
+    fn file_end_claims_after_the_last_writer_drained_first() {
+        let inflight = Arc::new(AtomicI64::new(1));
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(filament_peerloop::recv::CompletionGate::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        drop(completion_writer(&inflight, &end_seen, &completion, tx));
+        assert!(rx.try_recv().is_err(), "writer saw no end yet");
+        assert!(
+            completion.file_end(&inflight, &end_seen),
+            "file-end claims inline after the writer drained first"
+        );
+        assert!(end_seen.load(Ordering::SeqCst), "end_seen is published");
+        assert!(
+            rx.try_recv().is_err(),
+            "an inline completion needs no MaybeComplete event"
+        );
+        assert!(
+            !completion.last_writer(1, &end_seen),
+            "the writer cannot claim a second completion"
+        );
+    }
+
+    /// The ordinary deferred path: file-end arrives while a writer is still in
+    /// flight, so the last writer emits the one MaybeComplete.
+    #[test]
+    fn file_end_defers_to_the_last_writer_and_it_emits_once() {
+        let inflight = Arc::new(AtomicI64::new(1));
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(filament_peerloop::recv::CompletionGate::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(!completion.file_end(&inflight, &end_seen));
+        drop(completion_writer(&inflight, &end_seen, &completion, tx));
+        match rx.try_recv() {
+            Ok(Ev::MaybeComplete(pid, sid)) => {
+                assert_eq!((pid.as_str(), sid), ("peer", 7));
+            }
+            Ok(other) => panic!("unexpected event: {other:?}"),
+            Err(error) => panic!("the last writer must emit MaybeComplete: {error}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one MaybeComplete");
+    }
+
+    /// A verify re-request re-inserts the stream: the gate must be re-armed so
+    /// the next last writer can complete it again exactly once.
+    #[test]
+    fn completion_gate_rearms_after_a_verify_retry() {
+        let inflight = Arc::new(AtomicI64::new(0));
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(filament_peerloop::recv::CompletionGate::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(completion.file_end(&inflight, &end_seen));
+        completion.reset(&end_seen);
+        assert!(!end_seen.load(Ordering::SeqCst));
+
+        inflight.store(1, Ordering::SeqCst);
+        assert!(!completion.file_end(&inflight, &end_seen));
+        drop(completion_writer(&inflight, &end_seen, &completion, tx));
+        match rx.try_recv() {
+            Ok(Ev::MaybeComplete(pid, sid)) => {
+                assert_eq!((pid.as_str(), sid), ("peer", 7));
+            }
+            Ok(other) => panic!("unexpected event: {other:?}"),
+            Err(error) => panic!("the re-armed last writer must emit MaybeComplete: {error}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one MaybeComplete after reset"
+        );
+    }
+
+    /// Both sides observe the completed state (file-end stored end_seen, then
+    /// the last writer drained and read it, then file-end read zero inflight).
+    /// Only the claim CAS may emit MaybeComplete.
+    #[test]
+    fn file_end_and_last_writer_emit_one_maybe_complete_when_both_see_zero() {
+        let inflight = Arc::new(AtomicI64::new(1));
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(filament_peerloop::recv::CompletionGate::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // File-end's store half lands, but its inflight load has not run yet.
+        end_seen.store(true, Ordering::SeqCst);
+        // The last writer drains and sees end_seen: it claims the one event.
+        drop(completion_writer(&inflight, &end_seen, &completion, tx));
+        match rx.try_recv() {
+            Ok(Ev::MaybeComplete(pid, sid)) => {
+                assert_eq!((pid.as_str(), sid), ("peer", 7));
+            }
+            Ok(other) => panic!("unexpected event: {other:?}"),
+            Err(error) => panic!("the last writer must emit MaybeComplete: {error}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one MaybeComplete");
+        // File-end's load half now observes zero too; the claim CAS must make
+        // it defer instead of processing a second completion.
+        assert!(!completion.file_end(&inflight, &end_seen));
+        assert!(rx.try_recv().is_err(), "the late file-end cannot duplicate");
     }
 
     #[derive(Default)]
