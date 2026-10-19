@@ -39,9 +39,9 @@ use filament_peerloop::mesh::{MeshListener, MeshStream, MeshTunnel};
 /// crate so the receive loop can ask a host to start one without naming the
 /// CLI; re-exported here so existing callers keep resolving.
 pub use filament_peerloop::mesh::L3Mode;
-/// The pure mesh naming and route rules moved to the peer-loop crate. Kept as
+/// The pure mesh naming rules moved to the peer-loop crate. Kept as
 /// re-exports so this module and its tests still name them the same way.
-pub(crate) use filament_peerloop::mesh::{installable_routes, sanitize_host, short_host_label};
+pub(crate) use filament_peerloop::mesh::{sanitize_host, short_host_label};
 
 /// A mode-agnostic accepted overlay connection: a kernel `TcpStream` (bound on the
 /// overlay IP) or a userspace smoltcp stream. Implements the same async byte-stream
@@ -1799,33 +1799,6 @@ mod tests {
         assert_eq!(dest_ip(&[]), None);
         assert_eq!(dest_ip(&[0x45, 0, 0]), None); // too short for v4
         assert_eq!(dest_ip(&[0x70, 0, 0, 0]), None); // not v4/v6
-    }
-
-    // A transport that carries datagrams but never delivers one, so add_peer's pump
-    // parks; we only inspect the route/reader bookkeeping it leaves behind.
-    #[test]
-    fn installing_a_route_needs_the_receiver_and_the_owner_to_agree() {
-        let adv = vec!["10.0.0.0/24".to_string(), "192.168.1.0/24".to_string()];
-        let granted = |c: &str| c == "10.0.0.0/24";
-
-        // Both gates open: only the granted prefix installs. An advertisement
-        // for something ungranted is simply not taken, not an error: a peer may
-        // advertise to several receivers with different grants.
-        assert_eq!(
-            super::installable_routes(&adv, true, granted),
-            vec!["10.0.0.0/24".to_string()]
-        );
-
-        // Receiver declines: nothing installs, however well granted. The owner's
-        // grant does not oblige this machine to route through anyone.
-        assert!(super::installable_routes(&adv, false, granted).is_empty());
-
-        // Owner granted nothing: nothing installs, however willing the receiver.
-        assert!(super::installable_routes(&adv, true, |_| false).is_empty());
-
-        // Nothing advertised is trivially nothing installed, which is also the
-        // shape an older peer and a failed route signature both produce.
-        assert!(super::installable_routes(&[], true, |_| true).is_empty());
     }
 
     #[test]
