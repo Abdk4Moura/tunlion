@@ -650,11 +650,17 @@ pub mod serving {
                     let result = receive_file(
                         cfg, &record, &mut recs, cancel, max_record_bytes, commit_state,
                     ).await;
-                    let ack = match result {
+                    let cancelled = *cancel.borrow();
+                    let ack = match &result {
                         Ok(()) => json!({ "type": "file-ack", "p": path, "ok": true }),
                         Err(error) => json!({ "type": "file-ack", "p": path, "ok": false, "err": error.to_string() }),
                     };
                     send_json(&cfg.transport, cfg.sid, &ack).await?;
+                    // Cancellation is terminal. The peer may already have
+                    // pipelined the rest of this file, but those records are
+                    // payload, not top-level messages; reinterpreting them
+                    // after an aborted receive would misreport the abort.
+                    if cancelled { bail!("sync cancelled"); }
                 }
                 Some("delete") if cfg.delete && !cfg.dry_run => {
                     let mut gone = Vec::new();
@@ -1159,7 +1165,7 @@ pub mod serving {
             task.cancel();
             release.notify_one();
 
-            assert!(task.join().await.unwrap().is_ok());
+            assert_eq!(task.join().await.unwrap().unwrap_err(), "sync cancelled");
             assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), b"initial");
             assert!(!root.0.join("file.txt.part").exists());
             let replies = outgoing_json(&transport);
@@ -1194,10 +1200,11 @@ pub mod serving {
             entered.notified().await;
             task.cancel();
             release.notify_one();
-            // Mid-file cancellation is reported by the per-file negative ack;
-            // the peer's already-buffered `done` then ends the protocol
-            // gracefully, exactly as in the hash-finalization cancellation case.
-            assert!(task.join().await.unwrap().is_ok());
+            // Mid-file cancellation is terminal: the per-file negative ack is
+            // sent, then the serve loop aborts with the cancellation error
+            // instead of reinterpreting the file's unread payload records as
+            // top-level protocol messages.
+            assert_eq!(task.join().await.unwrap().unwrap_err(), "sync cancelled");
             assert!(!root.0.join("retry.txt.part").exists());
             assert!(!root.0.join("retry.txt").exists());
             assert_eq!(mux.live_streams().await, 0);
