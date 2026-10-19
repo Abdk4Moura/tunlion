@@ -41,24 +41,30 @@ type EngineTask = Engine<Result<(), String>>;
 /// The states exist to keep two contracts honest under concurrency and under a
 /// stop that does not finish:
 ///
-/// - If a retry observes a task that finished on its own, it may join it as
-///   `Ended(_)`; if it is still alive under `Running`, it is joined by `stop`.
+/// - A task that finished on its own is still **unjoined**: its `JoinHandle`
+///   (and therefore its `Ok`, `Err` or panic) is owned by the slot until a stop
+///   joins it. Status reports `FinishedUnjoined`, never `Stopped`, in that
+///   window.
 /// - `Ended(_)` and `None` are the only states a fresh `start_with_dispatch`
 ///   may replace. `Running`, `Stopping` and `Unstopped` all refuse a new start,
-///   because in each of those a prior task may still be running.
+///   even when `is_finished()` is already true, because replacing them would
+///   drop the handle and silently discard the outcome.
 enum EngineSlot {
     /// Nothing was ever started.
     None,
-    /// The one live engine, owned by this slot.
+    /// The one engine, owned by this slot. It may already have finished while
+    /// still unjoined; `stop` is what joins it and records `Ended`.
     Running(EngineTask),
     /// A stop owns the settle. The task was moved into the stop future; no
     /// start or second stop may proceed until that owner records the outcome.
     Stopping,
     /// A bounded stop expired. The engine is retained here; it may still be
-    /// running, so a start is refused until joining or observing it finished.
+    /// running, or it may have finished since. Either way it is not joined, so
+    /// a start is refused until a stop joins it.
     Unstopped(EngineTask),
-    /// The last engine returned. `Err` is its dispatch error, if any. A start
-    /// may replace this: the task is known to have terminated.
+    /// The last engine was joined. `Err` is its dispatch error (or panic), if
+    /// any. A start may replace this: the task is known to have terminated and
+    /// its outcome was retrieved.
     Ended(Result<(), String>),
 }
 
@@ -120,10 +126,16 @@ pub enum EngineState {
     /// A stop is in flight; the task may still be running. A start and a second
     /// stop are both refused while this holds.
     Stopping,
-    /// The last engine dispatch returned cleanly (naturally or by stop). No
-    /// child process exists; this is about the in-process task.
+    /// The last engine task finished but has not been joined. Its `JoinHandle`
+    /// still owns the outcome (`Ok`, `Err` or panic); status cannot call it
+    /// `Stopped` or `Failed` until a stop joins it. A restart is refused until
+    /// then, so the handle and outcome are never silently dropped.
+    FinishedUnjoined,
+    /// The last engine dispatch was joined and returned cleanly (naturally or
+    /// by stop). No child process exists; this is about the in-process task.
     Stopped,
-    /// The last engine dispatch returned an error.
+    /// The last engine dispatch was joined and returned an error, including a
+    /// panic.
     Failed,
     /// A bounded stop expired and the task was retained; it may still be
     /// running. `EngineState` reports this rather than `Stopped` so a caller
@@ -161,9 +173,14 @@ pub enum CoreError {
     #[error("an engine stop is already in progress in this core")]
     EngineStopping,
     /// A previous stop bound expired and its task was retained. It may still be
-    /// running, so a new engine is refused until it is joined or observed done.
+    /// running, so a new engine is refused until it is joined.
     #[error("the previous engine has not stopped")]
     EngineNotStopped,
+    /// The previous engine task has finished but was not joined, so its result
+    /// (including an error or panic) is still owned by this Core. A start would
+    /// drop that handle, so it is refused until `stop` / `stop_within` joins it.
+    #[error("the previous engine finished but has not been joined")]
+    EngineNotJoined,
     /// The dispatch returned an error string after it was started.
     #[error("{0}")]
     Engine(String),
@@ -272,24 +289,29 @@ impl Core {
             .engine
             .lock()
             .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
-        // A new engine may replace only a slot whose prior task is known to have
-        // terminated: `None` (nothing started) or `Ended` (it returned). Every
-        // other state may still have a live task, so refuse rather than install
-        // a second engine or lose a handle.
+        // A new engine may replace only a slot whose prior task was joined:
+        // `None` (nothing started) or `Ended` (its outcome was retrieved).
+        // Every other state still owns a `JoinHandle`, even when
+        // `is_finished()` is already true. Replacing those would drop the
+        // handle and silently discard a natural `Err` or panic, so refuse and
+        // make the caller join through `stop`.
         let blocked = match &*slot {
             EngineSlot::Stopping => Some(CoreError::EngineStopping),
-            EngineSlot::Running(engine) if !engine.is_finished() => {
-                Some(CoreError::EngineAlreadyRunning)
-            }
-            EngineSlot::Unstopped(engine) if !engine.is_finished() => {
-                Some(CoreError::EngineNotStopped)
-            }
-            _ => None,
+            EngineSlot::Running(engine) => Some(if engine.is_finished() {
+                CoreError::EngineNotJoined
+            } else {
+                CoreError::EngineAlreadyRunning
+            }),
+            EngineSlot::Unstopped(engine) => Some(if engine.is_finished() {
+                CoreError::EngineNotJoined
+            } else {
+                CoreError::EngineNotStopped
+            }),
+            EngineSlot::None | EngineSlot::Ended(_) => None,
         };
         if let Some(error) = blocked {
             return Err(error);
         }
-        *slot = EngineSlot::None;
 
         let cancel = Cancellation::default();
         let engine = if tokio::runtime::Handle::try_current().is_ok() {
@@ -327,6 +349,10 @@ impl Core {
     /// `CoreError::Stop` once the bound expires, and its task is **retained**
     /// (`status().engine` is `TimedOut`), never reported as stopped and never
     /// replaced while it may still run.
+    ///
+    /// If the task already finished on its own, this still joins its handle and
+    /// records the outcome: `FinishedUnjoined` becomes `Stopped` or `Failed`,
+    /// and a natural `Err` / panic is returned instead of being discarded.
     pub async fn stop(&self) -> Result<(), CoreError> {
         self.stop_within(Duration::from_secs(5)).await
     }
@@ -414,15 +440,18 @@ impl Core {
         }
     }
 
-    /// Whether this Core may still own a live dispatch task.
+    /// Whether this Core may still own a task whose outcome is unreaped.
     ///
-    /// True for `Running`, `Stopping` and `TimedOut`: in each, a task exists and
-    /// has not been confirmed returned. False only once it is `Stopped`,
-    /// `Failed` or `NotLinked`.
+    /// True for `Running`, `Stopping`, `FinishedUnjoined` and `TimedOut`: in
+    /// each, a `JoinHandle` exists and has not been joined. False only once it
+    /// is `Stopped`, `Failed` or `NotLinked`.
     pub fn is_engine_running(&self) -> Result<bool, CoreError> {
         Ok(matches!(
             self.engine_state()?,
-            EngineState::Running | EngineState::Stopping | EngineState::TimedOut
+            EngineState::Running
+                | EngineState::Stopping
+                | EngineState::FinishedUnjoined
+                | EngineState::TimedOut
         ))
     }
 
@@ -433,13 +462,15 @@ impl Core {
             .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
         Ok(match &*slot {
             EngineSlot::None => EngineState::NotLinked,
-            EngineSlot::Running(engine) if engine.is_finished() => EngineState::Stopped,
+            // A finished task is still unjoined: its result (including a
+            // natural error or panic) is owned by the handle in the slot.
+            // `Stopped`/`Failed` require the join `stop` performs.
+            EngineSlot::Running(engine) if engine.is_finished() => EngineState::FinishedUnjoined,
             EngineSlot::Running(_) => EngineState::Running,
             EngineSlot::Stopping => EngineState::Stopping,
-            // An `Unstopped` task that has since finished is a clean stop for
-            // status purposes (we cannot recover its Ok/Err without joining, and
-            // a join is what `stop` is for); while it is alive it is `TimedOut`.
-            EngineSlot::Unstopped(engine) if engine.is_finished() => EngineState::Stopped,
+            // The same holds after a timed-out stop: finishing on its own does
+            // not reap the handle.
+            EngineSlot::Unstopped(engine) if engine.is_finished() => EngineState::FinishedUnjoined,
             EngineSlot::Unstopped(_) => EngineState::TimedOut,
             EngineSlot::Ended(Ok(())) => EngineState::Stopped,
             EngineSlot::Ended(Err(_)) => EngineState::Failed,
@@ -449,6 +480,38 @@ impl Core {
     fn store(&self) -> DirStore {
         DirStore {
             root: self.dir.clone(),
+        }
+    }
+}
+
+impl Drop for Core {
+    /// Fallback shutdown, not a joined stop.
+    ///
+    /// `stop` / `stop_within` are the only paths that prove the dispatch's
+    /// epilogue returned; `Drop` cannot await. It requests cancellation through
+    /// the owned `Engine` (dropping the slot first), then takes the instance
+    /// runtime and calls `shutdown_background`. `shutdown_background` is
+    /// non-blocking and safe even when `Core` is dropped inside another Tokio
+    /// async context, where dropping a `Runtime` directly would panic.
+    ///
+    /// Tasks that have not observed cancellation are abandoned with the
+    /// runtime; callers that need the join must call `stop` before dropping.
+    fn drop(&mut self) {
+        // Drop the engine slot first so its `Engine::drop` sets the
+        // cancellation latch before the runtime goes away. A poisoned lock
+        // still yields the slot: Drop must not panic.
+        let slot = match self.engine.get_mut() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        drop(std::mem::replace(slot, EngineSlot::None));
+
+        let runtime = match self.runtime.get_mut() {
+            Ok(runtime) => runtime.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(runtime) = runtime {
+            runtime.shutdown_background();
         }
     }
 }
@@ -721,6 +784,89 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn a_natural_error_is_kept_until_joined_and_not_reported_stopped() {
+        let core = core();
+        let (returned_tx, returned_rx) = tokio::sync::oneshot::channel();
+        core.start_with_dispatch(move |_stop, readiness| async move {
+            readiness.publish(|| {});
+            let _ = returned_tx.send(());
+            Err("natural-boom".to_string())
+        })
+        .unwrap();
+        returned_rx.await.unwrap();
+        // Let the runtime mark the task finished; no sleeps.
+        for _ in 0..1_000 {
+            if core.status().unwrap().engine == EngineState::FinishedUnjoined {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // It finished, but its Err is still owned by the unjoined handle.
+        assert_eq!(core.status().unwrap().engine, EngineState::FinishedUnjoined);
+        assert!(core.is_engine_running().unwrap());
+        // Replacing the slot here would drop the handle and lose the error.
+        assert_eq!(
+            core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) }),
+            Err(CoreError::EngineNotJoined)
+        );
+
+        // Explicit stop is what reaps and reports the outcome...
+        assert_eq!(
+            core.stop().await,
+            Err(CoreError::Engine("natural-boom".into()))
+        );
+        assert_eq!(core.status().unwrap().engine, EngineState::Failed);
+        // ...and only then is a restart allowed.
+        core.start_with_dispatch(|_stop, readiness| async move {
+            readiness.publish(|| {});
+            Ok(())
+        })
+        .unwrap();
+        core.stop().await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_natural_panic_is_kept_until_joined() {
+        let core = core();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        core.start_with_dispatch(move |_stop, readiness| async move {
+            readiness.publish(|| {});
+            let _ = entered_tx.send(());
+            (move || -> Result<(), String> { panic!("natural engine panic") })()
+        })
+        .unwrap();
+        entered_rx.await.unwrap();
+        for _ in 0..1_000 {
+            if core.status().unwrap().engine == EngineState::FinishedUnjoined {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(core.status().unwrap().engine, EngineState::FinishedUnjoined);
+        assert_eq!(
+            core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) }),
+            Err(CoreError::EngineNotJoined)
+        );
+        match core.stop().await {
+            Err(CoreError::Engine(message)) => {
+                assert!(
+                    message.contains("panicked"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected the panic to be reported, got {other:?}"),
+        }
+        assert_eq!(core.status().unwrap().engine, EngineState::Failed);
+        core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) })
+            .unwrap();
+        core.stop().await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+    }
+
     #[test]
     fn core_creates_its_own_runtime_outside_an_ambient_one() {
         let core = core();
@@ -737,6 +883,40 @@ mod tests {
             .unwrap();
         rt.block_on(core.stop()).unwrap();
         assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+    }
+
+    /// Dropping `Core` inside an async context must not drop a `Runtime`
+    /// directly (that panics). This test has no ambient runtime, so
+    /// `start_with_dispatch` creates and retains the Core-owned multi-thread
+    /// runtime; dropping Core then happens inside another runtime's
+    /// `block_on`.
+    #[test]
+    fn dropping_core_inside_another_runtime_does_not_panic() {
+        let core = core();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        core.start_with_dispatch(move |stop, readiness| async move {
+            readiness.publish(|| {});
+            let _ = entered_tx.send(());
+            stop.run(std::future::pending::<()>()).await;
+            Ok(())
+        })
+        .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dispatch entered");
+        assert!(
+            core.runtime.lock().unwrap().is_some(),
+            "the test must exercise the Core-owned runtime"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            // Fallback Drop: cancel, then non-blocking runtime shutdown.
+            drop(core);
+        });
     }
 
     #[tokio::test]

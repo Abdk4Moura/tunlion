@@ -27,7 +27,7 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,12 +97,20 @@ impl fmt::Display for ReadyError {
 
 impl std::error::Error for ReadyError {}
 
+/// Readiness is a three-state edge, not a boolean: `Unpublished`, then
+/// `Announcing` while the publish call's side effects run, then `Ready`.
+/// Observers see only the last state, so `is_ready` / `wait` can never return
+/// before `announce` has returned.
+const UNPUBLISHED: u8 = 0;
+const ANNOUNCING: u8 = 1;
+const READY: u8 = 2;
+
 /// The publish-once half of the readiness edge. Clone it into the dispatch and
 /// any required setup it owns; publish exactly once, after required setup and
 /// immediately before the serving loop.
 #[derive(Clone)]
 pub struct Readiness {
-    published: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
     tx: watch::Sender<bool>,
 }
 
@@ -110,7 +118,7 @@ pub struct Readiness {
 /// observe the same latch and the same notification.
 #[derive(Clone)]
 pub struct ReadyWatch {
-    published: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
     rx: watch::Receiver<bool>,
 }
 
@@ -118,14 +126,14 @@ impl Readiness {
     /// Create the two halves. The dispatch keeps the [`Readiness`]; the
     /// supervisor keeps the [`ReadyWatch`].
     pub fn new() -> (Self, ReadyWatch) {
-        let published = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(AtomicU8::new(UNPUBLISHED));
         let (tx, rx) = watch::channel(false);
         (
             Self {
-                published: Arc::clone(&published),
+                state: Arc::clone(&state),
                 tx,
             },
-            ReadyWatch { published, rx },
+            ReadyWatch { state, rx },
         )
     }
 
@@ -133,20 +141,30 @@ impl Readiness {
     /// only for the publishing call; later calls are no-ops, so a stray second
     /// publication cannot re-announce readiness after startup.
     ///
-    /// The announcement runs before waiters are notified, so observing `Ready`
-    /// implies the edge's own side effects ran.
+    /// The edge becomes observable only after `announce` returns. While the
+    /// announcement is still running the state is `Announcing`, which both
+    /// `is_ready` and `wait` treat as not ready; only then is the watch
+    /// notified. Observing `Ready` therefore implies the edge's own side
+    /// effects ran.
     pub fn publish(&self, announce: impl FnOnce()) -> bool {
-        if self.published.swap(true, Ordering::AcqRel) {
+        if self
+            .state
+            .compare_exchange(UNPUBLISHED, ANNOUNCING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return false;
         }
         announce();
+        // Release: everything `announce` did happens-before an Acquire reader
+        // that observes `READY`.
+        self.state.store(READY, Ordering::Release);
         let _ = self.tx.send(true);
         true
     }
 
-    /// Whether this invocation already published the edge.
+    /// Whether this invocation already completed the edge (announcement done).
     pub fn is_published(&self) -> bool {
-        self.published.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == READY
     }
 }
 
@@ -157,8 +175,10 @@ impl Default for Readiness {
 }
 
 impl ReadyWatch {
+    /// True only once the publisher's `announce` has returned. `Announcing`
+    /// (the announcement is in progress) is deliberately not ready.
     pub fn is_ready(&self) -> bool {
-        self.published.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == READY
     }
 
     /// Wait for the dispatch to publish readiness.
@@ -383,6 +403,53 @@ mod tests {
         assert!(publish.publish(|| announced += 1));
         assert!(!publish.publish(|| announced += 1));
         assert_eq!(announced, 1);
+        assert!(watch.is_ready());
+        assert_eq!(watch.wait(Some(Duration::ZERO)).await, Ok(()));
+    }
+
+    /// `publish` must not make the edge observable until `announce` returns.
+    /// The publisher blocks inside `announce` on a std channel (so a current
+    /// thread runtime is not stalled); the watcher and a concurrent waiter are
+    /// both live in the Tokio runtime during that window.
+    #[tokio::test]
+    async fn readiness_is_not_observable_while_announce_is_blocked() {
+        let (publish, mut watch) = Readiness::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let publisher = std::thread::spawn(move || {
+            publish.publish(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+
+        // The publisher is now inside `announce` and cannot return until we
+        // release it. The watcher is not ready, and a zero-bound wait times
+        // out rather than observing a premature edge.
+        entered_rx.await.unwrap();
+        assert!(!watch.is_ready());
+        assert_eq!(
+            watch.wait(Some(Duration::ZERO)).await,
+            Err(ReadyError::TimedOut)
+        );
+
+        // A concurrent waiter is also blocked: it must not finish while the
+        // announcement is still running. Yield until it has had a poll.
+        let mut waiter_watch = watch.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_watch.wait(Some(Duration::from_secs(1))).await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "readiness became observable before announce returned"
+        );
+        assert!(!watch.is_ready());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(waiter.await.unwrap(), Ok(()));
+        publisher.join().unwrap();
         assert!(watch.is_ready());
         assert_eq!(watch.wait(Some(Duration::ZERO)).await, Ok(()));
     }

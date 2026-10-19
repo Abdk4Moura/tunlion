@@ -46,20 +46,30 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   | slot | start allowed | `status().engine` | what it means |
   |---|---|---|---|
   | `None` | yes | `NotLinked` | nothing was ever started |
-  | `Running(engine)` | no | `Running` (or `Stopped` once finished) | the one live engine |
+  | `Running(engine)` | no | `Running`, or `FinishedUnjoined` once finished | the one engine; a finished task is still unjoined |
   | `Stopping` | no | `Stopping` | a stop claimed the slot and is joining |
-  | `Unstopped(engine)` | only once `is_finished()` | `TimedOut` | a stop bound expired; the task is retained and may still run |
-  | `Ended(Ok)` | yes | `Stopped` | the task returned cleanly |
-  | `Ended(Err)` | yes | `Failed` | the task returned an error |
+  | `Unstopped(engine)` | no | `TimedOut` while live, `FinishedUnjoined` once finished | a stop bound expired; the task is retained and not joined |
+  | `Ended(Ok)` | yes | `Stopped` | the task was joined and returned cleanly |
+  | `Ended(Err)` | yes | `Failed` | the task was joined and returned an error (or panicked) |
 
-  A start replaces only `None` / `Ended` — states where the prior task is known
-  to have terminated. While a stop is claimed (`Stopping`) a concurrent start
-  and a concurrent stop both fail with `EngineStopping`, and a bound expiry
-  (`TimedOut`) refuses a start with `EngineNotStopped` until the retained task
-  is joined or observed finished. A stop future dropped mid-join returns the
-  task to the slot as `Unstopped` via `StopClaim::drop`, so the task is never
-  detached on the floor. `Stopped` is therefore only recorded after a confirmed
-  join.
+  A start replaces only `None` / `Ended` — states where the prior task was
+  actually **joined** and its outcome retrieved. While a stop is claimed
+  (`Stopping`) a concurrent start and a concurrent stop both fail with
+  `EngineStopping`; a bound expiry (`TimedOut`) refuses a start with
+  `EngineNotStopped` until the retained task is joined. A task that finished on
+  its own is `FinishedUnjoined` and refuses a start with `EngineNotJoined`: its
+  `JoinHandle` still owns the `Ok`, `Err` or panic, so replacing the slot would
+  discard it. `stop` / `stop_within` is what joins that handle and records
+  `Stopped` or `Failed`. A stop future dropped mid-join returns the task to the
+  slot as `Unstopped` via `StopClaim::drop`, so the task is never detached on
+  the floor. `Stopped` is therefore only recorded after a confirmed join.
+
+  `Core::drop` is a fallback, not a joined stop: it requests cancellation by
+  dropping the engine slot, then calls `shutdown_background` on the
+  instance-owned runtime. That is non-blocking and safe inside another Tokio
+  async context (dropping a `Runtime` there would panic); any task that has not
+  observed cancellation is abandoned with the runtime. Callers that need the
+  dispatch epilogue use `stop` first.
 
 ## What is still linked out, and why `Core::start` refuses
 
@@ -92,14 +102,19 @@ CI-only (no local Rust builds, tests or binding generation). The moved code has
 in-memory `#[tokio::test]` coverage for latched/repeated cancellation, publish
 once, readiness observed across tasks, `NotPublished` on early return, bounded
 `TimedOut` that retains the task and can still join it, independent instances,
-`stop` joining the dispatch epilogue, and `Drop` requesting stop without
-joining. `tunlion-core` tests cover, deterministically (channel-gated dispatches,
-no sleeps): start/stop one owned dispatch both inside and outside an ambient
-runtime; refusing a start while a stop is in flight (`EngineStopping`); refusing
-a concurrent stop while one is in flight; a stop bound expiry retaining the task
-and refusing restart (`TimedOut` / `EngineNotStopped`) until it is joined; a
-dropped stop future retaining the task via `StopClaim::drop`; a dispatch error
-recorded as `Failed`; the no-engine stop no-op; and that `Core::start` stays
-`EngineNotLinked` without installing a slot. Android keeps the reduced
+`stop` joining the dispatch epilogue, `Drop` requesting stop without joining,
+and a blocked `announce` that keeps `is_ready` / `wait` unready until the
+announcement returns. `tunlion-core` tests cover, deterministically
+(channel-gated dispatches, no sleeps): start/stop one owned dispatch both inside
+and outside an ambient runtime; dropping `Core` inside another runtime's
+`block_on` after it created its own runtime (non-blocking `shutdown_background`,
+no panic); refusing a start while a stop is in flight (`EngineStopping`);
+refusing a concurrent stop while one is in flight; a stop bound expiry retaining
+the task and refusing restart (`TimedOut` / `EngineNotStopped`) until it is
+joined; a dropped stop future retaining the task via `StopClaim::drop`; a
+natural `Err` and a natural panic remaining `FinishedUnjoined` and refusing
+restart (`EngineNotJoined`) until `stop` joins and reports `Failed`; a dispatch
+error recorded as `Failed`; the no-engine stop no-op; and that `Core::start`
+stays `EngineNotLinked` without installing a slot. Android keeps the reduced
 `filament-peerloop` profile: no `mount-server`, `forward-server` or `mesh`
 sectors compile into the library.

@@ -98,11 +98,19 @@ language binding cannot supply a dispatch, so `start` refuses honestly, and
 `Core::stop` is a Rust API for now rather than an exported one.
 
 `status().engine` is the slot state a UI polls: `NotLinked` (nothing started),
-`Running`, `Stopping` (a stop is joining), `Stopped` (confirmed join),
-`Failed` (the dispatch returned an error), and `TimedOut` (a stop bound expired
-and the task is retained). `Stopped` is only reported after a confirmed join;
-`TimedOut` is not `Stopped`, and a restart is refused while a retained task may
-still run.
+`Running`, `Stopping` (a stop is joining), `FinishedUnjoined` (the task returned
+but its handle has not been joined, so its `Ok` / `Err` / panic is still owned
+by `Core`), `Stopped` (confirmed join), `Failed` (the joined dispatch returned
+an error or panicked), and `TimedOut` (a stop bound expired and the task is
+retained). `Stopped` and `Failed` are only reported after a confirmed join; a
+finished-but-unjoined task is `FinishedUnjoined`, never `Stopped`, and a
+restart is refused with `EngineNotJoined` until `stop` joins it. `TimedOut` is
+not `Stopped`, and a restart is refused while a retained task may still run.
+
+`Core::drop` is a fallback, not a joined stop. It requests cancellation and
+shuts the instance runtime down with `shutdown_background` (non-blocking and
+safe inside an async context); tasks that have not observed cancellation are
+abandoned. Callers that need the dispatch epilogue await `stop` first.
 
 Identity bytes are `filament-id`'s format: `filament-id-seed-v1\0` plus the
 32-byte seed, written by `secret-write` (mode `0600` on Unix). Do not invent a
