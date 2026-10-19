@@ -4,7 +4,8 @@
 //! confinement, the transfer capability gate, and the shared-mux registration
 //! order. The CLI keeps parking, the consent request and user-facing log lines;
 //! this module also owns the admitted stream's record protocol and file-write
-//! state machine through [`serving`].
+//! state machine through the `serving` submodule (present only when the
+//! `mount-server` feature is on).
 //!
 //! Ordering is the security contract, preserved from the CLI handler:
 //! transport, checked L2 sid, path bounds, authorization, capacity, collision,
@@ -151,7 +152,7 @@ pub fn diff(local: &[Entry], remote: &[Entry]) -> Plan {
 pub enum SyncAdmission {
     /// Admitted, registered on the caller's shared mux and acknowledged. The
     /// caller owns the returned stream receiver and starts the stateful server
-    /// through [`serving`].
+    /// through the `serving` submodule (present only with `mount-server`).
     Accepted(SyncAccepted),
     /// Refused by the transfer gate. The caller may hold it for identity proof
     /// through its existing `park_on_deny`; if it does not, it records the
@@ -392,6 +393,15 @@ pub async fn admit_sync_open(
 /// framing, manifest validation, delta planning, bounded file writes, content
 /// verification, deletion, cancellation and stream cleanup. The CLI owns the
 /// user-facing outcome and the consent/parking policy.
+///
+/// This is inbound filesystem serving, so it is absent from reduced engine
+/// profiles exactly like the mount server: it reuses the `mount_proto`
+/// parent-relative confinement primitives (`safe_open_beneath`,
+/// `safe_rename_beneath`, `safe_unlink_staged_beneath`), which are themselves
+/// gated behind `mount-server`. Admission ([`admit_sync_open`]) and the wire
+/// vocabulary stay common; a reduced build admits an open but has no stateful
+/// receiver to start it, and its CLI refuses the `sync-open` by name.
+#[cfg(feature = "mount-server")]
 pub mod serving {
     use super::{Entry, MAX_SYNC_RECORD_BYTES, SYNC_CHUNK};
     use crate::l2::Mux;
