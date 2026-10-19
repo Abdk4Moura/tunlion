@@ -1122,7 +1122,10 @@ pub mod serving {
 
             assert!(task.join().await.unwrap().is_ok());
             assert!(std::fs::read_dir(&outside.0).unwrap().next().is_none());
-            assert!(displaced.join("file.txt").exists());
+            // The staging entry remains in the directory handle opened before
+            // the swap; the final target name must not be committed there.
+            assert!(displaced.join("file.txt.part").exists());
+            assert!(!displaced.join("file.txt").exists());
             let replies = outgoing_json(&transport);
             assert_eq!(replies[1]["type"], "file-ack");
             assert_eq!(replies[1]["ok"], false);
