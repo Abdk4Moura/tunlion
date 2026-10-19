@@ -1716,6 +1716,27 @@ mod promise_tests {
         assert!(shell_not_granted_hint("laptop", &with_shell, None).is_none());
         assert!(shell_not_granted_hint("laptop", &caps, Some(with_shell.as_slice())).is_none());
     }
+
+    /// The serving-off refusal lives in the library now and decides "outside
+    /// the ceiling" with its own one-line containment. `pair_cmd`'s
+    /// `grant_vs_ceiling` is the CLI's rule for the same question (which
+    /// command to suggest), so pin them together: a future edit to either
+    /// must fail here rather than let the refusal and the remedy disagree.
+    #[test]
+    fn the_serving_off_ceiling_rule_matches_grant_vs_ceiling() {
+        use filament_peerloop::shell::off::ceiling_excludes;
+        let covered = vec!["transfer".to_string(), "shell".to_string()];
+        let outside = vec!["transfer".to_string()];
+        for ceiling in [None, Some(&covered[..]), Some(&outside[..]), Some(&[][..])] {
+            let cli =
+                grant_vs_ceiling(ceiling, "shell", false) == GrantVsCeiling::OutsideCeiling;
+            assert_eq!(
+                ceiling_excludes(ceiling, "shell"),
+                cli,
+                "library and pair_cmd disagree for {ceiling:?}"
+            );
+        }
+    }
 }
 
 /// What to say when a pairing filed the peer as EXTERNAL because the two
