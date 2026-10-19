@@ -531,6 +531,41 @@ mod tls_tests;
 mod tests {
     use super::*;
 
+    async fn read_raw_client_frame(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+
+        let mut header = [0; 2];
+        socket.read_exact(&mut header).await.unwrap();
+        let mut len = (header[1] & 0x7f) as usize;
+        if len == 126 {
+            let mut extended = [0; 2];
+            socket.read_exact(&mut extended).await.unwrap();
+            len = u16::from_be_bytes(extended) as usize;
+        } else if len == 127 {
+            let mut extended = [0; 8];
+            socket.read_exact(&mut extended).await.unwrap();
+            len = u64::from_be_bytes(extended) as usize;
+        }
+        assert_ne!(header[1] & 0x80, 0, "client frames must be masked");
+        let mut mask = [0; 4];
+        socket.read_exact(&mut mask).await.unwrap();
+        let mut payload = vec![0; len];
+        socket.read_exact(&mut payload).await.unwrap();
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % mask.len()];
+        }
+        (header[0] & 0x0f, payload)
+    }
+
+    async fn send_raw_server_text(socket: &mut tokio::net::TcpStream, text: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let payload = text.as_bytes();
+        assert!(payload.len() < 126);
+        socket.write_all(&[0x81, payload.len() as u8]).await.unwrap();
+        socket.write_all(payload).await.unwrap();
+    }
+
     async fn local_client(
         server_action: impl FnOnce(
                 tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
@@ -604,15 +639,23 @@ mod tests {
     async fn disconnect_aborts_reader_when_peer_ignores_close() {
         let (client, mut rx, server) = local_client(|mut ws| {
             tokio::spawn(async move {
-                assert_eq!(ws.next().await.unwrap().unwrap().into_text().unwrap(), "41");
+                use tokio::io::AsyncReadExt;
+
+                // Read raw TCP frames after the Socket.IO handshake. The
+                // tungstenite server API automatically answers Close when
+                // polled, which would mask the peer-ignores-close case.
+                let socket = ws.get_mut();
+                let (opcode, payload) = read_raw_client_frame(socket).await;
+                assert_eq!(opcode, 1);
+                assert_eq!(payload, b"41");
                 // A peer may still send data after Socket.IO DISCONNECT. Local
                 // shutdown must suppress it, then finish even if this peer
                 // never answers the websocket close handshake.
-                ws.send(Message::Text(r#"42["late",{}]"#.into()))
-                    .await
-                    .unwrap();
-                assert!(matches!(ws.next().await.unwrap().unwrap(), Message::Close(_)));
-                std::future::pending::<()>().await;
+                send_raw_server_text(socket, r#"42["late",{}]"#).await;
+                let (opcode, _) = read_raw_client_frame(socket).await;
+                assert_eq!(opcode, 8, "client should send a websocket Close frame");
+                let mut byte = [0; 1];
+                assert_eq!(socket.read(&mut byte).await.unwrap(), 0, "forced sink drop should close TCP");
             })
         })
         .await;
