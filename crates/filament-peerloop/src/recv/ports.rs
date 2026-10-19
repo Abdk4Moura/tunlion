@@ -327,6 +327,15 @@ pub trait RecvDaemon: Send + Sync {
     async fn mount_health(&mut self, req: crate::control::Req);
     /// Remove mounts whose host path vanished; daemon-only, periodic.
     async fn mount_health_tick(&mut self, host: &dyn HostServices);
+    async fn warm_bootstrap(
+        &mut self,
+        conn: &Conn,
+        tx: &mpsc::UnboundedSender<Ev>,
+        req: crate::control::Req,
+    );
+    async fn reach_ping(&mut self, conn: &Conn, pid: &str, v: &Value);
+    async fn reach_pong(&mut self, conn: &Conn, pid: &str, v: &Value);
+    fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool;
     async fn complete_warm_bootstrap(&mut self, conn: &Conn, pid: &str, reply: &Value);
     fn reap_warm_bootstraps(&mut self);
     fn revocation_snapshot(&self) -> Option<HashSet<String>>;
