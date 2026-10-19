@@ -532,7 +532,8 @@ fn sync_destination(peer: &str, remote_dir: &str, dest: Option<&str>) -> String 
 /// The endpoint owns path bounds, the transfer gate, the shared-mux
 /// capacity/collision rule, registration and the ack. What stays here is the
 /// receive driver's policy: parking an unproven-identity deny for re-drive,
-/// raising the owner's consent request, and serving the stateful protocol.
+/// raising the owner's consent request, and returning the accepted serving
+/// task to the receive driver for lifecycle ownership.
 pub(crate) async fn handle_sync_open(
     conn: &mut Conn,
     pid: &str,
@@ -540,7 +541,7 @@ pub(crate) async fn handle_sync_open(
     muxes: &mut l2::MuxMap,
     drop_dir: &Path,
     parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
-) {
+) -> Option<(u32, sync::serving::SyncServeTask)> {
     match sync::admit_sync_open(conn, pid, v, muxes, drop_dir).await {
         SyncAdmission::Accepted(a) => {
             let SyncAccepted {
@@ -568,13 +569,7 @@ pub(crate) async fn handle_sync_open(
                 stream: rx,
                 max_record_bytes: filament_peerloop::sync::MAX_SYNC_RECORD_BYTES,
             });
-            tokio::spawn(async move {
-                match task.join().await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => ui::say(&format!("sync: ended: {error}")),
-                    Err(error) => ui::say(&format!("sync: ended: server task failed: {error}")),
-                }
-            });
+            return Some((sid, task));
         }
         SyncAdmission::Denied(d) => {
             // Settle-then-evaluate, as exec does: a deny that rests on a
@@ -591,7 +586,7 @@ pub(crate) async fn handle_sync_open(
             )
             .await
             {
-                return;
+                return None;
             }
             let name = conn.link(pid).and_then(|l| l.verified_name.clone());
             crate::enqueue_if_requestable(name.as_deref().unwrap_or("<unverified>"), "transfer");
@@ -605,6 +600,7 @@ pub(crate) async fn handle_sync_open(
         }
         SyncAdmission::Ignored => {}
     }
+    None
 }
 
 #[cfg(test)]
