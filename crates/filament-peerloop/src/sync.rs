@@ -424,11 +424,11 @@ pub mod serving {
         pub max_record_bytes: usize,
     }
 
-    /// An owned serving task. The CLI may retain this to cancel/join the
-    /// stream; dropping it detaches, matching the old receiver behavior.
+    /// An owned serving task. The caller can cancel and join it; dropping the
+    /// owner requests cancellation before detaching the join handle.
     pub struct SyncServeTask {
         cancel: watch::Sender<bool>,
-        join: JoinHandle<Result<(), String>>,
+        join: Option<JoinHandle<Result<(), String>>>,
     }
 
     impl SyncServeTask {
@@ -438,12 +438,25 @@ pub mod serving {
             self.cancel.send_replace(true);
         }
 
+        /// Whether the serving future has completed. Callers can use this to
+        /// reap completed tasks with [`Self::join`] without awaiting active ones.
+        pub fn is_finished(&self) -> bool {
+            self.join.as_ref().map_or(true, |join| join.is_finished())
+        }
+
         /// Join and retrieve the protocol result. Errors are strings to keep
         /// the CLI's existing user-facing rendering policy outside the library.
         pub async fn join(
-            self,
+            mut self,
         ) -> std::result::Result<std::result::Result<(), String>, tokio::task::JoinError> {
-            self.join.await
+            self.join.take().expect("sync task joined once").await
+        }
+    }
+
+    impl Drop for SyncServeTask {
+        fn drop(&mut self) {
+            // A dropped owner must not silently leave a live receiver behind.
+            self.cancel.send_replace(true);
         }
     }
 
@@ -456,7 +469,7 @@ pub mod serving {
             let result = serve(config, cancel_rx).await;
             result.map_err(|e| e.to_string())
         });
-        SyncServeTask { cancel, join }
+        SyncServeTask { cancel, join: Some(join) }
     }
 
     #[derive(Default)]
@@ -595,16 +608,55 @@ pub mod serving {
         let target = cfg.root.join(&rel);
         if !path_within(&cfg.root, &target) { bail!("path escapes the remote dir"); }
         if let Some(parent) = target.parent() { bound_parent(&cfg.root, parent)?; }
-        let part = target.with_file_name(format!(
-            "{}.part", target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-        ));
-        if std::fs::symlink_metadata(&part).is_ok() { std::fs::remove_file(&part)?; }
-        match std::fs::symlink_metadata(&target) {
-            Ok(md) if md.is_file() => { std::fs::copy(&target, &part)?; }
-            Ok(_) => bail!("destination exists and is not a regular file"),
-            Err(_) => {}
+        let part_name = format!(
+            "{}.part", rel.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+        );
+        let mut part_rel = rel.clone();
+        part_rel.set_file_name(part_name);
+        let part = cfg.root.join(&part_rel);
+        let source = match safe_open_existing_file(&cfg.root, &rel) {
+            Ok(source) => match source.metadata() {
+                Ok(metadata) if metadata.is_file() => Some(source),
+                Ok(_) => {
+                    discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                    bail!("destination exists and is not a regular file");
+                }
+                Err(error) => {
+                    discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                    return Err(error.into());
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                return Err(error.into());
+            }
+        };
+        // Create the staging file atomically and exclusively. Never unlink an
+        // existing name and reopen it: that can follow a planted/replaced
+        // symlink. Existing stale `.part` files fail closed. CREATE_NEW / O_EXCL
+        // also closes the check/open race without a preceding path lookup.
+        let mut file = match safe_create_part(&cfg.root, &part_rel) {
+            Ok(file) => file,
+            Err(error) => {
+                discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                return Err(error.into());
+            }
+        };
+        if let Some(mut source) = source {
+            use std::io::{Seek, SeekFrom};
+            let copied = (|| -> std::io::Result<()> {
+                file.set_len(0)?;
+                std::io::copy(&mut source, &mut file)?;
+                file.seek(SeekFrom::Start(0))?;
+                Ok(())
+            })();
+            if let Err(error) = copied {
+                drop(file);
+                discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                return Err(error.into());
+            }
         }
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&part)?;
         loop {
             let header = next_json(&mut cfg.stream, recs, max_record_bytes, cancel).await?;
             match header["type"].as_str() {
@@ -622,20 +674,99 @@ pub mod serving {
         }
         file.set_len(size)?;
         file.sync_all()?;
-        drop(file);
-        let part_for_hash = part.clone();
-        let got = tokio::task::spawn_blocking(move || hash_whole_file(&part_for_hash)).await?;
-        if got.as_deref() != Some(full.as_str()) {
-            let _ = std::fs::remove_file(&part);
+        let got = tokio::task::spawn_blocking(move || {
+            let digest = hash_open_file(&mut file);
+            (file, digest)
+        }).await?;
+        let (file, digest) = got;
+        if digest.as_deref() != Some(full.as_str()) {
+            drop(file);
+            std::fs::remove_file(&part)?;
             bail!("content hash mismatch after transfer");
         }
+        drop(file);
         std::fs::rename(&part, &target)?;
         Ok(())
     }
 
-    fn hash_whole_file(path: &Path) -> Option<String> {
+    async fn discard_file_payload(
+        cfg: &mut SyncServeConfig,
+        recs: &mut Records,
+        cancel: &mut watch::Receiver<bool>,
+        max_record_bytes: usize,
+    ) -> Result<()> {
+        loop {
+            let header = next_json(&mut cfg.stream, recs, max_record_bytes, cancel).await?;
+            match header["type"].as_str() {
+                Some("file-end") => return Ok(()),
+                Some("chunk") => {
+                    let _ = header["idx"].as_u64().ok_or_else(|| anyhow::anyhow!("invalid chunk index"))?;
+                    let _ = next_rec(&mut cfg.stream, recs, max_record_bytes, cancel).await?;
+                }
+                other => bail!("unexpected record inside a file: {other:?}"),
+            }
+        }
+    }
+
+    fn safe_create_part(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            crate::mount_proto::safe_open_beneath(
+                root,
+                rel,
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                true,
+                0o600,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            // CREATE_NEW is atomic on Windows: a pre-existing file, symlink,
+            // or reparse point cannot be followed or replaced.
+            std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(root.join(rel))
+        }
+    }
+
+    fn safe_open_existing_file(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            crate::mount_proto::safe_open_beneath(root, rel, libc::O_RDONLY, true, 0)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = root.join(rel);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                use std::os::windows::fs::MetadataExt;
+                // OPEN_REPARSE_POINT opens the link itself instead of following
+                // it. Inspect the handle metadata, not a prior path lookup.
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)?;
+                let metadata = file.metadata()?;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "destination is a reparse point",
+                    ));
+                }
+                Ok(file)
+            }
+            #[cfg(not(windows))]
+            {
+                std::fs::File::open(path)
+            }
+        }
+    }
+
+    fn hash_open_file(file: &mut std::fs::File) -> Option<String> {
         use std::io::Read;
-        let mut file = std::fs::File::open(path).ok()?;
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0)).ok()?;
         let mut hash = sha2::Sha256::new();
         let mut buf = vec![0; 1 << 20];
         loop {
@@ -817,6 +948,38 @@ pub mod serving {
             assert!(transport.controls.lock().unwrap().is_empty());
         }
 
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn planted_part_symlink_is_not_removed_or_followed() {
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            let outside_file = outside.0.join("outside.bin");
+            std::fs::write(&outside_file, b"outside must remain unchanged").unwrap();
+            let part = root.0.join("file.txt.part");
+            std::os::unix::fs::symlink(&outside_file, &part).unwrap();
+
+            let bytes = b"payload";
+            let digest = sha2::Sha256::digest(bytes).iter()
+                .map(|b| format!("{b:02x}")).collect::<String>();
+            let mut wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[]}), &mut wire);
+            record(&json!({"type":"file", "p":"file.txt", "size":bytes.len(), "full":digest}), &mut wire);
+            record(&json!({"type":"chunk", "idx":0}), &mut wire);
+            record_bytes(bytes, &mut wire);
+            record(&json!({"type":"file-end"}), &mut wire);
+            record(&json!({"type":"done"}), &mut wire);
+
+            let (task, mux, transport) = setup(&root.0, wire).await;
+            assert!(task.join().await.unwrap().is_ok());
+            assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside must remain unchanged");
+            assert!(std::fs::symlink_metadata(&part).unwrap().file_type().is_symlink());
+            assert!(!root.0.join("file.txt").exists());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["type"], "file-ack");
+            assert_eq!(replies[1]["ok"], false);
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
         #[tokio::test]
         async fn cancellation_closes_and_cleans_an_idle_stream() {
             let root = TempRoot::new();
@@ -829,6 +992,22 @@ pub mod serving {
                 &[json!({"type":"l2-close", "sid":SID, "err":"sync cancelled"})]
             );
             assert_eq!(mux.live_streams().await, 0, "cancel cleans the shared SID");
+        }
+
+        #[tokio::test]
+        async fn dropping_owner_requests_cancellation_and_cleans_stream() {
+            let root = TempRoot::new();
+            let (task, mux, transport) = setup(&root.0, Vec::new()).await;
+            drop(task);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while mux.live_streams().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("dropping the owner must not leave the receiver detached");
+            assert_eq!(
+                transport.controls.lock().unwrap().as_slice(),
+                &[json!({"type":"l2-close", "sid":SID, "err":"sync cancelled"})]
+            );
         }
     }
 }
