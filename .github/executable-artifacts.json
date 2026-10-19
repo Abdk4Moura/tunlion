@@ -432,7 +432,7 @@
       "disposition": "diagnostic",
       "issue": "https://github.com/Abdk4Moura/tunlion/issues/318",
       "owner": "pi-director",
-      "expires": "2026-10-18"
+      "expires": "2026-11-18"
     },
     {
       "path": "cli/tests/mount-revoke-gates.sh",
@@ -803,7 +803,7 @@
       "disposition": "diagnostic",
       "issue": "https://github.com/Abdk4Moura/tunlion/issues/316",
       "owner": "claude-advisor",
-      "expires": "2026-10-18"
+      "expires": "2026-11-18"
     },
     {
       "path": "cli/tests/durability_soak.py",
