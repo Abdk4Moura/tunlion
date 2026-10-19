@@ -1659,16 +1659,47 @@ pub fn safe_unlink_beneath(root: &std::path::Path, rel: &std::path::Path) -> std
 }
 
 /// Remove the staging file represented by an already-open handle. Windows
-/// marks that exact handle for deletion; Unix uses an unlink relative to the
-/// root-confined parent. The open handle prevents a path swap from redirecting
-/// cleanup to another file.
+/// marks that exact handle for deletion. Unix resolves a stable beneath-root
+/// parent fd, compares the named entry to the open file with `fstatat` and
+/// `AT_SYMLINK_NOFOLLOW`, then unlinks relative to that fd. A non-matching
+/// entry (including a planted symlink) is left untouched. Unix has no portable
+/// unlink-by-file-handle primitive, so a same-name replacement in the narrow
+/// interval between identity check and `unlinkat` cannot be excluded against a
+/// concurrent local filesystem attacker.
 #[cfg(unix)]
 pub fn safe_unlink_staged_beneath(
     root: &std::path::Path,
     rel: &std::path::Path,
-    _file: &std::fs::File,
+    file: &std::fs::File,
 ) -> std::io::Result<()> {
-    safe_unlink_beneath(root, rel)
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let (parent, name) = resolve_parent_beneath(root, rel)?;
+    let opened = file.metadata()?;
+    let mut named: libc::stat = unsafe { std::mem::zeroed() };
+    let stat_result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut named,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if stat_result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if named.st_dev as u64 != opened.dev() || named.st_ino as u64 != opened.ino() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staging name no longer identifies this transfer's open file; refusing cleanup",
+        ));
+    }
+    beneath_unlink(&parent, &name)
 }
 
 #[cfg(windows)]

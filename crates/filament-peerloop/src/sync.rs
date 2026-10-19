@@ -426,6 +426,63 @@ pub mod serving {
         pub max_record_bytes: usize,
         #[cfg(test)]
         finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        #[cfg(test)]
+        staging_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    }
+
+    /// Owns the exclusively created `.part` entry until it is atomically
+    /// renamed into place. Every return, cancellation, and unwind after create
+    /// attempts identity-checked cleanup; an existing name is never adopted.
+    #[cfg(not(windows))]
+    struct StagedPart {
+        root: PathBuf,
+        rel: PathBuf,
+        file: Option<std::fs::File>,
+        committed: bool,
+    }
+
+    #[cfg(not(windows))]
+    impl StagedPart {
+        fn new(root: &Path, rel: &Path, file: std::fs::File) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                rel: rel.to_path_buf(),
+                file: Some(file),
+                committed: false,
+            }
+        }
+
+        fn file(&self) -> &std::fs::File {
+            self.file.as_ref().expect("uncommitted staging file is present")
+        }
+
+        fn file_mut(&mut self) -> &mut std::fs::File {
+            self.file.as_mut().expect("uncommitted staging file is present")
+        }
+
+        fn mark_committed(&mut self) {
+            self.committed = true;
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for StagedPart {
+        fn drop(&mut self) {
+            if self.committed {
+                return;
+            }
+            if let Some(file) = self.file.as_ref() {
+                // Drop is the all-path fallback. Cleanup errors are deliberately
+                // fail-safe: never replace/delete an entry that no longer
+                // matches our open file. Explicit transfer errors remain the
+                // protocol's primary error.
+                let _ = crate::mount_proto::safe_unlink_staged_beneath(
+                    &self.root,
+                    &self.rel,
+                    file,
+                );
+            }
+        }
     }
 
     /// An owned serving task. The caller can cancel and join it; dropping the
@@ -674,23 +731,28 @@ pub mod serving {
         // existing name and reopen it: that can follow a planted/replaced
         // symlink. Existing stale `.part` files fail closed. CREATE_NEW / O_EXCL
         // also closes the check/open race without a preceding path lookup.
-        let mut file = match safe_create_part(&cfg.root, &part_rel) {
+        let file = match safe_create_part(&cfg.root, &part_rel) {
             Ok(file) => file,
             Err(error) => {
                 discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
                 return Err(error.into());
             }
         };
+        let mut staged = StagedPart::new(&cfg.root, &part_rel, file);
+        #[cfg(test)]
+        if let Some((entered, release)) = &cfg.staging_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         if let Some(mut source) = source {
             use std::io::{Seek, SeekFrom};
             let copied = (|| -> std::io::Result<()> {
-                file.set_len(0)?;
-                std::io::copy(&mut source, &mut file)?;
-                file.seek(SeekFrom::Start(0))?;
+                staged.file_mut().set_len(0)?;
+                std::io::copy(&mut source, staged.file_mut())?;
+                staged.file_mut().seek(SeekFrom::Start(0))?;
                 Ok(())
             })();
             if let Err(error) = copied {
-                drop(file);
                 discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
                 return Err(error.into());
             }
@@ -705,42 +767,34 @@ pub mod serving {
                     let pos = idx.checked_mul(SYNC_CHUNK).filter(|p| *p < size.max(1))
                         .ok_or_else(|| anyhow::anyhow!("chunk index out of range"))?;
                     if data.len() as u64 > SYNC_CHUNK || pos + data.len() as u64 > size { bail!("chunk overruns the file"); }
-                    filament_transfer::pwrite_at(&file, &data, pos)?;
+                    filament_transfer::pwrite_at(staged.file(), &data, pos)?;
                 }
                 other => bail!("unexpected record inside a file: {other:?}"),
             }
         }
-        file.set_len(size)?;
-        file.sync_all()?;
-        let got = tokio::task::spawn_blocking(move || {
-            let digest = hash_open_file(&mut file);
-            (file, digest)
+        staged.file().set_len(size)?;
+        staged.file().sync_all()?;
+        let (staged, digest) = tokio::task::spawn_blocking(move || {
+            let digest = hash_open_file(staged.file_mut());
+            (staged, digest)
         }).await?;
-        let (file, digest) = got;
         #[cfg(test)]
         if let Some((entered, release)) = &cfg.finalization_gate {
             entered.notify_one();
             release.notified().await;
         }
         if *cancel.borrow() {
-            crate::mount_proto::safe_unlink_staged_beneath(&cfg.root, &part_rel, &file)?;
-            drop(file);
             bail!("sync cancelled");
         }
         if digest.as_deref() != Some(full.as_str()) {
-            crate::mount_proto::safe_unlink_staged_beneath(&cfg.root, &part_rel, &file)?;
-            drop(file);
             bail!("content hash mismatch after transfer");
         }
         let cancelled = commit_state.lock().unwrap_or_else(|e| e.into_inner());
         if *cancelled {
-            drop(cancelled);
-            crate::mount_proto::safe_unlink_staged_beneath(&cfg.root, &part_rel, &file)?;
-            drop(file);
             bail!("sync cancelled");
         }
-        crate::mount_proto::safe_rename_beneath(&cfg.root, &part_rel, &rel, &file)?;
-        drop(file);
+        crate::mount_proto::safe_rename_beneath(&cfg.root, &part_rel, &rel, staged.file())?;
+        staged.mark_committed();
         drop(cancelled);
         Ok(())
     }
@@ -897,6 +951,23 @@ pub mod serving {
             wire: Vec<u8>,
             finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
         ) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
+            setup_with_gates(root, wire, finalization_gate, None).await
+        }
+
+        async fn setup_with_staging_gate(
+            root: &Path,
+            wire: Vec<u8>,
+            staging_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        ) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
+            setup_with_gates(root, wire, None, staging_gate).await
+        }
+
+        async fn setup_with_gates(
+            root: &Path,
+            wire: Vec<u8>,
+            finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+            staging_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        ) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
             let host: Arc<dyn HostServices> = Arc::new(NoHost);
             let transport = Arc::new(CaptureTransport::default());
             let mux = Mux::new(transport.clone(), host);
@@ -915,6 +986,8 @@ pub mod serving {
                 max_record_bytes: super::super::MAX_SYNC_RECORD_BYTES,
                 #[cfg(test)]
                 finalization_gate,
+                #[cfg(test)]
+                staging_gate,
             });
             (task, mux, transport)
         }
@@ -1087,6 +1160,56 @@ pub mod serving {
             assert_eq!(replies[1]["ok"], false);
             assert_eq!(replies[1]["err"], "sync cancelled");
             assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn cancellation_after_stage_creation_cleans_stage_and_retry_succeeds() {
+            let root = TempRoot::new();
+            let bytes = b"retry after cancelled stage";
+            let digest = sha2::Sha256::digest(bytes).iter()
+                .map(|b| format!("{b:02x}")).collect::<String>();
+            let mut first_wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[]}), &mut first_wire);
+            record(&json!({"type":"file", "p":"retry.txt", "size":bytes.len(), "full":digest}), &mut first_wire);
+            record(&json!({"type":"chunk", "idx":0}), &mut first_wire);
+            record_bytes(bytes, &mut first_wire);
+            record(&json!({"type":"file-end"}), &mut first_wire);
+            record(&json!({"type":"done"}), &mut first_wire);
+
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_staging_gate(
+                &root.0,
+                first_wire,
+                Some((entered.clone(), release.clone())),
+            ).await;
+            entered.notified().await;
+            task.cancel();
+            release.notify_one();
+            assert_eq!(task.join().await.unwrap().unwrap_err().to_string(), "sync cancelled");
+            assert!(!root.0.join("retry.txt.part").exists());
+            assert!(!root.0.join("retry.txt").exists());
+            assert_eq!(mux.live_streams().await, 0);
+            let first_ack = outgoing_json(&transport);
+            assert_eq!(first_ack[1]["type"], "file-ack");
+            assert_eq!(first_ack[1]["ok"], false);
+
+            let mut retry_wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[]}), &mut retry_wire);
+            record(&json!({"type":"file", "p":"retry.txt", "size":bytes.len(), "full":digest}), &mut retry_wire);
+            record(&json!({"type":"chunk", "idx":0}), &mut retry_wire);
+            record_bytes(bytes, &mut retry_wire);
+            record(&json!({"type":"file-end"}), &mut retry_wire);
+            record(&json!({"type":"done"}), &mut retry_wire);
+
+            let (retry, retry_mux, retry_transport) = setup(&root.0, retry_wire).await;
+            assert!(retry.join().await.unwrap().is_ok());
+            assert_eq!(std::fs::read(root.0.join("retry.txt")).unwrap(), bytes);
+            assert!(!root.0.join("retry.txt.part").exists());
+            let retry_ack = outgoing_json(&retry_transport);
+            assert_eq!(retry_ack[1], json!({"type":"file-ack", "p":"retry.txt", "ok":true}));
+            assert_eq!(retry_mux.live_streams().await, 0);
         }
 
         #[cfg(unix)]
