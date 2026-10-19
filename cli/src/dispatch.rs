@@ -740,6 +740,9 @@ pub(crate) async fn async_main() -> Result<()> {
                 let remember_name = remember.clone();
                 let transport_context =
                     crate::transport_context::for_root(&settings::config_dir())?;
+                // One report per invocation: concurrent receives never share
+                // files, refusals or their sender-gone clock.
+                let report = crate::recv_report::RecvReport::new();
                 let res = recv_cmd(
                     &server,
                     code,
@@ -760,11 +763,12 @@ pub(crate) async fn async_main() -> Result<()> {
                     transport_context,
                     crate::host_impl::cli_log(),
                     crate::host_impl::cli_host(),
+                    &report,
                 )
                 .await;
                 // Refused files decide the outcome: all refused is the
                 // refusal's own code, some refused is partial.
-                let res = crate::recv_report::finish(res);
+                let res = crate::recv_report::finish(&report, res);
                 if let (Ok(()), Some(r)) = (&res, remember_name.as_deref()) {
                     if !crate::shared_defs::REMEMBER_STORED.load(std::sync::atomic::Ordering::Relaxed) {
                         ui::caution(
@@ -775,7 +779,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 }
                 if json_out {
-                    return crate::recv_report::emit(res, &shown_dir);
+                    return crate::recv_report::emit(&report, res, &shown_dir);
                 }
                 res
             }

@@ -33,9 +33,12 @@
 //! carries `recv::transfer_truth`, the host-free truth/decision half lifted
 //! from `cli/src/transfer_truth.rs`: the sequential-accept rule, the resume
 //! line, the partials a receive recorded and the ones actually kept, and the
-//! sender-gone sentence. The CLI re-exports them; what stays there is the
-//! orchestration plus the host/UI adapters (`finalize_incoming`, the inbox
-//! helpers, the rendered refusal, and every place a sentence is shown).
+//! sender-gone sentence. It also carries `recv::report`: the per-invocation
+//! `RecvReport` (files, last refusal, outcome, `--json` object) that replaced
+//! the CLI's process-global report state. The CLI re-exports them; what stays
+//! there is the orchestration plus the host/UI adapters (`finalize_incoming`,
+//! the inbox helpers, the rendered refusal, the exit-code mapping, and every
+//! place a sentence is shown).
 //!
 //! What the crate still does NOT contain:
 //! - the command surface (`send_cmd`, `recv_cmd`, the daemons, the roster UI):

@@ -24,13 +24,19 @@
 //!     resume line, the partials a receive recorded (`SessionPart`,
 //!     `note_part`), the ones actually on disk (`KeptPartial`,
 //!     `kept_partials`; an empty partial is deleted, not reported), and the
-//!     sender-gone sentence.
+//!     sender-gone sentence;
+//!   * the invocation report (`report`): the per-file record, the
+//!     invocation-owned `RecvReport` (files and last-refusal stamp), the
+//!     refusal outcome aggregation, and the `receive --json` result object.
+//!     It replaces the CLI's process-global `FILES`/`LAST_REFUSAL`, so two
+//!     concurrent receives cannot see or overwrite each other.
 //!
 //! What stays in the CLI, because it is bound to the host, the filesystem
 //! layout or the terminal: `finalize_incoming` (UI, settings, history, the
 //! daemon log), the inbox helpers (`ensure_inbox`, `inbox_problem`, ...; config
 //! paths), `storage_refusal` (a rendered sentence), `delivery_ack` (session
-//! state), `partial_status_lines` (a rendered table) and every call that emits
+//! state), `partial_status_lines` (a rendered table), the exit-code/UI adapter
+//! over the report (`recv_report::finish`/`emit`) and every call that emits
 //! a truth sentence to the user.
 //!
 //! The moved mechanics print nothing. `verify_incoming`'s old debug line and
@@ -50,6 +56,7 @@ use sha2::{Digest, Sha256};
 use crate::host::StorageFailure;
 use crate::present::{Progress as ProgressBar, human};
 
+pub mod report;
 pub mod transfer_truth;
 
 // Re-exported at the receive module root so the CLI shim (and library callers)
@@ -57,6 +64,12 @@ pub mod transfer_truth;
 pub use transfer_truth::{
     KeptPartial, SessionPart, accept_is_sequential, kept_partials, note_part, resume_line,
     sender_gone_message,
+};
+// The per-invocation receive report (files, last refusal, outcome, JSON
+// object). Re-exported here so callers can name it without the child path.
+pub use report::{
+    OutcomeKind, RecvFile, RecvReport, Refusal, RefusalClass, RefusedOutcome, ReportError,
+    refused_error, result_object, storage_kind,
 };
 
 /// P4 (GAP-5): sha256 over the WHOLE file, the end-to-end content digest the
