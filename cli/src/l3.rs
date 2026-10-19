@@ -256,9 +256,8 @@ pub struct L3 {
     /// rather than re-read from the kernel so tunlion only ever deletes routes
     /// it created, and never a route the operator put there.
     kernel_subnets: Mutex<std::collections::HashSet<String>>,
-    /// Whether the policy-routing exit route is currently in force, so it is
-    /// installed once and withdrawn exactly once.
-    exit_route_installed: Mutex<bool>,
+    /// The active exit-route install plan, or a plan awaiting successful teardown.
+    exit_route_state: Mutex<Option<ExitRouteState>>,
     /// Highest announce sequence ACCEPTED from each peer identity, so a stale
     /// announce cannot roll an address back. Keyed by the announcing PUBKEY,
     /// not by pid: pid is a session artefact, and the signature binds the key.
@@ -275,6 +274,24 @@ pub struct L3 {
     /// means there is no kernel route to the overlay, so we do NOT write /etc/hosts
     /// (names would resolve but not route) and `add_route` is a no-op.
     netstack: Option<Arc<NetstackTun>>,
+}
+
+type ExitRoutePlan = Vec<Vec<String>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExitRouteState {
+    /// This plan was applied successfully and is believed active.
+    Active(ExitRoutePlan),
+    /// Teardown failed (or rollback after a partial install failed). Retrying
+    /// teardown is required before another desired plan may be installed.
+    PendingTeardown(ExitRoutePlan),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExitRouteChange {
+    Unchanged,
+    Installed,
+    Withdrawn,
 }
 
 impl L3 {
@@ -340,7 +357,7 @@ impl L3 {
             by_pid: Mutex::new(HashMap::new()),
             identity,
             kernel_subnets: Mutex::new(std::collections::HashSet::new()),
-            exit_route_installed: Mutex::new(false),
+            exit_route_state: Mutex::new(None),
             seen_seq: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             netstack,
@@ -754,28 +771,9 @@ impl L3 {
             }
             return;
         }
-        {
-            let mut installed = self.exit_route_installed.lock().await;
-            if defaults.is_empty() {
-                if *installed {
-                    match reconcile_installed_flag(&mut installed, false, || {
-                        crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan())
-                            .map_err(|e| e.to_string())
-                    }) {
-                        Ok(true) => {
-                            crate::ui::say("  exit route withdrawn; traffic uses the ordinary path again");
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            crate::ui::debug(&format!("  could not withdraw the exit route: {e}"));
-                        }
-                    }
-                }
-                return;
-            }
-            if *installed {
-                return; // already in force; nothing changed
-            }
+        let mut desired = None;
+        let mut excluded = 0;
+        if !defaults.is_empty() {
             let (mut underlay, unknown) = self.default_route_underlay().await;
             if unknown {
                 // A relay link cannot name its own endpoint, so there is no
@@ -785,37 +783,43 @@ impl L3 {
                     "  {} not accepting an exit route over a relay link: its underlay address is unknown, so it cannot be excluded from the route it offers",
                     crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
                 ));
-                return;
-            }
-            // The signaling server, or the node cannot renegotiate, cannot be
-            // told to stop, and cannot recover on its own.
-            underlay.extend(crate::exit_route::signaling_addrs());
-            if underlay.is_empty() {
-                crate::ui::say(&format!(
-                    "  {} not accepting an exit route: no underlay address to exclude",
-                    crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
-                ));
-                return;
-            }
-            let gw = crate::platform::policy_route::default_gateway();
-            let plan = crate::exit_route::install_plan(ifname(), gw.as_deref(), &underlay);
-            match crate::platform::policy_route::run_plan(&plan) {
-                Ok(()) => {
-                    *installed = true;
+            } else {
+                // The signaling server must retain its ordinary path so a lost
+                // exit-node link can always be renegotiated and withdrawn.
+                underlay.extend(crate::exit_route::signaling_addrs());
+                if underlay.is_empty() {
                     crate::ui::say(&format!(
-                        "  {} exit route active: all traffic via the mesh, except {} excluded address(es)",
-                        crate::ui::paint(crate::ui::Tone::Ok, crate::ui::glyph_ok()),
-                        underlay.len()
-                    ));
-                }
-                Err(e) => {
-                    // Do not leave a half-applied policy in place.
-                    let _ = crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan());
-                    crate::ui::say(&format!(
-                        "  {} could not install the exit route ({e}); reverted",
+                        "  {} not accepting an exit route: no underlay address to exclude",
                         crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
                     ));
+                } else {
+                    let gw = crate::platform::policy_route::default_gateway();
+                    desired = Some(crate::exit_route::install_plan(ifname(), gw.as_deref(), &underlay));
+                    excluded = underlay.len();
                 }
+            }
+        }
+
+        let mut state = self.exit_route_state.lock().await;
+        let result = reconcile_exit_route_state(
+            &mut state,
+            desired,
+            || crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan()).map_err(|e| e.to_string()),
+            |plan| crate::platform::policy_route::run_plan(plan).map_err(|e| e.to_string()),
+        );
+        match result {
+            Ok(ExitRouteChange::Unchanged) => {}
+            Ok(ExitRouteChange::Withdrawn) => {
+                crate::ui::say("  exit route withdrawn; traffic uses the ordinary path again");
+            }
+            Ok(ExitRouteChange::Installed) => {
+                crate::ui::say(&format!(
+                    "  {} exit route active: all traffic via the mesh, except {excluded} excluded address(es)",
+                    crate::ui::paint(crate::ui::Tone::Ok, crate::ui::glyph_ok())
+                ));
+            }
+            Err(e) => {
+                crate::ui::debug(&format!("  could not reconcile the exit route: {e}"));
             }
         }
     }
@@ -1385,28 +1389,71 @@ where
     errors
 }
 
-/// Apply an exit-route state transition, committing the tracked state only when
-/// the OS operation succeeds. A failed teardown therefore remains pending for
-/// the next route reconciliation.
-fn reconcile_installed_flag<F>(
-    installed: &mut bool,
-    desired: bool,
-    apply: F,
-) -> Result<bool, String>
+/// Reconcile the active exit-route plan with the newly desired plan. Teardown is
+/// always completed before installing a changed plan. If teardown fails, retain
+/// the old plan as pending and retry it on the next reconciliation, even when
+/// that next reconciliation desires a different plan.
+fn reconcile_exit_route_state<T, I>(
+    state: &mut Option<ExitRouteState>,
+    desired: Option<ExitRoutePlan>,
+    mut teardown: T,
+    mut install: I,
+) -> Result<ExitRouteChange, String>
 where
-    F: FnOnce() -> Result<(), String>,
+    T: FnMut() -> Result<(), String>,
+    I: FnMut(&ExitRoutePlan) -> Result<(), String>,
 {
-    if *installed == desired {
-        return Ok(false);
+    if state.is_none() && desired.is_none() {
+        return Ok(ExitRouteChange::Unchanged);
     }
-    apply()?;
-    *installed = desired;
-    Ok(true)
+    if let (Some(ExitRouteState::Active(active)), Some(desired_plan)) =
+        (state.as_ref(), desired.as_ref())
+    {
+        if active == desired_plan {
+            return Ok(ExitRouteChange::Unchanged);
+        }
+    }
+
+    if let Some(previous) = state.take() {
+        let previous_plan = match previous {
+            ExitRouteState::Active(plan) | ExitRouteState::PendingTeardown(plan) => plan,
+        };
+        if let Err(error) = teardown() {
+            *state = Some(ExitRouteState::PendingTeardown(previous_plan));
+            return Err(format!("could not remove previous exit-route plan: {error}"));
+        }
+    }
+
+    let Some(desired_plan) = desired else {
+        return Ok(ExitRouteChange::Withdrawn);
+    };
+    match install(&desired_plan) {
+        Ok(()) => {
+            *state = Some(ExitRouteState::Active(desired_plan));
+            Ok(ExitRouteChange::Installed)
+        }
+        Err(install_error) => {
+            // Installation commands can fail partway through. Try the global
+            // teardown, and remember a pending cleanup if that too fails.
+            match teardown() {
+                Ok(()) => *state = None,
+                Err(teardown_error) => {
+                    *state = Some(ExitRouteState::PendingTeardown(desired_plan));
+                    return Err(format!(
+                        "install failed ({install_error}) and rollback failed ({teardown_error})"
+                    ));
+                }
+            }
+            Err(format!("install failed ({install_error}); rollback completed"))
+        }
+    }
 }
 
 #[cfg(test)]
 mod route_reconcile_tests {
-    use super::reconcile_installed_routes;
+    use super::{
+        reconcile_exit_route_state, reconcile_installed_routes, ExitRouteChange, ExitRouteState,
+    };
     use std::collections::HashSet;
 
     #[test]
@@ -1451,23 +1498,82 @@ mod route_reconcile_tests {
 
     #[test]
     fn failed_exit_route_teardown_remains_pending_and_retries() {
-        let mut installed = true;
+        let plan = vec![vec!["exit-plan-A".to_string()]];
+        let mut state = Some(ExitRouteState::Active(plan));
         let mut teardown_calls = 0;
 
-        let result = reconcile_installed_flag(&mut installed, false, || {
-            teardown_calls += 1;
-            Err("simulated teardown failure".to_string())
-        });
-        assert_eq!(result, Err("simulated teardown failure".to_string()));
-        assert!(installed, "failure must preserve the believed-installed state");
+        let result = reconcile_exit_route_state(
+            &mut state,
+            None,
+            || {
+                teardown_calls += 1;
+                Err("simulated teardown failure".to_string())
+            },
+            |_| panic!("no installation expected"),
+        );
+        assert!(result.is_err());
+        assert!(matches!(state.as_ref(), Some(ExitRouteState::PendingTeardown(_))));
 
-        let result = reconcile_installed_flag(&mut installed, false, || {
-            teardown_calls += 1;
-            Ok(())
-        });
-        assert_eq!(result, Ok(true));
+        let result = reconcile_exit_route_state(
+            &mut state,
+            None,
+            || {
+                teardown_calls += 1;
+                Ok(())
+            },
+            |_| panic!("no installation expected"),
+        );
+        assert_eq!(result, Ok(ExitRouteChange::Withdrawn));
         assert_eq!(teardown_calls, 2);
-        assert!(!installed, "successful retry clears the pending teardown");
+        assert!(state.is_none(), "successful retry clears the pending teardown");
+    }
+
+    #[test]
+    fn failed_exit_teardown_reconciles_changed_desired_plan_before_stabilizing() {
+        let plan_a = vec![vec!["exit-plan-A".to_string()]];
+        let plan_b = vec![vec!["exit-plan-B".to_string()]];
+        let mut state = Some(ExitRouteState::Active(plan_a.clone()));
+        let mut os_plan = Some(plan_a.clone());
+        let mut teardown_calls = 0;
+
+        let result = reconcile_exit_route_state(
+            &mut state,
+            Some(plan_b.clone()),
+            || {
+                teardown_calls += 1;
+                Err("simulated teardown failure".to_string())
+            },
+            |_| panic!("B must not install while A may still be active"),
+        );
+        assert!(result.is_err());
+        assert_eq!(os_plan, Some(plan_a.clone()));
+        assert_eq!(state, Some(ExitRouteState::PendingTeardown(plan_a)));
+
+        let result = reconcile_exit_route_state(
+            &mut state,
+            Some(plan_b.clone()),
+            || {
+                teardown_calls += 1;
+                os_plan = None;
+                Ok(())
+            },
+            |plan| {
+                os_plan = Some(plan.clone());
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(ExitRouteChange::Installed));
+        assert_eq!(os_plan, Some(plan_b.clone()), "stale A is removed before B is installed");
+        assert_eq!(state, Some(ExitRouteState::Active(plan_b.clone())));
+
+        let result = reconcile_exit_route_state(
+            &mut state,
+            Some(plan_b),
+            || panic!("stable plan must not teardown"),
+            |_| panic!("stable plan must not reinstall"),
+        );
+        assert_eq!(result, Ok(ExitRouteChange::Unchanged));
+        assert_eq!(teardown_calls, 2);
     }
 }
 
@@ -1871,7 +1977,7 @@ mod tests {
             by_pid: tokio::sync::Mutex::new(HashMap::new()),
             identity: None,
             kernel_subnets: tokio::sync::Mutex::new(std::collections::HashSet::new()),
-            exit_route_installed: tokio::sync::Mutex::new(false),
+            exit_route_state: tokio::sync::Mutex::new(None),
             seen_seq: Mutex::new(HashMap::new()),
             names: tokio::sync::Mutex::new(HashMap::new()),
             netstack: Some(ns),
