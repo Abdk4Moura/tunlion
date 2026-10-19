@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 /// What the read loop delivers upward. One channel for everything, because every
@@ -55,14 +55,36 @@ fn next_conn_id() -> u64 {
 
 type Writer = Arc<
     Mutex<
-        futures_util::stream::SplitSink<
+        Option<futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
             >,
             Message,
-        >,
+        >>,
     >,
 >;
+
+async fn send_writer_message(
+    writer: &Writer,
+    mut stopping: watch::Receiver<bool>,
+    message: Message,
+) -> Result<()> {
+    if *stopping.borrow() {
+        bail!("signaling connection is stopping");
+    }
+    tokio::select! {
+        biased;
+        _ = stopping.changed() => bail!("signaling connection is stopping"),
+        result = async {
+            let mut sink = writer.lock().await;
+            sink.as_mut()
+                .ok_or_else(|| anyhow!("signaling connection is closed"))?
+                .send(message)
+                .await
+                .map_err(anyhow::Error::from)
+        } => result,
+    }
+}
 
 /// A handle to a live signaling connection. Cheap to clone; every clone writes
 /// to the same socket behind one mutex.
@@ -79,6 +101,10 @@ pub struct Client {
     /// echoes them back on `43`.
     next_ack: Arc<AtomicU64>,
     pending: Pending,
+    // Shared among Client clones so shutdown can join the socket reader.
+    reader_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    stopping: Arc<Mutex<bool>>,
+    stop_tx: watch::Sender<bool>,
 }
 
 impl Client {
@@ -102,10 +128,11 @@ impl Client {
         // array. serde_json does the escaping, so an event name or payload
         // containing a quote cannot break framing.
         let frame = format!("42{}", Value::Array(vec![Value::String(event.into()), data]));
-        self.writer
-            .lock()
-            .await
-            .send(Message::Text(frame.into()))
+        send_writer_message(
+            &self.writer,
+            self.stop_tx.subscribe(),
+            Message::Text(frame.into()),
+        )
             .await
             .with_context(|| format!("emit '{event}'"))
     }
@@ -134,7 +161,13 @@ impl Client {
         self.pending.lock().await.insert(id, done_tx);
         let frame =
             format!("42{id}{}", Value::Array(vec![Value::String(event.into()), data]));
-        if let Err(e) = self.writer.lock().await.send(Message::Text(frame.into())).await {
+        if let Err(e) = send_writer_message(
+            &self.writer,
+            self.stop_tx.subscribe(),
+            Message::Text(frame.into()),
+        )
+        .await
+        {
             self.pending.lock().await.remove(&id);
             return Err(e).with_context(|| format!("emit '{event}' with ack"));
         }
@@ -175,9 +208,12 @@ impl Client {
         Ok((
             Client {
                 id: next_conn_id(),
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(Some(writer))),
                 next_ack: Arc::new(AtomicU64::new(1)),
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                reader_task: Arc::new(Mutex::new(None)),
+                stopping: Arc::new(Mutex::new(false)),
+                stop_tx: watch::channel(false).0,
             },
             far,
         ))
@@ -185,12 +221,49 @@ impl Client {
 
     /// Close the Socket.IO session and the websocket under it.
     ///
-    /// Best effort by design: this runs on paths that are already tearing down,
-    /// and a peer that has gone away must not turn shutdown into an error.
+    /// Tries the Socket.IO and websocket close handshake for at most
+    /// [`DISCONNECT_GRACE`]. A peer that ignores Close cannot keep this future
+    /// alive forever: after the grace period the owned reader is aborted and
+    /// joined, and the shared sink is dropped (with a second bounded wait for
+    /// concurrent writers). The usual bound is two grace periods plus runtime
+    /// scheduling. The handle stays in shared state until the join completes,
+    /// so a caller that cancels this future can retry shutdown safely.
     pub async fn disconnect(&self) -> Result<()> {
-        let mut w = self.writer.lock().await;
-        let _ = w.send(Message::Text("41".into())).await; // Socket.IO DISCONNECT
-        let _ = w.send(Message::Close(None)).await;
+        *self.stopping.lock().await = true;
+        self.stop_tx.send_replace(true);
+        // Hold the task slot for the whole operation. Concurrent callers wait
+        // here, and a timed-out/cancelled caller leaves the JoinHandle in place.
+        let mut reader_task = self.reader_task.lock().await;
+
+        let graceful = tokio::time::timeout(DISCONNECT_GRACE, async {
+            let mut writer = self.writer.lock().await;
+            if let Some(w) = writer.as_mut() {
+                let _ = w.send(Message::Text("41".into())).await; // Socket.IO DISCONNECT
+                let _ = w.close().await; // Flush and close the owned websocket sink.
+            }
+            drop(writer);
+            if let Some(task) = reader_task.as_mut() {
+                let _ = task.await;
+            }
+        })
+        .await;
+
+        if graceful.is_err() {
+            // Dropping the read future releases its split websocket half. Abort
+            // and join rather than detach: no task can emit after this returns.
+            if let Some(task) = reader_task.as_mut() {
+                task.abort();
+                let _ = task.await;
+            }
+            // SplitSink is shared by Client clones; aborting only the reader
+            // would otherwise leave its TCP write half alive. Remove it after
+            // the graceful future has released the writer mutex.
+            let _ = tokio::time::timeout(DISCONNECT_GRACE, async {
+                self.writer.lock().await.take();
+            })
+            .await;
+        }
+        *reader_task = None;
         Ok(())
     }
 }
@@ -266,6 +339,11 @@ pub fn parse_ack(body: &str) -> Option<(u64, Vec<Value>)> {
 /// replacement has to as well, or a dead server turns into a stuck process
 /// instead of an error the caller can retry.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Maximum graceful signaling shutdown time before the owned reader is aborted.
+/// Forced sink release gets a second bound of the same length. This is
+/// deliberately short: callers may already be in a larger engine shutdown
+/// budget, and a peer is not required to answer a websocket Close.
+const DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Connect, complete both handshakes, and start the read loop.
 ///
@@ -299,7 +377,8 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
             .await
             .with_context(|| format!("websocket connect to {url}"))?;
     let (writer, mut reader) = stream.split();
-    let writer: Writer = Arc::new(Mutex::new(writer));
+    let writer: Writer = Arc::new(Mutex::new(Some(writer)));
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     // Engine.IO OPEN ('0') must arrive first and carries the session parameters.
     // Anything else here means we are not talking to an Engine.IO v4 endpoint,
@@ -316,7 +395,14 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
     }
 
     // Socket.IO CONNECT to the default namespace, then wait for its reply.
-    writer.lock().await.send(Message::Text("40".into())).await.context("send Socket.IO CONNECT")?;
+    writer
+        .lock()
+        .await
+        .as_mut()
+        .ok_or_else(|| anyhow!("signaling writer closed"))?
+        .send(Message::Text("40".into()))
+        .await
+        .context("send Socket.IO CONNECT")?;
     loop {
         let msg = reader
             .next()
@@ -334,7 +420,12 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
             Some(('2', _)) => {
                 // A ping can arrive mid-handshake; answer it or the server
                 // will time us out while we are still waiting.
-                let _ = writer.lock().await.send(Message::Text("3".into())).await;
+                let _ = send_writer_message(
+                    &writer,
+                    stop_rx.clone(),
+                    Message::Text("3".into()),
+                )
+                .await;
             }
             _ => continue,
         }
@@ -342,13 +433,20 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
 
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let id = next_conn_id();
+    let reader_task = Arc::new(Mutex::new(None));
+    let stopping = Arc::new(Mutex::new(false));
     let client = Client {
         id,
         writer: writer.clone(),
         next_ack: Arc::new(AtomicU64::new(1)),
         pending: pending.clone(),
+        reader_task: reader_task.clone(),
+        stopping: stopping.clone(),
+        stop_tx,
     };
-    tokio::spawn(read_loop(id, reader, writer, tx, pending));
+    *reader_task.lock().await = Some(tokio::spawn(read_loop(
+        id, reader, writer, tx, pending, stopping, stop_rx,
+    )));
     Ok(client)
 }
 
@@ -363,6 +461,8 @@ async fn read_loop(
     writer: Writer,
     tx: mpsc::UnboundedSender<Incoming>,
     pending: Pending,
+    stopping: Arc<Mutex<bool>>,
+    stop_rx: watch::Receiver<bool>,
 ) {
     let reason = loop {
         let Some(next) = reader.next().await else { break "closed".to_string() };
@@ -384,7 +484,10 @@ async fn read_loop(
             // is what produced the 30s-silence reconnect storm documented in
             // net.rs, so it is the one thing here that must never be skipped.
             Some(('2', _)) => {
-                if writer.lock().await.send(Message::Text("3".into())).await.is_err() {
+                if send_writer_message(&writer, stop_rx.clone(), Message::Text("3".into()))
+                    .await
+                    .is_err()
+                {
                     break "write failed".to_string();
                 }
             }
@@ -392,6 +495,10 @@ async fn read_loop(
             Some(('4', rest)) => match split_packet(rest) {
                 Some(('2', body)) => {
                     if let Some((name, data)) = parse_event(body) {
+                        let stopping = stopping.lock().await;
+                        if *stopping {
+                            break "stopped".to_string();
+                        }
                         if tx.send(Incoming::Event { name, data }).is_err() {
                             break "receiver gone".to_string();
                         }
@@ -411,7 +518,10 @@ async fn read_loop(
             _ => {}
         }
     };
-    let _ = tx.send(Incoming::Down { conn, reason });
+    let stopping = stopping.lock().await;
+    if !*stopping {
+        let _ = tx.send(Incoming::Down { conn, reason });
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +530,160 @@ mod tls_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn read_raw_client_frame(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+
+        let mut header = [0; 2];
+        socket.read_exact(&mut header).await.unwrap();
+        let mut len = (header[1] & 0x7f) as usize;
+        if len == 126 {
+            let mut extended = [0; 2];
+            socket.read_exact(&mut extended).await.unwrap();
+            len = u16::from_be_bytes(extended) as usize;
+        } else if len == 127 {
+            let mut extended = [0; 8];
+            socket.read_exact(&mut extended).await.unwrap();
+            len = u64::from_be_bytes(extended) as usize;
+        }
+        assert_ne!(header[1] & 0x80, 0, "client frames must be masked");
+        let mut mask = [0; 4];
+        socket.read_exact(&mut mask).await.unwrap();
+        let mut payload = vec![0; len];
+        socket.read_exact(&mut payload).await.unwrap();
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % mask.len()];
+        }
+        (header[0] & 0x0f, payload)
+    }
+
+    async fn send_raw_server_text(socket: &mut tokio::net::TcpStream, text: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let payload = text.as_bytes();
+        assert!(payload.len() < 126);
+        socket.write_all(&[0x81, payload.len() as u8]).await.unwrap();
+        socket.write_all(payload).await.unwrap();
+    }
+
+    async fn local_client(
+        server_action: impl FnOnce(
+                tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+            ) -> tokio::task::JoinHandle<()>
+            + Send
+            + 'static,
+    ) -> (Client, mpsc::UnboundedReceiver<Incoming>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let url = format!("http://{addr}");
+        let client_fut = connect(&url, tx);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            ws.send(Message::Text("0{}".into())).await.unwrap();
+            assert_eq!(ws.next().await.unwrap().unwrap().into_text().unwrap(), "40");
+            ws.send(Message::Text("40{}".into())).await.unwrap();
+            server_action(ws)
+        });
+        let client = client_fut.await.unwrap();
+        // Let the server finish its handshake and start its scripted behavior.
+        let action = server.await.unwrap();
+        (client, rx, action)
+    }
+
+    async fn reply_to_client_close(mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
+        while let Some(frame) = ws.next().await {
+            match frame.unwrap() {
+                Message::Close(_) => {
+                    let _ = ws.send(Message::Close(None)).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_joins_reader_and_suppresses_late_event_and_down() {
+        let (client, mut rx, server) = local_client(|mut ws| {
+            tokio::spawn(async move {
+                // The local stop flag is set before disconnect writes this packet.
+                assert_eq!(ws.next().await.unwrap().unwrap().into_text().unwrap(), "41");
+                ws.send(Message::Text(r#"42["late",{}]"#.into()))
+                    .await
+                    .unwrap();
+                reply_to_client_close(ws).await;
+            })
+        })
+        .await;
+        client.disconnect().await.unwrap();
+        assert!(rx.try_recv().is_err(), "local shutdown must not emit Down/event");
+        assert!(rx.recv().await.is_none(), "disconnect must await reader exit");
+        assert!(server.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_disconnects_are_idempotent_and_both_join() {
+        let (client, mut rx, server) =
+            local_client(|ws| tokio::spawn(reply_to_client_close(ws))).await;
+        let cloned = client.clone();
+        let (a, b) = tokio::join!(client.disconnect(), cloned.disconnect());
+        a.unwrap();
+        b.unwrap();
+        assert!(rx.try_recv().is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_terminates_socket_when_peer_ignores_close() {
+        let (client, mut rx, server) = local_client(|mut ws| {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+
+                // Read raw TCP frames after the Socket.IO handshake. The
+                // tungstenite server API automatically answers Close when
+                // polled, which would mask the peer-ignores-close case.
+                let socket = ws.get_mut();
+                let (opcode, payload) = read_raw_client_frame(socket).await;
+                assert_eq!(opcode, 1);
+                assert_eq!(payload, b"41");
+                // A peer may still send data after Socket.IO DISCONNECT. Local
+                // shutdown must suppress it, then finish even if this peer
+                // never answers the websocket close handshake.
+                send_raw_server_text(socket, r#"42["late",{}]"#).await;
+                let (opcode, _) = read_raw_client_frame(socket).await;
+                assert_eq!(opcode, 8, "client should send a websocket Close frame");
+                let mut byte = [0; 1];
+                assert_eq!(socket.read(&mut byte).await.unwrap(), 0, "forced sink drop should close TCP");
+            })
+        })
+        .await;
+
+        let started = std::time::Instant::now();
+        client.disconnect().await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(rx.try_recv().is_err(), "shutdown must suppress late data");
+        assert!(rx.recv().await.is_none(), "reader task must be joined after abort");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_close_delivers_down_when_not_locally_stopping() {
+        let (client, mut rx, server) = local_client(|mut ws| {
+            tokio::spawn(async move {
+                ws.send(Message::Close(None)).await.unwrap();
+            })
+        })
+        .await;
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, Incoming::Down { conn, .. } if conn == client.id()));
+        client.disconnect().await.unwrap();
+        server.await.unwrap();
+    }
 
     #[test]
     fn https_becomes_wss_and_keeps_the_engineio_query() {
