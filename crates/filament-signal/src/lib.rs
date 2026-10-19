@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 /// What the read loop delivers upward. One channel for everything, because every
@@ -55,14 +55,36 @@ fn next_conn_id() -> u64 {
 
 type Writer = Arc<
     Mutex<
-        futures_util::stream::SplitSink<
+        Option<futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
             >,
             Message,
-        >,
+        >>,
     >,
 >;
+
+async fn send_writer_message(
+    writer: &Writer,
+    mut stopping: watch::Receiver<bool>,
+    message: Message,
+) -> Result<()> {
+    if *stopping.borrow() {
+        bail!("signaling connection is stopping");
+    }
+    tokio::select! {
+        biased;
+        _ = stopping.changed() => bail!("signaling connection is stopping"),
+        result = async {
+            let mut sink = writer.lock().await;
+            sink.as_mut()
+                .ok_or_else(|| anyhow!("signaling connection is closed"))?
+                .send(message)
+                .await
+                .map_err(anyhow::Error::from)
+        } => result,
+    }
+}
 
 /// A handle to a live signaling connection. Cheap to clone; every clone writes
 /// to the same socket behind one mutex.
@@ -82,6 +104,7 @@ pub struct Client {
     // Shared among Client clones so shutdown can join the socket reader.
     reader_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     stopping: Arc<Mutex<bool>>,
+    stop_tx: watch::Sender<bool>,
 }
 
 impl Client {
@@ -105,10 +128,11 @@ impl Client {
         // array. serde_json does the escaping, so an event name or payload
         // containing a quote cannot break framing.
         let frame = format!("42{}", Value::Array(vec![Value::String(event.into()), data]));
-        self.writer
-            .lock()
-            .await
-            .send(Message::Text(frame.into()))
+        send_writer_message(
+            &self.writer,
+            self.stop_tx.subscribe(),
+            Message::Text(frame.into()),
+        )
             .await
             .with_context(|| format!("emit '{event}'"))
     }
@@ -137,7 +161,13 @@ impl Client {
         self.pending.lock().await.insert(id, done_tx);
         let frame =
             format!("42{id}{}", Value::Array(vec![Value::String(event.into()), data]));
-        if let Err(e) = self.writer.lock().await.send(Message::Text(frame.into())).await {
+        if let Err(e) = send_writer_message(
+            &self.writer,
+            self.stop_tx.subscribe(),
+            Message::Text(frame.into()),
+        )
+        .await
+        {
             self.pending.lock().await.remove(&id);
             return Err(e).with_context(|| format!("emit '{event}' with ack"));
         }
@@ -178,11 +208,12 @@ impl Client {
         Ok((
             Client {
                 id: next_conn_id(),
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(Some(writer))),
                 next_ack: Arc::new(AtomicU64::new(1)),
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 reader_task: Arc::new(Mutex::new(None)),
                 stopping: Arc::new(Mutex::new(false)),
+                stop_tx: watch::channel(false).0,
             },
             far,
         ))
@@ -190,21 +221,49 @@ impl Client {
 
     /// Close the Socket.IO session and the websocket under it.
     ///
-    /// Best effort by design: this runs on paths that are already tearing down,
-    /// and a peer that has gone away must not turn shutdown into an error.
+    /// Tries the Socket.IO and websocket close handshake for at most
+    /// [`DISCONNECT_GRACE`]. A peer that ignores Close cannot keep this future
+    /// alive forever: after the grace period the owned reader is aborted and
+    /// joined, and the shared sink is dropped (with a second bounded wait for
+    /// concurrent writers). The usual bound is two grace periods plus runtime
+    /// scheduling. The handle stays in shared state until the join completes,
+    /// so a caller that cancels this future can retry shutdown safely.
     pub async fn disconnect(&self) -> Result<()> {
         *self.stopping.lock().await = true;
-        let mut w = self.writer.lock().await;
-        let _ = w.send(Message::Text("41".into())).await; // Socket.IO DISCONNECT
-        let _ = w.send(Message::Close(None)).await;
-        drop(w);
-        // Keep the slot locked while awaiting: concurrent disconnect callers
-        // must not mistake the first caller's taken handle for a joined task.
+        self.stop_tx.send_replace(true);
+        // Hold the task slot for the whole operation. Concurrent callers wait
+        // here, and a timed-out/cancelled caller leaves the JoinHandle in place.
         let mut reader_task = self.reader_task.lock().await;
-        if let Some(task) = reader_task.as_mut() {
-            let _ = task.await;
-            *reader_task = None;
+
+        let graceful = tokio::time::timeout(DISCONNECT_GRACE, async {
+            let mut writer = self.writer.lock().await;
+            if let Some(w) = writer.as_mut() {
+                let _ = w.send(Message::Text("41".into())).await; // Socket.IO DISCONNECT
+                let _ = w.close().await; // Flush and close the owned websocket sink.
+            }
+            drop(writer);
+            if let Some(task) = reader_task.as_mut() {
+                let _ = task.await;
+            }
+        })
+        .await;
+
+        if graceful.is_err() {
+            // Dropping the read future releases its split websocket half. Abort
+            // and join rather than detach: no task can emit after this returns.
+            if let Some(task) = reader_task.as_mut() {
+                task.abort();
+                let _ = task.await;
+            }
+            // SplitSink is shared by Client clones; aborting only the reader
+            // would otherwise leave its TCP write half alive. Remove it after
+            // the graceful future has released the writer mutex.
+            let _ = tokio::time::timeout(DISCONNECT_GRACE, async {
+                self.writer.lock().await.take();
+            })
+            .await;
         }
+        *reader_task = None;
         Ok(())
     }
 }
@@ -280,6 +339,11 @@ pub fn parse_ack(body: &str) -> Option<(u64, Vec<Value>)> {
 /// replacement has to as well, or a dead server turns into a stuck process
 /// instead of an error the caller can retry.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Maximum graceful signaling shutdown time before the owned reader is aborted.
+/// Forced sink release gets a second bound of the same length. This is
+/// deliberately short: callers may already be in a larger engine shutdown
+/// budget, and a peer is not required to answer a websocket Close.
+const DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Connect, complete both handshakes, and start the read loop.
 ///
@@ -313,7 +377,8 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
             .await
             .with_context(|| format!("websocket connect to {url}"))?;
     let (writer, mut reader) = stream.split();
-    let writer: Writer = Arc::new(Mutex::new(writer));
+    let writer: Writer = Arc::new(Mutex::new(Some(writer)));
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     // Engine.IO OPEN ('0') must arrive first and carries the session parameters.
     // Anything else here means we are not talking to an Engine.IO v4 endpoint,
@@ -330,7 +395,14 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
     }
 
     // Socket.IO CONNECT to the default namespace, then wait for its reply.
-    writer.lock().await.send(Message::Text("40".into())).await.context("send Socket.IO CONNECT")?;
+    writer
+        .lock()
+        .await
+        .as_mut()
+        .ok_or_else(|| anyhow!("signaling writer closed"))?
+        .send(Message::Text("40".into()))
+        .await
+        .context("send Socket.IO CONNECT")?;
     loop {
         let msg = reader
             .next()
@@ -348,7 +420,12 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
             Some(('2', _)) => {
                 // A ping can arrive mid-handshake; answer it or the server
                 // will time us out while we are still waiting.
-                let _ = writer.lock().await.send(Message::Text("3".into())).await;
+                let _ = send_writer_message(
+                    &writer,
+                    stop_rx.clone(),
+                    Message::Text("3".into()),
+                )
+                .await;
             }
             _ => continue,
         }
@@ -365,8 +442,11 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
         pending: pending.clone(),
         reader_task: reader_task.clone(),
         stopping: stopping.clone(),
+        stop_tx,
     };
-    *reader_task.lock().await = Some(tokio::spawn(read_loop(id, reader, writer, tx, pending, stopping)));
+    *reader_task.lock().await = Some(tokio::spawn(read_loop(
+        id, reader, writer, tx, pending, stopping, stop_rx,
+    )));
     Ok(client)
 }
 
@@ -382,6 +462,7 @@ async fn read_loop(
     tx: mpsc::UnboundedSender<Incoming>,
     pending: Pending,
     stopping: Arc<Mutex<bool>>,
+    stop_rx: watch::Receiver<bool>,
 ) {
     let reason = loop {
         let Some(next) = reader.next().await else { break "closed".to_string() };
@@ -403,7 +484,10 @@ async fn read_loop(
             // is what produced the 30s-silence reconnect storm documented in
             // net.rs, so it is the one thing here that must never be skipped.
             Some(('2', _)) => {
-                if writer.lock().await.send(Message::Text("3".into())).await.is_err() {
+                if send_writer_message(&writer, stop_rx.clone(), Message::Text("3".into()))
+                    .await
+                    .is_err()
+                {
                     break "write failed".to_string();
                 }
             }
@@ -512,6 +596,32 @@ mod tests {
         b.unwrap();
         assert!(rx.try_recv().is_err());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_aborts_reader_when_peer_ignores_close() {
+        let (client, mut rx, server) = local_client(|mut ws| {
+            tokio::spawn(async move {
+                assert_eq!(ws.next().await.unwrap().unwrap().into_text().unwrap(), "41");
+                // A peer may still send data after Socket.IO DISCONNECT. Local
+                // shutdown must suppress it, then finish even if this peer
+                // never answers the websocket close handshake.
+                ws.send(Message::Text(r#"42["late",{}]"#.into()))
+                    .await
+                    .unwrap();
+                assert!(matches!(ws.next().await.unwrap().unwrap(), Message::Close(_)));
+                std::future::pending::<()>().await;
+            })
+        })
+        .await;
+
+        let started = std::time::Instant::now();
+        client.disconnect().await.unwrap();
+        assert!(started.elapsed() >= DISCONNECT_GRACE);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(rx.try_recv().is_err(), "shutdown must suppress late data");
+        assert!(rx.recv().await.is_none(), "reader task must be joined after abort");
+        server.abort();
     }
 
     #[tokio::test]
