@@ -44,6 +44,9 @@ pub(crate) use filament_peerloop::l2::mux::{
     L2_SID_BASE, MAX_STREAMS_PER_LINK, Mux, OpenOutcome, OpenVerdict, PipeItem, is_l2_sid,
     serve_stream, wire_sid,
 };
+// The caller-owned per-peer table every L2 sector receives. Re-exported so
+// sector modules name it through `crate::l2`, as they name `Mux`.
+pub(crate) use filament_peerloop::l2::MuxMap;
 
 /// H-1 (DoS): process-wide cap on concurrently live PTYs across ALL links. Each
 /// PTY is a login shell + threads, so this bounds total resource use even if many
