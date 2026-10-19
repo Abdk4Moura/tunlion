@@ -826,6 +826,7 @@ pub async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn mode_dir(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir()
