@@ -44,6 +44,14 @@ What is here:
   transfer target.
 - **`petname`** -- `link_petname` and the rule it encodes: a device lookup joins on
   the petname a link PROVED it reaches, never on the broadcast display name.
+- **`recv`** -- the host-free receive mechanics: untrusted-name collisions, the
+  whole-file digest, the `.part.meta` sidecar and resumable-partial lifecycle,
+  the storage-failure vocabulary, the in-order stdout sink, `IncomingFile`, the
+  whole-file verify and the confinement-safe `.part` open. Its
+  `recv::transfer_truth` child owns the transfer's truth/decisions: the
+  sequential-accept rule, the resume line, the partials a receive recorded and
+  the ones actually kept, and the sender-gone sentence. The CLI re-exports them;
+  the command surface, the inbox layout and every rendered sentence stay there.
 
 The command surface stays in the CLI: `send_cmd`, `recv_cmd`, the daemons, the
 roster UI and every decision about what a person asked for. The CLI keeps thin
