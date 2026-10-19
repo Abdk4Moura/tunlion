@@ -2,18 +2,28 @@
 //!
 //! Android is what forced the surface into existence. It is one caller, not the
 //! owner. A desktop embedding, a test, or another language binding uses the
-//! same types. Slice 1 is identity in an explicit config directory. `Conn` and
-//! the receive-driver lifetime seam live in `filament-peerloop::conn` and the
-//! CLI (`cli/src/recv_cmd.rs`) respectively, so the receive driver is still not
-//! callable from this crate and `start` refuses by name. See `docs/android-ffi.md`.
+//! same types. Slice 1 is identity in an explicit config directory.
+//!
+//! The engine runtime now lives in `filament_peerloop::driver::Engine`: one
+//! cancellation latch, one publish-once readiness edge, one owned dispatch task
+//! with `stop`/`wait`. `Core` owns that runtime per instance. What is still not
+//! library-callable is the receive **dispatch body** (`cli/src/recv_cmd.rs::
+//! recv_run`), whose sectors still read CLI config/devices/mount/session state.
+//! `Core::start` therefore stays honest and refuses by name; a Rust embedder
+//! that has the real dispatch calls `start_with_dispatch`, the same driver the
+//! CLI `up` path runs. See `docs/android-ffi.md`.
 
 uniffi::setup_scaffolding!();
 
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use filament_id::{user_key_path, KeyStore, PendingIdentity, UserKey};
+use filament_peerloop::driver::{Cancellation, Engine, Readiness};
 use secret_write::SecretFile;
 
 /// Build proof for the Android cdylib job. Not the app API.
@@ -22,10 +32,28 @@ pub extern "C" fn tunlion_core_abi_version() -> u32 {
     1
 }
 
+/// One dispatch task owned by this Core. The dispatch body is supplied by the
+/// embedder; the library owns the runtime, the latch, readiness and the join.
+type EngineTask = Engine<Result<(), String>>;
+
+/// The one engine slot a Core owns. `Stopped` is deliberately distinct from
+/// `None`: "nothing was ever started" and "the last run returned" are different
+/// answers, and a caller that stopped an engine must not read `NotLinked`.
+enum EngineSlot {
+    None,
+    Running(EngineTask),
+    Stopped,
+}
+
 /// A core opened on one config directory. The directory is the app's private
 /// files dir on Android. This type does not read `TUNLION_CONFIG_DIR`.
 pub struct Core {
     dir: PathBuf,
+    /// At most one engine per Core. No process-global engine state.
+    engine: Mutex<EngineSlot>,
+    /// Created only when the caller is not already inside a Tokio runtime, so
+    /// the engine never borrows another instance's runtime.
+    runtime: Mutex<Option<tokio::runtime::Runtime>>,
 }
 
 /// An identity that exists only in memory until `Core::commit_identity`.
@@ -36,10 +64,15 @@ pub struct UncommittedIdentity {
 /// Whether the peer loop is running inside this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum EngineState {
-    /// The receive driver and its lifetime controls still live in the CLI
-    /// binary (`cli/src/recv_cmd.rs`); only `Conn` has moved into
-    /// `filament-peerloop`. `Core::start` therefore returns `EngineNotLinked`.
+    /// No engine is owned by this Core. `Core::start` has no library receive
+    /// dispatch to run yet, so it returns `EngineNotLinked`. A Rust embedder
+    /// that does have the dispatch uses `start_with_dispatch`.
     NotLinked,
+    /// An engine dispatch started through `start_with_dispatch` is running.
+    Running,
+    /// The last engine dispatch returned (normally or by stop). No child
+    /// process exists; this is about the in-process task.
+    Stopped,
 }
 
 /// What the UI may poll. A missing identity is `fingerprint: None`, not an error.
@@ -61,9 +94,18 @@ pub enum CoreError {
     /// `identity.ed25519` is already in this config directory.
     #[error("an identity already exists in this config directory")]
     AlreadyExists,
-    /// `start` was called and the engine is not in this crate yet.
+    /// `start` was called and no library receive dispatch is linked yet.
     #[error("the engine is not linked")]
     EngineNotLinked,
+    /// An engine dispatch is already running in this Core.
+    #[error("an engine is already running in this core")]
+    EngineAlreadyRunning,
+    /// The dispatch returned an error string after it was started.
+    #[error("{0}")]
+    Engine(String),
+    /// The engine did not finish within the stop bound.
+    #[error("{0}")]
+    Stop(String),
 }
 
 struct DirStore {
@@ -90,7 +132,11 @@ impl Core {
         let dir = config_dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(io_err)?;
         set_private_dir(&dir)?;
-        Ok(Core { dir })
+        Ok(Core {
+            dir,
+            engine: Mutex::new(EngineSlot::None),
+            runtime: Mutex::new(None),
+        })
     }
 
     pub fn config_dir(&self) -> &Path {
@@ -132,13 +178,127 @@ impl Core {
     pub fn status(&self) -> Result<Status, CoreError> {
         Ok(Status {
             fingerprint: self.fingerprint()?,
-            engine: EngineState::NotLinked,
+            engine: self.engine_state()?,
         })
     }
 
-    /// The engine is not in this crate yet. This does not start a child process.
+    /// No library receive dispatch is linked yet, so there is nothing the
+    /// credential-side Core can start. This never spawns a child process.
     pub fn start(&self) -> Result<(), CoreError> {
         Err(CoreError::EngineNotLinked)
+    }
+
+    /// Start the library engine over a caller-supplied dispatch.
+    ///
+    /// This is the same `filament_peerloop::driver::Engine` the CLI receive/up
+    /// path runs. The dispatch receives the cancellation latch and readiness
+    /// publisher, and must return only after its own cleanup epilogue. It is
+    /// Rust-only on purpose: a language binding cannot supply a dispatch, and
+    /// `start` must not pretend it can.
+    ///
+    /// A Tokio runtime must be available: the caller's current one is used, or
+    /// this Core creates and retains its own. The runtime is never global.
+    pub fn start_with_dispatch<F, Fut>(&self, dispatch: F) -> Result<(), CoreError>
+    where
+        F: FnOnce(Cancellation, Readiness) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let mut slot = self
+            .engine
+            .lock()
+            .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+        if matches!(&*slot, EngineSlot::Running(engine) if !engine.is_finished()) {
+            return Err(CoreError::EngineAlreadyRunning);
+        }
+        // A finished task is retained only so `status` can say Stopped; replace
+        // it with the new run.
+        *slot = EngineSlot::None;
+
+        let cancel = Cancellation::default();
+        let engine = if tokio::runtime::Handle::try_current().is_ok() {
+            Engine::start(cancel, dispatch)
+        } else {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| CoreError::Engine("the runtime lock was poisoned".into()))?;
+            if runtime.is_none() {
+                *runtime = Some(
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .thread_name("tunlion-core-engine")
+                        .build()
+                        .map_err(|error| CoreError::Engine(error.to_string()))?,
+                );
+            }
+            let runtime = runtime.as_ref().expect("runtime inserted above");
+            // `enter` sets this runtime as the ambient context for the spawn
+            // inside `Engine::start`; the guard is released at the end of the
+            // branch. This is the runtime's own thread, so spawning here is
+            // what makes the task instance-owned rather than global.
+            let _entered = runtime.enter();
+            Engine::start(cancel, dispatch)
+        };
+        *slot = EngineSlot::Running(engine);
+        Ok(())
+    }
+
+    /// Request stop and wait, in this instance, for the dispatch to return.
+    ///
+    /// The dispatch's own epilogue is what is joined; work it detached is not
+    /// proven stopped. A dispatch that ignores the latch is reported as
+    /// `CoreError::Stop` once the bound expires, not as success.
+    pub async fn stop(&self) -> Result<(), CoreError> {
+        // Take only a running engine; leave an already-stopped slot as Stopped
+        // and never turn "was never started" into anything but NotLinked.
+        let taken = {
+            let mut slot = self
+                .engine
+                .lock()
+                .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+            match std::mem::replace(&mut *slot, EngineSlot::None) {
+                EngineSlot::Running(engine) => Some(engine),
+                EngineSlot::Stopped => {
+                    *slot = EngineSlot::Stopped;
+                    None
+                }
+                EngineSlot::None => None,
+            }
+        };
+        let Some(engine) = taken else {
+            return Ok(());
+        };
+        let result = engine.stop_within(Duration::from_secs(5)).await;
+        {
+            let mut slot = self
+                .engine
+                .lock()
+                .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+            *slot = EngineSlot::Stopped;
+        }
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(CoreError::Engine(message)),
+            Err(error) => Err(CoreError::Stop(error.to_string())),
+        }
+    }
+
+    /// Whether this Core currently owns a running dispatch.
+    pub fn is_engine_running(&self) -> Result<bool, CoreError> {
+        Ok(self.engine_state()? == EngineState::Running)
+    }
+
+    fn engine_state(&self) -> Result<EngineState, CoreError> {
+        let slot = self
+            .engine
+            .lock()
+            .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+        Ok(match &*slot {
+            EngineSlot::None => EngineState::NotLinked,
+            EngineSlot::Stopped => EngineState::Stopped,
+            EngineSlot::Running(engine) if engine.is_finished() => EngineState::Stopped,
+            EngineSlot::Running(_) => EngineState::Running,
+        })
     }
 
     fn store(&self) -> DirStore {
@@ -239,6 +399,53 @@ mod tests {
         assert_eq!(status.fingerprint, None);
         assert_eq!(status.engine, EngineState::NotLinked);
         assert_eq!(core.start().unwrap_err(), CoreError::EngineNotLinked);
+    }
+
+    #[tokio::test]
+    async fn core_owns_starts_and_stops_one_dispatch_task() {
+        let core = core();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        core.start_with_dispatch(move |stop, readiness| async move {
+            readiness.publish(|| {});
+            let _ = entered_tx.send(());
+            stop.run(std::future::pending::<()>()).await;
+            Ok(())
+        })
+        .unwrap();
+        entered_rx.await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+        assert_eq!(
+            core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) }),
+            Err(CoreError::EngineAlreadyRunning)
+        );
+        core.stop().await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        assert!(!core.is_engine_running().unwrap());
+    }
+
+    #[test]
+    fn core_creates_its_own_runtime_outside_an_ambient_one() {
+        let core = core();
+        core.start_with_dispatch(|stop, readiness| async move {
+            readiness.publish(|| {});
+            stop.run(std::future::pending::<()>()).await;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(core.stop()).unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn stop_without_a_started_engine_is_a_no_op() {
+        let core = core();
+        core.stop().await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::NotLinked);
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! The receive command (`tunlion recv`) and its event loop, lifted out of `main.rs`.
 //!
 //! The existing setup + dispatch body stays together. `recv_cmd` adapts process
-//! signals and exit policy; `recv_driver` supplies invocation-local cancellation
-//! and a cleanup-return boundary. This is not yet an embeddable engine: stdin,
-//! ambient configuration and lower-layer detached work still have process scope.
+//! signals and exit policy; the library `filament_peerloop::driver::Engine` owns
+//! the one dispatch task, its cancellation latch, its readiness edge and its
+//! join. This is not yet an embeddable engine: stdin, ambient configuration and
+//! lower-layer detached work still have process scope, and the dispatch body
+//! itself still reads CLI config/devices/session state.
 //!
 //! Everything it calls stays where it was and is imported here -- notably the thirty
 //! helpers shared with the send path, `daemon_alive` included. Nothing was promoted for
@@ -999,16 +1001,31 @@ pub(crate) async fn recv_cmd(
     log: Arc<dyn LogSink>,
     host: Arc<dyn HostServices>,
 ) -> Result<()> {
-    use filament_peerloop::driver::{Cancellation, DriverOutcome};
+    use filament_peerloop::driver::{Cancellation, DriverOutcome, Engine};
     let stop = Cancellation::default();
     let mut signals = crate::recv_lifecycle::Signals::install(stop.clone())?;
-    let mut cleanup = RecvCleanup::default();
-    let outcome = recv_driver(
-        server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
-        relay, remember, daemon, output, shell_policy, shell_user,
-        no_proxy_fallback, transport_context, log.clone(), host, &stop,
-        &mut cleanup,
-    ).await;
+    // The library owns the one dispatch task and its join. This adapter keeps
+    // only process policy: signal installation, exit codes and the CLI's
+    // cleanup resources. `recv_run` is the same production dispatch the
+    // library driver starts; nothing is spawned as a child process.
+    let server = server.to_string();
+    let engine_log = log.clone();
+    let engine = Engine::start(stop.clone(), move |stop, readiness| async move {
+        let mut cleanup = RecvCleanup::default();
+        recv_driver(
+            &server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
+            relay, remember, daemon, output, shell_policy, shell_user,
+            no_proxy_fallback, transport_context, engine_log, host, &stop,
+            &readiness, &mut cleanup,
+        ).await
+    });
+    let outcome = match engine.wait().await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            signals.stop().await;
+            return Err(anyhow::anyhow!("the receive engine task failed: {error}"));
+        }
+    };
     signals.stop().await;
     match outcome {
         DriverOutcome::Returned(result) => result,
@@ -1054,12 +1071,14 @@ async fn recv_driver(
     log: Arc<dyn LogSink>,
     host: Arc<dyn HostServices>,
     stop: &filament_peerloop::driver::Cancellation,
+    readiness: &filament_peerloop::driver::Readiness,
     cleanup: &mut RecvCleanup,
 ) -> filament_peerloop::driver::DriverOutcome<Result<()>> {
     let outcome = stop.run(recv_run(
         server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
         relay, remember, daemon, output, shell_policy, shell_user,
-        no_proxy_fallback, transport_context, log.clone(), host, stop, cleanup,
+        no_proxy_fallback, transport_context, log.clone(), host, stop, readiness,
+        cleanup,
     )).await;
     cleanup.finish(log.as_ref()).await;
     // A signal received during cleanup still has its signal-specific outcome.
@@ -1115,7 +1134,11 @@ impl SyncTasks {
         let key = (pid, sid);
         // A live SID collision is rejected during admission. A finished entry
         // can remain until the next reap tick; join it before replacing it.
-        if let Some(previous) = self.0.lock().unwrap().remove(&key) {
+        // Remove into a binding so the guard drops before the await: a guard
+        // held across `join().await` would make the whole receive dispatch
+        // non-`Send` and is no longer needed once the task is taken.
+        let previous = self.0.lock().unwrap().remove(&key);
+        if let Some(previous) = previous {
             previous.cancel();
             report_sync_join(log, &key.0, key.1, previous.join().await);
         }
@@ -1129,7 +1152,9 @@ impl SyncTasks {
             .map(|(key, _)| key.clone())
             .collect();
         for (pid, sid) in finished {
-            if let Some(task) = self.0.lock().unwrap().remove(&(pid.clone(), sid)) {
+            // Take the task out first; drop the guard before the await.
+            let removed = self.0.lock().unwrap().remove(&(pid.clone(), sid));
+            if let Some(task) = removed {
                 report_sync_join(log, &pid, sid, task.join().await);
             }
         }
@@ -1143,7 +1168,8 @@ impl SyncTasks {
             .collect();
         let mut joining = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(task) = self.0.lock().unwrap().remove(&key) {
+            let removed = self.0.lock().unwrap().remove(&key);
+            if let Some(task) = removed {
                 task.cancel();
                 joining.push((key, task));
             }
@@ -1246,6 +1272,7 @@ async fn recv_run(
     // `NoHost` and every read resolves to the inert default.
     host: Arc<dyn HostServices>,
     stop: &filament_peerloop::driver::Cancellation,
+    readiness: &filament_peerloop::driver::Readiness,
     cleanup: &mut RecvCleanup,
 ) -> Result<()> {
     if let Some(expected) = expect_sha256.as_deref() {
@@ -2255,7 +2282,6 @@ async fn recv_run(
     // `up --detach` ready marker consume this one edge, so they cannot disagree
     // about when the daemon was ready. No-op for a one-shot receive, which has
     // transfer-completion semantics instead of an "engine is serving" edge.
-    let mut readiness = crate::recv_lifecycle::Readiness::default();
     if daemon {
         readiness.publish(|| {
             // systemd Type=notify: announce readiness once the serving loop is
@@ -8953,7 +8979,7 @@ async fn recv_run(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use filament_peerloop::driver::{Cancellation, DriverOutcome};
+    use filament_peerloop::driver::{Cancellation, DriverOutcome, Readiness};
     use filament_peerloop::host::{NoHost, NoLog};
 
     async fn invalid_receive_with(
@@ -8962,12 +8988,13 @@ mod lifecycle_tests {
     ) -> DriverOutcome<Result<()>> {
         // Validation precedes filesystem/network/UI setup, so this exercises
         // the actual return seam without a backend or process signal adapter.
+        let (readiness, _watch) = Readiness::new();
         recv_driver(
             "https://unused.invalid", None, PathBuf::new(), false, None, None,
             false, None, Some("invalid".into()), false, None, false, None,
             ShellPolicy::Granted, None, false,
             filament_transport::TransportContext::default(),
-            Arc::new(NoLog), Arc::new(NoHost), stop, cleanup,
+            Arc::new(NoLog), Arc::new(NoHost), stop, &readiness, cleanup,
         ).await
     }
 
@@ -8979,6 +9006,22 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn driver_setup_failure_returns_without_a_process_exit() {
         match invalid_receive(&Cancellation::default()).await {
+            DriverOutcome::Returned(Err(error)) => {
+                assert!(error.to_string().contains("--expect-sha256"));
+            }
+            other => panic!("expected validation failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_library_engine_drives_the_real_receive_dispatch() {
+        use filament_peerloop::driver::Engine;
+        let stop = Cancellation::default();
+        let engine = Engine::start(stop.clone(), |stop, _readiness| async move {
+            let mut cleanup = RecvCleanup::default();
+            invalid_receive_with(&stop, &mut cleanup).await
+        });
+        match engine.wait().await.expect("engine task") {
             DriverOutcome::Returned(Err(error)) => {
                 assert!(error.to_string().contains("--expect-sha256"));
             }

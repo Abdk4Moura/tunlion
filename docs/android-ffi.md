@@ -1,7 +1,9 @@
 # tunlion-core: a library any process can call
 
-Status: slice 1 of issue #465. The engine is not linked yet. `start` refuses,
-by name, until it is.
+Status: slice 1 of issue #465. The engine *runtime* is linked
+(`filament_peerloop::driver::Engine`, `docs/engine-driver.md`), but the receive
+*dispatch body* is still in the CLI, so `start` refuses by name until it is
+library-callable.
 
 Android is why this crate exists now. It is not the owner of the API. Kotlin
 is one binding. A Rust caller, a desktop embedding, or a later language
@@ -87,7 +89,13 @@ crate. A missing identity is not an error. It is `fingerprint: None`.
 
 `start() -> Result<(), CoreError>`
 
-Returns `EngineNotLinked`. It must not report the engine as up.
+Returns `EngineNotLinked`. It must not report the engine as up. The engine
+*runtime* now lives in `filament_peerloop::driver::Engine` (see
+`docs/engine-driver.md`); what is still missing is a library-callable receive
+*dispatch*. `Core` owns that runtime per instance, and a Rust embedder that has
+the dispatch uses `Core::start_with_dispatch` (not exposed over UniFFI). A
+language binding cannot supply a dispatch, so `start` refuses honestly, and
+`Core::stop` is a Rust API for now rather than an exported one.
 
 Identity bytes are `filament-id`'s format: `filament-id-seed-v1\0` plus the
 32-byte seed, written by `secret-write` (mode `0600` on Unix). Do not invent a
@@ -98,23 +106,22 @@ no recovery phrase. The phone uses `PendingIdentity`.
 
 These are the rest of issue #465. Do not stub them as success.
 
-- `stop`. Availability off will mean no engine thread and no notification.
-  There is no child process to kill.
 - create a code, join a code, remember.
 - send to a device, send by code, receive, incoming transfer.
 - shell bytes and resize, only toward a device that granted shell. The phone
   does not serve a shell (`openpty` on Android already refuses).
 
 `up` on the CLI is `recv_cmd(..., daemon: true)`. There is no separate daemon
-loop. Linking the engine means that function's driver, not a copy of
-`send_cmd`. `send_cmd` stays in the CLI. The library will call
+loop. The library `Engine` driver now runs that function's dispatch, not a copy
+of `send_cmd`. `send_cmd` stays in the CLI. The library will call
 `filament-transfer` and `filament-proto` for the byte mechanics.
 
 `Conn` now lives in `filament-peerloop::conn`; `cli/src/conn.rs` is only a
 re-export shim. The library will own link state and adoption. The CLI still owns
 argument parsing, terminal copy, the pidfile, service install, the control
-socket, and `/etc` writes, and it still owns the receive driver itself
-(`cli/src/recv_cmd.rs`), which is why `Core::start` remains `EngineNotLinked`.
+socket, and `/etc` writes, and the receive **dispatch body** is still in
+`cli/src/recv_cmd.rs`, which is why `Core::start` remains `EngineNotLinked`.
+The remaining sectors are listed in `docs/engine-driver.md`.
 Lookups use the petname (`verified_name`), never the broadcast display name. A
 signaling close is current only when it carries the live client id and the same
 link generation.

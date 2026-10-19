@@ -6,6 +6,9 @@ binding uses the same types.
 
 Contract: `docs/android-ffi.md`.
 
-Slice 1 opens an explicit config directory, mints a recoverable identity, and
-refuses to start an engine that is not linked yet. It does not spawn the
-`tunlion` binary.
+Slice 1 opens an explicit config directory and mints a recoverable identity.
+The engine *runtime* is linked: `Core` owns one `filament_peerloop::driver::
+Engine` per instance (`start_with_dispatch` / `stop`). The receive *dispatch
+body* is still in the CLI, so the credential-side `start` refuses by name with
+`EngineNotLinked` until it is library-callable. It never spawns the `tunlion`
+binary. Remaining sectors: `docs/engine-driver.md`.

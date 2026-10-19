@@ -65,7 +65,11 @@ impl CoreSession {
         self.inner.status()
     }
 
-    /// Refuses until the peer loop lives in this crate. Does not spawn a process.
+    /// Refuses until a library receive dispatch is linked. Does not spawn a
+    /// process. A Rust embedder with the real dispatch uses
+    /// `Core::start_with_dispatch`; a language binding cannot supply one, and
+    /// this must not pretend it can. Engine `stop` is therefore not exported
+    /// here yet either: there is nothing a binding can have started.
     pub fn start(&self) -> Result<(), CoreError> {
         self.inner.start()
     }
