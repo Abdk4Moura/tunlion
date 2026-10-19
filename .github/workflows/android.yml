@@ -38,12 +38,21 @@ jobs:
       fail-fast: false
       matrix:
         target: [aarch64-linux-android, x86_64-linux-android]
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+          - target: x86_64-linux-android
+            abi: x86_64
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
-        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          cargo install cargo-ndk --locked --version 4.1.2
       - name: Compile isolated reduced peerloop root
-        run: cargo check --locked -p filament-peerloop --no-default-features --target ${{ matrix.target }}
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop --no-default-features
       - name: Compile default compatibility profile
         run: cargo test --locked -p filament-peerloop
 
