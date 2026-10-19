@@ -621,7 +621,7 @@ impl L3 {
     /// peer's list, because two peers may advertise overlapping prefixes and a
     /// withdrawal by one must not delete a route the other still provides.
     pub async fn subnet_prefixes(&self) -> Vec<(IpAddr, u8)> {
-        self.routes.lock().await.subnets.iter().map(|(n, l, _)| (*n, *l)).collect()
+        self.routes.lock().await.subnets.iter().map(|(n, l, _, _)| (*n, *l)).collect()
     }
 
     /// The underlay address of every transport currently carrying a DEFAULT
@@ -636,7 +636,7 @@ impl L3 {
     async fn default_route_underlay(&self) -> (Vec<IpAddr>, bool) {
         let mut addrs = Vec::new();
         let mut unknown = false;
-        for (net, len, t) in self.routes.lock().await.subnets.iter() {
+        for (net, len, t, _) in self.routes.lock().await.subnets.iter() {
             if !crate::exit_route::is_default_route(*net, *len) {
                 continue;
             }
@@ -672,9 +672,8 @@ impl L3 {
         }
         {
             let mut map = self.routes.lock().await;
-            map.set_subnets(t, &prefixes);
+            map.set_subnets(pid, t, &prefixes);
         }
-        let _ = pid; // routes are keyed by transport; pid retracts via remove_by_pid
         self.sync_kernel_subnets().await;
     }
 
@@ -695,7 +694,7 @@ impl L3 {
                 table
                     .subnets
                     .iter()
-                    .any(|(sn, sl, t)| sn == n && sl == l && t.is_alive())
+                    .any(|(sn, sl, t, _)| sn == n && sl == l && t.is_alive())
             })
             .copied()
             .collect()
@@ -900,6 +899,7 @@ impl L3 {
     /// reserved for an explicit device-forget path. Kept for that use.
     #[allow(dead_code)]
     pub async fn remove_by_pid(&self, pid: &str) {
+        self.routes.lock().await.remove_subnets_by_pid(pid);
         if let Some(ips) = self.by_pid.lock().await.remove(pid) {
             let mut map = self.routes.lock().await;
             for ip in ips {
@@ -912,6 +912,9 @@ impl L3 {
         if self.names.lock().await.remove(pid).is_some() {
             self.refresh_hosts().await;
         }
+        // Reconcile both OS subnet routes and exit-node policy after withdrawing
+        // this owner's entries. Shared prefixes remain desired while any peer owns them.
+        self.sync_kernel_subnets().await;
     }
 
     /// Rewrite the managed /etc/hosts block from the current verified names so
@@ -1274,7 +1277,9 @@ struct RouteTable {
     /// (network, prefix_len, via). Small and read on every packet that misses the
     /// host map, so a linear longest-match scan is the right shape until a node
     /// carries enough prefixes for that to show up in a profile.
-    subnets: Vec<(IpAddr, u8, Arc<dyn Transport>)>,
+    /// (network, prefix_len, via, announcing pid). The transport is the packet
+    /// path; pid is the revocation/withdrawal owner. They are not interchangeable.
+    subnets: Vec<(IpAddr, u8, Arc<dyn Transport>, String)>,
 }
 
 impl RouteTable {
@@ -1284,9 +1289,9 @@ impl RouteTable {
         }
         self.subnets
             .iter()
-            .filter(|(net, len, _)| prefix_contains(*net, *len, dst))
-            .max_by_key(|(_, len, _)| *len)
-            .map(|(_, _, t)| t.clone())
+            .filter(|(net, len, _, _)| prefix_contains(*net, *len, dst))
+            .max_by_key(|(_, len, _, _)| *len)
+            .map(|(_, _, t, _)| t.clone())
     }
 
     fn insert_host(&mut self, ip: IpAddr, t: Arc<dyn Transport>) {
@@ -1319,11 +1324,17 @@ impl RouteTable {
     /// Replace every prefix advertised via one peer. Advertisement is a full
     /// restatement, not a delta: a peer that stops advertising a prefix must have
     /// it withdrawn, and diffing deltas is how stale routes survive a retraction.
-    fn set_subnets(&mut self, via: &Arc<dyn Transport>, prefixes: &[(IpAddr, u8)]) {
-        self.subnets.retain(|(_, _, t)| !Arc::ptr_eq(t, via));
+    fn set_subnets(&mut self, pid: &str, via: &Arc<dyn Transport>, prefixes: &[(IpAddr, u8)]) {
+        // A full restatement replaces this pid's prior claim, even when a reconnect
+        // supplies a new Transport object. Never erase another pid sharing a path.
+        self.subnets.retain(|(_, _, _, owner)| owner != pid);
         for (net, len) in prefixes {
-            self.subnets.push((*net, *len, via.clone()));
+            self.subnets.push((*net, *len, via.clone(), pid.to_string()));
         }
+    }
+
+    fn remove_subnets_by_pid(&mut self, pid: &str) {
+        self.subnets.retain(|(_, _, _, owner)| owner != pid);
     }
 }
 
@@ -1623,8 +1634,8 @@ mod tests {
         let c: Arc<dyn Transport> = Arc::new(DgramTransport);
 
         let mut rt = RouteTable::default();
-        rt.set_subnets(&a, &[(v4("10.0.0.0"), 8)]);
-        rt.set_subnets(&b, &[(v4("10.1.0.0"), 16)]);
+        rt.set_subnets("a", &a, &[(v4("10.0.0.0"), 8)]);
+        rt.set_subnets("b", &b, &[(v4("10.1.0.0"), 16)]);
         rt.insert_host(v4("10.1.0.7"), c.clone());
 
         // Most specific wins: host beats /16 beats /8.
@@ -1635,7 +1646,7 @@ mod tests {
 
         // Advertisement is a RESTATEMENT: re-advertising without a prefix withdraws
         // it. Diffing deltas instead is how a retracted route survives.
-        rt.set_subnets(&a, &[]);
+        rt.set_subnets("a", &a, &[]);
         assert!(rt.lookup(v4("10.9.9.9")).is_none(), "withdrawn prefix must not linger");
         assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.8")).unwrap(), &b), "other peers unaffected");
 
@@ -1644,6 +1655,29 @@ mod tests {
         assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.7")).unwrap(), &c));
         rt.remove_host(&v4("10.1.0.7"));
         assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.7")).unwrap(), &b), "now covered by the /16");
+    }
+
+    #[test]
+    fn subnet_ownership_withdrawal_replacement_and_longest_prefix_are_scoped_to_pid() {
+        let v4 = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
+        let v6 = |s: &str| s.parse::<IpAddr>().unwrap();
+        let old: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let replacement: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let other: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let mut rt = RouteTable::default();
+        rt.set_subnets("revoked", &old, &[(v4("10.0.0.0"), 8), (v6("fd00::"), 8)]);
+        rt.set_subnets("other", &other, &[(v4("10.1.0.0"), 16)]);
+        // Replacement restatement removes that pid's old transport-keyed claims.
+        rt.set_subnets("revoked", &replacement, &[(v4("192.0.2.0"), 24)]);
+        assert!(rt.lookup(v4("10.9.0.1")).is_none()); // stale /8 was replaced
+        assert!(rt.lookup(v6("fd00::1")).is_none());
+        assert!(Arc::ptr_eq(&rt.lookup(v4("192.0.2.1")).unwrap(), &replacement));
+        // Empty is a full withdrawal, and cannot delete another peer's overlap.
+        rt.set_subnets("revoked", &replacement, &[]);
+        assert!(rt.lookup(v4("192.0.2.1")).is_none());
+        assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.1")).unwrap(), &other));
+        rt.remove_subnets_by_pid("other");
+        assert!(rt.lookup(v4("10.1.0.1")).is_none());
     }
 
     struct DgramTransport;
