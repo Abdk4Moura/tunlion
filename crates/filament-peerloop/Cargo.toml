@@ -27,7 +27,7 @@ default = ["mesh", "mount-server", "forward-server", "dispatch"]
 mesh = ["dep:filament-overlay"]
 # The receive dispatch loop and its host capability traits. Default-on for the
 # CLI; a reduced consumer that only wants the mechanics can omit it.
-dispatch = []
+dispatch = ["dep:filament-fleet"]
 # Inbound filesystem serving is opt-out for existing consumers, but absent from
 # reduced engine profiles. The wire/control vocabulary remains available.
 mount-server = []
@@ -52,7 +52,7 @@ base64 = "0.22"
 bytes = "1.11.1"
 chrono = "0.4"
 filament-cap = { path = "../filament-cap", version = "0.1.1" }
-filament-fleet = { path = "../filament-fleet", version = "0.1.0" }
+filament-fleet = { path = "../filament-fleet", version = "0.1.0", optional = true }
 filament-id = { path = "../filament-id", version = "0.1.0" }
 filament-pair = { path = "../filament-pair", version = "0.1.0" }
 filament-overlay = { path = "../filament-overlay", version = "0.1.0", optional = true }
