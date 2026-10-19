@@ -13,6 +13,10 @@
 //! move. That is verified by diffing rustfmt(original) against rustfmt(this file).
 use super::*;
 use filament_transfer::path_bounds::path_within_canonical;
+// The crate root used to import the `json!` macro unconditionally because the
+// (now-moved) `.part.meta` writer used it. This module's `use super::*` no
+// longer inherits it, so name it here, where the tests actually use it.
+use serde_json::json;
 
 /// TUNLION_CONFIG_DIR is process-global, so tests that point it at their
 /// own temp dir must not run concurrently with each other (a second test

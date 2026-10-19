@@ -368,16 +368,11 @@ pub fn open_private_log(path: &Path, truncate: bool) -> std::io::Result<std::fs:
 /// the process umask (a daemon started with umask 0 made 0666 sidecars).
 /// Fails if anything (a file, a planted symlink) already sits at `path`.
 /// Windows: files take the containing directory's ACL; nothing to set here.
-pub fn create_new_private(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
-}
+///
+/// Moved to `filament-peerloop::recv` with the `.part.meta` sidecar that is its
+/// only production consumer; re-exported so `platform::create_new_private` and
+/// its mode test keep resolving to the one implementation.
+pub use filament_peerloop::recv::create_new_private;
 
 /// Make an already-open file owner-only (0600 on unix) through its handle,
 /// never through a path that could have been swapped for a symlink. Used on a
@@ -3525,41 +3520,11 @@ pub fn free_space(dir: &Path) -> Option<u64> {
 pub use filament_peerloop::host::StorageFailure;
 
 /// Classify an io error as a storage failure, or `None` for anything else.
-pub fn storage_failure(e: &std::io::Error) -> Option<StorageFailure> {
-    #[cfg(unix)]
-    {
-        match e.raw_os_error() {
-            Some(libc::ENOSPC) | Some(libc::EDQUOT) => return Some(StorageFailure::NoSpace),
-            Some(libc::ENAMETOOLONG) => return Some(StorageFailure::NameTooLong),
-            Some(libc::EROFS) => return Some(StorageFailure::ReadOnly),
-            Some(libc::EACCES) | Some(libc::EPERM) => return Some(StorageFailure::Permission),
-            _ => {}
-        }
-    }
-    #[cfg(windows)]
-    {
-        // ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL, ERROR_FILENAME_EXCED_RANGE,
-        // ERROR_WRITE_PROTECT, ERROR_ACCESS_DENIED.
-        match e.raw_os_error() {
-            Some(112) | Some(39) => return Some(StorageFailure::NoSpace),
-            Some(206) => return Some(StorageFailure::NameTooLong),
-            Some(19) => return Some(StorageFailure::ReadOnly),
-            Some(5) => return Some(StorageFailure::Permission),
-            _ => {}
-        }
-    }
-    // The kind, for an error that was re-wrapped on its way here and lost its
-    // OS code (safe_create_part adds context that way).
-    match e.kind() {
-        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
-            Some(StorageFailure::NoSpace)
-        }
-        std::io::ErrorKind::InvalidFilename => Some(StorageFailure::NameTooLong),
-        std::io::ErrorKind::ReadOnlyFilesystem => Some(StorageFailure::ReadOnly),
-        std::io::ErrorKind::PermissionDenied => Some(StorageFailure::Permission),
-        _ => None,
-    }
-}
+///
+/// Moved to `filament-peerloop::recv` with the receive mechanics that consume
+/// it (`WriteFailure`, the typed refusal); re-exported so every existing
+/// `platform::storage_failure` caller keeps resolving to the one classifier.
+pub use filament_peerloop::recv::storage_failure;
 
 // ----------------------------------------------------------- control socket --
 

@@ -115,11 +115,12 @@ pub(crate) const MAX_VERIFY_FAILS: u32 = 3;
 /// JSON {"size":N,"head":"hex","full":"hex"}; legacy files hold a bare size string.
 /// `full` is the whole-file sha256 the sender offered (P4), persisted so a
 /// resume after a process restart can still verify-on-completion.
-pub(crate) struct PartMeta {
-    pub(crate) size: u64,
-    pub(crate) head: Option<String>,
-    pub(crate) full: Option<String>,
-}
+///
+/// Moved to `filament-peerloop::recv` with the rest of the receive-side file
+/// mechanics (its `load`/`store` live there now). Re-exported so the crate
+/// root's `PartMeta` and every call site keep resolving to the one
+/// implementation.
+pub(crate) use filament_peerloop::recv::PartMeta;
 
 /// The three clocks that can end a delegated device's recognition. The binding
 /// one is whichever expires first; the state display names it so "X time left"
@@ -272,7 +273,7 @@ pub(crate) struct TtyGuard {
 
 #[cfg(test)]
 mod tests {
-    use crate::{MAX_PENDING, PartMeta, PendingRequest, ShellPolicy, add_pending_request};
+    use crate::{MAX_PENDING, PendingRequest, ShellPolicy, add_pending_request};
 
     /// RC lab item 10: the default signaling server is the tunlion host.
     #[test]
@@ -340,73 +341,5 @@ mod tests {
             count_pending <= MAX_PENDING,
             "queue must not exceed MAX_PENDING"
         );
-    }
-
-    #[test]
-    fn part_meta_roundtrip_and_legacy() {
-        let dir = std::env::temp_dir().join(format!("filament-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("x.part.meta");
-        PartMeta {
-            size: 42,
-            head: Some("abc".into()),
-            full: Some("deadbeef".into()),
-        }
-        .store(&p)
-        .unwrap();
-        let m = PartMeta::load(&p).unwrap();
-        assert_eq!(m.size, 42);
-        assert_eq!(m.head.as_deref(), Some("abc"));
-        // P4: the whole-file digest survives the round-trip too.
-        assert_eq!(m.full.as_deref(), Some("deadbeef"));
-        // legacy plain-size format still parses
-        std::fs::write(&p, "1234").unwrap();
-        let m = PartMeta::load(&p).unwrap();
-        assert_eq!(m.size, 1234);
-        assert!(m.head.is_none());
-        assert!(m.full.is_none());
-        // garbage does not
-        std::fs::write(&p, "{not json").unwrap();
-        assert!(PartMeta::load(&p).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The sidecar names the file, its size and digests, and sits in a
-    /// download dir others may read: it is created owner-only (0600) whatever
-    /// the umask, and a looser leftover is replaced rather than reused.
-    #[test]
-    fn part_meta_is_owner_only() {
-        let dir = std::env::temp_dir().join(format!("filament-test-meta-mode-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("z.part.meta");
-        std::fs::write(&p, "1").unwrap();
-        PartMeta { size: 9, head: Some("ab".into()), full: Some("cd".into()) }.store(&p).unwrap();
-        if let Some(mode) = crate::platform::file_mode(&p) {
-            assert_eq!(mode & 0o777, 0o600, ".part.meta must be 0600, got {mode:o}");
-        }
-        assert_eq!(PartMeta::load(&p).unwrap().size, 9);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A `.part.meta` planted as a symlink must not redirect the sidecar write
-    /// onto the link's target.
-    #[test]
-    fn part_meta_store_does_not_write_through_a_symlink() {
-        let dir = std::env::temp_dir().join(format!("filament-test-meta-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let victim = dir.join("victim");
-        std::fs::write(&victim, b"precious").unwrap();
-        let p = dir.join("y.part.meta");
-        if crate::platform::symlink(&victim, &p).is_ok() {
-            PartMeta { size: 7, head: None, full: None }.store(&p).unwrap();
-            assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the link target is untouched");
-            assert!(!std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(), "the sidecar is a real file now");
-            assert_eq!(PartMeta::load(&p).unwrap().size, 7);
-        } else {
-            crate::ui::say("note: this platform would not create a symlink; the symlink arm is skipped");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

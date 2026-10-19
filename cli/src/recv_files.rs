@@ -1,320 +1,44 @@
-//! Receive-side file assembly and whole-file verification, lifted out of
-//! `main.rs` (goal: shrink `main.rs` without touching the receive loop).
+//! Receive-side file mechanics: the CLI half.
 //!
-//! Everything here is a leaf: each item takes its inputs explicitly
-//! (`&Path`, `&IncomingFile`, `IncomingFile`) and returns a value. None of it
-//! reads a `recv_cmd` local, opens a channel, or spawns work of its own, which
-//! is why the move needs no context struct and no ownership reshaping.
+//! The host-free leaves moved to `filament-peerloop::recv` (issue #465-style
+//! extraction, receive slice): the name-collision rule, the whole-file digest,
+//! the `PartMeta` sidecar, the resumable-partial lifecycle, the storage-failure
+//! vocabulary, the `StdoutSink`/`IncomingFile` state, the whole-file verify and
+//! the confinement-safe `.part` open. This file re-exports them so every
+//! `crate::recv_files::…` call site keeps resolving, and keeps only what is
+//! genuinely the CLI's:
 //!
-//! cfg discipline: `safe_create_part` and `safe_resume_part` each exist twice
-//! (`#[cfg(unix)]` / `#[cfg(not(unix))]`) and both halves moved together with
-//! their attributes; their platform `use` statements are function-local and
-//! travelled inside the bodies.
-use crate::dlog;
+//!   * `finalize_incoming` — UI, settings, transfer history and the daemon log;
+//!   * the inbox helpers — they read the machine's config and filesystem layout;
+//!   * `storage_refusal` — a rendered sentence to the peer and the user;
+//!   * `delivery_ack` — per-session state riding the wire vocabulary;
+//!   * `expire_partials_and_say` / `partial_status_lines` — terminal output.
+//!
+//! Nothing here re-implements a moved mechanism: the library owns the single
+//! implementation and the CLI calls it.
+#![allow(unused_imports)]
+
 use crate::protocol;
 use crate::settings;
-use crate::test_hooks;
 use crate::ui;
 use crate::{chrono_now, human, up_log};
 use anyhow::Result;
-use filament_peerloop::present::Progress as ProgressBar;
-use filament_transfer::{coverage_complete, first_gap};
-use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
-/// P4 (GAP-5): sha256 over the WHOLE file, the end-to-end content digest the
-/// receiver compares against on completion so a truncated/corrupt transfer can
-/// never be declared "done" (the runner had to bolt this above the transport;
-/// P4 makes it a core guarantee). Streamed in 1 MiB reads so a large payload
-/// doesn't have to be slurped into RAM. `None` if the file can't be read, the
-/// offer then omits `full` and the receiver degrades to the legacy size-only
-/// check (backward-compat; bounded, never a hang).
-pub(crate) fn full_hash(path: &Path) -> Option<String> {
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => h.update(&buf[..n]),
-            Err(_) => return None,
-        }
-    }
-    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Where a received `name` lands in `dir` without replacing anything already
-/// there: `name` itself when free, else `stem (1).ext`, `stem (2).ext`, ...
-///
-/// The counter goes BEFORE the extension. It used to be appended after it
-/// (`report.pdf.1`), which nothing opens as a PDF and which a file manager
-/// shows as an unknown type. A compound archive extension stays whole
-/// (`backup (1).tar.gz`). The result never exceeds the 255-byte name limit:
-/// the stem is shortened (on a character boundary) to make room for the
-/// counter, so a name already at the limit still gets a free slot rather than
-/// an ENAMETOOLONG.
-pub(crate) fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let candidate = dir.join(name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    for i in 1..1000 {
-        let c = dir.join(numbered_name(name, &format!(" ({i})")));
-        if !c.exists() {
-            return c;
-        }
-    }
-    dir.join(numbered_name(name, " (dup)"))
-}
-
-/// The longest file name we create, in bytes (NAME_MAX on Linux and macOS).
-const NAME_LIMIT: usize = 255;
-
-/// `name` with `tag` inserted between its stem and its extension, the stem
-/// shortened if the whole would pass NAME_LIMIT. Pure.
-pub(crate) fn numbered_name(name: &str, tag: &str) -> String {
-    let (stem, ext) = split_extension(name);
-    let room = NAME_LIMIT.saturating_sub(tag.len() + ext.len());
-    let mut cut = stem.len().min(room);
-    while cut > 0 && !stem.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}{tag}{ext}", &stem[..cut])
-}
-
-/// (stem, extension-with-dot). A leading dot is part of the stem (`.bashrc`
-/// has no extension), a trailing dot is not an extension, and `.tar.<x>` is
-/// kept together.
-fn split_extension(name: &str) -> (&str, &str) {
-    let Some(dot) = name.rfind('.') else { return (name, "") };
-    if dot == 0 || dot + 1 == name.len() {
-        return (name, "");
-    }
-    let lower = name.to_ascii_lowercase();
-    if let Some(tar) = lower[..dot].rfind(".tar") {
-        if tar > 0 && tar + 4 == dot {
-            return (&name[..tar], &name[tar..]);
-        }
-    }
-    (&name[..dot], &name[dot..])
-}
-
-/// Create a FRESH .part file. Uses RESOLVE_BENEATH on Linux (TOCTOU-safe,
-/// protects symlinked parents too), O_NOFOLLOW on other Unix, create_new
-/// (O_EXCL) on non-Unix. O_EXCL means "fail if exists" — correct for fresh,
-/// WRONG for resume (use safe_resume_part for that).
-///
-/// Windows (since 0.7.3): opens with FILE_FLAG_OPEN_REPARSE_POINT so a
-/// symlink/junction at the .part path is NOT followed. Rejects reparse points
-/// after open. This closes the Windows half that 0.7.2/0.7.3 explicitly deferred.
-#[cfg(unix)]
-pub(crate) async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    // On Linux: use safe_open_beneath with O_CREAT|O_EXCL for one-primitive guarantee
-    #[cfg(target_os = "linux")]
-    {
-        let parent = path.parent().unwrap_or(std::path::Path::new("."));
-        let rel = path.strip_prefix(parent).unwrap_or(path);
-        // deny_symlinks=true: this is the final component of a file we are
-        // creating. It must never be a symlink, so an attacker who can write
-        // into the download directory cannot plant one that redirects an
-        // incoming transfer to a different file in that same directory. The
-        // mount path uses false because a symlink beneath the share root is
-        // legitimate content; do not unify these without the security entry.
-        crate::mount_proto::safe_open_beneath(
-            parent,
-            rel,
-            (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as i32,
-            true,
-            // Owner-only from creation: a partial is not yet a delivered file
-            // and the download dir may be readable by others.
-            0o600,
-        )
-        .map_err(|e| std::io::Error::new(e.kind(), format!("safe create .part: {e}")))
-        .map(|f| tokio::fs::File::from_std(f))
-    }
-    // Non-Linux Unix: O_NOFOLLOW + O_EXCL (only protects final component)
-    #[cfg(not(target_os = "linux"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .await
-    }
-}
-
-/// Resume an EXISTING .part file. NO O_EXCL (must open existing), but
-/// RESOLVE_BENEATH on Linux (or O_NOFOLLOW on other Unix) AND an explicit
-/// fstat check that what you opened is a REGULAR file — because O_NOFOLLOW
-/// alone will happily open a FIFO or device node someone dropped at that path.
-///
-/// Windows (since 0.7.3): opens with FILE_FLAG_OPEN_REPARSE_POINT so a
-/// symlink/junction at the .part path is NOT followed. Rejects reparse points
-/// and non-regular files after open. This closes the Windows half that
-/// 0.7.2/0.7.3 explicitly deferred.
-#[cfg(unix)]
-pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    // On Linux: use safe_open_beneath (RESOLVE_BENEATH)
-    // Add O_NONBLOCK to prevent blocking on FIFOs/special files
-    #[cfg(target_os = "linux")]
-    {
-        let parent = path.parent().unwrap_or(std::path::Path::new("."));
-        let rel = path.strip_prefix(parent).unwrap_or(path);
-        // deny_symlinks=true, same reason as safe_create_part: the .part final
-        // component must never be a symlink planted inside the download
-        // directory. The mount path uses false; keep them distinct.
-        let file = crate::mount_proto::safe_open_beneath(
-            parent,
-            rel,
-            libc::O_WRONLY | libc::O_NONBLOCK as i32,
-            true,
-            0,
-        )
-        .map_err(|e| std::io::Error::new(e.kind(), format!("safe resume .part: {e}")))?;
-        // Verify what we opened is a regular file (not FIFO, device, etc.)
-        let meta = file.metadata()?;
-        if !meta.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to resume: .part is not a regular file (type: {:?})",
-                    meta.file_type()
-                ),
-            ));
-        }
-        // A partial left by an older build may be group/world readable.
-        let _ = crate::platform::restrict_open_file(&file);
-        Ok(tokio::fs::File::from_std(file))
-    }
-    // Non-Linux Unix: open with O_NOFOLLOW, then fstat the opened fd
-    // (not stat the path before open — that races a swap)
-    #[cfg(not(target_os = "linux"))]
-    {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .await?;
-
-        // fstat on the opened fd — no TOCTOU
-        let meta = file.metadata().await?;
-        if !meta.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to resume: .part is not a regular file (type: {:?})",
-                    meta.file_type()
-                ),
-            ));
-        }
-        let file = file.into_std().await;
-        let _ = crate::platform::restrict_open_file(&file);
-        Ok(tokio::fs::File::from_std(file))
-    }
-}
-
-/// Windows: create a FRESH .part file, refusing to follow symlinks/junctions.
-/// Opens with FILE_FLAG_OPEN_REPARSE_POINT so a reparse point at the path
-/// is NOT followed, then rejects if the opened file is a reparse point.
-/// FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction for the
-/// handle-based attribute check.
-/// This closes the Windows half deferred in 0.7.2/0.7.3.
-#[cfg(not(unix))]
-pub(crate) async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem as WinFs;
-
-    // Open with FILE_FLAG_OPEN_REPARSE_POINT so CreateFile does NOT follow
-    // a symlink/junction at the path. CREATE_NEW = fail if exists.
-    // FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction.
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(WinFs::FILE_FLAG_OPEN_REPARSE_POINT | WinFs::FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .await?;
-
-    // Post-open check via handle (fstat, not stat-the-path — no TOCTOU).
-    let handle = file.as_raw_handle();
-    let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe { WinFs::GetFileInformationByHandle(handle as *mut _, &mut info) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if (info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to create .part: path is a reparse point (symlink/junction)",
-        ));
-    }
-
-    Ok(file)
-}
-
-/// Windows: resume an EXISTING .part file, refusing symlinks/junctions and
-/// non-regular files. Opens with FILE_FLAG_OPEN_REPARSE_POINT so a reparse
-/// point at the path is NOT followed, then rejects reparse points and
-/// non-regular files after open.
-/// FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction for the
-/// handle-based attribute check.
-/// This closes the Windows half deferred in 0.7.2/0.7.3.
-#[cfg(not(unix))]
-pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem as WinFs;
-
-    // Open with FILE_FLAG_OPEN_REPARSE_POINT so CreateFile does NOT follow
-    // a symlink/junction at the path. OPEN_EXISTING = must exist.
-    // FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction.
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(WinFs::FILE_FLAG_OPEN_REPARSE_POINT | WinFs::FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .await?;
-
-    // Post-open check via handle (fstat, not stat-the-path — no TOCTOU).
-    let handle = file.as_raw_handle();
-    let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe { WinFs::GetFileInformationByHandle(handle as *mut _, &mut info) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // Reject reparse points (symlinks, junctions)
-    if (info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to resume .part: path is a reparse point (symlink/junction)",
-        ));
-    }
-
-    // Reject non-regular files (directories, devices, etc.)
-    if (info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_DIRECTORY) != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing to resume: .part is a directory (attrs: {:#x})",
-                info.dwFileAttributes
-            ),
-        ));
-    }
-
-    // Portable tighten-through-the-handle (a no-op on this platform, where
-    // the file takes the directory's ACL); kept so every resume does it.
-    let file = file.into_std().await;
-    let _ = crate::platform::restrict_open_file(&file);
-    Ok(tokio::fs::File::from_std(file))
-}
+// The moved receive leaves. Re-exported so `crate::recv_files::…` (and the
+// crate-root re-exports in `main.rs`) keep resolving to the ONE implementation
+// in the peer-loop crate.
+pub(crate) use filament_peerloop::recv::{
+    IncomingFile, PARTIAL_TTL_SECS, PartMeta, Partial, StdoutSink, WriteFailure, age_words,
+    discard_partial, expire_partials, full_hash, numbered_name, partials_json,
+    resumable_partials, stdout_put, unique_path, verify_incoming,
+};
+// The confined `.part` open needs the beneath-root primitive the `mount-server`
+// feature owns; the CLI always builds with it (its `mount_proto` shim is
+// likewise unconditional).
+#[cfg(feature = "mount-server")]
+pub(crate) use filament_peerloop::recv::{safe_create_part, safe_resume_part};
 
 /// Transfer id -> the final name a finished file was stored under, read once
 /// by the delivery-ack that follows.
@@ -330,73 +54,12 @@ fn note_stored(id: &str, name: &str) {
 /// The delivery-ack for transfer `id`, carrying the name it was stored under
 /// when this side knows it. `stored` is additive: an older sender ignores it.
 pub(crate) fn delivery_ack(id: &str, sid: u32) -> serde_json::Value {
-    let mut m = crate::protocol::delivery_ack_msg(id, sid);
+    let mut m = protocol::delivery_ack_msg(id, sid);
     let stored = STORED.lock().ok().and_then(|mut s| s.as_mut()?.remove(id));
     if let Some(name) = stored {
         m["stored"] = serde_json::json!(name);
     }
     m
-}
-
-pub(crate) struct IncomingFile {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) size: u64,
-    /// Atomic counter so background writer tasks can publish received bytes
-    /// without locking. The event loop polls this for progress updates.
-    pub(crate) received: Arc<AtomicU64>,
-    /// Disjoint sorted byte intervals [start, end) received so far, for
-    /// out-of-order reassembly from multi-stream transports. Shared via
-    /// Mutex so concurrent spawn_blocking writer tasks can update safely.
-    pub(crate) ranges: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
-    /// Raw file handle shared across concurrent spawn_blocking writer tasks.
-    /// Positional writes go through `pwrite_at` (write_at on Unix, seek_write on
-    /// Windows) which is atomic per call — no seek needed, safe for concurrent
-    /// access.
-    pub(crate) file: Arc<std::fs::File>,
-    pub(crate) part_path: PathBuf,
-    /// P4 (GAP-5): the whole-file sha256 the SENDER offered (`full`). On
-    /// completion we hash the received `.part` and compare, only a match
-    /// finalizes + acks. `None` = the sender offered no digest (old peer / an
-    /// un-hashable source); we fall back to the legacy size-only acceptance and
-    /// do NOT ack (nothing to verify), which the sender's bounded fallback covers.
-    pub(crate) full: Option<String>,
-    /// Number of inflight spawn_blocking write tasks. The event loop uses
-    /// this to decide when a file is ready for finalization:
-    ///   inflight == 0 && end_seen → finalize
-    pub(crate) inflight: Arc<AtomicI64>,
-    /// Set by the file-end handler when the sender reports end-of-file, even
-    /// if inflight writes are still pending. The last finishing writer checks
-    /// this flag and emits Ev::MaybeComplete if both conditions are met.
-    pub(crate) end_seen: Arc<AtomicBool>,
-    /// The sid to use in the delivery-ack message. Set from the file-end
-    /// control frame; read by the MaybeComplete handler for the ack.
-    pub(crate) ack_sid: u32,
-    /// Tracks the last received value used for progress display (to avoid
-    /// re-ticking the same value). Not atomic — only accessed from the event loop.
-    pub(crate) last_tick: u64,
-    pub(crate) bar: Box<dyn ProgressBar>,
-    /// The first write that failed on this file (disk full, a filesystem gone
-    /// read-only), recorded by the writer task that hit it. The event loop turns
-    /// it into a typed refusal to the sender. Before this a failed write only
-    /// left a hole, the whole-file digest then failed three times, and the user
-    /// was told the file was CORRUPT when the disk was full.
-    pub(crate) write_err: Arc<std::sync::Mutex<Option<WriteFailure>>>,
-    /// `receive -o -`: the in-order writer to stdout. `None` for a file.
-    pub(crate) stdout: Option<Arc<std::sync::Mutex<StdoutSink<std::fs::File>>>>,
-}
-
-/// See `IncomingFile::write_err`.
-#[derive(Clone, Debug)]
-pub(crate) struct WriteFailure {
-    pub(crate) kind: Option<crate::platform::StorageFailure>,
-    pub(crate) detail: String,
-}
-
-impl WriteFailure {
-    pub(crate) fn from_io(e: &std::io::Error) -> Self {
-        WriteFailure { kind: crate::platform::storage_failure(e), detail: e.to_string() }
-    }
 }
 
 /// A refusal's stable wire token and the sentence both ends show, for a file
@@ -516,231 +179,38 @@ pub(crate) fn inbox_to_check(daemon_running: bool) -> PathBuf {
         .unwrap_or_else(|| crate::drop_dir(None))
 }
 
-/// Remove what a refused file left behind: its `.part` and `.part.meta`. A
-/// refused partial is not resumable (the cause was the disk or the name, not the
-/// link), and on a full disk it is holding the very space that ran out.
-pub(crate) fn discard_partial(part_path: &Path) {
-    let _ = std::fs::remove_file(part_path);
-    let meta = {
-        let mut m = part_path.as_os_str().to_owned();
-        m.push(".meta");
-        PathBuf::from(m)
-    };
-    let _ = std::fs::remove_file(meta);
-}
-
-/// How many bytes `-o -` may hold back while it waits for an earlier gap to
-/// arrive. The receiver asks the sender for one in-order stream, so the only
-/// reordering left is between concurrent writer tasks; this bounds what an
-/// older sender that still splits the file across links can make it hold.
-pub(crate) const STDOUT_REORDER_LIMIT: usize = 64 * 1024 * 1024;
-
-/// `receive -o -` into a pipe. A pipe cannot seek, so positional writes (what a
-/// `.part` file gets) fail with ESPIPE: every `-o - | reader` used to end in
-/// "Invalid seek (os error 29)". This writes strictly in order, holding a chunk
-/// that arrives early until the bytes before it have been written, and hashes
-/// what it writes, so the stream can still be verified against the sender's
-/// whole-file digest (and acked) although it can never be re-read.
-pub(crate) struct StdoutSink<W: std::io::Write> {
-    out: W,
-    next: u64,
-    pending: std::collections::BTreeMap<u64, Vec<u8>>,
-    pending_bytes: usize,
-    hasher: Sha256,
-}
-
-impl<W: std::io::Write> StdoutSink<W> {
-    pub(crate) fn new(out: W) -> Self {
-        StdoutSink {
-            out,
-            next: 0,
-            pending: Default::default(),
-            pending_bytes: 0,
-            hasher: Sha256::new(),
-        }
-    }
-
-    /// Bytes written to the output so far (always a contiguous prefix).
-    pub(crate) fn written(&self) -> u64 {
-        self.next
-    }
-
-    /// Hex SHA-256 of everything written so far.
-    pub(crate) fn digest(&self) -> String {
-        self.hasher
-            .clone()
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
-
-    fn emit(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.out.write_all(data)?;
-        self.hasher.update(data);
-        self.next += data.len() as u64;
-        Ok(())
-    }
-
-    /// Accept `data` at absolute offset `pos`. Bytes already written are
-    /// skipped (a re-sent range), bytes ahead of a gap are held, and anything
-    /// that closes a gap is written together with what it unblocks.
-    pub(crate) fn put(&mut self, pos: u64, data: &[u8]) -> std::io::Result<()> {
-        let end = pos + data.len() as u64;
-        if end <= self.next {
-            return Ok(()); // all of it is already out
-        }
-        if pos > self.next {
-            if self.pending_bytes + data.len() > STDOUT_REORDER_LIMIT {
-                return Err(std::io::Error::other(format!(
-                    "data arrived {} ahead of the stream written to stdout; more than {} would have to be held",
-                    crate::human(pos - self.next),
-                    crate::human(STDOUT_REORDER_LIMIT as u64)
-                )));
-            }
-            self.pending_bytes += data.len();
-            if let Some(old) = self.pending.insert(pos, data.to_vec()) {
-                self.pending_bytes -= old.len();
-            }
-            return Ok(());
-        }
-        let skip = (self.next - pos) as usize;
-        self.emit(&data[skip..])?;
-        loop {
-            let Some(p) = self.pending.keys().next().copied() else {
-                break;
-            };
-            if p > self.next {
-                break;
-            }
-            let chunk = self.pending.remove(&p).unwrap_or_default();
-            self.pending_bytes -= chunk.len();
-            let end = p + chunk.len() as u64;
-            if end > self.next {
-                let skip = (self.next - p) as usize;
-                self.emit(&chunk[skip..])?;
-            }
-        }
-        self.out.flush()
-    }
-
-    /// The verdict once the sender said the stream ended: every byte out, and
-    /// (when the sender offered one) the digest of what was written matches.
-    pub(crate) fn verdict(&self, size: u64, full: Option<&str>) -> std::result::Result<(), String> {
-        if self.next != size {
-            return Err(format!(
-                "the stream to stdout ended after {} of {}",
-                crate::human(self.next),
-                crate::human(size)
-            ));
-        }
-        match full {
-            Some(want) if want != self.digest() => Err(
-                "the bytes written to stdout do not match the sender's whole-file SHA-256 \
-                 (they cannot be re-fetched: stdout cannot be rewound)"
-                    .to_string(),
-            ),
-            _ => Ok(()),
-        }
+/// Expire old partials at receiver start and say what went.
+pub(crate) fn expire_partials_and_say(dir: &Path) {
+    for p in expire_partials(dir, std::time::SystemTime::now()) {
+        ui::say(&format!(
+            "  removed an interrupted transfer's partial of {} ({}), unresumed for {} days",
+            p.name,
+            human(p.bytes),
+            p.age_secs / 86_400
+        ));
     }
 }
 
-/// One positional chunk into a `-o -` sink, shaped like `pwrite_at` (the count
-/// is write iterations, always 1 here) so the writer task treats both alike.
-pub(crate) fn stdout_put(
-    sink: &std::sync::Mutex<StdoutSink<std::fs::File>>,
-    pos: u64,
-    data: &[u8],
-) -> std::io::Result<u32> {
-    let mut s = sink
-        .lock()
-        .map_err(|_| std::io::Error::other("stdout writer poisoned"))?;
-    s.put(pos, data).map(|()| 1)
-}
-
-/// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
-/// compare against the digest the sender offered (`inc.full`, guaranteed Some by
-/// the caller). Flushes first so every buffered byte is on disk. This is the
-/// CORE whole-file integrity guarantee the runner used to bolt on above the
-/// transport, now every `recv` gets it.
-///
-/// Test hook (the truncation/ack gate): `TUNLION_TEST_CORRUPT_RECV=<id>` flips
-/// a byte of the on-disk `.part` for the matching transfer id right before the
-/// hash is computed, deterministically inducing the corrupt-receive case so the
-/// gate can prove reject + recover. `TUNLION_TEST_CORRUPT_ONCE=1` makes it fire
-/// exactly once (the re-fetch then succeeds), proving auto-recovery.
-/// Recompute the whole-file sha256 and compare against the sender's offered
-/// digest. Flushes (syncs) first. This is the receiver-side core of P4 integrity.
-pub(crate) async fn verify_incoming(inc: &IncomingFile) -> protocol::VerifyResult {
-    let want = match &inc.full {
-        Some(w) => w.clone(),
-        None => return protocol::VerifyResult::Match,
-    };
-    // Sync file to disk before hashing.
-    let f = inc.file.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = f.sync_all();
-    })
-    .await;
-
-    let recvd = inc.received.load(Ordering::Relaxed);
-
-    // Test-only corruption injection (deterministic; gate proof). Compiled out
-    // entirely on default/release builds, the `corrupt_recv_target` twin returns
-    // None there, so this whole block strips to nothing.
-    if let Some(target) = test_hooks::corrupt_recv_target() {
-        #[cfg(feature = "test-hooks")]
-        {
-            let once = test_hooks::corrupt_recv_once();
-            let already = test_hooks::corrupt_already_fired();
-            if target == inc.id && recvd == inc.size && !(once && already) {
-                if let Ok(mut bytes) = std::fs::read(&inc.part_path) {
-                    if let Some(b) = bytes.last_mut() {
-                        *b ^= 0xFF;
-                        let _ = std::fs::write(&inc.part_path, &bytes);
-                        eprintln!(
-                            "[test] CORRUPT-RECV: flipped the last byte of {} (id {})",
-                            inc.name, inc.id
-                        );
-                        if once {
-                            test_hooks::corrupt_mark_fired();
-                        }
-                    }
-                }
-            }
-        }
-        let _ = &target;
+/// `status`'s human lines for the partials (none when there are none).
+pub(crate) fn partial_status_lines(dir: &Path) -> Vec<String> {
+    let parts = resumable_partials(dir, std::time::SystemTime::now());
+    if parts.is_empty() {
+        return Vec::new();
     }
-
-    if recvd < inc.size {
-        return protocol::decide_verify(recvd, inc.size, None);
+    let mut lines = vec![format!(
+        "  interrupted transfers in {} (resume by sending again; removed after {} days):",
+        dir.display(),
+        PARTIAL_TTL_SECS / 86_400
+    )];
+    for p in parts {
+        lines.push(format!(
+            "    {}  {} so far, {} old",
+            p.name,
+            human(p.bytes),
+            age_words(p.age_secs)
+        ));
     }
-
-    // Contiguity guard: before hashing, verify coverage is one contiguous
-    // [0,size) interval. Any gap means the file has unwritten bytes even
-    // though received == size. Report WHERE the first gap is.
-    {
-        let r = inc.ranges.lock().unwrap();
-        if !coverage_complete(&r, inc.size) {
-            let _gap = first_gap(&r, inc.size);
-            dlog!(
-                "[recv] INCOMPLETE at verify: {} ranges, received {}/{}, first gap at {:?}",
-                r.len(),
-                recvd,
-                inc.size,
-                gap
-            );
-            drop(r);
-            return protocol::decide_verify(recvd, inc.size, None); // re-fetch, never a false Match
-        }
-    }
-
-    let path = inc.part_path.clone();
-    let got = tokio::task::spawn_blocking(move || full_hash(&path))
-        .await
-        .ok()
-        .flatten();
-    protocol::decide_verify(recvd, inc.size, Some(got.as_deref() == Some(want.as_str())))
+    lines
 }
 
 /// Finalize a fully-received incoming file: sync, rename `.part` → final,
@@ -851,194 +321,9 @@ pub(crate) async fn finalize_incoming(
     Ok(true)
 }
 
-/// How long an interrupted transfer's partial (`<name>.part` plus its
-/// `<name>.part.meta`) waits in the inbox for its resume before the receiver
-/// removes it: 7 days, stated wherever `tunlion status` lists partials.
-/// Before this a partial of up to the chunk size stayed forever, and nothing
-/// mentioned it.
-pub(crate) const PARTIAL_TTL_SECS: u64 = 7 * 86_400;
-
-/// One resumable partial left in the inbox by an interrupted transfer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Partial {
-    /// The file it will become (`<name>` of `<name>.part`).
-    pub(crate) name: String,
-    pub(crate) bytes: u64,
-    pub(crate) age_secs: u64,
-}
-
-/// The resumable partials in `dir` (not recursive): a regular `<name>.part`
-/// WITH its `<name>.part.meta`. The meta is what makes it ours: a received
-/// file that merely ends in `.part` has none, so it is never listed and never
-/// expired. Sorted by name.
-pub(crate) fn resumable_partials(dir: &Path, now: std::time::SystemTime) -> Vec<Partial> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<Partial> = entries
-        .flatten()
-        .filter_map(|e| {
-            let file = e.file_name().to_string_lossy().into_owned();
-            let name = file.strip_suffix(".part")?.to_string();
-            if name.is_empty() {
-                return None;
-            }
-            let md = std::fs::symlink_metadata(e.path()).ok()?;
-            if !md.is_file() || !dir.join(format!("{file}.meta")).is_file() {
-                return None;
-            }
-            let age_secs = md
-                .modified()
-                .ok()
-                .and_then(|m| now.duration_since(m).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            Some(Partial {
-                name,
-                bytes: md.len(),
-                age_secs,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
-}
-
-/// Remove the partials in `dir` older than [`PARTIAL_TTL_SECS`] (the `.part`
-/// and its `.part.meta`). Returns what was removed.
-pub(crate) fn expire_partials(dir: &Path, now: std::time::SystemTime) -> Vec<Partial> {
-    let mut gone = Vec::new();
-    for p in resumable_partials(dir, now) {
-        if p.age_secs < PARTIAL_TTL_SECS {
-            continue;
-        }
-        let part = dir.join(format!("{}.part", p.name));
-        if std::fs::remove_file(&part).is_ok() {
-            let _ = std::fs::remove_file(dir.join(format!("{}.part.meta", p.name)));
-            gone.push(p);
-        }
-    }
-    gone
-}
-
-/// Expire old partials at receiver start and say what went.
-pub(crate) fn expire_partials_and_say(dir: &Path) {
-    for p in expire_partials(dir, std::time::SystemTime::now()) {
-        ui::say(&format!(
-            "  removed an interrupted transfer's partial of {} ({}), unresumed for {} days",
-            p.name,
-            human(p.bytes),
-            p.age_secs / 86_400
-        ));
-    }
-}
-
-/// `status --json`'s view of the partials: name, size, age, and when each
-/// will be removed if nobody resumes it.
-pub(crate) fn partials_json(dir: &Path) -> serde_json::Value {
-    let now = std::time::SystemTime::now();
-    serde_json::Value::Array(
-        resumable_partials(dir, now)
-            .into_iter()
-            .map(|p| {
-                serde_json::json!({
-                    "name": p.name,
-                    "bytes": p.bytes,
-                    "ageSecs": p.age_secs,
-                    "expiresInSecs": PARTIAL_TTL_SECS.saturating_sub(p.age_secs),
-                })
-            })
-            .collect(),
-    )
-}
-
-/// `status`'s human lines for the partials (none when there are none).
-pub(crate) fn partial_status_lines(dir: &Path) -> Vec<String> {
-    let parts = resumable_partials(dir, std::time::SystemTime::now());
-    if parts.is_empty() {
-        return Vec::new();
-    }
-    let mut lines = vec![format!(
-        "  interrupted transfers in {} (resume by sending again; removed after {} days):",
-        dir.display(),
-        PARTIAL_TTL_SECS / 86_400
-    )];
-    for p in parts {
-        lines.push(format!(
-            "    {}  {} so far, {} old",
-            p.name,
-            human(p.bytes),
-            age_words(p.age_secs)
-        ));
-    }
-    lines
-}
-
-fn age_words(secs: u64) -> String {
-    match secs {
-        s if s < 3_600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3_600),
-        s => format!("{}d", s / 86_400),
-    }
-}
-
-#[cfg(test)]
-mod partial_tests {
-    use super::*;
-
-    /// E4: an interrupted transfer left `<name>.part` and `.part.meta` in the
-    /// inbox forever, and `status` never mentioned them. They are listed with
-    /// size and age, expire after PARTIAL_TTL_SECS, and a received file that
-    /// merely ends in `.part` (no meta) is never touched.
-    #[test]
-    fn partials_are_listed_and_expire_and_a_plain_dot_part_file_is_left_alone() {
-        let d = std::env::temp_dir().join(format!(
-            "fil-partials-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|t| t.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("old.bin.part"), vec![0u8; 4096]).unwrap();
-        std::fs::write(d.join("old.bin.part.meta"), b"{}").unwrap();
-        std::fs::write(d.join("new.bin.part"), vec![0u8; 10]).unwrap();
-        std::fs::write(d.join("new.bin.part.meta"), b"{}").unwrap();
-        std::fs::write(d.join("notes.part"), b"a file the user received").unwrap();
-        let now = std::time::SystemTime::now();
-        let later = now + std::time::Duration::from_secs(PARTIAL_TTL_SECS - 3_600);
-        // Age `old` past the bound by moving "now", not the file clock.
-        std::fs::File::options()
-            .write(true)
-            .open(d.join("old.bin.part"))
-            .unwrap()
-            .set_modified(now - std::time::Duration::from_secs(2 * 3_600))
-            .unwrap();
-        let listed = resumable_partials(&d, now);
-        let names: Vec<&str> = listed.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["new.bin", "old.bin"]);
-        assert_eq!(listed[1].bytes, 4096);
-        assert!(listed[1].age_secs >= 2 * 3_600 - 5, "{:?}", listed[1]);
-        let lines = partial_status_lines(&d);
-        assert!(lines[0].contains("removed after 7 days"), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("old.bin")), "{lines:?}");
-        let json = partials_json(&d);
-        assert_eq!(json.as_array().unwrap().len(), 2, "{json}");
-
-        let gone = expire_partials(&d, later);
-        assert_eq!(gone.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["old.bin"]);
-        assert!(!d.join("old.bin.part").exists() && !d.join("old.bin.part.meta").exists());
-        assert!(d.join("new.bin.part").exists() && d.join("new.bin.part.meta").exists());
-        assert!(d.join("notes.part").exists(), "a received file named *.part was removed");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};
-    use super::numbered_name;
+    use super::*;
 
     fn mode_dir(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("filament-test-partmode-{}-{name}", std::process::id()));
@@ -1048,7 +333,8 @@ mod tests {
     }
 
     /// A fresh `.part` is owner-only from the create itself: the bytes of a
-    /// download in progress are not readable by other accounts.
+    /// download in progress are not readable by other accounts. Exercises the
+    /// re-exported library implementation through the CLI's own name.
     #[tokio::test]
     async fn fresh_part_is_owner_only() {
         let d = mode_dir("fresh");
@@ -1099,126 +385,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A writer that refuses to seek, like a pipe: `-o -` must never need to.
-    struct Pipe(Vec<u8>);
-    impl std::io::Write for Pipe {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            // Short writes, as a slow pipe gives them.
-            let n = b.len().min(7);
-            self.0.extend_from_slice(&b[..n]);
-            Ok(n)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// `receive -o - | slow-reader`: chunks arriving out of order, re-sent and
-    /// overlapping still come out as exactly the original bytes, in order, and
-    /// the digest of what was written is the whole-file digest.
+    /// `status` renders the library's partial listing: the TTL header, each
+    /// interrupted transfer by name, its size, and an age word. This restores
+    /// the CLI-rendering assertions that travelled out of the old partial test
+    /// when its data half moved to peerloop::recv.
     #[test]
-    fn stdout_sink_writes_in_order_without_seeking() {
-        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
-        let mut s = super::StdoutSink::new(Pipe(Vec::new()));
-        // Second half first, then a duplicate of an early range, then the rest.
-        s.put(5_000, &data[5_000..]).unwrap();
-        assert_eq!(s.written(), 0, "nothing past a gap may be written");
-        s.put(0, &data[..3_000]).unwrap();
-        s.put(1_000, &data[1_000..2_000]).unwrap(); // already out: skipped
-        s.put(2_500, &data[2_500..5_000]).unwrap(); // overlaps what is out
-        assert_eq!(s.written(), 10_000);
-        assert_eq!(s.out.0, data, "byte-exact and in order");
-        assert_eq!(s.digest(), sha256_hex(&data));
-        assert_eq!(s.verdict(10_000, Some(&sha256_hex(&data))), Ok(()));
-        assert!(s.verdict(10_000, Some("00")).unwrap_err().contains("SHA-256"));
-        assert!(s.verdict(20_000, None).unwrap_err().contains("ended after"));
-    }
-
-    /// An early chunk is held only up to the bound, never without limit.
-    #[test]
-    fn stdout_sink_bounds_what_it_holds() {
-        let mut s = super::StdoutSink::new(Pipe(Vec::new()));
-        let big = vec![0u8; super::STDOUT_REORDER_LIMIT];
-        s.put(1, &big).unwrap();
-        let e = s.put(1 + big.len() as u64, &[1u8]).unwrap_err();
-        assert!(e.to_string().contains("ahead of the stream"), "{e}");
-    }
-
-    #[test]
-    fn full_hash_whole_file_integrity() {
-        // P4 (GAP-5): full_hash digests the WHOLE file (not just the 256 KiB
-        // head), so a difference PAST the head, exactly the truncation/corrupt
-        // case the head-hash can't see, produces a different digest.
-        let dir = std::env::temp_dir().join(format!("filament-test-fh-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let a = dir.join("a.bin");
-        let b = dir.join("b.bin");
-        let mut base = vec![3u8; (HEAD_BYTES + 4096) as usize];
-        std::fs::write(&a, &base).unwrap();
-        // identical head, byte flipped well PAST the head: head_hash agrees but
-        // full_hash MUST differ (this is the whole-file guarantee).
-        base[(HEAD_BYTES + 2048) as usize] = 4;
-        std::fs::write(&b, &base).unwrap();
-        assert_eq!(
-            head_hash(&a),
-            head_hash(&b),
-            "tails past the head don't change the head hash"
+    fn partial_status_lines_render_the_library_listing() {
+        let d = mode_dir("partial-lines");
+        assert!(
+            super::partial_status_lines(&d).is_empty(),
+            "no partials, no lines"
         );
-        assert_ne!(
-            full_hash(&a),
-            full_hash(&b),
-            "full_hash sees the whole file"
+
+        let old = d.join("old.bin.part");
+        std::fs::write(&old, vec![0u8; 4096]).unwrap();
+        std::fs::write(d.join("old.bin.part.meta"), b"{}").unwrap();
+        std::fs::write(d.join("new.bin.part"), vec![0u8; 10]).unwrap();
+        std::fs::write(d.join("new.bin.part.meta"), b"{}").unwrap();
+        // A received file that merely ends in `.part` has no meta and is not ours.
+        std::fs::write(d.join("notes.part"), b"a file the user received").unwrap();
+
+        // Age the old partial past two days so the rendered age word is stable.
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(2 * 86_400 + 60),
+            )
+            .unwrap();
+
+        let lines = super::partial_status_lines(&d);
+        assert!(lines[0].contains("removed after 7 days"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("old.bin")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("new.bin")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("notes.part")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("4.0 KiB")),
+            "size is rendered: {lines:?}"
         );
-        // a truncated file (same prefix, shorter) also differs.
-        std::fs::write(&b, &base[..base.len() - 100]).unwrap();
-        assert_ne!(
-            full_hash(&a),
-            full_hash(&b),
-            "truncation changes the full hash"
-        );
-        // full_hash matches a one-shot sha256 of the bytes.
-        assert_eq!(
-            full_hash(&a),
-            Some(sha256_hex(&vec![3u8; (HEAD_BYTES + 4096) as usize]))
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        let old_line = lines.iter().find(|l| l.contains("old.bin")).unwrap();
+        assert!(old_line.contains("2d old"), "{old_line}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// The CLI adapter expires through the library and keeps fresh partials:
+    /// the side effect startup relies on. The library's expiry rules keep
+    /// their own peerloop tests; this one proves the host adapter + its line.
     #[test]
-    fn unique_path_suffixes() {
-        let dir = std::env::temp_dir().join(format!("filament-test-u-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt"));
-        std::fs::write(dir.join("f.txt"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (1).txt"));
-        std::fs::write(dir.join("f (1).txt"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (2).txt"));
-        // A name at the 255-byte limit still gets a free slot, at the limit,
-        // with its extension intact (the report: "...xxx.txt.1", 257 bytes).
-        let long = format!("{}.txt", "x".repeat(251));
-        assert_eq!(long.len(), 255);
-        std::fs::write(dir.join(&long), b"x").unwrap();
-        let next = unique_path(&dir, &long);
-        let got = next.file_name().unwrap().to_str().unwrap().to_string();
-        assert!(got.ends_with(" (1).txt"), "{got}");
-        assert!(got.len() <= 255, "{} bytes", got.len());
-        std::fs::write(&next, b"x").unwrap();
-        assert!(!dir.join(&long).with_extension("txt.1").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn expire_partials_and_say_removes_only_expired_partials() {
+        let d = mode_dir("expire-say");
+        let old = d.join("old.bin.part");
+        std::fs::write(&old, vec![0u8; 64]).unwrap();
+        std::fs::write(d.join("old.bin.part.meta"), b"{}").unwrap();
+        std::fs::write(d.join("new.bin.part"), vec![0u8; 8]).unwrap();
+        std::fs::write(d.join("new.bin.part.meta"), b"{}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(PARTIAL_TTL_SECS + 60),
+            )
+            .unwrap();
+
+        super::expire_partials_and_say(&d);
+
+        assert!(!old.exists(), "the expired .part is removed");
+        assert!(
+            !d.join("old.bin.part.meta").exists(),
+            "its sidecar is removed"
+        );
+        assert!(d.join("new.bin.part").exists(), "a fresh .part is kept");
+        assert!(
+            d.join("new.bin.part.meta").exists(),
+            "its sidecar is kept"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// `age_words` moved to the library; this proves the CLI re-export resolves
+    /// and still renders the boundaries the partial table uses.
     #[test]
-    fn the_collision_counter_goes_before_the_extension() {
-        assert_eq!(numbered_name("report.pdf", " (1)"), "report (1).pdf");
-        assert_eq!(numbered_name("backup.tar.gz", " (3)"), "backup (3).tar.gz");
-        assert_eq!(numbered_name("Backup.TAR.XZ", " (1)"), "Backup (1).TAR.XZ");
-        assert_eq!(numbered_name(".bashrc", " (1)"), ".bashrc (1)");
-        assert_eq!(numbered_name("noext", " (2)"), "noext (2)");
-        assert_eq!(numbered_name("trailing.", " (1)"), "trailing. (1)");
-        assert_eq!(numbered_name(".tar.gz", " (1)"), ".tar (1).gz");
-        // Multi-byte stems are cut on a character boundary, never mid-char.
-        let wide = format!("{}.txt", "\u{e9}".repeat(200));
-        let out = numbered_name(&wide, " (1)");
-        assert!(out.len() <= 255 && out.ends_with(" (1).txt"), "{}", out.len());
+    fn age_words_renders_through_the_cli_re_export() {
+        assert_eq!(super::age_words(59), "0m");
+        assert_eq!(super::age_words(60), "1m");
+        assert_eq!(super::age_words(3_599), "59m");
+        assert_eq!(super::age_words(3_600), "1h");
+        assert_eq!(super::age_words(86_399), "23h");
+        assert_eq!(super::age_words(86_400), "1d");
     }
 }

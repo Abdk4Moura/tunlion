@@ -97,6 +97,23 @@ impl Progress for NoBar {
     fn done(&self, _bytes: u64) {}
 }
 
+/// Byte counts and rates for every transfer line, in binary units: the divisor
+/// is 1024, so the labels are the IEC ones. Lifted out of `cli/src/main.rs` (a
+/// pure formatter with no host opinion) so the moved receive mechanics — the
+/// `-o -` sink's error sentences, the partial table — can render the same bytes
+/// without the CLI. The CLI re-exports it, so every existing caller resolves
+/// unchanged.
+pub fn human(bytes: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", U[i]) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +132,17 @@ mod tests {
         bar.tick(4);
         bar.tick(10);
         bar.done(10);
+    }
+
+    /// The byte formatter is binary (1024) with IEC labels, exactly as the CLI's
+    /// transfer output has always read.
+    #[test]
+    fn human_formats_binary_units() {
+        assert_eq!(human(512), "512 B");
+        assert_eq!(human(1024), "1.0 KiB");
+        assert_eq!(human(1536), "1.5 KiB");
+        assert_eq!(human(1024 * 1024), "1.0 MiB");
+        assert_eq!(human(5 * 1024 * 1024 * 1024), "5.0 GiB");
+        assert_eq!(human(2 * 1024u64.pow(4)), "2.0 TiB");
     }
 }
