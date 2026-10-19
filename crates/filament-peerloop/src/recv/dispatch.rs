@@ -4690,7 +4690,13 @@ async fn recv_run(
                     if !proven && !idev_known {
                         ports
                             .identity
-                            .issue_proven_challenge_and_hold(&conn, &pid, &mut identity_nonces)
+                            .issue_proven_challenge_and_hold(
+                                &conn,
+                                &pid,
+                                &t,
+                                &st.pending_proven,
+                                &mut identity_nonces,
+                            )
                             .await;
                     }
                 }
@@ -6379,7 +6385,7 @@ async fn recv_run(
                         .servers
                         .open_exec(
                             &mut conn,
-                            &pid,
+                            pid.clone(),
                             &v,
                             &shell_policy,
                             &shell_user,
