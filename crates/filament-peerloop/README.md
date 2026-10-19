@@ -29,6 +29,10 @@ What is here:
   proactive link (explicitly configured, auto-warmed, or recently used), their
   exponential reconnect backoff, and when a peer goes dormant and gets one probe
   per retry window instead of never.
+- **`sync`** -- inbound `sync-open` admission: drop-root confinement through
+  `filament-transfer::path_bounds`, the transfer gate, and shared-mux
+  capacity/collision registration and ack. The CLI keeps parking, the consent
+  request and the stateful `serve_sync` protocol.
 - **`liveness`** -- `link_dead_for` / `link_has_live_for` (the #246 rule that a
   link mid-`establish` is alive even with no transport yet), `ice_fallback_allowed`
   and `direct_permitted`.
