@@ -774,7 +774,7 @@ pub mod serving {
         }
         staged.file().set_len(size)?;
         staged.file().sync_all()?;
-        let (staged, digest) = tokio::task::spawn_blocking(move || {
+        let (mut staged, digest) = tokio::task::spawn_blocking(move || {
             let digest = hash_open_file(staged.file_mut());
             (staged, digest)
         }).await?;
