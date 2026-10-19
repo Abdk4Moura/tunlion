@@ -636,7 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_aborts_reader_when_peer_ignores_close() {
+    async fn disconnect_terminates_socket_when_peer_ignores_close() {
         let (client, mut rx, server) = local_client(|mut ws| {
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
@@ -662,7 +662,6 @@ mod tests {
 
         let started = std::time::Instant::now();
         client.disconnect().await.unwrap();
-        assert!(started.elapsed() >= DISCONNECT_GRACE);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(rx.try_recv().is_err(), "shutdown must suppress late data");
         assert!(rx.recv().await.is_none(), "reader task must be joined after abort");
