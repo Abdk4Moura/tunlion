@@ -17,6 +17,7 @@ use crate::net::{Ev, Transport};
 use crate::ui;
 use anyhow::{Result, bail};
 use bytes::Bytes;
+use filament_peerloop::sync::{self, SyncAccepted, SyncAdmission};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -54,10 +55,11 @@ pub(crate) struct Plan {
 }
 
 // Destination confinement and manifest-name bounds now live in
-// filament-transfer. Re-exported so the handler and its remaining tests keep
-// the old paths; the stateful protocol stays here.
+// filament-transfer. Re-exported so the remaining receiver code and its tests
+// keep the old paths; the stateful protocol stays here. The open-time root
+// bound is called by `peerloop::sync`, which imports the same module directly.
 pub(crate) use filament_transfer::path_bounds::{
-    bound_parent, delete_within, manifest_paths_are_bounded, resolve_root, safe_relpath,
+    bound_parent, delete_within, manifest_paths_are_bounded, safe_relpath,
 };
 
 fn hex(d: &[u8]) -> String {
@@ -645,42 +647,6 @@ async fn sync_inner(
 
 // ------------------------------------------------------------- receiver -----
 
-/// The same decision a `file-offer` from this peer gets in daemon mode: the
-/// transfer capability under the trust floor, legacy trust in shadow, an
-/// authoritative deny hard-refusing. Returns the verified petname on allow.
-fn authorize_sync(conn: &mut Conn, pid: &str, in_bounds: bool) -> Result<String, String> {
-    use crate::capability as cap;
-    let trusted = conn.link(pid).map(|l| l.trusted).unwrap_or(false);
-    let who = conn
-        .link(pid)
-        .and_then(|l| l.verified_name.clone())
-        .unwrap_or_else(|| "<unverified>".into());
-    let az = crate::peer_authz(conn, pid);
-    let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-    let cfg = crate::settings::config_dir();
-    let outcome = cap::cap_authorize(&cfg, "self", cap::CAP_TRANSFER, idev, iusr, ak_caps);
-    let outcome = cap::cap_trust_floor(&outcome, trusted, binding, cap::cap_authoritative());
-    let (own_user, has_grant) =
-        cap::cap_fleet_inputs(&cfg, "self", cap::CAP_TRANSFER, idev, iusr, ak_caps);
-    // The last two arguments mirror the `file-offer` transfer gate exactly:
-    // `denied` false because no deny list is consulted on the transfer path
-    // today, and `ceiling_authorizes` false because transfer is a SCOPED
-    // DEFAULT (in_bounds above), not a deliberate-tier action the enrolment
-    // ceiling decides. Passing anything else here would make sync a different
-    // decision from a file-offer, which is precisely what this verb must not be.
-    let d = cap::cap_gate_effective(
-        trusted, &outcome, cap::CAP_TRANSFER, "self", idev, iusr, binding, expires, ak_caps,
-        own_user.as_ref(), in_bounds, has_grant, cert_revoked, false, false,
-    );
-    if let Some(reason) = cap::transfer_gate_decision(&d, cap::cap_authoritative()) {
-        return Err(reason);
-    }
-    if !d.allowed() {
-        return Err(d.deny_reason("unverified peer: pair first").to_string());
-    }
-    Ok(who)
-}
-
 /// `peer:/abs/path` as the peer reported it, else the request as typed with
 /// where it is relative to (an older peer does not report the path).
 fn sync_destination(peer: &str, remote_dir: &str, dest: Option<&str>) -> String {
@@ -690,36 +656,48 @@ fn sync_destination(peer: &str, remote_dir: &str, dest: Option<&str>) -> String 
     }
 }
 
+/// Accept one `sync-open` by delegating admission to the library.
+///
+/// The endpoint owns path bounds, the transfer gate, the shared-mux
+/// capacity/collision rule, registration and the ack. What stays here is the
+/// receive driver's policy: parking an unproven-identity deny for re-drive,
+/// raising the owner's consent request, and serving the stateful protocol.
 pub(crate) async fn handle_sync_open(
     conn: &mut Conn,
     pid: &str,
-    t: Arc<dyn Transport>,
-    mux: Arc<l2::Mux>,
     v: &Value,
+    muxes: &mut l2::MuxMap,
     drop_dir: &Path,
     parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
 ) {
-    let Some(sid) = l2::wire_sid(v) else { return };
-    if !l2::is_l2_sid(sid) {
-        return;
-    }
-    let refuse = |err: String| {
-        let t = t.clone();
-        async move {
-            ui::say(&format!("sync: refused: {err}"));
-            let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": err })).await;
+    match sync::admit_sync_open(conn, pid, v, muxes, drop_dir).await {
+        SyncAdmission::Accepted(a) => {
+            let SyncAccepted {
+                sid,
+                who,
+                root,
+                dry_run,
+                delete,
+                rx,
+                mux,
+                transport: t,
+            } = a;
+            ui::say(&format!(
+                "sync: '{who}' -> {}{}",
+                root.display(),
+                if dry_run { " (dry run)" } else { "" }
+            ));
+            tokio::spawn(async move {
+                if let Err(e) = serve_sync(&t, &mux, sid, &root, delete, dry_run, rx).await {
+                    ui::say(&format!("sync: ended: {e}"));
+                    let _ = t
+                        .send_control(&json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }))
+                        .await;
+                }
+                mux.drop_stream(sid).await;
+            });
         }
-    };
-    // Bounds first, so an out-of-root request never widens to a grant-only
-    // decision it would have failed anyway, and the gate sees the real scope.
-    let dry_run = v["dry_run"].as_bool() == Some(true);
-    let root = match resolve_root(drop_dir, v["root"].as_str().unwrap_or(""), !dry_run) {
-        Ok(r) => r,
-        Err(e) => return refuse(e).await,
-    };
-    let who = match authorize_sync(conn, pid, true) {
-        Ok(w) => w,
-        Err(reason) => {
+        SyncAdmission::Denied(d) => {
             // Settle-then-evaluate, as exec does: a deny that rests on a
             // not-yet-proven identity parks for re-drive on proof.
             if crate::recv_cmd::park_on_deny(
@@ -727,10 +705,10 @@ pub(crate) async fn handle_sync_open(
                 conn,
                 pid,
                 crate::recv_cmd::ParkKind::Sync,
-                &t,
-                sid,
+                &d.transport,
+                d.park.sid,
                 v,
-                &reason,
+                &d.park.reason,
             )
             .await
             {
@@ -738,29 +716,16 @@ pub(crate) async fn handle_sync_open(
             }
             let name = conn.link(pid).and_then(|l| l.verified_name.clone());
             crate::enqueue_if_requestable(name.as_deref().unwrap_or("<unverified>"), "transfer");
-            return refuse(format!("not authorized: {reason}")).await;
+            let err = d.err();
+            ui::say(&format!("sync: refused: {err}"));
+            let _ = d.transport.send_control(&d.close_frame()).await;
         }
-    };
-    if mux.at_stream_cap().await {
-        return refuse("too many streams".into()).await;
+        SyncAdmission::Refused(r) => {
+            ui::say(&format!("sync: refused: {}", r.reason));
+            let _ = r.transport.send_control(&r.close).await;
+        }
+        SyncAdmission::Ignored => {}
     }
-    let Some(pipe) = mux.register_stream(sid).await else {
-        return refuse("sid in use".into()).await;
-    };
-    let delete = v["delete"].as_bool() == Some(true);
-    // `dest`: the resolved absolute destination, so the sender can say where
-    // its files went (additive; older senders ignore it).
-    let _ = t
-        .send_control(&json!({ "type": "sync-open-ack", "sid": sid, "dest": root.display().to_string() }))
-        .await;
-    ui::say(&format!("sync: '{who}' -> {}{}", root.display(), if dry_run { " (dry run)" } else { "" }));
-    tokio::spawn(async move {
-        if let Err(e) = serve_sync(&t, &mux, sid, &root, delete, dry_run, pipe).await {
-            ui::say(&format!("sync: ended: {e}"));
-            let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": e.to_string() })).await;
-        }
-        mux.drop_stream(sid).await;
-    });
 }
 
 async fn serve_sync(
