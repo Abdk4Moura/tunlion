@@ -30,6 +30,23 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  peerloop-mount-server-boundary:
+    name: peerloop mount-server feature boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux-android, x86_64-linux-android]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - name: Compile isolated reduced peerloop root
+        run: cargo check --locked -p filament-peerloop --no-default-features --target ${{ matrix.target }}
+      - name: Compile default compatibility profile
+        run: cargo test --locked -p filament-peerloop --no-run
+
   core-tooling-graph:
     name: core tooling dependency split
     runs-on: ubuntu-latest

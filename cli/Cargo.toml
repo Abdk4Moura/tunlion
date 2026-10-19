@@ -92,7 +92,7 @@ filament-fleet = { path = "../crates/filament-fleet", version = "0.1.0" }
 # adoption, the petname rule), carved out in issue #465 slice 3 so the later move
 # of `Conn` itself is a `git mv`. Re-exported by `crate::conn`, so no call site
 # moved with it.
-filament-peerloop = { path = "../crates/filament-peerloop", version = "0.1.0" }
+filament-peerloop = { path = "../crates/filament-peerloop", version = "0.1.0", features = ["mount-server"] }
 filament-transport = { path = "../crates/filament-transport", version = "0.1.0" }
 hex = "0.4"
 rand_core = "0.6"
