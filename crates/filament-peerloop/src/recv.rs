@@ -650,7 +650,6 @@ pub async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::
     // Non-Linux Unix: O_NOFOLLOW + O_EXCL (only protects final component)
     #[cfg(not(target_os = "linux"))]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -707,8 +706,6 @@ pub async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::
     // (not stat the path before open — that races a swap)
     #[cfg(not(target_os = "linux"))]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-
         let file = tokio::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -739,7 +736,6 @@ pub async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::
 /// handle-based attribute check.
 #[cfg(all(not(unix), feature = "mount-server"))]
 pub async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem as WinFs;
 
@@ -776,7 +772,6 @@ pub async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::
 /// non-regular files after open.
 #[cfg(all(not(unix), feature = "mount-server"))]
 pub async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem as WinFs;
 
@@ -958,6 +953,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// The age word the CLI's partial table renders: minutes under an hour,
+    /// hours under a day, days beyond. Boundaries are asserted exactly.
+    #[test]
+    fn age_words_formats_minutes_hours_days() {
+        assert_eq!(age_words(0), "0m");
+        assert_eq!(age_words(59), "0m");
+        assert_eq!(age_words(60), "1m");
+        assert_eq!(age_words(3_599), "59m");
+        assert_eq!(age_words(3_600), "1h");
+        assert_eq!(age_words(86_399), "23h");
+        assert_eq!(age_words(86_400), "1d");
+        assert_eq!(age_words(2 * 86_400 + 5), "2d");
+    }
+
     #[test]
     fn part_meta_roundtrip_and_legacy() {
         let dir = mode_dir("meta");
@@ -998,29 +1007,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Try to create a file symlink, returning the OS's refusal when the
+    /// platform does not allow one (Windows without Developer Mode or the
+    /// SeCreateSymbolicLink privilege). The security test below skips only on
+    /// that refusal, never merely because the platform is Windows.
+    fn try_symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this platform has no file symlinks",
+            ))
+        }
+    }
+
     /// A `.part.meta` planted as a symlink must not redirect the sidecar write
-    /// onto the link's target.
+    /// onto the link's target. Runs on every platform that can actually plant
+    /// the link (including Windows with symlink rights), exactly as the old
+    /// portable CLI test did.
     #[test]
     fn part_meta_store_does_not_write_through_a_symlink() {
         let dir = mode_dir("meta-link");
         let victim = dir.join("victim");
         std::fs::write(&victim, b"precious").unwrap();
         let p = dir.join("y.part.meta");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&victim, &p).unwrap();
-            PartMeta { size: 7, head: None, full: None }.store(&p).unwrap();
-            assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the link target is untouched");
-            assert!(
-                !std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(),
-                "the sidecar is a real file now"
-            );
-            assert_eq!(PartMeta::load(&p).unwrap().size, 7);
+        // The OS may refuse a Windows file symlink without Developer Mode /
+        // SeCreateSymbolicLink. Skip only then; never silently skip the arm.
+        if try_symlink_file(&victim, &p).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = p;
-        }
+        PartMeta { size: 7, head: None, full: None }.store(&p).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the link target is untouched");
+        assert!(
+            !std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(),
+            "the sidecar is a real file now"
+        );
+        assert_eq!(PartMeta::load(&p).unwrap().size, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

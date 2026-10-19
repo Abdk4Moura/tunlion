@@ -384,4 +384,97 @@ mod tests {
         assert!(msg.contains(&blocked.display().to_string()) && msg.contains("notes.txt"), "{msg}");
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// `status` renders the library's partial listing: the TTL header, each
+    /// interrupted transfer by name, its size, and an age word. This restores
+    /// the CLI-rendering assertions that travelled out of the old partial test
+    /// when its data half moved to peerloop::recv.
+    #[test]
+    fn partial_status_lines_render_the_library_listing() {
+        let d = mode_dir("partial-lines");
+        assert!(
+            super::partial_status_lines(&d).is_empty(),
+            "no partials, no lines"
+        );
+
+        let old = d.join("old.bin.part");
+        std::fs::write(&old, vec![0u8; 4096]).unwrap();
+        std::fs::write(d.join("old.bin.part.meta"), b"{}").unwrap();
+        std::fs::write(d.join("new.bin.part"), vec![0u8; 10]).unwrap();
+        std::fs::write(d.join("new.bin.part.meta"), b"{}").unwrap();
+        // A received file that merely ends in `.part` has no meta and is not ours.
+        std::fs::write(d.join("notes.part"), b"a file the user received").unwrap();
+
+        // Age the old partial past two days so the rendered age word is stable.
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(2 * 86_400 + 60),
+            )
+            .unwrap();
+
+        let lines = super::partial_status_lines(&d);
+        assert!(lines[0].contains("removed after 7 days"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("old.bin")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("new.bin")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("notes.part")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("4.0 KiB")),
+            "size is rendered: {lines:?}"
+        );
+        let old_line = lines.iter().find(|l| l.contains("old.bin")).unwrap();
+        assert!(old_line.contains("2d old"), "{old_line}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The CLI adapter expires through the library and keeps fresh partials:
+    /// the side effect startup relies on. The library's expiry rules keep
+    /// their own peerloop tests; this one proves the host adapter + its line.
+    #[test]
+    fn expire_partials_and_say_removes_only_expired_partials() {
+        let d = mode_dir("expire-say");
+        let old = d.join("old.bin.part");
+        std::fs::write(&old, vec![0u8; 64]).unwrap();
+        std::fs::write(d.join("old.bin.part.meta"), b"{}").unwrap();
+        std::fs::write(d.join("new.bin.part"), vec![0u8; 8]).unwrap();
+        std::fs::write(d.join("new.bin.part.meta"), b"{}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(PARTIAL_TTL_SECS + 60),
+            )
+            .unwrap();
+
+        super::expire_partials_and_say(&d);
+
+        assert!(!old.exists(), "the expired .part is removed");
+        assert!(
+            !d.join("old.bin.part.meta").exists(),
+            "its sidecar is removed"
+        );
+        assert!(d.join("new.bin.part").exists(), "a fresh .part is kept");
+        assert!(
+            d.join("new.bin.part.meta").exists(),
+            "its sidecar is kept"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `age_words` moved to the library; this proves the CLI re-export resolves
+    /// and still renders the boundaries the partial table uses.
+    #[test]
+    fn age_words_renders_through_the_cli_re_export() {
+        assert_eq!(super::age_words(59), "0m");
+        assert_eq!(super::age_words(60), "1m");
+        assert_eq!(super::age_words(3_599), "59m");
+        assert_eq!(super::age_words(3_600), "1h");
+        assert_eq!(super::age_words(86_399), "23h");
+        assert_eq!(super::age_words(86_400), "1d");
+    }
 }
