@@ -10,23 +10,23 @@
 //! implementations. A reduced build (Android) omits them and every open is
 //! refused by the fallback in `NoRecvServers`.
 
-use crate::host::{LogSink, Tone};
 use crate::l2;
 use crate::recv_cmd::park_on_deny;
-use crate::recv_cmd::{ParkKind, ParkedOpen};
-use crate::shell::ShellPolicy;
-use crate::{identity, refusal};
+use crate::ShellPolicy;
+use crate::{enqueue_if_requestable, identity, refusal};
 use crate::{shell_argv, shell_root_note, spawn_session_pumps};
 use anyhow::{Context, Result};
 use filament_peerloop::conn::Conn;
 use filament_peerloop::control::Req;
 use filament_peerloop::driver::Cancellation as _;
 use filament_peerloop::host::HostServices;
+use filament_peerloop::host::{LogSink, Tone};
 use filament_peerloop::l2 as lib_l2;
 use filament_peerloop::l2::forward;
 use filament_peerloop::l2::Mux;
 use filament_peerloop::mesh::MeshTunnel;
 use filament_peerloop::recv::dispatch::{self, settle_timeout_reason};
+use filament_peerloop::recv::dispatch::{ParkKind, ParkedOpen};
 use filament_peerloop::recv::ports::{
     RawMode, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvPrompt, RecvServers, RecvStore,
 };
@@ -50,7 +50,8 @@ pub struct CliRecv {
     pub pty_sessions: l2::PtySessions,
     pub warm_ptys: crate::WarmPtys,
     pub liveness: crate::LivenessProbes,
-    pub pending_bootstrap: crate::PendingBootstraps,
+    #[cfg(unix)]
+    pub pending_bootstrap: filament_peerloop::daemon_ctl::PendingBootstraps,
     pub daemon_mounts: crate::DaemonMounts,
     pub last_mount_check: Instant,
     pub exposer: Option<Arc<crate::expose::Exposer>>,
@@ -63,6 +64,7 @@ impl Default for CliRecv {
             pty_sessions: l2::PtySessions::new(),
             warm_ptys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             liveness: crate::LivenessProbes::new(),
+            #[cfg(unix)]
             pending_bootstrap: HashMap::new(),
             daemon_mounts: crate::DaemonMounts {
                 entries: HashMap::new(),
@@ -810,6 +812,7 @@ impl RecvDaemon for CliRecv {
         crate::daemon_ctl::handle_list_warm(conn_for_list, req).await
     }
     async fn mount(&mut self, req: Req, server: &str, relay: bool) {
+        #[cfg(unix)]
         crate::daemon_ctl::handle_mount(
             req,
             server,
@@ -817,16 +820,30 @@ impl RecvDaemon for CliRecv {
             &mut self.daemon_mounts,
             &mut self.last_mount_check,
         )
-        .await
+        .await;
+        #[cfg(not(unix))]
+        {
+            let _ = (server, relay);
+            req.reject("mount is not available on this platform").await;
+        }
     }
     async fn unmount(&mut self, req: Req) {
-        crate::daemon_ctl::handle_unmount(req, &mut self.daemon_mounts).await
+        #[cfg(unix)]
+        crate::daemon_ctl::handle_unmount(req, &mut self.daemon_mounts).await;
+        #[cfg(not(unix))]
+        req.reject("mount is not available on this platform").await;
     }
     async fn list_mounts(&mut self, req: Req) {
-        crate::daemon_ctl::handle_list_mounts(req, &self.daemon_mounts).await
+        #[cfg(unix)]
+        crate::daemon_ctl::handle_list_mounts(req, &self.daemon_mounts).await;
+        #[cfg(not(unix))]
+        req.reject("mount is not available on this platform").await;
     }
     async fn mount_health(&mut self, req: Req) {
-        crate::daemon_ctl::handle_mount_health(req, &self.daemon_mounts).await
+        #[cfg(unix)]
+        crate::daemon_ctl::handle_mount_health(req, &self.daemon_mounts).await;
+        #[cfg(not(unix))]
+        req.reject("mount is not available on this platform").await;
     }
     async fn mount_health_tick(&mut self, host: &dyn HostServices) {
         let dead_locals: Vec<String> = self
@@ -857,13 +874,26 @@ impl RecvDaemon for CliRecv {
         }
     }
     async fn warm_bootstrap(&mut self, conn: &Conn, _tx: &mpsc::UnboundedSender<Ev>, req: Req) {
-        crate::daemon_ctl::handle_warm_bootstrap(conn, &mut self.pending_bootstrap, req).await
+        #[cfg(unix)]
+        crate::daemon_ctl::handle_warm_bootstrap(conn, &mut self.pending_bootstrap, req).await;
+        #[cfg(not(unix))]
+        {
+            let _ = (conn, req);
+            req.reject("bootstrap is not available on this platform")
+                .await;
+        }
     }
     async fn complete_warm_bootstrap(&mut self, _conn: &Conn, pid: &str, reply: &Value) {
-        crate::daemon_ctl::complete_warm_bootstrap(&mut self.pending_bootstrap, pid, reply).await
+        #[cfg(unix)]
+        crate::daemon_ctl::complete_warm_bootstrap(&mut self.pending_bootstrap, pid, reply).await;
+        #[cfg(not(unix))]
+        {
+            let _ = (pid, reply);
+        }
     }
     fn reap_warm_bootstraps(&mut self) {
-        crate::daemon_ctl::reap_warm_bootstraps(&mut self.pending_bootstrap)
+        #[cfg(unix)]
+        crate::daemon_ctl::reap_warm_bootstraps(&mut self.pending_bootstrap);
     }
     fn revocation_snapshot(&self) -> Option<HashSet<String>> {
         crate::revocation_live::store_snapshot()

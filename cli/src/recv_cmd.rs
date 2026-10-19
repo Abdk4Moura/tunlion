@@ -13,7 +13,7 @@ use crate::{display_name, host_impl, mk_uid, ShellPolicy};
 use anyhow::Result;
 use filament_peerloop::driver::{Cancellation, DriverOutcome, Engine};
 use filament_peerloop::host::{HostServices, LogSink, Tone};
-use filament_peerloop::recv::dispatch::{drive, ParkKind, ParkedOpen, RecvCleanup};
+use filament_peerloop::recv::dispatch::{drive, RecvCleanup};
 use filament_peerloop::recv::ports::{RecvEnv, RecvPorts};
 use std::path::PathBuf;
 use std::sync::Arc;
