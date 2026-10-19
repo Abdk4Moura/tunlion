@@ -16,6 +16,10 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { PredictiveEcho } from '../lib/predict.js'
 import { log } from '../lib/log.js'
+import {
+  SCROLL_APPLICATION, SCROLL_CURSOR_KEYS, SCROLL_HISTORY, applicationWheelActive,
+  isMouseReport, latin1Bytes, pageLines, scrollModeKey, scrollRoute, wheelDeltaForDirection,
+} from '../lib/tui-scroll.js'
 import '@xterm/xterm/css/xterm.css'
 
 const enc = new TextEncoder()
@@ -89,6 +93,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const [barOpen, setBarOpen] = useState(false) // the one-line bar, expanded to the full line
   const [kbInset, setKbInset] = useState(0) // visualViewport keyboard height
   const [atBottom, setAtBottom] = useState(true) // false => show scroll-to-bottom
+  const [wheelRoute, setWheelRoute] = useState(SCROLL_HISTORY) // who owns a vertical wheel
   const [toast, setToast] = useState('') // brief copy/paste feedback
   const toastTimer = useRef(0)
   const sessionIdRef = useRef(makeSessionId(instanceId))
@@ -141,6 +146,13 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   // reconnect (new link, same terminal) keeps input flowing without rebuilding
   // any of the persistent handlers that call write.
   const write = useCallback((s) => { const l = linkRef.current; return l && l.sendPtyInput(enc.encode(s)) }, [])
+  // Raw-byte input path for xterm's binary events (legacy mouse reports). Never
+  // run these through TextEncoder: byte values >127 are Latin-1 code units in
+  // xterm's report string, and UTF-8 encoding would expand/corrupt them.
+  const writeBytes = useCallback((u8) => {
+    const l = linkRef.current
+    return l && u8 && l.sendPtyInput(u8)
+  }, [])
 
   // apply sticky Ctrl/Alt to a single typed char, then disarm (unless locked)
   const applyMods = useCallback((data) => {
@@ -169,23 +181,85 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     if (term.buffer.active.type === 'alternate') return true
     return term.buffer.active.viewportY >= term.buffer.active.baseY
   }, [])
+  // What owns a vertical wheel/touch scroll right now? Read only PUBLIC xterm
+  // state: the active buffer type and the application's mouse tracking mode.
+  // A partial TUI can keep the normal buffer while asking for mouse reports, so
+  // "alternate screen?" alone is not enough (the old bug: those apps got local
+  // history scrolling and never saw the gesture).
+  const routeForTerm = useCallback((term) => {
+    try {
+      return scrollRoute(term.buffer.active.type, term.modes.mouseTrackingMode)
+    } catch (e) {
+      return SCROLL_HISTORY
+    }
+  }, [])
+  // Turn a touch/page step into real WheelEvents on xterm's screen element.
+  // xterm's own wheel listeners then do the encoding: SGR/legacy/pixel mouse
+  // reports for a mouse-tracking app, or Up/Down cursor keys when an alternate
+  // screen has no scrollback (honouring applicationCursorKeys). We never touch
+  // xterm internals or hardcode a mouse protocol here.
+  //
+  // Exactly-once routing: xterm binds its wheel listeners on the `.xterm`
+  // element (the screen element is a child), and its mouse-reporting listener
+  // and its no-scrollback fallback are mutually exclusive (`requestedEvents.wheel`
+  // makes the fallback return immediately). Dispatching on `.xterm-screen`
+  // therefore reaches one handler, once, and the touch handler returns without
+  // also calling scrollLines() for the same gesture.
+  const dispatchWheel = useCallback((clientX, clientY, lines, dir) => {
+    const host = hostRef.current
+    const screen = host && host.querySelector('.xterm-screen')
+    const n = Math.max(0, Math.min(200, Math.abs(Math.trunc(lines)) || 0))
+    if (!screen || !n) return 0
+    const deltaY = wheelDeltaForDirection(dir)
+    let sent = 0
+    for (let i = 0; i < n; i++) {
+      const ev = new WheelEvent('wheel', {
+        bubbles: true, cancelable: true, composed: true,
+        clientX, clientY, deltaX: 0, deltaY,
+        deltaMode: WheelEvent.DOM_DELTA_LINE,
+      })
+      // Marks the event as ours for debugging / harness assertions only; xterm
+      // does not need (or read) it.
+      try { ev.__tunlionTouchWheel = true } catch (e) {}
+      screen.dispatchEvent(ev)
+      sent++
+    }
+    return sent
+  }, [])
   const scrollToBottom = useCallback(() => {
     const term = termRef.current
     if (!term) return
+    // Explicit escape hatch, not a wheel route: a partial TUI that started while
+    // the reader was off-tail must not strand them in hidden history. The
+    // per-finger wheel still belongs to the app; this button deliberately jumps
+    // the local viewport back to the live tail.
     term.scrollToBottom()
     setAtBottom(true)
     haptic()
     try { term.focus() } catch (e) {}
   }, [])
   // Page up/down for the accessory bar (a touch-friendly chunk scroll). A near-
-  // full-page step (rows - 1) keeps a line of context, like a pager.
+  // full-page step (rows - 1) keeps a line of context, like a pager. In local
+  // history this moves xterm's scrollback; when the app owns the wheel the same
+  // step is delivered as wheel reports at the terminal centre, so a TUI pages
+  // itself instead of the shell's history moving underneath it. There is no
+  // blind PgUp/PgDn key injection: an app that does not report wheel keeps the
+  // standard xterm behaviour (cursor keys in the alternate screen).
   const scrollPage = useCallback((dir) => {
     const term = termRef.current
     if (!term) return
-    if (term.buffer && term.buffer.active && term.buffer.active.type === 'alternate') return
-    term.scrollLines(dir * Math.max(1, (term.rows || 24) - 1))
+    const n = pageLines(term.rows)
+    if (routeForTerm(term) === SCROLL_HISTORY) {
+      term.scrollLines(dir * n)
+    } else {
+      const host = hostRef.current
+      const screen = host && host.querySelector('.xterm-screen')
+      if (!screen) return
+      const rect = screen.getBoundingClientRect()
+      dispatchWheel(rect.left + rect.width / 2, rect.top + rect.height / 2, n, dir)
+    }
     haptic()
-  }, [])
+  }, [dispatchWheel, routeForTerm])
 
   // Recompute the thumb size + position from xterm's buffer geometry. The total
   // scrollable height is (baseY + rows) lines: baseY is the topmost viewport
@@ -203,7 +277,14 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     const term = termRef.current
     const b = term && term.buffer && term.buffer.active
     if (!term || !b) { setBar((p) => (p.visible ? { ...p, visible: false } : p)); return }
-    if (b.type === 'alternate' || b.baseY <= 0) {
+    // History-only chrome: never offer a dragbar for a TUI's wheel, and the
+    // alternate screen has no scrollback at all. A partial TUI in the normal
+    // buffer still counts as app-owned (mouse reporting), so its scrollbar is
+    // hidden too even though xterm has history behind it.
+    const route = routeForTerm(term)
+    setWheelRoute((prev) => (prev === route ? prev : route))
+    const appOwnsWheel = applicationWheelActive(route)
+    if (b.type === 'alternate' || appOwnsWheel || b.baseY <= 0) {
       setBar((p) => (p.visible ? { ...p, visible: false } : p)); return
     }
     const rows = term.rows || 24
@@ -212,7 +293,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     const maxTop = 100 - h
     const top = total > rows ? (b.viewportY / b.baseY) * maxTop : 0
     setBar({ visible: true, top: Math.max(0, Math.min(maxTop, top)), height: h })
-  }, [])
+  }, [routeForTerm])
 
   // Map a fractional position along the track (0 = top, 1 = bottom) to a buffer
   // line and scroll there. Used by both the thumb drag and a track tap-to-page
@@ -221,9 +302,10 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     const term = termRef.current
     const b = term && term.buffer && term.buffer.active
     if (!term || !b || b.type === 'alternate') return
+    if (applicationWheelActive(routeForTerm(term))) return // history-only control
     const f = Math.max(0, Math.min(1, frac))
     term.scrollToLine(Math.round(f * b.baseY))
-  }, [])
+  }, [routeForTerm])
 
   // Thumb drag: pointer events cover mouse + touch + pen identically, so a synth
   // drag in the harness exercises the exact code a real finger does. We capture
@@ -564,10 +646,28 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     // guarded so a predict/write throw can never wedge typing. predict.onUserKey
     // is itself fail-safe; this is belt-and-suspenders and protects write().
     const dataSub = term.onData((d) => {
-      if (!ctrl.current && !alt.current) {
+      // SGR/SGR-pixel mouse reports arrive on onData, but they are generated
+      // application input: sticky Ctrl/Alt must not prefix them or be consumed.
+      // Ordinary typed/accessory input keeps the existing modifier semantics.
+      // Only an exact SGR report shapes while a mouse protocol is live can be
+      // generated input; the same bytes pasted into a plain shell are text.
+      let mouseTracking = 'none'
+      try { mouseTracking = term.modes.mouseTrackingMode } catch (e) {}
+      const mouseReport = mouseTracking !== 'none' && isMouseReport(d)
+      if (!mouseReport && !ctrl.current && !alt.current) {
         guarded('onData.predict', () => predict.onUserKey(d, composingRef.current))
       }
-      guarded('onData.write', () => write(applyMods(d)))
+      guarded('onData.write', () => {
+        if (mouseReport) write(d)
+        else write(applyMods(d))
+      })
+    })
+    // Legacy (X10/VT200/DRAG/ANY without an SGR encoding) mouse reports are
+    // emitted on xterm's BINARY path. Their JS string code units are the wire
+    // bytes; forward them raw as Uint8Array, never TextEncoder (UTF-8 would
+    // corrupt coordinates/modifiers >127). Guarded + disposed with the terminal.
+    const binarySub = term.onBinary((d) => {
+      guarded('onBinary.write', () => writeBytes(latin1Bytes(d)))
     })
     // Resize -> PTY: route through linkRef.current so a reconnect keeps SIGWINCH
     // flowing to the new link without rebuilding this subscription. Guarded: a
@@ -591,31 +691,59 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     const resizeBarSub = term.onResize(() => guarded('onResize.bar', () => syncBar()))
 
     // --- touch scrolling (issue #5) -----------------------------------------
-    // On mobile a one-finger swipe over the terminal must scroll the SCROLLBACK,
-    // not type into the PTY and not start a text selection. xterm's own viewport
-    // is touch-finicky, so we translate vertical swipe delta into scrollLines on
-    // the host element directly. We never preventDefault on a clear horizontal
-    // move (let the accessory bar / page scroll), and we skip the alternate
-    // screen (a TUI owns touch there, e.g. scrolling a list). A swipe under a
-    // small threshold is treated as a tap so the keyboard/selection still work.
+    // On mobile a one-finger swipe over the terminal must scroll the right
+    // context, not type into the PTY and not start a text selection. There are
+    // three contexts (see lib/tui-scroll.js):
+    //   history      normal buffer, no wheel-capable mouse mode -> scrollLines
+    //   application  mouse reporting (even a partial TUI in normal buffer) ->
+    //                synthetic wheel at the ORIGINAL touch cell; xterm encodes
+    //                the selected protocol itself (SGR/legacy/pixels)
+    //   cursor-keys  alternate screen with no wheel reporting -> synthetic
+    //                wheel; xterm turns it into Up/Down respecting DECCKM
+    // We never preventDefault on a clear horizontal move (allow selection/bar),
+    // and a swipe under a small threshold stays a tap so focus/keyboard work.
     const host = hostRef.current
-    let tY = 0, tX = 0, tAccum = 0, tMoved = false, tActive = false
+    let tY = 0, tX = 0, tStartX = 0, tStartY = 0, tAccum = 0, tMoved = false, tActive = false
+    let tRoute = SCROLL_HISTORY
+    let tModeKey = ''
     const cellH = () => {
       const t = termRef.current
-      // approximate row height in px from the viewport; fall back to font-based.
-      const vp = host && host.querySelector('.xterm-viewport')
-      if (vp && t && t.rows) return Math.max(8, vp.clientHeight / t.rows)
+      // Measure the rendered screen, not .xterm-viewport: in xterm 6 the
+      // viewport element can report clientHeight 0 (the renderer owns the
+      // canvas), which used to make this fall back to 8px and move ~2.4 rows
+      // per finger row. The screen rect is exactly rows * cell height.
+      const screen = host && host.querySelector('.xterm-screen')
+      if (screen && t && t.rows) {
+        const h = screen.getBoundingClientRect().height
+        if (h > 0) return Math.max(8, h / t.rows)
+      }
       return 18
     }
     const onTouchStart = (e) => {
       if (e.touches.length !== 1) { tActive = false; return }
       const t = termRef.current
-      if (t && t.buffer && t.buffer.active && t.buffer.active.type === 'alternate') { tActive = false; return }
+      if (!t) { tActive = false; return }
+      // Capture the context once per gesture. A TUI entering/exiting mouse mode
+      // or flipping buffers mid-swipe aborts below instead of delivering the
+      // captured route to whatever app arrived next.
+      tRoute = routeForTerm(t)
+      try { tModeKey = scrollModeKey(t.buffer.active.type, t.modes.mouseTrackingMode) } catch (e) { tModeKey = '' }
       tActive = true; tMoved = false; tAccum = 0
       tY = e.touches[0].clientY; tX = e.touches[0].clientX
+      tStartY = tY; tStartX = tX
     }
     const onTouchMove = (e) => {
       if (!tActive || e.touches.length !== 1) return
+      const t = termRef.current
+      if (!t) { tActive = false; return }
+      let nowKey = ''
+      try { nowKey = scrollModeKey(t.buffer.active.type, t.modes.mouseTrackingMode) } catch (err) { nowKey = '' }
+      if (tModeKey && nowKey !== tModeKey) {
+        // The app changed scroll context under the finger. Drop the rest of this
+        // gesture rather than scrolling/reporting into the new one.
+        tActive = false; tMoved = false; tAccum = 0
+        return
+      }
       const y = e.touches[0].clientY, x = e.touches[0].clientX
       const dy = y - tY, dx = x - tX
       // Ignore a mostly-horizontal drag (let it be / allow text selection drag).
@@ -629,8 +757,16 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       const lines = Math.trunc(tAccum / h)
       if (lines !== 0) {
         tAccum -= lines * h
-        const t = termRef.current
-        if (t) t.scrollLines(-lines)
+        if (tRoute === SCROLL_HISTORY) {
+          const t = termRef.current
+          if (t) t.scrollLines(-lines)
+        } else {
+          // Original touch position, not the finger's current cell: xterm
+          // reports the cell the user grabbed, and every line of the swipe
+          // rides the same application protocol handler exactly once.
+          // Finger down (lines > 0) reveals older content = wheel up (-1).
+          dispatchWheel(tStartX, tStartY, Math.abs(lines), lines > 0 ? -1 : 1)
+        }
       }
       tY = y; tX = x
       if (e.cancelable) e.preventDefault() // stop selection + PTY input on a scroll
@@ -657,7 +793,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     // link swap, preserving scrollback and never blanking the screen.
     return () => {
       if (fitRaf.current) { cancelAnimationFrame(fitRaf.current); fitRaf.current = 0 }
-      dataSub.dispose(); sizeSub.dispose(); scrollSub.dispose(); ro.disconnect()
+      dataSub.dispose(); binarySub.dispose(); sizeSub.dispose(); scrollSub.dispose(); ro.disconnect()
       try { writeSub.dispose(); lineSub.dispose(); resizeBarSub.dispose() } catch (e) {}
       host.removeEventListener('touchstart', onTouchStart)
       host.removeEventListener('touchmove', onTouchMove)
@@ -923,6 +1059,12 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const toggleAlt = () => { alt.current = !alt.current; setAltOn(alt.current); haptic(); termRef.current?.focus() }
 
   const dot = status === 'ready' ? T.ok : status === 'closed' ? T.bad : T.warn
+  // Say what the page buttons actually do in the current context.
+  const pageHint = (verb) => {
+    if (wheelRoute === SCROLL_APPLICATION) return `scroll the running app ${verb}`
+    if (wheelRoute === SCROLL_CURSOR_KEYS) return `send cursor-key ${verb} to the alternate-screen app`
+    return `scroll terminal history ${verb}`
+  }
 
   // accessory bar key spec (default row). Copy/Paste live at the end so they are
   // always reachable on touch (issue #3).
@@ -930,9 +1072,11 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     { l: 'Esc' }, { l: 'Tab' }, { l: 'ctrl', on: ctrlOn, fn: toggleCtrl }, { l: 'alt', on: altOn, fn: toggleAlt },
     { l: 'Up', g: '↑' }, { l: 'Down', g: '↓' }, { l: 'Left', g: '←' }, { l: 'Right', g: '→' },
     { l: '|' }, { l: '/' }, { l: '~' }, { l: '-' }, { l: 'Home', g: '⤒' }, { l: 'End', g: '⤓' }, { l: 'Del' },
-    // Scrollback page controls (scroll the xterm buffer, NOT PgUp/PgDn to the
-    // PTY): a touch-friendly way to move through history a page at a time.
-    { l: 'ScrollUp', g: '⇞', fn: () => scrollPage(-1) }, { l: 'ScrollDn', g: '⇟', fn: () => scrollPage(1) },
+    // Page controls are mode-aware: local history in an ordinary shell, wheel
+    // reports (or xterm's cursor-key fallback) when an app owns the alternate
+    // screen / mouse wheel. Never a blind PgUp/PgDn into the shell's input.
+    { l: 'ScrollUp', g: '⇞', fn: () => scrollPage(-1), title: pageHint('up'), label: pageHint('up') },
+    { l: 'ScrollDn', g: '⇟', fn: () => scrollPage(1), title: pageHint('down'), label: pageHint('down') },
     // No-reload recovery: repaint + reattach if the screen ever freezes after a
     // flaky reconnect, so the user never has to reload the page.
     { l: 'Redraw', g: '⟳', fn: redrawRecover },
@@ -980,10 +1124,6 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       })()}
       {/* terminal (position:relative anchors the scroll-to-bottom affordance) */}
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-        {/* Let the xterm viewport own vertical panning; our touch handler does the
-            actual scroll, this just stops the browser from rubber-banding the page
-            or zooming on a swipe over the terminal. */}
-        <style>{`[data-testid="term-host"] .xterm-viewport{touch-action:pan-y}`}</style>
         <div ref={hostRef} data-testid="term-host" style={{ position: 'absolute', inset: 0, padding: '8px 10px', touchAction: 'none' }} />
         {/* Custom scrollbar: a track + draggable thumb pinned to the right edge,
             ABOVE the xterm canvas (zIndex 4, under the modal-level toast/button).
@@ -1046,7 +1186,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         {ROW.map((k, i) => {
           const active = k.on
           return (
-            <button key={i} data-key={k.l} aria-label={k.l} aria-pressed={k.on === undefined ? undefined : !!k.on} onClick={k.fn || (() => sendKey(k.l))} style={{
+            <button key={i} data-key={k.l} aria-label={k.label || k.l} title={k.title} aria-pressed={k.on === undefined ? undefined : !!k.on} onClick={k.fn || (() => sendKey(k.l))} style={{
               flex: '0 0 auto', minWidth: narrow || isTouch ? 44 : 38, minHeight: narrow || isTouch ? 44 : 34, padding: '0 11px', fontFamily: font, fontSize: 13, borderRadius: 7,
               cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all .1s',
               border: `1px solid ${active ? accent : T.line}`, color: active ? T.onAccent : T.text,

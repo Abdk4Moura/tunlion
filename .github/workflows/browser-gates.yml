@@ -114,6 +114,14 @@ jobs:
       - name: pty-reattach
         run: node frontend/tests/pty-reattach.spec.cjs
 
+      # Touch scrolling is mode-aware: ordinary shells scroll local history,
+      # mouse-reporting TUIs (including partial ones still in the normal buffer)
+      # get xterm-encoded wheel reports at the touched cell, and the alternate
+      # screen without mouse reporting uses xterm's cursor-key fallback. Also
+      # gates taps/horizontal/multi-touch and the mobile IME path.
+      - name: webshell-scroll
+        run: node frontend/tests/webshell-scroll.spec.cjs
+
       # Screenshots are the evidence a browser actually rendered, rather than the
       # harness reporting on itself. Keep them when a gate fails.
       #
