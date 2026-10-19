@@ -33,6 +33,17 @@ code distinct from pass and fail, rather than print a result from a box that cou
 not have produced one. Stated in full, with the reference implementation, in the
 header of `cli/tests/lib/fixture.sh` (see "Preconditions and refusal").
 
+## Diagnostic expiry review (2026-10-19)
+
+- `cli/tests/mount-gates.sh` remains diagnostic: its measured result is 6
+  PASS / 2 FAIL because mount mutations return EIO. Issue #318 remains open;
+  owner `pi-director` and issue link are unchanged. The expiry is extended to
+  2026-11-18 as a review date, not a coverage claim.
+- `cli/tests/reach-until-direct-gates.sh` has behavioral assertions but is not
+  wired into CI. Issue #316 remains open; owner `claude-advisor` and issue link
+  are unchanged. The expiry is extended to 2026-11-18 as a review date, not a
+  coverage claim.
+
 ## Retired artifacts
 
 - `cli/tests/livelock-nat-gates.sh`: removed because the netns/coturn
