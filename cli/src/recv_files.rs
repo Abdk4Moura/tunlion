@@ -30,8 +30,8 @@ use std::sync::atomic::Ordering;
 // crate-root re-exports in `main.rs`) keep resolving to the ONE implementation
 // in the peer-loop crate.
 pub(crate) use filament_peerloop::recv::{
-    IncomingFile, PARTIAL_TTL_SECS, PartMeta, Partial, StdoutSink, WriteFailure, age_words,
-    discard_partial, expire_partials, full_hash, numbered_name, partials_json,
+    IncomingFile, PARTIAL_TTL_SECS, PartMeta, Partial, RecvReport, StdoutSink, WriteFailure,
+    age_words, discard_partial, expire_partials, full_hash, numbered_name, partials_json,
     resumable_partials, stdout_put, unique_path, verify_incoming,
 };
 // The confined `.part` open needs the beneath-root primitive the `mount-server`
@@ -222,6 +222,7 @@ pub(crate) async fn finalize_incoming(
     rename_to: Option<&str>,
     daemon: bool,
     from_name: &str,
+    report: &RecvReport,
 ) -> Result<bool> {
     // Sync then drop file handle before rename (file is closed for the rename on Linux).
     let f = inc.file.clone();
@@ -293,7 +294,7 @@ pub(crate) async fn finalize_incoming(
         .unwrap_or_default();
     note_stored(&inc.id, &stored_name);
     if !daemon && ok {
-        crate::recv_report::note_stored(&inc.name, recvd, inc.full.as_deref(), &stored_name);
+        report.note_stored(&inc.name, recvd, inc.full.as_deref(), &stored_name);
     }
     crate::transfer_history::append(&[crate::transfer_history::Record {
         time: crate::transfer_history::now_secs(),

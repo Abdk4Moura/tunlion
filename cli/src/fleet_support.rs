@@ -22,7 +22,7 @@ use crate::fleet;
 use crate::identity;
 use crate::load_owner_key;
 use crate::platform;
-use crate::recv_files::{IncomingFile, finalize_incoming};
+use crate::recv_files::{IncomingFile, RecvReport, finalize_incoming};
 use crate::session;
 use crate::settings;
 use crate::shell_policy_from_settings;
@@ -692,6 +692,7 @@ pub(crate) async fn sweep_completed_streams(
     output: &Option<String>,
     to_stdout: bool,
     daemon: bool,
+    report: &RecvReport,
     completed: &mut usize,
 ) -> Result<()> {
     let done_sids: Vec<(String, u32)> = by_sid
@@ -724,7 +725,7 @@ pub(crate) async fn sweep_completed_streams(
                     inc.name
                 ),
             ));
-            if finalize_incoming(inc, dir, rename_to.as_deref(), daemon, "").await? {
+            if finalize_incoming(inc, dir, rename_to.as_deref(), daemon, "", report).await? {
                 *completed += 1;
             }
         }

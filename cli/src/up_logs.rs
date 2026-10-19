@@ -579,6 +579,10 @@ pub(crate) async fn up_cmd(
     // (daemon.log, the journal, a gate's redirect) every line carries an ISO
     // timestamp: a log with no times cannot be read against anything else.
     ui::set_daemon_log(!std::io::IsTerminal::is_terminal(&std::io::stderr()));
+    // The daemon serves many senders and ends with none of them, so its
+    // report is never emitted; it still owns its own instance rather than
+    // sharing a process-global list with any embedded receive.
+    let report = crate::recv_report::RecvReport::new();
     let res = recv_cmd(
         server,
         None,
@@ -599,6 +603,7 @@ pub(crate) async fn up_cmd(
         transport_context,
         crate::host_impl::cli_log(),
         crate::host_impl::cli_host(),
+        &report,
     )
     .await;
     crate::file_io::remove_pidfile();

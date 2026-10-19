@@ -42,6 +42,7 @@
 //! evaluation/token work (`filament-cap`, imported as `cap`). Those are crate
 //! calls, not host ones.
 use crate::dlog;
+use crate::recv_report::{RecvReport, RefusalClass};
 use crate::signaling_health;
 #[cfg(l3)]
 use filament_overlay::Announce;
@@ -1000,6 +1001,7 @@ pub(crate) async fn recv_cmd(
     transport_context: filament_transport::TransportContext,
     log: Arc<dyn LogSink>,
     host: Arc<dyn HostServices>,
+    report: &RecvReport,
 ) -> Result<()> {
     use filament_peerloop::driver::{Cancellation, DriverOutcome, Engine};
     let stop = Cancellation::default();
@@ -1010,12 +1012,15 @@ pub(crate) async fn recv_cmd(
     // library driver starts; nothing is spawned as a child process.
     let server = server.to_string();
     let engine_log = log.clone();
+    // The invocation-owned report travels into the engine task by clone; its
+    // state is per invocation, never a process-global list.
+    let engine_report = RecvReport::clone(report);
     let engine = Engine::start(stop.clone(), move |stop, readiness| async move {
         let mut cleanup = RecvCleanup::default();
         recv_driver(
             &server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
             relay, remember, daemon, output, shell_policy, shell_user,
-            no_proxy_fallback, transport_context, engine_log, host, &stop,
+            no_proxy_fallback, transport_context, engine_log, host, engine_report, &stop,
             &readiness, &mut cleanup,
         ).await
     });
@@ -1070,6 +1075,7 @@ async fn recv_driver(
     transport_context: filament_transport::TransportContext,
     log: Arc<dyn LogSink>,
     host: Arc<dyn HostServices>,
+    report: RecvReport,
     stop: &filament_peerloop::driver::Cancellation,
     readiness: &filament_peerloop::driver::Readiness,
     cleanup: &mut RecvCleanup,
@@ -1077,7 +1083,7 @@ async fn recv_driver(
     let outcome = stop.run(recv_run(
         server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
         relay, remember, daemon, output, shell_policy, shell_user,
-        no_proxy_fallback, transport_context, log.clone(), host, stop, readiness,
+        no_proxy_fallback, transport_context, log.clone(), host, report, stop, readiness,
         cleanup,
     )).await;
     cleanup.finish(log.as_ref()).await;
@@ -1271,6 +1277,7 @@ async fn recv_run(
     // filesystem). The CLI hands it `CliHost`; a caller with no host hands it
     // `NoHost` and every read resolves to the inert default.
     host: Arc<dyn HostServices>,
+    report: RecvReport,
     stop: &filament_peerloop::driver::Cancellation,
     readiness: &filament_peerloop::driver::Readiness,
     cleanup: &mut RecvCleanup,
@@ -2378,10 +2385,10 @@ async fn recv_run(
             && st.pending.is_empty()
             && st.recv_pending_offers.is_empty()
         {
-            if let Some(since) = crate::recv_report::since_last_refusal() {
+            if let Some(since) = report.since_last_refusal() {
                 let sender_gone = conn.rejoin.waiting_rejoin.is_some() || conn.links.is_empty();
                 if sender_gone || since >= Duration::from_secs(3) {
-                    if let Some(e) = crate::recv_report::refused_outcome() {
+                    if let Some(e) = crate::recv_report::refused_outcome(&report) {
                         conn.present.clear_sticky();
                         let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
                         return Err(e);
@@ -3830,6 +3837,7 @@ async fn recv_run(
             &output,
             to_stdout,
             daemon,
+            &report,
             &mut st.completed,
         )
         .await?;
@@ -7346,12 +7354,13 @@ async fn recv_run(
                                 ),
                             ));
                             note_refusal(
+                                &report,
                                 daemon,
                                 &name,
                                 size,
                                 "sha256_mismatch",
                                 reason,
-                                crate::exit_codes::ExitKind::Denied,
+                                RefusalClass::Denied,
                             );
                             let r = t.send_control(&protocol::decline_msg(&id)).await;
                             peer_step(daemon, &pid, "digest refusal", r, log.as_ref())?;
@@ -7599,12 +7608,13 @@ async fn recv_run(
                             enqueue_if_requestable(&sender_name, "transfer");
                         }
                         note_refusal(
+                            &report,
                             daemon,
                             &name,
                             size,
                             "denied",
                             &format!("declined {name} from {sender_name} ({reason})"),
-                            crate::exit_codes::ExitKind::Denied,
+                            RefusalClass::Denied,
                         );
                         let r = t.send_control(&policy_decline_msg(&id, Some(reason.as_str()))).await;
                         peer_step(daemon, &pid, "decline", r, log.as_ref())?;
@@ -7653,14 +7663,16 @@ async fn recv_run(
                         ));
                         match xfer_deny_reason.as_deref() {
                             Some(reason) => note_refusal(
+                                &report,
                                 daemon,
                                 &name,
                                 size,
                                 "denied",
                                 &format!("declined {name} from {sender_name} ({reason})"),
-                                crate::exit_codes::ExitKind::Denied,
+                                RefusalClass::Denied,
                             ),
                             None => note_refusal(
+                                &report,
                                 daemon,
                                 &name,
                                 size,
@@ -7668,7 +7680,7 @@ async fn recv_run(
                                 &format!(
                                     "declined {name} from {sender_name}: no tty to ask on and no -y"
                                 ),
-                                crate::exit_codes::ExitKind::Usage,
+                                RefusalClass::Usage,
                             ),
                         }
                         let r = t
@@ -7805,7 +7817,7 @@ async fn recv_run(
                                 Tone::Err,
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
-                            note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
+                            note_refusal(&report, daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                             let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
                             peer_step(daemon, &pid, "refusal", r, log.as_ref())?;
                             continue;
@@ -7831,7 +7843,7 @@ async fn recv_run(
                                 Tone::Err,
                                 &format!("  refused {name} from {sender_name}: {msg}"),
                             ));
-                            note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
+                            note_refusal(&report, daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                             let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
                             peer_step(daemon, &pid, "refusal", r, log.as_ref())?;
                             continue;
@@ -7870,7 +7882,7 @@ async fn recv_run(
                                     Tone::Err,
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
-                                note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
+                                note_refusal(&report, daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                                 let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
                                 peer_step(daemon, &pid, "refusal", r, log.as_ref())?;
                                 continue;
@@ -7915,7 +7927,7 @@ async fn recv_run(
                                     Tone::Err,
                                     &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
-                                note_refusal(daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
+                                note_refusal(&report, daemon, &name, size, token, &msg, crate::recv_report::storage_kind(token));
                                 let r = t.send_control(&protocol::refuse_msg(&id, token, &msg)).await;
                                 peer_step(daemon, &pid, "refusal", r, log.as_ref())?;
                                 continue;
@@ -8054,7 +8066,7 @@ async fn recv_run(
                     })
                     .await;
                     if to_stdout {
-                        stdout_delivered(&inc, &conn, &pid, sid).await?;
+                        stdout_delivered(&inc, &conn, &pid, sid, &report).await?;
                         st.completed += 1;
                         continue;
                     }
@@ -8065,7 +8077,7 @@ async fn recv_run(
                     if let Some(wf) = failed {
                         st.verify_fails.remove(&id);
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref(), host.as_ref());
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, &report, log.as_ref(), host.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -8084,7 +8096,7 @@ async fn recv_run(
                                 let from =
                                     conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                                 let nm = inc.name.clone();
-                                if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from)
+                                if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from, &report)
                                     .await?
                                 {
                                     st.completed += 1;
@@ -8215,7 +8227,7 @@ async fn recv_run(
                             None
                         };
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await?
+                        if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from, &report).await?
                         {
                             st.completed += 1;
                         }
@@ -8234,7 +8246,7 @@ async fn recv_run(
                 };
                 if let Some(mut inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                     if to_stdout {
-                        stdout_delivered(&inc, &conn, &pid, ack_sid).await?;
+                        stdout_delivered(&inc, &conn, &pid, ack_sid, &report).await?;
                         st.completed += 1;
                         continue;
                     }
@@ -8245,7 +8257,7 @@ async fn recv_run(
                     if let Some(wf) = failed {
                         st.verify_fails.remove(&id);
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref(), host.as_ref());
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, &report, log.as_ref(), host.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -8264,7 +8276,7 @@ async fn recv_run(
                                 let from =
                                     conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                                 let nm = inc.name.clone();
-                                if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from)
+                                if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from, &report)
                                     .await?
                                 {
                                     st.completed += 1;
@@ -8382,7 +8394,7 @@ async fn recv_run(
                             None
                         };
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await?
+                        if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from, &report).await?
                         {
                             st.completed += 1;
                         }
@@ -8413,7 +8425,7 @@ async fn recv_run(
                     if let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         st.verify_fails.remove(&inc.id);
-                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, log.as_ref(), host.as_ref());
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from, daemon, &report, log.as_ref(), host.as_ref());
                         if let Some(t) = conn.transport_of(&pid) {
                             let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
                         }
@@ -8585,12 +8597,13 @@ async fn recv_run(
                         conn.present.clear_sticky();
                         let qname = safe_incoming_name(qv["name"].as_str().unwrap_or("file"));
                         note_refusal(
+                            &report,
                             daemon,
                             &qname,
                             qv["size"].as_u64().unwrap_or(0),
                             "declined",
                             &format!("declined {qname}"),
-                            crate::exit_codes::ExitKind::Denied,
+                            RefusalClass::Denied,
                         );
                         log.say(&log.paint(
                             Tone::Dim,
@@ -8793,6 +8806,7 @@ async fn recv_run(
                         &output,
                         to_stdout,
                         daemon,
+                        &report,
                         &mut st.completed,
                     )
                     .await?;
@@ -8827,6 +8841,7 @@ async fn recv_run(
                         &output,
                         to_stdout,
                         daemon,
+                        &report,
                         &mut st.completed,
                     )
                     .await?;
@@ -8994,7 +9009,7 @@ mod lifecycle_tests {
             false, None, Some("invalid".into()), false, None, false, None,
             ShellPolicy::Granted, None, false,
             filament_transport::TransportContext::default(),
-            Arc::new(NoLog), Arc::new(NoHost), stop, &readiness, cleanup,
+            Arc::new(NoLog), Arc::new(NoHost), RecvReport::new(), stop, &readiness, cleanup,
         ).await
     }
 
@@ -9206,7 +9221,13 @@ mod lifecycle_tests {
 /// delivery like a file's, and is acked the same way, so the sender can report
 /// it verified. Anything else ends the receive with the reason: the bytes are
 /// already out and stdout cannot be rewound to re-fetch them.
-async fn stdout_delivered(inc: &IncomingFile, conn: &Conn, pid: &str, sid: u32) -> Result<()> {
+async fn stdout_delivered(
+    inc: &IncomingFile,
+    conn: &Conn,
+    pid: &str,
+    sid: u32,
+    report: &RecvReport,
+) -> Result<()> {
     let Some(sink) = &inc.stdout else {
         return Ok(());
     };
@@ -9220,7 +9241,7 @@ async fn stdout_delivered(inc: &IncomingFile, conn: &Conn, pid: &str, sid: u32) 
         bail!("{}: {why}", inc.name);
     }
     inc.bar.done(written);
-    crate::recv_report::note_stored(&inc.name, written, inc.full.as_deref(), "-");
+    report.note_stored(&inc.name, written, inc.full.as_deref(), "-");
     if inc.full.is_some() {
         if let Some(t) = conn.transport_of(pid) {
             let _ = t.send_control(&protocol::delivery_ack_msg(&inc.id, sid)).await;
@@ -9417,6 +9438,7 @@ fn refuse_failed_write(
     wf: &crate::recv_files::WriteFailure,
     from: &str,
     daemon: bool,
+    report: &RecvReport,
     log: &dyn LogSink,
     host: &dyn HostServices,
 ) -> (String, &'static str, String) {
@@ -9429,7 +9451,7 @@ fn refuse_failed_write(
         Tone::Err,
         &format!("  refused {} from {from}: {msg}", inc.name),
     ));
-    note_refusal(daemon, &inc.name, inc.size, token, &msg, crate::recv_report::storage_kind(token));
+    note_refusal(report, daemon, &inc.name, inc.size, token, &msg, crate::recv_report::storage_kind(token));
     let id = inc.id.clone();
     let part = inc.part_path.clone();
     drop(inc);
@@ -9440,15 +9462,16 @@ fn refuse_failed_write(
 /// Record a refusal for a one-shot receive's outcome (`recv_report`). The
 /// daemon serves many senders and ends with none of them, so it keeps no list.
 fn note_refusal(
+    report: &RecvReport,
     daemon: bool,
     name: &str,
     size: u64,
     token: &str,
     msg: &str,
-    kind: crate::exit_codes::ExitKind,
+    class: RefusalClass,
 ) {
     if !daemon {
-        crate::recv_report::note_refused(name, size, token, msg, kind);
+        report.note_refused(name, size, token, msg, class);
     }
 }
 
