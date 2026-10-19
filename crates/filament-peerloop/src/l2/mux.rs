@@ -49,6 +49,11 @@ pub fn is_l2_sid(sid: u32) -> bool {
     sid & L2_SID_BASE != 0
 }
 
+/// The honest refusal sent for an inbound `l2-open` when this build has no
+/// inbound forward server compiled (`forward-server` off). It is a named
+/// protocol refusal, not a silent accept or a bare drop.
+pub const FORWARD_SERVER_UNAVAILABLE: &str = "forward server is not available in this build";
+
 /// Parse a stream id from an inbound control message's `sid` field, REFUSING a
 /// value that does not fit in u32 instead of silently truncating it. A bare
 /// `as_u64().unwrap_or(0) as u32` cast both defaults a MISSING sid to 0 and
@@ -683,7 +688,12 @@ impl Mux {
         trusted: bool,
         allow_nonloopback: bool,
     ) -> OpenVerdict {
+        // With `forward-server` off, the `l2-open` arm is compiled out and these
+        // two inputs are unused; keep the signature stable and silence the lint.
+        #[cfg(not(feature = "forward-server"))]
+        let _ = (trusted, allow_nonloopback);
         match v["type"].as_str() {
+            #[cfg(feature = "forward-server")]
             Some("l2-open") => {
                 // Reject a missing OR out-of-range sid (wire_sid never truncates)
                 // rather than defaulting/wrapping into a forged is_l2_sid value.
@@ -765,6 +775,19 @@ impl Mux {
                     rx,
                 }
             }
+            // Without `forward-server` there is no inbound dial implementation
+            // compiled, so an open is refused by name: never registered on the
+            // mux, never dialled. `l2-close` stays common because a node that
+            // serves no inbound opens still OPENS outbound ones, and the peer's
+            // answer to those must not be discarded.
+            #[cfg(not(feature = "forward-server"))]
+            Some("l2-open") => match wire_sid(v) {
+                Some(sid) if is_l2_sid(sid) => OpenVerdict::Deny {
+                    sid,
+                    err: FORWARD_SERVER_UNAVAILABLE,
+                },
+                _ => OpenVerdict::Ignore,
+            },
             Some("l2-close") => {
                 // wire_sid (not `as u32`): a wrapped/oversized close sid must not
                 // be truncated into a live sid and tear down the wrong stream.
@@ -794,7 +817,20 @@ impl Mux {
         rx: mpsc::Receiver<PipeItem>,
         idev: Option<[u8; 32]>,
     ) {
-        match self.host.connect_local_stream(host.as_str(), port).await {
+        // The dial itself is the host's: a peer asked for a local socket, and
+        // only the host may open one. With `forward-server` off, no dial
+        // implementation is compiled anywhere; the open is answered with an
+        // explicit named refusal instead of an ack, so the peer never hangs.
+        #[cfg(feature = "forward-server")]
+        let dialed = self.host.connect_local_stream(host.as_str(), port).await;
+        #[cfg(not(feature = "forward-server"))]
+        let dialed: std::io::Result<tokio::net::TcpStream> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            FORWARD_SERVER_UNAVAILABLE,
+        ));
+        #[cfg(not(feature = "forward-server"))]
+        let _ = (&host, &port);
+        match dialed {
             Ok(sock) => {
                 let _ = sock.set_nodelay(true);
                 // l2-open-ack is mandatory (design §3.4/O2): it tells the
