@@ -252,14 +252,21 @@ impl Report {
                 self.files.push(d);
             }
         } else {
-            let tail = match (reason, bytes) {
-                (Some(r), _) => format!(": {r}  {p}"),
-                (None, 0) => format!("  {p}"),
-                (None, b) => format!("  {p}  ({})", crate::human(b)),
-            };
-            ui::say(&format!("  {state}{tail}"));
+            ui::say(&format!("  {}", file_result_text(state, p, bytes, reason)));
         }
     }
+}
+
+/// Human-readable per-file result. Keep the receiver's refusal reason intact:
+/// security-policy refusals (such as Windows' temporary fail-closed path) must
+/// not collapse into a generic "transfer failed" line.
+fn file_result_text(state: &str, path: &str, bytes: u64, reason: Option<&str>) -> String {
+    let tail = match (reason, bytes) {
+        (Some(reason), _) => format!(": {reason}  {path}"),
+        (None, 0) => format!("  {path}"),
+        (None, n) => format!("  {path}  ({})", crate::human(n)),
+    };
+    format!("{state}{tail}")
 }
 
 /// Run the verb end to end and return the process exit code. Prints its own
@@ -606,6 +613,26 @@ pub(crate) async fn handle_sync_open(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_sync_refusal_is_operator_visible_without_genericizing_reason() {
+        let reason = "Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed";
+        assert_eq!(
+            file_result_text("failed", "docs/notes.txt", 123, Some(reason)),
+            "failed: Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed  docs/notes.txt",
+        );
+        let mut report = Report {
+            json: true,
+            json_lines: false,
+            tally: Tally::default(),
+            files: Vec::new(),
+            dest: None,
+            kept_on_peer: 0,
+        };
+        report.line("failed", "docs/notes.txt", 123, Some(reason));
+        assert_eq!(report.files[0]["reason"], reason);
+        assert_eq!(report.files[0]["state"], "failed");
+    }
 
     /// J4: two files gave `"moved":4,"sent":2,"total":4` and three gave
     /// `"moved":2,"sent":1,"same":2,"total":6`: bytes and file counts side by
