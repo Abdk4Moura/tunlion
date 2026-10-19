@@ -1608,6 +1608,153 @@ fn beneath_rename(
     std::fs::rename(from_parent.join(from_name), to_parent.join(to_name))
 }
 
+/// Atomically rename one path to another while keeping both parents beneath
+/// `root`. Unix performs the rename relative to stable parent directory
+/// handles. Windows currently fails closed because its path-based resolver
+/// cannot prove resistance to concurrent ancestor reparse-point replacement.
+/// Other non-Unix targets retain the canonical-parent fallback, which cannot
+/// resist concurrent parent replacement.
+#[cfg(unix)]
+pub fn safe_rename_beneath(
+    root: &std::path::Path,
+    from_rel: &std::path::Path,
+    to_rel: &std::path::Path,
+    _source_file: &std::fs::File,
+) -> std::io::Result<()> {
+    let (from_parent, from_name) = resolve_parent_beneath(root, from_rel)?;
+    let (to_parent, to_name) = resolve_parent_beneath(root, to_rel)?;
+    beneath_rename(&from_parent, &from_name, &to_parent, &to_name)
+}
+
+#[cfg(not(unix))]
+pub fn safe_rename_beneath(
+    root: &std::path::Path,
+    from_rel: &std::path::Path,
+    to_rel: &std::path::Path,
+    source_file: &std::fs::File,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = (root, from_rel, to_rel, source_file);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sync finalization is disabled on Windows until ancestor-safe handle-relative staging is available",
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        let (from_parent, from_name) = resolve_parent_beneath(root, from_rel)?;
+        let (to_parent, to_name) = resolve_parent_beneath(root, to_rel)?;
+        beneath_rename(&from_parent, &from_name, &to_parent, &to_name)
+    }
+}
+
+/// Remove a name beneath `root` without following its final component. Unix
+/// unlinks relative to a stable parent handle; non-Unix uses the same
+/// canonical-parent fallback as `safe_rename_beneath`.
+#[cfg(unix)]
+pub fn safe_unlink_beneath(root: &std::path::Path, rel: &std::path::Path) -> std::io::Result<()> {
+    let (parent, name) = resolve_parent_beneath(root, rel)?;
+    beneath_unlink(&parent, &name)
+}
+
+/// Remove the staging file represented by an already-open handle. Windows
+/// marks that exact handle for deletion. Unix resolves a stable beneath-root
+/// parent fd, compares the named entry to the open file with `fstatat` and
+/// `AT_SYMLINK_NOFOLLOW`, then unlinks relative to that fd. A non-matching
+/// entry (including a planted symlink) is left untouched. Unix has no portable
+/// unlink-by-file-handle primitive, so a same-name replacement in the narrow
+/// interval between identity check and `unlinkat` cannot be excluded against a
+/// concurrent local filesystem attacker.
+#[cfg(unix)]
+pub fn safe_unlink_staged_beneath(
+    root: &std::path::Path,
+    rel: &std::path::Path,
+    file: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let (parent, name) = resolve_parent_beneath(root, rel)?;
+    let opened = file.metadata()?;
+    let mut named: libc::stat = unsafe { std::mem::zeroed() };
+    let stat_result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut named,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if stat_result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if named.st_dev as u64 != opened.dev() || named.st_ino as u64 != opened.ino() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staging name no longer identifies this transfer's open file; refusing cleanup",
+        ));
+    }
+    beneath_unlink(&parent, &name)
+}
+
+#[cfg(windows)]
+pub fn safe_unlink_staged_beneath(
+    _root: &std::path::Path,
+    _rel: &std::path::Path,
+    file: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileDispositionInfo {
+        delete_file: u8,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information_class: i32,
+            information: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    let disposition = FileDispositionInfo { delete_file: 1 };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as *mut _,
+            4, // FileDispositionInfo
+            (&disposition as *const FileDispositionInfo).cast(),
+            std::mem::size_of::<FileDispositionInfo>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn safe_unlink_staged_beneath(
+    root: &std::path::Path,
+    rel: &std::path::Path,
+    _file: &std::fs::File,
+) -> std::io::Result<()> {
+    safe_unlink_beneath(root, rel)
+}
+
+#[cfg(not(unix))]
+pub fn safe_unlink_beneath(root: &std::path::Path, rel: &std::path::Path) -> std::io::Result<()> {
+    let (parent, name) = resolve_parent_beneath(root, rel)?;
+    beneath_unlink(&parent, &name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

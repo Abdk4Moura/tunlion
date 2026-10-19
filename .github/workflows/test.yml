@@ -214,7 +214,7 @@ jobs:
       - name: Test the transfer crate (Windows path bounds)
         shell: bash
         run: cargo test --release --manifest-path crates/filament-transfer/Cargo.toml
-      - name: Test sync admission (Windows directory-symlink escape)
+      - name: Test sync admission (Windows confinement and fail-closed receive)
         shell: bash
         run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'sync::tests::'
       - name: Show sccache stats

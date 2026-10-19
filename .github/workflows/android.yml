@@ -31,7 +31,7 @@ env:
 
 jobs:
   peerloop-mount-server-boundary:
-    name: peerloop mount-server feature boundary
+    name: peerloop sector feature boundaries
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -53,6 +53,21 @@ jobs:
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop --no-default-features
+      - name: Compile without forward-server (mesh + mount-server on)
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop \
+            --no-default-features --features mesh,mount-server
+      - name: Compile without mount-server (mesh + forward-server on)
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop \
+            --no-default-features --features mesh,forward-server
+      - name: Compile CLI without forward-server (mesh + mount-server on)
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-cli \
+            --no-default-features --features mesh,mount-server
       - name: Compile default compatibility profile
         run: cargo test --locked -p filament-peerloop
 

@@ -335,6 +335,7 @@ impl HostServices for CliHost {
             .await
             .map_err(|e| e.to_string())
     }
+    #[cfg(feature = "forward-server")]
     async fn connect_local_stream(
         &self,
         host: &str,
@@ -342,6 +343,8 @@ impl HostServices for CliHost {
     ) -> std::io::Result<tokio::net::TcpStream> {
         // The same dial the acceptor always ran. The loopback rule and the
         // per-device allowlist were applied by the caller before this point.
+        // Gated: a reduced build has no local-dial implementation, so the
+        // host trait's inert refusal applies instead.
         tokio::net::TcpStream::connect((host, port)).await
     }
     fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<LiveCut> {

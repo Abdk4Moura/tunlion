@@ -2,7 +2,7 @@
 //! transfer between paired devices. The sender walks the tree into a manifest
 //! (whole-file sha256 plus per-chunk sha256), the receiver answers with what it
 //! lacks, and only those chunks cross. Every landed file is verified by the same
-//! whole-file digest `send`/`receive` use (`recv_files::full_hash`) before it is
+//! whole-file digest `send`/`receive` use before it is
 //! renamed into place, and the receiver admits the stream through the same
 //! transfer gate a `file-offer` from a paired device passes (`CAP_TRANSFER`).
 //!
@@ -18,146 +18,17 @@ use crate::ui;
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use filament_peerloop::sync::{self, SyncAccepted, SyncAdmission};
-use serde::{Deserialize, Serialize};
+pub(crate) use filament_peerloop::sync::{
+    diff, hash_file, walk_manifest, Entry, Need, Plan, SYNC_CHUNK,
+};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Delta granularity. Wire frames are cut to the transport's payload underneath.
-pub(crate) const SYNC_CHUNK: u64 = 256 * 1024;
-const MAX_RECORD: usize = 64 << 20;
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub(crate) struct Entry {
-    pub p: String,
-    pub size: u64,
-    pub mtime: u64,
-    pub full: String,
-    pub chunks: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub(crate) struct Need {
-    pub p: String,
-    pub new: bool,
-    pub chunks: Vec<u32>,
-}
-
-#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
-pub(crate) struct Plan {
-    pub need: Vec<Need>,
-    pub same: Vec<String>,
-    pub extra: Vec<String>,
-}
-
-// Destination confinement and manifest-name bounds now live in
-// filament-transfer. Re-exported so the remaining receiver code and its tests
-// keep the old paths; the stateful protocol stays here. The open-time root
-// bound is called by `peerloop::sync`, which imports the same module directly.
-pub(crate) use filament_transfer::path_bounds::{
-    bound_parent, delete_within, manifest_paths_are_bounded, safe_relpath,
-};
-
-fn hex(d: &[u8]) -> String {
-    d.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Whole-file digest and per-chunk digests in one pass.
-pub(crate) fn hash_file(path: &Path) -> std::io::Result<(String, Vec<String>)> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
-    let mut whole = Sha256::new();
-    let mut chunks = Vec::new();
-    let mut buf = vec![0u8; SYNC_CHUNK as usize];
-    loop {
-        let mut n = 0;
-        while n < buf.len() {
-            let k = f.read(&mut buf[n..])?;
-            if k == 0 {
-                break;
-            }
-            n += k;
-        }
-        if n == 0 {
-            break;
-        }
-        whole.update(&buf[..n]);
-        chunks.push(hex(&Sha256::digest(&buf[..n])));
-        if n < buf.len() {
-            break;
-        }
-    }
-    Ok((hex(&whole.finalize()), chunks))
-}
-
-/// Walk `root` without following symlinks. Returns the manifest (sorted by path)
-/// and the entries skipped with a reason (symlinks, non-regular files).
-pub(crate) fn walk_manifest(root: &Path) -> Result<(Vec<Entry>, Vec<(String, String)>)> {
-    let mut out = Vec::new();
-    let mut skipped = Vec::new();
-    let mut stack = vec![PathBuf::new()];
-    while let Some(rel) = stack.pop() {
-        for e in std::fs::read_dir(root.join(&rel))? {
-            let e = e?;
-            let r = rel.join(e.file_name());
-            // `/`-separated on every platform: this string is the path the plan carries on the
-            // wire, and `sub\\small` is not the same key as `sub/small` to the peer looking it up.
-            let rs = r.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
-            let md = e.metadata()?; // does not follow symlinks
-            if md.file_type().is_symlink() {
-                skipped.push((rs, "symlink".into()));
-            } else if md.is_dir() {
-                stack.push(r);
-            } else if !md.is_file() {
-                skipped.push((rs, "not a regular file".into()));
-            } else if safe_relpath(&rs).is_none() || !crate::path_within(root, &root.join(&r)) {
-                skipped.push((rs, "path escapes the directory".into()));
-            } else {
-                let (full, chunks) = hash_file(&e.path())?;
-                let mtime = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                out.push(Entry { p: rs, size: md.len(), mtime, full, chunks });
-            }
-        }
-    }
-    out.sort_by(|a, b| a.p.cmp(&b.p));
-    skipped.sort();
-    Ok((out, skipped))
-}
-
-/// What `remote` lacks relative to `local`: per differing file the chunk indices
-/// whose digest differs or that the remote does not have; equal digests are
-/// `same`; remote files absent from `local` are `extra`.
-pub(crate) fn diff(local: &[Entry], remote: &[Entry]) -> Plan {
-    let have: BTreeMap<&str, &Entry> = remote.iter().map(|e| (e.p.as_str(), e)).collect();
-    let mut plan = Plan::default();
-    for l in local {
-        match have.get(l.p.as_str()) {
-            Some(r) if r.full == l.full && r.size == l.size => plan.same.push(l.p.clone()),
-            other => {
-                let rc: &[String] = other.map(|r| r.chunks.as_slice()).unwrap_or(&[]);
-                let chunks = (l.chunks.iter().enumerate())
-                    .filter(|(i, h)| rc.get(*i) != Some(h))
-                    .map(|(i, _)| i as u32)
-                    .collect();
-                plan.need.push(Need { p: l.p.clone(), new: other.is_none(), chunks });
-            }
-        }
-    }
-    let want: BTreeSet<&str> = local.iter().map(|e| e.p.as_str()).collect();
-    plan.extra = (remote.iter().filter(|e| !want.contains(e.p.as_str())))
-        .map(|e| e.p.clone())
-        .collect();
-    plan
-}
+const MAX_RECORD: usize = filament_peerloop::sync::MAX_SYNC_RECORD_BYTES;
 
 // ------------------------------------------------------------- records ------
 
@@ -381,14 +252,21 @@ impl Report {
                 self.files.push(d);
             }
         } else {
-            let tail = match (reason, bytes) {
-                (Some(r), _) => format!(": {r}  {p}"),
-                (None, 0) => format!("  {p}"),
-                (None, b) => format!("  {p}  ({})", crate::human(b)),
-            };
-            ui::say(&format!("  {state}{tail}"));
+            ui::say(&format!("  {}", file_result_text(state, p, bytes, reason)));
         }
     }
+}
+
+/// Human-readable per-file result. Keep the receiver's refusal reason intact:
+/// security-policy refusals (such as Windows' temporary fail-closed path) must
+/// not collapse into a generic "transfer failed" line.
+fn file_result_text(state: &str, path: &str, bytes: u64, reason: Option<&str>) -> String {
+    let tail = match (reason, bytes) {
+        (Some(reason), _) => format!(": {reason}  {path}"),
+        (None, 0) => format!("  {path}"),
+        (None, n) => format!("  {path}  ({})", crate::human(n)),
+    };
+    format!("{state}{tail}")
 }
 
 /// Run the verb end to end and return the process exit code. Prints its own
@@ -661,7 +539,8 @@ fn sync_destination(peer: &str, remote_dir: &str, dest: Option<&str>) -> String 
 /// The endpoint owns path bounds, the transfer gate, the shared-mux
 /// capacity/collision rule, registration and the ack. What stays here is the
 /// receive driver's policy: parking an unproven-identity deny for re-drive,
-/// raising the owner's consent request, and serving the stateful protocol.
+/// raising the owner's consent request, and returning the accepted serving
+/// task to the receive driver for lifecycle ownership.
 pub(crate) async fn handle_sync_open(
     conn: &mut Conn,
     pid: &str,
@@ -669,7 +548,7 @@ pub(crate) async fn handle_sync_open(
     muxes: &mut l2::MuxMap,
     drop_dir: &Path,
     parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
-) {
+) -> Option<(u32, sync::serving::SyncServeTask)> {
     match sync::admit_sync_open(conn, pid, v, muxes, drop_dir).await {
         SyncAdmission::Accepted(a) => {
             let SyncAccepted {
@@ -687,15 +566,17 @@ pub(crate) async fn handle_sync_open(
                 root.display(),
                 if dry_run { " (dry run)" } else { "" }
             ));
-            tokio::spawn(async move {
-                if let Err(e) = serve_sync(&t, &mux, sid, &root, delete, dry_run, rx).await {
-                    ui::say(&format!("sync: ended: {e}"));
-                    let _ = t
-                        .send_control(&json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }))
-                        .await;
-                }
-                mux.drop_stream(sid).await;
+            let task = sync::serving::spawn_sync_server(sync::serving::SyncServeConfig {
+                transport: t,
+                mux,
+                sid,
+                root,
+                delete,
+                dry_run,
+                stream: rx,
+                max_record_bytes: filament_peerloop::sync::MAX_SYNC_RECORD_BYTES,
             });
+            return Some((sid, task));
         }
         SyncAdmission::Denied(d) => {
             // Settle-then-evaluate, as exec does: a deny that rests on a
@@ -712,7 +593,7 @@ pub(crate) async fn handle_sync_open(
             )
             .await
             {
-                return;
+                return None;
             }
             let name = conn.link(pid).and_then(|l| l.verified_name.clone());
             crate::enqueue_if_requestable(name.as_deref().unwrap_or("<unverified>"), "transfer");
@@ -726,136 +607,32 @@ pub(crate) async fn handle_sync_open(
         }
         SyncAdmission::Ignored => {}
     }
-}
-
-async fn serve_sync(
-    t: &Arc<dyn Transport>,
-    mux: &l2::Mux,
-    sid: u32,
-    root: &Path,
-    delete: bool,
-    dry_run: bool,
-    mut pipe: mpsc::Receiver<Option<Bytes>>,
-) -> Result<()> {
-    let wait = Duration::from_secs(300);
-    let mut recs = Records::default();
-    let mut m = next_json(&mut pipe, None, mux, sid, &mut recs, wait).await?;
-    if m["type"].as_str() != Some("manifest") {
-        bail!("expected a manifest");
-    }
-    let files: Vec<Entry> = serde_json::from_value(m["files"].take())?;
-    if !manifest_paths_are_bounded(files.iter().map(|e| e.p.as_str())) {
-        bail!("manifest names an unsafe path");
-    }
-    let r = root.to_path_buf();
-    let (have, _) = if r.is_dir() {
-        tokio::task::spawn_blocking(move || walk_manifest(&r)).await??
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    let plan = diff(&files, &have);
-    send_json(t, sid, &serde_json::to_value(&plan)?).await?;
-    loop {
-        let m = next_json(&mut pipe, None, mux, sid, &mut recs, wait).await?;
-        match m["type"].as_str() {
-            Some("done") => return Ok(()),
-            Some("file") if !dry_run => {
-                let p = m["p"].as_str().unwrap_or("").to_string();
-                let res = receive_file(t, mux, sid, root, &m, &mut pipe, &mut recs).await;
-                let ack = match res {
-                    Ok(()) => json!({ "type": "file-ack", "p": p, "ok": true }),
-                    Err(e) => json!({ "type": "file-ack", "p": p, "ok": false, "err": e.to_string() }),
-                };
-                send_json(t, sid, &ack).await?;
-            }
-            Some("delete") if delete && !dry_run => {
-                let mut gone = Vec::new();
-                for p in m["paths"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
-                    let Some(rel) = safe_relpath(p) else { continue };
-                    if delete_within(root, &rel) {
-                        gone.push(p.to_string());
-                    }
-                }
-                send_json(t, sid, &json!({ "type": "deleted", "paths": gone })).await?;
-            }
-            other => bail!("unexpected sync record {other:?}"),
-        }
-    }
-}
-
-/// Land one file: copy the existing target (if any) to `.part`, write the
-/// chunks that arrive at their positions, truncate to size, verify the whole
-/// digest, rename into place. Any failure leaves the target untouched.
-async fn receive_file(
-    t: &Arc<dyn Transport>,
-    mux: &l2::Mux,
-    sid: u32,
-    root: &Path,
-    m: &Value,
-    pipe: &mut mpsc::Receiver<Option<Bytes>>,
-    recs: &mut Records,
-) -> Result<()> {
-    let _ = t;
-    let wait = Duration::from_secs(300);
-    let rel = safe_relpath(m["p"].as_str().unwrap_or("")).ok_or_else(|| anyhow::anyhow!("unsafe path"))?;
-    let size = m["size"].as_u64().unwrap_or(0);
-    let full = m["full"].as_str().unwrap_or("").to_string();
-    let target = root.join(&rel);
-    if !crate::path_within(root, &target) {
-        bail!("path escapes the remote dir");
-    }
-    // The check above is lexical; `bound_parent` is the canonical one that
-    // catches a symlinked directory already planted inside the root.
-    if let Some(parent) = target.parent() {
-        bound_parent(root, parent)?;
-    }
-    let part = target.with_file_name(format!(
-        "{}.part",
-        target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-    ));
-    if std::fs::symlink_metadata(&part).is_ok() {
-        std::fs::remove_file(&part)?;
-    }
-    match std::fs::symlink_metadata(&target) {
-        Ok(md) if md.is_file() => {
-            std::fs::copy(&target, &part)?;
-        }
-        Ok(_) => bail!("destination exists and is not a regular file"),
-        Err(_) => {}
-    }
-    let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&part)?;
-    loop {
-        let h = next_json(pipe, None, mux, sid, recs, wait).await?;
-        match h["type"].as_str() {
-            Some("file-end") => break,
-            Some("chunk") => {
-                let idx = h["idx"].as_u64().unwrap_or(u64::MAX);
-                let data = next_rec(pipe, None, mux, sid, recs, wait).await?;
-                let pos = idx.checked_mul(SYNC_CHUNK).filter(|p| *p < size.max(1)).ok_or_else(|| anyhow::anyhow!("chunk index out of range"))?;
-                if data.len() as u64 > SYNC_CHUNK || pos + data.len() as u64 > size {
-                    bail!("chunk overruns the file");
-                }
-                filament_transfer::pwrite_at(&f, &data, pos)?;
-            }
-            other => bail!("unexpected record inside a file: {other:?}"),
-        }
-    }
-    f.set_len(size)?;
-    f.sync_all()?;
-    drop(f);
-    let p2 = part.clone();
-    let got = tokio::task::spawn_blocking(move || crate::recv_files::full_hash(&p2)).await?;
-    if got.as_deref() != Some(full.as_str()) {
-        let _ = std::fs::remove_file(&part);
-        bail!("content hash mismatch after transfer");
-    }
-    std::fs::rename(&part, &target)?;
-    Ok(())
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_sync_refusal_is_operator_visible_without_genericizing_reason() {
+        let reason = "Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed";
+        assert_eq!(
+            file_result_text("failed", "docs/notes.txt", 123, Some(reason)),
+            "failed: Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed  docs/notes.txt",
+        );
+        let mut report = Report {
+            json: true,
+            json_lines: false,
+            tally: Tally::default(),
+            files: Vec::new(),
+            dest: None,
+            kept_on_peer: 0,
+        };
+        report.line("failed", "docs/notes.txt", 123, Some(reason));
+        assert_eq!(report.files[0]["reason"], reason);
+        assert_eq!(report.files[0]["state"], "failed");
+    }
 
     /// J4: two files gave `"moved":4,"sent":2,"total":4` and three gave
     /// `"moved":2,"sent":1,"same":2,"total":6`: bytes and file counts side by

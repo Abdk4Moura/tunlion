@@ -1224,7 +1224,161 @@ pub async fn http_get_json(context: &crate::TransportContext, url: &str) -> Resu
 
 // ---------------------------------------------------------------- signaling --
 
-pub async fn connect_signaling(context: &crate::TransportContext, server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
+/// The mapping from a raw signaling packet to the driver's `Ev`, factored out so
+/// the forwarder below is one function with no hidden state. `None` means "an
+/// event this client does not model": logged and dropped, exactly as before.
+fn map_incoming(msg: filament_signal::Incoming) -> Option<Ev> {
+    Some(match msg {
+        filament_signal::Incoming::Down { conn, reason } => Ev::SignalingDown(reason, conn),
+        filament_signal::Incoming::Event { name, data } => match name.as_str() {
+            "welcome" => Ev::Welcome(data),
+            "peer-joined" => Ev::PeerJoined(data),
+            "peer-left" => Ev::PeerLeft(data),
+            "signal" => Ev::Signal(data),
+            "pair-code" => Ev::PairCode(data),
+            "pair-ok" => Ev::PairOk(data),
+            "pair-matched" => Ev::PairMatched(data),
+            "pair-used" => Ev::PairUsed(data),
+            "pair-error" => Ev::PairError(data),
+            "known-peer" => Ev::KnownPeer(data),
+            "known-peer-left" => Ev::KnownPeerLeft(data),
+            "synced" => Ev::Synced(data),
+            other => {
+                crate::hooks::debug(&format!("  signaling: ignoring event '{other}'"));
+                return None;
+            }
+        },
+    })
+}
+
+/// The one task that turns a signaling connection's raw packets into `Ev`.
+///
+/// Owned by [`Signaling`]: it is the only writer of signaling-derived events for
+/// this connection, so stopping it is what makes "no event from a closed
+/// connection reaches the driver" a property rather than a hope. It checks
+/// `stop` BEFORE forwarding, so a packet already queued when the connection was
+/// torn down is dropped instead of delivered after shutdown.
+fn spawn_signal_forwarder(
+    mut raw_rx: mpsc::UnboundedReceiver<filament_signal::Incoming>,
+    tx: mpsc::UnboundedSender<Ev>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(msg) = raw_rx.recv().await {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let Some(ev) = map_incoming(msg) else { continue };
+            if tx.send(ev).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// How long [`Signaling::shutdown`] waits for the forwarder to exit before it
+/// aborts it. The forwarder never blocks on `tx.send` (the channel is unbounded)
+/// and its producer is closed by `Client::disconnect`, so this is a backstop,
+/// not the normal path.
+const SIGNAL_TASK_GRACE: Duration = Duration::from_secs(2);
+
+/// An owning handle for one signaling connection AND the forwarder task that
+/// feeds its events to the driver's `Ev` loop.
+///
+/// `Client` alone is not enough for an honest stop: `disconnect()` closes the
+/// socket and joins the socket reader, but the forwarder that maps raw packets
+/// to `Ev` is a SEPARATE task. Without owning it, a caller that stops signaling
+/// cannot prove that no further event (or a stale `Welcome`/`Signal` from the
+/// connection it is replacing) will arrive afterwards.
+///
+/// This handle ties the two together per connection:
+/// * each `connect` gets its own forwarder, so two sequential connections (a
+///   re-dial) are two independent task generations - stopping one never stops
+///   the other. [`Signaling::generation`] names the generation;
+/// * [`Signaling::shutdown`] cancels and AWAITS the forwarder, so after it
+///   returns no event from this connection can be emitted;
+/// * dropping the handle cancels the forwarder too, so a connection whose owner
+///   is gone stops emitting.
+///
+/// It `Deref`s to `Client`, so `emit`, `emit_with_ack` and `id` are unchanged for
+/// callers that only write.
+pub struct Signaling {
+    client: Client,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Serializes concurrent `shutdown` calls so a second caller waits for the
+    /// first to finish joining instead of returning while the task is still
+    /// alive.
+    shutdown_gate: Mutex<()>,
+    /// Cleared by [`Signaling::into_client`]: the compatibility path hands the
+    /// forwarder to the caller's ownership and must keep it running detached
+    /// across this handle's drop.
+    owns_task: std::sync::atomic::AtomicBool,
+}
+
+impl Signaling {
+    /// The connection generation: the same id its `SignalingDown` carries, and a
+    /// different value for every `connect`. A driver that keys links by this can
+    /// drop late events from a superseded connection.
+    pub fn generation(&self) -> u64 {
+        self.client.id()
+    }
+
+    /// The bare client, for callers that must pass the `Client` on. Writing can
+    /// go through `Deref` instead.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Stop the connection for good: suppress the forwarder, close and join the
+    /// socket, then join the forwarder. Idempotent and safe to call
+    /// concurrently. After this returns, no event from this connection can be
+    /// emitted.
+    pub async fn shutdown(&self) {
+        let _gate = self.shutdown_gate.lock().await;
+        // Cancel before closing, so a packet that is already queued is dropped
+        // instead of racing the socket teardown.
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.client.disconnect().await;
+        let task = self.task.lock().unwrap().take();
+        if let Some(mut task) = task {
+            if tokio::time::timeout(SIGNAL_TASK_GRACE, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    /// Hand back the bare `Client` and leave the forwarder running detached,
+    /// exactly as it ran before this handle existed. The compatibility adapter.
+    pub fn into_client(self) -> Client {
+        self.owns_task.store(false, std::sync::atomic::Ordering::Release);
+        self.client.clone()
+    }
+}
+
+impl std::ops::Deref for Signaling {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
+impl Drop for Signaling {
+    fn drop(&mut self) {
+        if !self.owns_task.load(std::sync::atomic::Ordering::Acquire) {
+            return; // detached by `into_client`
+        }
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(task) = self.task.lock().unwrap().take() {
+            task.abort();
+        }
+    }
+}
+
+/// Connect signaling and return the OWNING handle: the client plus the task that
+/// forwards its events, which [`Signaling::shutdown`] cancels and awaits.
+pub async fn connect_signaling_owned(context: &crate::TransportContext, server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Signaling> {
     // Warm the OS resolver cache before rust_socketio resolves the host itself.
     // rust_socketio's builder takes only a URL string (no DNS-override or custom
     // client hook), so we cannot steer its connect at a cached IP the way the
@@ -1243,42 +1397,35 @@ pub async fn connect_signaling(context: &crate::TransportContext, server: &str, 
     // ignoring the client argument entirely. Naming the mapping here makes the
     // set of events the client understands readable in one place, and an event
     // the server adds later shows up in the debug line rather than vanishing.
-    let sio = filament_signal::connect(server, {
-        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = raw_rx.recv().await {
-                let ev = match msg {
-                    filament_signal::Incoming::Down { conn, reason } => Ev::SignalingDown(reason, conn),
-                    filament_signal::Incoming::Event { name, data } => match name.as_str() {
-                        "welcome" => Ev::Welcome(data),
-                        "peer-joined" => Ev::PeerJoined(data),
-                        "peer-left" => Ev::PeerLeft(data),
-                        "signal" => Ev::Signal(data),
-                        "pair-code" => Ev::PairCode(data),
-                        "pair-ok" => Ev::PairOk(data),
-                        "pair-matched" => Ev::PairMatched(data),
-                        "pair-used" => Ev::PairUsed(data),
-                        "pair-error" => Ev::PairError(data),
-                        "known-peer" => Ev::KnownPeer(data),
-                        "known-peer-left" => Ev::KnownPeerLeft(data),
-                        "synced" => Ev::Synced(data),
-                        other => {
-                            crate::hooks::debug(&format!("  signaling: ignoring event '{other}'"));
-                            continue;
-                        }
-                    },
-                };
-                if tx.send(ev).is_err() {
-                    break;
-                }
-            }
-        });
-        raw_tx
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (raw_tx, raw_rx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
+    let forwarder = spawn_signal_forwarder(raw_rx, tx, stop.clone());
+    let sio = match filament_signal::connect(server, raw_tx).await {
+        Ok(sio) => sio,
+        Err(e) => {
+            // Startup failure: no connection exists, so cancel the forwarder
+            // rather than leave a task that will never see a packet.
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            forwarder.abort();
+            let _ = forwarder.await;
+            return Err(e).with_context(|| format!("signaling connect to {server}"));
+        }
+    };
+    Ok(Signaling {
+        client: sio,
+        stop,
+        task: std::sync::Mutex::new(Some(forwarder)),
+        shutdown_gate: Mutex::new(()),
+        owns_task: std::sync::atomic::AtomicBool::new(true),
     })
-    .await
-    .with_context(|| format!("signaling connect to {server}"))?;
-    Ok(sio)
+}
+
+/// Compatibility adapter: connect signaling and return the bare `Client`, with
+/// the event forwarder left running detached (the pre-existing behaviour). New
+/// and library callers should prefer [`connect_signaling_owned`] so shutdown can
+/// cancel and await the forwarder (see [`Signaling`]).
+pub async fn connect_signaling(context: &crate::TransportContext, server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
+    Ok(connect_signaling_owned(context, server, tx).await?.into_client())
 }
 
 /// P2 (GAP-2): re-dial signaling for a long-lived acceptor whose socket died.
@@ -1289,6 +1436,13 @@ pub async fn connect_signaling(context: &crate::TransportContext, server: &str, 
 /// caller owns the backoff (so it can also keep ticking the rest of the loop).
 pub async fn reconnect_signaling(context: &crate::TransportContext, server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
     connect_signaling(context, server, tx).await
+}
+
+/// Owned re-dial: the same connect as [`connect_signaling_owned`], named so a
+/// driver holding a [`Signaling`] can swap generations without detaching the
+/// forwarder.
+pub async fn reconnect_signaling_owned(context: &crate::TransportContext, server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Signaling> {
+    connect_signaling_owned(context, server, tx).await
 }
 
 /// Silence-watchdog heartbeat: an ACK'd `sync` round-trip that proves the
@@ -2370,6 +2524,198 @@ mod tests {
                 "round {round}: the buffered frame must still be delivered, after ChannelReady"
             );
         }
+    }
+
+    // -------------------------------------------------- signaling ownership --
+
+    /// Build a `Signaling` around a loopback client and a forwarder fed by a
+    /// channel the test controls, so its ownership semantics can be exercised
+    /// without a signaling server. The far socket keeps emits from failing.
+    async fn owned_test_signaling() -> (
+        Signaling,
+        mpsc::UnboundedSender<filament_signal::Incoming>,
+        mpsc::UnboundedReceiver<Ev>,
+        tokio::net::TcpStream,
+    ) {
+        let (sio, far) = filament_signal::Client::loopback().await.unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
+        let (tx, rx) = mpsc::unbounded_channel::<Ev>();
+        let forwarder = spawn_signal_forwarder(raw_rx, tx, stop.clone());
+        let sig = Signaling {
+            client: sio,
+            stop,
+            task: std::sync::Mutex::new(Some(forwarder)),
+            shutdown_gate: Mutex::new(()),
+            owns_task: std::sync::atomic::AtomicBool::new(true),
+        };
+        (sig, raw_tx, rx, far)
+    }
+
+    /// The forwarder maps every modeled packet and drops unmodeled ones, and a
+    /// `Down` still carries the connection id it belongs to.
+    #[tokio::test]
+    async fn signal_forwarder_maps_modeled_events_and_drops_unknown_ones() {
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = spawn_signal_forwarder(raw_rx, tx, stop.clone());
+
+        raw_tx
+            .send(filament_signal::Incoming::Event {
+                name: "welcome".into(),
+                data: json!({ "sid": "s" }),
+            })
+            .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a modeled event must be forwarded")
+            .expect("channel open");
+        assert!(matches!(ev, Ev::Welcome(_)), "welcome must map to Ev::Welcome");
+
+        // An event a newer server added must be dropped, not surfaced. A
+        // following `Down` is the marker that the unknown packet was passed
+        // over rather than merely slow.
+        raw_tx
+            .send(filament_signal::Incoming::Event {
+                name: "added-by-a-newer-server".into(),
+                data: json!({}),
+            })
+            .unwrap();
+        raw_tx
+            .send(filament_signal::Incoming::Down { conn: 7, reason: "test".into() })
+            .unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("Down must be forwarded")
+            .expect("channel open");
+        assert!(
+            matches!(next, Ev::SignalingDown(ref r, 7) if r == "test"),
+            "an unmodeled event must be dropped, not surfaced"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        drop(raw_tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("forwarder must exit")
+            .unwrap();
+    }
+
+    /// A stop set before the packet is read suppresses it: the forwarder checks
+    /// the flag BEFORE forwarding, so a packet already queued when the
+    /// connection was torn down is never delivered.
+    #[tokio::test]
+    async fn signal_forwarder_drops_a_queued_packet_once_stopped() {
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let task = spawn_signal_forwarder(raw_rx, tx, stop);
+        raw_tx
+            .send(filament_signal::Incoming::Event { name: "signal".into(), data: json!({}) })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("forwarder must exit")
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "a stopped forwarder must not emit the queued packet"
+        );
+    }
+
+    /// `shutdown` joins the forwarder; after it returns nothing more is emitted,
+    /// and repeated or concurrent shutdowns are safe.
+    #[tokio::test]
+    async fn signaling_shutdown_joins_the_forwarder_and_is_idempotent() {
+        let (sig, raw_tx, mut rx, _far) = owned_test_signaling().await;
+        raw_tx
+            .send(filament_signal::Incoming::Event { name: "welcome".into(), data: json!({}) })
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("welcome before shutdown")
+            .expect("channel open");
+        assert!(matches!(first, Ev::Welcome(_)));
+
+        tokio::time::timeout(Duration::from_secs(5), sig.shutdown())
+            .await
+            .expect("shutdown must complete");
+
+        // The forwarder is joined and the producer is stopped, so a packet sent
+        // now cannot be delivered.
+        let _ = raw_tx.send(filament_signal::Incoming::Event {
+            name: "signal".into(),
+            data: json!({}),
+        });
+        assert!(rx.try_recv().is_err(), "no event may be emitted after shutdown");
+
+        // Idempotent, and safe from two callers at once.
+        tokio::time::timeout(Duration::from_secs(5), sig.shutdown())
+            .await
+            .expect("repeat shutdown must complete");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(sig.shutdown(), sig.shutdown());
+        })
+        .await
+        .expect("concurrent shutdown must complete");
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Each connection is its own generation: the id is stable on the handle and
+    /// differs between two connects, so a re-dial never looks like the
+    /// connection it replaced.
+    #[tokio::test]
+    async fn signaling_generation_is_the_connection_id() {
+        let (a, _raw_a, _rx_a, _far_a) = owned_test_signaling().await;
+        let (b, _raw_b, _rx_b, _far_b) = owned_test_signaling().await;
+        assert_eq!(a.generation(), a.client().id());
+        assert_ne!(a.generation(), b.generation(), "two connects are two generations");
+    }
+
+    /// The compatibility path hands back the bare client and leaves the forwarder
+    /// running: events keep flowing exactly as before this handle existed.
+    #[tokio::test]
+    async fn into_client_keeps_the_forwarder_running() {
+        let (sig, raw_tx, mut rx, _far) = owned_test_signaling().await;
+        let client = sig.into_client();
+        let _ = client.id();
+        raw_tx
+            .send(filament_signal::Incoming::Event { name: "synced".into(), data: json!({}) })
+            .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a detached forwarder keeps forwarding")
+            .expect("channel open");
+        assert!(matches!(ev, Ev::Synced(_)));
+    }
+
+    /// A failed connect cancels and joins the forwarder instead of leaving a task
+    /// behind: the startup-failure half of the ownership contract.
+    #[tokio::test]
+    async fn connect_signaling_owned_cleans_up_on_startup_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Accept, then drop at once: the websocket handshake can never
+            // complete.
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let result = tokio::time::timeout(
+            Duration::from_secs(25),
+            connect_signaling_owned(
+                &crate::TransportContext::default(),
+                &format!("http://{addr}"),
+                tx,
+            ),
+        )
+        .await
+        .expect("connect must not hang on a server that closes");
+        assert!(result.is_err(), "connect to a closed server must fail");
+        assert!(rx.try_recv().is_err(), "a failed connect must emit nothing");
+        server.await.unwrap();
     }
 
     /// A link closed while opening announces nothing, but its reader still runs

@@ -8,6 +8,16 @@ the GitHub release notes.
 
 ### Breaking
 
+- **Windows sync file receiving is temporarily disabled.** A received file is
+  drained and negatively acknowledged without creating a `.part` file or
+  changing the target. The sender reports the per-file failure, including in
+  `sync --json`/`--json-lines`, as: `Windows sync receive disabled: race-safe
+  parent-relative rename unavailable; no target or .part file was changed`.
+  This affects the Windows device acting as sync receiver (including desktop
+  Windows); Unix receive behavior is unchanged. Sync deletion and dry-run
+  behavior are not disabled. Windows sync file delivery is not feature-complete
+  until race-safe handle-relative staging is implemented.
+
 - `filament-transport` removes the process-global correctness hooks
   `hooks::set_settings_get_str`, `hooks::set_raw_membership` and
   `hooks::set_config_path` together with their getters. Pass an explicit
