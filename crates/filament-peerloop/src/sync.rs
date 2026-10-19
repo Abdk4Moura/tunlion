@@ -620,6 +620,27 @@ pub mod serving {
         max_record_bytes: usize,
         commit_state: &Arc<std::sync::Mutex<bool>>,
     ) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let _ = (record, commit_state);
+            discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+            bail!("sync file receive is disabled on Windows until ancestor-safe handle-relative staging is available");
+        }
+        #[cfg(not(windows))]
+        {
+            receive_file_confined(cfg, record, recs, cancel, max_record_bytes, commit_state).await
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn receive_file_confined(
+        cfg: &mut SyncServeConfig,
+        record: &Value,
+        recs: &mut Records,
+        cancel: &mut watch::Receiver<bool>,
+        max_record_bytes: usize,
+        commit_state: &Arc<std::sync::Mutex<bool>>,
+    ) -> Result<()> {
         let rel = safe_relpath(record["p"].as_str().unwrap_or("")).ok_or_else(|| anyhow::anyhow!("unsafe path"))?;
         let size = record["size"].as_u64().unwrap_or(0);
         let full = record["full"].as_str().unwrap_or("").to_string();
@@ -743,6 +764,7 @@ pub mod serving {
         }
     }
 
+    #[cfg(not(windows))]
     fn safe_create_part(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
         #[cfg(unix)]
         {
@@ -756,30 +778,11 @@ pub mod serving {
         }
         #[cfg(not(unix))]
         {
-            // CREATE_NEW is atomic on Windows: a pre-existing file, symlink,
-            // or reparse point cannot be followed or replaced.
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt;
-                const DELETE: u32 = 0x0001_0000;
-                const GENERIC_READ: u32 = 0x8000_0000;
-                const GENERIC_WRITE: u32 = 0x4000_0000;
-                const FILE_SHARE_ALL: u32 = 0x0001 | 0x0002 | 0x0004;
-                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-                std::fs::OpenOptions::new()
-                    .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
-                    .share_mode(FILE_SHARE_ALL)
-                    .create_new(true)
-                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                    .open(root.join(rel))
-            }
-            #[cfg(not(windows))]
-            {
-                std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(root.join(rel))
-            }
+            std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(root.join(rel))
         }
     }
 
+    #[cfg(not(windows))]
     fn safe_open_existing_file(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
         #[cfg(unix)]
         {
@@ -788,31 +791,7 @@ pub mod serving {
         #[cfg(not(unix))]
         {
             let path = root.join(rel);
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt;
-                use std::os::windows::fs::MetadataExt;
-                // OPEN_REPARSE_POINT opens the link itself instead of following
-                // it. Inspect the handle metadata, not a prior path lookup.
-                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                    .open(path)?;
-                let metadata = file.metadata()?;
-                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "destination is a reparse point",
-                    ));
-                }
-                Ok(file)
-            }
-            #[cfg(not(windows))]
-            {
-                std::fs::File::open(path)
-            }
+            std::fs::File::open(path)
         }
     }
 
@@ -1009,6 +988,33 @@ pub mod serving {
             assert_eq!(replies[1]["err"], "content hash mismatch after transfer");
             assert_eq!(mux.live_streams().await, 0);
             assert!(transport.controls.lock().unwrap().is_empty());
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_receive_fails_closed_without_touching_target_or_staging() {
+            let root = TempRoot::new();
+            std::fs::write(root.0.join("file.txt"), b"original").unwrap();
+            let bytes = b"must not be written";
+            let digest = sha2::Sha256::digest(bytes).iter()
+                .map(|b| format!("{b:02x}")).collect::<String>();
+            let mut wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[]}), &mut wire);
+            record(&json!({"type":"file", "p":"file.txt", "size":bytes.len(), "full":digest}), &mut wire);
+            record(&json!({"type":"chunk", "idx":0}), &mut wire);
+            record_bytes(bytes, &mut wire);
+            record(&json!({"type":"file-end"}), &mut wire);
+            record(&json!({"type":"done"}), &mut wire);
+
+            let (task, mux, transport) = setup(&root.0, wire).await;
+            assert!(task.join().await.unwrap().is_ok());
+            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), b"original");
+            assert!(!root.0.join("file.txt.part").exists());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["type"], "file-ack");
+            assert_eq!(replies[1]["ok"], false);
+            assert!(replies[1]["err"].as_str().unwrap().contains("disabled on Windows"));
+            assert_eq!(mux.live_streams().await, 0);
         }
 
         #[cfg(unix)]
