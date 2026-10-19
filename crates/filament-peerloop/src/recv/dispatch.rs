@@ -317,10 +317,10 @@ pub fn deny_is_proof_attributable(reason: &str) -> bool {
 /// remains. Returns true when the caller must return immediately, having
 /// either parked or sent the fast deny itself.
 pub async fn park_on_deny(
-    known_device: &dyn Fn(&[u8; 32]) -> bool,
-    revoked: &dyn Fn(&[u8; 32]) -> bool,
-    delegated_expired: &dyn Fn(&[u8; 32]) -> bool,
-    denied: &dyn Fn(&str, &str) -> bool,
+    known_device: &(dyn Fn(&[u8; 32]) -> bool + Send + Sync),
+    revoked: &(dyn Fn(&[u8; 32]) -> bool + Send + Sync),
+    delegated_expired: &(dyn Fn(&[u8; 32]) -> bool + Send + Sync),
+    denied: &(dyn Fn(&str, &str) -> bool + Send + Sync),
     settle_ms: u64,
     parked: &mut Vec<ParkedOpen>,
     conn: &Conn,

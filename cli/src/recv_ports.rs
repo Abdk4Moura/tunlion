@@ -166,10 +166,10 @@ impl RecvIdentity for CliRecv {
     fn owner_pub_for_resources(&self) -> Option<[u8; 32]> {
         crate::owner_pub_for_resources()
     }
-    fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<Value> {
+    fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<refusal::Reinvite> {
         crate::identity_state::reinvite_for(device_pub)
     }
-    fn enroll_channel(&self, public_key: &[u8]) -> String {
+    fn enroll_channel(&self, public_key: &[u8; 32]) -> String {
         crate::ephemeral::enroll_channel(public_key)
     }
     fn is_armed(&self) -> bool {
@@ -809,7 +809,12 @@ impl RecvDaemon for CliRecv {
             .await
     }
     async fn list_warm(&mut self, req: Req, conn_for_list: &Conn) {
-        filament_peerloop::daemon_ctl::handle_list_warm(conn_for_list, req).await
+        #[cfg(unix)]
+        filament_peerloop::daemon_ctl::handle_list_warm(conn_for_list, req).await;
+        #[cfg(not(unix))]
+        {
+            let _ = (conn_for_list, req);
+        }
     }
     async fn mount(&mut self, req: Req, server: &str, relay: bool) {
         #[cfg(unix)]
@@ -912,7 +917,7 @@ impl RecvDaemon for CliRecv {
     fn key_listed(&self, device_pub: &[u8; 32]) -> bool {
         crate::revocation_live::key_listed(device_pub)
     }
-    fn enroll_channel(&self, public_key: &[u8]) -> String {
+    fn enroll_channel(&self, public_key: &[u8; 32]) -> String {
         crate::ephemeral::enroll_channel(public_key)
     }
     fn is_armed(&self) -> bool {

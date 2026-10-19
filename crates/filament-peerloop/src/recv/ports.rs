@@ -108,8 +108,8 @@ pub trait RecvIdentity: Send + Sync {
             .unwrap_or(false)
     }
     fn owner_pub_for_resources(&self) -> Option<[u8; 32]>;
-    fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<Value>;
-    fn enroll_channel(&self, public_key: &[u8]) -> String;
+    fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<crate::refusal::Reinvite>;
+    fn enroll_channel(&self, public_key: &[u8; 32]) -> String;
     fn is_armed(&self) -> bool;
     fn verify_and_store_roster(
         &self,
@@ -341,7 +341,7 @@ pub trait RecvDaemon: Send + Sync {
     fn revocation_snapshot(&self) -> Option<HashSet<String>>;
     fn prune_to_store(&self, held: &mut Vec<(String, String)>) -> HashSet<String>;
     fn key_listed(&self, device_pub: &[u8; 32]) -> bool;
-    fn enroll_channel(&self, public_key: &[u8]) -> String;
+    fn enroll_channel(&self, public_key: &[u8; 32]) -> String;
     fn is_armed(&self) -> bool;
     fn verify_and_store_roster(
         &self,
