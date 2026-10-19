@@ -691,16 +691,16 @@ pub mod serving {
         }
         file.set_len(size)?;
         file.sync_all()?;
-        #[cfg(test)]
-        if let Some((entered, release)) = &cfg.finalization_gate {
-            entered.notify_one();
-            release.notified().await;
-        }
         let got = tokio::task::spawn_blocking(move || {
             let digest = hash_open_file(&mut file);
             (file, digest)
         }).await?;
         let (file, digest) = got;
+        #[cfg(test)]
+        if let Some((entered, release)) = &cfg.finalization_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         if *cancel.borrow() {
             crate::mount_proto::safe_unlink_staged_beneath(&cfg.root, &part_rel, &file)?;
             drop(file);
