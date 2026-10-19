@@ -1530,10 +1530,12 @@ mod route_reconcile_tests {
 
     #[test]
     fn failed_exit_teardown_reconciles_changed_desired_plan_before_stabilizing() {
+        use std::cell::RefCell;
+
         let plan_a = vec![vec!["exit-plan-A".to_string()]];
         let plan_b = vec![vec!["exit-plan-B".to_string()]];
         let mut state = Some(ExitRouteState::Active(plan_a.clone()));
-        let mut os_plan = Some(plan_a.clone());
+        let os_plan = RefCell::new(Some(plan_a.clone()));
         let mut teardown_calls = 0;
 
         let result = reconcile_exit_route_state(
@@ -1546,7 +1548,7 @@ mod route_reconcile_tests {
             |_| panic!("B must not install while A may still be active"),
         );
         assert!(result.is_err());
-        assert_eq!(os_plan, Some(plan_a.clone()));
+        assert_eq!(*os_plan.borrow(), Some(plan_a.clone()));
         assert_eq!(state, Some(ExitRouteState::PendingTeardown(plan_a)));
 
         let result = reconcile_exit_route_state(
@@ -1554,16 +1556,20 @@ mod route_reconcile_tests {
             Some(plan_b.clone()),
             || {
                 teardown_calls += 1;
-                os_plan = None;
+                *os_plan.borrow_mut() = None;
                 Ok(())
             },
             |plan| {
-                os_plan = Some(plan.clone());
+                *os_plan.borrow_mut() = Some(plan.clone());
                 Ok(())
             },
         );
         assert_eq!(result, Ok(ExitRouteChange::Installed));
-        assert_eq!(os_plan, Some(plan_b.clone()), "stale A is removed before B is installed");
+        assert_eq!(
+            *os_plan.borrow(),
+            Some(plan_b.clone()),
+            "stale A is removed before B is installed"
+        );
         assert_eq!(state, Some(ExitRouteState::Active(plan_b.clone())));
 
         let result = reconcile_exit_route_state(
