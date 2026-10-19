@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 
 pub struct CliRecv {
     pub log: Arc<dyn LogSink>,
-    pub pty_sessions: l2::PtySessions,
+    pub pty_sessions: std::sync::Arc<l2::PtySessions>,
     pub warm_ptys: crate::WarmPtys,
     pub liveness: crate::LivenessProbes,
     #[cfg(unix)]
@@ -809,7 +809,7 @@ impl RecvDaemon for CliRecv {
             .await
     }
     async fn list_warm(&mut self, req: Req, conn_for_list: &Conn) {
-        crate::daemon_ctl::handle_list_warm(conn_for_list, req).await
+        filament_peerloop::daemon_ctl::handle_list_warm(conn_for_list, req).await
     }
     async fn mount(&mut self, req: Req, server: &str, relay: bool) {
         #[cfg(unix)]
@@ -824,26 +824,34 @@ impl RecvDaemon for CliRecv {
         #[cfg(not(unix))]
         {
             let _ = (server, relay);
-            req.reject("mount is not available on this platform").await;
+            {
+                let _ = req;
+            }
         }
     }
     async fn unmount(&mut self, req: Req) {
         #[cfg(unix)]
         crate::daemon_ctl::handle_unmount(req, &mut self.daemon_mounts).await;
         #[cfg(not(unix))]
-        req.reject("mount is not available on this platform").await;
+        {
+            let _ = req;
+        }
     }
     async fn list_mounts(&mut self, req: Req) {
         #[cfg(unix)]
         crate::daemon_ctl::handle_list_mounts(req, &self.daemon_mounts).await;
         #[cfg(not(unix))]
-        req.reject("mount is not available on this platform").await;
+        {
+            let _ = req;
+        }
     }
     async fn mount_health(&mut self, req: Req) {
         #[cfg(unix)]
         crate::daemon_ctl::handle_mount_health(req, &self.daemon_mounts).await;
         #[cfg(not(unix))]
-        req.reject("mount is not available on this platform").await;
+        {
+            let _ = req;
+        }
     }
     async fn mount_health_tick(&mut self, host: &dyn HostServices) {
         let dead_locals: Vec<String> = self

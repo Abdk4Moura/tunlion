@@ -18,11 +18,10 @@ use filament_peerloop::recv::ports::{RecvEnv, RecvPorts};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub(crate) use crate::recv_ports::cli_park_on_deny as park_on_deny;
 /// Re-exported so the CLI's host-side server implementations (and the existing
 /// `exec_recv`/`sync_cmd`/`ssh_ca` modules) share the one parked-open type.
-pub(crate) use filament_peerloop::recv::dispatch::{
-    park_on_deny, settle_timeout_reason, ParkKind, ParkedOpen,
-};
+pub(crate) use filament_peerloop::recv::dispatch::{settle_timeout_reason, ParkKind, ParkedOpen};
 
 /// CLI process adapter. Returns only after the library dispatch and its owned
 /// cleanup have completed; cancellation is translated into the CLI exit policy.
