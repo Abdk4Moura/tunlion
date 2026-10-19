@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// Re-exported so the CLI's host-side server implementations (and the existing
 /// `exec_recv`/`sync_cmd`/`ssh_ca` modules) share the one parked-open type.
 pub(crate) use filament_peerloop::recv::dispatch::{
-    ParkKind, ParkedOpen, park_on_deny, settle_timeout_reason,
+    park_on_deny, settle_timeout_reason, ParkKind, ParkedOpen,
 };
 
 /// CLI process adapter. Returns only after the library dispatch and its owned

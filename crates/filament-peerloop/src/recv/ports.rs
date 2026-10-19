@@ -370,8 +370,16 @@ pub trait RecvDaemon: Send + Sync {
     fn wg_usable(&self) -> bool;
     fn wg_claim_attempt(&self, addr: &str) -> bool;
     fn wg_release_attempt(&self, addr: &str);
-    fn wg_local_offer(&self) -> Option<(String, u16)>;
-    async fn wg_adopt_peer(&mut self, conn: &Conn, pid: &str, v: &Value) -> anyhow::Result<()>;
+    fn wg_local_offer(&self) -> anyhow::Result<(String, u16)>;
+    async fn wg_adopt_peer(
+        &mut self,
+        peer_pub: &str,
+        peer_overlay: &str,
+        our_overlay: &str,
+        mtu: u32,
+        peer_underlay: std::net::IpAddr,
+        peer_wg_port: u16,
+    ) -> anyhow::Result<()>;
     /// Enable/refresh subnet forwarding for the advertised prefixes.
     fn subnet_enable(
         &mut self,

@@ -48,12 +48,24 @@ pub fn b64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -69,7 +81,10 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    let s: Vec<u8> = s.bytes().filter(|&b| b != b'=' && !b.is_ascii_whitespace()).collect();
+    let s: Vec<u8> = s
+        .bytes()
+        .filter(|&b| b != b'=' && !b.is_ascii_whitespace())
+        .collect();
     let mut out = Vec::with_capacity(s.len() / 4 * 3);
     for chunk in s.chunks(4) {
         let mut n = 0u32;
@@ -355,8 +370,10 @@ impl Ceremony {
     /// fingerprints to verify against (the caller supplies the link's current
     /// fingerprints). On a verified confirm the secret is derived.
     pub fn on_signal(&mut self, data: &Value, fps: Option<(&str, &str)>) -> Inbound {
-        if matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm"))
-            && data["direct"].as_bool() == Some(true)
+        if matches!(
+            data["type"].as_str(),
+            Some("pake-msg") | Some("pake-confirm")
+        ) && data["direct"].as_bool() == Some(true)
         {
             self.peer_direct = true;
         }
@@ -364,7 +381,10 @@ impl Ceremony {
             Some("pake-msg") => {
                 if self.k.is_none() {
                     if let Some(state) = self.state.take() {
-                        let peer_el = data["msg"].as_str().and_then(b64_decode).unwrap_or_default();
+                        let peer_el = data["msg"]
+                            .as_str()
+                            .and_then(b64_decode)
+                            .unwrap_or_default();
                         match filament_pair::finish(state, &peer_el) {
                             Some(k) => self.k = Some(k),
                             None => {
@@ -383,7 +403,10 @@ impl Ceremony {
                         "confirmation arrived before key exchange (abort)".to_string(),
                     );
                 };
-                let recv_mac = data["mac"].as_str().and_then(b64_decode).unwrap_or_default();
+                let recv_mac = data["mac"]
+                    .as_str()
+                    .and_then(b64_decode)
+                    .unwrap_or_default();
                 let Some((my_fp, their_fp)) = fps else {
                     return Inbound::Abort(
                         "no DTLS fingerprints to bind confirmation (abort)".to_string(),
@@ -488,7 +511,9 @@ mod tests {
         b.on_signal(&a_msg, None);
         a.on_signal(&b_msg, None);
         // A's view: own=AA, peer=MITM_A. B's view: own=BB, peer=MITM_B.
-        let a_conf = a.take_confirm_payload("SHA-256 AA", "SHA-256 MITM-A").unwrap();
+        let a_conf = a
+            .take_confirm_payload("SHA-256 AA", "SHA-256 MITM-A")
+            .unwrap();
         let r = b.on_signal(&a_conf, Some(("SHA-256 BB", "SHA-256 MITM-B")));
         assert!(matches!(r, Inbound::Abort(_)));
         assert!(b.secret().is_none());
@@ -510,7 +535,6 @@ mod tests {
         let sdp = json!({ "type": "description", "description": { "type": "offer" } });
         assert!(matches!(a.on_signal(&sdp, None), Inbound::Ignored));
     }
-
 
     #[test]
     fn b64_roundtrips() {
@@ -550,7 +574,10 @@ mod tests {
 
         // A receives the relay's (forged) element instead of B's.
         assert!(matches!(a.on_signal(&relay_msg, None), Inbound::Consumed));
-        assert!(a.has_k(), "A derived K from the forged element (different K)");
+        assert!(
+            a.has_k(),
+            "A derived K from the forged element (different K)"
+        );
 
         // B receives A's element honestly.
         assert!(matches!(b.on_signal(&a_msg, None), Inbound::Consumed));
@@ -561,11 +588,23 @@ mod tests {
         // B verifies A's confirm under B's OWN K. Since K differs, it MUST fail.
         let r = b.on_signal(&a_conf, Some(("SHA-256 B", "SHA-256 A")));
         // The MITM substitution must be DETECTED: confirmation fails.
-        assert!(matches!(r, Inbound::Abort(_)), "Gate #2 BROKEN: MITM substitution undetected, {r:?}");
-        assert!(b.secret().is_none(), "Gate #2 BROKEN: B agreed a secret despite MITM");
-        assert!(b.aborted().is_some(), "Gate #2: confirmed abort flag is set");
+        assert!(
+            matches!(r, Inbound::Abort(_)),
+            "Gate #2 BROKEN: MITM substitution undetected, {r:?}"
+        );
+        assert!(
+            b.secret().is_none(),
+            "Gate #2 BROKEN: B agreed a secret despite MITM"
+        );
+        assert!(
+            b.aborted().is_some(),
+            "Gate #2: confirmed abort flag is set"
+        );
         // A also has no secret (the relay never completed the ceremony).
-        assert!(a.secret().is_none(), "Gate #2: A agreed nothing (ceremony incomplete)");
+        assert!(
+            a.secret().is_none(),
+            "Gate #2: A agreed nothing (ceremony incomplete)"
+        );
     }
 
     // ---- Gate #2b: relay cannot derive the password from relayed bytes ----
@@ -580,7 +619,10 @@ mod tests {
         // The password "brave-otter" must not appear in either payload.
         for payload in &[&a_msg, &b_msg] {
             let s = serde_json::to_string(payload).unwrap();
-            assert!(!s.contains("brave-otter"), "Gate #2b BROKEN: password leaked in payload: {s}");
+            assert!(
+                !s.contains("brave-otter"),
+                "Gate #2b BROKEN: password leaked in payload: {s}"
+            );
         }
         b.on_signal(&a_msg, None);
         a.on_signal(&b_msg, None);
@@ -588,7 +630,10 @@ mod tests {
         let b_conf = b.take_confirm_payload("SHA-256 B", "SHA-256 A").unwrap();
         for payload in &[&a_conf, &b_conf] {
             let s = serde_json::to_string(payload).unwrap();
-            assert!(!s.contains("brave-otter"), "Gate #2b BROKEN: password leaked in confirm payload: {s}");
+            assert!(
+                !s.contains("brave-otter"),
+                "Gate #2b BROKEN: password leaked in confirm payload: {s}"
+            );
         }
     }
 
@@ -607,7 +652,10 @@ mod tests {
         a.on_signal(&b_msg, None);
         let a_conf = a.take_confirm_payload("SHA-256 AA", "SHA-256 BB").unwrap();
         let r = b.on_signal(&a_conf, Some(("SHA-256 BB", "SHA-256 AA")));
-        assert!(matches!(r, Inbound::Abort(_)), "scope downgrade must be detected");
+        assert!(
+            matches!(r, Inbound::Abort(_)),
+            "scope downgrade must be detected"
+        );
         assert!(b.secret().is_none());
     }
 
@@ -618,16 +666,34 @@ mod tests {
     #[test]
     fn a_bystander_bound_at_link_up_gives_way_to_the_real_partner() {
         // Bound to a bystander; the creator's element names our nameplate.
-        assert_eq!(partner_for(Some("desk"), "phone", true, Some(true), false), Partner::Switch);
+        assert_eq!(
+            partner_for(Some("desk"), "phone", true, Some(true), false),
+            Partner::Switch
+        );
         // The same from the peer we are bound to.
-        assert_eq!(partner_for(Some("phone"), "phone", true, Some(true), false), Partner::Ours);
+        assert_eq!(
+            partner_for(Some("phone"), "phone", true, Some(true), false),
+            Partner::Ours
+        );
         // Another code's ceremony never feeds ours.
-        assert_eq!(partner_for(Some("phone"), "other", true, Some(false), false), Partner::Ignore);
-        assert_eq!(partner_for(None, "other", true, Some(false), false), Partner::Ignore);
+        assert_eq!(
+            partner_for(Some("phone"), "other", true, Some(false), false),
+            Partner::Ignore
+        );
+        assert_eq!(
+            partner_for(None, "other", true, Some(false), false),
+            Partner::Ignore
+        );
         // Once K is derived the ceremony is committed.
-        assert_eq!(partner_for(Some("phone"), "desk", true, Some(true), true), Partner::Ignore);
+        assert_eq!(
+            partner_for(Some("phone"), "desk", true, Some(true), true),
+            Partner::Ignore
+        );
         // A confirm from someone else is never a reason to switch.
-        assert_eq!(partner_for(Some("phone"), "desk", false, Some(true), false), Partner::Ignore);
+        assert_eq!(
+            partner_for(Some("phone"), "desk", false, Some(true), false),
+            Partner::Ignore
+        );
         // Nobody bound yet: the first speaker is ours (old untagged peers too).
         assert_eq!(partner_for(None, "phone", true, None, false), Partner::Ours);
         // Re-arming our element works only before K.
@@ -679,7 +745,10 @@ mod tests {
         let mut browser_side = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
         let mut from_browser = browser_side.take_msg_payload().unwrap();
         from_browser.as_object_mut().unwrap().remove("direct");
-        assert!(matches!(cli.on_signal(&from_browser, None), Inbound::Consumed));
+        assert!(matches!(
+            cli.on_signal(&from_browser, None),
+            Inbound::Consumed
+        ));
         assert!(!cli.peer_supports_direct());
     }
 }

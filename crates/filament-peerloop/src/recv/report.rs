@@ -446,7 +446,10 @@ mod tests {
         let second_object = second.result_object("/tmp/in", None);
         assert_eq!(second_object["files"].as_array().unwrap().len(), 1);
         assert_eq!(second_object["files"][0]["file"], json!("q.bin"));
-        assert_eq!(second_object["files"][0]["refusal"]["reason"], json!("declined"));
+        assert_eq!(
+            second_object["files"][0]["refusal"]["reason"],
+            json!("declined")
+        );
     }
 
     /// A clone is a handle to the same invocation's report, not a fresh or

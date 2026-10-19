@@ -896,11 +896,27 @@ impl RecvDaemon for CliRecv {
     fn wg_release_attempt(&self, addr: &str) {
         crate::wg::release_attempt(addr)
     }
-    fn wg_local_offer(&self) -> Option<(String, u16)> {
+    fn wg_local_offer(&self) -> Result<(String, u16)> {
         crate::wg::local_offer()
     }
-    async fn wg_adopt_peer(&mut self, conn: &Conn, pid: &str, v: &Value) -> Result<()> {
-        crate::wg::adopt_peer(conn, pid, v).await
+    async fn wg_adopt_peer(
+        &mut self,
+        peer_pub: &str,
+        peer_overlay: &str,
+        our_overlay: &str,
+        mtu: u32,
+        peer_underlay: std::net::IpAddr,
+        peer_wg_port: u16,
+    ) -> Result<()> {
+        crate::wg::adopt_peer(
+            peer_pub,
+            peer_overlay,
+            our_overlay,
+            mtu,
+            peer_underlay,
+            peer_wg_port,
+        )
+        .await
     }
     fn subnet_enable(&mut self, ifname: &str, prefixes: &[String], snat: bool) -> Result<()> {
         crate::subnet_forward::enable(ifname, prefixes, snat).map(|_| ())

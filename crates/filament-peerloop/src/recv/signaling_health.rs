@@ -25,7 +25,7 @@
 //! `signaling`, so a daemon that answers but is not connected (or keeps
 //! dropping) is reported degraded instead of "up".
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -63,7 +63,11 @@ pub(crate) fn reconnect_delay(attempt: u32, unit: f64) -> Duration {
     let base = BASE_MS
         .saturating_mul(1u64 << attempt.min(6))
         .min(MAX_BACKOFF.as_millis() as u64) as f64;
-    let unit = if unit.is_finite() { unit.clamp(0.0, 1.0) } else { 0.5 };
+    let unit = if unit.is_finite() {
+        unit.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
     let jittered = base * (0.75 + 0.5 * unit);
     Duration::from_millis(jittered.max(BASE_MS as f64 * 0.75) as u64)
 }
@@ -178,7 +182,11 @@ pub(crate) fn note_redialed() {
         h.connected = true;
         h.since = Some(now);
         h.redials.push_back(now);
-        while h.redials.front().is_some_and(|t| now.saturating_duration_since(*t) > FLAP_WINDOW) {
+        while h
+            .redials
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) > FLAP_WINDOW)
+        {
             h.redials.pop_front();
         }
     });
@@ -228,13 +236,24 @@ mod tests {
 
     #[test]
     fn backoff_grows_is_bounded_and_never_tight() {
-        let mid: Vec<u64> = (0..10).map(|a| reconnect_delay(a, 0.5).as_millis() as u64).collect();
-        assert_eq!(mid, vec![500, 1000, 2000, 4000, 8000, 15000, 15000, 15000, 15000, 15000]);
+        let mid: Vec<u64> = (0..10)
+            .map(|a| reconnect_delay(a, 0.5).as_millis() as u64)
+            .collect();
+        assert_eq!(
+            mid,
+            vec![500, 1000, 2000, 4000, 8000, 15000, 15000, 15000, 15000, 15000]
+        );
         for a in [0, 1, 5, 40, u32::MAX] {
             for u in [0.0, 0.25, 0.999, 1.0, f64::NAN, -3.0] {
                 let d = reconnect_delay(a, u);
-                assert!(d >= Duration::from_millis(375), "attempt {a} unit {u}: {d:?}");
-                assert!(d <= Duration::from_millis(18_750), "attempt {a} unit {u}: {d:?}");
+                assert!(
+                    d >= Duration::from_millis(375),
+                    "attempt {a} unit {u}: {d:?}"
+                );
+                assert!(
+                    d <= Duration::from_millis(18_750),
+                    "attempt {a} unit {u}: {d:?}"
+                );
             }
         }
         // Jitter actually spreads the delay.
@@ -274,10 +293,17 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(c.admit("k", "down", t0).as_deref(), Some("down"));
         for i in 1..=140u64 {
-            assert!(c.admit("k", "down", t0 + Duration::from_millis(400 * i)).is_none());
+            assert!(c
+                .admit("k", "down", t0 + Duration::from_millis(400 * i))
+                .is_none());
         }
-        let after = c.admit("k", "down", t0 + COLLAPSE_WINDOW + Duration::from_secs(1)).unwrap();
-        assert!(after.starts_with("down (and 140 more like it in the last "), "{after}");
+        let after = c
+            .admit("k", "down", t0 + COLLAPSE_WINDOW + Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            after.starts_with("down (and 140 more like it in the last "),
+            "{after}"
+        );
         // Another key is independent.
         assert_eq!(c.admit("other", "up", t0).as_deref(), Some("up"));
         // A quiet window prints plainly.

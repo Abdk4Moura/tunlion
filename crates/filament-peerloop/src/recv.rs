@@ -46,15 +46,15 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use filament_proto::{VerifyResult, decide_verify};
+use filament_proto::{decide_verify, VerifyResult};
 use filament_transfer::coverage_complete;
 use sha2::{Digest, Sha256};
 
 use crate::host::StorageFailure;
-use crate::present::{Progress as ProgressBar, human};
+use crate::present::{human, Progress as ProgressBar};
 
 pub mod ceremony;
 pub mod dispatch;
@@ -71,14 +71,14 @@ pub mod transfer_truth;
 // Re-exported at the receive module root so the CLI shim (and library callers)
 // can name `recv::accept_is_sequential` without reaching through the child.
 pub use transfer_truth::{
-    KeptPartial, SessionPart, accept_is_sequential, kept_partials, note_part, resume_line,
-    sender_gone_message,
+    accept_is_sequential, kept_partials, note_part, resume_line, sender_gone_message, KeptPartial,
+    SessionPart,
 };
 // The per-invocation receive report (files, last refusal, outcome, JSON
 // object). Re-exported here so callers can name it without the child path.
 pub use report::{
-    OutcomeKind, RecvFile, RecvReport, Refusal, RefusalClass, RefusedOutcome, ReportError,
-    refused_error, result_object, storage_kind,
+    refused_error, result_object, storage_kind, OutcomeKind, RecvFile, RecvReport, Refusal,
+    RefusalClass, RefusedOutcome, ReportError,
 };
 
 /// P4 (GAP-5): sha256 over the WHOLE file, the end-to-end content digest the
@@ -145,7 +145,9 @@ pub fn numbered_name(name: &str, tag: &str) -> String {
 /// has no extension), a trailing dot is not an extension, and `.tar.<x>` is
 /// kept together.
 fn split_extension(name: &str) -> (&str, &str) {
-    let Some(dot) = name.rfind('.') else { return (name, "") };
+    let Some(dot) = name.rfind('.') else {
+        return (name, "");
+    };
     if dot == 0 || dot + 1 == name.len() {
         return (name, "");
     }
@@ -212,10 +214,11 @@ impl PartMeta {
                 });
             }
         }
-        raw.trim()
-            .parse::<u64>()
-            .ok()
-            .map(|size| PartMeta { size, head: None, full: None })
+        raw.trim().parse::<u64>().ok().map(|size| PartMeta {
+            size,
+            head: None,
+            full: None,
+        })
     }
 
     /// Write the sidecar WITHOUT following a symlink at `path`: the download
@@ -393,7 +396,10 @@ pub struct WriteFailure {
 
 impl WriteFailure {
     pub fn from_io(e: &std::io::Error) -> Self {
-        WriteFailure { kind: storage_failure(e), detail: e.to_string() }
+        WriteFailure {
+            kind: storage_failure(e),
+            detail: e.to_string(),
+        }
     }
 }
 
@@ -949,8 +955,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     fn mode_dir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("filament-recv-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("filament-recv-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -962,7 +967,9 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::symlink_metadata(path).ok().map(|m| m.permissions().mode() & 0o7777)
+            std::fs::symlink_metadata(path)
+                .ok()
+                .map(|m| m.permissions().mode() & 0o7777)
         }
         #[cfg(not(unix))]
         {
@@ -1050,10 +1057,18 @@ mod tests {
         // identical head, byte flipped well PAST the head: full_hash must differ.
         base[(HEAD_BYTES + 2048) as usize] = 4;
         std::fs::write(&b, &base).unwrap();
-        assert_ne!(full_hash(&a), full_hash(&b), "full_hash sees the whole file");
+        assert_ne!(
+            full_hash(&a),
+            full_hash(&b),
+            "full_hash sees the whole file"
+        );
         // a truncated file (same prefix, shorter) also differs.
         std::fs::write(&b, &base[..base.len() - 100]).unwrap();
-        assert_ne!(full_hash(&a), full_hash(&b), "truncation changes the full hash");
+        assert_ne!(
+            full_hash(&a),
+            full_hash(&b),
+            "truncation changes the full hash"
+        );
         // full_hash matches a one-shot sha256 of the bytes.
         assert_eq!(
             full_hash(&a),
@@ -1096,7 +1111,11 @@ mod tests {
         // Multi-byte stems are cut on a character boundary, never mid-char.
         let wide = format!("{}.txt", "\u{e9}".repeat(200));
         let out = numbered_name(&wide, " (1)");
-        assert!(out.len() <= 255 && out.ends_with(" (1).txt"), "{}", out.len());
+        assert!(
+            out.len() <= 255 && out.ends_with(" (1).txt"),
+            "{}",
+            out.len()
+        );
     }
 
     /// E4: an interrupted transfer left `<name>.part` and `.part.meta` in the
@@ -1129,10 +1148,16 @@ mod tests {
         assert_eq!(json.as_array().unwrap().len(), 2, "{json}");
 
         let gone = expire_partials(&d, later);
-        assert_eq!(gone.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["old.bin"]);
+        assert_eq!(
+            gone.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["old.bin"]
+        );
         assert!(!d.join("old.bin.part").exists() && !d.join("old.bin.part.meta").exists());
         assert!(d.join("new.bin.part").exists() && d.join("new.bin.part.meta").exists());
-        assert!(d.join("notes.part").exists(), "a received file named *.part was removed");
+        assert!(
+            d.join("notes.part").exists(),
+            "a received file named *.part was removed"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1154,9 +1179,13 @@ mod tests {
     fn part_meta_roundtrip_and_legacy() {
         let dir = mode_dir("meta");
         let p = dir.join("x.part.meta");
-        PartMeta { size: 42, head: Some("abc".into()), full: Some("deadbeef".into()) }
-            .store(&p)
-            .unwrap();
+        PartMeta {
+            size: 42,
+            head: Some("abc".into()),
+            full: Some("deadbeef".into()),
+        }
+        .store(&p)
+        .unwrap();
         let m = PartMeta::load(&p).unwrap();
         assert_eq!(m.size, 42);
         assert_eq!(m.head.as_deref(), Some("abc"));
@@ -1182,7 +1211,13 @@ mod tests {
         let dir = mode_dir("meta-mode");
         let p = dir.join("z.part.meta");
         std::fs::write(&p, "1").unwrap();
-        PartMeta { size: 9, head: Some("ab".into()), full: Some("cd".into()) }.store(&p).unwrap();
+        PartMeta {
+            size: 9,
+            head: Some("ab".into()),
+            full: Some("cd".into()),
+        }
+        .store(&p)
+        .unwrap();
         if let Some(mode) = file_mode(&p) {
             assert_eq!(mode & 0o777, 0o600, ".part.meta must be 0600, got {mode:o}");
         }
@@ -1229,10 +1264,23 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
-        PartMeta { size: 7, head: None, full: None }.store(&p).unwrap();
-        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the link target is untouched");
+        PartMeta {
+            size: 7,
+            head: None,
+            full: None,
+        }
+        .store(&p)
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "the link target is untouched"
+        );
         assert!(
-            !std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(),
+            !std::fs::symlink_metadata(&p)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "the sidecar is a real file now"
         );
         assert_eq!(PartMeta::load(&p).unwrap().size, 7);
@@ -1247,7 +1295,11 @@ mod tests {
         let p = d.join("x.part.meta");
         drop(create_new_private(&p).unwrap());
         if let Some(m) = file_mode(&p) {
-            assert_eq!(m & 0o777, 0o600, "a new private file must be 0600, got {m:o}");
+            assert_eq!(
+                m & 0o777,
+                0o600,
+                "a new private file must be 0600, got {m:o}"
+            );
         }
         // create_new: it never reuses (or writes through) what is already there.
         assert!(create_new_private(&p).is_err());
@@ -1285,7 +1337,10 @@ mod tests {
         assert_eq!(s.out.0, data, "byte-exact and in order");
         assert_eq!(s.digest(), sha256_hex(&data));
         assert_eq!(s.verdict(10_000, Some(&sha256_hex(&data))), Ok(()));
-        assert!(s.verdict(10_000, Some("00")).unwrap_err().contains("SHA-256"));
+        assert!(s
+            .verdict(10_000, Some("00"))
+            .unwrap_err()
+            .contains("SHA-256"));
         assert!(s.verdict(20_000, None).unwrap_err().contains("ended after"));
     }
 
@@ -1351,4 +1406,27 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
+}
+
+// A reduced profile omits the mount server's confined (`*at`) open. The
+// receive loop still compiles and still stores files: the fallback opens the
+// same `.part` with ordinary create/append semantics. The hardened
+// beneath-root traversal is a mount-server property, not a receive one.
+#[cfg(not(feature = "mount-server"))]
+pub async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+}
+
+#[cfg(not(feature = "mount-server"))]
+pub async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
 }

@@ -7,7 +7,6 @@ use std::sync::{mpsc, Arc};
 
 use filament_peerloop::host::LogSink;
 
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum ControlReadyError {
     SenderDropped,

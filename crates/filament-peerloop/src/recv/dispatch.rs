@@ -1346,10 +1346,7 @@ async fn recv_run(
     // the daemon's life: it is what `--i-know` was checked against, so a live
     // `set shell on` must not widen it past that gate. The GRANT half is not
     // fixed: it is recomputed at the top of every loop iteration below.
-    let l2_launch = shell_policy.enables_l2()
-        || std::env::var("TUNLION_L2")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+    let l2_launch = shell_policy.enables_l2() || ports.env.l2_forced;
     let mut l2_enabled = l2_launch || ports.store.any_shell_grant();
 
     let mut conn = cleanup.conn.insert(
@@ -7505,7 +7502,7 @@ async fn recv_run(
                     }
                     // The inbox may have been deleted while this ran: recreate it,
                     // or refuse with that reason (not "No such file or directory").
-                    match crate::recv::files::ensure_inbox(&dir) {
+                    match crate::recv::files::ensure_inbox(host.as_ref(), &dir) {
                         Ok(true) => log.say(&log.paint(
                             Tone::Warn,
                             &format!("  the inbox {} was missing; recreated it", dir.display()),
