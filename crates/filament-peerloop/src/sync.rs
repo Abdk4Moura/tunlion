@@ -2,9 +2,9 @@
 //!
 //! This is the peer-loop half of `cli::sync_cmd::handle_sync_open`: destination
 //! confinement, the transfer capability gate, and the shared-mux registration
-//! order. The CLI keeps parking, the consent request, `serve_sync`'s stateful
-//! protocol and the user-facing log lines; this module decides whether a stream
-//! may exist and returns the validated root and the exact refusal to send.
+//! order. The CLI keeps parking, the consent request and user-facing log lines;
+//! this module also owns the admitted stream's record protocol and file-write
+//! state machine through [`serving`].
 //!
 //! Ordering is the security contract, preserved from the CLI handler:
 //! transport, checked L2 sid, path bounds, authorization, capacity, collision,
@@ -26,15 +26,132 @@ use filament_cap::capability as cap;
 use filament_transfer::path_bounds::resolve_root;
 use filament_transport::net::Transport;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// File chunk size used by the sync manifest and receiver.
+pub const SYNC_CHUNK: u64 = 256 * 1024;
+
+/// A manifest entry, shared by the sender and receiver protocol.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub p: String,
+    pub size: u64,
+    pub mtime: u64,
+    pub full: String,
+    pub chunks: Vec<String>,
+}
+
+/// One file the receiver needs from a manifest.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Need {
+    pub p: String,
+    pub new: bool,
+    pub chunks: Vec<u32>,
+}
+
+/// The receiver's chunk plan for one manifest.
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
+pub struct Plan {
+    pub need: Vec<Need>,
+    pub same: Vec<String>,
+    pub extra: Vec<String>,
+}
+
+/// The receiver's maximum record payload. It bounds a serialized manifest as
+/// well as every individual control/data record, preserving the CLI limit.
+pub const MAX_SYNC_RECORD_BYTES: usize = 64 << 20;
+
+fn hex(d: &[u8]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whole-file digest and per-chunk digests in one pass.
+pub fn hash_file(path: &Path) -> std::io::Result<(String, Vec<String>)> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut whole = sha2::Sha256::new();
+    let mut chunks = Vec::new();
+    let mut buf = vec![0u8; SYNC_CHUNK as usize];
+    loop {
+        let mut n = 0;
+        while n < buf.len() {
+            let k = f.read(&mut buf[n..])?;
+            if k == 0 { break; }
+            n += k;
+        }
+        if n == 0 { break; }
+        whole.update(&buf[..n]);
+        chunks.push(hex(&sha2::Sha256::digest(&buf[..n])));
+        if n < buf.len() { break; }
+    }
+    Ok((hex(&whole.finalize()), chunks))
+}
+
+/// Walk `root` without following symlinks. Returns a sorted manifest and
+/// skipped entries, shared by sender and receiver.
+pub fn walk_manifest(root: &Path) -> anyhow::Result<(Vec<Entry>, Vec<(String, String)>)> {
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        for e in std::fs::read_dir(root.join(&rel))? {
+            let e = e?;
+            let r = rel.join(e.file_name());
+            let rs = r.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+            let md = e.metadata()?;
+            if md.file_type().is_symlink() {
+                skipped.push((rs, "symlink".into()));
+            } else if md.is_dir() {
+                stack.push(r);
+            } else if !md.is_file() {
+                skipped.push((rs, "not a regular file".into()));
+            } else if filament_transfer::path_bounds::safe_relpath(&rs).is_none()
+                || !filament_transfer::path_bounds::path_within(root, &root.join(&r))
+            {
+                skipped.push((rs, "path escapes the directory".into()));
+            } else {
+                let (full, chunks) = hash_file(&e.path())?;
+                let mtime = md.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                out.push(Entry { p: rs, size: md.len(), mtime, full, chunks });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.p.cmp(&b.p));
+    skipped.sort();
+    Ok((out, skipped))
+}
+
+/// Compute what `remote` lacks relative to `local`.
+pub fn diff(local: &[Entry], remote: &[Entry]) -> Plan {
+    let have: BTreeMap<&str, &Entry> = remote.iter().map(|e| (e.p.as_str(), e)).collect();
+    let mut plan = Plan::default();
+    for l in local {
+        match have.get(l.p.as_str()) {
+            Some(r) if r.full == l.full && r.size == l.size => plan.same.push(l.p.clone()),
+            other => {
+                let rc: &[String] = other.map(|r| r.chunks.as_slice()).unwrap_or(&[]);
+                let chunks = l.chunks.iter().enumerate().filter(|(i, h)| rc.get(*i) != Some(h))
+                    .map(|(i, _)| i as u32).collect();
+                plan.need.push(Need { p: l.p.clone(), new: other.is_none(), chunks });
+            }
+        }
+    }
+    let want: BTreeSet<&str> = local.iter().map(|e| e.p.as_str()).collect();
+    plan.extra = remote.iter().filter(|e| !want.contains(e.p.as_str())).map(|e| e.p.clone()).collect();
+    plan
+}
+
 /// One inbound `sync-open` decision.
 pub enum SyncAdmission {
     /// Admitted, registered on the caller's shared mux and acknowledged. The
-    /// caller owns the stateful serving task (`serve_sync`) and the returned
-    /// stream receiver.
+    /// caller owns the returned stream receiver and starts the stateful server
+    /// through [`serving`].
     Accepted(SyncAccepted),
     /// Refused by the transfer gate. The caller may hold it for identity proof
     /// through its existing `park_on_deny`; if it does not, it records the
@@ -269,6 +386,451 @@ pub async fn admit_sync_open(
         mux,
         transport: t,
     })
+}
+
+/// Stateful receiver for an admitted sync stream. This module owns record
+/// framing, manifest validation, delta planning, bounded file writes, content
+/// verification, deletion, cancellation and stream cleanup. The CLI owns the
+/// user-facing outcome and the consent/parking policy.
+pub mod serving {
+    use super::{Entry, MAX_SYNC_RECORD_BYTES, SYNC_CHUNK};
+    use crate::l2::Mux;
+    use anyhow::{Result, bail};
+    use bytes::Bytes;
+    use filament_transfer::path_bounds::{
+        bound_parent, delete_within, manifest_paths_are_bounded, path_within, safe_relpath,
+    };
+    use filament_transport::net::Transport;
+    use serde_json::{Value, json};
+    use sha2::Digest;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, watch};
+    use tokio::task::JoinHandle;
+
+    /// Server configuration resolved by the caller from one admitted open.
+    /// `root` must be the validated result of `path_bounds::resolve_root`; the
+    /// library repeats per-file confinement checks before every write/delete.
+    pub struct SyncServeConfig {
+        pub transport: Arc<dyn Transport>,
+        pub mux: Arc<Mux>,
+        pub sid: u32,
+        pub root: PathBuf,
+        pub delete: bool,
+        pub dry_run: bool,
+        pub stream: mpsc::Receiver<Option<Bytes>>,
+        /// Maximum individual length-prefixed record, including the manifest.
+        pub max_record_bytes: usize,
+    }
+
+    /// An owned serving task. The CLI may retain this to cancel/join the
+    /// stream; dropping it detaches, matching the old receiver behavior.
+    pub struct SyncServeTask {
+        cancel: watch::Sender<bool>,
+        join: JoinHandle<Result<(), String>>,
+    }
+
+    impl SyncServeTask {
+        /// Request cancellation. The server exits at its next record boundary,
+        /// then closes and removes its mux stream before completing the handle.
+        pub fn cancel(&self) {
+            self.cancel.send_replace(true);
+        }
+
+        /// Join and retrieve the protocol result. Errors are strings to keep
+        /// the CLI's existing user-facing rendering policy outside the library.
+        pub async fn join(
+            self,
+        ) -> std::result::Result<std::result::Result<(), String>, tokio::task::JoinError> {
+            self.join.await
+        }
+    }
+
+    /// Spawn one stateful sync receiver and return its cancellation/join owner.
+    /// The task sends the same close on protocol failure as the CLI handler did
+    /// and always removes the stream on success, refusal, or cancellation.
+    pub fn spawn_sync_server(config: SyncServeConfig) -> SyncServeTask {
+        let (cancel, cancel_rx) = watch::channel(false);
+        let join = tokio::spawn(async move {
+            let result = serve(config, cancel_rx).await;
+            result.map_err(|e| e.to_string())
+        });
+        SyncServeTask { cancel, join }
+    }
+
+    #[derive(Default)]
+    struct Records(Vec<u8>);
+
+    impl Records {
+        fn next(&mut self, max: usize) -> Result<Option<Vec<u8>>> {
+            if self.0.len() < 4 { return Ok(None); }
+            let n = u32::from_be_bytes([self.0[0], self.0[1], self.0[2], self.0[3]]) as usize;
+            if n > max { bail!("sync record too large ({n} bytes)"); }
+            if self.0.len() < 4 + n { return Ok(None); }
+            let rec = self.0[4..4 + n].to_vec();
+            self.0.drain(..4 + n);
+            Ok(Some(rec))
+        }
+    }
+
+    async fn next_rec(
+        pipe: &mut mpsc::Receiver<Option<Bytes>>,
+        recs: &mut Records,
+        max: usize,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        loop {
+            if let Some(record) = recs.next(max)? { return Ok(record); }
+            tokio::select! {
+                biased;
+                changed = cancel.changed() => {
+                    if changed.is_err() {
+                        // Dropping the owner detaches; it is not a cancel request.
+                        std::future::pending::<()>().await;
+                    } else if *cancel.borrow() {
+                        bail!("sync cancelled");
+                    }
+                }
+                item = pipe.recv() => match item {
+                    Some(Some(bytes)) => recs.0.extend_from_slice(&bytes),
+                    _ => bail!("the peer closed the sync stream"),
+                },
+                _ = tokio::time::sleep_until(deadline) => bail!("timed out waiting for the peer"),
+            }
+        }
+    }
+
+    async fn next_json(
+        pipe: &mut mpsc::Receiver<Option<Bytes>>,
+        recs: &mut Records,
+        max: usize,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Value> {
+        Ok(serde_json::from_slice(&next_rec(pipe, recs, max, cancel).await?)?)
+    }
+
+    async fn send_rec(t: &Arc<dyn Transport>, sid: u32, payload: &[u8]) -> Result<()> {
+        let mut record = (payload.len() as u32).to_be_bytes().to_vec();
+        record.extend_from_slice(payload);
+        for chunk in record.chunks(t.max_payload().max(1)) {
+            t.send_frame(sid, 0, chunk).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_json(t: &Arc<dyn Transport>, sid: u32, value: &Value) -> Result<()> {
+        send_rec(t, sid, &serde_json::to_vec(value)?).await
+    }
+
+    async fn serve(mut cfg: SyncServeConfig, mut cancel: watch::Receiver<bool>) -> Result<()> {
+        let result = serve_protocol(&mut cfg, &mut cancel).await;
+        if let Err(error) = &result {
+            let _ = cfg.transport.send_control(&json!({
+                "type": "l2-close", "sid": cfg.sid, "err": error.to_string()
+            })).await;
+        }
+        cfg.mux.drop_stream(cfg.sid).await;
+        result
+    }
+
+    async fn serve_protocol(
+        cfg: &mut SyncServeConfig,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        let mut recs = Records::default();
+        let max_record_bytes = cfg.max_record_bytes.min(MAX_SYNC_RECORD_BYTES);
+        let mut manifest = next_json(&mut cfg.stream, &mut recs, max_record_bytes, cancel).await?;
+        if manifest["type"].as_str() != Some("manifest") { bail!("expected a manifest"); }
+        let files: Vec<Entry> = serde_json::from_value(manifest["files"].take())?;
+        if !manifest_paths_are_bounded(files.iter().map(|entry| entry.p.as_str())) {
+            bail!("manifest names an unsafe path");
+        }
+        let root = cfg.root.clone();
+        let (have, _) = if root.is_dir() {
+            tokio::task::spawn_blocking(move || super::walk_manifest(&root)).await??
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let plan = super::diff(&files, &have);
+        send_json(&cfg.transport, cfg.sid, &serde_json::to_value(&plan)?).await?;
+
+        loop {
+            let record = next_json(&mut cfg.stream, &mut recs, max_record_bytes, cancel).await?;
+            match record["type"].as_str() {
+                Some("done") => return Ok(()),
+                Some("file") if !cfg.dry_run => {
+                    let path = record["p"].as_str().unwrap_or("").to_string();
+                    let result = receive_file(cfg, &record, &mut recs, cancel, max_record_bytes).await;
+                    let ack = match result {
+                        Ok(()) => json!({ "type": "file-ack", "p": path, "ok": true }),
+                        Err(error) => json!({ "type": "file-ack", "p": path, "ok": false, "err": error.to_string() }),
+                    };
+                    send_json(&cfg.transport, cfg.sid, &ack).await?;
+                }
+                Some("delete") if cfg.delete && !cfg.dry_run => {
+                    let mut gone = Vec::new();
+                    for path in record["paths"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                        let Some(rel) = safe_relpath(path) else { continue };
+                        if delete_within(&cfg.root, &rel) { gone.push(path.to_string()); }
+                    }
+                    send_json(&cfg.transport, cfg.sid, &json!({ "type": "deleted", "paths": gone })).await?;
+                }
+                other => bail!("unexpected sync record {other:?}"),
+            }
+        }
+    }
+
+    async fn receive_file(
+        cfg: &mut SyncServeConfig,
+        record: &Value,
+        recs: &mut Records,
+        cancel: &mut watch::Receiver<bool>,
+        max_record_bytes: usize,
+    ) -> Result<()> {
+        let rel = safe_relpath(record["p"].as_str().unwrap_or("")).ok_or_else(|| anyhow::anyhow!("unsafe path"))?;
+        let size = record["size"].as_u64().unwrap_or(0);
+        let full = record["full"].as_str().unwrap_or("").to_string();
+        let target = cfg.root.join(&rel);
+        if !path_within(&cfg.root, &target) { bail!("path escapes the remote dir"); }
+        if let Some(parent) = target.parent() { bound_parent(&cfg.root, parent)?; }
+        let part = target.with_file_name(format!(
+            "{}.part", target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        ));
+        if std::fs::symlink_metadata(&part).is_ok() { std::fs::remove_file(&part)?; }
+        match std::fs::symlink_metadata(&target) {
+            Ok(md) if md.is_file() => { std::fs::copy(&target, &part)?; }
+            Ok(_) => bail!("destination exists and is not a regular file"),
+            Err(_) => {}
+        }
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&part)?;
+        loop {
+            let header = next_json(&mut cfg.stream, recs, max_record_bytes, cancel).await?;
+            match header["type"].as_str() {
+                Some("file-end") => break,
+                Some("chunk") => {
+                    let idx = header["idx"].as_u64().unwrap_or(u64::MAX);
+                    let data = next_rec(&mut cfg.stream, recs, max_record_bytes, cancel).await?;
+                    let pos = idx.checked_mul(SYNC_CHUNK).filter(|p| *p < size.max(1))
+                        .ok_or_else(|| anyhow::anyhow!("chunk index out of range"))?;
+                    if data.len() as u64 > SYNC_CHUNK || pos + data.len() as u64 > size { bail!("chunk overruns the file"); }
+                    filament_transfer::pwrite_at(&file, &data, pos)?;
+                }
+                other => bail!("unexpected record inside a file: {other:?}"),
+            }
+        }
+        file.set_len(size)?;
+        file.sync_all()?;
+        drop(file);
+        let part_for_hash = part.clone();
+        let got = tokio::task::spawn_blocking(move || hash_whole_file(&part_for_hash)).await?;
+        if got.as_deref() != Some(full.as_str()) {
+            let _ = std::fs::remove_file(&part);
+            bail!("content hash mismatch after transfer");
+        }
+        std::fs::rename(&part, &target)?;
+        Ok(())
+    }
+
+    fn hash_whole_file(path: &Path) -> Option<String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut hash = sha2::Sha256::new();
+        let mut buf = vec![0; 1 << 20];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hash.update(&buf[..n]),
+                Err(_) => return None,
+            }
+        }
+        Some(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::host::{HostServices, NoHost};
+        use filament_transport::net::Transport;
+        use sha2::Digest;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const SID: u32 = crate::l2::L2_SID_BASE + 191;
+
+        #[derive(Default)]
+        struct CaptureTransport {
+            controls: Mutex<Vec<Value>>,
+            frames: Mutex<Vec<Vec<u8>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Transport for CaptureTransport {
+            async fn send_control(&self, value: &Value) -> anyhow::Result<()> {
+                self.controls.lock().unwrap().push(value.clone());
+                Ok(())
+            }
+            async fn send_frame(&self, _sid: u32, _offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
+                self.frames.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            }
+            async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+            fn max_payload(&self) -> usize { 64 * 1024 }
+            fn is_alive(&self) -> bool { true }
+            fn is_dead(&self) -> bool { false }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+
+        struct TempRoot(PathBuf);
+        impl TempRoot {
+            fn new() -> Self {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "filament-sync-serving-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed),
+                ));
+                std::fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+        }
+        impl Drop for TempRoot {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+
+        fn record(value: &Value, wire: &mut Vec<u8>) {
+            let payload = serde_json::to_vec(value).unwrap();
+            wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            wire.extend_from_slice(&payload);
+        }
+
+        fn record_bytes(payload: &[u8], wire: &mut Vec<u8>) {
+            wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            wire.extend_from_slice(payload);
+        }
+
+        fn outgoing_json(t: &CaptureTransport) -> Vec<Value> {
+            let bytes = t.frames.lock().unwrap().concat();
+            let mut rest = bytes.as_slice();
+            let mut values = Vec::new();
+            while rest.len() >= 4 {
+                let size = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+                if rest.len() < 4 + size { break; }
+                if let Ok(value) = serde_json::from_slice(&rest[4..4 + size]) {
+                    values.push(value);
+                }
+                rest = &rest[4 + size..];
+            }
+            values
+        }
+
+        async fn setup(root: &Path, wire: Vec<u8>) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
+            let host: Arc<dyn HostServices> = Arc::new(NoHost);
+            let transport = Arc::new(CaptureTransport::default());
+            let mux = Mux::new(transport.clone(), host);
+            let stream = mux.register_stream(SID).await.unwrap();
+            if !wire.is_empty() {
+                mux.on_frame(SID, Bytes::from(wire)).await;
+            }
+            let task = spawn_sync_server(SyncServeConfig {
+                transport: transport.clone(),
+                mux: mux.clone(),
+                sid: SID,
+                root: root.to_path_buf(),
+                delete: true,
+                dry_run: false,
+                stream,
+                max_record_bytes: super::super::MAX_SYNC_RECORD_BYTES,
+            });
+            (task, mux, transport)
+        }
+
+        #[tokio::test]
+        async fn success_writes_verified_file_and_cleans_shared_stream() {
+            let root = TempRoot::new();
+            let bytes = b"sync lands this file";
+            let digest = sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let chunk_digest = digest.clone();
+            let mut wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[{
+                "p":"nested/file.txt", "size":bytes.len(), "mtime":1,
+                "full":digest, "chunks":[chunk_digest]
+            }]}), &mut wire);
+            record(&json!({"type":"file", "p":"nested/file.txt", "size":bytes.len(), "full":digest}), &mut wire);
+            record(&json!({"type":"chunk", "idx":0}), &mut wire);
+            record_bytes(bytes, &mut wire);
+            record(&json!({"type":"file-end"}), &mut wire);
+            record(&json!({"type":"done"}), &mut wire);
+            let (task, mux, transport) = setup(&root.0, wire).await;
+            assert_eq!(task.join().await.unwrap().unwrap(), ());
+            assert_eq!(std::fs::read(root.0.join("nested/file.txt")).unwrap(), bytes);
+            assert_eq!(mux.live_streams().await, 0, "normal completion cleans the shared SID");
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[0]["need"].as_array().unwrap().len(), 1);
+            assert_eq!(replies[0]["need"][0]["p"], "nested/file.txt");
+            assert_eq!(replies[1], json!({"type":"file-ack", "p":"nested/file.txt", "ok":true}));
+            assert!(transport.controls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn unsafe_manifest_is_refused_and_cleans_shared_stream() {
+            let root = TempRoot::new();
+            let mut wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[{
+                "p":"../escape", "size":0, "mtime":0, "full":"", "chunks":[]
+            }]}), &mut wire);
+            let (task, mux, transport) = setup(&root.0, wire).await;
+            let result = task.join().await.unwrap();
+            assert_eq!(result.unwrap_err(), "manifest names an unsafe path");
+            assert_eq!(
+                transport.controls.lock().unwrap().as_slice(),
+                &[json!({"type":"l2-close", "sid":SID, "err":"manifest names an unsafe path"})]
+            );
+            assert_eq!(mux.live_streams().await, 0, "refusal cleans the shared SID");
+            assert!(std::fs::read_dir(&root.0).unwrap().next().is_none());
+        }
+
+        #[tokio::test]
+        async fn hash_mismatch_preserves_existing_file_and_reports_negative_ack() {
+            let root = TempRoot::new();
+            std::fs::write(root.0.join("file.txt"), b"original").unwrap();
+            let bytes = b"tampered";
+            let wrong_digest = sha2::Sha256::digest(b"different").iter()
+                .map(|b| format!("{b:02x}")).collect::<String>();
+            let mut wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[]}), &mut wire);
+            record(&json!({"type":"file", "p":"file.txt", "size":bytes.len(), "full":wrong_digest}), &mut wire);
+            record(&json!({"type":"chunk", "idx":0}), &mut wire);
+            record_bytes(bytes, &mut wire);
+            record(&json!({"type":"file-end"}), &mut wire);
+            record(&json!({"type":"done"}), &mut wire);
+            let (task, mux, transport) = setup(&root.0, wire).await;
+            assert!(task.join().await.unwrap().is_ok());
+            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), b"original");
+            assert!(!root.0.join("file.txt.part").exists());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["type"], "file-ack");
+            assert_eq!(replies[1]["ok"], false);
+            assert_eq!(replies[1]["err"], "content hash mismatch after transfer");
+            assert_eq!(mux.live_streams().await, 0);
+            assert!(transport.controls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn cancellation_closes_and_cleans_an_idle_stream() {
+            let root = TempRoot::new();
+            let (task, mux, transport) = setup(&root.0, Vec::new()).await;
+            task.cancel();
+            let result = task.join().await.unwrap();
+            assert_eq!(result.unwrap_err(), "sync cancelled");
+            assert_eq!(
+                transport.controls.lock().unwrap().as_slice(),
+                &[json!({"type":"l2-close", "sid":SID, "err":"sync cancelled"})]
+            );
+            assert_eq!(mux.live_streams().await, 0, "cancel cleans the shared SID");
+        }
+    }
 }
 
 #[cfg(test)]
