@@ -541,7 +541,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
-        let client_fut = connect(&format!("http://{addr}"), tx);
+        let url = format!("http://{addr}");
+        let client_fut = connect(&url, tx);
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
@@ -591,7 +592,8 @@ mod tests {
     async fn concurrent_disconnects_are_idempotent_and_both_join() {
         let (client, mut rx, server) =
             local_client(|ws| tokio::spawn(reply_to_client_close(ws))).await;
-        let (a, b) = tokio::join!(client.disconnect(), client.clone().disconnect());
+        let cloned = client.clone();
+        let (a, b) = tokio::join!(client.disconnect(), cloned.disconnect());
         a.unwrap();
         b.unwrap();
         assert!(rx.try_recv().is_err());
