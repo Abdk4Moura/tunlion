@@ -1,5 +1,11 @@
 # Receive invocation cancellation (first lifecycle seam)
 
+> Follow-up: the cancellation latch and the readiness edge are now the
+> library-owned `filament_peerloop::driver` runtime (`Engine` / `Readiness` /
+> `ReadyWatch`), and the CLI `recv_cmd` runs its dispatch through it. See
+> `docs/engine-driver.md`. The history below is kept because the cleanup limits
+> it records are still current.
+
 This slice uses the existing `main -> dispatch -> up_logs::up_cmd -> recv_cmd`
 driver (also used by one-shot receive). It does not link a second driver or
 change `Core::start`: that still returns `EngineNotLinked`.

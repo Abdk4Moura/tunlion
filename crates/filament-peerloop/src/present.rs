@@ -35,7 +35,11 @@ pub enum Ask {
 /// The two verbs are exactly the two the receive loop uses: advance to the
 /// bytes received so far, and land the final summary once the bytes are stored.
 /// A live bar rate-limits its own redraws; [`NoBar`] draws nothing at all.
-pub trait Progress: Send {
+///
+/// `Sync` matters because a receive loop owns the bar behind an `Arc` inside
+/// `IncomingFile`; a spawned dispatch future must be `Send`, and holding
+/// `&IncomingFile` across an await requires the bar to be `Sync`.
+pub trait Progress: Send + Sync {
     /// Advance the bar to `bytes` received.
     fn tick(&mut self, bytes: u64);
     /// The transfer finished having stored `bytes`; print the summary once.

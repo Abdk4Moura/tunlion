@@ -4072,9 +4072,11 @@ name = "tunlion-core"
 version = "0.1.0"
 dependencies = [
  "filament-id",
+ "filament-peerloop",
  "secret-write",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "uniffi",
 ]
 

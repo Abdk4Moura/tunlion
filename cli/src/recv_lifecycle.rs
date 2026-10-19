@@ -27,43 +27,6 @@ pub(super) async fn control_ready(
     }
 }
 
-/// The single linearized readiness edge for one receive invocation.
-///
-/// Published exactly once, immediately before the driver dispatches, after
-/// every required initialization. It is deliberately distinct from the console
-/// banner and from optional post-dispatch work such as mount restoration:
-/// nothing awaited and optional may sit between this edge and entering the
-/// loop. The systemd notifier and the `up --detach` ready marker both consume
-/// this one edge, so they can no longer disagree about when the daemon became
-/// ready. The console banner is still printed earlier, before Conn/sector setup,
-/// and is NOT yet unified with this edge.
-///
-/// A one-shot receive does not publish it: that path has its own
-/// transfer-completion and deadline semantics, not an "engine is serving" edge.
-#[derive(Default)]
-pub(super) struct Readiness {
-    published: bool,
-}
-
-impl Readiness {
-    /// Publish the ready edge and run `announce` exactly once. Returns `true`
-    /// only for the publishing call; later calls are no-ops, so a stray
-    /// second publication cannot re-announce readiness after startup.
-    pub(super) fn publish(&mut self, announce: impl FnOnce()) -> bool {
-        if self.published {
-            return false;
-        }
-        self.published = true;
-        announce();
-        true
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_published(&self) -> bool {
-        self.published
-    }
-}
-
 #[derive(Default)]
 pub(super) struct Tasks(Vec<tokio::task::JoinHandle<()>>);
 
@@ -344,18 +307,6 @@ mod tests {
             control_ready(rx, Duration::ZERO).await,
             Err(ControlReadyError::TimedOut)
         );
-    }
-
-    #[test]
-    fn readiness_publishes_the_single_edge_exactly_once() {
-        let mut readiness = Readiness::default();
-        assert!(!readiness.is_published());
-        let mut announced = 0;
-        assert!(readiness.publish(|| announced += 1));
-        // A late second publication must not re-announce readiness.
-        assert!(!readiness.publish(|| announced += 1));
-        assert_eq!(announced, 1);
-        assert!(readiness.is_published());
     }
 
     struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
