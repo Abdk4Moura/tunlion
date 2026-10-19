@@ -11,16 +11,19 @@
 //! refused by the fallback in `NoRecvServers`.
 
 use crate::host::{LogSink, Tone};
-use crate::l2 as cli_l2;
+use crate::l2;
+use crate::recv_cmd::park_on_deny;
 use crate::recv_cmd::{ParkKind, ParkedOpen};
 use crate::shell::ShellPolicy;
 use crate::{identity, refusal};
+use crate::{shell_argv, shell_root_note, spawn_session_pumps};
 use anyhow::{Context, Result};
 use filament_peerloop::conn::Conn;
 use filament_peerloop::control::Req;
 use filament_peerloop::driver::Cancellation as _;
 use filament_peerloop::host::HostServices;
 use filament_peerloop::l2 as lib_l2;
+use filament_peerloop::l2::forward;
 use filament_peerloop::l2::Mux;
 use filament_peerloop::mesh::MeshTunnel;
 use filament_peerloop::recv::dispatch::{self, settle_timeout_reason};
@@ -30,7 +33,9 @@ use filament_peerloop::recv::ports::{
 use filament_peerloop::recv::report::RecvReport;
 use filament_peerloop::recv::IncomingFile;
 use filament_peerloop::session::Session;
+use filament_peerloop::shell::ShellHost;
 use filament_peerloop::shell_gate::PeerAuthz;
+use filament_proto as protocol;
 use filament_signal::Client as SignalClient;
 use filament_transport::net::{Ev, Transport};
 use serde_json::{json, Value};
@@ -42,7 +47,7 @@ use tokio::sync::mpsc;
 
 pub struct CliRecv {
     pub log: Arc<dyn LogSink>,
-    pub pty_sessions: cli_l2::PtySessions,
+    pub pty_sessions: l2::PtySessions,
     pub warm_ptys: crate::WarmPtys,
     pub liveness: crate::LivenessProbes,
     pub pending_bootstrap: crate::PendingBootstraps,
@@ -55,7 +60,7 @@ impl Default for CliRecv {
     fn default() -> Self {
         Self {
             log: Arc::new(filament_peerloop::host::NoLog),
-            pty_sessions: cli_l2::PtySessions::new(),
+            pty_sessions: l2::PtySessions::new(),
             warm_ptys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             liveness: crate::LivenessProbes::new(),
             pending_bootstrap: HashMap::new(),
@@ -937,19 +942,8 @@ impl RecvDaemon for CliRecv {
     async fn reach_pong(&mut self, _conn: &Conn, pid: &str, v: &Value) {
         self.liveness.answered(None, pid, v);
     }
-    fn peer_present(&self, conn: &Conn, pid: &str) -> bool {
-        let Some(link) = conn.link(pid) else {
-            return false;
-        };
-        let Some(transport) = link.transport.as_ref() else {
-            return false;
-        };
-        crate::link_manager::peer_present(
-            transport.is_alive(),
-            link.direct,
-            transport.heard_ms(),
-            transport.idle_ms(),
-        )
+    fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
+        crate::link_manager::peer_present(alive, direct, heard_ms, idle_ms)
     }
     fn liveness_pong(v: &Value) -> Value {
         filament_peerloop::daemon_ctl::liveness_pong(v)

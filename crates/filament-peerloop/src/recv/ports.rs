@@ -341,7 +341,7 @@ pub trait RecvDaemon: Send + Sync {
     /// `reach-ping`/`reach-pong` liveness probes.
     async fn reach_ping(&mut self, conn: &Conn, pid: &str, v: &Value);
     async fn reach_pong(&mut self, conn: &Conn, pid: &str, v: &Value);
-    fn peer_present(&self, conn: &Conn, pid: &str) -> bool;
+    fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool;
     fn liveness_pong(v: &Value) -> Value;
     async fn warm_bootstrap(
         &mut self,
