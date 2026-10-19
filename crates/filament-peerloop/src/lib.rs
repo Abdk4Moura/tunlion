@@ -43,6 +43,7 @@ pub mod consent;
 pub mod control;
 pub mod daemon_ctl;
 pub mod driver;
+#[cfg(feature = "mount-server")]
 pub mod fs_at;
 pub mod holepunch;
 pub mod host;
@@ -52,7 +53,9 @@ pub mod limits;
 pub mod link_manager;
 pub mod liveness;
 pub mod local;
+#[cfg(feature = "mount-server")]
 pub mod mount;
+#[cfg(feature = "mount-server")]
 pub mod mount_proto;
 #[cfg(feature = "mesh")]
 pub mod mesh;

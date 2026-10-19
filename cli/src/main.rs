@@ -55,6 +55,7 @@ mod l2;
 mod proxy_state;
 mod mount;
 mod mount_proto;
+#[cfg(feature = "mount-server")]
 mod mount_recv;
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 mod mount_fuse;
@@ -143,6 +144,7 @@ pub(crate) use device_view::{devices_store, devices_store_v2, device_cert_for, d
 #[cfg(test)]
 pub(crate) use device_view::devices_touch_at;
 /// The pure `mount-open` decision inputs (capability + share-root confinement).
+#[cfg(feature = "mount-server")]
 mod mount_gate;
 /// Mount planning/implementation and reset.
 mod mount_cmd;

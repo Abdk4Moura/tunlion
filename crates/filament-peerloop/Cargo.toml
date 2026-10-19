@@ -23,8 +23,11 @@ categories = ["network-programming"]
 
 [features]
 # Compatibility: existing consumers, including the CLI, keep the mesh API.
-default = ["mesh"]
+default = ["mesh", "mount-server"]
 mesh = ["dep:filament-overlay"]
+# Inbound filesystem serving is opt-out for existing consumers, but absent from
+# reduced engine profiles. The wire/control vocabulary remains available.
+mount-server = []
 # Fault-injection hooks the peer-loop paths read. The CLI forwards its own
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
