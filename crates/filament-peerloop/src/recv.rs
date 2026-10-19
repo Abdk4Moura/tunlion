@@ -56,17 +56,26 @@ use sha2::{Digest, Sha256};
 use crate::host::StorageFailure;
 use crate::present::{human, Progress as ProgressBar};
 
-pub mod ceremony;
-pub mod dispatch;
-pub mod events;
-pub mod files;
-pub mod fleet;
-pub mod lifecycle;
-pub mod ports;
 pub mod report;
-pub mod revocation;
-pub mod signaling_health;
 pub mod transfer_truth;
+#[cfg(feature = "dispatch")]
+pub mod ceremony;
+#[cfg(feature = "dispatch")]
+pub mod dispatch;
+#[cfg(feature = "dispatch")]
+pub mod events;
+#[cfg(feature = "dispatch")]
+pub mod files;
+#[cfg(feature = "dispatch")]
+pub mod fleet;
+#[cfg(feature = "dispatch")]
+pub mod lifecycle;
+#[cfg(feature = "dispatch")]
+pub mod ports;
+#[cfg(feature = "dispatch")]
+pub mod revocation;
+#[cfg(feature = "dispatch")]
+pub mod signaling_health;
 
 // Re-exported at the receive module root so the CLI shim (and library callers)
 // can name `recv::accept_is_sequential` without reaching through the child.

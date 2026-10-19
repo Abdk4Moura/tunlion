@@ -16,12 +16,14 @@ name = "tunlion"
 path = "src/main.rs"
 
 [features]
-default = ["mesh", "mount-server", "forward-server"]
+default = ["mesh", "mount-server", "forward-server", "dispatch"]
 mesh = ["filament-peerloop/mesh"]
 mount-server = ["filament-peerloop/mount-server"]
 # Inbound local forward serving: dial a peer-requested local socket. Default-on
 # for the CLI; reduced engine profiles omit the dial implementation.
 forward-server = ["filament-peerloop/forward-server"]
+# The receive dispatch loop and its host capability traits.
+dispatch = ["filament-peerloop/dispatch"]
 # Static builds need no feature: the musl target alone produces a static-pie
 # binary because the whole TLS tree is rustls. A `static` feature that vendored
 # OpenSSL (a rust_socketio/native-tls leftover, ledger C16) was removed on

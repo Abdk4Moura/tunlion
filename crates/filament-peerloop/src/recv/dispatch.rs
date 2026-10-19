@@ -12,11 +12,13 @@
 //! [`LogSink`](crate::host::LogSink), and the remaining host-bound sectors
 //! through the narrow traits in [`crate::recv::ports`].
 
-use crate::conn::{Conn, DigestSurface, Promotion};
-use crate::control::Req;
+use crate::conn::{Conn, DigestSurface, Presence, Promotion, Rung};
+use crate::control::{Req, ReqKind};
+use crate::daemon_ctl::sshd_listening;
 use crate::driver::DriverOutcome;
-use crate::host::{HostServices, Level, LogSink, Tone};
+use crate::host::{CapGate, HostServices, Level, LogSink, Tone};
 use crate::l2::{self, Mux};
+use crate::limits::MAX_ATTEMPTS;
 use crate::mesh::MeshTunnel;
 #[cfg(l3)]
 use crate::mesh::{
@@ -27,11 +29,14 @@ use crate::present::{Ask, Presentation};
 use crate::recv::ceremony::{Ceremony, Inbound as PakeInbound};
 use crate::recv::ports::{RecvDaemon, RecvPorts, RecvServers};
 use crate::recv::report::{RecvReport, RefusalClass};
+use crate::recv::signaling_health;
 use crate::recv::{IncomingFile, PartMeta, StdoutSink, WriteFailure};
 use crate::refusal::Code as RefusalCode;
+use crate::secret::fresh_secret;
 use crate::session::Session;
 use crate::shell::ShellHost;
 use crate::shell_gate::PeerAuthz;
+use crate::shell_gate::ShellPolicy;
 use crate::{refusal, test_hooks};
 use anyhow::{anyhow, bail, Context, Result};
 use filament_cap::capability as cap;
@@ -61,6 +66,11 @@ use tokio::sync::oneshot;
 /// the loop moves on, and a peer that will never acknowledge must not hold the
 /// receiver (and its exit) hostage.
 const ACK_FLUSH_BUDGET: Duration = Duration::from_secs(2);
+
+/// Whole-file verify failures before the transfer fails clearly (P4/GAP-5).
+pub const MAX_VERIFY_FAILS: u32 = 3;
+/// How long a proven-identity challenge is held before re-issuing.
+pub const PROVEN_CHALLENGE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// The `caps` message to re-send on live links when what this machine serves
 /// changed (a grant, or the revoke of the last shell grant), else None. Pure.
@@ -244,7 +254,7 @@ fn log_ctl_rx<'a>(pid: &str, ty: Option<&'a str>, log: &dyn LogSink) -> Option<&
 /// May this overlay key hold a route here? Not when its device was revoked,
 /// and not once the invitation that admitted it ended: a route is access too,
 /// the one a device keeps without opening anything.
-pub(crate) fn overlay_key_refused(pubkey: &[u8; 32]) -> bool {
+pub fn overlay_key_refused(ports: &RecvPorts, host: &dyn HostServices, pubkey: &[u8; 32]) -> bool {
     ports.identity.device_cert_revoked(pubkey)
         || host
             .delegated_access_for(pubkey)
@@ -292,6 +302,10 @@ pub fn deny_is_proof_attributable(reason: &str) -> bool {
 /// remains. Returns true when the caller must return immediately, having
 /// either parked or sent the fast deny itself.
 pub async fn park_on_deny(
+    known_device: &dyn Fn(&[u8; 32]) -> bool,
+    revoked: &dyn Fn(&[u8; 32]) -> bool,
+    delegated_expired: &dyn Fn(&[u8; 32]) -> bool,
+    denied: &dyn Fn(&str, &str) -> bool,
     parked: &mut Vec<ParkedOpen>,
     conn: &Conn,
     pid: &str,
@@ -334,26 +348,17 @@ pub async fn park_on_deny(
     // "Known key" means it resolves to a device record: an unresolved key
     // cannot become Proven against a record, so it must not occupy hold
     // budget (a stream of unknown-key opens would otherwise fill the queue).
-    if ports
-        .store
-        .devices_find_by_device_pub(&device_pub)
-        .is_none()
-    {
+    if !known_device(&device_pub) {
         return false;
     }
-    if ports.identity.device_cert_revoked_some(Some(&device_pub)) {
+    if revoked(&device_pub) {
         return false;
     }
-    // And independently of how the reason was worded: an ended delegated
-    // device never parks.
-    if host
-        .delegated_access_for(&device_pub)
-        .is_some_and(|a| a.expired(filament_id::now_secs()))
-    {
+    if delegated_expired(&device_pub) {
         return false;
     }
     if let Some(n) = name.as_deref() {
-        if host.device_capability_denied(n, kind.denied_cap()) {
+        if denied(n, kind.denied_cap()) {
             return false;
         }
     }
@@ -1086,7 +1091,7 @@ async fn recv_run(
     // that second link on the roster line under its raw signaling id.
     let code_only = code.is_some() && !daemon;
     if !code_only {
-        sess.channels = devices.iter().map(|(_, s)| channel_of(s)).collect();
+        sess.channels = devices.iter().map(|(_, s)| host.channel_of(s)).collect();
         // Fleet auto-mesh: one more meeting point, where devices certified by the
         // SAME owner key find each other with no pairwise pairing. Presence there
         // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
@@ -1256,7 +1261,7 @@ async fn recv_run(
             } else {
                 log.debug("enrollment closed (no armed keys: mint or arm an auth-key to open)");
             }
-            let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
+            let chans: Vec<String> = devices.iter().map(|(_, s)| host.channel_of(s)).collect();
             let mut c = chans;
             if ports.identity.is_armed() {
                 if let Some(uk) = host.user_key() {
@@ -1326,7 +1331,7 @@ async fn recv_run(
             .await;
             // C12: announce on every known device's presence channel
             if !devices.is_empty() {
-                let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
+                let chans: Vec<String> = devices.iter().map(|(_, s)| host.channel_of(s)).collect();
                 log.say(&format!("watching for {} known device(s)", devices.len()));
                 sess.emit(&sio, "subscribe", json!({ "channels": chans }))
                     .await;
@@ -1762,7 +1767,7 @@ async fn recv_run(
     // session digest (which includes `sess.channels`) repairs a lost subscribe
     // on the next tick. Existing channels and live links are untouched.
     let mut known_channels: std::collections::HashSet<String> =
-        devices.iter().map(|(_, s)| channel_of(s)).collect();
+        devices.iter().map(|(_, s)| host.channel_of(s)).collect();
     known_channels.extend(fleet::channel());
     let mut last_devices_scan = Instant::now();
     // Fleet auto-mesh link state, keyed by peer sid.
@@ -3204,7 +3209,7 @@ async fn recv_run(
                     });
                     if !revoked_secrets.is_empty() {
                         let gone: std::collections::HashSet<String> =
-                            revoked_secrets.iter().map(|s| channel_of(s)).collect();
+                            revoked_secrets.iter().map(|s| host.channel_of(s)).collect();
                         known_channels.retain(|c| !gone.contains(c));
                         let before = sess.channels.len();
                         sess.channels.retain(|c| !gone.contains(c));
@@ -3248,7 +3253,7 @@ async fn recv_run(
                             unrouted.push(pid.clone());
                         }
                     }
-                    forgotten_channels.extend(revoked_secrets.iter().map(|s| channel_of(s)));
+                    forgotten_channels.extend(revoked_secrets.iter().map(|s| host.channel_of(s)));
                     revoked_secrets.clear();
                     brokered_pids.retain(|p, by| {
                         (conn.links.contains_key(p) || conn.direct_pending.contains_key(p))
@@ -3815,7 +3820,7 @@ async fn recv_run(
                             continue;
                         }
                         if let Some((name, secret)) = devices.iter().find(|(_, s)| {
-                            channel_of(s) == p["channel"].as_str().unwrap_or_default()
+                            host.channel_of(s) == p["channel"].as_str().unwrap_or_default()
                         }) {
                             let pid = p["id"].as_str().unwrap_or_default().to_string();
                             let (name, secret) = (name.clone(), secret.clone());
@@ -4087,7 +4092,7 @@ async fn recv_run(
                 }
                 if let Some((n, sec)) = devices
                     .iter()
-                    .find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or(""))
+                    .find(|(_, s)| host.channel_of(s) == v["channel"].as_str().unwrap_or(""))
                 {
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
                     // WARM-HOLD: a known peer just came online. Under auto-warm, adopt it
@@ -4151,7 +4156,7 @@ async fn recv_run(
                     }
                 } else if v["channel"].as_str().is_some_and(|c| {
                     forgotten_channels.contains(c)
-                        || revoked_secrets.iter().any(|s| channel_of(s) == c)
+                        || revoked_secrets.iter().any(|s| host.channel_of(s) == c)
                 }) {
                     // A device forgotten here, dialing the meeting place it still
                     // finds us on: tell it, rather than leave it waiting.
@@ -4295,7 +4300,7 @@ async fn recv_run(
                         && !conn.links.contains_key(&from)
                         && data["ch"].as_str().is_some_and(|c| {
                             forgotten_channels.contains(c)
-                                || revoked_secrets.iter().any(|s| channel_of(s) == c)
+                                || revoked_secrets.iter().any(|s| host.channel_of(s) == c)
                         })
                     {
                         refuse_unrecognized_dial(&sio, &from, log.as_ref()).await;
@@ -4806,7 +4811,11 @@ async fn recv_run(
                                     log.debug(&format!(
                                         "  l3-announce from {pid} ignored: relayed link and peer does not advertise relay datagrams"
                                     ));
-                                } else if overlay_key_refused(&pending.pubkey) {
+                                } else if overlay_key_refused(
+                                    &ports,
+                                    host.as_ref(),
+                                    &pending.pubkey,
+                                ) {
                                     // The overlay key IS the device key: a
                                     // revoked or forgotten device gets no route.
                                     log.debug(&format!(
@@ -5351,7 +5360,11 @@ async fn recv_run(
                                         Ok(ip) => {
                                             // The overlay key IS the device key: a
                                             // revoked or forgotten device gets no route.
-                                            if overlay_key_refused(&ann.pubkey) {
+                                            if overlay_key_refused(
+                                                &ports,
+                                                host.as_ref(),
+                                                &ann.pubkey,
+                                            ) {
                                                 log.debug(&format!(
                                                     "  l3-announce from {pid} ignored: its key is revoked here"
                                                 ));
@@ -7849,7 +7862,7 @@ async fn recv_run(
                                 let from =
                                     conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                                 let nm = inc.name.clone();
-                                if finalize_incoming(
+                                if crate::recv::files::finalize_incoming(
                                     host.as_ref(),
                                     log.as_ref(),
                                     inc,
@@ -7994,7 +8007,7 @@ async fn recv_run(
                             None
                         };
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        if finalize_incoming(
+                        if crate::recv::files::finalize_incoming(
                             host.as_ref(),
                             log.as_ref(),
                             inc,
@@ -8064,7 +8077,7 @@ async fn recv_run(
                                 let from =
                                     conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                                 let nm = inc.name.clone();
-                                if finalize_incoming(
+                                if crate::recv::files::finalize_incoming(
                                     host.as_ref(),
                                     log.as_ref(),
                                     inc,
@@ -8196,7 +8209,7 @@ async fn recv_run(
                             None
                         };
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        if finalize_incoming(
+                        if crate::recv::files::finalize_incoming(
                             host.as_ref(),
                             log.as_ref(),
                             inc,
@@ -8488,7 +8501,10 @@ async fn recv_run(
                         log.say(&format!(
                             "  {}  {}",
                             log.paint(Tone::Bold, n),
-                            log.paint(Tone::Dim, &format!("(channel {})", &channel_of(s)[..12]))
+                            log.paint(
+                                Tone::Dim,
+                                &format!("(channel {})", &host.channel_of(s)[..12])
+                            )
                         ));
                     }
                 } else if let Some(n) = ans.strip_prefix("forget ") {
@@ -8957,4 +8973,97 @@ fn regex_lite_code(s: &str) -> bool {
         && !parts[1].is_empty()
         && parts[2].len() >= 2
         && parts[2].chars().all(|c| c.is_ascii_digit())
+}
+/// `receive -o -`: the sender said the stream ended. Every byte written in
+/// order and the digest of what was written matching the offered one is a
+/// delivery like a file's, and is acked the same way, so the sender can report
+/// it verified. Anything else ends the receive with the reason: the bytes are
+/// already out and stdout cannot be rewound to re-fetch them.
+async fn stdout_delivered(
+    inc: &IncomingFile,
+    conn: &Conn,
+    pid: &str,
+    sid: u32,
+    report: &RecvReport,
+) -> Result<()> {
+    let Some(sink) = &inc.stdout else {
+        return Ok(());
+    };
+    let (verdict, written) = {
+        let s = sink
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the stdout writer for {} failed", inc.name))?;
+        (s.verdict(inc.size, inc.full.as_deref()), s.written())
+    };
+    if let Err(why) = verdict {
+        bail!("{}: {why}", inc.name);
+    }
+    inc.bar.done(written);
+    report.note_stored(&inc.name, written, inc.full.as_deref(), "-");
+    if inc.full.is_some() {
+        if let Some(t) = conn.transport_of(pid) {
+            let _ = t
+                .send_control(&protocol::delivery_ack_msg(&inc.id, sid))
+                .await;
+            let _ = t.flush().await;
+        }
+    }
+    Ok(())
+}
+
+/// A write to an incoming file failed. Report it on this side (must-see), drop
+/// the partial, and return the typed refusal (`id`, token, sentence) for the
+/// sender. `need` is what was still to come and `free` what the disk has now,
+/// so a full disk says by how much instead of calling the file corrupt.
+fn refuse_failed_write(
+    inc: IncomingFile,
+    dir: &Path,
+    wf: &crate::recv::files::WriteFailure,
+    from: &str,
+    daemon: bool,
+    report: &RecvReport,
+    log: &dyn LogSink,
+    host: &dyn HostServices,
+) -> (String, &'static str, String) {
+    let need = inc
+        .size
+        .saturating_sub(inc.received.load(Ordering::Relaxed));
+    let free = host.free_space(dir);
+    let (token, msg) =
+        crate::recv::files::storage_refusal(wf.kind, &inc.name, &wf.detail, Some(need), free);
+    let from = if from.is_empty() { "the sender" } else { from };
+    log.critical(&log.paint(
+        Tone::Err,
+        &format!("  refused {} from {from}: {msg}", inc.name),
+    ));
+    note_refusal(
+        report,
+        daemon,
+        &inc.name,
+        inc.size,
+        token,
+        &msg,
+        crate::recv::report::storage_kind(token),
+    );
+    let id = inc.id.clone();
+    let part = inc.part_path.clone();
+    drop(inc);
+    crate::recv::files::discard_partial(&part);
+    (id, token, msg)
+}
+
+/// Record a refusal for a one-shot receive's outcome (`recv_report`). The
+/// daemon serves many senders and ends with none of them, so it keeps no list.
+fn note_refusal(
+    report: &RecvReport,
+    daemon: bool,
+    name: &str,
+    size: u64,
+    token: &str,
+    msg: &str,
+    class: RefusalClass,
+) {
+    if !daemon {
+        report.note_refused(name, size, token, msg, class);
+    }
 }

@@ -989,3 +989,41 @@ impl RecvPrompt for CliPrompt {
         Some(Box::new(CliRawMode(crate::TtyGuard::raw())))
     }
 }
+
+/// The CLI's ambient settle-then-evaluate entry. The library decision takes
+/// the four host answers as closures; this adapter supplies the process's own
+/// device store/capability answers, exactly as the pre-move call sites did.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cli_park_on_deny(
+    parked: &mut Vec<ParkedOpen>,
+    conn: &Conn,
+    pid: &str,
+    kind: ParkKind,
+    t: &Arc<dyn Transport>,
+    sid: u32,
+    v: &Value,
+    gate_reason: &str,
+) -> bool {
+    let known = |p: &[u8; 32]| crate::device_view::devices_find_by_device_pub(p).is_some();
+    let revoked = |p: &[u8; 32]| crate::device_view::device_cert_revoked(p);
+    let delegated = |p: &[u8; 32]| {
+        crate::identity_state::delegated_access_for(p)
+            .is_some_and(|a| a.expired(identity::now_secs()))
+    };
+    let denied = |n: &str, c: &str| crate::device_capability_denied(n, c);
+    filament_peerloop::recv::dispatch::park_on_deny(
+        &known,
+        &revoked,
+        &delegated,
+        &denied,
+        parked,
+        conn,
+        pid,
+        kind,
+        t,
+        sid,
+        v,
+        gate_reason,
+    )
+    .await
+}

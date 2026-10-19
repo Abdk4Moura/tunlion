@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
-use filament_peerloop::host::LogSink;
+use crate::host::LogSink;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ControlReadyError {
@@ -286,7 +286,7 @@ fn threshold_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filament_peerloop::driver::{Cancellation, DriverOutcome};
+    use crate::driver::{Cancellation, DriverOutcome};
     use std::time::Duration;
 
     #[tokio::test]
@@ -384,7 +384,7 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .recv();
         }
-        fn paint(&self, _tone: filament_peerloop::host::Tone, s: &str) -> String {
+        fn paint(&self, _tone: crate::host::Tone, s: &str) -> String {
             s.to_string()
         }
         fn glyph_ok(&self) -> &'static str {
@@ -393,7 +393,7 @@ mod tests {
         fn glyph_warn(&self) -> &'static str {
             "!"
         }
-        fn enabled(&self, _level: filament_peerloop::host::Level) -> bool {
+        fn enabled(&self, _level: crate::host::Level) -> bool {
             true
         }
     }
@@ -410,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn watchdog_stop_wakes_and_joins_its_observer() {
-        use filament_peerloop::host::NoLog;
+        use crate::host::NoLog;
         // A 30 s observation interval makes the join meaningful: only the
         // disconnect wake can let stop return before the generous 5 s test
         // bound (production uses 1 s; the forced-block test covers timeout).
@@ -437,14 +437,14 @@ mod tests {
         assert_eq!(watchdog.stop().await, WatchdogStop::NotStarted);
         assert_eq!(watchdog.join_waiters(), 0);
         // A late tick must not create an observer after the terminal stop.
-        watchdog.tick(Arc::new(filament_peerloop::host::NoLog));
+        watchdog.tick(Arc::new(crate::host::NoLog));
         assert_eq!(watchdog.phase, Phase::Stopped);
         assert!(watchdog.thread.is_none());
     }
 
     #[tokio::test]
     async fn watchdog_tick_after_stop_does_not_restart_the_observer() {
-        use filament_peerloop::host::NoLog;
+        use crate::host::NoLog;
         let mut watchdog =
             LoopWatchdog::with_limits(Duration::from_secs(30), 20, Duration::from_secs(5));
         watchdog.tick(Arc::new(NoLog));
