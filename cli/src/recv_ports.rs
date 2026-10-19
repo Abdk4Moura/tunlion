@@ -145,24 +145,15 @@ impl RecvIdentity for CliRecv {
         crate::identity_state::gate_settle_ms()
     }
     fn hold_expired(&self, held: Instant) -> bool {
-        crate::identity_lifecycle::hold_expired(held)
+        crate::identity_lifecycle::hold_expired(held, Instant::now())
     }
     async fn resend_identity_challenge(
         &self,
         conn: &Conn,
         pid: &str,
-        t: &Arc<dyn Transport>,
-        pending_proven: &Arc<std::sync::Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
-        identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
-    ) {
-        crate::identity_lifecycle::resend_identity_challenge(
-            conn,
-            pid,
-            t,
-            pending_proven,
-            identity_nonces,
-        )
-        .await
+        identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+    ) -> bool {
+        crate::identity_lifecycle::resend_identity_challenge(conn, pid, identity_nonces).await
     }
     fn device_name_for_pub(&self, device_pub: &[u8; 32]) -> Option<String> {
         crate::device_view::device_name_for_pub(device_pub)
@@ -190,8 +181,13 @@ impl RecvIdentity for CliRecv {
     ) -> Result<bool> {
         crate::roster::verify_and_store_roster(blob, owner_pub, now)
     }
-    fn verify_depart(&self, device_pub: &[u8; 32], msg: &str, sig: &[u8; 64]) -> bool {
-        crate::membership::verify_depart(device_pub, msg, sig).is_ok()
+    fn verify_depart(
+        &self,
+        device_pub: &[u8; 32],
+        msg: &str,
+        sig: &[u8; 64],
+    ) -> std::result::Result<(), &'static str> {
+        crate::membership::verify_depart(device_pub, msg, sig)
     }
     fn fleet_channel(&self) -> Option<String> {
         crate::fleet::channel()
@@ -892,8 +888,13 @@ impl RecvDaemon for CliRecv {
     ) -> Result<bool> {
         crate::roster::verify_and_store_roster(blob, owner_pub, now)
     }
-    fn verify_depart(&self, device_pub: &[u8; 32], msg: &str, sig: &[u8; 64]) -> bool {
-        crate::membership::verify_depart(device_pub, msg, sig).is_ok()
+    fn verify_depart(
+        &self,
+        device_pub: &[u8; 32],
+        msg: &str,
+        sig: &[u8; 64],
+    ) -> std::result::Result<(), &'static str> {
+        crate::membership::verify_depart(device_pub, msg, sig)
     }
     fn fleet_share_root(&self) -> PathBuf {
         crate::fleet_support::fleet_share_root()

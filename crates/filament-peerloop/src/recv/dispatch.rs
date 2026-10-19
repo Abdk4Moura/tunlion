@@ -2006,7 +2006,7 @@ async fn recv_run(
                         conn.present.clear_sticky();
                         let _ =
                             tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-                        return Err(e);
+                        return Err(anyhow::anyhow!("{}", e.message));
                     }
                 }
             }
@@ -2218,7 +2218,7 @@ async fn recv_run(
                                 ),
                             })).await;
                         } else if matches!(&req.kind, ReqKind::ListWarm) {
-                            ports.daemon.list_warm(&conn, req).await;
+                            ports.daemon.list_warm(req, &conn).await;
                         } else if let ReqKind::FleetRendezvous { name } =
                             req.kind.clone()
                         {
@@ -2491,7 +2491,7 @@ async fn recv_run(
                     .unwrap()
                     .get(&p.pid)
                     .map(|(held_t, deadline)| {
-                        !ports.identity.hold_expired(*deadline, now) && Arc::ptr_eq(held_t, &t)
+                        !ports.identity.hold_expired(*deadline) && Arc::ptr_eq(held_t, &t)
                     })
                     .unwrap_or(false);
                 // A held nonce is still usable: RE-SEND the same challenge
@@ -2507,13 +2507,7 @@ async fn recv_run(
                     if retry_due {
                         if ports
                             .identity
-                            .resend_identity_challenge(
-                                &conn,
-                                &p.pid,
-                                &t,
-                                &st.pending_proven,
-                                &mut identity_nonces,
-                            )
+                            .resend_identity_challenge(&conn, &p.pid, &mut identity_nonces)
                             .await
                         {
                             log.debug(&format!(
@@ -2573,7 +2567,7 @@ async fn recv_run(
                             .servers
                             .open_exec(
                                 &mut conn,
-                                &p.pid,
+                                p.pid.clone(),
                                 &p.v,
                                 &shell_policy,
                                 &shell_user,
@@ -2604,7 +2598,7 @@ async fn recv_run(
                             .servers
                             .ssh_sign(
                                 &mut conn,
-                                p.pid.clone(),
+                                &p.pid,
                                 t.clone(),
                                 &p.v,
                                 &shell_policy,
@@ -4696,13 +4690,7 @@ async fn recv_run(
                     if !proven && !idev_known {
                         ports
                             .identity
-                            .issue_proven_challenge_and_hold(
-                                &conn,
-                                &pid,
-                                &t,
-                                &st.pending_proven,
-                                &mut identity_nonces,
-                            )
+                            .issue_proven_challenge_and_hold(&conn, &pid, &mut identity_nonces)
                             .await;
                     }
                 }

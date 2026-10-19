@@ -98,10 +98,8 @@ pub trait RecvIdentity: Send + Sync {
         &self,
         conn: &Conn,
         pid: &str,
-        t: &Arc<dyn Transport>,
-        pending_proven: &Arc<std::sync::Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
-        identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
-    );
+        identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+    ) -> bool;
     fn device_name_for_pub(&self, device_pub: &[u8; 32]) -> Option<String>;
     fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool;
     fn device_cert_revoked_some(&self, device_pub: Option<&[u8; 32]>) -> bool {
@@ -119,7 +117,12 @@ pub trait RecvIdentity: Send + Sync {
         owner_pub: &[u8; 32],
         now: u64,
     ) -> anyhow::Result<bool>;
-    fn verify_depart(&self, device_pub: &[u8; 32], msg: &str, sig: &[u8; 64]) -> bool;
+    fn verify_depart(
+        &self,
+        device_pub: &[u8; 32],
+        msg: &str,
+        sig: &[u8; 64],
+    ) -> std::result::Result<(), &'static str>;
     fn fleet_channel(&self) -> Option<String>;
     fn fleet_rv(&self) -> Option<String>;
     fn is_fleet_channel(&self, ch: &str) -> bool;
@@ -356,7 +359,12 @@ pub trait RecvDaemon: Send + Sync {
         owner_pub: &[u8; 32],
         now: u64,
     ) -> anyhow::Result<bool>;
-    fn verify_depart(&self, device_pub: &[u8; 32], msg: &str, sig: &[u8; 64]) -> bool;
+    fn verify_depart(
+        &self,
+        device_pub: &[u8; 32],
+        msg: &str,
+        sig: &[u8; 64],
+    ) -> std::result::Result<(), &'static str>;
     fn fleet_share_root(&self) -> PathBuf;
     fn mark_daemon_ready(&mut self);
     fn record_proxy(&self, bind: &str, port: u16);
