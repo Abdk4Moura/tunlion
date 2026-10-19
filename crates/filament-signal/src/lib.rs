@@ -79,6 +79,9 @@ pub struct Client {
     /// echoes them back on `43`.
     next_ack: Arc<AtomicU64>,
     pending: Pending,
+    // Shared among Client clones so shutdown can join the socket reader.
+    reader_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    stopping: Arc<Mutex<bool>>,
 }
 
 impl Client {
@@ -178,6 +181,8 @@ impl Client {
                 writer: Arc::new(Mutex::new(writer)),
                 next_ack: Arc::new(AtomicU64::new(1)),
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                reader_task: Arc::new(Mutex::new(None)),
+                stopping: Arc::new(Mutex::new(false)),
             },
             far,
         ))
@@ -188,9 +193,18 @@ impl Client {
     /// Best effort by design: this runs on paths that are already tearing down,
     /// and a peer that has gone away must not turn shutdown into an error.
     pub async fn disconnect(&self) -> Result<()> {
+        *self.stopping.lock().await = true;
         let mut w = self.writer.lock().await;
         let _ = w.send(Message::Text("41".into())).await; // Socket.IO DISCONNECT
         let _ = w.send(Message::Close(None)).await;
+        drop(w);
+        // Keep the slot locked while awaiting: concurrent disconnect callers
+        // must not mistake the first caller's taken handle for a joined task.
+        let mut reader_task = self.reader_task.lock().await;
+        if let Some(task) = reader_task.as_mut() {
+            let _ = task.await;
+            *reader_task = None;
+        }
         Ok(())
     }
 }
@@ -342,13 +356,17 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
 
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let id = next_conn_id();
+    let reader_task = Arc::new(Mutex::new(None));
+    let stopping = Arc::new(Mutex::new(false));
     let client = Client {
         id,
         writer: writer.clone(),
         next_ack: Arc::new(AtomicU64::new(1)),
         pending: pending.clone(),
+        reader_task: reader_task.clone(),
+        stopping: stopping.clone(),
     };
-    tokio::spawn(read_loop(id, reader, writer, tx, pending));
+    *reader_task.lock().await = Some(tokio::spawn(read_loop(id, reader, writer, tx, pending, stopping)));
     Ok(client)
 }
 
@@ -363,6 +381,7 @@ async fn read_loop(
     writer: Writer,
     tx: mpsc::UnboundedSender<Incoming>,
     pending: Pending,
+    stopping: Arc<Mutex<bool>>,
 ) {
     let reason = loop {
         let Some(next) = reader.next().await else { break "closed".to_string() };
@@ -392,6 +411,10 @@ async fn read_loop(
             Some(('4', rest)) => match split_packet(rest) {
                 Some(('2', body)) => {
                     if let Some((name, data)) = parse_event(body) {
+                        let stopping = stopping.lock().await;
+                        if *stopping {
+                            break "stopped".to_string();
+                        }
                         if tx.send(Incoming::Event { name, data }).is_err() {
                             break "receiver gone".to_string();
                         }
@@ -411,7 +434,10 @@ async fn read_loop(
             _ => {}
         }
     };
-    let _ = tx.send(Incoming::Down { conn, reason });
+    let stopping = stopping.lock().await;
+    if !*stopping {
+        let _ = tx.send(Incoming::Down { conn, reason });
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +446,90 @@ mod tls_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn local_client(
+        server_action: impl FnOnce(
+                tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+            ) -> tokio::task::JoinHandle<()>
+            + Send
+            + 'static,
+    ) -> (Client, mpsc::UnboundedReceiver<Incoming>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client_fut = connect(&format!("http://{addr}"), tx);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            ws.send(Message::Text("0{}".into())).await.unwrap();
+            assert_eq!(ws.next().await.unwrap().unwrap().into_text().unwrap(), "40");
+            ws.send(Message::Text("40{}".into())).await.unwrap();
+            server_action(ws)
+        });
+        let client = client_fut.await.unwrap();
+        // Let the server finish its handshake and start its scripted behavior.
+        let action = server.await.unwrap();
+        (client, rx, action)
+    }
+
+    async fn reply_to_client_close(mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
+        while let Some(frame) = ws.next().await {
+            match frame.unwrap() {
+                Message::Close(_) => {
+                    let _ = ws.send(Message::Close(None)).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_joins_reader_and_suppresses_late_event_and_down() {
+        let (client, mut rx, server) = local_client(|mut ws| {
+            tokio::spawn(async move {
+                // The local stop flag is set before disconnect writes this packet.
+                assert_eq!(ws.next().await.unwrap().unwrap().into_text().unwrap(), "41");
+                ws.send(Message::Text(r#"42["late",{}]"#.into()))
+                    .await
+                    .unwrap();
+                reply_to_client_close(ws).await;
+            })
+        })
+        .await;
+        client.disconnect().await.unwrap();
+        assert!(rx.try_recv().is_err(), "local shutdown must not emit Down/event");
+        assert!(rx.recv().await.is_none(), "disconnect must await reader exit");
+        assert!(server.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_disconnects_are_idempotent_and_both_join() {
+        let (client, mut rx, server) =
+            local_client(|ws| tokio::spawn(reply_to_client_close(ws))).await;
+        let (a, b) = tokio::join!(client.disconnect(), client.clone().disconnect());
+        a.unwrap();
+        b.unwrap();
+        assert!(rx.try_recv().is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_close_delivers_down_when_not_locally_stopping() {
+        let (client, mut rx, server) = local_client(|mut ws| {
+            tokio::spawn(async move {
+                ws.send(Message::Close(None)).await.unwrap();
+            })
+        })
+        .await;
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, Incoming::Down { conn, .. } if conn == client.id()));
+        client.disconnect().await.unwrap();
+        server.await.unwrap();
+    }
 
     #[test]
     fn https_becomes_wss_and_keeps_the_engineio_query() {
