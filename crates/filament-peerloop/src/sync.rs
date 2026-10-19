@@ -407,6 +407,8 @@ pub mod serving {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
+    #[cfg(test)]
+    use tokio::sync::Notify;
     use tokio::task::JoinHandle;
 
     /// Server configuration resolved by the caller from one admitted open.
@@ -422,12 +424,15 @@ pub mod serving {
         pub stream: mpsc::Receiver<Option<Bytes>>,
         /// Maximum individual length-prefixed record, including the manifest.
         pub max_record_bytes: usize,
+        #[cfg(test)]
+        finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     }
 
     /// An owned serving task. The caller can cancel and join it; dropping the
     /// owner requests cancellation before detaching the join handle.
     pub struct SyncServeTask {
         cancel: watch::Sender<bool>,
+        commit_state: Arc<std::sync::Mutex<bool>>,
         join: Option<JoinHandle<Result<(), String>>>,
     }
 
@@ -435,6 +440,9 @@ pub mod serving {
         /// Request cancellation. The server exits at its next record boundary,
         /// then closes and removes its mux stream before completing the handle.
         pub fn cancel(&self) {
+            let mut cancelled = self.commit_state.lock().unwrap_or_else(|e| e.into_inner());
+            *cancelled = true;
+            drop(cancelled);
             self.cancel.send_replace(true);
         }
 
@@ -456,7 +464,7 @@ pub mod serving {
     impl Drop for SyncServeTask {
         fn drop(&mut self) {
             // A dropped owner must not silently leave a live receiver behind.
-            self.cancel.send_replace(true);
+            self.cancel();
         }
     }
 
@@ -465,11 +473,13 @@ pub mod serving {
     /// and always removes the stream on success, refusal, or cancellation.
     pub fn spawn_sync_server(config: SyncServeConfig) -> SyncServeTask {
         let (cancel, cancel_rx) = watch::channel(false);
+        let commit_state = Arc::new(std::sync::Mutex::new(false));
+        let task_commit_state = commit_state.clone();
         let join = tokio::spawn(async move {
-            let result = serve(config, cancel_rx).await;
+            let result = serve(config, cancel_rx, task_commit_state).await;
             result.map_err(|e| e.to_string())
         });
-        SyncServeTask { cancel, join: Some(join) }
+        SyncServeTask { cancel, commit_state, join: Some(join) }
     }
 
     #[derive(Default)]
@@ -537,8 +547,12 @@ pub mod serving {
         send_rec(t, sid, &serde_json::to_vec(value)?).await
     }
 
-    async fn serve(mut cfg: SyncServeConfig, mut cancel: watch::Receiver<bool>) -> Result<()> {
-        let result = serve_protocol(&mut cfg, &mut cancel).await;
+    async fn serve(
+        mut cfg: SyncServeConfig,
+        mut cancel: watch::Receiver<bool>,
+        commit_state: Arc<std::sync::Mutex<bool>>,
+    ) -> Result<()> {
+        let result = serve_protocol(&mut cfg, &mut cancel, &commit_state).await;
         if let Err(error) = &result {
             let _ = cfg.transport.send_control(&json!({
                 "type": "l2-close", "sid": cfg.sid, "err": error.to_string()
@@ -551,6 +565,7 @@ pub mod serving {
     async fn serve_protocol(
         cfg: &mut SyncServeConfig,
         cancel: &mut watch::Receiver<bool>,
+        commit_state: &Arc<std::sync::Mutex<bool>>,
     ) -> Result<()> {
         let mut recs = Records::default();
         let max_record_bytes = cfg.max_record_bytes.min(MAX_SYNC_RECORD_BYTES);
@@ -575,7 +590,9 @@ pub mod serving {
                 Some("done") => return Ok(()),
                 Some("file") if !cfg.dry_run => {
                     let path = record["p"].as_str().unwrap_or("").to_string();
-                    let result = receive_file(cfg, &record, &mut recs, cancel, max_record_bytes).await;
+                    let result = receive_file(
+                        cfg, &record, &mut recs, cancel, max_record_bytes, commit_state,
+                    ).await;
                     let ack = match result {
                         Ok(()) => json!({ "type": "file-ack", "p": path, "ok": true }),
                         Err(error) => json!({ "type": "file-ack", "p": path, "ok": false, "err": error.to_string() }),
@@ -601,6 +618,7 @@ pub mod serving {
         recs: &mut Records,
         cancel: &mut watch::Receiver<bool>,
         max_record_bytes: usize,
+        commit_state: &Arc<std::sync::Mutex<bool>>,
     ) -> Result<()> {
         let rel = safe_relpath(record["p"].as_str().unwrap_or("")).ok_or_else(|| anyhow::anyhow!("unsafe path"))?;
         let size = record["size"].as_u64().unwrap_or(0);
@@ -613,7 +631,6 @@ pub mod serving {
         );
         let mut part_rel = rel.clone();
         part_rel.set_file_name(part_name);
-        let part = cfg.root.join(&part_rel);
         let source = match safe_open_existing_file(&cfg.root, &rel) {
             Ok(source) => match source.metadata() {
                 Ok(metadata) if metadata.is_file() => Some(source),
@@ -674,18 +691,36 @@ pub mod serving {
         }
         file.set_len(size)?;
         file.sync_all()?;
+        #[cfg(test)]
+        if let Some((entered, release)) = &cfg.finalization_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         let got = tokio::task::spawn_blocking(move || {
             let digest = hash_open_file(&mut file);
             (file, digest)
         }).await?;
         let (file, digest) = got;
-        if digest.as_deref() != Some(full.as_str()) {
+        if *cancel.borrow() {
+            crate::mount_proto::safe_unlink_staged_beneath(&cfg.root, &part_rel, &file)?;
             drop(file);
-            std::fs::remove_file(&part)?;
+            bail!("sync cancelled");
+        }
+        if digest.as_deref() != Some(full.as_str()) {
+            crate::mount_proto::safe_unlink_staged_beneath(&cfg.root, &part_rel, &file)?;
+            drop(file);
             bail!("content hash mismatch after transfer");
         }
+        let cancelled = commit_state.lock().unwrap_or_else(|e| e.into_inner());
+        if *cancelled {
+            drop(cancelled);
+            crate::mount_proto::safe_unlink_staged_beneath(&cfg.root, &part_rel, &file)?;
+            drop(file);
+            bail!("sync cancelled");
+        }
+        crate::mount_proto::safe_rename_beneath(&cfg.root, &part_rel, &rel, &file)?;
         drop(file);
-        std::fs::rename(&part, &target)?;
+        drop(cancelled);
         Ok(())
     }
 
@@ -723,7 +758,25 @@ pub mod serving {
         {
             // CREATE_NEW is atomic on Windows: a pre-existing file, symlink,
             // or reparse point cannot be followed or replaced.
-            std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(root.join(rel))
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const DELETE: u32 = 0x0001_0000;
+                const GENERIC_READ: u32 = 0x8000_0000;
+                const GENERIC_WRITE: u32 = 0x4000_0000;
+                const FILE_SHARE_ALL: u32 = 0x0001 | 0x0002 | 0x0004;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                std::fs::OpenOptions::new()
+                    .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                    .share_mode(FILE_SHARE_ALL)
+                    .create_new(true)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(root.join(rel))
+            }
+            #[cfg(not(windows))]
+            {
+                std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(root.join(rel))
+            }
         }
     }
 
@@ -857,6 +910,14 @@ pub mod serving {
         }
 
         async fn setup(root: &Path, wire: Vec<u8>) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
+            setup_with_finalization_gate(root, wire, None).await
+        }
+
+        async fn setup_with_finalization_gate(
+            root: &Path,
+            wire: Vec<u8>,
+            finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        ) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
             let host: Arc<dyn HostServices> = Arc::new(NoHost);
             let transport = Arc::new(CaptureTransport::default());
             let mux = Mux::new(transport.clone(), host);
@@ -873,6 +934,8 @@ pub mod serving {
                 dry_run: false,
                 stream,
                 max_record_bytes: super::super::MAX_SYNC_RECORD_BYTES,
+                #[cfg(test)]
+                finalization_gate,
             });
             (task, mux, transport)
         }
@@ -978,6 +1041,108 @@ pub mod serving {
             assert_eq!(replies[1]["type"], "file-ack");
             assert_eq!(replies[1]["ok"], false);
             assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[tokio::test]
+        async fn cancellation_during_hash_finalization_preserves_target_and_withholds_success_ack() {
+            let root = TempRoot::new();
+            std::fs::write(root.0.join("file.txt"), b"initial").unwrap();
+            let bytes = b"updated";
+            let digest = sha2::Sha256::digest(bytes).iter()
+                .map(|b| format!("{b:02x}")).collect::<String>();
+            let mut wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[]}), &mut wire);
+            record(&json!({"type":"file", "p":"file.txt", "size":bytes.len(), "full":digest}), &mut wire);
+            record(&json!({"type":"chunk", "idx":0}), &mut wire);
+            record_bytes(bytes, &mut wire);
+            record(&json!({"type":"file-end"}), &mut wire);
+            record(&json!({"type":"done"}), &mut wire);
+
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_finalization_gate(
+                &root.0,
+                wire,
+                Some((entered.clone(), release.clone())),
+            ).await;
+            entered.notified().await;
+            task.cancel();
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), b"initial");
+            assert!(!root.0.join("file.txt.part").exists());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["type"], "file-ack");
+            assert_eq!(replies[1]["ok"], false);
+            assert_eq!(replies[1]["err"], "sync cancelled");
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn parent_swap_to_outside_symlink_is_refused_by_final_rename() {
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            let nested = root.0.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            let bytes = b"confined";
+            let digest = sha2::Sha256::digest(bytes).iter()
+                .map(|b| format!("{b:02x}")).collect::<String>();
+            let mut wire = Vec::new();
+            record(&json!({"type":"manifest", "files":[]}), &mut wire);
+            record(&json!({"type":"file", "p":"nested/file.txt", "size":bytes.len(), "full":digest}), &mut wire);
+            record(&json!({"type":"chunk", "idx":0}), &mut wire);
+            record_bytes(bytes, &mut wire);
+            record(&json!({"type":"file-end"}), &mut wire);
+            record(&json!({"type":"done"}), &mut wire);
+
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_finalization_gate(
+                &root.0,
+                wire,
+                Some((entered.clone(), release.clone())),
+            ).await;
+            entered.notified().await;
+            let displaced = root.0.join("nested-displaced");
+            std::fs::rename(&nested, &displaced).unwrap();
+            std::os::unix::fs::symlink(&outside.0, &nested).unwrap();
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            assert!(std::fs::read_dir(&outside.0).unwrap().next().is_none());
+            assert!(displaced.join("file.txt").exists());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["type"], "file-ack");
+            assert_eq!(replies[1]["ok"], false);
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn safe_final_rename_replaces_final_symlink_without_following_it() {
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            let outside_file = outside.0.join("outside.txt");
+            std::fs::write(&outside_file, b"outside remains").unwrap();
+            std::fs::write(root.0.join("file.txt.part"), b"new content").unwrap();
+            std::os::unix::fs::symlink(&outside_file, root.0.join("file.txt")).unwrap();
+            let source = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.0.join("file.txt.part"))
+                .unwrap();
+
+            crate::mount_proto::safe_rename_beneath(
+                &root.0,
+                Path::new("file.txt.part"),
+                Path::new("file.txt"),
+                &source,
+            ).unwrap();
+
+            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), b"new content");
+            assert_eq!(std::fs::read(outside_file).unwrap(), b"outside remains");
         }
 
         #[tokio::test]
