@@ -110,12 +110,14 @@ loop. Linking the engine means that function's driver, not a copy of
 `send_cmd`. `send_cmd` stays in the CLI. The library will call
 `filament-transfer` and `filament-proto` for the byte mechanics.
 
-`Conn` lives in `cli/src/conn.rs`, not in `main.rs`. The library will own link
-state and adoption. The CLI keeps argument parsing, terminal copy, the pidfile,
-service install, the control socket, and `/etc` writes. Lookups use the
-petname (`verified_name`), never the broadcast display name. A signaling close
-is current only when it carries the live client id and the same link
-generation.
+`Conn` now lives in `filament-peerloop::conn`; `cli/src/conn.rs` is only a
+re-export shim. The library will own link state and adoption. The CLI still owns
+argument parsing, terminal copy, the pidfile, service install, the control
+socket, and `/etc` writes, and it still owns the receive driver itself
+(`cli/src/recv_cmd.rs`), which is why `Core::start` remains `EngineNotLinked`.
+Lookups use the petname (`verified_name`), never the broadcast display name. A
+signaling close is current only when it carries the live client id and the same
+link generation.
 
 ## What a caller must not do
 

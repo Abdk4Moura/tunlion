@@ -2,8 +2,10 @@
 //!
 //! Android is what forced the surface into existence. It is one caller, not the
 //! owner. A desktop embedding, a test, or another language binding uses the
-//! same types. Slice 1 is identity in an explicit config directory. The peer
-//! loop is still in the CLI, so `start` refuses by name. See `docs/android-ffi.md`.
+//! same types. Slice 1 is identity in an explicit config directory. `Conn` and
+//! the receive-driver lifetime seam live in `filament-peerloop::conn` and the
+//! CLI (`cli/src/recv_cmd.rs`) respectively, so the receive driver is still not
+//! callable from this crate and `start` refuses by name. See `docs/android-ffi.md`.
 
 uniffi::setup_scaffolding!();
 
@@ -34,7 +36,9 @@ pub struct UncommittedIdentity {
 /// Whether the peer loop is running inside this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum EngineState {
-    /// `Conn` and the receive loop still live in the CLI binary.
+    /// The receive driver and its lifetime controls still live in the CLI
+    /// binary (`cli/src/recv_cmd.rs`); only `Conn` has moved into
+    /// `filament-peerloop`. `Core::start` therefore returns `EngineNotLinked`.
     NotLinked,
 }
 
