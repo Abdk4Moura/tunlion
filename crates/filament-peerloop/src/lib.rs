@@ -29,9 +29,13 @@
 //! `cli/src/recv_files.rs`: the untrusted-name collision rule, the whole-file
 //! digest, the `.part.meta` sidecar and the resumable-partial lifecycle, the
 //! storage-failure vocabulary, the in-order `StdoutSink`, the `IncomingFile`
-//! state, the whole-file verify and the confinement-safe `.part` open. The CLI
-//! re-exports them; what stays there is the orchestration plus the host/UI
-//! adapters (`finalize_incoming`, the inbox helpers, the rendered refusal).
+//! state, the whole-file verify and the confinement-safe `.part` open. It also
+//! carries `recv::transfer_truth`, the host-free truth/decision half lifted
+//! from `cli/src/transfer_truth.rs`: the sequential-accept rule, the resume
+//! line, the partials a receive recorded and the ones actually kept, and the
+//! sender-gone sentence. The CLI re-exports them; what stays there is the
+//! orchestration plus the host/UI adapters (`finalize_incoming`, the inbox
+//! helpers, the rendered refusal, and every place a sentence is shown).
 //!
 //! What the crate still does NOT contain:
 //! - the command surface (`send_cmd`, `recv_cmd`, the daemons, the roster UI):
