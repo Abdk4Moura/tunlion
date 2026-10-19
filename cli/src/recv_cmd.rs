@@ -1053,8 +1053,9 @@ pub(crate) async fn recv_cmd(
 }
 
 /// Cancellation/cleanup-return seam for the existing driver, still CLI-bound.
-/// Return means only the resources in RecvCleanup have completed their epilogue.
-/// In particular it does NOT mean all detached/blocking work has been joined.
+/// Return means the resources in RecvCleanup have completed their epilogue,
+/// including every blocking receive writer it admitted. It does NOT mean work
+/// outside that owner (a detached watchdog actor, for example) has stopped.
 async fn recv_driver(
     server: &str,
     code: Option<String>,
@@ -1099,19 +1100,148 @@ async fn recv_driver(
 /// await, including setup/maintenance (not just next_ev). This is deliberately
 /// not an owner of all lower-layer tasks or a durable/no-thread stop promise.
 /// `watchdog` owns one diagnostic OS thread plus its stop handle; it does not
-/// own receive-driver work.
+/// own receive-driver work. `writers` owns the blocking writes admitted by
+/// `Ev::Chunk` and joins (never aborts) them before `state` is flushed.
 #[derive(Default)]
 struct RecvCleanup {
     state: Option<RecvState>,
     conn: Option<Conn>,
     signaling: Option<filament_signal::Client>,
     tasks: crate::recv_lifecycle::Tasks,
+    writers: WriterTasks,
     watchdog: crate::recv_lifecycle::LoopWatchdog,
     sync_tasks: SyncTasks,
+    /// Test-only observation of the cleanup order (`finish` also records the
+    /// static phases used by the older tests). A gated writer pushes into the
+    /// same trace, so ordering is observable across the blocking-pool thread.
+    #[cfg(test)]
+    trace: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 #[derive(Clone, Default)]
 struct SyncTasks(Arc<Mutex<HashMap<(String, u32), filament_peerloop::sync::serving::SyncServeTask>>>);
+
+/// Owns the blocking `pwrite_at`/stdout writers admitted by this invocation.
+///
+/// This is deliberately separate from [`crate::recv_lifecycle::Tasks`]: that
+/// owner aborts on stop, and aborting a `spawn_blocking` task does not stop the
+/// OS write it is running. A write admitted by `Ev::Chunk` must therefore be
+/// joined, never aborted, before its `.part` is flushed or stdout is called
+/// delivered. Completed handles are reaped during the event loop so a daemon
+/// does not accumulate one handle per chunk for its whole life.
+#[derive(Clone, Default)]
+struct WriterTasks {
+    next: Arc<AtomicU64>,
+    tasks: Arc<Mutex<HashMap<u64, WriterTask>>>,
+}
+
+struct WriterTask {
+    pid: String,
+    sid: u32,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl WriterTasks {
+    /// Register a write at spawn time. There is no await between the spawn and
+    /// the registration, so a cancelled dispatch cannot drop the handle before
+    /// the invocation's cleanup owns it.
+    fn spawn<F>(&self, pid: String, sid: u32, write: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let handle = tokio::task::spawn_blocking(write);
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.tasks
+            .lock()
+            .unwrap()
+            .insert(id, WriterTask { pid, sid, handle });
+    }
+
+    /// Join writers that already finished, releasing their handles. A running
+    /// write stays owned; a panic is reported here instead of being lost with
+    /// the detached handle.
+    async fn reap(&self, log: &dyn LogSink) {
+        let finished: Vec<u64> = self
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, task)| task.handle.is_finished())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in finished {
+            // Drop the guard before the await: see SyncTasks::reap_sync_tasks.
+            let task = self.tasks.lock().unwrap().remove(&id);
+            if let Some(task) = task {
+                report_writer_join(log, &task.pid, task.sid, task.handle.await);
+            }
+        }
+    }
+
+    /// Await every remaining write. Never aborts: the write was admitted and
+    /// must finish (or panic) before the caller flushes or finalizes its state.
+    async fn join_all(&self, log: &dyn LogSink) {
+        let mut joining: Vec<WriterTask> = std::mem::take(&mut *self.tasks.lock().unwrap())
+            .into_values()
+            .collect();
+        for task in joining.drain(..) {
+            report_writer_join(log, &task.pid, task.sid, task.handle.await);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.tasks.lock().unwrap().is_empty()
+    }
+}
+
+fn report_writer_join(
+    log: &dyn LogSink,
+    pid: &str,
+    sid: u32,
+    result: std::result::Result<(), tokio::task::JoinError>,
+) {
+    if let Err(error) = result {
+        log.say(&format!(
+            "recv: {pid}/{sid} blocking write task failed: {error}"
+        ));
+    }
+}
+
+/// Publishes the end of one admitted write. It runs on the normal return path
+/// and on panic, so a poisoned lock or a panicking sink cannot leave `inflight`
+/// permanently above zero and strand the stream. `WriterTasks` joins the
+/// handle and reports the join error separately.
+struct InflightGuard {
+    inflight: Arc<AtomicI64>,
+    end_seen: Arc<AtomicBool>,
+    tx: mpsc::UnboundedSender<Ev>,
+    write_err: Arc<Mutex<Option<crate::recv_files::WriteFailure>>>,
+    pid: String,
+    sid: u32,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        // A panic is a failed write, not an acceptable hole: record it once so
+        // the event loop refuses with a reason instead of finalizing (or
+        // re-fetching forever). The lock is not unwrapped: the panic may have
+        // poisoned it, and panicking again in a destructor would abort.
+        if std::thread::panicking() {
+            let mut slot = self.write_err.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(crate::recv_files::WriteFailure {
+                    kind: None,
+                    detail: "the blocking write task panicked".to_string(),
+                });
+            }
+        }
+        let prev = self.inflight.fetch_sub(1, Ordering::Relaxed);
+        if prev == 1 && self.end_seen.load(Ordering::Relaxed) {
+            let _ = self.tx.send(Ev::MaybeComplete(self.pid.clone(), self.sid));
+        }
+    }
+}
 
 /// Test-only observation of the production cleanup order. The no-op in normal
 /// builds keeps `finish` honest: tests assert what it actually awaits.
@@ -1198,6 +1328,16 @@ impl SyncTasks {
 }
 
 impl RecvCleanup {
+    fn note_phase(&self, phase: &'static str) {
+        note_cleanup_phase(phase);
+        #[cfg(test)]
+        {
+            if let Some(trace) = &self.trace {
+                trace.lock().unwrap().push(phase);
+            }
+        }
+    }
+
     async fn finish(&mut self, log: &dyn LogSink) {
         // The loop is intentionally no longer turning. Ask its stall observer
         // to stop before the (possibly slow) flush, so cleanup cannot be
@@ -1205,16 +1345,24 @@ impl RecvCleanup {
         // join: a `Detached` outcome leaves the observer and its blocking
         // waiter alive (still holding the log sink) until they finish.
         let _ = self.watchdog.stop().await;
-        note_cleanup_phase("watchdog");
+        self.note_phase("watchdog");
+        // Writers admitted by Ev::Chunk are blocking OS writes, not aborted
+        // tasks: join them before any by_sid entry is synced or drained. A
+        // dispatch must not return (or report Stopped) while one is running.
+        self.writers.join_all(log).await;
+        self.note_phase("writers");
         self.sync_tasks.stop_sync_tasks(log).await;
-        note_cleanup_phase("sync_tasks");
+        self.note_phase("sync_tasks");
         // Stop accepting control work before closing links. Joining aborted
         // tasks ensures their listener futures are dropped before we return.
         self.tasks.stop().await;
-        note_cleanup_phase("tasks");
+        self.note_phase("tasks");
+        let had_state = self.state.is_some();
         if let Some(st) = &mut self.state {
             flush_inflight(&mut st.by_sid).await;
-            note_cleanup_phase("flush");
+        }
+        if had_state {
+            self.note_phase("flush");
         }
         if let Some(conn) = &mut self.conn {
             conn.close_links_for_exit();
@@ -1416,6 +1564,10 @@ async fn recv_run(
     // Receive-side transfer/consent state, grouped out of this function's locals
     // (still a plain local; no handler extraction yet). See `RecvState`.
     let sync_tasks = cleanup.sync_tasks.clone();
+    // The invocation's writer handles live in RecvCleanup (so cancellation
+    // cannot lose them); the loop reaps finished ones and `finish` joins the
+    // rest before flushing by_sid.
+    let writer_tasks = cleanup.writers.clone();
     let st = cleanup.state.insert(RecvState {
         by_sid: HashMap::new(),
         verify_fails: HashMap::new(),
@@ -2322,6 +2474,10 @@ async fn recv_run(
 
     loop {
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
+        // Reap completed blocking writers every iteration: the handles are
+        // owned until their write lands, but a long-lived daemon must not keep
+        // one per chunk for its whole life.
+        writer_tasks.reap(log.as_ref()).await;
         // Live posture: a `tunlion grant <dev> shell` (or the revoke of the last
         // shell grant) applies to the RUNNING daemon on the next open. Computed once at startup, it silently required a
         // restart and refused every granted device with "shell serving is off".
@@ -8484,7 +8640,18 @@ async fn recv_run(
                     let pid_c = pid.clone();
                     let data_len = data.len();
                     let trace_inner = trace;
-                    tokio::task::spawn_blocking(move || {
+                    writer_tasks.spawn(pid.clone(), sid, move || {
+                        // Own the inflight count before touching the sink: even
+                        // a panic in the write path must decrement it, and, when
+                        // this was the last writer, wake the event loop.
+                        let _inflight = InflightGuard {
+                            inflight,
+                            end_seen,
+                            tx,
+                            write_err: Arc::clone(&write_err),
+                            pid: pid_c,
+                            sid,
+                        };
                         let t_pwrite = if trace_inner {
                             Some(std::time::Instant::now())
                         } else {
@@ -8542,10 +8709,6 @@ async fn recv_run(
                                 data_len,
                                 pwrite_us
                             );
-                        }
-                        let prev = inflight.fetch_sub(1, Ordering::Relaxed);
-                        if prev == 1 && end_seen.load(Ordering::Relaxed) {
-                            let _ = tx.send(Ev::MaybeComplete(pid_c, sid));
                         }
                     });
                     let recv_us = t_recv_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
@@ -9098,7 +9261,14 @@ mod lifecycle_tests {
         cleanup.finish(&NoLog).await;
         assert_eq!(
             super::CLEANUP_PHASES.with(|phases| phases.borrow().clone()),
-            vec!["watchdog", "sync_tasks", "task_drop", "tasks", "flush"]
+            vec![
+                "watchdog",
+                "writers",
+                "sync_tasks",
+                "task_drop",
+                "tasks",
+                "flush",
+            ]
         );
     }
 
@@ -9125,8 +9295,118 @@ mod lifecycle_tests {
         );
         assert_eq!(
             super::CLEANUP_PHASES.with(|phases| phases.borrow().clone()),
-            vec!["watchdog", "sync_tasks", "tasks"]
+            vec!["watchdog", "writers", "sync_tasks", "tasks"]
         );
+    }
+
+    /// A blocking writer is admitted work, not an abortable task: cleanup must
+    /// wait for it before flushing, and must not report a finished epilogue
+    /// while it still runs.
+    #[tokio::test]
+    async fn cleanup_awaits_a_gated_blocking_writer_before_flush() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let cleanup = RecvCleanup {
+            state: Some(empty_recv_state()),
+            trace: Some(Arc::clone(&trace)),
+            ..RecvCleanup::default()
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer_trace = Arc::clone(&trace);
+        let writers = cleanup.writers.clone();
+        cleanup.writers.spawn("peer-gated".into(), 1, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            writer_trace.lock().unwrap().push("writer");
+        });
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let running = tokio::spawn(async move {
+            let mut cleanup = cleanup;
+            cleanup.finish(&NoLog).await;
+            let _ = finished_tx.send(());
+            cleanup
+        });
+        started_rx.await.unwrap();
+        // join_all takes every handle before awaiting, so an empty group while
+        // the writer is still gated proves cleanup reached the writer join.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !writers.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup reached the writer join");
+        // The writer is provably still inside its blocking call, and cleanup
+        // has recorded only the pre-writer stage, never the flush.
+        let phases = trace.lock().unwrap().clone();
+        assert_eq!(phases, vec!["watchdog"], "cleanup advanced past the writer join");
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "finish returned while an admitted write was still running"
+        );
+        release_tx.send(()).unwrap();
+        let cleanup = running.await.expect("cleanup task");
+        finished_rx.await.expect("cleanup completion");
+        let phases = trace.lock().unwrap().clone();
+        assert_eq!(
+            phases,
+            vec![
+                "watchdog",
+                "writer",
+                "writers",
+                "sync_tasks",
+                "tasks",
+                "flush",
+            ],
+            "the admitted write completed before the flush stage"
+        );
+        assert!(cleanup.writers.is_empty(), "cleanup drained every writer");
+    }
+
+    #[tokio::test]
+    async fn writer_reaping_joins_finished_tasks_and_keeps_running_ones() {
+        let writers = WriterTasks::default();
+        let (running_started_tx, running_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (running_done_tx, running_done_rx) = tokio::sync::oneshot::channel();
+        writers.spawn("peer-running".into(), 7, move || {
+            let _ = running_started_tx.send(());
+            let _ = release_rx.recv();
+            let _ = running_done_tx.send(());
+        });
+        running_started_rx.await.unwrap();
+
+        let (quick_done_tx, quick_done_rx) = tokio::sync::oneshot::channel();
+        writers.spawn("peer-quick".into(), 8, move || {
+            let _ = quick_done_tx.send(());
+        });
+        quick_done_rx.await.unwrap();
+        // Reap by observing completion, not by sleeping: the running writer
+        // must survive, the finished one must be joined and released.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                writers.reap(&NoLog).await;
+                let tasks = writers.tasks.lock().unwrap();
+                if tasks.len() == 1 && tasks.values().all(|task| task.sid == 7) {
+                    break;
+                }
+                drop(tasks);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished writer handle is reaped");
+
+        release_tx.send(()).unwrap();
+        running_done_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !writers.is_empty() {
+                writers.reap(&NoLog).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed running writer is reaped");
     }
 
     #[derive(Default)]
