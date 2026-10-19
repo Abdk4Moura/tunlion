@@ -5639,6 +5639,7 @@ async fn recv_run(
                                                 log.debug(&format!(
                                                     "  L3 route for {who} withheld: relayed link and peer does not advertise relay datagrams"
                                                 ));
+                                                l3.set_peer_subnets(&pid, &t, &[]).await;
                                                 continue;
                                             }
                                             l3.add_peer(
