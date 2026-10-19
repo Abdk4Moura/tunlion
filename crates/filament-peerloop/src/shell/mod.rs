@@ -6,6 +6,16 @@
 //! platform default) and this decides how to invoke it. It moved here from
 //! `cli::platform` so the receive loop can name it without the CLI, and so a
 //! library consumer that serves a PTY asks the same rule.
+//!
+//! The sibling modules own the other host-free half of a shell-class open:
+//! [`admit`] decides whether a `pty-open`/`exec-open` may exist and returns a
+//! sanitized plan or a typed denial; [`exec`] is the pure `exec-open` frame
+//! parser; [`off`] is the serving-off refusal (ceiling-aware, asks once).
+//! Spawning a PTY or a child, and every process effect, stays in the CLI.
+
+pub mod admit;
+pub mod exec;
+pub mod off;
 
 use std::path::Path;
 
