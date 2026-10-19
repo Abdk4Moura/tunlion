@@ -46,7 +46,8 @@ use filament_overlay::Announce;
 use filament_overlay::{b64, unb64};
 #[cfg(l3)]
 use filament_peerloop::mesh::{
-    advertised_prefixes, installable_routes, sanitize_host, L3Mode, MeshTunnel, IFNAME,
+    accept_advertised, advertised_prefixes, sanitize_host, L3Mode, MeshTunnel, RouteAcceptance,
+    RoutePolicy, IFNAME,
 };
 #[cfg(l3)]
 use crate::{
@@ -5735,52 +5736,26 @@ async fn recv_run(
                                                 // prefix a member cared to advertise,
                                                 // 0.0.0.0/0 included, which is an exit
                                                 // node the owner never agreed to.
-                                                let ceiling_routes: Vec<String> =
+                                                let ceiling =
                                                     principal_ceiling_for(&who)
-                                                        .unwrap_or_default()
-                                                        .iter()
-                                                        .filter_map(|c| {
-                                                            c.strip_prefix("route:")
-                                                                .map(str::to_string)
-                                                        })
-                                                        .collect();
+                                                        .unwrap_or_default();
                                                 let cap_entries = host.cap_store();
                                                 let cap_now = host.now_secs();
-                                                let ok = installable_routes(
+                                                let RouteAcceptance {
+                                                    accepted: ok,
+                                                    declined,
+                                                } = accept_advertised(
                                                     &advertised,
-                                                    accept,
-                                                    |cidr| {
-                                                        if cap::cidr_within_any(
-                                                            cidr,
-                                                            &ceiling_routes,
-                                                        ) {
-                                                            return true;
-                                                        }
-                                                        let Some(pk) = owner_pk else {
-                                                            return false;
-                                                        };
-                                                        let Ok(res) =
-                                                            cap::route_resource_id(
-                                                                &pk, cidr,
-                                                            )
-                                                        else {
-                                                            return false;
-                                                        };
-                                                        matches!(
-                                                            cap::authorize_in(
-                                                                &cap_entries,
-                                                                &res,
-                                                                cap::CAP_ROUTE,
-                                                                idev.as_ref(),
-                                                                iusr.as_ref(),
-                                                                None,
-                                                                cap_now,
-                                                            ),
-                                                            cap::CapOutcome::Authorized
-                                                        )
+                                                    RoutePolicy {
+                                                        accept_routes: accept,
+                                                        ceiling: &ceiling,
+                                                        owner_pub: owner_pk,
+                                                        cap_store: &cap_entries,
+                                                        device_pub: idev,
+                                                        user_pub: iusr,
+                                                        now: cap_now,
                                                     },
                                                 );
-                                                let declined = advertised.len() - ok.len();
                                                 if declined > 0 {
                                                     // Say so rather than silently
                                                     // dropping: an advertisement
