@@ -698,6 +698,7 @@ pub mod serving {
         max_record_bytes: usize,
         commit_state: &Arc<std::sync::Mutex<bool>>,
     ) -> Result<()> {
+        if *cancel.borrow() { bail!("sync cancelled"); }
         let rel = safe_relpath(record["p"].as_str().unwrap_or("")).ok_or_else(|| anyhow::anyhow!("unsafe path"))?;
         let size = record["size"].as_u64().unwrap_or(0);
         let full = record["full"].as_str().unwrap_or("").to_string();
@@ -744,6 +745,11 @@ pub mod serving {
             entered.notify_one();
             release.notified().await;
         }
+        // Cancellation is a hard barrier: once the owner asks to stop, no
+        // further payload is copied or written, and the guard above removes
+        // the stage we created. Check here as well as at each record boundary
+        // so a large prefetched file cannot defer the abort until finalization.
+        if *cancel.borrow() { bail!("sync cancelled"); }
         if let Some(mut source) = source {
             use std::io::{Seek, SeekFrom};
             let copied = (|| -> std::io::Result<()> {
@@ -758,6 +764,7 @@ pub mod serving {
             }
         }
         loop {
+            if *cancel.borrow() { bail!("sync cancelled"); }
             let header = next_json(&mut cfg.stream, recs, max_record_bytes, cancel).await?;
             match header["type"].as_str() {
                 Some("file-end") => break,
@@ -1187,13 +1194,18 @@ pub mod serving {
             entered.notified().await;
             task.cancel();
             release.notify_one();
-            assert_eq!(task.join().await.unwrap().unwrap_err().to_string(), "sync cancelled");
+            // Mid-file cancellation is reported by the per-file negative ack;
+            // the peer's already-buffered `done` then ends the protocol
+            // gracefully, exactly as in the hash-finalization cancellation case.
+            assert!(task.join().await.unwrap().is_ok());
             assert!(!root.0.join("retry.txt.part").exists());
             assert!(!root.0.join("retry.txt").exists());
             assert_eq!(mux.live_streams().await, 0);
             let first_ack = outgoing_json(&transport);
             assert_eq!(first_ack[1]["type"], "file-ack");
             assert_eq!(first_ack[1]["ok"], false);
+            assert_eq!(first_ack[1]["err"], "sync cancelled");
+            assert_eq!(first_ack.len(), 2, "cancellation must not acknowledge success");
 
             let mut retry_wire = Vec::new();
             record(&json!({"type":"manifest", "files":[]}), &mut retry_wire);
