@@ -872,19 +872,14 @@ impl L3 {
         let desired: std::collections::HashSet<String> =
             subnets.into_iter().map(|(n, l)| format!("{n}/{l}")).collect();
         let mut installed = self.kernel_subnets.lock().await;
-        for cidr in desired.difference(&installed).cloned().collect::<Vec<_>>() {
-            match crate::tun::add_route(&cidr, ifname()) {
-                Ok(()) => {
-                    installed.insert(cidr);
-                }
-                Err(e) => crate::ui::debug(&format!("  could not install route {cidr}: {e}")),
-            }
-        }
-        for cidr in installed.difference(&desired).cloned().collect::<Vec<_>>() {
-            if let Err(e) = crate::tun::del_route(&cidr, ifname()) {
-                crate::ui::debug(&format!("  could not withdraw route {cidr}: {e}"));
-            }
-            installed.remove(&cidr);
+        for (operation, cidr, error) in reconcile_installed_routes(
+            &mut installed,
+            &desired,
+            |cidr| crate::tun::add_route(cidr, ifname()).map_err(|e| e.to_string()),
+            |cidr| crate::tun::del_route(cidr, ifname()).map_err(|e| e.to_string()),
+        ) {
+            let verb = if operation == "add" { "install" } else { "withdraw" };
+            crate::ui::debug(&format!("  could not {verb} route {cidr}: {error}"));
         }
     }
 
@@ -1350,6 +1345,86 @@ fn dest_ip(pkt: &[u8]) -> Option<IpAddr> {
     }
 }
 
+/// Reconcile the routes this process believes it installed with the desired set.
+/// State changes only after a successful OS operation: particularly, a failed
+/// delete remains tracked so a later reconciliation retries rather than silently
+/// forgetting a route that may still be present in the kernel.
+fn reconcile_installed_routes<A, D>(
+    installed: &mut std::collections::HashSet<String>,
+    desired: &std::collections::HashSet<String>,
+    mut add: A,
+    mut delete: D,
+) -> Vec<(&'static str, String, String)>
+where
+    A: FnMut(&str) -> Result<(), String>,
+    D: FnMut(&str) -> Result<(), String>,
+{
+    let mut errors = Vec::new();
+    for cidr in desired.difference(installed).cloned().collect::<Vec<_>>() {
+        match add(&cidr) {
+            Ok(()) => {
+                installed.insert(cidr);
+            }
+            Err(error) => errors.push(("add", cidr, error)),
+        }
+    }
+    for cidr in installed.difference(desired).cloned().collect::<Vec<_>>() {
+        match delete(&cidr) {
+            Ok(()) => {
+                installed.remove(&cidr);
+            }
+            Err(error) => errors.push(("delete", cidr, error)),
+        }
+    }
+    errors
+}
+
+#[cfg(test)]
+mod route_reconcile_tests {
+    use super::reconcile_installed_routes;
+    use std::collections::HashSet;
+
+    #[test]
+    fn failed_route_delete_stays_tracked_and_is_retried() {
+        let mut installed = HashSet::from(["192.0.2.0/24".to_string()]);
+        let desired = HashSet::new();
+        let mut delete_calls = 0;
+
+        let errors = reconcile_installed_routes(
+            &mut installed,
+            &desired,
+            |_| panic!("no additions expected"),
+            |_| {
+                delete_calls += 1;
+                Err("simulated delete failure".to_string())
+            },
+        );
+        assert_eq!(
+            errors,
+            vec![(
+                "delete",
+                "192.0.2.0/24".into(),
+                "simulated delete failure".into()
+            )]
+        );
+        assert!(installed.contains("192.0.2.0/24"));
+
+        // The retained entry remains in installed - desired and is attempted again.
+        let errors = reconcile_installed_routes(
+            &mut installed,
+            &desired,
+            |_| panic!("no additions expected"),
+            |_| {
+                delete_calls += 1;
+                Ok(())
+            },
+        );
+        assert!(errors.is_empty());
+        assert_eq!(delete_calls, 2);
+        assert!(!installed.contains("192.0.2.0/24"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1678,6 +1753,27 @@ mod tests {
         assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.1")).unwrap(), &other));
         rt.remove_subnets_by_pid("other");
         assert!(rt.lookup(v4("10.1.0.1")).is_none());
+    }
+
+    #[test]
+    fn shared_transport_does_not_merge_pid_subnet_ownership() {
+        let v4 = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
+        let shared: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let mut rt = RouteTable::default();
+        rt.set_subnets("first", &shared, &[(v4("198.51.100.0"), 24)]);
+        rt.set_subnets("second", &shared, &[(v4("198.51.100.0"), 24)]);
+
+        // Both PIDs own the same prefix through the same Transport object.
+        assert_eq!(rt.subnets.len(), 2);
+        rt.set_subnets("first", &shared, &[]);
+        assert_eq!(rt.subnets.len(), 1);
+        assert_eq!(rt.subnets[0].3, "second");
+        assert!(Arc::ptr_eq(&rt.lookup(v4("198.51.100.8")).unwrap(), &shared));
+
+        rt.remove_subnets_by_pid("first");
+        assert_eq!(rt.subnets.len(), 1, "removing the already-withdrawn PID preserves second");
+        rt.remove_subnets_by_pid("second");
+        assert!(rt.subnets.is_empty());
     }
 
     struct DgramTransport;
