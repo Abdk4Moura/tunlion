@@ -338,7 +338,7 @@ pub trait RecvDaemon: Send + Sync {
     fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool;
     async fn complete_warm_bootstrap(&mut self, conn: &Conn, pid: &str, reply: &Value);
     fn reap_warm_bootstraps(&mut self);
-    fn revocation_snapshot(&self) -> Option<HashSet<String>>;
+    fn revocation_snapshot(&self) -> Option<(String, String)>;
     fn prune_to_store(&self, held: &mut Vec<(String, String)>) -> HashSet<String>;
     fn key_listed(&self, device_pub: &[u8; 32]) -> bool;
     fn enroll_channel(&self, public_key: &[u8; 32]) -> String;

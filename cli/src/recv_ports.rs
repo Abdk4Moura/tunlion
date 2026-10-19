@@ -778,7 +778,7 @@ impl RecvServers for CliRecv {
     }
 
     async fn start_expose(&mut self, tunnel: Arc<dyn MeshTunnel>) -> usize {
-        let ex = std::sync::Arc::new(crate::expose::Exposer::new(tunnel));
+        let ex = crate::expose::Exposer::new(tunnel);
         let n = ex.reconcile().await;
         self.exposer = Some(ex);
         n
@@ -908,7 +908,7 @@ impl RecvDaemon for CliRecv {
         #[cfg(unix)]
         crate::daemon_ctl::reap_warm_bootstraps(&mut self.pending_bootstrap);
     }
-    fn revocation_snapshot(&self) -> Option<HashSet<String>> {
+    fn revocation_snapshot(&self) -> Option<(String, String)> {
         crate::revocation_live::store_snapshot()
     }
     fn prune_to_store(&self, held: &mut Vec<(String, String)>) -> HashSet<String> {
