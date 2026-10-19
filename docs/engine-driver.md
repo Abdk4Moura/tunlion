@@ -14,8 +14,12 @@ daemon dispatch, not just a cancellation latch:
   a bound. A dispatch that returns without publishing reports `NotPublished`,
   never "ready".
 - `Engine<T>` — spawns exactly one dispatch task, owns its `JoinHandle`, and
-  exposes `ready`, `request_stop`, `stop`, `stop_within` and `wait`. `Drop`
-  requests stop and detaches; it never joins.
+  exposes `ready`, `request_stop`, `stop`, `stop_within` and `wait`. `stop` /
+  `wait` consume the engine and join the dispatch's own epilogue. `stop_within`
+  borrows instead: on a bound expiry it returns `TimedOut` and **retains** the
+  task (the `JoinHandle` is not dropped), so a caller can retry or observe it
+  and must not report it stopped. `Drop` requests stop and detaches; it never
+  joins.
 
 Everything is instance-owned. There are no process globals, no signals, no
 `std::process::exit`, and no child process. The runtime itself belongs to the
@@ -32,9 +36,30 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   `RecvCleanup`. `up_cmd` reaches the same driver; it does not have a second
   acceptor.
 - **`tunlion-core`.** `Core::start_with_dispatch` starts the same `Engine` for
-  a Rust embedder that has the dispatch, and `Core::stop` requests stop and
-  waits for the dispatch's own epilogue. This is Rust-only on purpose: UniFFI
-  cannot carry a closure, and `Core::start` must not pretend it can.
+  a Rust embedder that has the dispatch; `Core::stop` / `stop_within` request
+  stop and join its own epilogue. This is Rust-only on purpose: UniFFI cannot
+  carry a closure, and `Core::start` must not pretend it can.
+
+  `Core` owns exactly one engine per instance, behind one mutex, with an
+  explicit slot state machine:
+
+  | slot | start allowed | `status().engine` | what it means |
+  |---|---|---|---|
+  | `None` | yes | `NotLinked` | nothing was ever started |
+  | `Running(engine)` | no | `Running` (or `Stopped` once finished) | the one live engine |
+  | `Stopping` | no | `Stopping` | a stop claimed the slot and is joining |
+  | `Unstopped(engine)` | only once `is_finished()` | `TimedOut` | a stop bound expired; the task is retained and may still run |
+  | `Ended(Ok)` | yes | `Stopped` | the task returned cleanly |
+  | `Ended(Err)` | yes | `Failed` | the task returned an error |
+
+  A start replaces only `None` / `Ended` — states where the prior task is known
+  to have terminated. While a stop is claimed (`Stopping`) a concurrent start
+  and a concurrent stop both fail with `EngineStopping`, and a bound expiry
+  (`TimedOut`) refuses a start with `EngineNotStopped` until the retained task
+  is joined or observed finished. A stop future dropped mid-join returns the
+  task to the slot as `Unstopped` via `StopClaim::drop`, so the task is never
+  detached on the floor. `Stopped` is therefore only recorded after a confirmed
+  join.
 
 ## What is still linked out, and why `Core::start` refuses
 
@@ -66,9 +91,15 @@ longer the blocker; the dispatch body's sectors are.
 CI-only (no local Rust builds, tests or binding generation). The moved code has
 in-memory `#[tokio::test]` coverage for latched/repeated cancellation, publish
 once, readiness observed across tasks, `NotPublished` on early return, bounded
-`TimedOut`, independent instances, `stop` joining the dispatch epilogue, and
-`Drop` requesting stop without joining. `tunlion-core` tests cover
-`start_with_dispatch` / `stop` running and stopping one owned dispatch both
-inside and outside an ambient runtime, refusing a second start, and the
-no-engine stop no-op. Android keeps the reduced `filament-peerloop` profile:
-no `mount-server`, `forward-server` or `mesh` sectors compile into the library.
+`TimedOut` that retains the task and can still join it, independent instances,
+`stop` joining the dispatch epilogue, and `Drop` requesting stop without
+joining. `tunlion-core` tests cover, deterministically (channel-gated dispatches,
+no sleeps): start/stop one owned dispatch both inside and outside an ambient
+runtime; refusing a start while a stop is in flight (`EngineStopping`); refusing
+a concurrent stop while one is in flight; a stop bound expiry retaining the task
+and refusing restart (`TimedOut` / `EngineNotStopped`) until it is joined; a
+dropped stop future retaining the task via `StopClaim::drop`; a dispatch error
+recorded as `Failed`; the no-engine stop no-op; and that `Core::start` stays
+`EngineNotLinked` without installing a slot. Android keeps the reduced
+`filament-peerloop` profile: no `mount-server`, `forward-server` or `mesh`
+sectors compile into the library.

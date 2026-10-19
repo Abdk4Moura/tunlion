@@ -198,8 +198,9 @@ impl ReadyWatch {
 pub enum StopError {
     /// The dispatch task panicked or was aborted.
     Panicked(JoinError),
-    /// The dispatch did not return within the caller's bound. The task was
-    /// detached; cancellation had already been requested.
+    /// The dispatch did not return within the caller's bound. The task is
+    /// **retained** by the caller's `Engine` (the handle was not dropped) and
+    /// may still be running; cancellation had already been requested.
     TimedOut,
 }
 
@@ -290,16 +291,20 @@ impl<T: Send + 'static> Engine<T> {
 
     /// Request stop and wait at most `bound` for the dispatch to return.
     ///
-    /// On timeout the task is detached (it keeps running and may still finish);
-    /// cancellation was requested but cooperation is the dispatch's.
-    pub async fn stop_within(mut self, bound: Duration) -> Result<T, StopError> {
+    /// Borrows the engine rather than consuming it, so a `TimedOut` outcome
+    /// **retains the task**: the `JoinHandle` is not dropped and the caller can
+    /// observe [`Engine::is_finished`] or retry the bounded join later. This is
+    /// what lets `Core` refuse to claim `Stopped` or permit a restart while a
+    /// task may still be running.
+    ///
+    /// Cancellation is requested first but cooperation belongs to the dispatch.
+    /// Once this returns `Ok`, the task has completed and the handle must not be
+    /// awaited again; drop the engine (or use the consuming [`Engine::stop`]).
+    pub async fn stop_within(&mut self, bound: Duration) -> Result<T, StopError> {
         self.cancel.cancel();
         match tokio::time::timeout(bound, &mut self.task).await {
             Ok(result) => result.map_err(StopError::Panicked),
-            Err(_) => {
-                // Dropping `self` detaches the task and re-asserts the latch.
-                Err(StopError::TimedOut)
-            }
+            Err(_) => Err(StopError::TimedOut),
         }
     }
 }
@@ -473,12 +478,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_expiry_detaches_a_dispatch_that_ignores_cancellation() {
+    async fn bound_expiry_retains_a_dispatch_that_ignores_cancellation() {
         let started = Arc::new(AtomicUsize::new(0));
         let started_in_dispatch = Arc::clone(&started);
         let release = Arc::new(tokio::sync::Notify::new());
         let release_in_dispatch = Arc::clone(&release);
-        let engine = Engine::start(
+        let mut engine = Engine::start(
             Cancellation::default(),
             move |_stop, _readiness| async move {
                 started_in_dispatch.fetch_add(1, Ordering::SeqCst);
@@ -493,11 +498,18 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        match engine.stop_within(Duration::from_millis(10)).await {
-            Err(StopError::TimedOut) => {}
-            other => panic!("expected a bounded detach, got {other:?}"),
-        }
+        assert!(matches!(
+            engine.stop_within(Duration::from_millis(10)).await,
+            Err(StopError::TimedOut)
+        ));
+        // Retained, not detached: the handle is still owned and not finished.
+        assert!(!engine.is_finished());
         release.notify_one();
+        // The retained engine can still be joined.
+        match engine.stop_within(Duration::from_secs(1)).await {
+            Ok(value) => assert_eq!(value, "late"),
+            Err(error) => panic!("expected the retained dispatch to join, got {error:?}"),
+        }
     }
 
     #[tokio::test]

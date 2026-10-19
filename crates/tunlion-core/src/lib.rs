@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use filament_id::{user_key_path, KeyStore, PendingIdentity, UserKey};
-use filament_peerloop::driver::{Cancellation, Engine, Readiness};
+use filament_peerloop::driver::{Cancellation, Engine, Readiness, StopError};
 use secret_write::SecretFile;
 
 /// Build proof for the Android cdylib job. Not the app API.
@@ -36,13 +36,60 @@ pub extern "C" fn tunlion_core_abi_version() -> u32 {
 /// embedder; the library owns the runtime, the latch, readiness and the join.
 type EngineTask = Engine<Result<(), String>>;
 
-/// The one engine slot a Core owns. `Stopped` is deliberately distinct from
-/// `None`: "nothing was ever started" and "the last run returned" are different
-/// answers, and a caller that stopped an engine must not read `NotLinked`.
+/// The one engine slot a Core owns.
+///
+/// The states exist to keep two contracts honest under concurrency and under a
+/// stop that does not finish:
+///
+/// - If a retry observes a task that finished on its own, it may join it as
+///   `Ended(_)`; if it is still alive under `Running`, it is joined by `stop`.
+/// - `Ended(_)` and `None` are the only states a fresh `start_with_dispatch`
+///   may replace. `Running`, `Stopping` and `Unstopped` all refuse a new start,
+///   because in each of those a prior task may still be running.
 enum EngineSlot {
+    /// Nothing was ever started.
     None,
+    /// The one live engine, owned by this slot.
     Running(EngineTask),
-    Stopped,
+    /// A stop owns the settle. The task was moved into the stop future; no
+    /// start or second stop may proceed until that owner records the outcome.
+    Stopping,
+    /// A bounded stop expired. The engine is retained here; it may still be
+    /// running, so a start is refused until joining or observing it finished.
+    Unstopped(EngineTask),
+    /// The last engine returned. `Err` is its dispatch error, if any. A start
+    /// may replace this: the task is known to have terminated.
+    Ended(Result<(), String>),
+}
+
+/// Owns one in-flight stop claim.
+///
+/// The slot is moved to `Stopping` and the task is carried here while the stop
+/// future awaits its bounded join. If that future is dropped before it settles
+/// (a supervisor timeout, a cancelled task), `Drop` returns the task to the
+/// slot as `Unstopped` — retained and still refusing a restart — rather than
+/// leaving a `Stopping` slot with the task lost.
+struct StopClaim<'a> {
+    slot: &'a Mutex<EngineSlot>,
+    engine: Option<EngineTask>,
+}
+
+impl<'a> StopClaim<'a> {
+    fn take(&mut self) -> EngineTask {
+        self.engine.take().expect("the stop claim is armed")
+    }
+}
+
+impl Drop for StopClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(engine) = self.engine.take() {
+            // No other writer can own the slot: it is `Stopping` and both
+            // `start_with_dispatch` and `stop_within` refuse that state.
+            if let Ok(mut slot) = self.slot.lock() {
+                *slot = EngineSlot::Unstopped(engine);
+            }
+        }
+    }
 }
 
 /// A core opened on one config directory. The directory is the app's private
@@ -70,9 +117,18 @@ pub enum EngineState {
     NotLinked,
     /// An engine dispatch started through `start_with_dispatch` is running.
     Running,
-    /// The last engine dispatch returned (normally or by stop). No child
-    /// process exists; this is about the in-process task.
+    /// A stop is in flight; the task may still be running. A start and a second
+    /// stop are both refused while this holds.
+    Stopping,
+    /// The last engine dispatch returned cleanly (naturally or by stop). No
+    /// child process exists; this is about the in-process task.
     Stopped,
+    /// The last engine dispatch returned an error.
+    Failed,
+    /// A bounded stop expired and the task was retained; it may still be
+    /// running. `EngineState` reports this rather than `Stopped` so a caller
+    /// never mistakes "we gave up waiting" for "it stopped".
+    TimedOut,
 }
 
 /// What the UI may poll. A missing identity is `fingerprint: None`, not an error.
@@ -100,10 +156,19 @@ pub enum CoreError {
     /// An engine dispatch is already running in this Core.
     #[error("an engine is already running in this core")]
     EngineAlreadyRunning,
+    /// A stop is already in flight. Starting or stopping again would let two
+    /// owners race the same slot, so both are refused.
+    #[error("an engine stop is already in progress in this core")]
+    EngineStopping,
+    /// A previous stop bound expired and its task was retained. It may still be
+    /// running, so a new engine is refused until it is joined or observed done.
+    #[error("the previous engine has not stopped")]
+    EngineNotStopped,
     /// The dispatch returned an error string after it was started.
     #[error("{0}")]
     Engine(String),
-    /// The engine did not finish within the stop bound.
+    /// The engine did not finish within the stop bound. Its task is retained by
+    /// this Core, not detached; `status().engine` is `TimedOut`.
     #[error("{0}")]
     Stop(String),
 }
@@ -207,11 +272,23 @@ impl Core {
             .engine
             .lock()
             .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
-        if matches!(&*slot, EngineSlot::Running(engine) if !engine.is_finished()) {
-            return Err(CoreError::EngineAlreadyRunning);
+        // A new engine may replace only a slot whose prior task is known to have
+        // terminated: `None` (nothing started) or `Ended` (it returned). Every
+        // other state may still have a live task, so refuse rather than install
+        // a second engine or lose a handle.
+        let blocked = match &*slot {
+            EngineSlot::Stopping => Some(CoreError::EngineStopping),
+            EngineSlot::Running(engine) if !engine.is_finished() => {
+                Some(CoreError::EngineAlreadyRunning)
+            }
+            EngineSlot::Unstopped(engine) if !engine.is_finished() => {
+                Some(CoreError::EngineNotStopped)
+            }
+            _ => None,
+        };
+        if let Some(error) = blocked {
+            return Err(error);
         }
-        // A finished task is retained only so `status` can say Stopped; replace
-        // it with the new run.
         *slot = EngineSlot::None;
 
         let cancel = Cancellation::default();
@@ -247,45 +324,106 @@ impl Core {
     ///
     /// The dispatch's own epilogue is what is joined; work it detached is not
     /// proven stopped. A dispatch that ignores the latch is reported as
-    /// `CoreError::Stop` once the bound expires, not as success.
+    /// `CoreError::Stop` once the bound expires, and its task is **retained**
+    /// (`status().engine` is `TimedOut`), never reported as stopped and never
+    /// replaced while it may still run.
     pub async fn stop(&self) -> Result<(), CoreError> {
-        // Take only a running engine; leave an already-stopped slot as Stopped
-        // and never turn "was never started" into anything but NotLinked.
-        let taken = {
+        self.stop_within(Duration::from_secs(5)).await
+    }
+
+    /// The bounded form of [`Core::stop`]. A caller that wants a shorter grace
+    /// (a test, or a supervisor with its own deadline) uses this.
+    pub async fn stop_within(&self, bound: Duration) -> Result<(), CoreError> {
+        // Phase 1, under the lock and without awaiting: claim the engine by
+        // moving the slot to `Stopping`. `Stopping` both owns the settle and
+        // refuses a concurrent start or stop, so no second owner can race the
+        // slot while this future awaits the join below.
+        let mut claim = {
             let mut slot = self
                 .engine
                 .lock()
                 .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
-            match std::mem::replace(&mut *slot, EngineSlot::None) {
-                EngineSlot::Running(engine) => Some(engine),
-                EngineSlot::Stopped => {
-                    *slot = EngineSlot::Stopped;
-                    None
+            enum Decision {
+                Settled,
+                Refuse,
+                Take,
+            }
+            let decision = match &*slot {
+                EngineSlot::None | EngineSlot::Ended(_) => Decision::Settled,
+                EngineSlot::Stopping => Decision::Refuse,
+                EngineSlot::Running(_) | EngineSlot::Unstopped(_) => Decision::Take,
+            };
+            match decision {
+                Decision::Refuse => return Err(CoreError::EngineStopping),
+                // Already settled: the last task terminated, so stop is a no-op.
+                Decision::Settled => return Ok(()),
+                Decision::Take => {
+                    let engine = match std::mem::replace(&mut *slot, EngineSlot::Stopping) {
+                        EngineSlot::Running(engine) | EngineSlot::Unstopped(engine) => engine,
+                        _ => unreachable!("a live engine was inspected above"),
+                    };
+                    StopClaim {
+                        slot: &self.engine,
+                        engine: Some(engine),
+                    }
                 }
-                EngineSlot::None => None,
             }
         };
-        let Some(engine) = taken else {
-            return Ok(());
-        };
-        let result = engine.stop_within(Duration::from_secs(5)).await;
-        {
-            let mut slot = self
-                .engine
-                .lock()
-                .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
-            *slot = EngineSlot::Stopped;
-        }
+
+        // Phase 2, no lock held across the await. The engine stays inside
+        // `claim`, so a future dropped here (a supervisor timeout) leaves
+        // `StopClaim::drop` to return it to the slot as `Unstopped`; it is never
+        // detached on the floor.
+        let result = claim
+            .engine
+            .as_mut()
+            .expect("the stop claim is armed")
+            .stop_within(bound)
+            .await;
+
+        // Phase 3, under the lock: record the outcome. Every arm disarms the
+        // claim first, so only the timeout arm leaves the task in the slot.
+        let mut slot = self
+            .engine
+            .lock()
+            .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(message)) => Err(CoreError::Engine(message)),
-            Err(error) => Err(CoreError::Stop(error.to_string())),
+            Ok(Ok(())) => {
+                let _ = claim.take();
+                *slot = EngineSlot::Ended(Ok(()));
+                Ok(())
+            }
+            Ok(Err(message)) => {
+                let _ = claim.take();
+                *slot = EngineSlot::Ended(Err(message.clone()));
+                Err(CoreError::Engine(message))
+            }
+            Err(StopError::Panicked(error)) => {
+                let _ = claim.take();
+                let message = format!("the engine dispatch failed: {error}");
+                *slot = EngineSlot::Ended(Err(message.clone()));
+                Err(CoreError::Engine(message))
+            }
+            Err(StopError::TimedOut) => {
+                let engine = claim.take();
+                *slot = EngineSlot::Unstopped(engine);
+                Err(CoreError::Stop(
+                    "the engine did not stop within the bound; its task is retained".into(),
+                ))
+            }
         }
     }
 
-    /// Whether this Core currently owns a running dispatch.
+    /// Whether this Core may still own a live dispatch task.
+    ///
+    /// True for `Running`, `Stopping` and `TimedOut`: in each, a task exists and
+    /// has not been confirmed returned. False only once it is `Stopped`,
+    /// `Failed` or `NotLinked`.
     pub fn is_engine_running(&self) -> Result<bool, CoreError> {
-        Ok(self.engine_state()? == EngineState::Running)
+        Ok(matches!(
+            self.engine_state()?,
+            EngineState::Running | EngineState::Stopping | EngineState::TimedOut
+        ))
     }
 
     fn engine_state(&self) -> Result<EngineState, CoreError> {
@@ -295,9 +433,16 @@ impl Core {
             .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
         Ok(match &*slot {
             EngineSlot::None => EngineState::NotLinked,
-            EngineSlot::Stopped => EngineState::Stopped,
             EngineSlot::Running(engine) if engine.is_finished() => EngineState::Stopped,
             EngineSlot::Running(_) => EngineState::Running,
+            EngineSlot::Stopping => EngineState::Stopping,
+            // An `Unstopped` task that has since finished is a clean stop for
+            // status purposes (we cannot recover its Ok/Err without joining, and
+            // a join is what `stop` is for); while it is alive it is `TimedOut`.
+            EngineSlot::Unstopped(engine) if engine.is_finished() => EngineState::Stopped,
+            EngineSlot::Unstopped(_) => EngineState::TimedOut,
+            EngineSlot::Ended(Ok(())) => EngineState::Stopped,
+            EngineSlot::Ended(Err(_)) => EngineState::Failed,
         })
     }
 
@@ -363,6 +508,7 @@ fn set_private_dir(dir: &Path) -> Result<(), CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn core() -> Core {
         Core::open(tempfile::tempdir().unwrap().keep()).unwrap()
@@ -401,16 +547,47 @@ mod tests {
         assert_eq!(core.start().unwrap_err(), CoreError::EngineNotLinked);
     }
 
+    /// A dispatch that observes cancellation cooperatively and then parks until
+    /// `hold` is released. `cancel_seen`, when set, reports that the latch fired
+    /// (which only happens after a stop claimed the slot).
+    macro_rules! cooperative_dispatch {
+        ($entered:expr, $cancel_seen:expr, $hold:expr) => {
+            move |stop: Cancellation, readiness: Readiness| async move {
+                readiness.publish(|| {});
+                let _ = $entered.send(());
+                let _ = stop.run(std::future::pending::<()>()).await;
+                if let Some(cancel_seen) = $cancel_seen {
+                    let _ = cancel_seen.send(());
+                }
+                let _ = $hold.await;
+                Ok::<(), String>(())
+            }
+        };
+    }
+
+    /// A dispatch that ignores cancellation entirely; only releasing `hold`
+    /// ends it. This is the worst case a stop must not mislabel as stopped.
+    macro_rules! stubborn_dispatch {
+        ($entered:expr, $hold:expr) => {
+            move |_stop: Cancellation, readiness: Readiness| async move {
+                readiness.publish(|| {});
+                let _ = $entered.send(());
+                let _ = $hold.await;
+                Ok::<(), String>(())
+            }
+        };
+    }
+
     #[tokio::test]
     async fn core_owns_starts_and_stops_one_dispatch_task() {
         let core = core();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        core.start_with_dispatch(move |stop, readiness| async move {
-            readiness.publish(|| {});
-            let _ = entered_tx.send(());
-            stop.run(std::future::pending::<()>()).await;
-            Ok(())
-        })
+        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel();
+        core.start_with_dispatch(cooperative_dispatch!(
+            entered_tx,
+            None::<tokio::sync::oneshot::Sender<()>>,
+            hold_rx
+        ))
         .unwrap();
         entered_rx.await.unwrap();
         assert_eq!(core.status().unwrap().engine, EngineState::Running);
@@ -418,9 +595,130 @@ mod tests {
             core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) }),
             Err(CoreError::EngineAlreadyRunning)
         );
+        // Let the cooperative dispatch finish after cancellation.
+        hold_tx.send(()).unwrap();
         core.stop().await.unwrap();
         assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
         assert!(!core.is_engine_running().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_start_is_refused_while_a_stop_is_in_flight() {
+        let core = Arc::new(core());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel();
+        core.start_with_dispatch(cooperative_dispatch!(entered_tx, Some(cancel_tx), hold_rx))
+            .unwrap();
+        entered_rx.await.unwrap();
+
+        let stop_core = Arc::clone(&core);
+        let stop_task = tokio::spawn(async move { stop_core.stop().await });
+        // Cancellation is only requested after `stop` claimed the slot as
+        // `Stopping`, so observing it proves the slot is claimed.
+        cancel_rx.await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopping);
+        // No concurrent start may install a second engine...
+        assert_eq!(
+            core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) }),
+            Err(CoreError::EngineStopping)
+        );
+        // ...and no concurrent stop may claim success while the task lives.
+        assert_eq!(core.stop().await, Err(CoreError::EngineStopping));
+
+        hold_tx.send(()).unwrap();
+        assert_eq!(stop_task.await.unwrap(), Ok(()));
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+
+        // The old handle was not lost: a fresh start succeeds and owns the slot.
+        let (entered2_tx, entered2_rx) = tokio::sync::oneshot::channel();
+        let (hold2_tx, hold2_rx) = tokio::sync::oneshot::channel();
+        core.start_with_dispatch(cooperative_dispatch!(
+            entered2_tx,
+            None::<tokio::sync::oneshot::Sender<()>>,
+            hold2_rx
+        ))
+        .unwrap();
+        entered2_rx.await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+        hold2_tx.send(()).unwrap();
+        core.stop().await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_stop_timeout_retains_the_task_and_refuses_restart() {
+        let core = core();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel();
+        // Ignores cancellation entirely; only `hold` ends it.
+        core.start_with_dispatch(stubborn_dispatch!(entered_tx, hold_rx))
+            .unwrap();
+        entered_rx.await.unwrap();
+
+        assert!(matches!(
+            core.stop_within(Duration::from_millis(20)).await,
+            Err(CoreError::Stop(_))
+        ));
+        assert_eq!(core.status().unwrap().engine, EngineState::TimedOut);
+        assert!(core.is_engine_running().unwrap());
+        assert_eq!(
+            core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) }),
+            Err(CoreError::EngineNotStopped)
+        );
+
+        // The retained task can still be joined; only then is a restart allowed.
+        hold_tx.send(()).unwrap();
+        core.stop_within(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        core.start_with_dispatch(|stop, _| async move {
+            stop.run(std::future::pending::<()>()).await;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+        core.stop().await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stop_future_retains_the_task() {
+        let core = core();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel();
+        core.start_with_dispatch(stubborn_dispatch!(entered_tx, hold_rx))
+            .unwrap();
+        entered_rx.await.unwrap();
+
+        // A supervisor gives up waiting: the stop future is dropped mid-await.
+        assert!(tokio::time::timeout(Duration::from_millis(20), core.stop())
+            .await
+            .is_err());
+        // The task was retained, not lost: still not `Stopped`, restart refused.
+        assert_eq!(core.status().unwrap().engine, EngineState::TimedOut);
+        assert_eq!(
+            core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) }),
+            Err(CoreError::EngineNotStopped)
+        );
+
+        hold_tx.send(()).unwrap();
+        core.stop_within(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_error_is_recorded_as_failed() {
+        let core = core();
+        core.start_with_dispatch(|_stop, readiness| async move {
+            readiness.publish(|| {});
+            Err("boom".to_string())
+        })
+        .unwrap();
+        assert_eq!(core.stop().await, Err(CoreError::Engine("boom".into())));
+        assert_eq!(core.status().unwrap().engine, EngineState::Failed);
+        // The failed task terminated, so a restart is safe.
+        core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) })
+            .unwrap();
     }
 
     #[test]
@@ -445,6 +743,14 @@ mod tests {
     async fn stop_without_a_started_engine_is_a_no_op() {
         let core = core();
         core.stop().await.unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::NotLinked);
+    }
+
+    #[test]
+    fn start_without_a_dispatch_stays_engine_not_linked() {
+        let core = core();
+        assert_eq!(core.start().unwrap_err(), CoreError::EngineNotLinked);
+        // The credential-side start must not install an engine slot.
         assert_eq!(core.status().unwrap().engine, EngineState::NotLinked);
     }
 

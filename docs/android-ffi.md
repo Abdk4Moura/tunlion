@@ -97,6 +97,13 @@ the dispatch uses `Core::start_with_dispatch` (not exposed over UniFFI). A
 language binding cannot supply a dispatch, so `start` refuses honestly, and
 `Core::stop` is a Rust API for now rather than an exported one.
 
+`status().engine` is the slot state a UI polls: `NotLinked` (nothing started),
+`Running`, `Stopping` (a stop is joining), `Stopped` (confirmed join),
+`Failed` (the dispatch returned an error), and `TimedOut` (a stop bound expired
+and the task is retained). `Stopped` is only reported after a confirmed join;
+`TimedOut` is not `Stopped`, and a restart is refused while a retained task may
+still run.
+
 Identity bytes are `filament-id`'s format: `filament-id-seed-v1\0` plus the
 32-byte seed, written by `secret-write` (mode `0600` on Unix). Do not invent a
 second file. Do not call `UserKey::generate`. That path writes a PKCS8 key and
