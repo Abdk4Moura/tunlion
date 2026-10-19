@@ -1059,9 +1059,9 @@ async fn recv_driver(
     let outcome = stop.run(recv_run(
         server, code, dir, yes, room, to, keep_open, timeout, expect_sha256,
         relay, remember, daemon, output, shell_policy, shell_user,
-        no_proxy_fallback, transport_context, log, host, stop, cleanup,
+        no_proxy_fallback, transport_context, log.clone(), host, stop, cleanup,
     )).await;
-    cleanup.finish().await;
+    cleanup.finish(log.as_ref()).await;
     // A signal received during cleanup still has its signal-specific outcome.
     if stop.is_cancelled() {
         filament_peerloop::driver::DriverOutcome::Cancelled
@@ -1082,7 +1082,11 @@ struct RecvCleanup {
     signaling: Option<filament_signal::Client>,
     tasks: crate::recv_lifecycle::Tasks,
     watchdog: crate::recv_lifecycle::LoopWatchdog,
+    sync_tasks: SyncTasks,
 }
+
+#[derive(Clone, Default)]
+struct SyncTasks(Arc<Mutex<HashMap<(String, u32), filament_peerloop::sync::serving::SyncServeTask>>>);
 
 /// Test-only observation of the production cleanup order. The no-op in normal
 /// builds keeps `finish` honest: tests assert what it actually awaits.
@@ -1100,8 +1104,69 @@ fn note_cleanup_phase(phase: &'static str) {
 #[cfg(not(test))]
 fn note_cleanup_phase(_phase: &'static str) {}
 
+impl SyncTasks {
+    async fn track_sync_task(
+        &self,
+        pid: String,
+        sid: u32,
+        task: filament_peerloop::sync::serving::SyncServeTask,
+        log: &dyn LogSink,
+    ) {
+        let key = (pid, sid);
+        // A live SID collision is rejected during admission. A finished entry
+        // can remain until the next reap tick; join it before replacing it.
+        if let Some(previous) = self.0.lock().unwrap().remove(&key) {
+            previous.cancel();
+            report_sync_join(log, &key.0, key.1, previous.join().await);
+        }
+        self.0.lock().unwrap().insert(key, task);
+    }
+
+    async fn reap_sync_tasks(&self, log: &dyn LogSink) {
+        let finished: Vec<_> = self.0.lock().unwrap()
+            .iter()
+            .filter(|(_, task)| task.is_finished())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (pid, sid) in finished {
+            if let Some(task) = self.0.lock().unwrap().remove(&(pid.clone(), sid)) {
+                report_sync_join(log, &pid, sid, task.join().await);
+            }
+        }
+    }
+
+    async fn cancel_sync_for_pid(&self, pid: &str, log: &dyn LogSink) {
+        let keys: Vec<_> = self.0.lock().unwrap()
+            .keys()
+            .filter(|(task_pid, _)| task_pid == pid)
+            .cloned()
+            .collect();
+        let mut joining = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(task) = self.0.lock().unwrap().remove(&key) {
+                task.cancel();
+                joining.push((key, task));
+            }
+        }
+        for ((task_pid, sid), task) in joining {
+            report_sync_join(log, &task_pid, sid, task.join().await);
+        }
+    }
+
+    async fn stop_sync_tasks(&self, log: &dyn LogSink) {
+        let mut joining = std::mem::take(&mut *self.0.lock().unwrap()).into_iter().collect::<Vec<_>>();
+        for (_, task) in &joining {
+            task.cancel();
+        }
+        for ((pid, sid), task) in joining.drain(..) {
+            report_sync_join(log, &pid, sid, task.join().await);
+        }
+    }
+
+}
+
 impl RecvCleanup {
-    async fn finish(&mut self) {
+    async fn finish(&mut self, log: &dyn LogSink) {
         // The loop is intentionally no longer turning. Ask its stall observer
         // to stop before the (possibly slow) flush, so cleanup cannot be
         // reported as a live-loop stall. This is a best-effort one-second
@@ -1109,6 +1174,8 @@ impl RecvCleanup {
         // waiter alive (still holding the log sink) until they finish.
         let _ = self.watchdog.stop().await;
         note_cleanup_phase("watchdog");
+        self.sync_tasks.stop_sync_tasks(log).await;
+        note_cleanup_phase("sync_tasks");
         // Stop accepting control work before closing links. Joining aborted
         // tasks ensures their listener futures are dropped before we return.
         self.tasks.stop().await;
@@ -1126,6 +1193,19 @@ impl RecvCleanup {
         }
         self.conn.take();
         self.state.take();
+    }
+}
+
+fn report_sync_join(
+    log: &dyn LogSink,
+    pid: &str,
+    sid: u32,
+    result: Result<std::result::Result<(), String>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log.say(&format!("sync: {pid}/{sid} ended: {error}")),
+        Err(error) => log.say(&format!("sync: {pid}/{sid} server task failed: {error}")),
     }
 }
 
@@ -1301,6 +1381,7 @@ async fn recv_run(
     // points at `tunlion add` / `tunlion join`, which run the SPAKE2 ceremony.
     // Receive-side transfer/consent state, grouped out of this function's locals
     // (still a plain local; no handler extraction yet). See `RecvState`.
+    let sync_tasks = cleanup.sync_tasks.clone();
     let st = cleanup.state.insert(RecvState {
         by_sid: HashMap::new(),
         verify_fails: HashMap::new(),
@@ -2185,6 +2266,7 @@ async fn recv_run(
     let receive_started = Instant::now();
 
     loop {
+        sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Live posture: a `tunlion grant <dev> shell` (or the revoke of the last
         // shell grant) applies to the RUNNING daemon on the next open. Computed once at startup, it silently required a
         // restart and refused every granted device with "shell serving is off".
@@ -2700,6 +2782,7 @@ async fn recv_run(
                 // it stops `warm_link_for` from selecting it again, so the
                 // caller's retry -- we send a RETRYABLE reason -- establishes
                 // a fresh link instead of parking on the same corpse.
+                sync_tasks.cancel_sync_for_pid(&p.pid, log.as_ref()).await;
                 conn.drop_link(&p.pid);
             }
             for (p, reason) in stale {
@@ -2860,6 +2943,9 @@ async fn recv_run(
                     ParkKind::Sync => {
                         // The re-drive re-checks transport under its own label;
                         // admission then resolves it again from the same link.
+                        if stop.is_cancelled() {
+                            continue;
+                        }
                         if conn.transport_of(&p.pid).is_none() {
                             crate::conn::dropped_no_transport(
                                 &p.pid,
@@ -2867,7 +2953,7 @@ async fn recv_run(
                             );
                             continue;
                         }
-                        crate::sync_cmd::handle_sync_open(
+                        if let Some((sid, task)) = crate::sync_cmd::handle_sync_open(
                             &mut conn,
                             &p.pid,
                             &p.v,
@@ -2875,7 +2961,12 @@ async fn recv_run(
                             &dir,
                             &mut parked_opens,
                         )
-                        .await;
+                        .await
+                        {
+                            sync_tasks
+                                .track_sync_task(p.pid.clone(), sid, task, log.as_ref())
+                                .await;
+                        }
                     }
                     ParkKind::Forward => {
                         handle_forward_open(
@@ -3210,6 +3301,7 @@ async fn recv_run(
                 log.debug(&format!(
                     "tunlion: link to '{pid}' died, dropping so it can re-connect"
                 ));
+                sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                 conn.drop_link(&pid);
                 // Removing the mux is not ending its streams: every served
                 // session holds its own Arc, so a bare remove left a remote
@@ -3511,6 +3603,7 @@ async fn recv_run(
                         }
                     }
                     for (pid, label) in &doomed {
+                        sync_tasks.cancel_sync_for_pid(pid, log.as_ref()).await;
                         conn.drop_link(pid);
                         l2_muxes.remove(pid);
                         fleet_pending.remove(pid);
@@ -3959,6 +4052,7 @@ async fn recv_run(
                     log.debug(&format!(
                         "tunlion: dropping zombie warm link to '{pid}' (black-holed a stream)"
                     ));
+                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                     conn.drop_link(&pid);
                     retire_link_streams(&pid, &mut l2_muxes, &mut pty_bindings, &pty_sessions)
                         .await;
@@ -4105,6 +4199,7 @@ async fn recv_run(
                     }
                     for pid in channel_gone {
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                         conn.drop_link(&pid);
                         // A stale duplicate of a peer that is still linked is
                         // housekeeping, not a departure: it printed "ok alpha
@@ -4183,6 +4278,7 @@ async fn recv_run(
                     }
                     for pid in gone {
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                         conn.drop_link(&pid);
                         // A stale duplicate of a peer that is still linked is
                         // housekeeping, not a departure: it printed "ok alpha
@@ -5227,6 +5323,7 @@ async fn recv_run(
                                     ));
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
+                                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                                     conn.drop_link(&pid);
                                 }
                                 Ok(ok) => {
@@ -5437,6 +5534,7 @@ async fn recv_run(
                                     log.debug(&format!("fleet-hello from {pid} rejected: {e}"));
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
+                                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                                     conn.drop_link(&pid);
                                 }
                             }
@@ -6528,11 +6626,14 @@ async fn recv_run(
                 // would be, and parked on an unproven-identity deny like the
                 // shell-class opens.
                 Some("sync-open") => {
+                    if stop.is_cancelled() {
+                        continue;
+                    }
                     if conn.transport_of(&pid).is_none() {
                         crate::conn::dropped_no_transport(&pid, "sync-open");
                         continue;
                     }
-                    crate::sync_cmd::handle_sync_open(
+                    if let Some((sid, task)) = crate::sync_cmd::handle_sync_open(
                         &mut conn,
                         &pid,
                         &v,
@@ -6540,7 +6641,12 @@ async fn recv_run(
                         &dir,
                         &mut parked_opens,
                     )
-                    .await;
+                    .await
+                    {
+                        sync_tasks
+                            .track_sync_task(pid.clone(), sid, task, log.as_ref())
+                            .await;
+                    }
                     continue;
                 }
                 Some("ssh-sign-request") if !l2_enabled => {
@@ -7963,6 +8069,7 @@ async fn recv_run(
                                                 "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
                                             ),
                                         ));
+                                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                                         conn.drop_link(&pid);
                                     } else if test_hooks::suppress_delivery_ack() {
                                         log.say(&log.paint(
@@ -8142,6 +8249,7 @@ async fn recv_run(
                                                 "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
                                             ),
                                         ));
+                                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                                         conn.drop_link(&pid);
                                     } else if test_hooks::suppress_delivery_ack() {
                                         log.say(&log.paint(
@@ -8697,6 +8805,7 @@ async fn recv_run(
                         .get(&pid)
                         .is_some_and(|mux| !mux.transport().is_alive());
                     if selected_transport_dead {
+                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                         if let Some(mux) = l2_muxes.remove(&pid) {
                             mux.shutdown_all().await;
                         }
@@ -8906,10 +9015,10 @@ mod lifecycle_tests {
         entered_rx.await.unwrap();
         // `Some` makes finish enter the flush stage (an empty map parks nothing).
         cleanup.state = Some(empty_recv_state());
-        cleanup.finish().await;
+        cleanup.finish(&NoLog).await;
         assert_eq!(
             super::CLEANUP_PHASES.with(|phases| phases.borrow().clone()),
-            vec!["watchdog", "task_drop", "tasks", "flush"]
+            vec!["watchdog", "sync_tasks", "task_drop", "tasks", "flush"]
         );
     }
 
@@ -8936,7 +9045,93 @@ mod lifecycle_tests {
         );
         assert_eq!(
             super::CLEANUP_PHASES.with(|phases| phases.borrow().clone()),
-            vec!["watchdog", "tasks"]
+            vec!["watchdog", "sync_tasks", "tasks"]
+        );
+    }
+
+    #[derive(Default)]
+    struct SyncTestTransport;
+
+    #[async_trait::async_trait]
+    impl filament_transport::net::Transport for SyncTestTransport {
+        async fn send_control(&self, _msg: &Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_frame(
+            &self,
+            _sid: u32,
+            _offset: u64,
+            _payload: &[u8],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            64 * 1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn sync_server(
+        stream: tokio::sync::mpsc::Receiver<Option<bytes::Bytes>>,
+    ) -> filament_peerloop::sync::serving::SyncServeTask {
+        let transport: Arc<dyn filament_transport::net::Transport> =
+            Arc::new(SyncTestTransport);
+        let mux = filament_peerloop::l2::Mux::new(transport.clone(), Arc::new(NoHost));
+        filament_peerloop::sync::serving::spawn_sync_server(
+            filament_peerloop::sync::serving::SyncServeConfig {
+                transport,
+                mux,
+                sid: 0x8000_0101,
+                root: std::env::temp_dir(),
+                delete: false,
+                dry_run: false,
+                stream,
+                max_record_bytes: filament_peerloop::sync::MAX_SYNC_RECORD_BYTES,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_task_reaping_and_cleanup_join_owned_servers() {
+        let (finished_tx, finished_rx) = tokio::sync::mpsc::channel(1);
+        drop(finished_tx);
+        let mut cleanup = RecvCleanup::default();
+        let sync_tasks = cleanup.sync_tasks.clone();
+        sync_tasks
+            .track_sync_task("peer-finished".into(), 0x8000_0101, sync_server(finished_rx), &NoLog)
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !sync_tasks.0.lock().unwrap().values().next().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed sync stream completes its server");
+        sync_tasks.reap_sync_tasks(&NoLog).await;
+        assert!(sync_tasks.0.lock().unwrap().is_empty(), "completed owner is joined and removed");
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
+        sync_tasks
+            .track_sync_task("peer-revoked".into(), 0x8000_0102, sync_server(cancel_rx), &NoLog)
+            .await;
+        let (_survivor_tx, survivor_rx) = tokio::sync::mpsc::channel(1);
+        sync_tasks
+            .track_sync_task("peer-live".into(), 0x8000_0103, sync_server(survivor_rx), &NoLog)
+            .await;
+        sync_tasks.cancel_sync_for_pid("peer-revoked", &NoLog).await;
+        assert!(
+            sync_tasks.0.lock().unwrap().contains_key(&("peer-live".into(), 0x8000_0103)),
+            "peer teardown must not cancel another peer's stream"
+        );
+        sync_tasks.stop_sync_tasks(&NoLog).await;
+        assert!(
+            sync_tasks.0.lock().unwrap().is_empty(),
+            "shutdown cancels, joins, and drains owners"
         );
     }
 }
