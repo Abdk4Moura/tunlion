@@ -2166,18 +2166,40 @@ async fn recv_run(
     // validity refresh, or a newly-established link.
     let mut last_roster_push = Instant::now();
 
-    // systemd Type=notify: announce readiness once the serving loop is about to
-    // run, then ping the watchdog below. No-op when not run under systemd.
+    // The single linearized readiness edge: published exactly once, immediately
+    // before dispatch, after every required initialization. It is deliberately
+    // distinct from the console banner (printed before Conn/sector setup) and
+    // from optional post-dispatch work. Nothing awaited and optional may sit
+    // between this edge and entering the loop. The systemd notifier and the
+    // `up --detach` ready marker consume this one edge, so they cannot disagree
+    // about when the daemon was ready. No-op for a one-shot receive, which has
+    // transfer-completion semantics instead of an "engine is serving" edge.
+    let mut readiness = crate::recv_lifecycle::Readiness::default();
     if daemon {
-        sdnotify::ready();
-        sdnotify::status("up - serving");
-        // The same edge for `up --detach`, which has no systemd to tell it.
-        crate::file_io::mark_daemon_ready();
+        readiness.publish(|| {
+            // systemd Type=notify: announce readiness once the serving loop is
+            // about to run. No-op when not run under systemd.
+            sdnotify::ready();
+            sdnotify::status("up - serving");
+            // The same edge for `up --detach`, which has no systemd to tell it.
+            crate::file_io::mark_daemon_ready();
+        });
     }
 
-    // Restore mounts that were marked with auto_restore.
-    if let Err(e) = host.restore_mounts(server, relay).await {
-        log.say(&format!("warning: failed to restore mounts: {e}"));
+    // Optional mount restoration is NOT a readiness gate. It starts after the
+    // ready edge and after dispatch, reports degraded status on failure, and is
+    // owned by this invocation so `RecvCleanup::finish` cancels and joins it on
+    // normal return. A slow or hung restore can no longer delay serving after
+    // readiness was announced.
+    {
+        let host = host.clone();
+        let log = log.clone();
+        let server = server.to_string();
+        cleanup.tasks.push(tokio::spawn(async move {
+            if let Err(e) = host.restore_mounts(&server, relay).await {
+                log.say(&format!("warning: failed to restore mounts: {e}"));
+            }
+        }));
     }
 
     // The deadline starts when the loop starts, not when the process did: the
