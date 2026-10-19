@@ -72,6 +72,14 @@ pub static REMEMBER_STORED: std::sync::atomic::AtomicBool =
 /// and is delivered without this wait; it only lets a live peer take it before
 /// the loop moves on, and a peer that will never acknowledge must not hold the
 /// receiver (and its exit) hostage.
+/// Dev-debug lines, exactly the CLI's old gate: stripped unless `debug-logs`.
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "debug-logs")]
+        eprintln!($($arg)*);
+    };
+}
+
 const ACK_FLUSH_BUDGET: Duration = Duration::from_secs(2);
 
 /// Whole-file verify failures before the transfer fails clearly (P4/GAP-5).
