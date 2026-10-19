@@ -293,7 +293,7 @@ mod fleet_ui;
 
 use anyhow::{bail, Result};
 use net::{Ev, Transport};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal};
@@ -447,19 +447,6 @@ mod test_hooks {
         PREMATURE_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// truncation/ack gate corruption injector. `TUNLION_TEST_CORRUPT_RECV=<id>`
-    /// flips the last on-disk byte of the matching transfer; `_CORRUPT_ONCE=1`
-    /// fires exactly once (proving auto-recovery). The "already fired" latch is a
-    /// process-global AtomicBool, no env mutation (the old code did an unsafe
-    /// `set_var` of `TUNLION_TEST_CORRUPT_FIRED` inside the async runtime).
-    static CORRUPT_FIRED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    /// The configured corrupt-recv target id, if any.
-    pub fn corrupt_recv_target() -> Option<String> {
-        std::env::var("TUNLION_TEST_CORRUPT_RECV").ok()
-    }
-
     /// daemon-survival gate (14c): `TUNLION_TEST_FAIL_ADOPT=<n>` makes the
     /// first n peer adoptions fail the way an ICE-config timeout does, so the
     /// gate can prove a per-peer failure never ends the `up` daemon and that
@@ -479,15 +466,6 @@ mod test_hooks {
                 |used| (used < n).then_some(used + 1),
             )
             .is_ok()
-    }
-    pub fn corrupt_recv_once() -> bool {
-        std::env::var("TUNLION_TEST_CORRUPT_ONCE").map(|v| v == "1").unwrap_or(false)
-    }
-    pub fn corrupt_already_fired() -> bool {
-        CORRUPT_FIRED.load(std::sync::atomic::Ordering::SeqCst)
-    }
-    pub fn corrupt_mark_fired() {
-        CORRUPT_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -512,7 +490,6 @@ mod test_hooks {
     #[inline] pub fn premature_close_once() -> bool { false }
     #[inline] pub fn premature_already_fired() -> bool { false }
     #[inline] pub fn premature_mark_fired() {}
-    #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
     #[inline] pub fn fail_adopt() -> bool { false }
 }
 
@@ -815,56 +792,19 @@ pub(crate) fn short_host_label(host: &str) -> String {
     if label.is_empty() { "device".to_string() } else { label }
 }
 
-pub(crate) fn human(bytes: u64) -> String {
-    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    // Byte counts and rates for all transfer output, in binary units: the
-    // divisor is 1024, so the labels are the IEC ones. They used to say
-    // KB/MB/GB over the same divisor, which reads as decimal and understated
-    // every size and rate (by about 7% at the GB scale).
-    let mut v = bytes as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", U[i]) }
-}
+/// Byte counts and rates for all transfer output, in binary units: the divisor
+/// is 1024, so the labels are the IEC ones. It used to say KB/MB/GB over the
+/// same divisor, which reads as decimal and understated every size and rate
+/// (by about 7% at the GB scale).
+///
+/// Moved to `filament-peerloop::present` with the receive mechanics that render
+/// bytes (`StdoutSink`); re-exported here so every `crate::human` call site
+/// keeps resolving to the one implementation.
+pub(crate) use filament_peerloop::present::human;
 
 
 
 
-impl PartMeta {
-    fn load(path: &Path) -> Option<PartMeta> {
-        let raw = std::fs::read_to_string(path).ok()?;
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            if let Some(size) = v["size"].as_u64() {
-                return Some(PartMeta {
-                    size,
-                    head: v["head"].as_str().map(|s| s.to_string()),
-                    full: v["full"].as_str().map(|s| s.to_string()),
-                });
-            }
-        }
-        raw.trim().parse::<u64>().ok().map(|size| PartMeta { size, head: None, full: None })
-    }
-    /// Write the sidecar WITHOUT following a symlink at `path`: the download
-    /// dir may be writable by others, and `std::fs::write` through a planted
-    /// `x.part.meta -> ~/.bashrc` would overwrite the link's target. Unlink
-    /// first (removes a link, never its target), then create exclusively, so a
-    /// link re-planted in between makes this fail instead of writing through.
-    /// Created owner-only (0600) regardless of umask: it names the file, its
-    /// size and digests, and sits in a download dir others may read.
-    fn store(&self, path: &Path) -> std::io::Result<()> {
-        use std::io::Write;
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let mut f = crate::platform::create_new_private(path)?;
-        f.write_all(json!({ "size": self.size, "head": self.head, "full": self.full }).to_string().as_bytes())
-    }
-}
 
 
 // ------------------------------------------------------- known devices (C12) --

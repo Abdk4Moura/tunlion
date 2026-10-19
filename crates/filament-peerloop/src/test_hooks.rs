@@ -37,6 +37,27 @@ mod on {
             )
             .is_ok()
     }
+
+    /// Truncation/ack gate corruption injector. `TUNLION_TEST_CORRUPT_RECV=<id>`
+    /// flips the last on-disk byte of the matching transfer; `_CORRUPT_ONCE=1`
+    /// fires exactly once (proving auto-recovery). The "already fired" latch is a
+    /// process-global AtomicBool, no env mutation. Moved here with the receive
+    /// verify (`recv::verify_incoming`), whose only reader they are.
+    static CORRUPT_FIRED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// The configured corrupt-recv target id, if any.
+    pub fn corrupt_recv_target() -> Option<String> {
+        std::env::var("TUNLION_TEST_CORRUPT_RECV").ok()
+    }
+    pub fn corrupt_recv_once() -> bool {
+        std::env::var("TUNLION_TEST_CORRUPT_ONCE").map(|v| v == "1").unwrap_or(false)
+    }
+    pub fn corrupt_already_fired() -> bool {
+        CORRUPT_FIRED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn corrupt_mark_fired() {
+        CORRUPT_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(not(feature = "test-hooks"))]
@@ -45,6 +66,10 @@ mod off {
     #[inline] pub fn disable_modeb_drop() -> bool { false }
     #[inline] pub fn no_defer() -> bool { false }
     #[inline] pub fn fail_adopt() -> bool { false }
+    #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
+    #[inline] pub fn corrupt_recv_once() -> bool { false }
+    #[inline] pub fn corrupt_already_fired() -> bool { false }
+    #[inline] pub fn corrupt_mark_fired() {}
 }
 
 #[cfg(feature = "test-hooks")]

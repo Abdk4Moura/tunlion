@@ -25,6 +25,14 @@
 //! out of `cli/src/l2.rs` in the next slice; its acceptor dial and live-session
 //! cut go through `host::HostServices`, never the CLI.
 //!
+//! `recv` carries the host-free receive-side file mechanics lifted from
+//! `cli/src/recv_files.rs`: the untrusted-name collision rule, the whole-file
+//! digest, the `.part.meta` sidecar and the resumable-partial lifecycle, the
+//! storage-failure vocabulary, the in-order `StdoutSink`, the `IncomingFile`
+//! state, the whole-file verify and the confinement-safe `.part` open. The CLI
+//! re-exports them; what stays there is the orchestration plus the host/UI
+//! adapters (`finalize_incoming`, the inbox helpers, the rendered refusal).
+//!
 //! What the crate still does NOT contain:
 //! - the command surface (`send_cmd`, `recv_cmd`, the daemons, the roster UI):
 //!   those decide what a person asked for and render it.
@@ -61,6 +69,7 @@ pub mod mount_proto;
 pub mod mesh;
 mod petname;
 pub mod present;
+pub mod recv;
 pub mod refusal;
 pub mod resilience;
 mod retry;
