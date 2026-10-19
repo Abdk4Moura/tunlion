@@ -16,6 +16,9 @@ name = "tunlion"
 path = "src/main.rs"
 
 [features]
+default = ["mesh", "mount-server"]
+mesh = ["filament-peerloop/mesh"]
+mount-server = ["filament-peerloop/mount-server"]
 # Static builds need no feature: the musl target alone produces a static-pie
 # binary because the whole TLS tree is rustls. A `static` feature that vendored
 # OpenSSL (a rust_socketio/native-tls leftover, ledger C16) was removed on
@@ -92,7 +95,7 @@ filament-fleet = { path = "../crates/filament-fleet", version = "0.1.0" }
 # adoption, the petname rule), carved out in issue #465 slice 3 so the later move
 # of `Conn` itself is a `git mv`. Re-exported by `crate::conn`, so no call site
 # moved with it.
-filament-peerloop = { path = "../crates/filament-peerloop", version = "0.1.0", features = ["mount-server"] }
+filament-peerloop = { path = "../crates/filament-peerloop", version = "0.1.0", default-features = false }
 filament-transport = { path = "../crates/filament-transport", version = "0.1.0" }
 hex = "0.4"
 rand_core = "0.6"

@@ -45,7 +45,7 @@ jobs:
       - name: Compile isolated reduced peerloop root
         run: cargo check --locked -p filament-peerloop --no-default-features --target ${{ matrix.target }}
       - name: Compile default compatibility profile
-        run: cargo test --locked -p filament-peerloop --no-run
+        run: cargo test --locked -p filament-peerloop
 
   core-tooling-graph:
     name: core tooling dependency split

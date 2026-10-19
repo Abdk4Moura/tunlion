@@ -6597,6 +6597,7 @@ async fn recv_run(
                     .await;
                     continue;
                 }
+                #[cfg(feature = "mount-server")]
                 Some("mount-open") if l2_enabled => {
                     // The endpoint returns the serving task so a future driver
                     // can join it; binding and dropping it here is today's
@@ -6609,6 +6610,20 @@ async fn recv_run(
                         &crate::fleet_share_root(),
                     )
                     .await;
+                }
+                #[cfg(not(feature = "mount-server"))]
+                Some("mount-open") if l2_enabled => {
+                    // The frame vocabulary stays in the common receive loop,
+                    // but a reduced build has no mount endpoint to admit it.
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let sid = l2::wire_sid(&v);
+                        if let Some(sid) = sid.filter(|sid| l2::is_l2_sid(*sid)) {
+                            let _ = t.send_control(&json!({
+                                "type": "l2-close", "sid": sid,
+                                "err": "mount server is not available in this build",
+                            })).await;
+                        }
+                    }
                 }
                 Some("pty-resize") if l2_enabled => {
                     let Some(sid) = l2::wire_sid(&v) else {
