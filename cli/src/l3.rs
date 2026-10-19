@@ -39,9 +39,9 @@ use filament_peerloop::mesh::{MeshListener, MeshStream, MeshTunnel};
 /// crate so the receive loop can ask a host to start one without naming the
 /// CLI; re-exported here so existing callers keep resolving.
 pub use filament_peerloop::mesh::L3Mode;
-/// The pure mesh naming and route rules moved to the peer-loop crate. Kept as
+/// The pure mesh naming rules moved to the peer-loop crate. Kept as
 /// re-exports so this module and its tests still name them the same way.
-pub(crate) use filament_peerloop::mesh::{installable_routes, sanitize_host, short_host_label};
+pub(crate) use filament_peerloop::mesh::{sanitize_host, short_host_label};
 
 /// A mode-agnostic accepted overlay connection: a kernel `TcpStream` (bound on the
 /// overlay IP) or a userspace smoltcp stream. Implements the same async byte-stream
@@ -256,9 +256,8 @@ pub struct L3 {
     /// rather than re-read from the kernel so tunlion only ever deletes routes
     /// it created, and never a route the operator put there.
     kernel_subnets: Mutex<std::collections::HashSet<String>>,
-    /// Whether the policy-routing exit route is currently in force, so it is
-    /// installed once and withdrawn exactly once.
-    exit_route_installed: Mutex<bool>,
+    /// The active exit-route install plan, or a plan awaiting successful teardown.
+    exit_route_state: Mutex<Option<ExitRouteState>>,
     /// Highest announce sequence ACCEPTED from each peer identity, so a stale
     /// announce cannot roll an address back. Keyed by the announcing PUBKEY,
     /// not by pid: pid is a session artefact, and the signature binds the key.
@@ -275,6 +274,24 @@ pub struct L3 {
     /// means there is no kernel route to the overlay, so we do NOT write /etc/hosts
     /// (names would resolve but not route) and `add_route` is a no-op.
     netstack: Option<Arc<NetstackTun>>,
+}
+
+type ExitRoutePlan = Vec<Vec<String>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExitRouteState {
+    /// This plan was applied successfully and is believed active.
+    Active(ExitRoutePlan),
+    /// Teardown failed (or rollback after a partial install failed). Retrying
+    /// teardown is required before another desired plan may be installed.
+    PendingTeardown(ExitRoutePlan),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExitRouteChange {
+    Unchanged,
+    Installed,
+    Withdrawn,
 }
 
 impl L3 {
@@ -340,7 +357,7 @@ impl L3 {
             by_pid: Mutex::new(HashMap::new()),
             identity,
             kernel_subnets: Mutex::new(std::collections::HashSet::new()),
-            exit_route_installed: Mutex::new(false),
+            exit_route_state: Mutex::new(None),
             seen_seq: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             netstack,
@@ -621,7 +638,7 @@ impl L3 {
     /// peer's list, because two peers may advertise overlapping prefixes and a
     /// withdrawal by one must not delete a route the other still provides.
     pub async fn subnet_prefixes(&self) -> Vec<(IpAddr, u8)> {
-        self.routes.lock().await.subnets.iter().map(|(n, l, _)| (*n, *l)).collect()
+        self.routes.lock().await.subnets.iter().map(|(n, l, _, _)| (*n, *l)).collect()
     }
 
     /// The underlay address of every transport currently carrying a DEFAULT
@@ -636,7 +653,7 @@ impl L3 {
     async fn default_route_underlay(&self) -> (Vec<IpAddr>, bool) {
         let mut addrs = Vec::new();
         let mut unknown = false;
-        for (net, len, t) in self.routes.lock().await.subnets.iter() {
+        for (net, len, t, _) in self.routes.lock().await.subnets.iter() {
             if !crate::exit_route::is_default_route(*net, *len) {
                 continue;
             }
@@ -672,9 +689,8 @@ impl L3 {
         }
         {
             let mut map = self.routes.lock().await;
-            map.set_subnets(t, &prefixes);
+            map.set_subnets(pid, t, &prefixes);
         }
-        let _ = pid; // routes are keyed by transport; pid retracts via remove_by_pid
         self.sync_kernel_subnets().await;
     }
 
@@ -695,7 +711,7 @@ impl L3 {
                 table
                     .subnets
                     .iter()
-                    .any(|(sn, sl, t)| sn == n && sl == l && t.is_alive())
+                    .any(|(sn, sl, t, _)| sn == n && sl == l && t.is_alive())
             })
             .copied()
             .collect()
@@ -755,22 +771,9 @@ impl L3 {
             }
             return;
         }
-        {
-            let mut installed = self.exit_route_installed.lock().await;
-            if defaults.is_empty() {
-                if *installed {
-                    if let Err(e) = crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan())
-                    {
-                        crate::ui::debug(&format!("  could not withdraw the exit route: {e}"));
-                    }
-                    *installed = false;
-                    crate::ui::say("  exit route withdrawn; traffic uses the ordinary path again");
-                }
-                return;
-            }
-            if *installed {
-                return; // already in force; nothing changed
-            }
+        let mut desired = None;
+        let mut excluded = 0;
+        if !defaults.is_empty() {
             let (mut underlay, unknown) = self.default_route_underlay().await;
             if unknown {
                 // A relay link cannot name its own endpoint, so there is no
@@ -780,37 +783,43 @@ impl L3 {
                     "  {} not accepting an exit route over a relay link: its underlay address is unknown, so it cannot be excluded from the route it offers",
                     crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
                 ));
-                return;
-            }
-            // The signaling server, or the node cannot renegotiate, cannot be
-            // told to stop, and cannot recover on its own.
-            underlay.extend(crate::exit_route::signaling_addrs());
-            if underlay.is_empty() {
-                crate::ui::say(&format!(
-                    "  {} not accepting an exit route: no underlay address to exclude",
-                    crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
-                ));
-                return;
-            }
-            let gw = crate::platform::policy_route::default_gateway();
-            let plan = crate::exit_route::install_plan(ifname(), gw.as_deref(), &underlay);
-            match crate::platform::policy_route::run_plan(&plan) {
-                Ok(()) => {
-                    *installed = true;
+            } else {
+                // The signaling server must retain its ordinary path so a lost
+                // exit-node link can always be renegotiated and withdrawn.
+                underlay.extend(crate::exit_route::signaling_addrs());
+                if underlay.is_empty() {
                     crate::ui::say(&format!(
-                        "  {} exit route active: all traffic via the mesh, except {} excluded address(es)",
-                        crate::ui::paint(crate::ui::Tone::Ok, crate::ui::glyph_ok()),
-                        underlay.len()
-                    ));
-                }
-                Err(e) => {
-                    // Do not leave a half-applied policy in place.
-                    let _ = crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan());
-                    crate::ui::say(&format!(
-                        "  {} could not install the exit route ({e}); reverted",
+                        "  {} not accepting an exit route: no underlay address to exclude",
                         crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
                     ));
+                } else {
+                    let gw = crate::platform::policy_route::default_gateway();
+                    desired = Some(crate::exit_route::install_plan(ifname(), gw.as_deref(), &underlay));
+                    excluded = underlay.len();
                 }
+            }
+        }
+
+        let mut state = self.exit_route_state.lock().await;
+        let result = reconcile_exit_route_state(
+            &mut state,
+            desired,
+            || crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan()).map_err(|e| e.to_string()),
+            |plan| crate::platform::policy_route::run_plan(plan).map_err(|e| e.to_string()),
+        );
+        match result {
+            Ok(ExitRouteChange::Unchanged) => {}
+            Ok(ExitRouteChange::Withdrawn) => {
+                crate::ui::say("  exit route withdrawn; traffic uses the ordinary path again");
+            }
+            Ok(ExitRouteChange::Installed) => {
+                crate::ui::say(&format!(
+                    "  {} exit route active: all traffic via the mesh, except {excluded} excluded address(es)",
+                    crate::ui::paint(crate::ui::Tone::Ok, crate::ui::glyph_ok())
+                ));
+            }
+            Err(e) => {
+                crate::ui::debug(&format!("  could not reconcile the exit route: {e}"));
             }
         }
     }
@@ -873,19 +882,14 @@ impl L3 {
         let desired: std::collections::HashSet<String> =
             subnets.into_iter().map(|(n, l)| format!("{n}/{l}")).collect();
         let mut installed = self.kernel_subnets.lock().await;
-        for cidr in desired.difference(&installed).cloned().collect::<Vec<_>>() {
-            match crate::tun::add_route(&cidr, ifname()) {
-                Ok(()) => {
-                    installed.insert(cidr);
-                }
-                Err(e) => crate::ui::debug(&format!("  could not install route {cidr}: {e}")),
-            }
-        }
-        for cidr in installed.difference(&desired).cloned().collect::<Vec<_>>() {
-            if let Err(e) = crate::tun::del_route(&cidr, ifname()) {
-                crate::ui::debug(&format!("  could not withdraw route {cidr}: {e}"));
-            }
-            installed.remove(&cidr);
+        for (operation, cidr, error) in reconcile_installed_routes(
+            &mut installed,
+            &desired,
+            |cidr| crate::tun::add_route(cidr, ifname()).map_err(|e| e.to_string()),
+            |cidr| crate::tun::del_route(cidr, ifname()).map_err(|e| e.to_string()),
+        ) {
+            let verb = if operation == "add" { "install" } else { "withdraw" };
+            crate::ui::debug(&format!("  could not {verb} route {cidr}: {error}"));
         }
     }
 
@@ -900,6 +904,7 @@ impl L3 {
     /// reserved for an explicit device-forget path. Kept for that use.
     #[allow(dead_code)]
     pub async fn remove_by_pid(&self, pid: &str) {
+        self.routes.lock().await.remove_subnets_by_pid(pid);
         if let Some(ips) = self.by_pid.lock().await.remove(pid) {
             let mut map = self.routes.lock().await;
             for ip in ips {
@@ -912,6 +917,9 @@ impl L3 {
         if self.names.lock().await.remove(pid).is_some() {
             self.refresh_hosts().await;
         }
+        // Reconcile both OS subnet routes and exit-node policy after withdrawing
+        // this owner's entries. Shared prefixes remain desired while any peer owns them.
+        self.sync_kernel_subnets().await;
     }
 
     /// Rewrite the managed /etc/hosts block from the current verified names so
@@ -1274,7 +1282,9 @@ struct RouteTable {
     /// (network, prefix_len, via). Small and read on every packet that misses the
     /// host map, so a linear longest-match scan is the right shape until a node
     /// carries enough prefixes for that to show up in a profile.
-    subnets: Vec<(IpAddr, u8, Arc<dyn Transport>)>,
+    /// (network, prefix_len, via, announcing pid). The transport is the packet
+    /// path; pid is the revocation/withdrawal owner. They are not interchangeable.
+    subnets: Vec<(IpAddr, u8, Arc<dyn Transport>, String)>,
 }
 
 impl RouteTable {
@@ -1284,9 +1294,9 @@ impl RouteTable {
         }
         self.subnets
             .iter()
-            .filter(|(net, len, _)| prefix_contains(*net, *len, dst))
-            .max_by_key(|(_, len, _)| *len)
-            .map(|(_, _, t)| t.clone())
+            .filter(|(net, len, _, _)| prefix_contains(*net, *len, dst))
+            .max_by_key(|(_, len, _, _)| *len)
+            .map(|(_, _, t, _)| t.clone())
     }
 
     fn insert_host(&mut self, ip: IpAddr, t: Arc<dyn Transport>) {
@@ -1319,11 +1329,17 @@ impl RouteTable {
     /// Replace every prefix advertised via one peer. Advertisement is a full
     /// restatement, not a delta: a peer that stops advertising a prefix must have
     /// it withdrawn, and diffing deltas is how stale routes survive a retraction.
-    fn set_subnets(&mut self, via: &Arc<dyn Transport>, prefixes: &[(IpAddr, u8)]) {
-        self.subnets.retain(|(_, _, t)| !Arc::ptr_eq(t, via));
+    fn set_subnets(&mut self, pid: &str, via: &Arc<dyn Transport>, prefixes: &[(IpAddr, u8)]) {
+        // A full restatement replaces this pid's prior claim, even when a reconnect
+        // supplies a new Transport object. Never erase another pid sharing a path.
+        self.subnets.retain(|(_, _, _, owner)| owner != pid);
         for (net, len) in prefixes {
-            self.subnets.push((*net, *len, via.clone()));
+            self.subnets.push((*net, *len, via.clone(), pid.to_string()));
         }
+    }
+
+    fn remove_subnets_by_pid(&mut self, pid: &str) {
+        self.subnets.retain(|(_, _, _, owner)| owner != pid);
     }
 }
 
@@ -1336,6 +1352,234 @@ fn dest_ip(pkt: &[u8]) -> Option<IpAddr> {
             Some(IpAddr::from(a))
         }
         _ => None,
+    }
+}
+
+/// Reconcile the routes this process believes it installed with the desired set.
+/// State changes only after a successful OS operation: particularly, a failed
+/// delete remains tracked so a later reconciliation retries rather than silently
+/// forgetting a route that may still be present in the kernel.
+fn reconcile_installed_routes<A, D>(
+    installed: &mut std::collections::HashSet<String>,
+    desired: &std::collections::HashSet<String>,
+    mut add: A,
+    mut delete: D,
+) -> Vec<(&'static str, String, String)>
+where
+    A: FnMut(&str) -> Result<(), String>,
+    D: FnMut(&str) -> Result<(), String>,
+{
+    let mut errors = Vec::new();
+    for cidr in desired.difference(installed).cloned().collect::<Vec<_>>() {
+        match add(&cidr) {
+            Ok(()) => {
+                installed.insert(cidr);
+            }
+            Err(error) => errors.push(("add", cidr, error)),
+        }
+    }
+    for cidr in installed.difference(desired).cloned().collect::<Vec<_>>() {
+        match delete(&cidr) {
+            Ok(()) => {
+                installed.remove(&cidr);
+            }
+            Err(error) => errors.push(("delete", cidr, error)),
+        }
+    }
+    errors
+}
+
+/// Reconcile the active exit-route plan with the newly desired plan. Teardown is
+/// always completed before installing a changed plan. If teardown fails, retain
+/// the old plan as pending and retry it on the next reconciliation, even when
+/// that next reconciliation desires a different plan.
+fn reconcile_exit_route_state<T, I>(
+    state: &mut Option<ExitRouteState>,
+    desired: Option<ExitRoutePlan>,
+    mut teardown: T,
+    mut install: I,
+) -> Result<ExitRouteChange, String>
+where
+    T: FnMut() -> Result<(), String>,
+    I: FnMut(&ExitRoutePlan) -> Result<(), String>,
+{
+    if state.is_none() && desired.is_none() {
+        return Ok(ExitRouteChange::Unchanged);
+    }
+    if let (Some(ExitRouteState::Active(active)), Some(desired_plan)) =
+        (state.as_ref(), desired.as_ref())
+    {
+        if active == desired_plan {
+            return Ok(ExitRouteChange::Unchanged);
+        }
+    }
+
+    if let Some(previous) = state.take() {
+        let previous_plan = match previous {
+            ExitRouteState::Active(plan) | ExitRouteState::PendingTeardown(plan) => plan,
+        };
+        if let Err(error) = teardown() {
+            *state = Some(ExitRouteState::PendingTeardown(previous_plan));
+            return Err(format!("could not remove previous exit-route plan: {error}"));
+        }
+    }
+
+    let Some(desired_plan) = desired else {
+        return Ok(ExitRouteChange::Withdrawn);
+    };
+    match install(&desired_plan) {
+        Ok(()) => {
+            *state = Some(ExitRouteState::Active(desired_plan));
+            Ok(ExitRouteChange::Installed)
+        }
+        Err(install_error) => {
+            // Installation commands can fail partway through. Try the global
+            // teardown, and remember a pending cleanup if that too fails.
+            match teardown() {
+                Ok(()) => *state = None,
+                Err(teardown_error) => {
+                    *state = Some(ExitRouteState::PendingTeardown(desired_plan));
+                    return Err(format!(
+                        "install failed ({install_error}) and rollback failed ({teardown_error})"
+                    ));
+                }
+            }
+            Err(format!("install failed ({install_error}); rollback completed"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod route_reconcile_tests {
+    use super::{
+        reconcile_exit_route_state, reconcile_installed_routes, ExitRouteChange, ExitRouteState,
+    };
+    use std::collections::HashSet;
+
+    #[test]
+    fn failed_route_delete_stays_tracked_and_is_retried() {
+        let mut installed = HashSet::from(["192.0.2.0/24".to_string()]);
+        let desired = HashSet::new();
+        let mut delete_calls = 0;
+
+        let errors = reconcile_installed_routes(
+            &mut installed,
+            &desired,
+            |_| panic!("no additions expected"),
+            |_| {
+                delete_calls += 1;
+                Err("simulated delete failure".to_string())
+            },
+        );
+        assert_eq!(
+            errors,
+            vec![(
+                "delete",
+                "192.0.2.0/24".into(),
+                "simulated delete failure".into()
+            )]
+        );
+        assert!(installed.contains("192.0.2.0/24"));
+
+        // The retained entry remains in installed - desired and is attempted again.
+        let errors = reconcile_installed_routes(
+            &mut installed,
+            &desired,
+            |_| panic!("no additions expected"),
+            |_| {
+                delete_calls += 1;
+                Ok(())
+            },
+        );
+        assert!(errors.is_empty());
+        assert_eq!(delete_calls, 2);
+        assert!(!installed.contains("192.0.2.0/24"));
+    }
+
+    #[test]
+    fn failed_exit_route_teardown_remains_pending_and_retries() {
+        let plan = vec![vec!["exit-plan-A".to_string()]];
+        let mut state = Some(ExitRouteState::Active(plan));
+        let mut teardown_calls = 0;
+
+        let result = reconcile_exit_route_state(
+            &mut state,
+            None,
+            || {
+                teardown_calls += 1;
+                Err("simulated teardown failure".to_string())
+            },
+            |_| panic!("no installation expected"),
+        );
+        assert!(result.is_err());
+        assert!(matches!(state.as_ref(), Some(ExitRouteState::PendingTeardown(_))));
+
+        let result = reconcile_exit_route_state(
+            &mut state,
+            None,
+            || {
+                teardown_calls += 1;
+                Ok(())
+            },
+            |_| panic!("no installation expected"),
+        );
+        assert_eq!(result, Ok(ExitRouteChange::Withdrawn));
+        assert_eq!(teardown_calls, 2);
+        assert!(state.is_none(), "successful retry clears the pending teardown");
+    }
+
+    #[test]
+    fn failed_exit_teardown_reconciles_changed_desired_plan_before_stabilizing() {
+        use std::cell::RefCell;
+
+        let plan_a = vec![vec!["exit-plan-A".to_string()]];
+        let plan_b = vec![vec!["exit-plan-B".to_string()]];
+        let mut state = Some(ExitRouteState::Active(plan_a.clone()));
+        let os_plan = RefCell::new(Some(plan_a.clone()));
+        let mut teardown_calls = 0;
+
+        let result = reconcile_exit_route_state(
+            &mut state,
+            Some(plan_b.clone()),
+            || {
+                teardown_calls += 1;
+                Err("simulated teardown failure".to_string())
+            },
+            |_| panic!("B must not install while A may still be active"),
+        );
+        assert!(result.is_err());
+        assert_eq!(*os_plan.borrow(), Some(plan_a.clone()));
+        assert_eq!(state, Some(ExitRouteState::PendingTeardown(plan_a)));
+
+        let result = reconcile_exit_route_state(
+            &mut state,
+            Some(plan_b.clone()),
+            || {
+                teardown_calls += 1;
+                *os_plan.borrow_mut() = None;
+                Ok(())
+            },
+            |plan| {
+                *os_plan.borrow_mut() = Some(plan.clone());
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(ExitRouteChange::Installed));
+        assert_eq!(
+            *os_plan.borrow(),
+            Some(plan_b.clone()),
+            "stale A is removed before B is installed"
+        );
+        assert_eq!(state, Some(ExitRouteState::Active(plan_b.clone())));
+
+        let result = reconcile_exit_route_state(
+            &mut state,
+            Some(plan_b),
+            || panic!("stable plan must not teardown"),
+            |_| panic!("stable plan must not reinstall"),
+        );
+        assert_eq!(result, Ok(ExitRouteChange::Unchanged));
+        assert_eq!(teardown_calls, 2);
     }
 }
 
@@ -1557,33 +1801,6 @@ mod tests {
         assert_eq!(dest_ip(&[0x70, 0, 0, 0]), None); // not v4/v6
     }
 
-    // A transport that carries datagrams but never delivers one, so add_peer's pump
-    // parks; we only inspect the route/reader bookkeeping it leaves behind.
-    #[test]
-    fn installing_a_route_needs_the_receiver_and_the_owner_to_agree() {
-        let adv = vec!["10.0.0.0/24".to_string(), "192.168.1.0/24".to_string()];
-        let granted = |c: &str| c == "10.0.0.0/24";
-
-        // Both gates open: only the granted prefix installs. An advertisement
-        // for something ungranted is simply not taken, not an error: a peer may
-        // advertise to several receivers with different grants.
-        assert_eq!(
-            super::installable_routes(&adv, true, granted),
-            vec!["10.0.0.0/24".to_string()]
-        );
-
-        // Receiver declines: nothing installs, however well granted. The owner's
-        // grant does not oblige this machine to route through anyone.
-        assert!(super::installable_routes(&adv, false, granted).is_empty());
-
-        // Owner granted nothing: nothing installs, however willing the receiver.
-        assert!(super::installable_routes(&adv, true, |_| false).is_empty());
-
-        // Nothing advertised is trivially nothing installed, which is also the
-        // shape an older peer and a failed route signature both produce.
-        assert!(super::installable_routes(&[], true, |_| true).is_empty());
-    }
-
     #[test]
     fn prefix_matching_is_family_aware_and_handles_the_edges() {
         let v4 = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
@@ -1623,8 +1840,8 @@ mod tests {
         let c: Arc<dyn Transport> = Arc::new(DgramTransport);
 
         let mut rt = RouteTable::default();
-        rt.set_subnets(&a, &[(v4("10.0.0.0"), 8)]);
-        rt.set_subnets(&b, &[(v4("10.1.0.0"), 16)]);
+        rt.set_subnets("a", &a, &[(v4("10.0.0.0"), 8)]);
+        rt.set_subnets("b", &b, &[(v4("10.1.0.0"), 16)]);
         rt.insert_host(v4("10.1.0.7"), c.clone());
 
         // Most specific wins: host beats /16 beats /8.
@@ -1635,7 +1852,7 @@ mod tests {
 
         // Advertisement is a RESTATEMENT: re-advertising without a prefix withdraws
         // it. Diffing deltas instead is how a retracted route survives.
-        rt.set_subnets(&a, &[]);
+        rt.set_subnets("a", &a, &[]);
         assert!(rt.lookup(v4("10.9.9.9")).is_none(), "withdrawn prefix must not linger");
         assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.8")).unwrap(), &b), "other peers unaffected");
 
@@ -1644,6 +1861,50 @@ mod tests {
         assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.7")).unwrap(), &c));
         rt.remove_host(&v4("10.1.0.7"));
         assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.7")).unwrap(), &b), "now covered by the /16");
+    }
+
+    #[test]
+    fn subnet_ownership_withdrawal_replacement_and_longest_prefix_are_scoped_to_pid() {
+        let v4 = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
+        let v6 = |s: &str| s.parse::<IpAddr>().unwrap();
+        let old: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let replacement: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let other: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let mut rt = RouteTable::default();
+        rt.set_subnets("revoked", &old, &[(v4("10.0.0.0"), 8), (v6("fd00::"), 8)]);
+        rt.set_subnets("other", &other, &[(v4("10.1.0.0"), 16)]);
+        // Replacement restatement removes that pid's old transport-keyed claims.
+        rt.set_subnets("revoked", &replacement, &[(v4("192.0.2.0"), 24)]);
+        assert!(rt.lookup(v4("10.9.0.1")).is_none()); // stale /8 was replaced
+        assert!(rt.lookup(v6("fd00::1")).is_none());
+        assert!(Arc::ptr_eq(&rt.lookup(v4("192.0.2.1")).unwrap(), &replacement));
+        // Empty is a full withdrawal, and cannot delete another peer's overlap.
+        rt.set_subnets("revoked", &replacement, &[]);
+        assert!(rt.lookup(v4("192.0.2.1")).is_none());
+        assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.1")).unwrap(), &other));
+        rt.remove_subnets_by_pid("other");
+        assert!(rt.lookup(v4("10.1.0.1")).is_none());
+    }
+
+    #[test]
+    fn shared_transport_does_not_merge_pid_subnet_ownership() {
+        let v4 = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
+        let shared: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let mut rt = RouteTable::default();
+        rt.set_subnets("first", &shared, &[(v4("198.51.100.0"), 24)]);
+        rt.set_subnets("second", &shared, &[(v4("198.51.100.0"), 24)]);
+
+        // Both PIDs own the same prefix through the same Transport object.
+        assert_eq!(rt.subnets.len(), 2);
+        rt.set_subnets("first", &shared, &[]);
+        assert_eq!(rt.subnets.len(), 1);
+        assert_eq!(rt.subnets[0].3, "second");
+        assert!(Arc::ptr_eq(&rt.lookup(v4("198.51.100.8")).unwrap(), &shared));
+
+        rt.remove_subnets_by_pid("first");
+        assert_eq!(rt.subnets.len(), 1, "removing the already-withdrawn PID preserves second");
+        rt.remove_subnets_by_pid("second");
+        assert!(rt.subnets.is_empty());
     }
 
     struct DgramTransport;
@@ -1695,7 +1956,7 @@ mod tests {
             by_pid: tokio::sync::Mutex::new(HashMap::new()),
             identity: None,
             kernel_subnets: tokio::sync::Mutex::new(std::collections::HashSet::new()),
-            exit_route_installed: tokio::sync::Mutex::new(false),
+            exit_route_state: tokio::sync::Mutex::new(None),
             seen_seq: Mutex::new(HashMap::new()),
             names: tokio::sync::Mutex::new(HashMap::new()),
             netstack: Some(ns),
