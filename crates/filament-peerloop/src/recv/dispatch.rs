@@ -4872,6 +4872,7 @@ async fn recv_run(
                     let direct_route = l.direct_route;
                     if let Some(p) = l.peer.clone() {
                         let log = log.clone();
+                        let host = host.clone();
                         tokio::spawn(async move {
                             // ICE may renominate; retry briefly (mirrors the
                             // browser's _detectRoute attempts) so fast transfers
