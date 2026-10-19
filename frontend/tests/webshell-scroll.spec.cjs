@@ -49,8 +49,8 @@ function build() {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function openPage(browser) {
-  const page = await browser.newPage({ viewport: { width: 900, height: 700 }, hasTouch: true });
+async function openPage(browser, { width = 900, height = 700 } = {}) {
+  const page = await browser.newPage({ viewport: { width, height }, hasTouch: true });
   page.on('pageerror', (e) => { pageErrors.push(String(e)); console.log('[page-error]', String(e).slice(0, 400)); });
   await page.goto(`http://127.0.0.1:${PORT}/?preview=webshell-scroll&touch=1`, { waitUntil: 'networkidle' });
   await page.waitForFunction(() => window.__webterm && window.__scroll, null, { timeout: 10000 })
@@ -62,6 +62,7 @@ async function openPage(browser) {
 const feed = (page, text) => page.evaluate((t) => window.__scroll.feed(t), text);
 const state = (page) => page.evaluate(() => window.__scroll.state());
 const inputs = (page) => page.evaluate(() => window.__scroll.inputs());
+const inputBytes = (page) => page.evaluate(() => window.__scroll.inputBytes());
 const clearInputs = (page) => page.evaluate(() => window.__scroll.clearInputs());
 
 const HISTORY = Array.from({ length: 140 }, (_, i) => `history line ${String(i + 1).padStart(3, '0')}`).join('\r\n') + '\r\n';
@@ -105,11 +106,40 @@ async function swipe(page, { x0, y0, x1 = x0, y1, steps = 1, fingers = 1 }) {
   }, { x0, y0, x1, y1, steps, fingers });
 }
 
+// Split gesture primitives, so a spec can change the app's mode/buffer between
+// touchstart and touchmove (the stale-route abort case).
+async function touchStart(page, x, y) {
+  await page.evaluate(({ x, y }) => {
+    const host = document.querySelector('[data-testid="term-host"]');
+    const t = new Touch({ identifier: 1, target: host, clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y });
+    host.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, composed: true, touches: [t], targetTouches: [t], changedTouches: [t] }));
+  }, { x, y });
+}
+async function touchMove(page, x, y) {
+  await page.evaluate(({ x, y }) => {
+    const host = document.querySelector('[data-testid="term-host"]');
+    const t = new Touch({ identifier: 1, target: host, clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y });
+    host.dispatchEvent(new TouchEvent('touchmove', { bubbles: true, cancelable: true, composed: true, touches: [t], targetTouches: [t], changedTouches: [t] }));
+  }, { x, y });
+}
+async function touchEnd(page) {
+  await page.evaluate(() => {
+    const host = document.querySelector('[data-testid="term-host"]');
+    host.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, composed: true, touches: [], targetTouches: [], changedTouches: [] }));
+  });
+}
+
 // Report xterm itself would encode for the ORIGINAL touch cell. We compute the
 // expectation from the same screen rect/cell size the event carries, never by
 // hardcoding a protocol in the component.
 function sgrWheel(button, col, row) {
   return `\x1b[<${button};${col + 1};${row + 1}M`; // 64 = wheel up, 65 = wheel down
+}
+
+// Legacy DEFAULT encoding: CSI M, then event-code/col/row each +32, one byte.
+// Wheel up = 64+32 = 96, wheel down = 65+32 = 97.
+function legacyWheel(code, col, row) {
+  return [27, 91, 77, code, col + 1 + 32, row + 1 + 32];
 }
 
 (async () => {
@@ -131,6 +161,9 @@ function sgrWheel(button, col, row) {
     if (!(s0.baseY > 0) || s0.viewportY !== s0.baseY) fail(`history fixture did not fill scrollback at the live tail: baseY=${s0.baseY} viewportY=${s0.viewportY}`);
     await page.waitForSelector('[data-testid="term-scrollbar"]', { state: 'visible', timeout: 4000 })
       .catch(() => fail('ordinary history terminal has no scrollbar'));
+    eq(await page.getAttribute('[data-key="ScrollUp"]', 'aria-label'), 'scroll terminal history up', 'history page-up label');
+    eq(await page.getAttribute('[data-key="ScrollUp"]', 'title'), 'scroll terminal history up', 'history page-up title');
+    eq(await page.getAttribute('[data-key="ScrollDn"]', 'aria-label'), 'scroll terminal history down', 'history page-down label');
     const p = await cellPoint(page, 8, 4);
     await swipe(page, { x0: p.x, y0: p.y, y1: p.y + s0.cell.height * 8, steps: 1 });
     const s1 = await state(page);
@@ -155,12 +188,30 @@ function sgrWheel(button, col, row) {
   {
     const page = await openPage(browser);
     await feed(page, HISTORY);
+    const before = await state(page);
+    const pOff = await cellPoint(page, 8, 4);
+    // The reader is off the live tail when a partial TUI takes the wheel. That
+    // must not strand them: the scroll-to-bottom escape hatch stays reachable.
+    await swipe(page, { x0: pOff.x, y0: pOff.y, y1: pOff.y + before.cell.height * 8, steps: 1 });
+    const off = await state(page);
+    if (!(off.viewportY < off.baseY)) fail('could not scroll history off-tail before entering the partial TUI');
+    await clearInputs(page);
     await feed(page, '\x1b[?1000h\x1b[?1006h'); // VT200 + SGR
     const s0 = await state(page);
     if (s0.bufferType !== 'normal' || s0.mouseTrackingMode !== 'vt200') fail(`partial-TUI fixture is not normal+vt200: ${JSON.stringify(s0)}`);
     if (!(s0.baseY > 0)) fail('partial-TUI fixture lost its normal-buffer scrollback');
     await page.waitForFunction(() => !document.querySelector('[data-testid="term-scrollbar"]'), null, { timeout: 4000 })
       .catch(() => fail('the history scrollbar stayed visible while the app owns the wheel'));
+    eq(await page.getAttribute('[data-key="ScrollUp"]', 'aria-label'), 'scroll the running app up', 'app page-up label');
+    eq(await page.getAttribute('[data-key="ScrollDn"]', 'title'), 'scroll the running app down', 'app page-down title');
+    const jump = page.locator('[data-testid="scroll-to-bottom"]');
+    if (await jump.count() !== 1) fail('off-tail reader was stranded: no scroll-to-bottom while the app owns the wheel');
+    await jump.click();
+    const back = await state(page);
+    eq(back.viewportY, back.baseY, 'scroll-to-bottom did not return to the live tail');
+    eq(await inputs(page), [], 'scroll-to-bottom must not send PTY bytes');
+    ok('partial TUI: off-tail history kept a reachable scroll-to-bottom escape hatch');
+
     await clearInputs(page);
     const col = 12, row = 7;
     const p = await cellPoint(page, col, row);
@@ -170,7 +221,7 @@ function sgrWheel(button, col, row) {
     const got = await inputs(page);
     eq(got, [sgrWheel(64, col, row), sgrWheel(64, col, row), sgrWheel(64, col, row)], 'partial TUI should get 3 SGR wheel-up reports at the touched cell');
     const s1 = await state(page);
-    eq(s1.viewportY, s0.viewportY, 'partial TUI: touch wheel must not also scroll local history');
+    eq(s1.viewportY, back.viewportY, 'partial TUI: touch wheel must not also scroll local history');
     ok(`partial normal-buffer TUI: 3 wheel-up reports at cell ${col + 1},${row + 1}, history untouched`);
 
     // Accessory page button is app paging, not history paging.
@@ -180,7 +231,7 @@ function sgrWheel(button, col, row) {
     if (down.length !== Math.max(1, s1.rows - 1)) fail(`page-down sent ${down.length} wheel reports, want rows-1=${Math.max(1, s1.rows - 1)}`);
     if (!down.every((d) => d === down[0] && /^\x1b\[<65;\d+;\d+M$/.test(d))) fail(`page-down did not encode wheel-down reports: ${JSON.stringify(down.slice(0, 3))}`);
     const s2 = await state(page);
-    eq(s2.viewportY, s0.viewportY, 'partial TUI page button must not move local history');
+    eq(s2.viewportY, back.viewportY, 'partial TUI page button must not move local history');
     ok(`partial TUI: page-down = ${down.length} app wheel-down reports at the terminal centre`);
     await page.close();
   }
@@ -208,6 +259,8 @@ function sgrWheel(button, col, row) {
     await feed(page, '\x1b[?1049h');
     let s0 = await state(page);
     if (s0.bufferType !== 'alternate' || s0.mouseTrackingMode !== 'none') fail(`alt fallback fixture is not alt+none: ${JSON.stringify(s0)}`);
+    eq(await page.getAttribute('[data-key="ScrollUp"]', 'aria-label'), 'send cursor-key up to the alternate-screen app', 'cursor-fallback page-up label');
+    eq(await page.getAttribute('[data-key="ScrollDn"]', 'title'), 'send cursor-key down to the alternate-screen app', 'cursor-fallback page-down title');
     const p = await cellPoint(page, 6, 4);
     await clearInputs(page);
     // Finger down = reveal older = wheel up = Up.
@@ -301,6 +354,111 @@ function sgrWheel(button, col, row) {
     await wait(150);
     eq(await inputs(page), ['你'], 'IME composition must commit exactly once');
     ok('mobile textarea hardening preserved; typing and one-shot IME commit intact');
+    await page.close();
+  }
+
+  // 8. Legacy mouse encoding (DECSET 1000 without 1006/1016) is emitted on
+  //    xterm's BINARY path. It must reach the PTY as exact raw bytes, including
+  //    a coordinate above 127, which UTF-8 encoding would corrupt.
+  {
+    const page = await openPage(browser, { width: 1800, height: 700 });
+    await feed(page, HISTORY);
+    await feed(page, '\x1b[?1000h'); // VT200, DEFAULT (legacy) encoding
+    const s0 = await state(page);
+    if (s0.mouseTrackingMode !== 'vt200' || s0.bufferType !== 'normal') fail(`legacy normal fixture is not normal+vt200: ${JSON.stringify(s0)}`);
+    if (!(s0.cols > 152)) fail(`legacy report needs columns >152 to exercise a byte >127, got ${s0.cols}`);
+    await clearInputs(page);
+    const col = 150, row = 6;
+    const p = await cellPoint(page, col, row);
+    await swipe(page, { x0: p.x, y0: p.y, y1: p.y + s0.cell.height * 2, steps: 1 });
+    const bytes = await inputBytes(page);
+    eq(bytes, [legacyWheel(96, col, row), legacyWheel(96, col, row)], '1000-only normal TUI should get exact legacy ESC[M wheel bytes');
+    const s1 = await state(page);
+    eq(s1.viewportY, s0.viewportY, 'legacy normal TUI: history moved underneath the app');
+    if (bytes.some((b) => b.length !== 6)) fail(`legacy report was re-encoded to ${JSON.stringify(bytes)} (want 6 bytes each)`);
+    ok(`legacy normal TUI: 2 raw ESC[M reports, column byte ${col + 1 + 32} (>127), no history move`);
+
+    await clearInputs(page);
+    await feed(page, '\x1b[?1049h');
+    await feed(page, '\x1b[?1000h'); // still no SGR encoding
+    const s2 = await state(page);
+    const q = await cellPoint(page, col, 4);
+    await swipe(page, { x0: q.x, y0: q.y, y1: q.y + s2.cell.height, steps: 1 });
+    eq(await inputBytes(page), [legacyWheel(96, col, 4)], '1000-only alternate TUI should get one exact legacy ESC[M wheel report');
+    ok('legacy alternate TUI: raw ESC[M bytes, no duplicates');
+    await page.close();
+  }
+
+  // 9. Sticky Alt/Ctrl is for text, not generated mouse input. A swipe must
+  //    keep the modifier armed for the next real key, for both mouse encodings.
+  {
+    const page = await openPage(browser);
+    await feed(page, '\x1b[?1000h\x1b[?1006h'); // SGR
+    await page.click('[data-key="alt"]');
+    eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'true', 'sticky alt did not arm');
+    await clearInputs(page);
+    const p = await cellPoint(page, 10, 5);
+    await swipe(page, { x0: p.x, y0: p.y, y1: p.y + (await state(page)).cell.height, steps: 1 });
+    eq(await inputs(page), [sgrWheel(64, 10, 5)], 'sticky Alt corrupted an SGR wheel report');
+    eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'true', 'SGR wheel consumed sticky Alt');
+    await clearInputs(page);
+    await page.keyboard.type('a');
+    await wait(100);
+    eq(await inputBytes(page), [[27, 97]], 'sticky Alt no longer prefixes real text');
+    eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'false', 'sticky Alt did not disarm after real text');
+    ok('sticky Alt: SGR wheel stays exact and armed; next real key is ESC+a and disarms');
+    await page.close();
+  }
+  {
+    const page = await openPage(browser, { width: 1800, height: 700 });
+    await feed(page, '\x1b[?1000h'); // legacy binary path
+    await page.click('[data-key="alt"]');
+    await clearInputs(page);
+    const p = await cellPoint(page, 150, 5);
+    await swipe(page, { x0: p.x, y0: p.y, y1: p.y + (await state(page)).cell.height, steps: 1 });
+    eq(await inputBytes(page), [legacyWheel(96, 150, 5)], 'sticky Alt corrupted a legacy wheel report');
+    eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'true', 'legacy wheel consumed sticky Alt');
+    await clearInputs(page);
+    await page.keyboard.type('a');
+    await wait(100);
+    eq(await inputBytes(page), [[27, 97]], 'sticky Alt no longer prefixes real text after a legacy report');
+    eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'false', 'sticky Alt did not disarm after real text');
+    ok('sticky Alt: legacy wheel stays exact and armed; next real key is ESC+a and disarms');
+    await page.close();
+  }
+
+  // 10. A mode or active-buffer change mid-gesture aborts it, instead of
+  //     delivering the captured route to the new app.
+  {
+    const page = await openPage(browser);
+    await feed(page, HISTORY);
+    const s0 = await state(page);
+    const p = await cellPoint(page, 8, 5);
+    await clearInputs(page);
+    await touchStart(page, p.x, p.y);
+    await feed(page, '\x1b[?1000h'); // history -> application wheel mid-gesture
+    await touchMove(page, p.x, p.y + s0.cell.height * 5);
+    await touchEnd(page);
+    const s1 = await state(page);
+    eq(s1.viewportY, s0.viewportY, 'mode change mid-gesture still scrolled history');
+    eq(await inputs(page), [], 'mode change mid-gesture delivered a stale wheel route');
+    ok('gesture aborted on mouse-mode change: no scroll, no report');
+    await page.close();
+  }
+  {
+    const page = await openPage(browser);
+    await feed(page, HISTORY);
+    const s0 = await state(page);
+    const p = await cellPoint(page, 8, 5);
+    await clearInputs(page);
+    await touchStart(page, p.x, p.y);
+    await feed(page, '\x1b[?1049h'); // normal buffer -> alternate mid-gesture
+    await touchMove(page, p.x, p.y + s0.cell.height * 5);
+    await touchEnd(page);
+    const s1 = await state(page);
+    if (s1.bufferType !== 'alternate') fail('buffer-flip fixture did not enter the alternate screen');
+    eq(await inputs(page), [], 'buffer change mid-gesture delivered a stale cursor-key route');
+    ok('gesture aborted on active-buffer change: no cursor keys, no report');
     await page.close();
   }
 

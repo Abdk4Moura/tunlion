@@ -2,8 +2,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   SCROLL_APPLICATION, SCROLL_CURSOR_KEYS, SCROLL_HISTORY,
-  applicationWheelActive, pageLines, scrollRoute, wheelDeltaForDirection,
+  applicationWheelActive, isMouseReport, latin1Bytes, pageLines, scrollModeKey, scrollRoute,
+  wheelDeltaForDirection,
 } from '../src/lib/tui-scroll.js'
+import { frame, parseFrame } from '../src/net/protocol/wire.js'
 
 test('ordinary normal-buffer shell scrolls local history', () => {
   assert.equal(scrollRoute('normal', 'none'), SCROLL_HISTORY)
@@ -51,4 +53,36 @@ test('wheel direction follows xterm: negative deltaY is up', () => {
   assert.equal(wheelDeltaForDirection(-1), -1)
   assert.equal(wheelDeltaForDirection(1), 1)
   assert.equal(wheelDeltaForDirection(0), 1)
+})
+
+test('a gesture context is buffer + mouse mode, so either change aborts it', () => {
+  assert.equal(scrollModeKey('normal', 'none'), 'normal:none')
+  assert.notEqual(scrollModeKey('normal', 'none'), scrollModeKey('normal', 'vt200'))
+  assert.notEqual(scrollModeKey('normal', 'vt200'), scrollModeKey('alternate', 'vt200'))
+  assert.equal(scrollModeKey(undefined, undefined), 'normal:none')
+})
+
+test('only generated SGR mouse reports bypass sticky text modifiers', () => {
+  assert.equal(isMouseReport('\x1b[<64;13;8M'), true)
+  assert.equal(isMouseReport('\x1b[<65;13;8M'), true)
+  assert.equal(isMouseReport('\x1b[<64;1013;800M'), true)
+  assert.equal(isMouseReport('a'), false)
+  assert.equal(isMouseReport('\x1b[A'), false)
+  assert.equal(isMouseReport('\x1b[<64;13;8Mtail'), false)
+  assert.equal(isMouseReport(''), false)
+})
+
+test('legacy xterm mouse strings become raw Latin-1 bytes, not UTF-8', () => {
+  // ESC [ M, wheel-up code 96, column 1-based 151 + 32 = 183, row 8 + 32 = 40.
+  const report = '\x1b[M' + String.fromCharCode(96, 183, 40)
+  const bytes = Array.from(latin1Bytes(report))
+  assert.deepEqual(bytes, [27, 91, 77, 96, 183, 40])
+  // The UTF-8 encoding of the same string would be longer and wrong.
+  assert.notDeepEqual(bytes, Array.from(new TextEncoder().encode(report)))
+})
+
+test('legacy report bytes survive the transport frame unchanged', () => {
+  const bytes = latin1Bytes('\x1b[M' + String.fromCharCode(96, 183, 40))
+  const parsed = parseFrame(frame(0x80000001, bytes, 7).buffer)
+  assert.deepEqual(Array.from(parsed.payload), [27, 91, 77, 96, 183, 40])
 })

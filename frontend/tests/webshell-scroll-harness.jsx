@@ -16,6 +16,14 @@ const T = {
 const inputs = []
 let active = null
 
+function recordInput(u8) {
+  // Keep the exact bytes AND the UTF-8 text (what a real PTY receives). The
+  // bytes are what mouse-report tests assert on: legacy xterm reports carry
+  // values >127 that are single Latin-1 bytes, not UTF-8 sequences.
+  const copy = u8 instanceof Uint8Array ? Array.from(u8) : Array.from(u8 || [])
+  inputs.push({ bytes: copy, text: dec.decode(new Uint8Array(copy)) })
+}
+
 function fakeLink() {
   return {
     channel: { readyState: 'open', send: () => {} },
@@ -29,7 +37,7 @@ function fakeLink() {
     },
     resizePty() {},
     closePty() { this._ptySid = null },
-    sendPtyInput(u8) { inputs.push(dec.decode(u8)) },
+    sendPtyInput(u8) { recordInput(u8) },
   }
 }
 
@@ -88,8 +96,9 @@ window.__scroll = {
       setTimeout(finish, 250)
     })
   },
-  inputs: () => inputs.slice(),
-  takeInputs() { return inputs.splice(0, inputs.length) },
+  inputs: () => inputs.map((i) => i.text),
+  inputBytes: () => inputs.map((i) => i.bytes),
+  takeInputs() { return inputs.splice(0, inputs.length).map((i) => i.text) },
   clearInputs() { inputs.length = 0 },
   state,
 }
