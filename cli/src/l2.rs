@@ -1626,6 +1626,7 @@ pub(crate) async fn open_stream_verified_reason(
 }
 
 /// What the peer said to one probe open of `rport`, before `forward` says ready.
+#[cfg(feature = "forward-server")]
 pub(crate) enum ForwardProbe {
     Accepted,
     Refused(String),
@@ -1636,6 +1637,7 @@ pub(crate) enum ForwardProbe {
 /// the user the truth BEFORE it claims to be ready: it used to print "ready"
 /// having asked nothing, and the first client got an empty reply while the
 /// refusal went to a log. Costs one connect+close on the peer's target port.
+#[cfg(feature = "forward-server")]
 async fn probe_forward(mux: &Arc<Mux>, rport: u16) -> ForwardProbe {
     let Ok((sid, mut rx)) = open_stream(mux, rport).await else {
         return ForwardProbe::Silent;
@@ -1709,6 +1711,7 @@ pub(crate) const FORWARD_DENIED_EXIT: i32 = 4;
 
 /// What the startup probe learned about the target, for the "ready" line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "forward-server")]
 pub(crate) enum ForwardTarget {
     /// The peer accepted the probe (or gave no conclusive answer).
     Open,
@@ -1718,6 +1721,7 @@ pub(crate) enum ForwardTarget {
 
 /// The word that opens the "ready" line, carrying the target's state so a
 /// warning printed above it is not contradicted by a bare "ready" below it.
+#[cfg(feature = "forward-server")]
 pub(crate) fn forward_ready_word(rport: u16, target: ForwardTarget) -> String {
     match target {
         ForwardTarget::Open => "ready".to_string(),
@@ -1728,6 +1732,7 @@ pub(crate) fn forward_ready_word(rport: u16, target: ForwardTarget) -> String {
 }
 
 /// The final line a forward prints when the peer's policy stops it.
+#[cfg(feature = "forward-server")]
 pub(crate) fn forward_denied_line(peer: &str, rport: u16, reason: &str) -> String {
     format!(
         "tunlion: forward to {peer}:{rport} stopped: {peer} no longer allows it ({reason}); not listening any more (exit {FORWARD_DENIED_EXIT})"
@@ -1736,6 +1741,7 @@ pub(crate) fn forward_denied_line(peer: &str, rport: u16, reason: &str) -> Strin
 
 /// What a forward prints when a connection waited the whole bound for a peer
 /// that never answered.
+#[cfg(feature = "forward-server")]
 pub(crate) fn forward_unreachable_line(peer: &str, secs: u64) -> String {
     format!(
         "tunlion: cannot reach {peer} (no answer within {secs}s); closed the connection, and new ones are closed at once until {peer} is back (check with `tunlion reach {peer}`)"
@@ -1743,6 +1749,7 @@ pub(crate) fn forward_unreachable_line(peer: &str, secs: u64) -> String {
 }
 
 /// The remedy lines for a policy refusal, when the reason carries a known code.
+#[cfg(feature = "forward-server")]
 fn forward_refusal_fix(peer: &str, reason: &str) -> Option<(String, Option<String>)> {
     let code = crate::refusal::code_from_reason(reason)?;
     let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
@@ -1754,6 +1761,7 @@ fn forward_refusal_fix(peer: &str, reason: &str) -> Option<(String, Option<Strin
 /// port the peer had EXPOSED, which needs no shell at all. For a refusal about
 /// shell, also name the route that works for an exposed port: `<peer>.mesh`,
 /// directly with a kernel TUN or through the daemon's SOCKS5 proxy. Pure.
+#[cfg(feature = "forward-server")]
 pub(crate) fn forward_exposed_note(peer: &str, rport: u16, reason: &str) -> Option<String> {
     use crate::refusal::Code;
     let code = crate::refusal::code_from_reason(reason)?;
@@ -1775,6 +1783,7 @@ pub(crate) fn forward_exposed_note(peer: &str, rport: u16, reason: &str) -> Opti
 /// connection: tunnels off, no grant, revoked) ends the forward now with the
 /// reason and its remedy; a refusal of the target port itself (nothing
 /// listening there yet) is a warning, since a service may start later.
+#[cfg(feature = "forward-server")]
 fn forward_probe_verdict(peer: &str, rport: u16, probe: ForwardProbe) -> Result<ForwardTarget> {
     match probe {
         ForwardProbe::Accepted | ForwardProbe::Silent => Ok(ForwardTarget::Open),
@@ -2134,6 +2143,7 @@ pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
 
 /// `tunlion netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
 /// This is the ssh ProxyCommand primitive.
+#[cfg(feature = "forward-server")]
 pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Result<()> {
     // WARM-LINK FAST PATH: if a local `up` daemon already holds a link to `peer`,
     // ride it (no signaling, no establishment, ~1s saved). Skipped under --relay
@@ -3326,6 +3336,7 @@ fn norm_device_name(s: &str) -> String {
 
 /// True when `peer` names THIS device (its configured name, that name's host part,
 /// or the system hostname), so the forward would just loop back to this machine.
+#[cfg(feature = "forward-server")]
 fn forward_target_is_self(peer: &str) -> bool {
     let p = norm_device_name(peer);
     if p.is_empty() {
@@ -3344,6 +3355,7 @@ fn forward_target_is_self(peer: &str) -> bool {
 /// instead of staring at a static "ready" line. Increments on accept, decrements on
 /// close (RAII), keeps one updating status line ("N active, M total"), and prints a
 /// one-time confirmation on the very first forwarded connection.
+#[cfg(feature = "forward-server")]
 struct ForwardActivity {
     active: std::sync::Arc<std::sync::atomic::AtomicU64>,
     total: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -3365,6 +3377,7 @@ struct ForwardActivity {
     rport: u16,
 }
 
+#[cfg(feature = "forward-server")]
 impl ForwardActivity {
     fn new(peer: &str, rport: u16) -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
         let (denied, denied_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3506,6 +3519,7 @@ impl ForwardActivity {
     }
 }
 
+#[cfg(feature = "forward-server")]
 struct ConnGuard {
     active: std::sync::Arc<std::sync::atomic::AtomicU64>,
     total: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -3513,6 +3527,7 @@ struct ConnGuard {
     rport: u16,
 }
 
+#[cfg(feature = "forward-server")]
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3548,6 +3563,7 @@ pub async fn mount_cmd(
     Ok(client)
 }
 
+#[cfg(feature = "forward-server")]
 pub async fn forward_cmd(
     server: &str,
     lport: u16,
@@ -3853,6 +3869,7 @@ pub(crate) fn proxy_usage_lines(bind: &str, port: u16) -> Vec<String> {
 }
 
 /// True for an address that only this machine can reach.
+#[cfg(feature = "forward-server")]
 fn bind_is_loopback(bind: &str) -> bool {
     bind.eq_ignore_ascii_case("localhost")
         || bind
@@ -3872,6 +3889,7 @@ fn bind_is_loopback(bind: &str) -> bool {
 ///
 /// When `--http-port` is set, also runs an HTTP CONNECT proxy + PAC file endpoint
 /// on that port for browser/OS proxy config (Tailscale parity).
+#[cfg(feature = "forward-server")]
 pub async fn proxy_cmd(
     server: &str,
     bind: &str,
@@ -4590,6 +4608,7 @@ async fn serve_mesh_connect(
 /// reached by then the connection is closed (dropping `sock` sends the FIN) and
 /// the forward says so, instead of holding the client open indefinitely.
 /// Never propagates errors to the accept loop.
+#[cfg(feature = "forward-server")]
 async fn serve_cold_connection(
     mut rx: tokio::sync::watch::Receiver<Option<Arc<Mux>>>,
     sock: TcpStream,

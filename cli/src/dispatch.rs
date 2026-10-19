@@ -1872,36 +1872,59 @@ pub(crate) async fn async_main() -> Result<()> {
             http_port,
             allow_remote,
         } => {
-            let (peer, rport) = match target.split_once(':') {
-                Some((p, r)) => (
-                    p.to_string(),
-                    r.parse().map_err(|_| {
-                        crate::exit_codes::err(
-                            crate::exit_codes::ExitKind::Usage,
-                            format!("invalid port in '{target}'; expected <device>:<port>"),
-                        )
-                    })?,
-                ),
-                None => crate::bail_usage!("forward needs <device>:<port>, e.g. `tunlion forward laptop:5432`"),
-            };
-            if stdio {
-                // #202: the netcat shape - pipe stdio to the peer's port (the
-                // ssh ProxyCommand contract). `forward` owns the role; --stdio
-                // is the second plumbing.
-                require_known_device(&peer)?;
-                l2::netcat_cmd(&server, &peer, rport, relay).await
-            } else if socks {
-                l2::proxy_cmd(&server, &bind, port, http_port, relay, allow_remote).await
-            } else {
-                require_known_device(&peer)?;
-                let lport = lport.unwrap_or(rport);
-                l2::forward_cmd(&server, lport, &peer, rport, relay).await
+            // Reduced builds compile no forward/proxy server, so the client
+            // entry points are absent; refuse by name instead of compiling a
+            // command that could never work.
+            #[cfg(not(feature = "forward-server"))]
+            {
+                let _ = (target, lport, stdio, socks, port, bind, http_port, allow_remote);
+                crate::bail_usage!(
+                    "this build has no forward/proxy server (compiled without the `forward-server` feature)"
+                );
+            }
+            #[cfg(feature = "forward-server")]
+            {
+                let (peer, rport) = match target.split_once(':') {
+                    Some((p, r)) => (
+                        p.to_string(),
+                        r.parse().map_err(|_| {
+                            crate::exit_codes::err(
+                                crate::exit_codes::ExitKind::Usage,
+                                format!("invalid port in '{target}'; expected <device>:<port>"),
+                            )
+                        })?,
+                    ),
+                    None => crate::bail_usage!("forward needs <device>:<port>, e.g. `tunlion forward laptop:5432`"),
+                };
+                if stdio {
+                    // #202: the netcat shape - pipe stdio to the peer's port (the
+                    // ssh ProxyCommand contract). `forward` owns the role; --stdio
+                    // is the second plumbing.
+                    require_known_device(&peer)?;
+                    l2::netcat_cmd(&server, &peer, rport, relay).await
+                } else if socks {
+                    l2::proxy_cmd(&server, &bind, port, http_port, relay, allow_remote).await
+                } else {
+                    require_known_device(&peer)?;
+                    let lport = lport.unwrap_or(rport);
+                    l2::forward_cmd(&server, lport, &peer, rport, relay).await
+                }
             }
         }
         Cmd::Netcat { peer, rport } => {
             // Hidden one-release alias for the netcat shape, now forward --stdio.
-            require_known_device(&peer)?;
-            l2::netcat_cmd(&server, &peer, rport, relay).await
+            #[cfg(not(feature = "forward-server"))]
+            {
+                let _ = (peer, rport);
+                crate::bail_usage!(
+                    "this build has no forward/proxy server (compiled without the `forward-server` feature)"
+                );
+            }
+            #[cfg(feature = "forward-server")]
+            {
+                require_known_device(&peer)?;
+                l2::netcat_cmd(&server, &peer, rport, relay).await
+            }
         }
         Cmd::Expose {
             port,
