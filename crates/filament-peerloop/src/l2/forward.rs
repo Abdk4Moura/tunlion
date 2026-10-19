@@ -289,7 +289,7 @@ pub async fn admit_forward_open(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "forward-server"))]
 mod tests {
     use super::*;
     use crate::conn::{Link, Presence};

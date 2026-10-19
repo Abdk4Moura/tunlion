@@ -23,11 +23,16 @@ categories = ["network-programming"]
 
 [features]
 # Compatibility: existing consumers, including the CLI, keep the mesh API.
-default = ["mesh", "mount-server"]
+default = ["mesh", "mount-server", "forward-server"]
 mesh = ["dep:filament-overlay"]
 # Inbound filesystem serving is opt-out for existing consumers, but absent from
 # reduced engine profiles. The wire/control vocabulary remains available.
 mount-server = []
+# Inbound local forward serving: accept an `l2-open` and dial the peer's
+# requested local socket. Reduced engine profiles omit it so no local dial
+# implementation compiles; the wire vocabulary and the admission policy stay
+# common, and a forward open is refused honestly.
+forward-server = []
 # Fault-injection hooks the peer-loop paths read. The CLI forwards its own
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
