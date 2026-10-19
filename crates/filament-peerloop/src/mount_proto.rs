@@ -1609,11 +1609,11 @@ fn beneath_rename(
 }
 
 /// Atomically rename one path to another while keeping both parents beneath
-/// `root`. On Unix the rename is relative to stable parent directory handles;
-/// on Windows it renames the already-open source handle relative to a checked,
-/// pinned destination-directory handle. Both replace a destination final
-/// symlink rather than following it. Other non-Unix targets retain the
-/// canonical-parent fallback, which cannot resist concurrent parent replacement.
+/// `root`. Unix performs the rename relative to stable parent directory
+/// handles. Windows currently fails closed because its path-based resolver
+/// cannot prove resistance to concurrent ancestor reparse-point replacement.
+/// Other non-Unix targets retain the canonical-parent fallback, which cannot
+/// resist concurrent parent replacement.
 #[cfg(unix)]
 pub fn safe_rename_beneath(
     root: &std::path::Path,
@@ -1635,7 +1635,11 @@ pub fn safe_rename_beneath(
 ) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        return windows_rename_open_file_beneath(root, source_file, to_rel);
+        let _ = (root, from_rel, to_rel, source_file);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sync finalization is disabled on Windows until ancestor-safe handle-relative staging is available",
+        ));
     }
     #[cfg(not(windows))]
     {
@@ -1643,166 +1647,6 @@ pub fn safe_rename_beneath(
         let (to_parent, to_name) = resolve_parent_beneath(root, to_rel)?;
         beneath_rename(&from_parent, &from_name, &to_parent, &to_name)
     }
-}
-
-#[cfg(windows)]
-fn windows_rename_open_file_beneath(
-    root: &std::path::Path,
-    source_file: &std::fs::File,
-    to_rel: &std::path::Path,
-) -> std::io::Result<()> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
-
-    const FILE_ADD_FILE: u32 = 0x0002;
-    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
-    const FILE_SHARE_ALL: u32 = 0x0001 | 0x0002 | 0x0004;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const FILE_RENAME_INFO_CLASS: i32 = 3;
-    const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 1;
-    let _ = from_rel;
-
-    #[repr(C)]
-    struct RenameInfoHeader {
-        flags: u32,
-        root_directory: *mut std::ffi::c_void,
-        file_name_length: u32,
-        file_name: [u16; 0],
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFinalPathNameByHandleW(
-            file: *mut std::ffi::c_void,
-            path: *mut u16,
-            path_len: u32,
-            flags: u32,
-        ) -> u32;
-        fn SetFileInformationByHandle(
-            file: *mut std::ffi::c_void,
-            information_class: i32,
-            information: *const std::ffi::c_void,
-            size: u32,
-        ) -> i32;
-    }
-
-    fn handle_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
-        let mut wide = vec![0u16; 32_768];
-        let len = unsafe {
-            GetFinalPathNameByHandleW(
-                file.as_raw_handle() as *mut _,
-                wide.as_mut_ptr(),
-                wide.len() as u32,
-                0,
-            )
-        } as usize;
-        if len == 0 || len >= wide.len() {
-            return Err(std::io::Error::last_os_error());
-        }
-        wide.truncate(len);
-        Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(&wide)))
-    }
-
-    fn normalized(path: &std::path::Path) -> String {
-        let mut text = path.to_string_lossy().replace('/', "\\").to_lowercase();
-        if let Some(rest) = text.strip_prefix("\\\\?\\unc\\") {
-            text = format!("\\\\{rest}");
-        } else if let Some(rest) = text.strip_prefix("\\\\?\\") {
-            text = rest.to_string();
-        }
-        text.trim_end_matches('\\').to_string()
-    }
-
-    fn contained(root: &std::path::Path, actual: &std::path::Path) -> std::io::Result<()> {
-        let root = normalized(&root.canonicalize()?);
-        let actual = normalized(actual);
-        if actual == root || actual.strip_prefix(&root).is_some_and(|s| s.starts_with('\\')) {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "rename parent escapes the sync root",
-            ))
-        }
-    }
-
-    let source_meta = source_file.metadata()?;
-    if !source_meta.is_file() || source_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "rename source is not a regular file",
-        ));
-    }
-    contained(root, &handle_path(source_file)?)?;
-
-    let to_name = to_rel.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "rename target has no file name")
-    })?;
-    let parent_rel = to_rel.parent().unwrap_or_else(|| std::path::Path::new(""));
-    let parent_path = root.join(parent_rel);
-    let parent = std::fs::OpenOptions::new()
-        .access_mode(FILE_ADD_FILE | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_ALL)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(parent_path)?;
-    let metadata = parent.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "rename parent is not a plain directory",
-        ));
-    }
-    contained(root, &handle_path(&parent)?)?;
-
-    let name: Vec<u16> = to_name.encode_wide().collect();
-    if name.is_empty() || name.iter().any(|c| *c == 0) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid rename target name"));
-    }
-    let name_bytes = name.len().checked_mul(std::mem::size_of::<u16>()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "rename target name is too long")
-    })?;
-    let name_bytes = u32::try_from(name_bytes).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "rename target name is too long")
-    })?;
-    let name_offset = std::mem::offset_of!(RenameInfoHeader, file_name);
-    let byte_len = name_offset.checked_add(name.len() * 2).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "rename buffer is too large")
-    })?;
-    let buffer_len = u32::try_from(byte_len).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "rename buffer is too large")
-    })?;
-    let words = (byte_len + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
-    let mut storage = vec![0usize; words];
-    let header = storage.as_mut_ptr().cast::<RenameInfoHeader>();
-    unsafe {
-        std::ptr::write(
-            header,
-            RenameInfoHeader {
-                flags: FILE_RENAME_REPLACE_IF_EXISTS,
-                root_directory: parent.as_raw_handle() as *mut _,
-                file_name_length: name_bytes,
-                file_name: [],
-            },
-        );
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            storage.as_mut_ptr().cast::<u8>().add(name_offset).cast::<u16>(),
-            name.len(),
-        );
-        let ok = SetFileInformationByHandle(
-            source_file.as_raw_handle() as *mut _,
-            FILE_RENAME_INFO_CLASS,
-            header.cast(),
-            buffer_len,
-        );
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 /// Remove a name beneath `root` without following its final component. Unix
