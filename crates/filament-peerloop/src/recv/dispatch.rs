@@ -9699,6 +9699,8 @@ mod lifecycle_tests {
             dry_run: false,
             stream,
             max_record_bytes: crate::sync::MAX_SYNC_RECORD_BYTES,
+            finalization_gate: None,
+            staging_gate: None,
         })
     }
 
