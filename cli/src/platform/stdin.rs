@@ -115,8 +115,13 @@ impl StdinOwner for CliStdin {
     fn join(&mut self) -> StdinOutcome {
         match self.handle.take() {
             None => StdinOutcome::NotStarted,
-            Some(handle) if handle.join().is_ok() => StdinOutcome::Joined,
-            Some(_) => StdinOutcome::Detached("stdin reader panicked"),
+            Some(handle) => {
+                if handle.join().is_ok() {
+                    StdinOutcome::Joined
+                } else {
+                    StdinOutcome::Detached("stdin reader panicked")
+                }
+            }
         }
     }
 }
