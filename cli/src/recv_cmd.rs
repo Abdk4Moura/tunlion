@@ -117,7 +117,15 @@ pub(crate) async fn recv_cmd(
     };
     signals.stop().await;
     match outcome {
-        DriverOutcome::Returned(result) => result,
+        DriverOutcome::Returned(result) => result.map_err(|e| {
+            match e.downcast::<filament_peerloop::recv::report::RefusedFailure>() {
+                Ok(refused) => crate::recv_report::as_error(crate::recv_report::RefusedOutcome {
+                    kind: refused.kind,
+                    message: refused.message,
+                }),
+                Err(e) => e,
+            }
+        }),
         DriverOutcome::Cancelled => {
             if daemon {
                 log.say(&format!(

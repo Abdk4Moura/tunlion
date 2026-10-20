@@ -59,7 +59,7 @@ fn exit_kind(kind: OutcomeKind) -> ExitKind {
     }
 }
 
-fn as_error(outcome: RefusedOutcome) -> anyhow::Error {
+pub(crate) fn as_error(outcome: RefusedOutcome) -> anyhow::Error {
     exit_codes::err(exit_kind(outcome.kind), outcome.message)
 }
 

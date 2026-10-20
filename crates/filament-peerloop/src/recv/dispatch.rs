@@ -2021,7 +2021,10 @@ async fn recv_run(
                         conn.present.clear_sticky();
                         let _ =
                             tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-                        return Err(anyhow::anyhow!("{}", e.message));
+                        return Err(anyhow::Error::new(crate::recv::report::RefusedFailure {
+                            kind: e.kind,
+                            message: e.message,
+                        }));
                     }
                 }
             }
