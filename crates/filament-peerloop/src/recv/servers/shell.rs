@@ -32,6 +32,12 @@ pub const PTY_SERVER_UNAVAILABLE: &str = "pty receive is not available in this b
 /// has no PTY state machine. Testable without a Conn.
 pub fn pty_unavailable_close(v: &Value) -> Option<(u32, Value)> {
     let sid = l2::wire_sid(v)?;
+    // Parity with the mount/sync/exec reduced refusals: only a valid L2-half
+    // sid names a stream this build could have opened. A low-half or wrapped
+    // value is not a PTY stream and must not be echoed into an `l2-close`.
+    if !l2::is_l2_sid(sid) {
+        return None;
+    }
     Some((
         sid,
         json!({
@@ -43,6 +49,10 @@ pub fn pty_unavailable_close(v: &Value) -> Option<(u32, Value)> {
 }
 
 /// Admission-free named refusal for a build with `pty-server` off.
+///
+/// The reduced open runs BEFORE admission: it has no serving gate or session
+/// store, so it answers only a syntactically valid L2-half sid. Every
+/// serving-off/denial rule stays in the full state machine's `admit_pty_open`.
 pub async fn open_pty_unavailable(conn: &Conn, pid: &str, v: &Value) {
     if let (Some((_, close)), Some(t)) = (pty_unavailable_close(v), conn.transport_of(pid)) {
         let _ = t.send_control(&close).await;
@@ -1001,5 +1011,20 @@ mod reduced_tests {
             .as_str()
             .unwrap()
             .contains("pty receive is not available in this build"));
+    }
+
+    #[test]
+    fn reduced_pty_open_ignores_a_non_l2_sid() {
+        for sid in [7u64, 0u64, u32::MAX as u64 + 1] {
+            assert!(
+                pty_unavailable_close(&json!({
+                    "type": "pty-open",
+                    "sid": sid,
+                    "session": "client-1",
+                }))
+                .is_none(),
+                "sid {sid} is not a valid L2-half stream"
+            );
+        }
     }
 }

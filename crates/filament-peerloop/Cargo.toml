@@ -49,9 +49,10 @@ forward-server = []
 exec-server = ["dispatch"]
 # Inbound `pty-open` serving: reattach-vs-spawn, mux registration, ack and the
 # session identity state machine. The protocol lives in the library behind this
-# feature; the host supplies only a PtyBackend. Reduced profiles omit it so
-# no PTY backend compiles, and a well-formed open gets a named refusal.
-pty-server = []
+# feature; the host supplies only a PtyBackend. It implies `dispatch` because
+# the module lives in `recv::servers`. A profile that explicitly omits defaults
+# compiles no PTY backend, and a well-formed open gets a named refusal.
+pty-server = ["dispatch"]
 # Fault-injection hooks the peer-loop paths read. The CLI forwards its own
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
