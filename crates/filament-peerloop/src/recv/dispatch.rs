@@ -976,9 +976,16 @@ async fn recv_run(
             Tone::Dim,
             "  enter a code to connect to a specific person, or press enter to use the local network",
         ));
-        match ports.prompt.ask_code("  receive / code  ")? {
-            Some(c) => code = Some(c),
-            None => { /* fall through to the local-network auto room */ }
+        match ports.prompt.ask_code("  receive / code  ") {
+            Ok(Some(c)) => code = Some(c),
+            Ok(None) => { /* fall through to the local-network auto room */ }
+            // Ctrl-C is an interrupt, not a choice: the CLI adapter maps the
+            // cancelled dispatch to its signal exit (130).
+            Err(e) if e.to_string() == "interrupted" => {
+                stop.cancel();
+                return std::future::pending().await;
+            }
+            Err(e) => return Err(e),
         }
     }
     if opened_flow {
