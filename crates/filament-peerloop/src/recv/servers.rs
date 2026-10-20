@@ -233,13 +233,13 @@ mod reduced_tests {
     fn reduced_sync_open_closes_with_a_named_unavailable_error() {
         let (sid, close) = sync_unavailable_close(&json!({
             "type": "sync-open",
-            "sid": 0x8000_0101,
+            "sid": 0x8000_0101u32,
             "root": "docs",
         }))
         .expect("a well-formed sync-open gets an explicit close");
-        assert_eq!(sid, 0x8000_0101);
+        assert_eq!(sid, 0x8000_0101u32);
         assert_eq!(close["type"], "l2-close");
-        assert_eq!(close["sid"], 0x8000_0101);
+        assert_eq!(close["sid"], 0x8000_0101u32);
         assert!(close["err"]
             .as_str()
             .unwrap()
