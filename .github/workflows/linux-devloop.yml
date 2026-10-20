@@ -1,0 +1,110 @@
+name: linux-devloop
+
+# The Linux twin of windows-devloop: a leased, warm Ubuntu runner that polls a
+# branch and rebuilds only when the tip or the command changes. Results are
+# pushed to a results branch as an empty commit whose subject is the outcome.
+# Not a merge gate: normal CI still decides.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to poll and test
+        required: true
+        default: ci/linux-devloop
+      minutes:
+        description: Lease duration in minutes (max 330)
+        required: true
+        default: "120"
+
+concurrency:
+  group: linux-devloop
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  DEVPUSH_RESULTS_BRANCH: ci/devloop-results-linux
+
+jobs:
+  devloop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      DEVPUSH_BRANCH: ${{ inputs.branch }}
+      DEVPUSH_MINUTES: ${{ inputs.minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-devloop-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            linux-devloop-
+
+      - name: Loop
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          branch="$DEVPUSH_BRANCH"
+          results="$DEVPUSH_RESULTS_BRANCH"
+          deadline=$(( $(date +%s) + DEVPUSH_MINUTES * 60 ))
+          echo "DEVPUSH lease start branch=$branch minutes=$DEVPUSH_MINUTES"
+          last=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            git fetch --depth=1 origin "$branch" >/dev/null 2>&1
+            git reset --hard FETCH_HEAD >/dev/null 2>&1
+            sha=$(git rev-parse --short HEAD)
+            cmd="cargo check --workspace --all-targets --locked"
+            if [ -f .devloop/cmd.txt ]; then
+              line=$(head -n 1 .devloop/cmd.txt)
+              [ -n "${line// }" ] && cmd="$line"
+            fi
+            if [ -f .devloop/stop ]; then
+              echo "DEVPUSH stop requested at $sha"
+              break
+            fi
+            key="$sha|$cmd"
+            if [ "$key" != "$last" ]; then
+              echo "DEVPUSH head=$sha"
+              echo "DEVCMD $cmd"
+              start=$(date +%s)
+              set +e
+              out=$(bash -c "$cmd" 2>&1)
+              code=$?
+              set -e
+              secs=$(( $(date +%s) - start ))
+              echo "$out"
+              status=ok; [ "$code" -ne 0 ] && status=fail
+              echo "DEVRESULT $status code=$code secs=$secs head=$sha"
+              tmp="$RUNNER_TEMP/devloop-results"
+              if [ ! -d "$tmp" ]; then
+                git clone --depth=1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$tmp" >/dev/null 2>&1
+              fi
+              if [ -d "$tmp" ]; then
+                (
+                  cd "$tmp"
+                  git checkout -B "$results" >/dev/null 2>&1
+                  tail=$(printf '%s\n' "$out" | tail -n 40)
+                  git -c user.name=devloop -c user.email=devloop@local commit --allow-empty -q \
+                    -m "DEVRESULT $status code=$code secs=$secs head=$sha" \
+                    -m "cmd: $cmd"$'\n\n'"$tail"
+                  git push -f origin "$results" >/dev/null 2>&1
+                ) || true
+              fi
+              last="$key"
+            fi
+            sleep 10
+          done
+          echo "DEVPUSH lease end"
