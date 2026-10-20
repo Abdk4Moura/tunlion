@@ -393,12 +393,7 @@ impl Core {
             identity,
             Arc::new(store.clone()),
             Box::new(CoreServers),
-            Box::new(CoreDaemon::new(
-                self.dir.clone(),
-                store.clone(),
-                overlay,
-                display_name.clone(),
-            )),
+            Box::new(CoreDaemon::new(self.dir.clone(), store.clone(), overlay)),
             Arc::new(CorePrompt),
             Arc::new(NoScreen),
             RecvEnv {

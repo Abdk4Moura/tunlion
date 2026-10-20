@@ -832,21 +832,14 @@ pub struct CoreDaemon {
     root: PathBuf,
     store: DeviceStore,
     overlay: OverlayKey,
-    display_name: String,
 }
 
 impl CoreDaemon {
-    pub fn new(
-        root: PathBuf,
-        store: DeviceStore,
-        overlay: OverlayKey,
-        display_name: String,
-    ) -> Self {
+    pub fn new(root: PathBuf, store: DeviceStore, overlay: OverlayKey) -> Self {
         Self {
             root,
             store,
             overlay,
-            display_name,
         }
     }
 
@@ -1043,7 +1036,7 @@ mod tests {
         )
     }
 
-    fn gate<'a>(outcome: &'a CapOutcome, action: &'a str, legacy: bool) -> CapGate<'a> {
+    fn cap_gate<'a>(outcome: &'a CapOutcome, action: &'a str, legacy: bool) -> CapGate<'a> {
         CapGate {
             legacy_allowed: legacy,
             outcome,
@@ -1068,13 +1061,13 @@ mod tests {
         let host = host();
         let unauthorized = CapOutcome::Unprovisioned;
         assert!(host
-            .cap_gate_effective(gate(&unauthorized, CAP_TRANSFER, true))
+            .cap_gate_effective(cap_gate(&unauthorized, CAP_TRANSFER, true))
             .allowed());
         assert!(!host
-            .cap_gate_effective(gate(&unauthorized, CAP_TRANSFER, false))
+            .cap_gate_effective(cap_gate(&unauthorized, CAP_TRANSFER, false))
             .allowed());
         // A shell open is refused by name even when legacy trust would allow it.
-        let denial = host.cap_gate_effective(gate(&unauthorized, "shell", true));
+        let denial = host.cap_gate_effective(cap_gate(&unauthorized, "shell", true));
         assert!(!denial.allowed());
         assert!(denial
             .deny_reason("")
@@ -1085,19 +1078,19 @@ mod tests {
     fn the_transfer_gate_still_honors_revocation_and_delegated_ceilings() {
         let host = host();
         let authorized = CapOutcome::Authorized;
-        let mut gate = gate(&authorized, CAP_TRANSFER, true);
-        gate.cert_revoked = true;
-        assert!(!host.cap_gate_effective(gate).allowed());
+        let mut g = cap_gate(&authorized, CAP_TRANSFER, true);
+        g.cert_revoked = true;
+        assert!(!host.cap_gate_effective(g).allowed());
 
         let caps = vec!["shell".to_string()];
-        let mut gate = gate(&authorized, CAP_TRANSFER, true);
-        gate.auth_key_caps = Some(&caps);
-        assert!(!host.cap_gate_effective(gate).allowed());
+        let mut g = cap_gate(&authorized, CAP_TRANSFER, true);
+        g.auth_key_caps = Some(&caps);
+        assert!(!host.cap_gate_effective(g).allowed());
 
         let caps = vec!["transfer".to_string()];
-        let mut gate = gate(&authorized, CAP_TRANSFER, true);
-        gate.auth_key_caps = Some(&caps);
-        gate.cert_expires = Some(now_secs().saturating_sub(1));
-        assert!(!host.cap_gate_effective(gate).allowed());
+        let mut g = cap_gate(&authorized, CAP_TRANSFER, true);
+        g.auth_key_caps = Some(&caps);
+        g.cert_expires = Some(now_secs().saturating_sub(1));
+        assert!(!host.cap_gate_effective(g).allowed());
     }
 }
