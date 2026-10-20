@@ -12,7 +12,7 @@ use crate::recv::dispatch::{park_on_deny, ParkKind, ParkedOpen};
 use crate::recv::ports::RecvPorts;
 use crate::shell_gate::ShellPolicy;
 use filament_transport::net::Transport;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ pub async fn open_forward(
     muxes: &mut HashMap<String, Arc<Mux>>,
     l2_enabled: bool,
     parked: &mut Vec<ParkedOpen>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let is_exposed = |port: u16| ports.servers.is_exposed(port);
     let target_allowed =
         |name: &str, host: &str, port: u16| ports.servers.forward_target_allowed(name, host, port);
@@ -47,7 +47,9 @@ pub async fn open_forward(
             mux,
         } => {
             let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
-            tokio::spawn(mux.dial_and_serve(sid, host, port, rx, spawn_idev));
+            return Some(tokio::spawn(
+                mux.dial_and_serve(sid, host, port, rx, spawn_idev),
+            ));
         }
         forward::ForwardAdmission::Denied(d) => {
             if let Some(p) = &d.park {
@@ -95,6 +97,21 @@ pub async fn open_forward(
         }
         forward::ForwardAdmission::Ignored => {}
     }
+    None
+}
+
+/// The honest close for a reduced build that admitted the frame vocabulary
+/// but has no stateful sync receiver. Testable without a Conn.
+pub fn sync_unavailable_close(v: &Value) -> Option<(u32, Value)> {
+    let sid = crate::l2::wire_sid(v)?;
+    Some((
+        sid,
+        json!({
+            "type": "l2-close",
+            "sid": sid,
+            "err": "sync receive is not available in this build",
+        }),
+    ))
 }
 
 #[allow(dead_code)]
@@ -197,7 +214,35 @@ pub async fn open_sync(
     }
     #[cfg(not(feature = "mount-server"))]
     {
-        let _ = (ports, host, conn, pid, v, muxes, drop_dir, parked);
+        let _ = (ports, host, muxes, drop_dir, parked);
+        if let Some((sid, close)) = sync_unavailable_close(v) {
+            if let Some(t) = conn.transport_of(pid) {
+                let _ = t.send_control(&close).await;
+            }
+            let _ = sid;
+        }
         None
+    }
+}
+
+#[cfg(all(test, not(feature = "mount-server")))]
+mod reduced_tests {
+    use super::*;
+
+    #[test]
+    fn reduced_sync_open_closes_with_a_named_unavailable_error() {
+        let (sid, close) = sync_unavailable_close(&json!({
+            "type": "sync-open",
+            "sid": 0x8000_0101,
+            "root": "docs",
+        }))
+        .expect("a well-formed sync-open gets an explicit close");
+        assert_eq!(sid, 0x8000_0101);
+        assert_eq!(close["type"], "l2-close");
+        assert_eq!(close["sid"], 0x8000_0101);
+        assert!(close["err"]
+            .as_str()
+            .unwrap()
+            .contains("sync receive is not available in this build"));
     }
 }

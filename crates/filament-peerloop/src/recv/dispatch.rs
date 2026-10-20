@@ -1194,9 +1194,11 @@ async fn recv_run(
         // SAME owner key find each other with no pairwise pairing. Presence there
         // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
         // and docs/design-fleet-automesh.md.
-        if let Some(fc) = ports.identity.fleet_channel() {
-            if !sess.channels.contains(&fc) {
-                sess.channels.push(fc);
+        if cfg!(feature = "fleet") {
+            if let Some(fc) = ports.identity.fleet_channel() {
+                if !sess.channels.contains(&fc) {
+                    sess.channels.push(fc);
+                }
             }
         }
     }
@@ -1370,9 +1372,11 @@ async fn recv_run(
             // sess.channels, so anything pushed onto sess.channels before this
             // point is discarded.) Presence here authorizes nothing; admission
             // runs on the certificate. See cli/src/fleet.rs.
-            if let Some(fc) = ports.identity.fleet_channel() {
-                if !c.contains(&fc) {
-                    c.push(fc);
+            if cfg!(feature = "fleet") {
+                if let Some(fc) = ports.identity.fleet_channel() {
+                    if !c.contains(&fc) {
+                        c.push(fc);
+                    }
                 }
             }
             sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
@@ -1494,9 +1498,10 @@ async fn recv_run(
         None
     };
     if interactive {
-        ports
-            .prompt
-            .spawn_stdin(tx.clone(), st.question_open.clone(), conn.present.clone());
+        cleanup.stdin =
+            ports
+                .prompt
+                .spawn_stdin(tx.clone(), st.question_open.clone(), conn.present.clone());
     }
     // L3 (serve_tun mesh): the up daemon opens a TUN and routes IP packets across
     // its peer links when `tun-addr` is set. `auto` (recommended) derives a stable,
@@ -1790,7 +1795,9 @@ async fn recv_run(
     // on the next tick. Existing channels and live links are untouched.
     let mut known_channels: std::collections::HashSet<String> =
         devices.iter().map(|(_, s)| host.channel_of(s)).collect();
-    known_channels.extend(ports.identity.fleet_channel());
+    if cfg!(feature = "fleet") {
+        known_channels.extend(ports.identity.fleet_channel());
+    }
     let mut last_devices_scan = Instant::now();
     // Fleet auto-mesh link state, keyed by peer sid.
     //   pending  dialed off the fleet channel, certificate NOT yet proven. Such a
@@ -2682,7 +2689,7 @@ async fn recv_run(
                         }
                     }
                     ParkKind::Forward => {
-                        crate::recv::servers::open_forward(
+                        if let Some(task) = crate::recv::servers::open_forward(
                             &ports,
                             host.as_ref(),
                             &mut conn,
@@ -2693,7 +2700,10 @@ async fn recv_run(
                             l2_enabled,
                             &mut parked_opens,
                         )
-                        .await;
+                        .await
+                        {
+                            cleanup.tasks.push(task);
+                        }
                     }
                 }
             }
@@ -4245,8 +4255,11 @@ async fn recv_run(
                     // verifies, the link is in `fleet_pending` and authorizes
                     // nothing.
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
-                    if !pid.is_empty() && !fleet_verified.contains(&pid) {
-                        fleet_pending.insert(pid.clone());
+                    if cfg!(feature = "fleet") && !pid.is_empty() && !fleet_verified.contains(&pid)
+                    {
+                        if cfg!(feature = "fleet") {
+                            fleet_pending.insert(pid.clone());
+                        }
                     }
                     // Dial direct-QUIC keyed by the fleet secret. It must be
                     // direct, not the WebRTC fallback: only a direct link exposes
@@ -4802,7 +4815,8 @@ async fn recv_run(
                 }
                 // H1: a DataChannel's binding folds in its DTLS fingerprints.
                 let link_fps = link_fingerprints(&conn, &pid).await;
-                if !fleet_verified.contains(&pid)
+                if cfg!(feature = "fleet")
+                    && !fleet_verified.contains(&pid)
                     && ports.identity.fleet_rv().is_some()
                     && (fleet_pending.contains(&pid)
                         || crate::recv::fleet::shaped_link(
@@ -4813,7 +4827,9 @@ async fn recv_run(
                 {
                     // Mark it, so the L3 gate and the drop-cleanup track this link
                     // even when it arrived via warm-hold rather than presence.
-                    fleet_pending.insert(pid.clone());
+                    if cfg!(feature = "fleet") {
+                        fleet_pending.insert(pid.clone());
+                    }
                     if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
                         match ports
                             .identity
@@ -5063,7 +5079,7 @@ async fn recv_run(
                                     // signed) and is asking again. Honouring
                                     // `fleet_greeted` here would leave it waiting
                                     // forever for a proof we refuse to re-send.
-                                    if !fleet_verified.contains(&pid) {
+                                    if cfg!(feature = "fleet") && !fleet_verified.contains(&pid) {
                                         if let Ok(hello) = ports
                                             .identity
                                             .make_fleet_hello(&cb, &ports.env.display_name)
@@ -6064,7 +6080,7 @@ async fn recv_run(
                 Some("l2-close") | Some("l2-open")
                     if l2_enabled || v["type"].as_str() == Some("l2-close") =>
                 {
-                    crate::recv::servers::open_forward(
+                    if let Some(task) = crate::recv::servers::open_forward(
                         &ports,
                         host.as_ref(),
                         &mut conn,
@@ -6075,7 +6091,10 @@ async fn recv_run(
                         l2_enabled,
                         &mut parked_opens,
                     )
-                    .await;
+                    .await
+                    {
+                        cleanup.tasks.push(task);
+                    }
                 }
                 // Seamless-shell bootstrap (acceptor). Opt-in (TUNLION_L2=1).
                 // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
@@ -6508,14 +6527,17 @@ async fn recv_run(
                     // The endpoint returns the serving task so a future driver
                     // can join it; binding and dropping it here is today's
                     // detached behaviour, unchanged.
-                    let _mount_server = crate::mount::handle_mount_open(
+                    if let Some(task) = crate::mount::handle_mount_open(
                         &mut conn,
                         &pid,
                         &v,
                         &mut l2_muxes,
                         &ports.daemon.fleet_share_root(),
                     )
-                    .await;
+                    .await
+                    {
+                        cleanup.tasks.push(task);
+                    }
                 }
                 #[cfg(not(feature = "mount-server"))]
                 Some("mount-open") if l2_enabled => {
@@ -7071,11 +7093,13 @@ async fn recv_run(
                         log.debug(&format!(
                             "deferring file-offer from {pid}: fleet identity still verifying"
                         ));
-                        fleet_deferred_offers.push((
-                            pid.clone(),
-                            v.clone(),
-                            Instant::now() + fleet_offer_grace,
-                        ));
+                        if cfg!(feature = "fleet") {
+                            fleet_deferred_offers.push((
+                                pid.clone(),
+                                v.clone(),
+                                Instant::now() + fleet_offer_grace,
+                            ));
+                        }
                         continue;
                     }
                     let id = v["id"].as_str().unwrap_or_default().to_string();
@@ -9785,6 +9809,43 @@ mod lifecycle_tests {
             finalization_gate: None,
             staging_gate: None,
         })
+    }
+
+    struct FakeStdin {
+        stopped: Arc<AtomicBool>,
+        joined: Arc<AtomicBool>,
+        tx: mpsc::UnboundedSender<Ev>,
+    }
+    impl crate::recv::ports::StdinOwner for FakeStdin {
+        fn stop(&mut self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+        fn join(&mut self) -> bool {
+            self.joined.store(true, Ordering::SeqCst);
+            // A stopped reader posts nothing: drop its sender.
+            let _ = &self.tx;
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_stops_and_joins_the_owned_stdin_reader() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut cleanup = RecvCleanup {
+            stdin: Some(Box::new(FakeStdin {
+                stopped: stopped.clone(),
+                joined: joined.clone(),
+                tx,
+            })),
+            ..RecvCleanup::default()
+        };
+        cleanup.finish(&NoLog).await;
+        assert!(stopped.load(Ordering::SeqCst), "stop is called before join");
+        assert!(joined.load(Ordering::SeqCst), "the reader is joined");
+        // Anything the reader tries after the join cannot reach the loop.
+        assert!(rx.try_recv().is_err(), "no StdinLine after cleanup");
     }
 
     #[cfg(feature = "mount-server")]
