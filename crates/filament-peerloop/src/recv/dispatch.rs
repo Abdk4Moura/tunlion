@@ -9967,7 +9967,7 @@ mod expiry_redrive_tests {
     fn the_redrive_never_overturns_a_final_deny() {
         for reason in [
             crate::refusal::expired_reason(1_760_000_000),
-            crate::capability::CEILING_REASON.to_string(),
+            crate::refusal::CEILING_REASON.to_string(),
             cap::REVOKED_REASON.to_string(),
             "device revoked".to_string(),
             "shell revoked for 'b' here".to_string(),

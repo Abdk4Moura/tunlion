@@ -312,6 +312,7 @@ pub async fn sweep_completed_streams(
                 daemon,
                 "",
                 report,
+                delivery,
             )
             .await?
             {
