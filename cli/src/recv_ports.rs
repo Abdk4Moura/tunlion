@@ -996,10 +996,7 @@ impl RecvDaemon for CliRecv {
         crate::sdnotify::watchdog()
     }
     fn request_reload(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::raise(libc::SIGTERM);
-        }
+        crate::platform::request_reload();
     }
 }
 

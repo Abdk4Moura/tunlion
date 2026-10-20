@@ -128,5 +128,14 @@ pub(crate) fn remove_mount(host: &dyn HostServices, local: &str) {
 #[cfg(not(unix))]
 pub(crate) fn remove_mount(_host: &dyn HostServices, _local: &str) {}
 
+#[cfg(unix)]
+pub(crate) fn request_reload() {
+    unsafe {
+        libc::raise(libc::SIGTERM);
+    }
+}
+#[cfg(not(unix))]
+pub(crate) fn request_reload() {}
+
 #[allow(dead_code)]
 fn _path(_: PathBuf) {}
