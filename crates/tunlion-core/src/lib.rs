@@ -78,7 +78,7 @@ fn new_consent_token() -> Result<String, CoreError> {
     let mut bytes = [0u8; 32];
     SystemRandom::new()
         .fill(&mut bytes)
-        .map_err(|error| CoreError::Engine(format!("consent token: {error}")))?;
+        .map_err(|_| CoreError::Engine("consent token: entropy unavailable".to_string()))?;
     Ok(hex::encode(bytes))
 }
 
