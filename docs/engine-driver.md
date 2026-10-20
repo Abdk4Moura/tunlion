@@ -1,9 +1,9 @@
 # The engine driver, and what is still linked out
 
-> Status: the receive **dispatch body** is library-owned now. It lives in
-> `filament-peerloop::recv::dispatch`; the CLI is the process adapter.
-> `Core::start` still refuses by name because it has no host composition for
-> the dispatch's capability ports yet.
+> Status: the receive **dispatch body** is library-owned and `Core::start`
+> composes a real reduced host around it. Identity/store/enrollment/roster/
+> depart are library implementations; absent server/daemon endpoints are
+> explicit refusals, not successes.
 
 ## What moved
 
@@ -37,10 +37,14 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   JSON interrupt envelope, the pid/ready markers and the cleanup resources in
   `RecvCleanup`. `up_cmd` reaches the same driver; it does not have a second
   acceptor.
-- **`tunlion-core`.** `Core::start_with_dispatch` starts the same `Engine` for
-  a Rust embedder that has the dispatch; `Core::stop` / `stop_within` request
-  stop and join its own epilogue. This is Rust-only on purpose: UniFFI cannot
-  carry a closure, and `Core::start` must not pretend it can.
+- **`tunlion-core`.** `Core::start` validates identity/config, takes the
+  same-root `up.lock` election (the CLI daemon uses the same lock), starts
+  `recv::dispatch::drive` through the same `Engine` and waits the real
+  readiness edge before publishing `Running`. `Core::stop` / `stop_within`
+  request stop and join its own epilogue. `start_with_dispatch` remains for a
+  Rust embedder that needs a different dispatch. UniFFI exposes synchronous
+  `CoreSession::start` / `stop`; a UI caller must invoke them off its main
+  thread, and no Tokio runtime crosses the boundary.
 
   `Core` owns exactly one engine per instance, behind one mutex, with an
   explicit slot state machine:
@@ -48,6 +52,8 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   | slot | start allowed | `status().engine` | what it means |
   |---|---|---|---|
   | `None` | yes | `NotLinked` | nothing was ever started |
+  | `Claimed` | no | `Starting` | `Core::start` claimed the Core before config/host/runtime work |
+  | `Starting(engine)` | no | `Starting` | `Core::start` spawned the dispatch and is waiting for readiness |
   | `Running(engine)` | no | `Running`, or `FinishedUnjoined` once finished | the one engine; a finished task is still unjoined |
   | `Stopping` | no | `Stopping` | a stop claimed the slot and is joining |
   | `Unstopped(engine)` | no | `TimedOut` while live, `FinishedUnjoined` once finished | a stop bound expired; the task is retained and not joined |
@@ -67,13 +73,15 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   the floor. `Stopped` is therefore only recorded after a confirmed join.
 
   `Core::drop` is a fallback, not a joined stop: it requests cancellation by
-  dropping the engine slot, then calls `shutdown_background` on the
-  instance-owned runtime. That is non-blocking and safe inside another Tokio
-  async context (dropping a `Runtime` there would panic); any task that has not
-  observed cancellation is abandoned with the runtime. Callers that need the
-  dispatch epilogue use `stop` first.
+  dropping the engine slot, releases `up.lock`, then calls
+  `shutdown_background` on the instance-owned runtime. That is non-blocking and
+  safe inside another Tokio async context (dropping a `Runtime` there would
+  panic); any task that has not observed cancellation is abandoned with the
+  runtime. Reopening the same config directory immediately after `drop` can
+  therefore race that abandoned work. Callers that need the dispatch epilogue
+  use `stop` first.
 
-## What is still linked out, and why `Core::start` refuses
+## What is still linked out
 
 `recv_run` moved to `crates/filament-peerloop/src/recv/dispatch.rs` with the
 transfer/consent/file arms, the reconnect loop, cleanup and the file/event
@@ -113,33 +121,38 @@ the host-effect surface, not a split target):
 `RecvEnv` is the process snapshot the CLI resolves (name, uid, terminal
 interactivity, quiet window, L2/direct posture, consent token).
 
-For Core, the blocker is now **composition**. `RecvStore` has a non-CLI
-implementation (`recv::store::DeviceStore`, opened on the Core's config
-directory with that instance's owner key), and the identity proof/expose/renew
-handlers have a non-CLI implementation (`recv::identity::IdentityService`,
-built from that store plus an explicit `OverlayKey` path). Auth-key enrolment
-has an instance-owned runtime and a non-CLI handler in `recv::enrollment`;
-roster/depart live in `recv::roster`/`recv::membership`; fleet facts live in
-`recv::fleet_rv`. The remaining non-CLI sectors are `RecvServers`,
-`RecvDaemon` and `RecvPrompt`.
-`Core::start` therefore keeps returning `EngineNotLinked`; an embedder that
-supplies those and the existing `HostServices` uses `start_with_dispatch` with
-`recv::dispatch::drive` today.
+`Core::start` now claims the slot before config/host/runtime work, validates
+identity/config, takes the same-root `up.lock` lease, starts the real
+`recv::dispatch::drive` on the Core runtime and waits its publish-once readiness
+edge. The lease and `Running` are published in one engine-lock critical
+section; a dispatch that publishes readiness and immediately finishes is
+joined and reported as an error, never `Ok`. The reduced `tunlion-core` host composes
+`DeviceStore`, `IdentityService`, `EnrollmentService`, roster/depart and a
+logical `CoreHost`; PTY/exec/ssh/sync/mount/forward/warm/proxy/wireguard/sshd
+endpoints are explicit named refusals. It composes the default shadow transfer
+gate (legacy consent, revocation, delegated ceiling); it refuses to pretend the
+authoritative capability policy is composed. Fleet is available only with the
+`tunlion-core/fleet` feature; the shipped Android profile leaves it off. The
+Core prompt is deliberately absent: the reduced engine is daemon-shaped, so it
+never waits for a terminal; non-interactive receive still works, and a caller
+that reaches a prompt gets an explicit error rather than a block or a fake
+answer. `scripts/check_core_tooling_graph.py` now proves that the shipped
+`tunlion-core` graph selects `filament-peerloop/dispatch` and excludes `mesh`,
+`fleet`, `mount-server`, `forward-server`, the overlay and the fleet crate, on
+the host and both Android targets. `authkeys-managed` remains an unconditional
+peerloop dependency, used only by the sshd shell-bootstrap arm; the reduced Core
+refuses that open and the graph check lists the crate as explicitly inert.
 
 Next linkage work, in order:
 
-1. Add a `CoreHost` composition that implements `HostServices` and `RecvEnv`,
-   and supplies the remaining ports for an embedder with no CLI modules (the
-   server sectors can be omitted behind the `dispatch` feature's server
-   capability; reduced profiles already omit them). Its `RecvStore` is a
-   `recv::store::DeviceStore` opened on the Core's config directory.
-2. Add the `RecvServers`/`RecvDaemon`/`RecvPrompt` compositions (or an explicit
-   reduced profile that refuses them honestly). The identity/store/roster/depart
-   and fleet facts are already library-owned; there is no remaining identity
-   handler in the CLI adapter.
-3. Have `Core::start` construct `HostServices + RecvPorts` and call
-   `Engine::start(..., recv::dispatch::drive(...))`; only then remove the
-   `EngineNotLinked` arm.
+1. Implement the real PTY/exec/ssh/sync/mount/warm/proxy/wireguard/sshd
+   handlers behind the reduced profile's explicit refusals.
+2. Compose the authoritative capability policy site for Core (the default
+   shadow transfer gate is composed; shell/forward remain denied by name).
+3. The optional `tunlion-core/fleet` feature composes
+   `recv::fleet_rv::FleetService`; its owner key is the keystore user key with
+   the local certificate issuer as fallback, so owner-signed fleet paths are
+   not inert. Keep the feature off in the Android reduced graph.
 
 ## Verification
 
@@ -159,7 +172,10 @@ the task and refusing restart (`TimedOut` / `EngineNotStopped`) until it is
 joined; a dropped stop future retaining the task via `StopClaim::drop`; a
 natural `Err` and a natural panic remaining `FinishedUnjoined` and refusing
 restart (`EngineNotJoined`) until `stop` joins and reports `Failed`; a dispatch
-error recorded as `Failed`; the no-engine stop no-op; and that `Core::start`
-stays `EngineNotLinked` without installing a slot. Android keeps the reduced
-`filament-peerloop` profile: no `mount-server`, `forward-server` or `mesh`
-sectors compile into the library.
+error recorded as `Failed`; the no-engine stop no-op; `Starting` until a gated
+signaling stub publishes readiness, then `Running`; a second Core on the same
+root refused by the `up.lock` lease and released after a joined stop; and a real
+`Core::start` -> dispatch -> `stop_blocking` integration over a local signaling
+stub. Android keeps the reduced `filament-peerloop` profile: no
+`mount-server`, `forward-server`, `mesh` or `fleet` sectors compile into the
+core library, and the graph gate fails if they do.

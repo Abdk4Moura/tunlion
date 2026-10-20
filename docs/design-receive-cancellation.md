@@ -7,8 +7,9 @@
 > it records are still current.
 
 This slice uses the existing `main -> dispatch -> up_logs::up_cmd -> recv_cmd`
-driver (also used by one-shot receive). It does not link a second driver or
-change `Core::start`: that still returns `EngineNotLinked`.
+driver (also used by one-shot receive). It does not link a second driver. The
+later Core composition runs the same `recv::dispatch::drive` behind
+`Core::start`; this document records the cancellation seam.
 
 ## Boundary implemented
 

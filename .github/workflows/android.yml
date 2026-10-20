@@ -80,13 +80,15 @@ jobs:
   core-tooling-graph:
     name: core tooling dependency split
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal
       - name: Check isolated library and bindgen graphs (no compilation)
         run: python3 scripts/check_core_tooling_graph.py
+      - name: Compile the optional desktop fleet composition
+        run: cargo check --locked -p tunlion-core --features fleet
 
   build:
     name: android build (${{ matrix.target }})
@@ -178,6 +180,14 @@ jobs:
           # The UniFFI scaffolding is what Kotlin actually calls. A .so that
           # built but exported no scaffolding would still pass the line above.
           nm -D out/libtunlion_core.so | grep -q uniffi_tunlion_core_
+          # The app calls these methods; a library that built but lost the
+          # CoreSession object methods is not the shipped Core.
+          nm -D out/libtunlion_core.so | grep -q uniffi_tunlion_core_fn_method_coresession_start
+          nm -D out/libtunlion_core.so | grep -q uniffi_tunlion_core_fn_method_coresession_stop
+          # A link-proven dispatch body is reachable from start. These literals
+          # come from recv::dispatch, not from the CLI wrapper.
+          strings out/libtunlion_core.so | grep -Fq 'receive / code'
+          strings out/libtunlion_core.so | grep -Fq 'identity not proven within'
       - uses: actions/upload-artifact@v4
         with:
           name: tunlion-core-${{ matrix.target }}
@@ -227,6 +237,8 @@ jobs:
           path: crates/tunlion-core/kotlin
           if-no-files-found: error
 
+  # This job drives the CLI binary. It does not load libtunlion_core.so; the
+  # Core .so proof is the build/staging/nm/strings job above.
   emulator:
     name: android emulator acceptance
     needs: build

@@ -1,9 +1,14 @@
 # tunlion-core: a library any process can call
 
-Status: slice 1 of issue #465. The engine *runtime* is linked
-(`filament_peerloop::driver::Engine`, `docs/engine-driver.md`), but the receive
-*dispatch body* is still in the CLI, so `start` refuses by name until it is
-library-callable.
+Status: the receive engine is linked. `CoreSession.start` and `stop` exist and
+run the real shared `recv::dispatch::drive` in `filament-peerloop`; the CLI is
+one process adapter, not the owner of the dispatch body. The reduced host
+serves the receive/transfer path and refuses absent desktop endpoints by name.
+
+This is **not** yet a complete FFI product. Creating or joining a code, sending
+by code, sending to a device, and the app-facing receive/incoming-transfer API
+still do not exist, so a fresh app cannot pair through FFI alone. `start` can
+serve an already-paired config directory; it cannot make one.
 
 Android is why this crate exists now. It is not the owner of the API. Kotlin
 is one binding. A Rust caller, a desktop embedding, or a later language
@@ -37,15 +42,23 @@ cargo run --features cli --bin uniffi-bindgen -- \
   --language kotlin --out-dir kotlin
 ```
 
-Run it from inside the crate. The bindgen shells out to `cargo metadata`, and
-this repo has no root manifest, so the repo root fails.
+The repository **does** have a root workspace `Cargo.toml`. Bindgen still runs
+from `crates/tunlion-core` because it shells out to `cargo metadata` and needs
+that package's metadata, not the virtual workspace root.
 
 `uniffi::setup_scaffolding!()` in `src/lib.rs` is what exports the surface.
 `tunlion_core_abi_version` is a plain build proof and not part of the API. Do
 not call it from the app.
 
-Threading: the engine will own its runtime. Kotlin calls in and gets a result
-or a callback. Tokio types do not cross the boundary.
+Threading: the engine owns its runtime. Kotlin calls in and gets a result or a
+callback. Tokio types do not cross the boundary. `start` and `stop` are
+synchronous; call them off the UI thread.
+
+Core settings come only from the explicit config directory, not
+`TUNLION_CONFIG_DIR` or other `TUNLION_*` settings. The transport underneath
+still inherits its existing process environment (for example `TUNLION_DIRECT`,
+`TUNLION_L2`, `TUNLION_PUBLIC_IP` and timeout overrides); the library does not
+scrub it.
 
 Errors are the `CoreError` enum. The app does not parse CLI stderr. Exit-code
 meanings in `cli/skills/tunlion/SKILL.md` stay the meaning when a call maps to
@@ -84,21 +97,40 @@ commit first and delete on failure.
 
 `status() -> Status`
 
-`fingerprint` as above. `engine` is `NotLinked` until the peer loop is in this
-crate. A missing identity is not an error. It is `fingerprint: None`.
+`fingerprint` as above. `engine` is `NotLinked` until `start` installs an
+engine. A missing identity is not an error. It is `fingerprint: None`.
 
 `start() -> Result<(), CoreError>`
 
-Returns `EngineNotLinked`. It must not report the engine as up. The engine
-*runtime* now lives in `filament_peerloop::driver::Engine` (see
-`docs/engine-driver.md`); what is still missing is a library-callable receive
-*dispatch*. `Core` owns that runtime per instance, and a Rust embedder that has
-the dispatch uses `Core::start_with_dispatch` (not exposed over UniFFI). A
-language binding cannot supply a dispatch, so `start` refuses honestly, and
-`Core::stop` is a Rust API for now rather than an exported one.
+Rejects a missing identity, an unreadable `config`, or an explicitly empty
+`server`; a missing `server` uses the compiled default. Takes the same-root
+`up.lock` lease, claims the engine slot before any host/runtime work, starts the
+real receive dispatch on the Core runtime and waits its readiness edge before
+returning. It never spawns the `tunlion` binary. The reduced Core host refuses
+PTY/exec/ssh/sync/mount/forward/warm/proxy/wireguard/sshd endpoints by name, and
+composes only the default shadow transfer gate. Each start mints a fresh random
+consent token; the daemon path accepts proven links, not a guessable token. The
+Android profile does not enable the optional `fleet` feature.
+
+`start` is bounded but can block: up to 30 seconds waiting readiness and then
+up to 5 seconds trying to join a failed startup. If that cleanup times out,
+`start` returns `CoreError::Stop` and retains the task and `up.lock`; the
+status is `TimedOut` and a restart is refused until a later `stop` joins it.
+It returns `Ok` only after the dispatch published readiness and was still alive
+under the engine lock; a dispatch that publishes and immediately returns is
+joined and reported as an error, never `Ok`.
+
+`stop() -> Result<(), CoreError>`
+
+Synchronous; cancels and joins the engine without carrying a Tokio runtime
+across the FFI boundary. The reduced Core starts no stdin owner, so it has no
+detached stdin to report. A dispatch that does not finish within the 5-second
+bound is retained and reported as `TimedOut` / `CoreError::Stop`, never
+`Stopped`.
 
 `status().engine` is the slot state a UI polls: `NotLinked` (nothing started),
-`Running`, `Stopping` (a stop is joining), `FinishedUnjoined` (the task returned
+`Starting` (startup claimed the Core, or the dispatch is spawned and readiness
+is pending), `Running`, `Stopping` (a stop is joining), `FinishedUnjoined` (the task returned
 but its handle has not been joined, so its `Ok` / `Err` / panic is still owned
 by `Core`), `Stopped` (confirmed join), `Failed` (the joined dispatch returned
 an error or panicked), and `TimedOut` (a stop bound expired and the task is
@@ -107,10 +139,12 @@ finished-but-unjoined task is `FinishedUnjoined`, never `Stopped`, and a
 restart is refused with `EngineNotJoined` until `stop` joins it. `TimedOut` is
 not `Stopped`, and a restart is refused while a retained task may still run.
 
-`Core::drop` is a fallback, not a joined stop. It requests cancellation and
-shuts the instance runtime down with `shutdown_background` (non-blocking and
-safe inside an async context); tasks that have not observed cancellation are
-abandoned. Callers that need the dispatch epilogue await `stop` first.
+`Core::drop` is a fallback, not a joined stop. It requests cancellation, drops
+the `up.lock` and shuts the instance runtime down with `shutdown_background`
+(non-blocking and safe inside an async context); tasks that have not observed
+cancellation are abandoned. Reopening the same config directory immediately
+after `drop` can therefore race that abandoned work. Callers that need the
+dispatch epilogue call `stop` first.
 
 Identity bytes are `filament-id`'s format: `filament-id-seed-v1\0` plus the
 32-byte seed, written by `secret-write` (mode `0600` on Unix). Do not invent a
@@ -122,7 +156,10 @@ no recovery phrase. The phone uses `PendingIdentity`.
 These are the rest of issue #465. Do not stub them as success.
 
 - create a code, join a code, remember.
-- send to a device, send by code, receive, incoming transfer.
+- send to a device, send by code.
+- an app-facing receive/incoming-transfer stream. The engine writes accepted
+  files to the config directory's inbox, but there is no FFI event/callback
+  surface yet.
 - shell bytes and resize, only toward a device that granted shell. The phone
   does not serve a shell (`openpty` on Android already refuses).
 
@@ -132,11 +169,11 @@ of `send_cmd`. `send_cmd` stays in the CLI. The library will call
 `filament-transfer` and `filament-proto` for the byte mechanics.
 
 `Conn` now lives in `filament-peerloop::conn`; `cli/src/conn.rs` is only a
-re-export shim. The library will own link state and adoption. The CLI still owns
+re-export shim. The library owns link state and adoption. The CLI still owns
 argument parsing, terminal copy, the pidfile, service install, the control
-socket, and `/etc` writes, and the receive **dispatch body** is still in
-`cli/src/recv_cmd.rs`, which is why `Core::start` remains `EngineNotLinked`.
-The remaining sectors are listed in `docs/engine-driver.md`.
+socket, and `/etc` writes. `Core::start` now runs the library dispatch with the
+reduced host; the remaining server/daemon handlers and the optional fleet
+profile are listed in `docs/engine-driver.md`.
 Lookups use the petname (`verified_name`), never the broadcast display name. A
 signaling close is current only when it carries the live client id and the same
 link generation.

@@ -20,7 +20,7 @@ use filament_id::{DeviceCert, MeshRoster, RosterDevice, UserKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::recv::store::{record_is_revoked, DeviceStore};
+use crate::recv::store::{record_is_revoked, DeviceStore, PRINCIPAL_STATE_REVOKED};
 
 pub const ROSTER_STATE_FILE: &str = "roster-state.json";
 pub const ROSTER_FILE: &str = "roster.json";
@@ -323,6 +323,78 @@ mod tests {
         assert!(!verify_and_store_roster(&store, &blob, &owner.public_key_bytes(), 200).unwrap());
         assert!(stored_roster(&store).is_none());
         assert!(verify_and_store_roster(&store, &blob, &[3u8; 32], 100).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_newer_roster_never_replaces_a_valid_one() {
+        let dir = temp("expired-replace");
+        let store = DeviceStore::open(&dir);
+        let owner = owner();
+        let owner_pub = owner.public_key_bytes();
+        let (valid, _) = mint_roster(&store, &owner, 100, None, 900).unwrap();
+        assert!(verify_and_store_roster(&store, &valid, &owner_pub, 100).unwrap());
+        let stored = stored_roster(&store).unwrap();
+
+        // A newer epoch that is already expired is a silent no-op.
+        let expired = MeshRoster {
+            owner_pub,
+            epoch: 99,
+            valid_until: 50,
+            devices: Vec::new(),
+        };
+        let mut blob = expired.to_json();
+        blob["sig"] = json!(hex::encode(expired.sign(owner.keypair()).unwrap()));
+        assert!(!verify_and_store_roster(&store, &blob, &owner_pub, 100).unwrap());
+        assert_eq!(stored_roster(&store), Some(stored));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_snapshot_excludes_cert_and_principal_state_revocation() {
+        let dir = temp("revoked-filter");
+        let store = DeviceStore::open(&dir);
+        let owner = owner();
+        let active = DeviceCert::certify(&owner, [1u8; 32], 100, 900).unwrap();
+        let cert_revoked = DeviceCert::certify(&owner, [2u8; 32], 100, 900).unwrap();
+        let principal_revoked = DeviceCert::certify(&owner, [3u8; 32], 100, 900).unwrap();
+        for (name, cert) in [
+            ("active", &active),
+            ("cert-revoked", &cert_revoked),
+            ("principal-revoked", &principal_revoked),
+        ] {
+            store
+                .devices_upsert_atomic(
+                    name,
+                    None,
+                    Some(cert),
+                    Some(&["transfer".to_string()]),
+                    Some(0x01),
+                    None,
+                    None,
+                    true,
+                )
+                .unwrap();
+        }
+        store
+            .with_devices_mut(|arr| {
+                for d in arr.iter_mut() {
+                    match d["name"].as_str() {
+                        Some("cert-revoked") => d["certRevoked"] = json!(true),
+                        Some("principal-revoked") => {
+                            d["principalState"] = json!(PRINCIPAL_STATE_REVOKED)
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let names: Vec<String> = owner_snapshot(&store, &owner.public_key_bytes(), None)
+            .into_iter()
+            .map(|d| d.petname)
+            .collect();
+        assert_eq!(names, vec!["active"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

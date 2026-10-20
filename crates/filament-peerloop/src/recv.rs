@@ -60,7 +60,7 @@ use crate::present::{human, Progress as ProgressBar};
 pub mod ceremony;
 #[cfg(feature = "dispatch")]
 pub mod dispatch;
-#[cfg(all(feature = "dispatch", feature = "mesh"))]
+#[cfg(feature = "dispatch")]
 pub mod enrollment;
 #[cfg(feature = "dispatch")]
 pub mod events;
@@ -70,11 +70,11 @@ pub mod files;
 pub mod fleet;
 #[cfg(all(feature = "dispatch", feature = "mesh", feature = "fleet"))]
 pub mod fleet_rv;
-#[cfg(all(feature = "dispatch", feature = "mesh"))]
+#[cfg(feature = "dispatch")]
 pub mod identity;
 #[cfg(feature = "dispatch")]
 pub mod lifecycle;
-#[cfg(all(feature = "dispatch", feature = "mesh"))]
+#[cfg(feature = "dispatch")]
 pub mod membership;
 #[cfg(not(feature = "mesh"))]
 pub mod mesh_stub;
@@ -84,7 +84,7 @@ pub mod renewal;
 pub mod report;
 #[cfg(feature = "dispatch")]
 pub mod revocation;
-#[cfg(all(feature = "dispatch", feature = "mesh"))]
+#[cfg(feature = "dispatch")]
 pub mod roster;
 #[cfg(feature = "dispatch")]
 pub mod servers;
