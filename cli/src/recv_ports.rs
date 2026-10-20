@@ -133,6 +133,90 @@ impl CliRecv {
     }
 }
 
+pub struct CliPty {
+    pub sessions: Arc<l2::PtySessions>,
+}
+
+#[async_trait::async_trait]
+impl filament_peerloop::recv::servers::shell::PtyBackend for CliPty {
+    async fn get_live(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<dyn filament_peerloop::recv::servers::shell::PtySession>> {
+        self.sessions
+            .get_live(session_id)
+            .await
+            .map(|s| Arc::new(s) as Arc<dyn filament_peerloop::recv::servers::shell::PtySession>)
+    }
+    fn reserve(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        l2::PtyGuard::try_acquire().map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
+    }
+    async fn spawn(
+        &self,
+        spec: filament_peerloop::recv::servers::shell::PtySpawnSpec,
+        reservation: Box<dyn std::any::Any + Send>,
+    ) -> Option<Arc<dyn filament_peerloop::recv::servers::shell::PtySession>> {
+        let guard = reservation.downcast::<l2::PtyGuard>().ok()?;
+        let handle = l2::spawn_pty_session(
+            self.sessions.clone(),
+            spec.session_id,
+            spec.transport,
+            spec.sid,
+            spec.cols,
+            spec.rows,
+            &spec.term,
+            spec.argv,
+            *guard,
+            spec.device_pub,
+            spec.admitted_via_ceiling,
+        )
+        .await?;
+        Some(Arc::new(handle))
+    }
+    fn start_pumps(
+        &self,
+        session: Arc<dyn filament_peerloop::recv::servers::shell::PtySession>,
+        input: tokio::sync::mpsc::Receiver<filament_peerloop::recv::servers::shell::PipeItem>,
+        resize: tokio::sync::mpsc::Receiver<(u16, u16)>,
+    ) {
+        let Some(handle) = session.as_any().downcast_ref::<l2::PtySessionHandle>() else {
+            return;
+        };
+        spawn_session_pumps(handle.clone(), input, resize);
+    }
+    fn shell_argv(&self, shell_user: &Option<String>) -> (Vec<String>, bool) {
+        shell_argv(None, shell_user.as_deref())
+    }
+    fn user_drop_available(&self, shell_user: &Option<String>) -> bool {
+        shell_user.is_some()
+            && shell_root_note().is_empty()
+            && shell_argv(None, shell_user.as_deref()).1
+    }
+}
+
+impl filament_peerloop::recv::servers::shell::PtySession for l2::PtySessionHandle {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn attach(
+        &self,
+        t: Arc<dyn filament_transport::net::Transport>,
+        sid: u32,
+        resume_from: Option<u64>,
+    ) {
+        l2::PtySessionHandle::attach(self, t, sid, resume_from)
+    }
+    fn resize(&self, cols: u16, rows: u16) {
+        l2::PtySessionHandle::resize(self, cols, rows)
+    }
+    fn detach(&self) {
+        l2::PtySessionHandle::detach(self)
+    }
+    fn end(&self) {
+        l2::PtySessionHandle::end(self)
+    }
+}
+
 #[async_trait::async_trait]
 impl RecvIdentity for CliRecv {
     async fn issue_proven_challenge_and_hold(
@@ -361,248 +445,9 @@ impl RecvStore for CliRecv {
 
 #[async_trait::async_trait]
 impl RecvServers for CliRecv {
-    async fn retire_link(
-        &mut self,
-        pid: &str,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-    ) {
-        if let Some(mux) = muxes.remove(pid) {
-            mux.shutdown_all().await;
-        }
-        if let Some(sid_map) = bindings.remove(pid) {
-            for session_id in sid_map.values() {
-                if let Some(sess) = self.pty_sessions.get_live(session_id).await {
-                    sess.detach();
-                }
-            }
-        }
-    }
     /// Accept one `pty-open` frame: validate, shell-gate, attach or spawn,
     /// acknowledge. Extracted verbatim from the recv loop arm so unsettled opens
     /// can be parked and re-driven through this same function.
-    async fn open_pty(
-        &mut self,
-        conn: &mut Conn,
-        pid: String,
-        v: &Value,
-        shell_policy: &ShellPolicy,
-        shell_user: &Option<String>,
-        l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
-        pty_bindings: &mut HashMap<String, HashMap<u32, String>>,
-        l2_enabled: bool,
-        parked: &mut Vec<ParkedOpen>,
-    ) {
-        let admission = filament_peerloop::shell::admit::admit_pty_open(
-            conn,
-            &pid,
-            v,
-            &filament_peerloop::shell::admit::ShellAdmissionConfig {
-                policy: shell_policy,
-                serving: l2_enabled,
-            },
-            || {
-                shell_user.is_some()
-                    && crate::shell_root_note().is_empty()
-                    && shell_argv(None, shell_user.as_deref()).1
-            },
-        )
-        .await;
-        let (t, sid, dev, device_pub, plan) = match admission {
-            filament_peerloop::shell::admit::ShellAdmission::Admitted {
-                transport,
-                sid,
-                device,
-                device_pub,
-                plan,
-                ..
-            } => (transport, sid, device, device_pub, plan),
-            filament_peerloop::shell::admit::ShellAdmission::Ignored => return,
-            filament_peerloop::shell::admit::ShellAdmission::Denied(d) => {
-                // Settle-then-evaluate: park for re-drive on proof when this deny
-                // is attributable to the unproven binding; else the live verdict.
-                if park_on_deny(
-                    parked,
-                    conn,
-                    &pid,
-                    ParkKind::Pty,
-                    &d.transport,
-                    d.sid,
-                    v,
-                    &d.reason,
-                )
-                .await
-                {
-                    return;
-                }
-                let who = d.device.as_deref().unwrap_or("<unverified>");
-                conn.log
-                    .say(&format!("l2: pty refused: {who}: {}", d.reason));
-                enqueue_if_requestable(who, "shell");
-                // The refusal already carries the precise code and our name for
-                // the peer (a missing grant is not "serving is off"); the caller
-                // adds the invite details exactly where it did before.
-                let refusal = crate::refusal::with_reinvite_for(d.refusal, d.device_pub.as_ref());
-                let _ = d.transport.send_control(&refusal.close_frame(d.sid)).await;
-                return;
-            }
-        };
-        let session_id = plan.session;
-        let term = plan.term;
-        let pty_cmd = plan.cmd;
-        let resume = plan.resume;
-        let cols = plan.cols;
-        let rows = plan.rows;
-        let mux = l2_muxes
-            .entry(pid.clone())
-            .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
-            .clone();
-        // #4 REATTACH: a live session for this id means a reconnect.
-        // Rebind its output to THIS link+sid and replay its buffer; do
-        // not spawn a new shell. Register the input pump + resizer for
-        // the new sid so typing and SIGWINCH reach the surviving PTY.
-        if let Some(sess) = self.pty_sessions.get_live(&session_id).await {
-            if mux.at_stream_cap().await {
-                conn.log
-                    .say("l2: pty reattach refused: too many streams on this link");
-                let _ = t
-                    .send_control(
-                        &json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }),
-                    )
-                    .await;
-                return;
-            }
-            // Collision-safe: if this sid is already live (peer reused
-            // a live forward/pty/mount sid) register refuses; deny the
-            // reattach rather than displacing the existing stream.
-            let Some(rx) = mux.register_stream(sid).await else {
-                conn.log
-                    .say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
-                let _ = t
-                    .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
-                    .await;
-                return;
-            };
-            let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-            mux.register_resizer(sid, rtx).await;
-            let _ = t
-                .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
-                .await;
-            // How much output the client already has, so only the missed part is
-            // replayed (absent from older clients and the browser: replay all).
-            sess.attach(t.clone(), sid, plan.resume_from);
-            sess.resize(cols, rows);
-            pty_bindings
-                .entry(pid.clone())
-                .or_default()
-                .insert(sid, session_id.clone());
-            spawn_session_pumps(sess.clone(), rx, rrx);
-            conn.log.say(&format!(
-                "l2: pty REATTACHED to '{}', {cols}x{rows}",
-                dev.unwrap_or_default()
-            ));
-            return;
-        }
-        // Resume-only + no live session: the client is a warm-drop
-        // fall-through and the session is gone (the shell exited cleanly).
-        // Close instead of spawning a fresh shell, so the client exits
-        // cleanly rather than getting a surprise re-login.
-        if resume {
-            let _ = t
-                .send_control(
-                    &json!({ "type": "l2-close", "sid": sid, "err": l2::NO_SUCH_SESSION }),
-                )
-                .await;
-            return;
-        }
-        // H-1 (DoS): refuse over the per-link stream cap or the global
-        // PTY cap BEFORE spawning a shell. A flaky/hostile paired
-        // device can otherwise flood `pty-open` and exhaust threads.
-        if mux.at_stream_cap().await {
-            conn.log
-                .say("l2: pty refused: too many streams on this link");
-            let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
-                .await;
-            return;
-        }
-        let Some(pty_guard) = l2::PtyGuard::try_acquire() else {
-            conn.log.say(&format!(
-                "l2: pty refused: too many PTYs (global cap {})",
-                l2::MAX_PTYS_GLOBAL
-            ));
-            let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
-                .await;
-            return;
-        };
-        // before spawn (race fix). Collision-safe: refuse (don't
-        // displace) if the peer named an already-live sid. `pty_guard`
-        // drops on `continue`, freeing the global PTY slot it reserved.
-        let Some(rx) = mux.register_stream(sid).await else {
-            conn.log
-                .say(&format!("l2: pty refused: sid {sid:#x} in use"));
-            let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
-                .await;
-            return;
-        };
-        let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-        // Resizer is owned by the mux so it is freed on EVERY teardown
-        // path (inbound l2-close, link death), H-1.
-        mux.register_resizer(sid, rtx).await;
-        let _ = t
-            .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
-            .await;
-        // #4: spawn the PTY as a PERSISTENT session keyed by session_id,
-        // not a link-bound serve_pty. It outlives this link; a drop
-        // detaches it, a reconnect reattaches above.
-        // Resolve the shell and build interactive or one-shot argv.
-        let (shell_argv, _can_use_user) = shell_argv(None, shell_user.as_deref());
-        let shell_host = ShellHost::new(&shell_argv);
-        let argv = if pty_cmd.is_empty() {
-            shell_host.interactive_args()
-        } else {
-            shell_host.exec_cmd_args(&pty_cmd)
-        };
-        // The peer's device key, from the admission that just decided (the gate
-        // resolved the same value for the open decision; no second lookup).
-        let spawn_idev = device_pub;
-        // Ceiling-admitted (covered, grantless) sessions must die
-        // when the ceiling narrows; grant-admitted ones ignore it.
-        let admitted_via_ceiling = plan.admitted_via_ceiling;
-        match l2::spawn_pty_session(
-            self.pty_sessions.clone(),
-            session_id.clone(),
-            t.clone(),
-            sid,
-            cols,
-            rows,
-            &term,
-            argv,
-            pty_guard,
-            spawn_idev,
-            admitted_via_ceiling,
-        )
-        .await
-        {
-            Some(sess) => {
-                pty_bindings
-                    .entry(pid.clone())
-                    .or_default()
-                    .insert(sid, session_id.clone());
-                spawn_session_pumps(sess, rx, rrx);
-                conn.log.say(&format!(
-                    "l2: pty granted to '{}', {cols}x{rows}",
-                    dev.unwrap_or_default()
-                ));
-            }
-            None => {
-                // spawn already sent an l2-close{err}; free the stream.
-                mux.drop_pty(sid).await;
-            }
-        }
-    }
 
     /// Accept one `l2-open` forward frame by delegating admission to the library.
     ///
@@ -661,60 +506,6 @@ impl RecvServers for CliRecv {
     }
     fn forward_target_allowed(&self, name: &str, host: &str, port: u16) -> bool {
         crate::l2_policy::l2_target_allowed(name, host, port)
-    }
-    async fn pty_resize(
-        &mut self,
-        pid: &str,
-        v: &Value,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-    ) {
-        let Some(sid) = lib_l2::wire_sid(v) else {
-            return;
-        };
-        let cols = v["cols"].as_u64().unwrap_or(80) as u16;
-        let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-        if let Some(sid_map) = bindings.get(pid) {
-            if let Some(session_id) = sid_map.get(&sid) {
-                if let Some(sess) = self.pty_sessions.get_live(session_id).await {
-                    sess.resize(cols, rows);
-                }
-            }
-        }
-        if let Some(mux) = muxes.get(pid) {
-            mux.resize_pty(sid, cols, rows).await;
-        }
-    }
-
-    async fn pty_close(
-        &mut self,
-        pid: &str,
-        v: &Value,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-    ) {
-        if let Some(session_id) = v["session"].as_str() {
-            if let Some(sess) = self.pty_sessions.get_live(session_id).await {
-                sess.end();
-            }
-            self.pty_sessions.remove(session_id).await;
-            if let Some(sid_map) = bindings.get_mut(pid) {
-                sid_map.retain(|_, v| v != session_id);
-            }
-        }
-    }
-
-    async fn detach_link_ptys(
-        &mut self,
-        pid: &str,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-    ) {
-        if let Some(sid_map) = bindings.remove(pid) {
-            for session_id in sid_map.values() {
-                if let Some(sess) = self.pty_sessions.get_live(session_id).await {
-                    sess.detach();
-                }
-            }
-        }
     }
 
     async fn exec_control(

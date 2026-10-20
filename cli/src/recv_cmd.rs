@@ -97,6 +97,9 @@ pub(crate) async fn recv_cmd(
             Box::new(crate::recv_ports::CliRecv::new(engine_log.clone())),
             Box::new(crate::recv_ports::CliRecv::new(engine_log.clone())),
             Arc::new(crate::recv_ports::CliPrompt),
+            Box::new(crate::recv_ports::CliPty {
+                sessions: cli.pty_sessions.clone(),
+            }),
             crate::host_impl::cli_screen(),
             env,
         );

@@ -2670,20 +2670,19 @@ async fn recv_run(
                             .await;
                     }
                     ParkKind::Pty => {
-                        ports
-                            .servers
-                            .open_pty(
-                                &mut conn,
-                                p.pid.clone(),
-                                &p.v,
-                                &shell_policy,
-                                &shell_user,
-                                &mut l2_muxes,
-                                &mut pty_bindings,
-                                l2_enabled,
-                                &mut parked_opens,
-                            )
-                            .await;
+                        crate::recv::servers::shell::open_pty(
+                            &ports,
+                            &mut conn,
+                            p.pid.clone(),
+                            &p.v,
+                            &shell_policy,
+                            &shell_user,
+                            &mut l2_muxes,
+                            &mut pty_bindings,
+                            l2_enabled,
+                            &mut parked_opens,
+                        )
+                        .await;
                     }
                     ParkKind::SshSign => {
                         ports
@@ -3082,10 +3081,13 @@ async fn recv_run(
                 // as the command liked (observed: five minutes of `sleep`
                 // after the initiator was gone). End them, and detach the
                 // shells this link carried so their idle reaper runs.
-                ports
-                    .servers
-                    .retire_link(&pid, &mut l2_muxes, &mut pty_bindings)
-                    .await;
+                crate::recv::servers::shell::retire_link(
+                    &ports,
+                    &pid,
+                    &mut l2_muxes,
+                    &mut pty_bindings,
+                )
+                .await;
             }
         }
 
@@ -3819,10 +3821,13 @@ async fn recv_run(
                     ));
                     sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                     conn.drop_link(&pid);
-                    ports
-                        .servers
-                        .retire_link(&pid, &mut l2_muxes, &mut pty_bindings)
-                        .await;
+                    crate::recv::servers::shell::retire_link(
+                        &ports,
+                        &pid,
+                        &mut l2_muxes,
+                        &mut pty_bindings,
+                    )
+                    .await;
                     // CONTINUITY: do NOT retract the L3 route here. A dropped link
                     // is almost always followed by a repair (a fresh transport for
                     // the same peer), whose add_peer atomically swaps the route. If
@@ -6444,20 +6449,19 @@ async fn recv_run(
                 // shell-bootstrap, a PTY is a superset of ssh-key access, so it
                 // reuses the `shell` cap / --shell policy and requires `trusted`.
                 Some("pty-open") => {
-                    ports
-                        .servers
-                        .open_pty(
-                            &mut conn,
-                            pid.clone(),
-                            &v,
-                            &shell_policy,
-                            &shell_user,
-                            &mut l2_muxes,
-                            &mut pty_bindings,
-                            l2_enabled,
-                            &mut parked_opens,
-                        )
-                        .await;
+                    crate::recv::servers::shell::open_pty(
+                        &ports,
+                        &mut conn,
+                        pid.clone(),
+                        &v,
+                        &shell_policy,
+                        &shell_user,
+                        &mut l2_muxes,
+                        &mut pty_bindings,
+                        l2_enabled,
+                        &mut parked_opens,
+                    )
+                    .await;
                 }
                 // Remote command execution: parse, shell-gate, direct-spawn
                 // and serve. The module sends its own ack/close/refusal
@@ -6615,16 +6619,21 @@ async fn recv_run(
                     // #4: resize the persistent session bound to this sid (not a
                     // link-local serve_pty). Falls back to the mux resizer if the
                     // sid isn't a known session binding (defensive).
-                    ports
-                        .servers
-                        .pty_resize(&pid, &v, &mut l2_muxes, &mut pty_bindings)
-                        .await;
+                    crate::recv::servers::shell::pty_resize(
+                        &ports,
+                        &pid,
+                        &v,
+                        &mut l2_muxes,
+                        &mut pty_bindings,
+                    )
+                    .await;
                 }
                 // #4: explicit end of a persistent PTY session (the ✕ / unmount).
                 // Distinct from a bare channel drop, which only DETACHES. Kills the
                 // shell and removes the session so a later open spawns fresh.
                 Some("pty-close") if l2_enabled => {
-                    ports.servers.pty_close(&pid, &v, &mut pty_bindings).await;
+                    crate::recv::servers::shell::pty_close(&ports, &pid, &v, &mut pty_bindings)
+                        .await;
                 }
                 // Client confirmed the protocol version advertised in mount-open-ack.
                 // The server is already running in that version; this control is
@@ -8868,10 +8877,12 @@ async fn recv_run(
                         && (s == "failed" || s == "closed")
                         && !pty_bindings.is_empty()
                     {
-                        ports
-                            .servers
-                            .detach_link_ptys(&pid, &mut pty_bindings)
-                            .await;
+                        crate::recv::servers::shell::detach_link_ptys(
+                            &ports,
+                            &pid,
+                            &mut pty_bindings,
+                        )
+                        .await;
                     }
                 }
                 conn.on_pc_state(&pid, &s).await;

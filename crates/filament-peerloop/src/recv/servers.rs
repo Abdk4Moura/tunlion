@@ -6,6 +6,7 @@
 //! `forward_target_allowed`) and the optional dial implementation.
 
 pub mod exec;
+pub mod shell;
 
 use crate::host::HostServices;
 use crate::l2::forward;

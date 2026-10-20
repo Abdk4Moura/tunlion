@@ -234,25 +234,7 @@ pub trait RecvStore: Send + Sync {
 /// a frame is refused honestly by the fallback implementation.
 #[async_trait]
 pub trait RecvServers: Send + Sync {
-    async fn retire_link(
-        &mut self,
-        pid: &str,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-    );
     #[allow(clippy::too_many_arguments)]
-    async fn open_pty(
-        &mut self,
-        conn: &mut Conn,
-        pid: String,
-        v: &Value,
-        policy: &ShellPolicy,
-        shell_user: &Option<String>,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-        l2_enabled: bool,
-        parked: &mut Vec<crate::recv::dispatch::ParkedOpen>,
-    );
     #[allow(clippy::too_many_arguments)]
     async fn open_exec(
         &mut self,
@@ -281,26 +263,8 @@ pub trait RecvServers: Send + Sync {
     fn is_exposed(&self, port: u16) -> bool;
     /// May a peer forward to this local target? (address/SSRF policy)
     fn forward_target_allowed(&self, name: &str, host: &str, port: u16) -> bool;
-    async fn pty_resize(
-        &mut self,
-        pid: &str,
-        v: &Value,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-    );
     /// A `pty-close` control: end the shell and forget the session.
-    async fn pty_close(
-        &mut self,
-        pid: &str,
-        v: &Value,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-    );
     /// A link's transport died: detach (not kill) its live PTY sessions.
-    async fn detach_link_ptys(
-        &mut self,
-        pid: &str,
-        bindings: &mut HashMap<String, HashMap<u32, String>>,
-    );
     /// Route `exec-alive`/`exec-signal` to the exec session on this link.
     async fn exec_control(
         &mut self,
@@ -471,6 +435,7 @@ pub struct RecvPorts {
     pub servers: Box<dyn RecvServers>,
     pub daemon: Box<dyn RecvDaemon>,
     pub prompt: Arc<dyn RecvPrompt>,
+    pub pty: Box<dyn crate::recv::servers::shell::PtyBackend>,
     pub present: Arc<dyn crate::present::Presentation>,
     pub env: RecvEnv,
 }
@@ -482,6 +447,7 @@ impl RecvPorts {
         servers: Box<dyn RecvServers>,
         daemon: Box<dyn RecvDaemon>,
         prompt: Arc<dyn RecvPrompt>,
+        pty: Box<dyn crate::recv::servers::shell::PtyBackend>,
         present: Arc<dyn crate::present::Presentation>,
         env: RecvEnv,
     ) -> Self {
@@ -491,6 +457,7 @@ impl RecvPorts {
             servers,
             daemon,
             prompt,
+            pty,
             present,
             env,
         }
@@ -511,6 +478,7 @@ pub(crate) mod test_support {
     pub(crate) struct NoServers;
     pub(crate) struct NoDaemon;
     pub(crate) struct NoPrompt;
+    pub(crate) struct NoPty;
 
     fn fail() -> ! {
         panic!("this test capability was not expected to be called")
@@ -687,26 +655,6 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl RecvServers for NoServers {
-        async fn retire_link(
-            &mut self,
-            _: &str,
-            _: &mut HashMap<String, Arc<Mux>>,
-            _: &mut HashMap<String, HashMap<u32, String>>,
-        ) {
-        }
-        async fn open_pty(
-            &mut self,
-            _: &mut Conn,
-            _: String,
-            _: &Value,
-            _: &ShellPolicy,
-            _: &Option<String>,
-            _: &mut HashMap<String, Arc<Mux>>,
-            _: &mut HashMap<String, HashMap<u32, String>>,
-            _: bool,
-            _: &mut Vec<ParkedOpen>,
-        ) {
-        }
         async fn open_exec(
             &mut self,
             _: &mut Conn,
@@ -734,27 +682,6 @@ pub(crate) mod test_support {
         }
         fn forward_target_allowed(&self, _: &str, _: &str, _: u16) -> bool {
             false
-        }
-        async fn pty_resize(
-            &mut self,
-            _: &str,
-            _: &Value,
-            _: &mut HashMap<String, Arc<Mux>>,
-            _: &mut HashMap<String, HashMap<u32, String>>,
-        ) {
-        }
-        async fn pty_close(
-            &mut self,
-            _: &str,
-            _: &Value,
-            _: &mut HashMap<String, HashMap<u32, String>>,
-        ) {
-        }
-        async fn detach_link_ptys(
-            &mut self,
-            _: &str,
-            _: &mut HashMap<String, HashMap<u32, String>>,
-        ) {
         }
         async fn exec_control(
             &mut self,
@@ -896,6 +823,39 @@ pub(crate) mod test_support {
         fn request_reload(&mut self) {}
     }
 
+    #[async_trait]
+    impl crate::recv::servers::shell::PtyBackend for NoPty {
+        async fn get_live(
+            &self,
+            _: &str,
+        ) -> Option<Arc<dyn crate::recv::servers::shell::PtySession>> {
+            None
+        }
+        fn reserve(&self) -> Option<Box<dyn std::any::Any + Send>> {
+            None
+        }
+        async fn spawn(
+            &self,
+            _: crate::recv::servers::shell::PtySpawnSpec,
+            _: Box<dyn std::any::Any + Send>,
+        ) -> Option<Arc<dyn crate::recv::servers::shell::PtySession>> {
+            None
+        }
+        fn start_pumps(
+            &self,
+            _: Arc<dyn crate::recv::servers::shell::PtySession>,
+            _: mpsc::Receiver<crate::recv::servers::shell::PipeItem>,
+            _: mpsc::Receiver<(u16, u16)>,
+        ) {
+        }
+        fn shell_argv(&self, _: &Option<String>) -> (Vec<String>, bool) {
+            (Vec::new(), false)
+        }
+        fn user_drop_available(&self, _: &Option<String>) -> bool {
+            false
+        }
+    }
+
     impl RecvPrompt for NoPrompt {
         fn ask_code(&self, _: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
@@ -924,6 +884,7 @@ pub(crate) mod test_support {
             Box::new(NoServers),
             Box::new(NoDaemon),
             Arc::new(NoPrompt),
+            Box::new(NoPty),
             Arc::new(crate::present::NoScreen),
             env,
         )
