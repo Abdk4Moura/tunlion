@@ -167,7 +167,7 @@ fn cancel_pending_read(thread_id: u32) {
     }
     // SAFETY: OpenThread only observes the id; the handle is closed here.
     let handle = unsafe { OpenThread(THREAD_TERMINATE, 0, thread_id) };
-    if handle != 0 {
+    if handle != std::ptr::null_mut() {
         unsafe {
             let _ = CancelSynchronousIo(handle);
             let _ = CloseHandle(handle);
