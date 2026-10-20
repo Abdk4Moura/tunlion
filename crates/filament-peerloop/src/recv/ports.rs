@@ -741,10 +741,12 @@ pub(crate) mod test_support {
             _: &mut Vec<ParkedOpen>,
         ) {
         }
-        /// Is this local port explicitly exposed through the overlay?
-        fn is_exposed(&self, port: u16) -> bool;
-        /// May a peer forward to this local target? (address/SSRF policy)
-        fn forward_target_allowed(&self, name: &str, host: &str, port: u16) -> bool;
+        fn is_exposed(&self, _: u16) -> bool {
+            false
+        }
+        fn forward_target_allowed(&self, _: &str, _: &str, _: u16) -> bool {
+            false
+        }
         async fn pty_resize(
             &mut self,
             _: &str,
