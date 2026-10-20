@@ -239,6 +239,26 @@ async fn deny_unsettled(
 /// forgotten here while we ran) with the refusal, over signaling: no link is
 /// built for it, and its sender reports the reason at once instead of
 /// waiting out its establishment window.
+/// A named close for an open this build does not serve. Valid L2 sids get a
+/// frame; malformed opens cannot be answered on a stream that does not exist.
+fn unserved_open_close(v: &Value, reason: &str) -> Option<Value> {
+    let sid = l2::wire_sid(v).filter(|sid| l2::is_l2_sid(*sid))?;
+    Some(json!({
+        "type": "l2-close",
+        "sid": sid,
+        "err": reason,
+    }))
+}
+
+async fn refuse_unserved_open(conn: &Conn, pid: &str, v: &Value, reason: &str) {
+    let Some(close) = unserved_open_close(v, reason) else {
+        return;
+    };
+    if let Some(t) = conn.transport_of(pid) {
+        let _ = t.send_control(&close).await;
+    }
+}
+
 async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str, log: &dyn LogSink) {
     let refusal = crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None);
     let mut data = json!({ "type": "not-recognized", "reason": refusal.reason });
@@ -6541,6 +6561,33 @@ async fn recv_run(
                         .await;
                     continue;
                 }
+                // `mount-open` is an OPEN, not a capability question. It must
+                // be answered even when the L2 acceptor is off; otherwise the
+                // initiator waits for a close that never arrives. This arm is
+                // deliberately not gated on `l2_enabled`.
+                Some("mount-open") if !l2_enabled => {
+                    refuse_unserved_open(
+                        &conn,
+                        &pid,
+                        &v,
+                        "mount serving is off in this core profile",
+                    )
+                    .await;
+                    continue;
+                }
+                #[cfg(not(feature = "mount-server"))]
+                Some("mount-open") => {
+                    // The frame vocabulary stays in the common receive loop,
+                    // but a reduced build has no mount endpoint to admit it.
+                    refuse_unserved_open(
+                        &conn,
+                        &pid,
+                        &v,
+                        "mount server is not available in this build",
+                    )
+                    .await;
+                    continue;
+                }
                 #[cfg(feature = "mount-server")]
                 Some("mount-open") if l2_enabled => {
                     // The endpoint returns the serving task so a future driver
@@ -6557,22 +6604,7 @@ async fn recv_run(
                     {
                         cleanup.tasks.push(task);
                     }
-                }
-                #[cfg(not(feature = "mount-server"))]
-                Some("mount-open") if l2_enabled => {
-                    // The frame vocabulary stays in the common receive loop,
-                    // but a reduced build has no mount endpoint to admit it.
-                    if let Some(t) = conn.transport_of(&pid) {
-                        let sid = l2::wire_sid(&v);
-                        if let Some(sid) = sid.filter(|sid| l2::is_l2_sid(*sid)) {
-                            let _ = t
-                                .send_control(&json!({
-                                    "type": "l2-close", "sid": sid,
-                                    "err": "mount server is not available in this build",
-                                }))
-                                .await;
-                        }
-                    }
+                    continue;
                 }
                 Some("pty-resize") if l2_enabled => {
                     let Some(sid) = l2::wire_sid(&v) else {
@@ -10273,6 +10305,43 @@ mod inventory {
         "a_deny_about_missing_proof_still_parks",
         "a_policy_decline_carries_its_reason",
     ];
+
+    #[test]
+    fn unserved_forward_and_sync_opens_are_named_closes() {
+        let forward = json!({ "type": "l2-open", "sid": 42u32 });
+        let close = super::unserved_open_close(&forward, crate::refusal::TUNNEL_OFF_REASON)
+            .expect("a valid forward sid must get a close");
+        assert_eq!(close["type"], "l2-close");
+        assert_eq!(close["sid"], 42);
+        assert!(close["err"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("tunnelling is off")));
+
+        let sync = json!({ "type": "sync-open", "sid": 43u32 });
+        let (sid, close) = crate::recv::servers::sync_unavailable_close(&sync)
+            .expect("a valid sync sid must get a close");
+        assert_eq!(sid, 43);
+        assert_eq!(close["type"], "l2-close");
+        assert!(close["err"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("sync")));
+    }
+
+    #[test]
+    fn unserved_mount_open_is_a_named_close_without_l2() {
+        // A Core-like reduced host has l2_enabled=false. The mount-open arm
+        // must still answer with a valid sid and a named reason.
+        let open = json!({ "type": "mount-open", "sid": 41u32 });
+        let close = super::unserved_open_close(&open, "mount serving is off in this core profile")
+            .expect("a valid sid must get a close");
+        assert_eq!(close["type"], "l2-close");
+        assert_eq!(close["sid"], 41);
+        assert!(close["err"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("mount serving is off")));
+        // A malformed open has no stream to close; it is not fabricated.
+        assert!(super::unserved_open_close(&json!({ "type": "mount-open" }), "x").is_none());
+    }
 
     #[test]
     fn fleet_presence_is_disabled_without_a_verifier() {

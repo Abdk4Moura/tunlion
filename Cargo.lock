@@ -4087,6 +4087,7 @@ dependencies = [
  "filament-transport",
  "futures-util",
  "hex",
+ "ring",
  "secret-write",
  "serde_json",
  "tempfile",

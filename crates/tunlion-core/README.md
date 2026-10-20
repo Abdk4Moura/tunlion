@@ -15,7 +15,8 @@ The remaining real server/daemon handlers are listed in
 `docs/engine-driver.md`.
 
 `stop` / `stop_within` join the dispatch and reap its outcome. `Drop` is only a
-fallback: it requests cancellation and shuts the instance runtime down
-non-blocking (`shutdown_background`), so it is safe inside an async context but
-does not prove the epilogue returned. A task that finished on its own stays
-`FinishedUnjoined` (never `Stopped`) until `stop` joins it.
+fallback: it requests cancellation, releases the root lease and shuts the
+instance runtime down non-blocking (`shutdown_background`), so it is safe inside
+an async context but does not prove the epilogue returned. Reopening the same
+directory immediately can race abandoned work. A task that finished on its own
+stays `FinishedUnjoined` (never `Stopped`) until `stop` joins it.

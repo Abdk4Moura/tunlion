@@ -45,21 +45,27 @@ pub struct CoreSettings {
 }
 
 impl CoreSettings {
-    pub fn load(root: &Path) -> Self {
+    pub fn load(root: &Path) -> std::io::Result<Self> {
+        let raw = match std::fs::read_to_string(root.join("config")) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
         let mut values = HashMap::new();
-        if let Ok(raw) = std::fs::read_to_string(root.join("config")) {
-            for line in raw.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let mut parts = line.splitn(2, char::is_whitespace);
-                if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-                    values.insert(key.to_string(), value.trim().to_string());
-                }
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
             }
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let key = parts.next().expect("a non-empty line has a key");
+            // A bare key is an explicit empty value, not a missing setting.
+            // That distinction is what lets `start` reject `server` instead of
+            // silently substituting the production endpoint.
+            let value = parts.next().map(str::trim).unwrap_or("");
+            values.insert(key.to_string(), value.to_string());
         }
-        Self { values }
+        Ok(Self { values })
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
@@ -701,19 +707,31 @@ impl RecvIdentity for CoreIdentity {
     }
 }
 
+/// The exact close frame a reduced Core sends for an open it does not serve.
+fn named_close_frame(sid: u64, what: &str) -> Value {
+    json!({
+        "type": "l2-close",
+        "sid": sid,
+        "err": format!("{what} is not served by this core profile"),
+    })
+}
+
+/// The exact control reply a reduced Core daemon sends for an unsupported
+/// local request.
+fn daemon_refusal_frame(what: &str) -> Value {
+    json!({
+        "ok": false,
+        "err": format!("{what} is not served by this core profile"),
+    })
+}
+
 async fn refuse_control(conn: &Conn, pid: &str, v: &Value, what: &str) {
     let sid = v["sid"].as_u64().unwrap_or(0);
     conn.log.say(&format!(
         "core: refused {what} from {pid}: this profile does not serve that endpoint"
     ));
     if let Some(t) = conn.transport_of(pid) {
-        let _ = t
-            .send_control(&json!({
-                "type": "l2-close",
-                "sid": sid,
-                "err": format!("{what} is not served by this core profile"),
-            }))
-            .await;
+        let _ = t.send_control(&named_close_frame(sid, what)).await;
     }
 }
 
@@ -844,9 +862,9 @@ impl CoreDaemon {
     }
 
     fn reject(req: filament_peerloop::control::Req, what: &str) {
-        let err = format!("{what} is not served by this core profile");
+        let reply = daemon_refusal_frame(what);
         tokio::spawn(async move {
-            req.reply(&json!({"ok": false, "err": err})).await;
+            req.reply(&reply).await;
         });
     }
 }
@@ -1072,6 +1090,31 @@ mod tests {
         assert!(denial
             .deny_reason("")
             .contains("shell opens are not served by this core profile"));
+    }
+
+    #[test]
+    fn core_server_and_daemon_refusals_are_named_frames() {
+        for what in ["pty-open", "exec-open", "ssh-sign-request"] {
+            let frame = named_close_frame(17, what);
+            assert_eq!(frame["type"], "l2-close");
+            assert_eq!(frame["sid"], 17);
+            assert!(
+                frame["err"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(what)),
+                "the close must name {what}: {frame}"
+            );
+        }
+        for what in ["warm-link reuse", "mount", "warm bootstrap"] {
+            let frame = daemon_refusal_frame(what);
+            assert_eq!(frame["ok"], false);
+            assert!(
+                frame["err"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(what)),
+                "the control error must name {what}: {frame}"
+            );
+        }
     }
 
     #[test]

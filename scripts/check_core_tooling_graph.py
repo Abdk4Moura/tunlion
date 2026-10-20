@@ -21,6 +21,10 @@ TOOLING_FEATURES = {"bindgen", "cli", "cargo-metadata"}
 REDUCED_PEERLOOP_FEATURES = {"dispatch"}
 FORBIDDEN_PEERLOOP_FEATURES = {"mesh", "fleet", "mount-server", "forward-server"}
 FORBIDDEN_REDUCED_PACKAGES = {"filament-overlay", "filament-fleet", "filament-cli"}
+# `authkeys-managed` is an unconditional peerloop dependency today. Its only
+# use is the sshd shell-bootstrap arm; the reduced Core refuses that open, so it
+# is compiled but inert. It is explicitly allowed here, not claimed excluded.
+INERT_REDUCED_PACKAGES = {"authkeys-managed"}
 
 
 def check_fleet_graph():
@@ -99,6 +103,11 @@ def check_graph(target, cli):
             f"{label}: reduced Core selected desktop/mesh sectors: "
             f"features {sorted(leaked_features)}, packages {sorted(leaked_packages)}"
         )
+    if INERT_REDUCED_PACKAGES - packages:
+        raise RuntimeError(
+            f"{label}: expected inert packages are absent; update the allow-list: "
+            f"{INERT_REDUCED_PACKAGES - packages}"
+        )
     if cli:
         if not TOOLING_PACKAGES <= packages or not TOOLING_FEATURES <= uniffi_features:
             raise RuntimeError(f"{label}: missing bindgen tooling or metadata discovery")
@@ -110,7 +119,8 @@ def check_graph(target, cli):
     print(
         f"PASS: {label}: {len(packages)} packages; "
         f"UniFFI features {sorted(uniffi_features)}; "
-        f"peerloop features {sorted(peerloop_features)}"
+        f"peerloop features {sorted(peerloop_features)}; "
+        f"inert {sorted(INERT_REDUCED_PACKAGES & packages)}"
     )
 
 

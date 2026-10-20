@@ -52,6 +52,7 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   | slot | start allowed | `status().engine` | what it means |
   |---|---|---|---|
   | `None` | yes | `NotLinked` | nothing was ever started |
+  | `Claimed` | no | `Starting` | `Core::start` claimed the Core before config/host/runtime work |
   | `Starting(engine)` | no | `Starting` | `Core::start` spawned the dispatch and is waiting for readiness |
   | `Running(engine)` | no | `Running`, or `FinishedUnjoined` once finished | the one engine; a finished task is still unjoined |
   | `Stopping` | no | `Stopping` | a stop claimed the slot and is joining |
@@ -72,11 +73,13 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   the floor. `Stopped` is therefore only recorded after a confirmed join.
 
   `Core::drop` is a fallback, not a joined stop: it requests cancellation by
-  dropping the engine slot, then calls `shutdown_background` on the
-  instance-owned runtime. That is non-blocking and safe inside another Tokio
-  async context (dropping a `Runtime` there would panic); any task that has not
-  observed cancellation is abandoned with the runtime. Callers that need the
-  dispatch epilogue use `stop` first.
+  dropping the engine slot, releases `up.lock`, then calls
+  `shutdown_background` on the instance-owned runtime. That is non-blocking and
+  safe inside another Tokio async context (dropping a `Runtime` there would
+  panic); any task that has not observed cancellation is abandoned with the
+  runtime. Reopening the same config directory immediately after `drop` can
+  therefore race that abandoned work. Callers that need the dispatch epilogue
+  use `stop` first.
 
 ## What is still linked out
 
@@ -118,9 +121,12 @@ the host-effect surface, not a split target):
 `RecvEnv` is the process snapshot the CLI resolves (name, uid, terminal
 interactivity, quiet window, L2/direct posture, consent token).
 
-`Core::start` now validates identity/config, takes the same-root `up.lock`
-lease, starts the real `recv::dispatch::drive` on the Core runtime and waits
-its publish-once readiness edge. The reduced `tunlion-core` host composes
+`Core::start` now claims the slot before config/host/runtime work, validates
+identity/config, takes the same-root `up.lock` lease, starts the real
+`recv::dispatch::drive` on the Core runtime and waits its publish-once readiness
+edge. The lease and `Running` are published in one engine-lock critical
+section; a dispatch that publishes readiness and immediately finishes is
+joined and reported as an error, never `Ok`. The reduced `tunlion-core` host composes
 `DeviceStore`, `IdentityService`, `EnrollmentService`, roster/depart and a
 logical `CoreHost`; PTY/exec/ssh/sync/mount/forward/warm/proxy/wireguard/sshd
 endpoints are explicit named refusals. It composes the default shadow transfer
@@ -133,7 +139,9 @@ that reaches a prompt gets an explicit error rather than a block or a fake
 answer. `scripts/check_core_tooling_graph.py` now proves that the shipped
 `tunlion-core` graph selects `filament-peerloop/dispatch` and excludes `mesh`,
 `fleet`, `mount-server`, `forward-server`, the overlay and the fleet crate, on
-the host and both Android targets.
+the host and both Android targets. `authkeys-managed` remains an unconditional
+peerloop dependency, used only by the sshd shell-bootstrap arm; the reduced Core
+refuses that open and the graph check lists the crate as explicitly inert.
 
 Next linkage work, in order:
 
@@ -142,7 +150,9 @@ Next linkage work, in order:
 2. Compose the authoritative capability policy site for Core (the default
    shadow transfer gate is composed; shell/forward remain denied by name).
 3. The optional `tunlion-core/fleet` feature composes
-   `recv::fleet_rv::FleetService`; keep it off in the Android reduced graph.
+   `recv::fleet_rv::FleetService`; its owner key is the keystore user key with
+   the local certificate issuer as fallback, so owner-signed fleet paths are
+   not inert. Keep the feature off in the Android reduced graph.
 
 ## Verification
 
