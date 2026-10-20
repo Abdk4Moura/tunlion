@@ -147,46 +147,68 @@ pub fn spawn_stdin(
 mod win {
     use super::*;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileType, ReadFile, SetFileCompletionNotificationModes, FILE_TYPE_CHAR,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, ReadFile, FILE_TYPE_CHAR};
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, ReadConsoleInputW,
         INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE,
     };
-    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
-    use windows_sys::Win32::System::WindowsProgramming::FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
-    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
+    /// One owned stdin reader. The stop event is owned here and closed only
+    /// after a normal joined finish; a detached reader leaks the event rather
+    /// than closing a handle another thread may still be waiting on.
     pub struct WindowsStdin {
         stop_event: usize,
         handle: Option<std::thread::JoinHandle<()>>,
+        detach_reason: Arc<std::sync::Mutex<Option<&'static str>>>,
+        detached: bool,
     }
 
     impl StdinOwner for WindowsStdin {
         fn stop(&mut self) {
-            // SAFETY: the event is owned by this reader until join.
+            // SAFETY: the event is owned by this struct.
             unsafe {
                 let _ = SetEvent(self.stop_event as HANDLE);
             }
         }
         fn join(&mut self) -> StdinOutcome {
+            self.stop();
             let Some(handle) = self.handle.take() else {
                 return StdinOutcome::NotStarted;
             };
-            if handle.join().is_ok() {
-                StdinOutcome::Joined
-            } else {
-                StdinOutcome::Detached("stdin reader panicked")
+            // A real bound on the thread, without a cross-thread OS handle:
+            // poll is_finished, then consume the JoinHandle only when done.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !handle.is_finished() {
+                if std::time::Instant::now() >= deadline {
+                    self.detached = true;
+                    self.handle = Some(handle);
+                    return StdinOutcome::Detached("stdin reader did not stop within 2s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            let _ = handle.join();
+            if let Some(reason) = *self.detach_reason.lock().unwrap() {
+                return StdinOutcome::External(reason);
+            }
+            StdinOutcome::Joined
         }
     }
 
     impl Drop for WindowsStdin {
         fn drop(&mut self) {
             self.stop();
+            if !self.detached {
+                // SAFETY: only closed after a joined/normal finish.
+                unsafe {
+                    let _ = CloseHandle(self.stop_event as HANDLE);
+                }
+            }
+            // A detached reader keeps the event handle alive on purpose; the
+            // process is ending and closing it would race its wait.
         }
     }
 
@@ -209,35 +231,46 @@ mod win {
         if input.is_null() {
             return None;
         }
-        // SAFETY: anonymous manual-reset event owned by the reader.
-        let stop = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null_mut()) };
-        if stop.is_null() {
-            return None;
-        }
         let mut mode = 0u32;
         // SAFETY: GetConsoleMode writes one u32 and fails for a pipe.
         let console = unsafe {
             GetFileType(input) == FILE_TYPE_CHAR && GetConsoleMode(input, &mut mode) != 0
         };
+        // SAFETY: anonymous manual-reset event owned by this reader.
+        let stop = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null_mut()) };
+        if stop.is_null() {
+            return None;
+        }
         let stop_usize = stop as usize;
         let input_usize = input as usize;
+        let detach_reason = Arc::new(std::sync::Mutex::new(None));
+        let reason = detach_reason.clone();
         let handle = std::thread::spawn(move || {
             let input = input_usize as HANDLE;
             let stop = stop_usize as HANDLE;
-            if console {
-                console_loop(input, stop, tx, question_open, present);
+            let outcome = if console {
+                console_loop(input, stop, tx, question_open, present)
             } else {
-                pipe_loop(input, stop, tx, question_open, present);
-            }
-            // SAFETY: this thread owns the stop event.
-            unsafe {
-                let _ = CloseHandle(stop);
+                pipe_loop(input, stop, tx, question_open, present)
+            };
+            if let Some(reason) = outcome {
+                if let Ok(mut slot) = reason.lock() {
+                    *slot = Some(reason);
+                }
             }
         });
         Some(Box::new(WindowsStdin {
             stop_event: stop_usize,
             handle: Some(handle),
+            detach_reason: reason,
+            detached: false,
         }))
+    }
+
+    /// Wait for the stop event for a short slice, checking stop every iteration.
+    fn stopped(stop: HANDLE) -> bool {
+        // SAFETY: event handle owned by WindowsStdin; wait only observes.
+        unsafe { WaitForSingleObject(stop, 75) == WAIT_OBJECT_0 }
     }
 
     fn console_loop(
@@ -246,39 +279,46 @@ mod win {
         tx: mpsc::UnboundedSender<Ev>,
         question_open: Arc<AtomicBool>,
         present: Arc<dyn Presentation>,
-    ) {
+    ) -> Option<&'static str> {
         let mut line = String::new();
+        let mut high_surrogate: Option<u16> = None;
         loop {
-            let handles = [stop, input];
-            // SAFETY: both handles are live for the loop; wait only observes.
-            let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, 1000) };
-            if waited == WAIT_OBJECT_0 {
-                return;
+            if stopped(stop) {
+                return None;
             }
-            if waited == WAIT_TIMEOUT || waited != WAIT_OBJECT_0 + 1 {
+            let mut available = 0u32;
+            // SAFETY: writes one count.
+            unsafe {
+                let _ = GetNumberOfConsoleInputEvents(input, &mut available);
+            }
+            if available == 0 {
                 continue;
             }
-            loop {
-                let mut available = 0u32;
-                // SAFETY: writes one count.
-                unsafe {
-                    let _ = GetNumberOfConsoleInputEvents(input, &mut available);
-                }
-                if available == 0 {
-                    break;
-                }
-                let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
-                let mut read = 0u32;
-                // SAFETY: one record buffer, one record requested.
-                let ok = unsafe { ReadConsoleInputW(input, &mut record, 1, &mut read) };
-                if ok == 0 || read == 0 {
-                    return;
-                }
-                if record.EventType as u32 == KEY_EVENT {
-                    let key = unsafe { record.Event.KeyEvent };
-                    if key.bKeyDown != 0 {
-                        let ch = char::from_u32(unsafe { key.uChar.UnicodeChar } as u32);
-                        if let Some(ch) = ch.filter(|c| *c != '\0') {
+            let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            let mut read = 0u32;
+            // SAFETY: one record buffer, one record requested; only called
+            // when the console reports an event available.
+            let ok = unsafe { ReadConsoleInputW(input, &mut record, 1, &mut read) };
+            if ok == 0 || read == 0 {
+                return None;
+            }
+            if record.EventType as u32 == KEY_EVENT {
+                let key = unsafe { record.Event.KeyEvent };
+                if key.bKeyDown != 0 {
+                    let unit = unsafe { key.uChar.UnicodeChar };
+                    if (0xD800..=0xDBFF).contains(&unit) {
+                        high_surrogate = Some(unit);
+                    } else if (0xDC00..=0xDFFF).contains(&unit) {
+                        if let Some(high) = high_surrogate.take() {
+                            if let Some(ch) =
+                                char::decode_utf16([high, unit]).next().and_then(|r| r.ok())
+                            {
+                                feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                            }
+                        }
+                    } else {
+                        high_surrogate = None;
+                        if let Some(ch) = char::from_u32(unit as u32).filter(|c| *c != '\0') {
                             feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
                         }
                     }
@@ -293,79 +333,80 @@ mod win {
         tx: mpsc::UnboundedSender<Ev>,
         question_open: Arc<AtomicBool>,
         present: Arc<dyn Presentation>,
-    ) {
-        // SAFETY: an event owned by this loop.
-        let io_event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null_mut()) };
-        if io_event.is_null() {
-            return;
-        }
-        // Avoid a completion packet when the read completes inline; the
-        // OVERLAPPED event then remains the only completion signal.
-        unsafe {
-            let _ = SetFileCompletionNotificationModes(
-                input,
-                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS as u8,
-            );
-        }
+    ) -> Option<&'static str> {
         let mut line = String::new();
-        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-        ov.hEvent = io_event;
+        let mut pending: Vec<u8> = Vec::new();
         loop {
-            let mut byte = 0u8;
+            if stopped(stop) {
+                return None;
+            }
+            let mut available = 0u32;
+            // SAFETY: PeekNamedPipe writes the count; no buffer is requested.
+            let ok = unsafe {
+                PeekNamedPipe(
+                    input,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                // Not a pipe (redirected file, unusual handle): keep the CLI's
+                // process-lifetime policy instead of blocking an engine thread.
+                return Some("stdin is not a pipe; CLI process-lifetime reader not owned");
+            }
+            if available == 0 {
+                continue;
+            }
+            let mut buf = [0u8; 512];
+            let want = available.min(buf.len() as u32);
             let mut read = 0u32;
-            // SAFETY: one byte buffer and one OVERLAPPED, both live until the
-            // matching completion below.
-            let ok = unsafe { ReadFile(input, &mut byte as *mut u8, 1, &mut read, &mut ov) };
-            if ok != 0 {
-                if read == 0 {
-                    break;
+            // SAFETY: PeekNamedPipe said at least `want` bytes are available;
+            // ReadFile cannot block for an anonymous pipe with data.
+            let ok = unsafe {
+                ReadFile(
+                    input,
+                    buf.as_mut_ptr(),
+                    want,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || read == 0 {
+                return None;
+            }
+            pending.extend_from_slice(&buf[..read as usize]);
+            loop {
+                match std::str::from_utf8(&pending) {
+                    Ok(text) => {
+                        for ch in text.chars() {
+                            feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                        }
+                        pending.clear();
+                        break;
+                    }
+                    Err(error) => {
+                        let valid = error.valid_up_to();
+                        if valid > 0 {
+                            let text = unsafe { std::str::from_utf8_unchecked(&pending[..valid]) };
+                            for ch in text.chars() {
+                                feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                            }
+                            pending.drain(..valid);
+                            continue;
+                        }
+                        if pending.len() >= 4 {
+                            let ch = char::REPLACEMENT_CHARACTER;
+                            feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                            pending.clear();
+                            break;
+                        }
+                        break; // incomplete UTF-8; wait for more bytes
+                    }
                 }
-                feed_char(
-                    byte as char,
-                    &tx,
-                    &question_open,
-                    present.as_ref(),
-                    &mut line,
-                );
-                continue;
             }
-            // SAFETY: GetLastError has no preconditions.
-            if unsafe { GetLastError() } != ERROR_IO_PENDING {
-                break;
-            }
-            let handles = [stop, io_event];
-            // SAFETY: both events live; wait observes.
-            let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, 1000) };
-            if waited == WAIT_OBJECT_0 {
-                // Cancel, then WAIT for the cancellation to complete before
-                // the byte/OVERLAPPED leave this scope.
-                unsafe {
-                    let _ = CancelIoEx(input, &ov);
-                    let mut done = 0u32;
-                    let _ = GetOverlappedResult(input, &ov, &mut done, 1);
-                }
-                break;
-            }
-            if waited != WAIT_OBJECT_0 + 1 {
-                continue;
-            }
-            let mut done = 0u32;
-            // SAFETY: the I/O event signalled; OVERLAPPED is still alive.
-            let ok = unsafe { GetOverlappedResult(input, &ov, &mut done, 0) };
-            if ok == 0 || done == 0 {
-                break;
-            }
-            feed_char(
-                byte as char,
-                &tx,
-                &question_open,
-                present.as_ref(),
-                &mut line,
-            );
-        }
-        // SAFETY: this loop owns the event.
-        unsafe {
-            let _ = CloseHandle(io_event);
         }
     }
 }

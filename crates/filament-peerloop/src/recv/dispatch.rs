@@ -946,10 +946,14 @@ impl RecvCleanup {
             Some(mut stdin) => {
                 stdin.stop();
                 let outcome = stdin.join();
-                if let crate::recv::ports::StdinOutcome::Detached(reason) = outcome {
-                    log.critical(&format!(
+                match outcome {
+                    crate::recv::ports::StdinOutcome::Detached(reason) => log.critical(&format!(
                         "recv: stdin reader detached: {reason}; cleanup continues but the reader may still live"
-                    ));
+                    )),
+                    crate::recv::ports::StdinOutcome::External(reason) => log.debug(&format!(
+                        "recv: stdin uses the CLI process-lifetime reader: {reason}"
+                    )),
+                    _ => {}
                 }
                 outcome
             }
