@@ -53,6 +53,7 @@ const LIVENESS_TICK: std::time::Duration = std::time::Duration::from_millis(500)
 
 /// How one exec is spawned: the resolved program, its args, and the account it
 /// runs as (None = the daemon user, only when no `--shell-user` is set).
+#[derive(Debug)]
 struct ExecSpawnPlan {
     program: PathBuf,
     args: Vec<String>,
@@ -1086,7 +1087,7 @@ mod tests {
         t: Arc<FakeTransport>,
         req: ExecOpen,
     ) -> Result<(), tokio::time::error::Elapsed> {
-        let mux = Arc::new(l2::Mux::new(t.clone(), host()));
+        let mux = l2::Mux::new(t.clone(), host());
         let (_stdin_tx, stdin_rx) = mpsc::channel(1);
         let (_ctl_tx, ctl_rx) = mpsc::channel(1);
         tokio::time::timeout(
