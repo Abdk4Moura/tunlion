@@ -2,9 +2,9 @@
 //! unix. The branch lives here; the receive adapter calls one function name on
 //! every target (docs/architecture/PLATFORM.md).
 
-use crate::host::HostServices;
 use filament_peerloop::conn::Conn;
 use filament_peerloop::control::Req;
+use filament_peerloop::host::HostServices;
 use std::path::PathBuf;
 
 #[cfg(unix)]
