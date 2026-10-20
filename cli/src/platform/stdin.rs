@@ -1,18 +1,54 @@
 //! The owned stdin reader for an interactive receive.
 //!
-//! The library asks for an owner and retains it; this adapter owns the OS
-//! thread and can stop it. Unix uses a pollable read; Windows waits on the
-//! console/pipe handle with a bounded timeout. Android never requests stdin
-//! (the embedding has no terminal composition), so it returns None.
+//! Unix polls stdin and checks an atomic stop flag. Windows uses two explicit
+//! strategies: console input is read with `ReadConsoleInputW` only after
+//! `WaitForMultipleObjects` says an event (or stop) is ready; redirected stdin
+//! uses overlapped `ReadFile` and waits on the stop event, so cancellation
+//! completes the I/O before the buffer is released. Android has no terminal
+//! composition and returns `None`.
 
 use filament_peerloop::present::Presentation;
-use filament_peerloop::recv::ports::StdinOwner;
+use filament_peerloop::recv::ports::{StdinOutcome, StdinOwner};
 use filament_transport::net::Ev;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Feed one decoded character into the line/consent state. Shared by both OS
+/// readers so their semantics cannot drift.
 #[cfg(any(all(unix, not(target_os = "android")), windows))]
+fn feed_char(
+    c: char,
+    tx: &mpsc::UnboundedSender<Ev>,
+    question_open: &AtomicBool,
+    present: &dyn Presentation,
+    line: &mut String,
+) {
+    if question_open.load(Ordering::Relaxed) && "yYnN".contains(c) && line.is_empty() {
+        present.answer_echo(c);
+        let _ = tx.send(Ev::StdinLine(c.to_lowercase().to_string()));
+        return;
+    }
+    match c {
+        '\n' | '\r' => {
+            crate::ui::say("");
+            let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
+            line.clear();
+        }
+        '\u{7f}' | '\u{8}' => {
+            if line.pop().is_some() {
+                crate::ui::erase_one();
+            }
+        }
+        c if !c.is_control() => {
+            crate::ui::echo_char(c);
+            line.push(c);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
 pub fn spawn_stdin(
     tx: mpsc::UnboundedSender<Ev>,
     question_open: Arc<AtomicBool>,
@@ -20,23 +56,76 @@ pub fn spawn_stdin(
 ) -> Option<Box<dyn StdinOwner>> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
-    let thread_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let id_thread = thread_id.clone();
     let handle = std::thread::spawn(move || {
-        #[cfg(windows)]
-        id_thread.store(
-            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
-            Ordering::Release,
-        );
-        #[cfg(not(windows))]
-        let _ = &id_thread;
-        reader_loop(tx, question_open, present, stop_thread)
+        use std::io::Read;
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 1];
+        let mut line = String::new();
+        while !stop_thread.load(Ordering::Relaxed) {
+            if !input_ready(100) {
+                continue;
+            }
+            if stdin.read(&mut buf).map(|n| n != 1).unwrap_or(true) {
+                break;
+            }
+            feed_char(
+                buf[0] as char,
+                &tx,
+                &question_open,
+                present.as_ref(),
+                &mut line,
+            );
+        }
     });
     Some(Box::new(CliStdin {
         stop,
-        thread_id,
         handle: Some(handle),
     }))
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn input_ready(timeout_ms: i32) -> bool {
+    use std::os::fd::AsRawFd;
+    input_ready_fd(std::io::stdin().as_raw_fd(), timeout_ms)
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn input_ready_fd(fd: i32, timeout_ms: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialized pollfd, no ownership transferred.
+    let n = unsafe { libc::poll(&mut p, 1, timeout_ms) };
+    n > 0 && (p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+struct CliStdin {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+impl StdinOwner for CliStdin {
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+    fn join(&mut self) -> StdinOutcome {
+        match self.handle.take() {
+            None => StdinOutcome::NotStarted,
+            Some(handle) if handle.join().is_ok() => StdinOutcome::Joined,
+            Some(_) => StdinOutcome::Detached("stdin reader panicked"),
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+impl Drop for CliStdin {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
@@ -48,184 +137,317 @@ pub fn spawn_stdin(
     None
 }
 
-#[cfg(any(all(unix, not(target_os = "android")), windows))]
-fn reader_loop(
+// ---------------------------------------------------------------- Windows --
+#[cfg(windows)]
+mod win {
+    use super::*;
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileType, ReadFile, SetFileCompletionNotificationModes,
+        FILE_SKIP_COMPLETION_PORT_ON_SUCCESS, FILE_TYPE_CHAR,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, ReadConsoleInputW,
+        INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+    pub struct WindowsStdin {
+        stop_event: usize,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StdinOwner for WindowsStdin {
+        fn stop(&mut self) {
+            // SAFETY: the event is owned by this reader until join.
+            unsafe {
+                let _ = SetEvent(self.stop_event as HANDLE);
+            }
+        }
+        fn join(&mut self) -> StdinOutcome {
+            let Some(handle) = self.handle.take() else {
+                return StdinOutcome::NotStarted;
+            };
+            if handle.join().is_ok() {
+                StdinOutcome::Joined
+            } else {
+                StdinOutcome::Detached("stdin reader panicked")
+            }
+        }
+    }
+
+    impl Drop for WindowsStdin {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    pub fn spawn(
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) -> Option<Box<dyn StdinOwner>> {
+        // SAFETY: standard handle; the reader only observes it.
+        let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        spawn_on_handle(input, tx, question_open, present)
+    }
+
+    pub(super) fn spawn_on_handle(
+        input: HANDLE,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) -> Option<Box<dyn StdinOwner>> {
+        if input.is_null() {
+            return None;
+        }
+        // SAFETY: anonymous manual-reset event owned by the reader.
+        let stop = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null_mut()) };
+        if stop.is_null() {
+            return None;
+        }
+        let mut mode = 0u32;
+        // SAFETY: GetConsoleMode writes one u32 and fails for a pipe.
+        let console = unsafe {
+            GetFileType(input) == FILE_TYPE_CHAR && GetConsoleMode(input, &mut mode) != 0
+        };
+        let stop_usize = stop as usize;
+        let input_usize = input as usize;
+        let handle = std::thread::spawn(move || {
+            let input = input_usize as HANDLE;
+            let stop = stop_usize as HANDLE;
+            if console {
+                console_loop(input, stop, tx, question_open, present);
+            } else {
+                pipe_loop(input, stop, tx, question_open, present);
+            }
+            // SAFETY: this thread owns the stop event.
+            unsafe {
+                let _ = CloseHandle(stop);
+            }
+        });
+        Some(Box::new(WindowsStdin {
+            stop_event: stop_usize,
+            handle: Some(handle),
+        }))
+    }
+
+    fn console_loop(
+        input: HANDLE,
+        stop: HANDLE,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) {
+        let mut line = String::new();
+        loop {
+            let handles = [stop, input];
+            // SAFETY: both handles are live for the loop; wait only observes.
+            let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, 1000) };
+            if waited == WAIT_OBJECT_0 {
+                return;
+            }
+            if waited == WAIT_TIMEOUT || waited != WAIT_OBJECT_0 + 1 {
+                continue;
+            }
+            loop {
+                let mut available = 0u32;
+                // SAFETY: writes one count.
+                unsafe {
+                    let _ = GetNumberOfConsoleInputEvents(input, &mut available);
+                }
+                if available == 0 {
+                    break;
+                }
+                let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+                let mut read = 0u32;
+                // SAFETY: one record buffer, one record requested.
+                let ok = unsafe { ReadConsoleInputW(input, &mut record, 1, &mut read) };
+                if ok == 0 || read == 0 {
+                    return;
+                }
+                if record.EventType as u32 == KEY_EVENT {
+                    let key = unsafe { record.Event.KeyEvent };
+                    if key.bKeyDown != 0 {
+                        let ch = char::from_u32(unsafe { key.uChar.UnicodeChar } as u32);
+                        if let Some(ch) = ch.filter(|c| *c != '\0') {
+                            feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn pipe_loop(
+        input: HANDLE,
+        stop: HANDLE,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) {
+        // SAFETY: an event owned by this loop.
+        let io_event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null_mut()) };
+        if io_event.is_null() {
+            return;
+        }
+        // Avoid a completion packet when the read completes inline; the
+        // OVERLAPPED event then remains the only completion signal.
+        unsafe {
+            let _ = SetFileCompletionNotificationModes(
+                input,
+                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS as u8,
+            );
+        }
+        let mut line = String::new();
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = io_event;
+        loop {
+            let mut byte = 0u8;
+            let mut read = 0u32;
+            // SAFETY: one byte buffer and one OVERLAPPED, both live until the
+            // matching completion below.
+            let ok = unsafe {
+                ReadFile(
+                    input,
+                    &mut byte as *mut u8 as *mut c_void,
+                    1,
+                    &mut read,
+                    &mut ov,
+                )
+            };
+            if ok != 0 {
+                if read == 0 {
+                    break;
+                }
+                feed_char(
+                    byte as char,
+                    &tx,
+                    &question_open,
+                    present.as_ref(),
+                    &mut line,
+                );
+                continue;
+            }
+            // SAFETY: GetLastError has no preconditions.
+            if unsafe { GetLastError() } != ERROR_IO_PENDING {
+                break;
+            }
+            let handles = [stop, io_event];
+            // SAFETY: both events live; wait observes.
+            let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, 1000) };
+            if waited == WAIT_OBJECT_0 {
+                // Cancel, then WAIT for the cancellation to complete before
+                // the byte/OVERLAPPED leave this scope.
+                unsafe {
+                    let _ = CancelIoEx(input, &ov);
+                    let mut done = 0u32;
+                    let _ = GetOverlappedResult(input, &ov, &mut done, 1);
+                }
+                break;
+            }
+            if waited != WAIT_OBJECT_0 + 1 {
+                continue;
+            }
+            let mut done = 0u32;
+            // SAFETY: the I/O event signalled; OVERLAPPED is still alive.
+            let ok = unsafe { GetOverlappedResult(input, &ov, &mut done, 0) };
+            if ok == 0 || done == 0 {
+                break;
+            }
+            feed_char(
+                byte as char,
+                &tx,
+                &question_open,
+                present.as_ref(),
+                &mut line,
+            );
+        }
+        // SAFETY: this loop owns the event.
+        unsafe {
+            let _ = CloseHandle(io_event);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn spawn_stdin(
     tx: mpsc::UnboundedSender<Ev>,
     question_open: Arc<AtomicBool>,
     present: Arc<dyn Presentation>,
-    stop: Arc<AtomicBool>,
-) {
-    use std::io::Read;
-    let mut stdin = std::io::stdin();
-    let mut buf = [0u8; 1];
-    let mut line = String::new();
-    while !stop.load(Ordering::Relaxed) {
-        if !input_ready(100) {
-            continue;
-        }
-        if stdin.read(&mut buf).map(|n| n != 1).unwrap_or(true) {
-            break;
-        }
-        let c = buf[0] as char;
-        if question_open.load(Ordering::Relaxed) && "yYnN".contains(c) && line.is_empty() {
-            present.answer_echo(c);
-            let _ = tx.send(Ev::StdinLine(c.to_lowercase().to_string()));
-            continue;
-        }
-        match buf[0] {
-            b'\n' | b'\r' => {
-                crate::ui::say("");
-                let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
-                line.clear();
-            }
-            0x7f | 0x08 => {
-                if line.pop().is_some() {
-                    crate::ui::erase_one();
-                }
-            }
-            _ if !c.is_control() => {
-                crate::ui::echo_char(c);
-                line.push(c);
-            }
-            _ => {}
-        }
-    }
+) -> Option<Box<dyn StdinOwner>> {
+    win::spawn(tx, question_open, present)
 }
 
-#[cfg(all(unix, not(target_os = "android")))]
-fn input_ready(timeout_ms: i32) -> bool {
-    use std::os::fd::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
-    let mut p = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one initialized pollfd, no ownership transferred.
-    let n = unsafe { libc::poll(&mut p, 1, timeout_ms) };
-    n > 0 && (p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
-}
-
-#[cfg(windows)]
-fn input_ready(timeout_ms: i32) -> bool {
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    // SAFETY: GetStdHandle has no preconditions; the wait only observes it.
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let timeout = u32::try_from(timeout_ms).unwrap_or(100);
-    // SAFETY: a valid standard handle for this process; no ownership changes.
-    unsafe { WaitForSingleObject(handle, timeout) == WAIT_OBJECT_0 }
-}
-
-#[cfg(any(all(unix, not(target_os = "android")), windows))]
-struct CliStdin {
-    stop: Arc<AtomicBool>,
-    thread_id: Arc<std::sync::atomic::AtomicU32>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(any(all(unix, not(target_os = "android")), windows))]
-impl StdinOwner for CliStdin {
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        #[cfg(windows)]
-        cancel_pending_read(self.thread_id.load(Ordering::Acquire));
-    }
-    fn join(&mut self) -> bool {
-        let Some(handle) = self.handle.take() else {
-            return true;
-        };
-        #[cfg(windows)]
-        {
-            // The cancellable read should return at once. Bound the join so a
-            // console that ignores cancellation cannot hold cleanup hostage;
-            // false means the CLI detaches and keeps cleaning up.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !handle.is_finished() {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            handle.join().is_ok()
-        }
-        #[cfg(not(windows))]
-        {
-            handle.join().is_ok()
-        }
-    }
-}
-
-#[cfg(windows)]
-fn cancel_pending_read(thread_id: u32) {
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::win::spawn_on_handle;
+    use filament_peerloop::present::NoScreen;
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_TERMINATE};
-    use windows_sys::Win32::System::IO::CancelSynchronousIo;
-    if thread_id == 0 {
-        return;
-    }
-    // SAFETY: OpenThread only observes the id; the handle is closed here.
-    let handle = unsafe { OpenThread(THREAD_TERMINATE, 0, thread_id) };
-    if handle != std::ptr::null_mut() {
-        unsafe {
-            let _ = CancelSynchronousIo(handle);
-            let _ = CloseHandle(handle);
-        }
-    }
-}
+    use windows_sys::Win32::System::Pipes::CreatePipe;
 
-#[cfg(any(all(unix, not(target_os = "android")), windows))]
-impl Drop for CliStdin {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(windows)]
     #[test]
-    fn stop_joins_a_pending_windows_reader_within_bounds() {
-        use super::spawn_stdin;
-        use filament_peerloop::present::NoScreen;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
+    fn stop_joins_a_pending_overlapped_pipe_read() {
+        let mut read = std::ptr::null_mut();
+        let mut write = std::ptr::null_mut();
+        // SAFETY: default security, anonymous pipe; handles checked below.
+        let ok = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null_mut(), 0) };
+        assert_ne!(ok, 0, "CreatePipe");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let question = Arc::new(AtomicBool::new(false));
-        let mut owner =
-            spawn_stdin(tx, question, Arc::new(NoScreen)).expect("Windows has an owned reader");
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let q = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut owner = spawn_on_handle(read, tx, q, std::sync::Arc::new(NoScreen))
+            .expect("reader for the pipe");
+        // No writer data: the ReadFile is pending on the pipe.
+        std::thread::sleep(std::time::Duration::from_millis(150));
         let started = std::time::Instant::now();
         owner.stop();
-        let joined = owner.join();
+        let outcome = owner.join();
+        assert_eq!(
+            outcome,
+            filament_peerloop::recv::ports::StdinOutcome::Joined,
+            "the overlapped read must cancel and join"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
-            "join must be bounded"
+            "join must be prompt"
         );
-        // A closed pipe exits, a console read is cancelled; either way the
-        // adapter reports the truth rather than a fabricated success.
-        let _ = joined;
+        unsafe {
+            let _ = CloseHandle(read);
+            let _ = CloseHandle(write);
+        }
     }
+}
 
-    #[cfg(all(unix, not(target_os = "android")))]
+#[cfg(all(test, unix, not(target_os = "android")))]
+mod unix_pipe_tests {
+    use super::input_ready_fd;
+
     #[test]
-    fn unix_reader_is_owned_and_bounded_on_stop() {
-        use super::spawn_stdin;
-        use filament_peerloop::present::NoScreen;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let question = Arc::new(AtomicBool::new(false));
-        let mut owner =
-            spawn_stdin(tx, question, Arc::new(NoScreen)).expect("unix has an owned reader");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let started = std::time::Instant::now();
-        owner.stop();
-        let _ = owner.join();
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "poll-based stop/join is bounded"
-        );
+    fn a_closed_pipe_is_ready_for_both_eof_and_hup() {
+        let mut fds = [0i32; 2];
+        // SAFETY: two-int array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        unsafe {
+            assert_eq!(libc::write(w, b"x".as_ptr() as *const _, 1), 1);
+            libc::close(w);
+        }
+        assert!(input_ready_fd(r, 100), "a byte is ready");
+        let mut b = 0u8;
+        unsafe {
+            assert_eq!(libc::read(r, &mut b as *mut _ as *mut _, 1), 1);
+        }
+        // After the write end closes, POLLHUP must still wake the poll; the
+        // reader's subsequent read(2) returns 0 and exits.
+        assert!(input_ready_fd(r, 100), "HUP is readiness, not a spin");
+        let mut b = 0u8;
+        unsafe {
+            assert_eq!(libc::read(r, &mut b as *mut _ as *mut _, 1), 0);
+            libc::close(r);
+        }
     }
 }

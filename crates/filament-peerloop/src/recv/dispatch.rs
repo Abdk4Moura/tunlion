@@ -601,11 +601,18 @@ pub async fn drive(
         ))
         .await;
     cleanup.finish(log.as_ref()).await;
+    let stdin_outcome = cleanup.stdin_outcome;
     // A signal received during cleanup still has its signal-specific outcome.
     if stop.is_cancelled() {
-        DriverOutcome::Cancelled
-    } else {
-        outcome
+        return DriverOutcome::Cancelled;
+    }
+    match (outcome, stdin_outcome) {
+        (DriverOutcome::Returned(Ok(())), crate::recv::ports::StdinOutcome::Detached(reason)) => {
+            DriverOutcome::Returned(Err(anyhow::anyhow!(
+                "stdin reader detached during cleanup: {reason}"
+            )))
+        }
+        (outcome, _) => outcome,
     }
 }
 
@@ -639,6 +646,7 @@ pub struct RecvCleanup {
     writers: WriterTasks,
     watchdog: crate::recv::lifecycle::LoopWatchdog,
     stdin: Option<Box<dyn crate::recv::ports::StdinOwner>>,
+    stdin_outcome: crate::recv::ports::StdinOutcome,
     sync_tasks: SyncTasks,
     /// Test-only observation of the cleanup order (`finish` also records the
     /// static phases used by the older tests). A gated writer pushes into the
@@ -933,14 +941,19 @@ impl RecvCleanup {
     async fn finish(&mut self, log: &dyn LogSink) {
         // The stdin reader is an owned CLI resource when the adapter could
         // join it. A platform that cannot do so returns false and says so.
-        if let Some(mut stdin) = self.stdin.take() {
-            stdin.stop();
-            if !stdin.join() {
-                log.debug(
-                    "recv: stdin reader could not be joined; CLI lifetime policy detaches it",
-                );
+        self.stdin_outcome = match self.stdin.take() {
+            None => crate::recv::ports::StdinOutcome::NotStarted,
+            Some(mut stdin) => {
+                stdin.stop();
+                let outcome = stdin.join();
+                if let crate::recv::ports::StdinOutcome::Detached(reason) = outcome {
+                    log.critical(&format!(
+                        "recv: stdin reader detached: {reason}; cleanup continues but the reader may still live"
+                    ));
+                }
+                outcome
             }
-        }
+        };
         // The loop is intentionally no longer turning. Ask its stall observer
         // to stop before the (possibly slow) flush, so cleanup cannot be
         // reported as a live-loop stall. This is a best-effort one-second
@@ -9846,9 +9859,13 @@ mod lifecycle_tests {
         fn stop(&mut self) {
             self.stopped.store(true, Ordering::SeqCst);
         }
-        fn join(&mut self) -> bool {
+        fn join(&mut self) -> crate::recv::ports::StdinOutcome {
             self.joined.store(true, Ordering::SeqCst);
-            self.handle.take().map(|h| h.join().is_ok()).unwrap_or(true)
+            match self.handle.take().map(|h| h.join()) {
+                Some(Ok(())) => crate::recv::ports::StdinOutcome::Joined,
+                Some(Err(_)) => crate::recv::ports::StdinOutcome::Detached("fake panic"),
+                None => crate::recv::ports::StdinOutcome::NotStarted,
+            }
         }
     }
 
@@ -9882,6 +9899,10 @@ mod lifecycle_tests {
         cleanup.finish(&NoLog).await;
         assert!(stopped.load(Ordering::SeqCst), "stop before join");
         assert!(joined.load(Ordering::SeqCst), "join completed");
+        assert_eq!(
+            cleanup.stdin_outcome,
+            crate::recv::ports::StdinOutcome::Joined
+        );
         while rx.try_recv().is_ok() {}
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(rx.try_recv().is_err(), "no StdinLine after stop+join");

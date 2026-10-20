@@ -419,11 +419,27 @@ pub trait RecvDaemon: Send + Sync {
 /// Terminal interaction: the code prompt and the confirmation line.
 pub trait RawMode: Send {}
 
-/// An owned stdin reader. `join` reports whether the reader actually stopped;
-/// an adapter that cannot join safely must return false (CLI-only policy).
+/// What cleanup achieved for the owned stdin reader. `Detached` is a real
+/// outcome, never a success: a future Core must not publish fully-stopped with
+/// a live reader thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdinOutcome {
+    NotStarted,
+    Joined,
+    Detached(&'static str),
+}
+
+impl Default for StdinOutcome {
+    fn default() -> Self {
+        Self::NotStarted
+    }
+}
+
+/// An owned stdin reader. `join` reports the structured outcome; an adapter
+/// that cannot join safely returns `Detached`, never a fabricated success.
 pub trait StdinOwner: Send {
     fn stop(&mut self);
-    fn join(&mut self) -> bool;
+    fn join(&mut self) -> StdinOutcome;
 }
 
 pub trait RecvPrompt: Send + Sync {
