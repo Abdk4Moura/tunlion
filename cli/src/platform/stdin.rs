@@ -245,6 +245,7 @@ mod win {
         let input_usize = input as usize;
         let detach_reason = Arc::new(std::sync::Mutex::new(None));
         let reason = detach_reason.clone();
+        let reason_in_thread = reason.clone();
         let handle = std::thread::spawn(move || {
             let input = input_usize as HANDLE;
             let stop = stop_usize as HANDLE;
@@ -254,7 +255,7 @@ mod win {
                 pipe_loop(input, stop, tx, question_open, present)
             };
             if let Some(text) = outcome {
-                if let Ok(mut slot) = reason.lock() {
+                if let Ok(mut slot) = reason_in_thread.lock() {
                     *slot = Some(text);
                 }
             }
