@@ -146,7 +146,6 @@ pub fn spawn_stdin(
 #[cfg(windows)]
 mod win {
     use super::*;
-    use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
@@ -316,15 +315,7 @@ mod win {
             let mut read = 0u32;
             // SAFETY: one byte buffer and one OVERLAPPED, both live until the
             // matching completion below.
-            let ok = unsafe {
-                ReadFile(
-                    input,
-                    &mut byte as *mut u8 as *mut c_void,
-                    1,
-                    &mut read,
-                    &mut ov,
-                )
-            };
+            let ok = unsafe { ReadFile(input, &mut byte as *mut u8, 1, &mut read, &mut ov) };
             if ok != 0 {
                 if read == 0 {
                     break;
