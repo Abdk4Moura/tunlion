@@ -50,8 +50,7 @@ pub struct CliRecv {
     pub pty_sessions: std::sync::Arc<l2::PtySessions>,
     pub warm_ptys: crate::WarmPtys,
     pub liveness: crate::LivenessProbes,
-    #[cfg(unix)]
-    pub pending_bootstrap: filament_peerloop::daemon_ctl::PendingBootstraps,
+    pub pending_bootstrap: crate::platform::PendingBootstraps,
     pub daemon_mounts: crate::DaemonMounts,
     pub last_mount_check: Instant,
     pub exposer: Option<Arc<crate::expose::Exposer>>,
@@ -64,8 +63,7 @@ impl Default for CliRecv {
             pty_sessions: l2::PtySessions::new(),
             warm_ptys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             liveness: crate::LivenessProbes::new(),
-            #[cfg(unix)]
-            pending_bootstrap: HashMap::new(),
+            pending_bootstrap: Default::default(),
             daemon_mounts: crate::DaemonMounts {
                 entries: HashMap::new(),
                 children: HashMap::new(),
@@ -809,54 +807,26 @@ impl RecvDaemon for CliRecv {
             .await
     }
     async fn list_warm(&mut self, req: Req, conn_for_list: &Conn) {
-        #[cfg(unix)]
-        filament_peerloop::daemon_ctl::handle_list_warm(conn_for_list, req).await;
-        #[cfg(not(unix))]
-        {
-            let _ = (conn_for_list, req);
-        }
+        crate::platform::list_warm(conn_for_list, req).await
     }
     async fn mount(&mut self, req: Req, server: &str, relay: bool) {
-        #[cfg(unix)]
-        crate::daemon_ctl::handle_mount(
+        crate::platform::mount(
             req,
             server,
             relay,
             &mut self.daemon_mounts,
             &mut self.last_mount_check,
         )
-        .await;
-        #[cfg(not(unix))]
-        {
-            let _ = (server, relay);
-            {
-                let _ = req;
-            }
-        }
+        .await
     }
     async fn unmount(&mut self, req: Req) {
-        #[cfg(unix)]
-        crate::daemon_ctl::handle_unmount(req, &mut self.daemon_mounts).await;
-        #[cfg(not(unix))]
-        {
-            let _ = req;
-        }
+        crate::platform::unmount(req, &mut self.daemon_mounts).await
     }
     async fn list_mounts(&mut self, req: Req) {
-        #[cfg(unix)]
-        crate::daemon_ctl::handle_list_mounts(req, &self.daemon_mounts).await;
-        #[cfg(not(unix))]
-        {
-            let _ = req;
-        }
+        crate::platform::list_mounts(req, &self.daemon_mounts).await
     }
     async fn mount_health(&mut self, req: Req) {
-        #[cfg(unix)]
-        crate::daemon_ctl::handle_mount_health(req, &self.daemon_mounts).await;
-        #[cfg(not(unix))]
-        {
-            let _ = req;
-        }
+        crate::platform::mount_health(req, &self.daemon_mounts).await
     }
     async fn mount_health_tick(&mut self, host: &dyn HostServices) {
         let dead_locals: Vec<String> = self
@@ -882,29 +852,18 @@ impl RecvDaemon for CliRecv {
                 if let Some(mut child) = self.daemon_mounts.children.remove(&local) {
                     let _ = child.kill().await;
                 }
-                let _ = host.remove_mount(&local);
+                crate::platform::remove_mount(host, &local);
             }
         }
     }
     async fn warm_bootstrap(&mut self, conn: &Conn, _tx: &mpsc::UnboundedSender<Ev>, req: Req) {
-        #[cfg(unix)]
-        crate::daemon_ctl::handle_warm_bootstrap(conn, &mut self.pending_bootstrap, req).await;
-        #[cfg(not(unix))]
-        {
-            let _ = (conn, req);
-        }
+        crate::platform::warm_bootstrap(conn, &mut self.pending_bootstrap, req).await
     }
     async fn complete_warm_bootstrap(&mut self, _conn: &Conn, pid: &str, reply: &Value) {
-        #[cfg(unix)]
-        crate::daemon_ctl::complete_warm_bootstrap(&mut self.pending_bootstrap, pid, reply).await;
-        #[cfg(not(unix))]
-        {
-            let _ = (pid, reply);
-        }
+        crate::platform::complete_warm_bootstrap(&mut self.pending_bootstrap, pid, reply).await
     }
     fn reap_warm_bootstraps(&mut self) {
-        #[cfg(unix)]
-        crate::daemon_ctl::reap_warm_bootstraps(&mut self.pending_bootstrap);
+        crate::platform::reap_warm_bootstraps(&mut self.pending_bootstrap)
     }
     fn revocation_snapshot(&self) -> Option<(String, String)> {
         crate::revocation_live::store_snapshot()

@@ -3932,3 +3932,6 @@ mod hostile_env_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+mod recv_daemon;
+pub(crate) use recv_daemon::*;
