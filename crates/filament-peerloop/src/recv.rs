@@ -67,15 +67,14 @@ pub mod files;
 #[cfg(feature = "dispatch")]
 pub mod fleet;
 #[cfg(feature = "dispatch")]
+pub mod identity;
+#[cfg(feature = "dispatch")]
 pub mod lifecycle;
 #[cfg(not(feature = "mesh"))]
 pub mod mesh_stub;
 #[cfg(feature = "dispatch")]
 pub mod ports;
-#[cfg(feature = "mesh")]
-pub use crate::mesh::MeshTunnel;
-#[cfg(not(feature = "mesh"))]
-pub use mesh_stub::MeshTunnel;
+pub mod renewal;
 pub mod report;
 #[cfg(feature = "dispatch")]
 pub mod revocation;
@@ -83,7 +82,13 @@ pub mod revocation;
 pub mod servers;
 #[cfg(feature = "dispatch")]
 pub mod signaling_health;
+pub mod store;
 pub mod transfer_truth;
+
+#[cfg(feature = "mesh")]
+pub use crate::mesh::MeshTunnel;
+#[cfg(not(feature = "mesh"))]
+pub use mesh_stub::MeshTunnel;
 
 // Re-exported at the receive module root so the CLI shim (and library callers)
 // can name `recv::accept_is_sequential` without reaching through the child.

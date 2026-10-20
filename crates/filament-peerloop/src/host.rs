@@ -100,6 +100,19 @@ pub trait LogSink: Send + Sync + 'static {
     fn glyph_warn(&self) -> &'static str;
     /// Is `level` at or below the configured verbosity ceiling?
     fn enabled(&self, level: Level) -> bool;
+
+    /// A warning with a title, an optional explanation and optional remedies.
+    /// The default degrades to ordinary lines so a silent/library sink needs no
+    /// new implementation; the terminal host overrides it with its boxed form.
+    fn caution(&self, title: &str, body: Option<&str>, actions: &[String]) {
+        self.say(title);
+        if let Some(body) = body {
+            self.say(body);
+        }
+        for action in actions {
+            self.say(action);
+        }
+    }
 }
 
 /// A [`LogSink`] that discards everything and renders no color. The host-free

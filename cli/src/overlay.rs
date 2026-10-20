@@ -1,12 +1,11 @@
 //! Host glue for `filament-overlay`.
 //!
 //! The addressing, the announce ceremony and the replay rule live in the crate,
-//! which knows nothing about this machine. What stays here is the only part that
-//! does: WHERE the key and sequence files live, and generating the key on first
-//! use. Three functions, and they are the reason the rest could leave.
+//! which knows nothing about this machine. The key load/generate lives in the
+//! library's explicit-path `OverlayKey`; what stays here is WHERE the key and
+//! sequence files live and the sequence helper.
 
-use anyhow::{Context, Result};
-use ring::signature::Ed25519KeyPair;
+use anyhow::Result;
 
 pub use filament_overlay::*;
 
@@ -28,22 +27,10 @@ pub fn next_announce_seq() -> u64 {
 }
 
 /// Load the overlay key, generating and persisting it (PKCS8, 0600) on first
-/// use. Kept separate from the ssh managed key so neither format constrains the
-/// other.
+/// use. The generation and the file format are the library's explicit-path
+/// `OverlayKey`; this module only names the process path.
 pub fn load_identity() -> Result<Identity> {
-    let path = key_path();
-    let pkcs8 = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let rng = ring::rand::SystemRandom::new();
-            let doc = Ed25519KeyPair::generate_pkcs8(&rng)
-                .map_err(|_| anyhow::anyhow!("overlay key generation failed"))?;
-            crate::platform::SecretFile::write(&path, doc.as_ref())
-                .context("write overlay key")?;
-            doc.as_ref().to_vec()
-        }
-    };
-    Identity::from_pkcs8(&pkcs8)
+    filament_peerloop::recv::store::OverlayKey::new(key_path()).load()
 }
 
 /// Convenience: load the overlay key and return just the 32-byte public key.

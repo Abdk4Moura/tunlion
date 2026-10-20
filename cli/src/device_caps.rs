@@ -16,7 +16,7 @@
 use crate::{
     device_cert_for, devices_path, load_owner_key, principal_ceiling_for, with_devices_mut,
 };
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -257,22 +257,7 @@ pub(crate) fn device_set_cap(
 }
 
 pub(crate) fn mark_bounded_cap_source(name: &str, capability: &str, source: &str) -> Result<()> {
-    with_devices_mut(|arr| {
-        let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
-            bail!("unknown device '{name}'")
-        };
-        let obj = device
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("invalid device record"))?;
-        let mut sources = obj
-            .get("capSources")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        sources.insert(capability.to_string(), json!(source));
-        obj.insert("capSources".into(), json!(sources));
-        Ok(())
-    })
+    crate::devices_store::store().mark_bounded_cap_source(name, capability, source)
 }
 
 /// Which key an owner-signed grant names.
@@ -559,15 +544,5 @@ pub(crate) fn issue_signed_bounded_grant(
 }
 
 pub(crate) fn devices_remove(name: &str) -> Result<()> {
-    let p = devices_path();
-    if let Some(dir) = p.parent() {
-        crate::platform::create_private_dir_all(dir)?;
-    }
-    // Raw-array filter so the REMAINING devices keep their v2 fields (caps,
-    // addedAt). The old tuple round-trip rewrote every survivor as bare
-    // {name, secret}, silently wiping their `shell` grants on any forget.
-    with_devices_mut(|arr| {
-        arr.retain(|d| d["name"].as_str() != Some(name));
-        Ok(())
-    })
+    crate::devices_store::store().devices_remove(name)
 }

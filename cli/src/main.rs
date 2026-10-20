@@ -233,10 +233,6 @@ use identity_lifecycle::{
 // Still reached from this crate root by recv_cmd; it is the crate's resolver
 // re-exported by identity_lifecycle, so it stays visible here.
 pub(crate) use identity_lifecycle::resolve_peer_identity;
-use renewal_lifecycle::{
-    handle_auth_key_enroll_response, handle_cert_renew_ack, maybe_request_cert_renewal,
-    respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
-};
 // DaemonMounts/WarmPtys/sshd_listening exist on every target (handle_warm_req
 // has a not(unix) stub); the rest are unix-only, so they need the gate their
 // definitions carry. Call sites stay byte-identical to the monolith.

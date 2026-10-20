@@ -1318,6 +1318,7 @@ dependencies = [
  "libc",
  "quinn",
  "ring",
+ "secret-write",
  "serde",
  "serde_json",
  "sha2 0.11.0",

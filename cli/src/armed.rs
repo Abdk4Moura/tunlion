@@ -130,14 +130,7 @@ pub fn disarm(key_id: &str) {
 /// Any unexpired armed key? Prunes expired entries on read, so the file self-
 /// cleans and a stale entry never keeps the room open.
 pub fn is_armed() -> bool {
-    let now = crate::capability::now_secs();
-    let mut entries = load();
-    let before = entries.len();
-    entries.retain(|e| e.expires > now);
-    if entries.len() != before {
-        save(&entries);
-    }
-    !entries.is_empty()
+    crate::devices_store::store().is_armed()
 }
 
 #[cfg(test)]

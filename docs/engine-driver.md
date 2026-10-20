@@ -85,11 +85,19 @@ arrive through grouped capability traits in `recv::ports` (their method count is
 the host-effect surface, not a split target):
 
 - `RecvIdentity` — proof/expose, cert renewal, auth-key enrolment, provisional
-  identity, device naming/revocation and the fleet host answers. The CLI
-  implementation forwards to `identity_lifecycle`, `renewal_lifecycle`,
-  `device_view`, `identity_state` and `fleet`.
-- `RecvStore` — the mutating half of the devices/capability store
-  (`devices_store`, `device_caps`).
+  identity, device naming/revocation and the fleet host answers. Proof/expose,
+  renewal, provisional identity, naming/revocation and the local certificate
+  now live in `recv::identity::IdentityService` and `recv::store`, with an
+  explicit store root, overlay-key path and log sink. The CLI forwards them.
+  Auth-key enrolment, roster/depart and the fleet rendezvous answers still
+  forward to `renewal_lifecycle`, `roster`, `membership` and `fleet`; their
+  exact host facts are named below.
+- `RecvStore` — the mutating half of the devices/capability store. Its
+  host-neutral implementation now lives in `recv::store`: a `DeviceStore`
+  opened on an explicit root implements the whole port (device records, the
+  capability store's owner-signed ops, provisional/local identity sidecars).
+  The CLI constructs one on its process config directory and forwards, so there
+  is one implementation rather than a callback-only wrapper.
 - `RecvServers` — the process effects of the optional inbound servers. The
   forward admission protocol moved to `recv::servers::open_forward`; the CLI
   still supplies PTY/exec/sync/mount/ssh primitives through this boundary.
@@ -102,24 +110,32 @@ the host-effect surface, not a split target):
 `RecvEnv` is the process snapshot the CLI resolves (name, uid, terminal
 interactivity, quiet window, L2/direct posture, consent token).
 
-For Core, the blocker is now **composition, not dispatch**: there is no
-non-CLI implementation of `RecvIdentity`/`RecvStore`/`RecvServers`/`RecvDaemon`.
+For Core, the blocker is now **composition**. `RecvStore` has a non-CLI
+implementation (`recv::store::DeviceStore`, opened on the Core's config
+directory with that instance's owner key), and the identity proof/expose/renew
+handlers have a non-CLI implementation (`recv::identity::IdentityService`,
+built from that store plus an explicit `OverlayKey` path). The remaining
+blockers are the auth-key enrolment handlers (they still need per-instance
+burn/nonce/rate-limit state), the roster/depart and fleet rendezvous answers
+(files that have not moved), and `RecvServers`/`RecvDaemon`.
 `Core::start` therefore keeps returning `EngineNotLinked`; an embedder that
 supplies those and the existing `HostServices` uses `start_with_dispatch` with
 `recv::dispatch::drive` today.
 
 Next linkage work, in order:
 
-1. Add a `CoreHost` composition that implements `HostServices`, `RecvEnv` and
-   the five ports for an embedder with no CLI modules (the server sectors can
-   be omitted behind the `dispatch` feature's server capability; reduced
-   profiles already omit them).
-2. Move the device-store mutations behind `HostServices` (or a storage crate) so
-   `RecvStore` has a host-neutral implementation.
-3. Move the identity lifecycle handlers into a `recv-identity` library feature,
-   using `filament-id`/`filament-cap` and the host store instead of CLI
-   `identity_lifecycle`/`renewal_lifecycle`.
-4. Have `Core::start` construct `HostServices + RecvPorts` and call
+1. Add a `CoreHost` composition that implements `HostServices` and `RecvEnv`,
+   and supplies the remaining ports for an embedder with no CLI modules (the
+   server sectors can be omitted behind the `dispatch` feature's server
+   capability; reduced profiles already omit them). Its `RecvStore` is a
+   `recv::store::DeviceStore` opened on the Core's config directory.
+2. Move the remaining identity handlers (`respond_to_auth_key_enroll_request`,
+   `handle_auth_key_enroll_response`, roster/depart, fleet rendezvous) into the
+   same library feature. The store, overlay key and proof/expose/renew rules are
+   already there; the outstanding host facts are per-instance
+   burn/nonce/rate-limit state, `armed.json`/`used-invitations.json`, the roster
+   file and the fleet rendezvous file.
+3. Have `Core::start` construct `HostServices + RecvPorts` and call
    `Engine::start(..., recv::dispatch::drive(...))`; only then remove the
    `EngineNotLinked` arm.
 
