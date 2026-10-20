@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [minimal, default]
+        profile: [minimal, default, dispatch]
     env:
       # Separate jobs and target directories prevent workspace/CLI feature
       # unification from hiding a broken mesh-disabled build.

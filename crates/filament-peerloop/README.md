@@ -46,8 +46,8 @@ What is here:
   the petname a link PROVED it reaches, never on the broadcast display name.
 - **`recv`** -- the host-free receive mechanics plus the production dispatch.
   `recv::dispatch` is the one receive event loop (the CLI `recv`/`up` path);
-  `recv::ports` is its narrow capability boundary (identity, device store,
-  optional servers, daemon control, prompt), and `recv::files`, `recv::events`,
+  `recv::ports` groups the remaining host capability sectors (identity, device
+  store, optional servers, daemon control, prompt), and `recv::files`, `recv::events`,
   `recv::lifecycle`, `recv::ceremony`, `recv::signaling_health`,
   `recv::fleet` and `recv::revocation` own the pieces that moved with it.
   The receive mechanics are: untrusted-name collisions, the
@@ -84,5 +84,6 @@ identity-only. Further sector cuts belong with their actual driver owners.
 
 CI runs `scripts/check_peerloop_mesh_graph.py` for isolated host and Android
 graphs, compiles/tests peerloop with defaults and without them, and checks the
-mesh-disabled API examples. No dependency versions or lockfile changes are
-needed for this boundary.
+mesh-disabled API examples. The `dispatch` profile enables `mesh` because fleet admission and overlay
+routing are part of the receive path; a build without `dispatch` keeps the
+reduced mechanics only.

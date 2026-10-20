@@ -30,23 +30,17 @@ pub struct ReceivedFileRecord {
     pub ok: bool,
 }
 
-/// Transfer id -> the final name a finished file was stored under, read once
-/// by the delivery-ack that follows.
-static STORED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-
-fn note_stored(id: &str, name: &str) {
-    if let Ok(mut m) = STORED.lock() {
-        m.get_or_insert_with(Default::default)
-            .insert(id.to_string(), name.to_string());
-    }
-}
-
 /// The delivery-ack for transfer `id`, carrying the name it was stored under
-/// when this side knows it. `stored` is additive: an older sender ignores it.
-pub fn delivery_ack(id: &str, sid: u32) -> serde_json::Value {
+/// when this invocation knows it. `stored` is additive: an older sender ignores
+/// it. The map is per invocation, never a process global.
+pub fn delivery_ack(
+    id: &str,
+    sid: u32,
+    stored: &std::sync::Arc<Mutex<HashMap<String, String>>>,
+) -> serde_json::Value {
     let mut m = protocol::delivery_ack_msg(id, sid);
-    let stored = STORED.lock().ok().and_then(|mut s| s.as_mut()?.remove(id));
-    if let Some(name) = stored {
+    let name = stored.lock().ok().and_then(|mut s| s.remove(id));
+    if let Some(name) = name {
         m["stored"] = serde_json::json!(name);
     }
     m
@@ -161,6 +155,7 @@ pub async fn finalize_incoming(
     daemon: bool,
     from_name: &str,
     report: &RecvReport,
+    delivery: &std::sync::Arc<Mutex<HashMap<String, String>>>,
 ) -> Result<bool> {
     let f = inc.file.clone();
     let _ = tokio::task::spawn_blocking(move || {
@@ -224,7 +219,9 @@ pub async fn finalize_incoming(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    note_stored(&inc.id, &stored_name);
+    if let Ok(mut m) = delivery.lock() {
+        m.insert(inc.id.clone(), stored_name.clone());
+    }
     if !daemon && ok {
         report.note_stored(&inc.name, recvd, inc.full.as_deref(), &stored_name);
     }

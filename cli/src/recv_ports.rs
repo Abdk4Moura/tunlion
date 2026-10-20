@@ -664,7 +664,14 @@ impl RecvServers for CliRecv {
         muxes: &mut HashMap<String, Arc<Mux>>,
         share_root: &Path,
     ) {
-        let _ = crate::mount_recv::handle_mount_open(conn, pid, v, muxes, share_root).await;
+        #[cfg(feature = "mount-server")]
+        {
+            let _ = crate::mount_recv::handle_mount_open(conn, pid, v, muxes, share_root).await;
+        }
+        #[cfg(not(feature = "mount-server"))]
+        {
+            let _ = (conn, pid, v, muxes, share_root);
+        }
     }
 
     async fn ssh_sign(
@@ -995,6 +1002,12 @@ impl RecvDaemon for CliRecv {
     fn sdnotify_watchdog(&self) {
         crate::sdnotify::watchdog()
     }
+    fn request_reload(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+    }
 }
 
 pub struct CliPrompt;
@@ -1022,6 +1035,47 @@ impl RecvPrompt for CliPrompt {
     }
     fn enter_raw_mode(&self) -> Option<Box<dyn RawMode>> {
         Some(Box::new(CliRawMode(crate::TtyGuard::raw())))
+    }
+    fn spawn_stdin(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<Ev>,
+        question_open: Arc<std::sync::atomic::AtomicBool>,
+        present: Arc<dyn filament_peerloop::present::Presentation>,
+    ) {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 1];
+            let mut line = String::new();
+            while stdin.read(&mut buf).map(|n| n == 1).unwrap_or(false) {
+                let c = buf[0] as char;
+                if question_open.load(std::sync::atomic::Ordering::Relaxed)
+                    && "yYnN".contains(c)
+                    && line.is_empty()
+                {
+                    present.answer_echo(c);
+                    let _ = tx.send(Ev::StdinLine(c.to_lowercase().to_string()));
+                    continue;
+                }
+                match buf[0] {
+                    b'\n' | b'\r' => {
+                        crate::ui::say("");
+                        let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
+                        line.clear();
+                    }
+                    0x7f | 0x08 => {
+                        if line.pop().is_some() {
+                            eprint!("\x08 \x08");
+                        }
+                    }
+                    _ if !c.is_control() => {
+                        eprint!("{c}");
+                        line.push(c);
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 }
 

@@ -394,6 +394,9 @@ impl HostServices for CliHost {
     fn signaling_snapshot(&self) -> serde_json::Value {
         crate::signaling_health::snapshot_json()
     }
+    fn report_signaling(&self, snapshot: serde_json::Value) {
+        crate::signaling_health::report(snapshot)
+    }
     fn launch_report(
         &self,
         server: &str,

@@ -63,10 +63,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-/// Set when `--remember <name>` actually stored a record this run.
-pub static REMEMBER_STORED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// How long the event loop waits, after writing a delivery-ack, for the peer to
 /// acknowledge it at the transport. Short on purpose: the ack is already queued
 /// and is delivered without this wait; it only lets a live peer take it before
@@ -182,6 +178,27 @@ pub fn sweep_arm(
         _ => SweepArm::Keep,
     }
 }
+
+/// A dispatch failure that carries the host's exit class without naming a
+/// process exit code. The CLI adapter maps these onto its own taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchFailureKind {
+    Usage,
+    Unreachable,
+}
+
+#[derive(Debug)]
+pub struct DispatchFailure {
+    pub kind: DispatchFailureKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for DispatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for DispatchFailure {}
 
 /// The settle timeout reason, shared by the expiry deny and the client.
 pub fn settle_timeout_reason(ms: u64) -> String {
@@ -941,11 +958,13 @@ async fn recv_run(
     readiness: &crate::driver::Readiness,
     cleanup: &mut RecvCleanup,
 ) -> Result<()> {
+    cleanup.watchdog = crate::recv::lifecycle::LoopWatchdog::with_stall(ports.env.loop_stall_secs);
     if let Some(expected) = expect_sha256.as_deref() {
         if !valid_sha256(expected) {
-            return Err(anyhow::anyhow!(
-                "--expect-sha256 must be exactly 64 hexadecimal characters",
-            ));
+            return Err(anyhow::Error::new(DispatchFailure {
+                kind: DispatchFailureKind::Usage,
+                message: "--expect-sha256 must be exactly 64 hexadecimal characters".into(),
+            }));
         }
     }
     let opened_flow = !daemon
@@ -989,33 +1008,33 @@ async fn recv_run(
         }
     }
     if opened_flow {
-        eprintln!();
-        eprintln!("  {}", log.paint(Tone::Brand, "RECEIVE"));
-        eprintln!(
+        log.say("");
+        log.say(&format!("  {}", log.paint(Tone::Brand, "RECEIVE")));
+        log.say(&format!(
             "  from     {}",
             to.as_deref().unwrap_or(if code.is_some() {
                 "holder of this one-time code"
             } else {
                 "nearby sender"
             })
-        );
-        eprintln!(
+        ));
+        log.say(&format!(
             "  into     {}",
             if to_stdout {
                 "stdout".to_string()
             } else {
                 dir.display().to_string()
             }
-        );
-        eprintln!("  verify   whole-file hash before final placement");
-        eprintln!(
+        ));
+        log.say("  verify   whole-file hash before final placement");
+        log.say(&format!(
             "  consent  {}",
             if yes {
                 "accept matching offers"
             } else {
                 "ask before each offer"
             }
-        );
+        ));
         let mut replay = vec!["tunlion".to_string(), "receive".to_string()];
         if let Some(code) = code.as_deref() {
             replay.push(command_arg(code));
@@ -1024,7 +1043,7 @@ async fn recv_run(
         if yes {
             replay.push("--yes".to_string());
         }
-        eprintln!("  command  {}", replay.join(" "));
+        log.say(&format!("  command  {}", replay.join(" ")));
         let confirmation = ports
             .prompt
             .line("\n  Press Enter to wait, or type cancel: ")?;
@@ -1170,12 +1189,7 @@ async fn recv_run(
     // challenge's entry does not expire and let a re-issue clobber the nonce.
     const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
-    let recv_pake_budget = Duration::from_secs(
-        std::env::var("TUNLION_PAIR_GRACE_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60),
-    );
+    let recv_pake_budget = ports.env.pair_grace;
     // Overall bound: once we are matched into the sender's room, SOMEONE must
     // authenticate within this window or the whole `recv` fails loudly. Per-peer
     // budgets only drop individual mis-latch candidates; this is the backstop for
@@ -1198,7 +1212,7 @@ async fn recv_run(
     let mut ctl_ready: Option<tokio::sync::oneshot::Receiver<()>> = None;
     #[cfg(unix)]
     {
-        if daemon && ports.daemon.daemon_alive() == Some(std::process::id()) {
+        if daemon && ports.daemon.daemon_alive() == Some(ports.env.pid) {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
             ctl_ready = Some(ready_rx);
             let ctl_tx = ctl_tx.clone();
@@ -1321,7 +1335,7 @@ async fn recv_run(
             ));
             // C29: this is a SESSION, like a browser tab, pairing and petname
             // management happen right here.
-            if std::io::stdin().is_terminal() {
+            if ports.env.interactive_terminal {
                 log.say(&log.paint(
                     Tone::Dim,
                     "  type a code to pair a new device · `pair` mints one · `devices` · `forget <name>`",
@@ -1417,59 +1431,16 @@ async fn recv_run(
     // C29: the stdin owner also runs for an INTERACTIVE daemon (a terminal-
     // attached `tunlion up` is a session); `up --install` under systemd has
     // no tty, so headless daemons stay stdin-free.
-    let interactive = !daemon || std::io::stdin().is_terminal();
-    let _tty_guard = if interactive && std::io::stdin().is_terminal() {
+    let interactive = !daemon || ports.env.interactive_terminal;
+    let _tty_guard = if interactive && ports.env.interactive_terminal {
         ports.prompt.enter_raw_mode()
     } else {
         None
     };
     if interactive {
-        let tx = tx.clone();
-        let q = st.question_open.clone();
-        let present = conn.present.clone();
-        // A DEDICATED OS thread, never `tokio::io::stdin()`. tokio's stdin is an
-        // uncancellable read on the runtime's blocking pool, and dropping the
-        // runtime waits for every blocking task: a receive that finished
-        // ("done (1 file).") then sat in that drop until someone pressed Enter,
-        // and since the signal tasks die with the runtime, Ctrl-C and SIGTERM
-        // were caught and ignored. A plain thread is reaped by process exit, so
-        // the receive leaves the moment it is done. (Same reason as
-        // l2::spawn_stdin_reader.)
-        std::thread::spawn(move || {
-            use std::io::Read;
-            // Not `.lock()`: a held lock would starve any later plain prompt.
-            let mut stdin = std::io::stdin();
-            let mut buf = [0u8; 1];
-            let mut line = String::new();
-            while stdin.read(&mut buf).map(|n| n == 1).unwrap_or(false) {
-                let c = buf[0] as char;
-                if q.load(std::sync::atomic::Ordering::Relaxed)
-                    && "yYnN".contains(c)
-                    && line.is_empty()
-                {
-                    present.answer_echo(c); // raw mode is no-echo; land it cleanly (C23)
-                    let _ = tx.send(Ev::StdinLine(c.to_lowercase().to_string()));
-                    continue;
-                }
-                match buf[0] {
-                    b'\n' | b'\r' => {
-                        eprintln!();
-                        let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
-                        line.clear();
-                    }
-                    0x7f | 0x08 => {
-                        if line.pop().is_some() {
-                            eprint!("\x08 \x08");
-                        }
-                    }
-                    _ if !c.is_control() => {
-                        eprint!("{c}");
-                        line.push(c);
-                    }
-                    _ => {}
-                }
-            }
-        });
+        ports
+            .prompt
+            .spawn_stdin(tx.clone(), st.question_open.clone(), conn.present.clone());
     }
     // L3 (serve_tun mesh): the up daemon opens a TUN and routes IP packets across
     // its peer links when `tun-addr` is set. `auto` (recommended) derives a stable,
@@ -1829,12 +1800,7 @@ async fn recv_run(
     // How long an offer may wait for its sender to prove itself before we decide
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
     // would turn a clean decline into the 45s timeout it replaced.
-    let fleet_offer_grace = Duration::from_secs(
-        std::env::var("TUNLION_FLEET_OFFER_GRACE_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8),
-    );
+    let fleet_offer_grace = ports.env.fleet_offer_grace;
     let mut fleet_greeted: std::collections::HashSet<String> = Default::default();
 
     // Daemon-managed mount state: the daemon holds the sshfs child processes and
@@ -1876,8 +1842,10 @@ async fn recv_run(
     let mut probed_silence: Option<Instant> = None;
     // Repeated reconnect lines are collapsed, not written once per cycle.
     let mut signaling_log = signaling_health::LogCollapse::default();
+    let mut health = signaling_health::Health::default();
     if signaling_self_heal {
-        signaling_health::note_serving();
+        health.note_serving();
+        host.report_signaling(health.snapshot_json());
     }
     let mut last_watchdog = Instant::now();
     // Link self-heal cadence (the multi-minute-outage fix, #3). A transport that
@@ -2063,9 +2031,10 @@ async fn recv_run(
             conn.present.clear_sticky();
             let secs = timeout.unwrap_or(0);
             let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-            return Err(anyhow::anyhow!(format!(
-                "nothing arrived within {secs}s: no sender offered a transfer"
-            ),));
+            return Err(anyhow::Error::new(DispatchFailure {
+                kind: DispatchFailureKind::Unreachable,
+                message: format!("nothing arrived within {secs}s: no sender offered a transfer"),
+            }));
         }
         if daemon {
             cleanup.watchdog.tick(log.clone());
@@ -2123,12 +2092,11 @@ async fn recv_run(
                             // then starts the new binary with fresh ambient caps: no
                             // manual restart, no sudo. Unsupervised, we decline (exiting
                             // would just leave the node down).
-                            let supervised = std::env::var("INVOCATION_ID").is_ok();
+                            let supervised = ports.env.supervised;
                             req.reply(&json!({ "ok": true, "reloading": supervised })).await;
                             if supervised {
                                 log.say("tunlion: reloading onto the updated binary (graceful restart)");
-                                #[cfg(unix)]
-                                unsafe { libc::raise(libc::SIGTERM); }
+                                ports.daemon.request_reload();
                             }
                         } else if matches!(&req.kind, ReqKind::Dial { .. }) {
                             // Overlay dial (proxy `.mesh` fallback): resolve the peer
@@ -2862,7 +2830,8 @@ async fn recv_run(
                         signaling_health::jitter_unit(),
                     );
                     last_reconnect_try = now;
-                    signaling_health::note_down(&why);
+                    health.note_down(&why);
+                    host.report_signaling(health.snapshot_json());
                     // Visible (not just debug): a node dropping off signaling was
                     // previously silent until it bit someone. Collapsed, so a
                     // link that keeps dropping cannot fill the disk with it.
@@ -2930,7 +2899,8 @@ async fn recv_run(
                         signaling_down_since = None;
                         signaling_up_since = Some(Instant::now());
                         probed_silence = None;
-                        signaling_health::note_redialed();
+                        health.note_redialed();
+                        host.report_signaling(health.snapshot_json());
                         // Visible: pairs with the "reconnecting..." line so the
                         // recovery is observable end to end. Collapsed with it.
                         if let Some(line) = signaling_log.admit(
@@ -6567,7 +6537,9 @@ async fn recv_run(
                         let kept = match (&remember, ceremony_peer) {
                             (Some(name), true) => match ports.store.devices_store(name, &sec) {
                                 Ok(stored) => {
-                                    crate::recv::dispatch::REMEMBER_STORED
+                                    ports
+                                        .env
+                                        .remember_stored
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
                                     log.say(&format!(
                                         "remembered this device as '{stored}', future sends auto-accept after proof"
@@ -7211,7 +7183,8 @@ async fn recv_run(
                     // peer can't forge "already consented".
                     let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    let consented = v["__consent"].as_str() == Some(ports.env.consent_token);
+                    let consented =
+                        v["__consent"].as_str() == Some(ports.env.consent_token.as_str());
                     // Legacy (pre-capability) decision, per mode.
                     // A code is consent: the person typed the code this
                     // sender's ceremony was bound to, which is what `receive
@@ -7334,7 +7307,7 @@ async fn recv_run(
                         continue;
                     }
                     if !ok {
-                        if !daemon && std::io::stdin().is_terminal() && xfer_deny_reason.is_none() {
+                        if !daemon && ports.env.interactive_terminal && xfer_deny_reason.is_none() {
                             st.pending.push_back((pid.clone(), v.clone()));
                             // The sender's no-answer timeout must not fire on a
                             // person who is still deciding; tell it so.
@@ -7874,6 +7847,7 @@ async fn recv_run(
                                     daemon,
                                     &from,
                                     &report,
+                                    &ports.env.delivery,
                                 )
                                 .await?
                                 {
@@ -7919,7 +7893,9 @@ async fn recv_run(
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
                                             .send_control(&crate::recv::files::delivery_ack(
-                                                &id, sid,
+                                                &id,
+                                                sid,
+                                                &ports.env.delivery,
                                             ))
                                             .await;
                                         // BOUNDED: this runs inline in the event
@@ -8019,6 +7995,7 @@ async fn recv_run(
                             daemon,
                             &from,
                             &report,
+                            &ports.env.delivery,
                         )
                         .await?
                         {
@@ -8089,6 +8066,7 @@ async fn recv_run(
                                     daemon,
                                     &from,
                                     &report,
+                                    &ports.env.delivery,
                                 )
                                 .await?
                                 {
@@ -8134,7 +8112,9 @@ async fn recv_run(
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
                                             .send_control(&crate::recv::files::delivery_ack(
-                                                &id, ack_sid,
+                                                &id,
+                                                ack_sid,
+                                                &ports.env.delivery,
                                             ))
                                             .await;
                                         log.say(&log.paint(
@@ -8221,6 +8201,7 @@ async fn recv_run(
                             daemon,
                             &from,
                             &report,
+                            &ports.env.delivery,
                         )
                         .await?
                         {
@@ -8277,8 +8258,7 @@ async fn recv_run(
                     }
                 } else if let Some(inc) = st.by_sid.get_mut(&(pid.clone(), sid)) {
                     // --- TRACE recv path ---
-                    let trace = cfg!(feature = "debug-logs")
-                        && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
+                    let trace = cfg!(feature = "debug-logs") && ports.env.trace_throughput;
                     let t_recv_start = if trace {
                         Some(std::time::Instant::now())
                     } else {
@@ -8437,7 +8417,7 @@ async fn recv_run(
                         answered = true;
                         let (qpid, mut qv) = st.pending.pop_front().unwrap();
                         conn.present.clear_sticky();
-                        qv["__consent"] = json!(ports.env.consent_token);
+                        qv["__consent"] = json!(ports.env.consent_token.clone());
                         let _ = tx.send(Ev::Control(qpid, qv)); // re-enter the offer path, consented
                     } else if ans == "n" || ans == "no" {
                         answered = true;
@@ -9083,5 +9063,1015 @@ fn note_refusal(
 ) {
     if !daemon {
         report.note_refused(name, size, token, msg, class);
+    }
+}
+#[cfg(test)]
+mod caps_reannounce_tests {
+    use super::caps_reannounce;
+
+    #[test]
+    fn a_grant_or_last_revoke_is_announced_on_live_links() {
+        assert_eq!(caps_reannounce(false, true).unwrap()["shell"], true);
+        assert_eq!(caps_reannounce(true, false).unwrap()["shell"], false);
+        assert_eq!(caps_reannounce(true, false).unwrap()["type"], "caps");
+        assert!(caps_reannounce(true, true).is_none());
+        assert!(caps_reannounce(false, false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod pake_expired_tests {
+    use super::recv_pake_expired_message;
+
+    #[test]
+    fn older_version_only_when_no_peer_ran_a_ceremony() {
+        assert!(recv_pake_expired_message(false, 60).contains("older version"));
+        let m = recv_pake_expired_message(true, 60);
+        assert!(!m.contains("older version"), "{m}");
+        assert!(m.contains("60s") && m.contains("FRESH code"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod offer_consent_tests {
+    use super::offer_has_consent;
+
+    /// Eval item 6: `receive <code>` asked `accept? [y/N]` at a terminal while
+    /// its help says a code never asks. The code's own sender is accepted.
+    #[test]
+    fn a_code_is_consent_and_nothing_else_is() {
+        assert!(offer_has_consent(false, false, false, false, false, true));
+        // A room offer from an unproven stranger still asks.
+        assert!(!offer_has_consent(false, false, false, false, false, false));
+        // The daemon never treats a code as consent: it holds no code.
+        assert!(!offer_has_consent(true, false, false, false, false, true));
+        assert!(offer_has_consent(true, false, false, true, false, false));
+    }
+
+    #[test]
+    fn the_receive_help_promises_what_the_code_path_does() {
+        let help = include_str!("cli_def.rs");
+        assert!(help.contains("`receive <code>` never asks"));
+    }
+}
+
+#[cfg(test)]
+mod quiet_exit_tests {
+    use super::quiet_exit_reason;
+
+    #[test]
+    fn a_code_receive_ends_after_its_files_even_while_the_browser_stays_connected() {
+        // The B03 case: files done, idle, the browser's link still healthy.
+        assert!(quiet_exit_reason(1, false, true, false, true).is_some());
+        // Not before anything arrived, not mid-transfer, not with --keep-open.
+        assert!(quiet_exit_reason(0, false, true, false, true).is_none());
+        assert!(quiet_exit_reason(1, false, false, false, true).is_none());
+        assert!(quiet_exit_reason(1, true, true, false, true).is_none());
+        // A non-code receive keeps waiting while a healthy link is up (gate 6:
+        // a bystander between two human-paced sends), and quiet-exits once clear.
+        assert!(quiet_exit_reason(1, false, true, false, false).is_none());
+        assert!(quiet_exit_reason(1, false, true, true, false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod receive_timeout_tests {
+    use super::receive_timed_out;
+    use std::time::Duration;
+
+    #[test]
+    fn nothing_arrived_at_the_deadline_is_a_timeout() {
+        assert!(receive_timed_out(
+            Duration::from_secs(30),
+            Some(Duration::from_secs(30)),
+            0
+        ));
+        assert!(receive_timed_out(
+            Duration::from_secs(31),
+            Some(Duration::from_secs(30)),
+            0
+        ));
+        assert!(!receive_timed_out(
+            Duration::from_secs(29),
+            Some(Duration::from_secs(30)),
+            0
+        ));
+    }
+
+    #[test]
+    fn a_received_file_beats_the_deadline() {
+        // The transfer happened; the clock must not turn a success into a
+        // timeout because the sender stayed connected afterwards.
+        assert!(!receive_timed_out(
+            Duration::from_secs(99),
+            Some(Duration::from_secs(30)),
+            1
+        ));
+    }
+
+    #[test]
+    fn no_deadline_means_no_deadline() {
+        assert!(!receive_timed_out(Duration::from_secs(86_400), None, 0));
+        // 0 is the documented "wait without limit" value.
+        assert!(!receive_timed_out(
+            Duration::from_secs(86_400),
+            Some(Duration::ZERO),
+            0
+        ));
+    }
+}
+
+#[cfg(test)]
+mod receive_expected_sha256_tests {
+    use super::{sha256_matches, valid_sha256};
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn accepts_only_a_well_formed_sha256() {
+        assert!(valid_sha256(HASH));
+        assert!(valid_sha256(&HASH.to_uppercase()));
+        assert!(!valid_sha256("abcd"));
+        assert!(!valid_sha256(&format!("{HASH}00")));
+        assert!(!valid_sha256(&"z".repeat(64)));
+    }
+
+    #[test]
+    fn compares_digest_hex_case_insensitively_and_requires_a_digest() {
+        assert!(sha256_matches(HASH, Some(HASH)));
+        assert!(sha256_matches(HASH, Some(&HASH.to_uppercase())));
+        assert!(!sha256_matches(HASH, None));
+        assert!(!sha256_matches(HASH, Some(&"f".repeat(64))));
+        assert!(!sha256_matches("invalid", Some(HASH)));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::driver::{Cancellation, DriverOutcome, Readiness};
+    use crate::host::{NoHost, NoLog};
+
+    async fn invalid_receive_with(
+        stop: &Cancellation,
+        cleanup: &mut RecvCleanup,
+    ) -> DriverOutcome<Result<()>> {
+        // Validation precedes filesystem/network/UI setup, so this exercises
+        // the actual return seam without a backend or process signal adapter.
+        let (readiness, _watch) = Readiness::new();
+        let mut env = RecvEnv::default();
+        env.interactive_terminal = false;
+        let ports = crate::recv::ports::test_support::ports(env);
+        drive(
+            "https://unused.invalid",
+            None,
+            PathBuf::new(),
+            false,
+            None,
+            None,
+            false,
+            None,
+            Some("invalid".into()),
+            false,
+            None,
+            false,
+            None,
+            ShellPolicy::Granted,
+            None,
+            false,
+            filament_transport::TransportContext::default(),
+            Arc::new(NoLog),
+            Arc::new(NoHost),
+            ports,
+            RecvReport::new(),
+            stop,
+            &readiness,
+            cleanup,
+        )
+        .await
+    }
+
+    async fn invalid_receive(stop: &Cancellation) -> DriverOutcome<Result<()>> {
+        let mut cleanup = RecvCleanup::default();
+        invalid_receive_with(stop, &mut cleanup).await
+    }
+
+    #[tokio::test]
+    async fn driver_setup_failure_returns_without_a_process_exit() {
+        match invalid_receive(&Cancellation::default()).await {
+            DriverOutcome::Returned(Err(error)) => {
+                assert!(error.to_string().contains("--expect-sha256"));
+            }
+            other => panic!("expected validation failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_library_engine_drives_the_real_receive_dispatch() {
+        use crate::driver::Engine;
+        let stop = Cancellation::default();
+        let engine = Engine::start(stop.clone(), |stop, _readiness| async move {
+            let mut cleanup = RecvCleanup::default();
+            invalid_receive_with(&stop, &mut cleanup).await
+        });
+        match engine.wait().await.expect("engine task") {
+            DriverOutcome::Returned(Err(error)) => {
+                assert!(error.to_string().contains("--expect-sha256"));
+            }
+            other => panic!("expected validation failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn driver_pre_cancel_is_local_and_returns_after_cleanup() {
+        let first = Cancellation::default();
+        first.cancel();
+        assert!(matches!(
+            invalid_receive(&first).await,
+            DriverOutcome::Cancelled
+        ));
+        // Another invocation still runs validation, not cancellation.
+        assert!(matches!(
+            invalid_receive(&Cancellation::default()).await,
+            DriverOutcome::Returned(Err(_))
+        ));
+    }
+
+    fn empty_recv_state() -> RecvState {
+        RecvState {
+            by_sid: HashMap::new(),
+            verify_fails: HashMap::new(),
+            completed: 0,
+            ever_received: false,
+            pending: Default::default(),
+            pending_proven: Arc::new(Mutex::new(HashMap::new())),
+            question_open: Arc::new(AtomicBool::new(false)),
+            question_shown: Instant::now(),
+            recv_pending_offers: HashMap::new(),
+            recv_cers: HashMap::new(),
+            recv_deadlines: HashMap::new(),
+        }
+    }
+
+    /// Records the task destructor inside the cleanup order vector.
+    struct PhaseDrop;
+    impl Drop for PhaseDrop {
+        fn drop(&mut self) {
+            super::note_cleanup_phase("task_drop");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_stops_a_started_watchdog_before_tasks_and_flush() {
+        super::CLEANUP_PHASES.with(|phases| phases.borrow_mut().clear());
+        let mut cleanup = RecvCleanup {
+            watchdog: crate::recv::lifecycle::LoopWatchdog::for_test(),
+            ..RecvCleanup::default()
+        };
+        cleanup.watchdog.tick(Arc::new(NoLog));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        cleanup.tasks.push(tokio::spawn(async move {
+            let _guard = PhaseDrop;
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        entered_rx.await.unwrap();
+        // `Some` makes finish enter the flush stage (an empty map parks nothing).
+        cleanup.state = Some(empty_recv_state());
+        cleanup.finish(&NoLog).await;
+        assert_eq!(
+            super::CLEANUP_PHASES.with(|phases| phases.borrow().clone()),
+            vec![
+                "watchdog",
+                "writers",
+                "sync_tasks",
+                "task_drop",
+                "tasks",
+                "flush",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_then_cleanup_stops_a_started_watchdog() {
+        super::CLEANUP_PHASES.with(|phases| phases.borrow_mut().clear());
+        let mut cleanup = RecvCleanup {
+            watchdog: crate::recv::lifecycle::LoopWatchdog::for_test(),
+            ..RecvCleanup::default()
+        };
+        let log = Arc::new(NoLog);
+        let weak = Arc::downgrade(&log);
+        cleanup.watchdog.tick(log);
+        let stop = Cancellation::default();
+        stop.cancel();
+        // The real driver seam: cancellation resolves, then its cleanup runs.
+        assert!(matches!(
+            invalid_receive_with(&stop, &mut cleanup).await,
+            DriverOutcome::Cancelled
+        ));
+        assert!(
+            weak.upgrade().is_none(),
+            "cleanup joined the started watchdog and released its sink"
+        );
+        assert_eq!(
+            super::CLEANUP_PHASES.with(|phases| phases.borrow().clone()),
+            vec!["watchdog", "writers", "sync_tasks", "tasks"]
+        );
+    }
+
+    /// A blocking writer is admitted work, not an abortable task: cleanup must
+    /// wait for it before flushing, and must not report a finished epilogue
+    /// while it still runs.
+    #[tokio::test]
+    async fn cleanup_awaits_a_gated_blocking_writer_before_flush() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let cleanup = RecvCleanup {
+            state: Some(empty_recv_state()),
+            trace: Some(Arc::clone(&trace)),
+            ..RecvCleanup::default()
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer_trace = Arc::clone(&trace);
+        let writers = cleanup.writers.clone();
+        cleanup.writers.spawn("peer-gated".into(), 1, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            writer_trace.lock().unwrap().push("writer");
+        });
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let running = tokio::spawn(async move {
+            let mut cleanup = cleanup;
+            cleanup.finish(&NoLog).await;
+            let _ = finished_tx.send(());
+            cleanup
+        });
+        started_rx.await.unwrap();
+        // join_all takes every handle before awaiting, so an empty group while
+        // the writer is still gated proves cleanup reached the writer join.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !writers.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup reached the writer join");
+        // The writer is provably still inside its blocking call, and cleanup
+        // has recorded only the pre-writer stage, never the flush.
+        let phases = trace.lock().unwrap().clone();
+        assert_eq!(
+            phases,
+            vec!["watchdog"],
+            "cleanup advanced past the writer join"
+        );
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "finish returned while an admitted write was still running"
+        );
+        release_tx.send(()).unwrap();
+        let cleanup = running.await.expect("cleanup task");
+        finished_rx.await.expect("cleanup completion");
+        let phases = trace.lock().unwrap().clone();
+        assert_eq!(
+            phases,
+            vec![
+                "watchdog",
+                "writer",
+                "writers",
+                "sync_tasks",
+                "tasks",
+                "flush",
+            ],
+            "the admitted write completed before the flush stage"
+        );
+        assert!(cleanup.writers.is_empty(), "cleanup drained every writer");
+    }
+
+    #[tokio::test]
+    async fn writer_reaping_joins_finished_tasks_and_keeps_running_ones() {
+        let writers = WriterTasks::default();
+        let (running_started_tx, running_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (running_done_tx, running_done_rx) = tokio::sync::oneshot::channel();
+        writers.spawn("peer-running".into(), 7, move || {
+            let _ = running_started_tx.send(());
+            let _ = release_rx.recv();
+            let _ = running_done_tx.send(());
+        });
+        running_started_rx.await.unwrap();
+
+        let (quick_done_tx, quick_done_rx) = tokio::sync::oneshot::channel();
+        writers.spawn("peer-quick".into(), 8, move || {
+            let _ = quick_done_tx.send(());
+        });
+        quick_done_rx.await.unwrap();
+        // Reap by observing completion, not by sleeping: the running writer
+        // must survive, the finished one must be joined and released.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                writers.reap(&NoLog).await;
+                let tasks = writers.tasks.lock().unwrap();
+                if tasks.len() == 1 && tasks.values().all(|task| task.sid == 7) {
+                    break;
+                }
+                drop(tasks);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished writer handle is reaped");
+
+        release_tx.send(()).unwrap();
+        running_done_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !writers.is_empty() {
+                writers.reap(&NoLog).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed running writer is reaped");
+    }
+
+    /// A verify re-request must join this stream's writers before re-arming
+    /// its completion gate; otherwise a post-decrement writer could claim the
+    /// next generation.
+    #[tokio::test]
+    async fn verify_retry_joins_stream_writers_before_reset() {
+        let writers = WriterTasks::default();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        writers.spawn("peer".into(), 7, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        });
+        started_rx.await.unwrap();
+
+        let joiner = {
+            let writers = writers.clone();
+            tokio::spawn(async move {
+                writers.join_sid("peer", 7, &NoLog).await;
+                writers
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !writers.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("join_sid took the stream's writer handle");
+        assert!(
+            !joiner.is_finished(),
+            "join_sid must wait for the stream's writer"
+        );
+        release_tx.send(()).unwrap();
+        let writers = joiner.await.expect("join task");
+        assert!(
+            writers.is_empty(),
+            "the stream's writer is joined and drained"
+        );
+    }
+
+    fn completion_writer(
+        inflight: &Arc<AtomicI64>,
+        end_seen: &Arc<AtomicBool>,
+        completion: &Arc<crate::recv::CompletionGate>,
+        tx: mpsc::UnboundedSender<Ev>,
+    ) -> InflightGuard {
+        InflightGuard {
+            inflight: Arc::clone(inflight),
+            end_seen: Arc::clone(end_seen),
+            completion: Arc::clone(completion),
+            tx,
+            write_err: Arc::new(Mutex::new(None)),
+            pid: "peer".into(),
+            sid: 7,
+        }
+    }
+
+    /// Write-before-end: the last writer drains completely before file-end
+    /// arrives. File-end must take the inline fast path and publish end_seen.
+    /// (The old read-then-store window itself is forced inside
+    /// `CompletionGate::file_end` by the library regression test.)
+    #[test]
+    fn file_end_claims_after_the_last_writer_drained_first() {
+        let inflight = Arc::new(AtomicI64::new(1));
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(crate::recv::CompletionGate::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        drop(completion_writer(&inflight, &end_seen, &completion, tx));
+        assert!(rx.try_recv().is_err(), "writer saw no end yet");
+        assert!(
+            completion.file_end(&inflight, &end_seen),
+            "file-end claims inline after the writer drained first"
+        );
+        assert!(end_seen.load(Ordering::SeqCst), "end_seen is published");
+        assert!(
+            rx.try_recv().is_err(),
+            "an inline completion needs no MaybeComplete event"
+        );
+        assert!(
+            !completion.last_writer(1, &end_seen),
+            "the writer cannot claim a second completion"
+        );
+    }
+
+    /// The ordinary deferred path: file-end arrives while a writer is still in
+    /// flight, so the last writer emits the one MaybeComplete.
+    #[test]
+    fn file_end_defers_to_the_last_writer_and_it_emits_once() {
+        let inflight = Arc::new(AtomicI64::new(1));
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(crate::recv::CompletionGate::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(!completion.file_end(&inflight, &end_seen));
+        drop(completion_writer(&inflight, &end_seen, &completion, tx));
+        match rx.try_recv() {
+            Ok(Ev::MaybeComplete(pid, sid)) => {
+                assert_eq!((pid.as_str(), sid), ("peer", 7));
+            }
+            Ok(other) => panic!("unexpected event: {other:?}"),
+            Err(error) => panic!("the last writer must emit MaybeComplete: {error}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one MaybeComplete");
+    }
+
+    /// A verify re-request re-inserts the stream: the gate must be re-armed so
+    /// the next last writer can complete it again exactly once.
+    #[test]
+    fn completion_gate_rearms_after_a_verify_retry() {
+        let inflight = Arc::new(AtomicI64::new(0));
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(crate::recv::CompletionGate::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(completion.file_end(&inflight, &end_seen));
+        completion.reset(&end_seen);
+        assert!(!end_seen.load(Ordering::SeqCst));
+
+        inflight.store(1, Ordering::SeqCst);
+        assert!(!completion.file_end(&inflight, &end_seen));
+        drop(completion_writer(&inflight, &end_seen, &completion, tx));
+        match rx.try_recv() {
+            Ok(Ev::MaybeComplete(pid, sid)) => {
+                assert_eq!((pid.as_str(), sid), ("peer", 7));
+            }
+            Ok(other) => panic!("unexpected event: {other:?}"),
+            Err(error) => panic!("the re-armed last writer must emit MaybeComplete: {error}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one MaybeComplete after reset"
+        );
+    }
+
+    /// Both sides observe the completed state (file-end stored end_seen, then
+    /// the last writer drained and read it, then file-end read zero inflight).
+    /// Only the claim CAS may emit MaybeComplete.
+    #[test]
+    fn file_end_and_last_writer_emit_one_maybe_complete_when_both_see_zero() {
+        let inflight = Arc::new(AtomicI64::new(1));
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(crate::recv::CompletionGate::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // File-end's store half lands, but its inflight load has not run yet.
+        end_seen.store(true, Ordering::SeqCst);
+        // The last writer drains and sees end_seen: it claims the one event.
+        drop(completion_writer(&inflight, &end_seen, &completion, tx));
+        match rx.try_recv() {
+            Ok(Ev::MaybeComplete(pid, sid)) => {
+                assert_eq!((pid.as_str(), sid), ("peer", 7));
+            }
+            Ok(other) => panic!("unexpected event: {other:?}"),
+            Err(error) => panic!("the last writer must emit MaybeComplete: {error}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one MaybeComplete");
+        // File-end's load half now observes zero too; the claim CAS must make
+        // it defer instead of processing a second completion.
+        assert!(!completion.file_end(&inflight, &end_seen));
+        assert!(rx.try_recv().is_err(), "the late file-end cannot duplicate");
+    }
+
+    #[derive(Default)]
+    struct SyncTestTransport;
+
+    #[async_trait::async_trait]
+    impl filament_transport::net::Transport for SyncTestTransport {
+        async fn send_control(&self, _msg: &Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            64 * 1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn sync_server(
+        stream: tokio::sync::mpsc::Receiver<Option<bytes::Bytes>>,
+    ) -> crate::sync::serving::SyncServeTask {
+        let transport: Arc<dyn filament_transport::net::Transport> = Arc::new(SyncTestTransport);
+        let mux = crate::l2::Mux::new(transport.clone(), Arc::new(NoHost));
+        crate::sync::serving::spawn_sync_server(crate::sync::serving::SyncServeConfig {
+            transport,
+            mux,
+            sid: 0x8000_0101,
+            root: std::env::temp_dir(),
+            delete: false,
+            dry_run: false,
+            stream,
+            max_record_bytes: crate::sync::MAX_SYNC_RECORD_BYTES,
+        })
+    }
+
+    #[tokio::test]
+    async fn sync_task_reaping_and_cleanup_join_owned_servers() {
+        let (finished_tx, finished_rx) = tokio::sync::mpsc::channel(1);
+        drop(finished_tx);
+        let mut cleanup = RecvCleanup::default();
+        let sync_tasks = cleanup.sync_tasks.clone();
+        sync_tasks
+            .track_sync_task(
+                "peer-finished".into(),
+                0x8000_0101,
+                sync_server(finished_rx),
+                &NoLog,
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !sync_tasks
+                .0
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed sync stream completes its server");
+        sync_tasks.reap_sync_tasks(&NoLog).await;
+        assert!(
+            sync_tasks.0.lock().unwrap().is_empty(),
+            "completed owner is joined and removed"
+        );
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
+        sync_tasks
+            .track_sync_task(
+                "peer-revoked".into(),
+                0x8000_0102,
+                sync_server(cancel_rx),
+                &NoLog,
+            )
+            .await;
+        let (_survivor_tx, survivor_rx) = tokio::sync::mpsc::channel(1);
+        sync_tasks
+            .track_sync_task(
+                "peer-live".into(),
+                0x8000_0103,
+                sync_server(survivor_rx),
+                &NoLog,
+            )
+            .await;
+        sync_tasks.cancel_sync_for_pid("peer-revoked", &NoLog).await;
+        assert!(
+            sync_tasks
+                .0
+                .lock()
+                .unwrap()
+                .contains_key(&("peer-live".into(), 0x8000_0103)),
+            "peer teardown must not cancel another peer's stream"
+        );
+        sync_tasks.stop_sync_tasks(&NoLog).await;
+        assert!(
+            sync_tasks.0.lock().unwrap().is_empty(),
+            "shutdown cancels, joins, and drains owners"
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_step_tests {
+    use super::*;
+    use crate::host::NoLog;
+
+    /// The daemon survives a peer's failure: the step is skipped, not the loop.
+    #[test]
+    fn daemon_skips_a_failed_peer_step() {
+        let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"));
+        assert!(matches!(
+            peer_step(true, "p1", "adoption", r, &NoLog),
+            Ok(None)
+        ));
+    }
+
+    /// A one-shot receive still fails, with the very error it met (no added
+    /// context: the exit-code taxonomy classifies on that text).
+    #[test]
+    fn one_shot_keeps_the_error_unchanged() {
+        let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"))
+            .context("direct fallback adoption failed for peer p1 on receive path");
+        let e = peer_step(false, "p1", "adoption", r, &NoLog).unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "direct fallback adoption failed for peer p1 on receive path: ICE config: no answer within 3s"
+        );
+    }
+
+    /// The daemon's skip line goes to the injected sink, not to a terminal.
+    #[test]
+    fn a_skipped_step_is_logged_to_the_sink() {
+        let log = crate::host::VecLog::new();
+        let r: Result<bool> = Err(anyhow::anyhow!("ICE config: no answer within 3s"));
+        assert!(matches!(
+            peer_step(true, "p1", "adoption", r, &log),
+            Ok(None)
+        ));
+        let lines = log.take();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, crate::host::Level::Debug);
+        assert!(
+            lines[0]
+                .1
+                .contains("PEER-STEP-FAILED peer=p1 step=adoption"),
+            "{:?}",
+            lines[0].1
+        );
+    }
+
+    /// Success passes the value through in both modes.
+    #[test]
+    fn success_passes_through() {
+        assert!(matches!(
+            peer_step(true, "p1", "adoption", Ok(true), &NoLog),
+            Ok(Some(true))
+        ));
+        assert!(matches!(
+            peer_step(false, "p1", "adoption", Ok(false), &NoLog),
+            Ok(Some(false))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod front_question_tests {
+    use super::*;
+    use crate::host::{Level, VecLog};
+    use crate::present::NoScreen;
+
+    /// A presentation with no screen must not let a pending question vanish.
+    /// Unless the caller already printed its permanent copy, the question goes
+    /// to the sink; the ask path itself is untouched, so it still waits.
+    #[test]
+    fn an_unfronted_question_reaches_the_sink_once() {
+        let log = VecLog::new();
+        front_question(&NoScreen, &log, "keep x? [y/n]", false);
+        assert_eq!(
+            log.take(),
+            vec![(Level::Critical, "keep x? [y/n]".to_string())]
+        );
+
+        front_question(&NoScreen, &log, "keep x? [y/n]", true);
+        assert!(
+            log.take().is_empty(),
+            "the caller's permanent line already carried the question"
+        );
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    #[test]
+    fn park_budget_bounds() {
+        // Empty: park.
+        assert!(park_budget_ok(0, 0));
+        // Room: park.
+        assert!(park_budget_ok(1, 31));
+        // Per-link cap (2): third concurrent open on the same link denies.
+        assert!(!park_budget_ok(2, 2));
+        // Per-daemon cap (32): the 33rd concurrent open denies.
+        assert!(!park_budget_ok(0, 32));
+        assert!(!park_budget_ok(1, 32));
+    }
+
+    /// Every sweep arm: the release condition, and each way a hold goes
+    /// stale. Pure, so these are exhaustive and clock-free. The record is
+    /// what stops a later edit from widening "fire" (e.g. dropping the
+    /// generation check) without noticing.
+    #[test]
+    fn sweep_arms_cover_fire_and_each_stale_way() {
+        use cap::BindingStrength as B;
+        let now = Instant::now();
+        let past = now + Duration::from_secs(3);
+        let deadline = now + Duration::from_secs(2);
+        let key_a = [0x11u8; 32];
+        let key_b = [0x22u8; 32];
+        // Same link generation, same key, Proven -> release.
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::Proven, Some(key_a), 7)), now, deadline),
+            SweepArm::Fire
+        ));
+        // Not proven yet, deadline ahead -> keep waiting.
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::Inferred, Some(key_a), 7)), now, deadline),
+            SweepArm::Keep
+        ));
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::None, None, 7)), now, deadline),
+            SweepArm::Keep
+        ));
+        // Deadline passed -> expire (denied at the bound).
+        assert!(matches!(
+            sweep_arm(
+                key_a,
+                7,
+                Some((B::Inferred, Some(key_a), 7)),
+                past,
+                deadline
+            ),
+            SweepArm::Expired
+        ));
+        // A different key on the link -> the peer re-keyed.
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::Proven, Some(key_b), 7)), now, deadline),
+            SweepArm::IdentityChanged
+        ));
+        // Same key, NEWER generation -> replaced. This is the case a
+        // pid+key-only hold got wrong: it would have fired into a transport
+        // that never carried the challenge, or closed a stranger's sid.
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::Proven, Some(key_a), 8)), now, deadline),
+            SweepArm::Replaced
+        ));
+        // No link -> dropped.
+        assert!(matches!(
+            sweep_arm(key_a, 7, None, now, deadline),
+            SweepArm::Dropped
+        ));
+    }
+
+    /// A hold must expire on its own deadline: the settle re-drive installs
+    /// one and spawns a removal timer, and the pure rule behind both is this.
+    #[test]
+    fn challenge_hold_expires_at_its_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(20);
+        assert!(!crate::identity_lifecycle::hold_expired(deadline, now));
+        assert!(!crate::identity_lifecycle::hold_expired(
+            deadline,
+            now + Duration::from_secs(19)
+        ));
+        assert!(crate::identity_lifecycle::hold_expired(deadline, deadline));
+        assert!(crate::identity_lifecycle::hold_expired(
+            deadline,
+            deadline + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn settle_timeout_reason_names_the_bound() {
+        let r = settle_timeout_reason(2000);
+        assert!(r.contains("2000"), "reason must name the bound: {r}");
+        assert!(r.contains("retry"), "reason must offer the retry: {r}");
+    }
+}
+
+#[cfg(test)]
+mod expiry_redrive_tests {
+    use super::{deny_is_proof_attributable, policy_decline_msg};
+    use filament_cap::capability as cap;
+
+    /// The lab defect: an exec denied because the guest's invitation had ended
+    /// was parked "for identity proof", then RE-DRIVEN and run once the peer
+    /// proved its key. A proof can only supply proof; a decision it cannot
+    /// change must keep its verdict.
+    #[test]
+    fn the_redrive_never_overturns_a_final_deny() {
+        for reason in [
+            crate::capability::expired_reason(1_760_000_000),
+            crate::capability::CEILING_REASON.to_string(),
+            cap::REVOKED_REASON.to_string(),
+            "device revoked".to_string(),
+            "shell revoked for 'b' here".to_string(),
+            "explicitly denied by owner (deniedCaps)".to_string(),
+            crate::refusal::UNRECOGNIZED_REASON.to_string(),
+        ] {
+            assert!(
+                !deny_is_proof_attributable(&reason),
+                "parked a final deny: {reason}"
+            );
+        }
+    }
+
+    /// The settle path still exists for what it was built for: a deny that is
+    /// about the binding not being proven yet.
+    #[test]
+    fn a_deny_about_missing_proof_still_parks() {
+        for reason in [
+            "identity not proven",
+            "fleet device: action needs an explicit grant (deliberate tier or out of scope)",
+            "device not granted shell",
+            "no shell cap / untrusted",
+        ] {
+            assert!(
+                deny_is_proof_attributable(reason),
+                "refused to park: {reason}"
+            );
+        }
+    }
+
+    /// A send refused for a known cause carries it, so the sender can say
+    /// "access expired at ..." instead of a bare "declined".
+    #[test]
+    fn a_policy_decline_carries_its_reason() {
+        let r = crate::capability::expired_reason(1_760_000_000);
+        let m = policy_decline_msg("x", Some(&r));
+        assert_eq!(m["type"], "file-decline");
+        assert_eq!(m["reason"], "expired");
+        assert!(m["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("access expired at"));
+        let rv = policy_decline_msg("x", Some("device revoked"));
+        assert_eq!(rv["reason"], "cert-revoked");
+        // A person's plain no (or an unknown reason) stays a plain decline.
+        assert!(policy_decline_msg("x", None).get("reason").is_none());
+        assert!(policy_decline_msg("x", Some("unverified peer"))
+            .get("reason")
+            .is_none());
+    }
+}
+
+#[cfg(test)]
+mod inventory {
+    /// The receive loop's regression suite moved with the loop. Names are part
+    /// of the contract: a relocation that silently drops one (or a suite) must
+    /// fail here, not be hidden by unrelated new tests elsewhere.
+    const RECEIVE_LOOP_TESTS: &[&str] = &[
+        "a_grant_or_last_revoke_is_announced_on_live_links",
+        "older_version_only_when_no_peer_ran_a_ceremony",
+        "a_code_is_consent_and_nothing_else_is",
+        "the_receive_help_promises_what_the_code_path_does",
+        "a_code_receive_ends_after_its_files_even_while_the_browser_stays_connected",
+        "nothing_arrived_at_the_deadline_is_a_timeout",
+        "a_received_file_beats_the_deadline",
+        "no_deadline_means_no_deadline",
+        "accepts_only_a_well_formed_sha256",
+        "compares_digest_hex_case_insensitively_and_requires_a_digest",
+        "driver_setup_failure_returns_without_a_process_exit",
+        "the_library_engine_drives_the_real_receive_dispatch",
+        "driver_pre_cancel_is_local_and_returns_after_cleanup",
+        "cleanup_stops_a_started_watchdog_before_tasks_and_flush",
+        "cancellation_then_cleanup_stops_a_started_watchdog",
+        "cleanup_awaits_a_gated_blocking_writer_before_flush",
+        "writer_reaping_joins_finished_tasks_and_keeps_running_ones",
+        "verify_retry_joins_stream_writers_before_reset",
+        "file_end_claims_after_the_last_writer_drained_first",
+        "file_end_defers_to_the_last_writer_and_it_emits_once",
+        "completion_gate_rearms_after_a_verify_retry",
+        "file_end_and_last_writer_emit_one_maybe_complete_when_both_see_zero",
+        "sync_task_reaping_and_cleanup_join_owned_servers",
+        "daemon_skips_a_failed_peer_step",
+        "one_shot_keeps_the_error_unchanged",
+        "a_skipped_step_is_logged_to_the_sink",
+        "success_passes_through",
+        "an_unfronted_question_reaches_the_sink_once",
+        "park_budget_bounds",
+        "sweep_arms_cover_fire_and_each_stale_way",
+        "challenge_hold_expires_at_its_deadline",
+        "settle_timeout_reason_names_the_bound",
+        "the_redrive_never_overturns_a_final_deny",
+        "a_deny_about_missing_proof_still_parks",
+        "a_policy_decline_carries_its_reason",
+    ];
+
+    #[test]
+    fn every_receive_loop_test_is_present_once() {
+        let source = include_str!("dispatch.rs");
+        assert_eq!(RECEIVE_LOOP_TESTS.len(), 35, "the base suite has 35 tests");
+        let mut seen = std::collections::HashSet::new();
+        for name in RECEIVE_LOOP_TESTS {
+            assert!(seen.insert(*name), "duplicate inventory name {name}");
+            let needle = format!("fn {name}(");
+            assert!(
+                source.matches(&needle).count() == 1,
+                "receive-loop test {name} is missing or duplicated"
+            );
+        }
     }
 }

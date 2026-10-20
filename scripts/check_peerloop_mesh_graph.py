@@ -16,6 +16,7 @@ PROFILES = {
     "minimal": ["--no-default-features"],
     "default": [],
     "mesh": ["--no-default-features", "--features", "filament-peerloop/mesh"],
+    "dispatch": ["--no-default-features", "--features", "filament-peerloop/dispatch"],
 }
 TARGETS = (None, "aarch64-linux-android", "x86_64-linux-android")
 COMMON = {"filament-peerloop", "filament-id", "filament-cap",

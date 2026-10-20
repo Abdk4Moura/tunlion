@@ -135,7 +135,7 @@ impl LogCollapse {
 
 /// What the daemon knows about its signaling link right now.
 #[derive(Default)]
-struct Health {
+pub struct Health {
     /// False until the daemon's serving loop starts tracking.
     tracked: bool,
     connected: bool,
@@ -146,50 +146,39 @@ struct Health {
     last_reason: Option<String>,
 }
 
-static HEALTH: Mutex<Option<Health>> = Mutex::new(None);
+impl Health {
+    /// The serving loop starts with a connected link.
+    pub fn note_serving(&mut self) {
+        self.tracked = true;
+        self.connected = true;
+        self.since = Some(Instant::now());
+    }
 
-fn with_health<R>(f: impl FnOnce(&mut Health) -> R) -> R {
-    let mut g = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
-    f(g.get_or_insert_with(Health::default))
-}
-
-/// The serving loop starts with a connected link.
-pub fn note_serving() {
-    with_health(|h| {
-        h.tracked = true;
-        h.connected = true;
-        h.since = Some(Instant::now());
-    });
-}
-
-/// The current link is down (closed, or silent past the watchdog).
-pub fn note_down(reason: &str) {
-    with_health(|h| {
-        h.tracked = true;
-        if h.connected {
-            h.since = Some(Instant::now());
+    /// The current link is down (closed, or silent past the watchdog).
+    pub fn note_down(&mut self, reason: &str) {
+        self.tracked = true;
+        if self.connected {
+            self.since = Some(Instant::now());
         }
-        h.connected = false;
-        h.last_reason = Some(reason.to_string());
-    });
-}
+        self.connected = false;
+        self.last_reason = Some(reason.to_string());
+    }
 
-/// A re-dial connected.
-pub fn note_redialed() {
-    with_health(|h| {
+    /// A re-dial connected.
+    pub fn note_redialed(&mut self) {
         let now = Instant::now();
-        h.tracked = true;
-        h.connected = true;
-        h.since = Some(now);
-        h.redials.push_back(now);
-        while h
+        self.tracked = true;
+        self.connected = true;
+        self.since = Some(now);
+        self.redials.push_back(now);
+        while self
             .redials
             .front()
             .is_some_and(|t| now.saturating_duration_since(*t) > FLAP_WINDOW)
         {
-            h.redials.pop_front();
+            self.redials.pop_front();
         }
-    });
+    }
 }
 
 /// The word for a link's state. Pure, so the thresholds are testable.
@@ -202,24 +191,24 @@ pub fn state_word(tracked: bool, connected: bool, redials_in_window: usize) -> &
     }
 }
 
-/// The `signaling` object of the daemon's `cap-status` reply.
-pub fn snapshot_json() -> Value {
-    with_health(|h| {
+impl Health {
+    /// The `signaling` object of the daemon's `cap-status` reply.
+    pub fn snapshot_json(&self) -> Value {
         let now = Instant::now();
-        let recent = h
+        let recent = self
             .redials
             .iter()
             .filter(|t| now.saturating_duration_since(**t) <= FLAP_WINDOW)
             .count();
         json!({
-            "state": state_word(h.tracked, h.connected, recent),
-            "connected": h.connected,
-            "for_secs": h.since.map(|s| now.saturating_duration_since(s).as_secs()),
+            "state": state_word(self.tracked, self.connected, recent),
+            "connected": self.connected,
+            "for_secs": self.since.map(|s| now.saturating_duration_since(s).as_secs()),
             "redials_window_secs": FLAP_WINDOW.as_secs(),
             "redials": recent,
-            "last_reason": h.last_reason,
+            "last_reason": self.last_reason,
         })
-    })
+    }
 }
 
 #[cfg(test)]

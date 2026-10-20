@@ -112,11 +112,12 @@ impl Default for LoopWatchdog {
 
 impl LoopWatchdog {
     pub fn new() -> Self {
-        Self::with_limits(
-            WATCHDOG_OBSERVE_EVERY,
-            threshold_secs(),
-            WATCHDOG_STOP_BOUND,
-        )
+        Self::with_stall(threshold_secs())
+    }
+
+    /// Production constructor with the invocation's configured threshold.
+    pub fn with_stall(threshold_secs: u64) -> Self {
+        Self::with_limits(WATCHDOG_OBSERVE_EVERY, threshold_secs, WATCHDOG_STOP_BOUND)
     }
 
     /// Test seam: production uses one second, the env threshold, and a

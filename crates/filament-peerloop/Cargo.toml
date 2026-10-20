@@ -27,7 +27,7 @@ default = ["mesh", "mount-server", "forward-server", "dispatch"]
 mesh = ["dep:filament-overlay"]
 # The receive dispatch loop and its host capability traits. Default-on for the
 # CLI; a reduced consumer that only wants the mechanics can omit it.
-dispatch = ["dep:filament-fleet"]
+dispatch = ["mesh", "dep:filament-fleet"]
 # Inbound filesystem serving is opt-out for existing consumers, but absent from
 # reduced engine profiles. The wire/control vocabulary remains available.
 mount-server = []

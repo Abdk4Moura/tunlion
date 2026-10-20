@@ -7,3 +7,18 @@
 #![allow(unused_imports)]
 
 pub(crate) use filament_peerloop::recv::signaling_health::*;
+
+/// Observation cache for `status`/`doctor`; the loop's `Health` is the owner.
+static REPORTED: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+
+pub(crate) fn report(snapshot: serde_json::Value) {
+    *REPORTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+}
+
+pub(crate) fn snapshot_json() -> serde_json::Value {
+    REPORTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({ "state": "unknown", "connected": false }))
+}

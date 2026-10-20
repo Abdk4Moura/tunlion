@@ -48,11 +48,56 @@ pub struct RecvEnv {
     pub interactive_allowed: bool,
     pub interactive_requested: bool,
     pub config_name: Option<String>,
-    pub consent_token: &'static str,
+    pub consent_token: String,
     pub direct_ok: bool,
     pub quiet_window: Duration,
     pub l2_forced: bool,
     pub daemon_ready: bool,
+    /// This process's pid, so the loop can tell "I own the daemon" without
+    /// naming a process global.
+    pub pid: u32,
+    /// stdin is a terminal (the adapter's `IsTerminal` answer).
+    pub interactive_terminal: bool,
+    /// Pair-ceremony grace before the code path gives up.
+    pub pair_grace: Duration,
+    /// How long an offer may wait for a fleet hello.
+    pub fleet_offer_grace: Duration,
+    /// `TUNLION_TRACE_THROUGHPUT` snapshot.
+    pub trace_throughput: bool,
+    /// The daemon was started by a supervisor (INVOCATION_ID).
+    pub supervised: bool,
+    /// Loop-stall threshold for the watchdog.
+    pub loop_stall_secs: u64,
+    /// `--remember` stored a record this invocation.
+    pub remember_stored: Arc<std::sync::atomic::AtomicBool>,
+    /// Transfer id -> the final stored name for this invocation's acks.
+    pub delivery: Arc<std::sync::Mutex<HashMap<String, String>>>,
+}
+
+impl Default for RecvEnv {
+    fn default() -> Self {
+        Self {
+            display_name: String::new(),
+            uid: String::new(),
+            interactive_allowed: false,
+            interactive_requested: false,
+            config_name: None,
+            consent_token: String::new(),
+            direct_ok: false,
+            quiet_window: Duration::from_secs(10),
+            l2_forced: false,
+            daemon_ready: false,
+            pid: std::process::id(),
+            interactive_terminal: false,
+            pair_grace: Duration::from_secs(60),
+            fleet_offer_grace: Duration::from_secs(8),
+            trace_throughput: false,
+            supervised: false,
+            loop_stall_secs: 20,
+            remember_stored: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            delivery: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl RecvEnv {
@@ -393,6 +438,8 @@ pub trait RecvDaemon: Send + Sync {
     fn sdnotify_ready(&self);
     fn sdnotify_status(&self, status: &str);
     fn sdnotify_watchdog(&self);
+    /// Supervisor-driven reload: the adapter raises its own graceful signal.
+    fn request_reload(&mut self);
 }
 
 /// Terminal interaction: the code prompt and the confirmation line.
@@ -406,6 +453,14 @@ pub trait RecvPrompt: Send + Sync {
     fn echo(&self, ch: char);
     /// Put the terminal in cbreak mode; the returned guard restores it.
     fn enter_raw_mode(&self) -> Option<Box<dyn RawMode>>;
+    /// Start the CLI's single stdin owner. The terminal read is process
+    /// behavior, so the adapter owns the thread; it only posts `Ev` values.
+    fn spawn_stdin(
+        &self,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<std::sync::atomic::AtomicBool>,
+        present: Arc<dyn crate::present::Presentation>,
+    );
 }
 
 /// What the receive dispatch is handed once, at its entry.
@@ -444,3 +499,456 @@ impl RecvPorts {
 /// Unused imports that keep the public signatures readable.
 #[allow(dead_code)]
 fn _type_anchors(_: &IncomingFile, _: &RecvReport, _: &Path, _: &HashSet<String>, _: IntroScope) {}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::recv::dispatch::ParkedOpen;
+
+    pub(crate) struct NoIdentity;
+    pub(crate) struct NoStore;
+    pub(crate) struct NoServers;
+    pub(crate) struct NoDaemon;
+    pub(crate) struct NoPrompt;
+
+    fn fail() -> ! {
+        panic!("this test capability was not expected to be called")
+    }
+
+    #[async_trait]
+    impl RecvIdentity for NoIdentity {
+        async fn issue_proven_challenge_and_hold(
+            &self,
+            _: &Conn,
+            _: &str,
+            _: &Arc<dyn Transport>,
+            _: &Arc<std::sync::Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
+            _: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+        ) {
+            fail()
+        }
+        async fn respond_to_identity_challenge(&self, _: &Arc<dyn Transport>, _: &Value) {
+            fail()
+        }
+        fn handle_identity_expose(
+            &self,
+            _: &mut Conn,
+            _: &str,
+            _: &Value,
+            _: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+        ) -> bool {
+            fail()
+        }
+        fn store_provisional_identity(&self, _: &str, _: &DeviceCert) -> anyhow::Result<()> {
+            fail()
+        }
+        fn load_provisional_identity(&self, _: &str) -> Option<DeviceCert> {
+            None
+        }
+        fn clear_provisional_identity(&self, _: &str) {}
+        fn local_device_cert(&self) -> Option<DeviceCert> {
+            None
+        }
+        async fn maybe_request_cert_renewal(&self, _: &Conn, _: &str) {}
+        async fn respond_to_cert_renew_request(&self, _: &mut Conn, _: String) {}
+        async fn handle_cert_renew_ack(&self, _: &Value) {}
+        async fn respond_to_auth_key_enroll_request(&self, _: &mut Conn, _: String, _: Value) {}
+        async fn handle_auth_key_enroll_response(&self, _: &mut Conn, _: String, _: Value) {}
+        fn gate_settle_ms(&self) -> u64 {
+            0
+        }
+        fn hold_expired(&self, _: Instant) -> bool {
+            true
+        }
+        async fn resend_identity_challenge(
+            &self,
+            _: &Conn,
+            _: &str,
+            _: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+        ) -> bool {
+            false
+        }
+        fn device_name_for_pub(&self, _: &[u8; 32]) -> Option<String> {
+            None
+        }
+        fn device_cert_revoked(&self, _: &[u8; 32]) -> bool {
+            false
+        }
+        fn owner_pub_for_resources(&self) -> Option<[u8; 32]> {
+            None
+        }
+        fn reinvite_for(&self, _: &[u8; 32]) -> Option<crate::refusal::Reinvite> {
+            None
+        }
+        fn enroll_channel(&self, _: &[u8; 32]) -> String {
+            String::new()
+        }
+        fn is_armed(&self) -> bool {
+            false
+        }
+        fn verify_and_store_roster(&self, _: &Value, _: &[u8; 32], _: u64) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn verify_depart(
+            &self,
+            _: &[u8; 32],
+            _: &str,
+            _: &[u8; 64],
+        ) -> std::result::Result<(), &'static str> {
+            Ok(())
+        }
+        fn fleet_channel(&self) -> Option<String> {
+            None
+        }
+        fn fleet_rv(&self) -> Option<String> {
+            None
+        }
+        fn is_fleet_channel(&self, _: &str) -> bool {
+            false
+        }
+        fn make_fleet_hello(&self, _: &[u8], _: &str) -> anyhow::Result<Value> {
+            fail()
+        }
+        fn fleet_owner_pub(&self) -> Option<[u8; 32]> {
+            None
+        }
+    }
+
+    impl RecvStore for NoStore {
+        fn devices_path(&self) -> PathBuf {
+            PathBuf::new()
+        }
+        fn devices_touch(
+            &self,
+            _: &str,
+            _: Option<std::net::Ipv6Addr>,
+            _: Option<std::net::Ipv4Addr>,
+        ) {
+        }
+        fn devices_remove(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn devices_store(&self, _: &str, _: &str) -> anyhow::Result<String> {
+            fail()
+        }
+        fn devices_store_new(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+            fail()
+        }
+        fn device_was_introduced(&self, _: &str) -> bool {
+            false
+        }
+        fn devices_sweep_lapsed(&self, _: u64) -> usize {
+            0
+        }
+        fn devices_upsert_atomic(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&DeviceCert>,
+            _: Option<&[String]>,
+            _: Option<u8>,
+            _: Option<&str>,
+            _: Option<(&[String], u64, u64, u64)>,
+            _: bool,
+        ) -> anyhow::Result<String> {
+            fail()
+        }
+        fn promote_provisional_identity(
+            &self,
+            _: &str,
+            _: &DeviceCert,
+            _: u8,
+        ) -> anyhow::Result<()> {
+            fail()
+        }
+        fn mark_bounded_cap_source(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn merge_owner_cap_ops(&self, _: &[Value]) -> usize {
+            0
+        }
+        fn owner_signed_cap_ops(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn mark_lapsed_now(&self, _: &[u8; 32]) -> Option<String> {
+            None
+        }
+        fn sanitize_device_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn devices_find_by_device_pub(&self, _: &[u8; 32]) -> Option<Value> {
+            None
+        }
+        fn any_shell_grant(&self) -> bool {
+            false
+        }
+    }
+
+    #[async_trait]
+    impl RecvServers for NoServers {
+        async fn retire_link(
+            &mut self,
+            _: &str,
+            _: &mut HashMap<String, Arc<Mux>>,
+            _: &mut HashMap<String, HashMap<u32, String>>,
+        ) {
+        }
+        async fn open_pty(
+            &mut self,
+            _: &mut Conn,
+            _: String,
+            _: &Value,
+            _: &ShellPolicy,
+            _: &Option<String>,
+            _: &mut HashMap<String, Arc<Mux>>,
+            _: &mut HashMap<String, HashMap<u32, String>>,
+            _: bool,
+            _: &mut Vec<ParkedOpen>,
+        ) {
+        }
+        async fn open_exec(
+            &mut self,
+            _: &mut Conn,
+            _: String,
+            _: &Value,
+            _: &ShellPolicy,
+            _: &Option<String>,
+            _: &mut HashMap<String, Arc<Mux>>,
+            _: bool,
+            _: &mut Vec<ParkedOpen>,
+        ) {
+        }
+        async fn open_forward(
+            &mut self,
+            _: &mut Conn,
+            _: String,
+            _: &Value,
+            _: &ShellPolicy,
+            _: &mut HashMap<String, Arc<Mux>>,
+            _: bool,
+            _: &mut Vec<ParkedOpen>,
+        ) {
+        }
+        async fn open_sync(
+            &mut self,
+            _: &mut Conn,
+            _: &str,
+            _: &Value,
+            _: &mut HashMap<String, Arc<Mux>>,
+            _: &Path,
+            _: &mut Vec<ParkedOpen>,
+        ) -> Option<(u32, SyncServeTask)> {
+            None
+        }
+        async fn open_mount(
+            &mut self,
+            _: &mut Conn,
+            _: &str,
+            _: &Value,
+            _: &mut HashMap<String, Arc<Mux>>,
+            _: &Path,
+        ) {
+        }
+        async fn ssh_sign(
+            &mut self,
+            _: &mut Conn,
+            _: &str,
+            _: Arc<dyn Transport>,
+            _: &Value,
+            _: &ShellPolicy,
+            _: &mut Vec<ParkedOpen>,
+        ) {
+        }
+        async fn pty_resize(
+            &mut self,
+            _: &str,
+            _: &Value,
+            _: &mut HashMap<String, Arc<Mux>>,
+            _: &mut HashMap<String, HashMap<u32, String>>,
+        ) {
+        }
+        async fn pty_close(
+            &mut self,
+            _: &str,
+            _: &Value,
+            _: &mut HashMap<String, HashMap<u32, String>>,
+        ) {
+        }
+        async fn detach_link_ptys(
+            &mut self,
+            _: &str,
+            _: &mut HashMap<String, HashMap<u32, String>>,
+        ) {
+        }
+        async fn exec_control(
+            &mut self,
+            _: &str,
+            _: &Value,
+            _: &HashMap<String, Arc<Mux>>,
+        ) -> bool {
+            false
+        }
+        async fn apply_reconfigure(
+            &mut self,
+            _: &str,
+            _: &mut PathBuf,
+            _: &mut ShellPolicy,
+            _: &mut Option<String>,
+            _: bool,
+            _: &mut crate::session::Session,
+            _: &SignalClient,
+            _: &str,
+        ) -> bool {
+            false
+        }
+        async fn start_expose(&mut self, _: Arc<dyn MeshTunnel>) -> usize {
+            0
+        }
+        async fn reconcile_expose(&mut self, _: &Arc<dyn MeshTunnel>) -> usize {
+            0
+        }
+        async fn reload_expose(&mut self) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl RecvDaemon for NoDaemon {
+        async fn warm_req(
+            &mut self,
+            _: &Conn,
+            _: &mut HashMap<String, Arc<Mux>>,
+            _: &mpsc::UnboundedSender<Ev>,
+            _: crate::control::Req,
+        ) {
+        }
+        async fn list_warm(&mut self, _: crate::control::Req, _: &Conn) {}
+        async fn mount(&mut self, _: crate::control::Req, _: &str, _: bool) {}
+        async fn unmount(&mut self, _: crate::control::Req) {}
+        async fn list_mounts(&mut self, _: crate::control::Req) {}
+        async fn mount_health(&mut self, _: crate::control::Req) {}
+        async fn mount_health_tick(&mut self, _: &dyn HostServices) {}
+        async fn warm_bootstrap(
+            &mut self,
+            _: &Conn,
+            _: &mpsc::UnboundedSender<Ev>,
+            _: crate::control::Req,
+        ) {
+        }
+        async fn reach_ping(&mut self, _: &Conn, _: &str, _: &Value) {}
+        async fn reach_pong(&mut self, _: &Conn, _: &str, _: &Value) {}
+        fn peer_present(&self, _: bool, _: bool, _: Option<u64>, _: u64) -> bool {
+            false
+        }
+        async fn complete_warm_bootstrap(&mut self, _: &Conn, _: &str, _: &Value) {}
+        fn reap_warm_bootstraps(&mut self) {}
+        fn revocation_snapshot(&self) -> Option<(String, String)> {
+            None
+        }
+        fn prune_to_store(&self, _: &mut Vec<(String, String)>) -> HashSet<String> {
+            HashSet::new()
+        }
+        fn key_listed(&self, _: &[u8; 32]) -> bool {
+            false
+        }
+        fn enroll_channel(&self, _: &[u8; 32]) -> String {
+            String::new()
+        }
+        fn is_armed(&self) -> bool {
+            false
+        }
+        fn verify_and_store_roster(&self, _: &Value, _: &[u8; 32], _: u64) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn verify_depart(
+            &self,
+            _: &[u8; 32],
+            _: &str,
+            _: &[u8; 64],
+        ) -> std::result::Result<(), &'static str> {
+            Ok(())
+        }
+        fn fleet_share_root(&self) -> PathBuf {
+            PathBuf::new()
+        }
+        fn mark_daemon_ready(&mut self) {}
+        fn record_proxy(&self, _: &str, _: u16) {}
+        fn maybe_hint_local_wedge(&mut self, _: &mut bool) {}
+        fn wg_usable(&self) -> bool {
+            false
+        }
+        fn wg_claim_attempt(&self, _: &str) -> bool {
+            false
+        }
+        fn wg_release_attempt(&self, _: &str) {}
+        fn wg_local_offer(&self) -> anyhow::Result<(String, u16)> {
+            fail()
+        }
+        async fn wg_adopt_peer(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: std::net::IpAddr,
+            _: u16,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn subnet_enable(&mut self, _: &str, _: &[String], _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn configure_sshd_overlay(&mut self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start_overlay_servers(&mut self, _: &dyn HostServices) -> Vec<String> {
+            Vec::new()
+        }
+        fn daemon_alive(&self) -> Option<u32> {
+            None
+        }
+        async fn start_proxy(
+            &mut self,
+            _: &str,
+            _: bool,
+        ) -> std::result::Result<(u16, Vec<String>), String> {
+            Err("no proxy".into())
+        }
+        fn sdnotify_ready(&self) {}
+        fn sdnotify_status(&self, _: &str) {}
+        fn sdnotify_watchdog(&self) {}
+        fn request_reload(&mut self) {}
+    }
+
+    impl RecvPrompt for NoPrompt {
+        fn ask_code(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn line(&self, _: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        fn echo(&self, _: char) {}
+        fn enter_raw_mode(&self) -> Option<Box<dyn RawMode>> {
+            None
+        }
+        fn spawn_stdin(
+            &self,
+            _: mpsc::UnboundedSender<Ev>,
+            _: Arc<std::sync::atomic::AtomicBool>,
+            _: Arc<dyn crate::present::Presentation>,
+        ) {
+        }
+    }
+
+    pub(crate) fn ports(env: RecvEnv) -> RecvPorts {
+        RecvPorts::new(
+            Arc::new(NoIdentity),
+            Arc::new(NoStore),
+            Box::new(NoServers),
+            Box::new(NoDaemon),
+            Arc::new(NoPrompt),
+            Arc::new(crate::present::NoScreen),
+            env,
+        )
+    }
+}

@@ -60,7 +60,7 @@ pub(crate) async fn recv_cmd(
         interactive_allowed: crate::interactive_allowed(),
         interactive_requested: crate::interactive_requested(),
         config_name: crate::config_get("name"),
-        consent_token: crate::consent_token(),
+        consent_token: crate::consent_token().to_string(),
         direct_ok: crate::direct_ok_for(daemon, l2_launch),
         quiet_window: crate::quiet_exit_window(),
         l2_forced: std::env::var("TUNLION_L2")
@@ -116,6 +116,9 @@ pub(crate) async fn recv_cmd(
         }
     };
     signals.stop().await;
+    if remember_stored.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::shared_defs::REMEMBER_STORED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     match outcome {
         DriverOutcome::Returned(result) => result.map_err(|e| {
             match e.downcast::<filament_peerloop::recv::report::RefusedFailure>() {

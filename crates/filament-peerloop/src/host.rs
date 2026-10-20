@@ -646,6 +646,9 @@ pub trait HostServices: Send + Sync + 'static {
     fn signaling_snapshot(&self) -> Value {
         Value::Null
     }
+    /// Publish the current invocation's signaling health for observational
+    /// callers (`status`/`doctor`). The loop owns the state; this is a cache.
+    fn report_signaling(&self, _snapshot: Value) {}
     /// The `launch` object of a daemon status reply: how this host was started,
     /// in the effective form the host's own `up` comparison reads.
     ///
