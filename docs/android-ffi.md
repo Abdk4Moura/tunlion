@@ -92,7 +92,9 @@ engine. A missing identity is not an error. It is `fingerprint: None`.
 Validates identity/config, takes the same-root `up.lock` lease, starts the real
 receive dispatch on the Core runtime and waits its readiness edge before
 returning. It never spawns the `tunlion` binary. The reduced Core host refuses
-absent server/daemon endpoints explicitly.
+PTY/exec/ssh/sync/mount/forward/warm/proxy/wireguard/sshd endpoints by name, and
+composes only the default shadow transfer gate. The Android profile does not
+enable the optional `fleet` feature.
 
 `stop() -> Result<(), CoreError>`
 

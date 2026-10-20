@@ -37,10 +37,14 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   JSON interrupt envelope, the pid/ready markers and the cleanup resources in
   `RecvCleanup`. `up_cmd` reaches the same driver; it does not have a second
   acceptor.
-- **`tunlion-core`.** `Core::start_with_dispatch` starts the same `Engine` for
-  a Rust embedder that has the dispatch; `Core::stop` / `stop_within` request
-  stop and join its own epilogue. This is Rust-only on purpose: UniFFI cannot
-  carry a closure, and `Core::start` must not pretend it can.
+- **`tunlion-core`.** `Core::start` validates identity/config, takes the
+  same-root `up.lock` election (the CLI daemon uses the same lock), starts
+  `recv::dispatch::drive` through the same `Engine` and waits the real
+  readiness edge before publishing `Running`. `Core::stop` / `stop_within`
+  request stop and join its own epilogue. `start_with_dispatch` remains for a
+  Rust embedder that needs a different dispatch. UniFFI exposes synchronous
+  `CoreSession::start` / `stop`; a UI caller must invoke them off its main
+  thread, and no Tokio runtime crosses the boundary.
 
   `Core` owns exactly one engine per instance, behind one mutex, with an
   explicit slot state machine:
@@ -118,19 +122,27 @@ interactivity, quiet window, L2/direct posture, consent token).
 lease, starts the real `recv::dispatch::drive` on the Core runtime and waits
 its publish-once readiness edge. The reduced `tunlion-core` host composes
 `DeviceStore`, `IdentityService`, `EnrollmentService`, roster/depart and a
-logical `CoreHost`; it refuses PTY/exec/ssh/sync/mount/warm/proxy/wireguard/
-sshd endpoints explicitly. Fleet is optional and not composed in this profile.
-The remaining work is the real server/daemon handlers and the capability policy
-site, not identity composition.
+logical `CoreHost`; PTY/exec/ssh/sync/mount/forward/warm/proxy/wireguard/sshd
+endpoints are explicit named refusals. It composes the default shadow transfer
+gate (legacy consent, revocation, delegated ceiling); it refuses to pretend the
+authoritative capability policy is composed. Fleet is available only with the
+`tunlion-core/fleet` feature; the shipped Android profile leaves it off. The
+Core prompt is deliberately absent: the reduced engine is daemon-shaped, so it
+never waits for a terminal; non-interactive receive still works, and a caller
+that reaches a prompt gets an explicit error rather than a block or a fake
+answer. `scripts/check_core_tooling_graph.py` now proves that the shipped
+`tunlion-core` graph selects `filament-peerloop/dispatch` and excludes `mesh`,
+`fleet`, `mount-server`, `forward-server`, the overlay and the fleet crate, on
+the host and both Android targets.
 
 Next linkage work, in order:
 
 1. Implement the real PTY/exec/ssh/sync/mount/warm/proxy/wireguard/sshd
    handlers behind the reduced profile's explicit refusals.
-2. Compose the capability policy site for Core (today gated shell/forward
-   actions deny by default in the reduced profile).
-3. Optionally compose `recv::fleet_rv::FleetService` when the mesh/fleet profile
-   is enabled.
+2. Compose the authoritative capability policy site for Core (the default
+   shadow transfer gate is composed; shell/forward remain denied by name).
+3. The optional `tunlion-core/fleet` feature composes
+   `recv::fleet_rv::FleetService`; keep it off in the Android reduced graph.
 
 ## Verification
 
@@ -150,8 +162,10 @@ the task and refusing restart (`TimedOut` / `EngineNotStopped`) until it is
 joined; a dropped stop future retaining the task via `StopClaim::drop`; a
 natural `Err` and a natural panic remaining `FinishedUnjoined` and refusing
 restart (`EngineNotJoined`) until `stop` joins and reports `Failed`; a dispatch
-error recorded as `Failed`; the no-engine stop no-op; and a real
+error recorded as `Failed`; the no-engine stop no-op; `Starting` until a gated
+signaling stub publishes readiness, then `Running`; a second Core on the same
+root refused by the `up.lock` lease and released after a joined stop; and a real
 `Core::start` -> dispatch -> `stop_blocking` integration over a local signaling
 stub. Android keeps the reduced `filament-peerloop` profile: no
-`mount-server`, `forward-server` or `mesh` sectors compile into the core
-library.
+`mount-server`, `forward-server`, `mesh` or `fleet` sectors compile into the
+core library, and the graph gate fails if they do.

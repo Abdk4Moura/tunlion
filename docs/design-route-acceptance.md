@@ -34,6 +34,6 @@ It is under the existing `mesh` feature, with no new feature or dependency.
   mesh/route and their endpoint providers in an isolated compile graph.
 
 This is an extraction of existing acceptance semantics, not a whole-sector
-safety claim or evidence that `Core::start`/`Core::stop` is implemented. Signed
-cap-store fixtures exercise the library policy; they do not prove real kernel
-routing, replay handling or teardown. Rust builds/tests run in CI only for this PR.
+safety claim. `Core::start`/`Core::stop` now run the reduced dispatch, but signed
+cap-store fixtures do not prove real kernel routing, replay handling or teardown.
+Rust builds/tests run in CI only for this PR.

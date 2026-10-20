@@ -56,9 +56,10 @@ executable inside the APK and drive it. No second implementation of the protocol
 The app calls `crates/tunlion-core` (UniFFI), not a child `tunlion` process.
 That crate is a general library. Android is one caller. The contract is
 `docs/android-ffi.md`. The CLI Android build stays as proof the protocol
-compiles for the NDK. It is not the core. The peer loop is not linked yet:
-`start` returns `EngineNotLinked` until issue #465 slice 3. The UI still talks
-to one Kotlin interface, `TunlionCore`. Its first implementation is that
+compiles for the NDK. It is not the core. The reduced peer loop is linked through
+`crates/tunlion-core`: `start` takes the same-root engine lease and runs the
+library dispatch, while absent desktop endpoints refuse by name. The UI still
+talks to one Kotlin interface, `TunlionCore`. Its first implementation is that
 library.
 
 ## Track A: Rust core (this repo)

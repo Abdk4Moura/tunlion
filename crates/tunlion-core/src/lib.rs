@@ -10,20 +10,13 @@
 //!
 //! The receive **dispatch body** moved into
 //! `filament_peerloop::recv::dispatch` (feature `dispatch`); the CLI is now the
-//! process adapter around it. `Core::start` still refuses by name because Core
-//! does not yet have a host composition for the dispatch's capability ports
-//! (`RecvIdentity`, `RecvStore`, `RecvServers`, `RecvDaemon`, `RecvPrompt`).
-//! Those interfaces exist and the loop calls them. `RecvStore` and the
-//! proof/expose/renew and auth-key enrolment parts of `RecvIdentity` now have
-//! host-neutral implementations (`recv::store::DeviceStore`,
-//! `recv::identity::IdentityService` and `recv::enrollment::EnrollmentService`,
-//! built from an explicit config directory and overlay-key path). Roster/depart
-//! and the fleet rendezvous facts now live in `recv::roster`,
-//! `recv::membership` and `recv::fleet_rv` with explicit roots/keys/routes. The
-//! remaining non-CLI gap is the optional server/daemon sectors (today they
-//! forward to `cli/src/daemon_ctl.rs` and the optional PTY/exec/ssh servers). A
-//! Rust embedder with that composition calls `start_with_dispatch` today. See
-//! `docs/engine-driver.md` and `docs/android-ffi.md`.
+//! process adapter around it. `Core::start` composes the reduced library host
+//! (`DeviceStore`, `IdentityService`, `EnrollmentService`, roster/depart and
+//! fleet facts), takes the same-root `up.lock` election and runs the real
+//! dispatch. It waits for the publish-once readiness edge before publishing
+//! `Running`; absent PTY/exec/sshd/mount/forward/sync/proxy/wireguard endpoints
+//! are named refusals. The optional fleet service is composed only with the
+//! `fleet` feature. See `docs/engine-driver.md` and `docs/android-ffi.md`.
 
 mod host;
 
@@ -198,10 +191,6 @@ pub enum CoreError {
     /// `identity.ed25519` is already in this config directory.
     #[error("an identity already exists in this config directory")]
     AlreadyExists,
-    /// Retained for API compatibility; `start` now returns a concrete
-    /// identity/config/lease/readiness error instead.
-    #[error("the engine is not linked")]
-    EngineNotLinked,
     /// Another Core or CLI daemon holds this config directory's engine lease.
     #[error("another engine holds this config directory")]
     EngineLease,
@@ -329,11 +318,6 @@ impl Core {
                 "the config has no signaling server".into(),
             ));
         }
-        let lease = store
-            .try_acquire_engine_lease()
-            .map_err(|e| CoreError::Engine(format!("engine lease: {e}")))?
-            .ok_or(CoreError::EngineLease)?;
-
         {
             let slot = self
                 .engine
@@ -365,6 +349,13 @@ impl Core {
                 EngineSlot::None | EngineSlot::Ended(_) => {}
             }
         }
+        // The slot is free for this Core, so take the root election before
+        // spawning. The lock is the same `up.lock` the CLI daemon uses; a second
+        // Core/CLI on this directory is refused here, before any network work.
+        let lease = store
+            .try_acquire_engine_lease()
+            .map_err(|e| CoreError::Engine(format!("engine lease: {e}")))?
+            .ok_or(CoreError::EngineLease)?;
 
         let display_name = settings
             .get("name")
@@ -397,8 +388,6 @@ impl Core {
             store.clone(),
             settings.clone(),
             overlay.clone(),
-            display_name.clone(),
-            uid.clone(),
         ));
         let ports = RecvPorts::new(
             identity,
@@ -976,6 +965,120 @@ mod tests {
         })
     }
 
+    fn gated_signaling_stub(
+        listener: std::net::TcpListener,
+        gate: std::sync::mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                ws.send(Message::Text("0{}".into())).await.unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    match message {
+                        Message::Text(text) if text == "40" => {
+                            // Hold the welcome until the test has observed the
+                            // Starting state. Readiness cannot publish before
+                            // this returns, so the state is deterministic.
+                            gate.recv_timeout(Duration::from_secs(10))
+                                .expect("the test releases the harness");
+                            ws.send(Message::Text("40{}".into())).await.unwrap();
+                            ws.send(Message::Text(
+                                r#"42["welcome",{"id":"stub","peers":[]}]"#.into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        Message::Text(text) if text.starts_with("41") => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        Message::Close(_) => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        })
+    }
+
+    #[test]
+    fn core_start_reports_starting_until_the_ready_edge_then_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(Core::open(dir.path()).unwrap());
+        let pending = core.begin_identity().unwrap();
+        let phrase = pending.phrase();
+        core.commit_identity(pending, &phrase).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::fs::write(dir.path().join("config"), format!("server http://{addr}\n")).unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let server = gated_signaling_stub(listener, gate_rx);
+        let start_core = Arc::clone(&core);
+        let start = std::thread::spawn(move || start_core.start());
+
+        let mut observed = false;
+        for _ in 0..10_000 {
+            match core.status().unwrap().engine {
+                EngineState::Starting => {
+                    observed = true;
+                    break;
+                }
+                EngineState::Running => break,
+                EngineState::Failed | EngineState::Stopped => break,
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert!(
+            observed,
+            "start must publish Starting while the readiness edge is pending"
+        );
+        gate_tx.send(()).unwrap();
+        start.join().unwrap().unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+        core.stop_blocking().unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_second_core_on_the_same_root_is_refused_by_the_engine_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Core::open(dir.path()).unwrap();
+        let pending = first.begin_identity().unwrap();
+        let phrase = pending.phrase();
+        first.commit_identity(pending, &phrase).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::fs::write(dir.path().join("config"), format!("server http://{addr}\n")).unwrap();
+        let server = signaling_stub(listener);
+        first.start().unwrap();
+        assert_eq!(first.status().unwrap().engine, EngineState::Running);
+
+        let second = Core::open(dir.path()).unwrap();
+        assert_eq!(second.start(), Err(CoreError::EngineLease));
+        assert_eq!(second.status().unwrap().engine, EngineState::NotLinked);
+
+        first.stop_blocking().unwrap();
+        assert_eq!(first.status().unwrap().engine, EngineState::Stopped);
+        let probe = DeviceStore::open(dir.path());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "a joined stop must release the same-root lease"
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn core_start_runs_the_real_dispatch_and_stop_joins_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -985,11 +1088,7 @@ mod tests {
         core.commit_identity(pending, &phrase).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        std::fs::write(
-            dir.path().join("config"),
-            format!("server http://{addr}\n"),
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("config"), format!("server http://{addr}\n")).unwrap();
         let server = signaling_stub(listener);
         core.start().unwrap();
         assert_eq!(core.status().unwrap().engine, EngineState::Running);

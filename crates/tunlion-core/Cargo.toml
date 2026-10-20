@@ -1,5 +1,5 @@
-# tunlion-core — the library the Android app calls. Slice 1 is identity in an
-# explicit config dir. The engine is not linked. See docs/android-ffi.md.
+# tunlion-core — the library the Android app calls. It owns a reduced receive
+# engine over an explicit config dir. See docs/android-ffi.md.
 [package]
 name = "tunlion-core"
 version = "0.1.0"
@@ -22,6 +22,9 @@ required-features = ["cli"]
 
 [features]
 cli = ["uniffi/cli", "uniffi/cargo-metadata"]
+# Desktop/full composition only. The Android reduced profile leaves this off so
+# mesh, overlay and fleet code are absent from the shipped graph.
+fleet = ["filament-peerloop/fleet", "filament-peerloop/mesh"]
 
 [dependencies]
 filament-id = { path = "../filament-id", version = "0.1.2" }

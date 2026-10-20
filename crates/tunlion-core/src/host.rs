@@ -11,7 +11,7 @@
 //! profile; that is a refusal, never an allow.
 
 use async_trait::async_trait;
-use filament_cap::capability::GateDecision;
+use filament_cap::capability::{BindingStrength, GateDecision, CAP_TRANSFER};
 use filament_id::{now_secs, DeviceCert, UserKey};
 use filament_peerloop::conn::Conn;
 use filament_peerloop::host::{
@@ -19,10 +19,10 @@ use filament_peerloop::host::{
 };
 use filament_peerloop::l2::Mux;
 use filament_peerloop::recv::enrollment::EnrollmentService;
+#[cfg(feature = "fleet")]
+use filament_peerloop::recv::fleet_rv::FleetService;
 use filament_peerloop::recv::identity::IdentityService;
-use filament_peerloop::recv::ports::{
-    RawMode, RecvDaemon, RecvIdentity, RecvPrompt, RecvServers,
-};
+use filament_peerloop::recv::ports::{RawMode, RecvDaemon, RecvIdentity, RecvPrompt, RecvServers};
 use filament_peerloop::recv::store::{
     effective_principal_deadline, DeviceStore, OverlayKey, PRINCIPAL_STATE_LAPSED,
     PRINCIPAL_STATE_REVOKED,
@@ -156,8 +156,6 @@ pub struct CoreHost {
     store: DeviceStore,
     settings: CoreSettings,
     overlay: OverlayKey,
-    display_name: String,
-    uid: String,
 }
 
 impl CoreHost {
@@ -166,16 +164,12 @@ impl CoreHost {
         store: DeviceStore,
         settings: CoreSettings,
         overlay: OverlayKey,
-        display_name: String,
-        uid: String,
     ) -> Self {
         Self {
             root,
             store,
             settings,
             overlay,
-            display_name,
-            uid,
         }
     }
 }
@@ -299,7 +293,14 @@ impl HostServices for CoreHost {
     }
 
     fn fleet_rv_present(&self) -> bool {
-        self.store.fleet_rv().is_some()
+        #[cfg(feature = "fleet")]
+        {
+            self.store.fleet_rv().is_some()
+        }
+        #[cfg(not(feature = "fleet"))]
+        {
+            false
+        }
     }
 
     fn cap_store(&self) -> Vec<Value> {
@@ -310,12 +311,70 @@ impl HostServices for CoreHost {
         self.settings.bool("cap-authoritative")
     }
 
-    fn cap_gate_effective(&self, _gate: CapGate<'_>) -> GateDecision {
-        // This reduced profile has no capability policy site. Denying is the
-        // only honest answer; it is never an allow and the server endpoints
-        // that would consume it are refused explicitly.
-        GateDecision::Deny {
-            cap_reason: Some("capability policy is not composed in this core profile".to_string()),
+    fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
+        // The reduced Core composes exactly one capability decision: the
+        // default (shadow) transfer gate. It does not pretend to implement the
+        // authoritative capability policy, and it never lets a shell/exec/
+        // mount/forward open through a policy site that is not composed.
+        if gate.action != CAP_TRANSFER {
+            return GateDecision::Deny {
+                cap_reason: Some(format!(
+                    "{} opens are not served by this core profile",
+                    gate.action
+                )),
+            };
+        }
+        if gate.cert_revoked {
+            return GateDecision::Deny {
+                cap_reason: Some("device revoked".to_string()),
+            };
+        }
+        if gate.denied {
+            return GateDecision::Deny {
+                cap_reason: Some("explicitly denied by the owner".to_string()),
+            };
+        }
+        if let Some(caps) = gate.auth_key_caps {
+            if !caps
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case(CAP_TRANSFER))
+            {
+                return GateDecision::Deny {
+                    cap_reason: Some("delegated ceiling excludes transfer".to_string()),
+                };
+            }
+            if let Some(expires) = gate.cert_expires {
+                if now_secs() >= expires {
+                    return GateDecision::Deny {
+                        cap_reason: Some("delegated access has expired".to_string()),
+                    };
+                }
+            }
+        }
+        if self.cap_authoritative() {
+            return GateDecision::Deny {
+                cap_reason: Some(
+                    "authoritative capability policy is not composed in this core profile"
+                        .to_string(),
+                ),
+            };
+        }
+        let same_owner = matches!(
+            (gate.own_user_pub, gate.user_pub),
+            (Some(own), Some(peer)) if own == peer && *peer != [0u8; 32]
+        );
+        let fleet_ok = same_owner
+            && gate.scoped_in_bounds
+            && gate.binding == BindingStrength::Proven
+            && !gate.cert_revoked;
+        if fleet_ok || gate.legacy_allowed {
+            GateDecision::Allow
+        } else {
+            GateDecision::Deny {
+                cap_reason: Some(
+                    "transfer needs legacy consent or a proven same-owner fleet link".to_string(),
+                ),
+            }
         }
     }
 
@@ -426,13 +485,15 @@ impl HostServices for CoreHost {
 }
 
 /// The real `RecvIdentity` composition. All trust-bearing methods forward to
-/// the library services; fleet is explicitly disabled in this reduced profile.
+/// the library services. Fleet is composed only under the `fleet` feature; the
+/// default Android/reduced profile refuses it by name.
 pub struct CoreIdentity {
     store: DeviceStore,
     overlay: OverlayKey,
-    display_name: String,
     identity: IdentityService,
     enrollment: EnrollmentService,
+    #[cfg(feature = "fleet")]
+    fleet: FleetService,
 }
 
 impl CoreIdentity {
@@ -452,12 +513,21 @@ impl CoreIdentity {
         );
         let enrollment =
             EnrollmentService::new(store.clone(), overlay.clone(), display_name.clone(), log);
+        #[cfg(feature = "fleet")]
+        let fleet = FleetService::new(
+            store.clone(),
+            overlay.clone(),
+            store.root().join("overlay.announce-seq"),
+            display_name.clone(),
+            Vec::new(),
+        );
         Self {
             store,
             overlay,
-            display_name,
             identity,
             enrollment,
+            #[cfg(feature = "fleet")]
+            fleet,
         }
     }
 
@@ -578,24 +648,58 @@ impl RecvIdentity for CoreIdentity {
         filament_peerloop::recv::membership::verify_depart(device_pub, msg, sig)
     }
     fn fleet_channel(&self) -> Option<String> {
-        None
+        #[cfg(feature = "fleet")]
+        {
+            self.fleet.channel()
+        }
+        #[cfg(not(feature = "fleet"))]
+        {
+            None
+        }
     }
     fn fleet_rv(&self) -> Option<String> {
-        None
+        #[cfg(feature = "fleet")]
+        {
+            self.fleet.rv()
+        }
+        #[cfg(not(feature = "fleet"))]
+        {
+            None
+        }
     }
-    fn is_fleet_channel(&self, _ch: &str) -> bool {
-        false
+    fn is_fleet_channel(&self, ch: &str) -> bool {
+        #[cfg(feature = "fleet")]
+        {
+            self.fleet.is_fleet_channel(ch)
+        }
+        #[cfg(not(feature = "fleet"))]
+        {
+            let _ = ch;
+            false
+        }
     }
-    fn make_fleet_hello(&self, _cb: &[u8], _name: &str) -> anyhow::Result<Value> {
-        anyhow::bail!("fleet is not enabled in this core profile")
+    fn make_fleet_hello(&self, cb: &[u8], name: &str) -> anyhow::Result<Value> {
+        #[cfg(feature = "fleet")]
+        {
+            self.fleet.make_hello(cb, name)
+        }
+        #[cfg(not(feature = "fleet"))]
+        {
+            let _ = (cb, name);
+            anyhow::bail!("fleet is not enabled in this core profile")
+        }
     }
     fn fleet_owner_pub(&self) -> Option<[u8; 32]> {
-        None
+        #[cfg(feature = "fleet")]
+        {
+            self.fleet.owner_pub()
+        }
+        #[cfg(not(feature = "fleet"))]
+        {
+            None
+        }
     }
 }
-
-#[allow(dead_code)]
-fn _identity_name(_: &str) {}
 
 async fn refuse_control(conn: &Conn, pid: &str, v: &Value, what: &str) {
     let sid = v["sid"].as_u64().unwrap_or(0);
@@ -921,5 +1025,79 @@ impl RecvPrompt for CorePrompt {
         _present: Arc<dyn filament_peerloop::present::Presentation>,
     ) -> Option<Box<dyn filament_peerloop::recv::ports::StdinOwner>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filament_cap::capability::CapOutcome;
+
+    fn host() -> CoreHost {
+        let dir = tempfile::tempdir().unwrap().keep();
+        CoreHost::new(
+            dir.clone(),
+            DeviceStore::open(&dir),
+            CoreSettings::default(),
+            OverlayKey::new(dir.join("overlay.ed25519")),
+        )
+    }
+
+    fn gate<'a>(outcome: &'a CapOutcome, action: &'a str, legacy: bool) -> CapGate<'a> {
+        CapGate {
+            legacy_allowed: legacy,
+            outcome,
+            action,
+            resource: "self",
+            device_pub: None,
+            user_pub: None,
+            binding: BindingStrength::None,
+            cert_expires: None,
+            auth_key_caps: None,
+            own_user_pub: None,
+            scoped_in_bounds: true,
+            has_explicit_grant: false,
+            cert_revoked: false,
+            denied: false,
+            ceiling_authorizes: false,
+        }
+    }
+
+    #[test]
+    fn the_reduced_core_composes_the_shadow_transfer_gate_only() {
+        let host = host();
+        let unauthorized = CapOutcome::Unprovisioned;
+        assert!(host
+            .cap_gate_effective(gate(&unauthorized, CAP_TRANSFER, true))
+            .allowed());
+        assert!(!host
+            .cap_gate_effective(gate(&unauthorized, CAP_TRANSFER, false))
+            .allowed());
+        // A shell open is refused by name even when legacy trust would allow it.
+        let denial = host.cap_gate_effective(gate(&unauthorized, "shell", true));
+        assert!(!denial.allowed());
+        assert!(denial
+            .deny_reason("")
+            .contains("shell opens are not served by this core profile"));
+    }
+
+    #[test]
+    fn the_transfer_gate_still_honors_revocation_and_delegated_ceilings() {
+        let host = host();
+        let authorized = CapOutcome::Authorized;
+        let mut gate = gate(&authorized, CAP_TRANSFER, true);
+        gate.cert_revoked = true;
+        assert!(!host.cap_gate_effective(gate).allowed());
+
+        let caps = vec!["shell".to_string()];
+        let mut gate = gate(&authorized, CAP_TRANSFER, true);
+        gate.auth_key_caps = Some(&caps);
+        assert!(!host.cap_gate_effective(gate).allowed());
+
+        let caps = vec!["transfer".to_string()];
+        let mut gate = gate(&authorized, CAP_TRANSFER, true);
+        gate.auth_key_caps = Some(&caps);
+        gate.cert_expires = Some(now_secs().saturating_sub(1));
+        assert!(!host.cap_gate_effective(gate).allowed());
     }
 }
