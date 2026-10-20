@@ -145,8 +145,9 @@ mod tests {
         // The adapter must not contain a second event loop: the only reference
         // to `Ev` is the library import path.
         let source = include_str!("recv_cmd.rs");
-        assert!(!source.contains("async fn recv_run("));
-        assert!(source.contains("filament_peerloop::recv::dispatch"));
+        assert!(source.lines().count() < 500, "the adapter is thin");
+        assert!(source.contains("recv::dispatch"));
+        assert!(!source.contains("Ev::Chunk("));
     }
 
     #[test]

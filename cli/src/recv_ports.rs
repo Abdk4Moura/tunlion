@@ -892,8 +892,6 @@ impl RecvDaemon for CliRecv {
         #[cfg(not(unix))]
         {
             let _ = (conn, req);
-            req.reject("bootstrap is not available on this platform")
-                .await;
         }
     }
     async fn complete_warm_bootstrap(&mut self, _conn: &Conn, pid: &str, reply: &Value) {

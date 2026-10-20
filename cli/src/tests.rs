@@ -565,7 +565,10 @@ fn owner_shell_refusal_offers_i_know_as_a_parseable_choice() {
             .expect("names --i-know");
         let cmd = line[line.find("tunlion ").unwrap()..].trim();
         let argv: Vec<&str> = cmd.split_whitespace().collect();
-        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "does not parse: {cmd}");
+        assert!(
+            crate::Cli::try_parse_from(&argv).is_ok(),
+            "does not parse: {cmd}"
+        );
     }
 }
 
@@ -1049,60 +1052,48 @@ fn roster_wrong_key_rejected_and_epoch_monotone() {
     assert!(crate::roster::verify_and_store_roster(&b, &owner_pub, now).is_err());
 
     // Valid roster -> accepted and stored.
-    assert!(
-        crate::roster::verify_and_store_roster(
-            &signed(&mk(1, now + 1000), &owner),
-            &owner_pub,
-            now
-        )
-        .unwrap()
-    );
+    assert!(crate::roster::verify_and_store_roster(
+        &signed(&mk(1, now + 1000), &owner),
+        &owner_pub,
+        now
+    )
+    .unwrap());
 
     // Older epoch (0 < 1) does not overwrite, even with a later valid_until.
-    assert!(
-        !crate::roster::verify_and_store_roster(
-            &signed(&mk(0, now + 9999), &owner),
-            &owner_pub,
-            now
-        )
-        .unwrap()
-    );
+    assert!(!crate::roster::verify_and_store_roster(
+        &signed(&mk(0, now + 9999), &owner),
+        &owner_pub,
+        now
+    )
+    .unwrap());
     // Replay (same epoch, same valid_until) rejected.
-    assert!(
-        !crate::roster::verify_and_store_roster(
-            &signed(&mk(1, now + 1000), &owner),
-            &owner_pub,
-            now
-        )
-        .unwrap()
-    );
+    assert!(!crate::roster::verify_and_store_roster(
+        &signed(&mk(1, now + 1000), &owner),
+        &owner_pub,
+        now
+    )
+    .unwrap());
     // Same epoch + later valid_until = refresh -> accepted.
-    assert!(
-        crate::roster::verify_and_store_roster(
-            &signed(&mk(1, now + 3000), &owner),
-            &owner_pub,
-            now
-        )
-        .unwrap()
-    );
+    assert!(crate::roster::verify_and_store_roster(
+        &signed(&mk(1, now + 3000), &owner),
+        &owner_pub,
+        now
+    )
+    .unwrap());
     // Newer epoch -> accepted.
-    assert!(
-        crate::roster::verify_and_store_roster(
-            &signed(&mk(2, now + 1000), &owner),
-            &owner_pub,
-            now
-        )
-        .unwrap()
-    );
+    assert!(crate::roster::verify_and_store_roster(
+        &signed(&mk(2, now + 1000), &owner),
+        &owner_pub,
+        now
+    )
+    .unwrap());
     // Expired (valid_until in the past) -> rejected, never stored.
-    assert!(
-        !crate::roster::verify_and_store_roster(
-            &signed(&mk(3, now.saturating_sub(1)), &owner),
-            &owner_pub,
-            now
-        )
-        .unwrap()
-    );
+    assert!(!crate::roster::verify_and_store_roster(
+        &signed(&mk(3, now.saturating_sub(1)), &owner),
+        &owner_pub,
+        now
+    )
+    .unwrap());
 
     unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
@@ -1206,7 +1197,10 @@ fn forget_and_store_preserve_other_devices_caps() {
     // handed the record's grants to whoever sent the secret). It becomes a
     // NEW, capless record, and the original keeps both its caps and secret.
     let stored = devices_store("shellbox", &"c".repeat(64)).unwrap();
-    assert_eq!(stored, "shellbox-2", "a clashing name is suffixed, never overwritten");
+    assert_eq!(
+        stored, "shellbox-2",
+        "a clashing name is suffixed, never overwritten"
+    );
     assert!(
         device_allows_at(&p, "shellbox", "shell"),
         "re-store dropped the device's own caps"
@@ -1217,7 +1211,11 @@ fn forget_and_store_preserve_other_devices_caps() {
     );
     let arr: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
     let orig = arr.iter().find(|d| d["name"] == "shellbox").unwrap();
-    assert_eq!(orig["secret"].as_str(), Some(sec.as_str()), "original secret untouched");
+    assert_eq!(
+        orig["secret"].as_str(),
+        Some(sec.as_str()),
+        "original secret untouched"
+    );
 
     unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
@@ -1445,7 +1443,7 @@ fn transfer_and_pairing_codes_are_distinguishable() {
     assert!(!transfer_hint("brave-otter-3141")); // a pairing code, no bail
     assert!(looks_like_pake_code("brave-otter-3141")); // -> "use pair"
     assert!(!looks_like_pake_code("brave-otter-37")); // 2-digit transfer
-    // width boundary: 2-3 digits => transfer hint, >=4 => pairing hint.
+                                                      // width boundary: 2-3 digits => transfer hint, >=4 => pairing hint.
     assert!(trailing_num_width("brave-otter-37") == 2);
     assert!(!looks_like_pake_code("brave-otter-37"));
     assert!(looks_like_pake_code("calm-lynx-1000"));
@@ -1651,7 +1649,10 @@ fn reset_leaves_no_inbox_marker() {
     let dir = std::env::temp_dir().join(format!(
         "fil-reset-marker-{}-{}",
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
@@ -2309,13 +2310,18 @@ fn a_device_with_no_identity_is_offered_both_ways_in() {
             1,
             "exactly one accept entry that names both a code and an invitation (device_count={count}): {actions:?}"
         );
-        assert_eq!(accept[0].1, "join", "the accept entry must run join, never add: {actions:?}");
+        assert_eq!(
+            accept[0].1, "join",
+            "the accept entry must run join, never add: {actions:?}"
+        );
         assert!(
             verbs.contains(&"join"),
             "a device with no identity must be offered a way in (device_count={count}): {verbs:?}"
         );
         assert!(
-            !actions.iter().any(|(label, verb)| label.contains("code I was given") && *verb == "add"),
+            !actions
+                .iter()
+                .any(|(label, verb)| label.contains("code I was given") && *verb == "add"),
             "an entry for a code you were given must not run the offering verb: {actions:?}"
         );
     }
@@ -2370,8 +2376,8 @@ fn product_sources() -> Vec<(String, String)> {
             if rel == "src/tests.rs" {
                 continue;
             }
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+            let text =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
             out.push((rel, blank_test_modules(&text)));
         }
     }
@@ -2490,8 +2496,24 @@ fn printed_hints_parse_as_typed() {
         .collect();
 
     const STOPS: [&str; 18] = [
-        "`", "'", "\"", "\\", "  ", " / ", " && ", ", ", ": ", "; ", ". ", ")", " (",
-        " \u{b7}", " \u{2014}", " - ", " to ", " then ",
+        "`",
+        "'",
+        "\"",
+        "\\",
+        "  ",
+        " / ",
+        " && ",
+        ", ",
+        ": ",
+        "; ",
+        ". ",
+        ")",
+        " (",
+        " \u{b7}",
+        " \u{2014}",
+        " - ",
+        " to ",
+        " then ",
     ];
 
     let mut bad = Vec::new();
@@ -2993,9 +3015,8 @@ fn printed_hints_name_verbs_that_exist() {
     // network interface" (#393), "the tunlion proxy requires it" (#388),
     // "use your tunlion keys" (#392). Each was read; each is prose.
     for prose in [
-        "daemon", "state", "mounts", "was", "from", "video", "identity",
-        "needs", "per", "has", "with", "failed", "for",
-        "server", "create", "proxy", "keys",
+        "daemon", "state", "mounts", "was", "from", "video", "identity", "needs", "per", "has",
+        "with", "failed", "for", "server", "create", "proxy", "keys",
     ] {
         valid.insert(prose.into());
     }
@@ -3663,7 +3684,7 @@ fn consent_enqueue_skips_unidentified() {
     // in enqueue_if_requestable, not add_pending_request).
     add_pending_request("<unverified>", "shell", &mut reqs);
     assert_eq!(reqs.len(), 1); // add_pending_request itself doesn't filter
-    // The guard is in enqueue_if_requestable, tested next.
+                               // The guard is in enqueue_if_requestable, tested next.
 }
 
 #[test]
@@ -3760,12 +3781,10 @@ fn delegated_ceiling_survives_record_roundtrip() {
         crate::capability::PrincipalKind::Delegated { caps: ceiling },
     );
     assert_eq!(expires, Some(u64::MAX));
-    assert!(
-        !principal
-            .auth_key_caps()
-            .unwrap()
-            .contains(&"shell".to_string())
-    );
+    assert!(!principal
+        .auth_key_caps()
+        .unwrap()
+        .contains(&"shell".to_string()));
     let decision = crate::capability::cap_gate_effective(
         true,
         &crate::capability::CapOutcome::Authorized,
@@ -3802,16 +3821,12 @@ fn legacy_bounded_cap_is_denied_after_expiry() {
         .unwrap(),
     )
     .unwrap();
-    assert!(
-        device_caps_at_time(&path, "peer", 9)
-            .unwrap()
-            .contains(&"shell".to_string())
-    );
-    assert!(
-        !device_caps_at_time(&path, "peer", 10)
-            .unwrap()
-            .contains(&"shell".to_string())
-    );
+    assert!(device_caps_at_time(&path, "peer", 9)
+        .unwrap()
+        .contains(&"shell".to_string()));
+    assert!(!device_caps_at_time(&path, "peer", 10)
+        .unwrap()
+        .contains(&"shell".to_string()));
     let _ = std::fs::remove_file(path);
 }
 
@@ -3907,10 +3922,18 @@ fn invitation_v2_roundtrips_without_argv_parsing() {
     let unprefixed = parse_invitation(&format!("filament-invite:{b64}"))
         .expect("the unprefixed form carries the same v2 payload and must parse");
     assert_eq!(unprefixed.enroll_pub, inv.enroll_pub);
-    let v1 = parse_invitation("filament-invite:v1:AAAA").err().expect("v1 is refused");
+    let v1 = parse_invitation("filament-invite:v1:AAAA")
+        .err()
+        .expect("v1 is refused");
     let v1 = v1.to_string();
-    assert!(v1.contains("pre-0.8.4"), "v1 must be named as stale, got: {v1}");
-    assert!(!v1.contains("base64"), "v1 must not read as a parse error, got: {v1}");
+    assert!(
+        v1.contains("pre-0.8.4"),
+        "v1 must be named as stale, got: {v1}"
+    );
+    assert!(
+        !v1.contains("base64"),
+        "v1 must not read as a parse error, got: {v1}"
+    );
 }
 
 #[test]
@@ -4057,7 +4080,7 @@ fn capability_revoke_warning_only_live_same_owner_cert() {
 // from the record, so forget both cuts the device off and frees the name.
 #[test]
 fn forget_of_a_live_fleet_certificate_revokes_the_key_and_says_so() {
-    use crate::fleet_support::{ForgetVerdict, forget_report, forget_verdict};
+    use crate::fleet_support::{forget_report, forget_verdict, ForgetVerdict};
     let cert = identity::DeviceCert::from_json(&serde_json::json!({
         "devicePub": hex::encode([0x11u8; 32]),
         "userPub": hex::encode([0x22u8; 32]),
@@ -4071,17 +4094,35 @@ fn forget_of_a_live_fleet_certificate_revokes_the_key_and_says_so() {
     let live = forget_verdict(Some(&cert), false, owner, 100);
     assert_eq!(live, ForgetVerdict::RevokeThenRemove { days_left: 3 });
     let msg = forget_report("laptop", &live);
-    assert!(msg.contains("revoked its fleet certificate") && msg.contains("3 more day(s)"), "{msg}");
-    assert!(!msg.contains("can no longer find"), "a live certificate must not be reported as plain removal: {msg}");
+    assert!(
+        msg.contains("revoked its fleet certificate") && msg.contains("3 more day(s)"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("can no longer find"),
+        "a live certificate must not be reported as plain removal: {msg}"
+    );
 
     let revoked = forget_verdict(Some(&cert), true, owner, 100);
-    assert_eq!(revoked, ForgetVerdict::KeepRevocationThenRemove { days_left: 3 });
+    assert_eq!(
+        revoked,
+        ForgetVerdict::KeepRevocationThenRemove { days_left: 3 }
+    );
     assert!(forget_report("laptop", &revoked).contains("revocation stays in force"));
 
     // Plain removal when no live certificate from us exists.
-    assert_eq!(forget_verdict(None, false, owner, 100), ForgetVerdict::Remove);
-    assert_eq!(forget_verdict(Some(&cert), false, Some([0x33; 32]), 100), ForgetVerdict::Remove);
-    assert_eq!(forget_verdict(Some(&cert), false, None, 100), ForgetVerdict::Remove);
+    assert_eq!(
+        forget_verdict(None, false, owner, 100),
+        ForgetVerdict::Remove
+    );
+    assert_eq!(
+        forget_verdict(Some(&cert), false, Some([0x33; 32]), 100),
+        ForgetVerdict::Remove
+    );
+    assert_eq!(
+        forget_verdict(Some(&cert), false, None, 100),
+        ForgetVerdict::Remove
+    );
     assert_eq!(
         forget_verdict(Some(&cert), false, owner, 100 + 3 * 86_400),
         ForgetVerdict::Remove
@@ -4098,12 +4139,22 @@ fn key_revocations_match_by_key_until_the_certificate_expires() {
         "devicePub": hex::encode(k), "certExpires": 500, "name": "laptop"
     })];
     assert!(key_revocation_in_force(&entries, &k, 100));
-    assert!(!key_revocation_in_force(&entries, &k, 500), "ends when the certificate does");
-    assert!(!key_revocation_in_force(&entries, &[0x12u8; 32], 100), "another key is not revoked");
+    assert!(
+        !key_revocation_in_force(&entries, &k, 500),
+        "ends when the certificate does"
+    );
+    assert!(
+        !key_revocation_in_force(&entries, &[0x12u8; 32], 100),
+        "another key is not revoked"
+    );
     let dir = std::env::temp_dir().join(format!("fil-keyrev-{}-{}", std::process::id(), line!()));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("revoked-keys.json");
-    assert_eq!(load_key_revocations_at(&p), Ok(Vec::new()), "absent is empty, not revoked");
+    assert_eq!(
+        load_key_revocations_at(&p),
+        Ok(Vec::new()),
+        "absent is empty, not revoked"
+    );
     std::fs::write(&p, b"{not json").unwrap();
     assert!(load_key_revocations_at(&p).is_err(), "corrupt fails closed");
     let _ = std::fs::remove_dir_all(&dir);
@@ -4120,7 +4171,10 @@ fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
     let dir = std::env::temp_dir().join(format!(
         "fil-relink-{}-{}",
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
@@ -4140,32 +4194,50 @@ fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
     assert!(!device_cert_revoked(&old.device_pub));
 
     // The chain, exactly as the hints print it.
-    let chain = ["tunlion devices forget p9-b -y", "tunlion devices rename p9-b-2 p9-b"];
+    let chain = [
+        "tunlion devices forget p9-b -y",
+        "tunlion devices rename p9-b-2 p9-b",
+    ];
     for step in chain {
         let argv: Vec<&str> = step.split_whitespace().collect();
-        let cli = crate::Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{step}` does not parse: {e}"));
+        let cli = crate::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("`{step}` does not parse: {e}"));
         let result = match cli.cmd {
-            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Forget { name }), .. }) => {
-                crate::fleet_support::forget_device(&name, now).map(|_| ())
-            }
-            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Rename { old, new }), .. }) => {
-                crate::fleet_support::rename_device(&old, &new)
-            }
+            Some(crate::Cmd::Devices {
+                action: Some(crate::DevicesAction::Forget { name }),
+                ..
+            }) => crate::fleet_support::forget_device(&name, now).map(|_| ()),
+            Some(crate::Cmd::Devices {
+                action: Some(crate::DevicesAction::Rename { old, new }),
+                ..
+            }) => crate::fleet_support::rename_device(&old, &new),
             _ => panic!("`{step}` is not a devices forget/rename"),
         };
         result.unwrap_or_else(|e| panic!("`{step}` failed: {e}"));
     }
 
     let named = crate::device_view::device_cert_for("p9-b").expect("p9-b exists again");
-    assert_eq!(named.device_pub, new.device_pub, "the name now belongs to the re-joined key");
+    assert_eq!(
+        named.device_pub, new.device_pub,
+        "the name now belongs to the re-joined key"
+    );
     assert!(crate::device_view::device_cert_for("p9-b-2").is_none());
-    assert!(device_cert_revoked(&old.device_pub), "the forgotten live key stays refused");
-    assert!(!device_cert_revoked(&new.device_pub), "the re-joined key is not");
+    assert!(
+        device_cert_revoked(&old.device_pub),
+        "the forgotten live key stays refused"
+    );
+    assert!(
+        !device_cert_revoked(&new.device_pub),
+        "the re-joined key is not"
+    );
 
     // A revoked record is forgettable too, and keeps its revocation.
     crate::set_device_cert_revoked("p9-b", true).unwrap();
     crate::fleet_support::forget_device("p9-b", now).expect("a revoked record can be forgotten");
-    assert!(device_cert_revoked(&new.device_pub), "its revocation outlives the record");
+    assert!(
+        device_cert_revoked(&new.device_pub),
+        "its revocation outlives the record"
+    );
     unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4314,7 +4386,10 @@ fn implicit_identity_is_minted_once_even_under_contention() {
         1,
         "exactly one thread creates: {outcomes:?}"
     );
-    assert!(outcomes.iter().all(|(fp, _)| *fp == outcomes[0].0), "one identity: {outcomes:?}");
+    assert!(
+        outcomes.iter().all(|(fp, _)| *fp == outcomes[0].0),
+        "one identity: {outcomes:?}"
+    );
     assert!(dir.join("identity.ed25519").exists());
     // Second call: a no-op, no created flag (so no line).
     let (again, created) = ensure_user_key_inner().unwrap();
@@ -4327,14 +4402,20 @@ fn implicit_identity_is_minted_once_even_under_contention() {
     std::fs::write(crate::local_device_cert_path(), "{}").unwrap();
     // `.err()` rather than `.unwrap_err()`: this Result carries a UserKey, and
     // unwrap_err needs the Ok type to be Debug, which a private key must never be.
-    let err = ensure_user_key_inner().err().expect("a joined device must not be adopted as an owner").to_string();
+    let err = ensure_user_key_inner()
+        .err()
+        .expect("a joined device must not be adopted as an owner")
+        .to_string();
     assert!(err.contains("joined device"), "{err}");
     assert!(!dir.join("identity.ed25519").exists());
 
     // Opt-out restores the old precondition, fail fast, nothing written.
     let dir = td("u1-optout");
     unsafe { std::env::set_var(NO_IMPLICIT_INIT_ENV, "1") };
-    let err = ensure_user_key_inner().err().expect("the opt-out must refuse to mint").to_string();
+    let err = ensure_user_key_inner()
+        .err()
+        .expect("the opt-out must refuse to mint")
+        .to_string();
     unsafe { std::env::remove_var(NO_IMPLICIT_INIT_ENV) };
     assert!(err.contains("tunlion init"), "{err}");
     assert!(!dir.join("identity.ed25519").exists());
@@ -4393,10 +4474,16 @@ fn the_default_device_name_comes_from_the_os_not_a_constant() {
     // The old unix path read /etc/hostname, which macOS does not have, so every
     // Mac was called "cli". The OS call must return the real name.
     let os = crate::platform::os_hostname();
-    assert!(os.as_deref().is_some_and(|h| !h.is_empty()), "no hostname from the OS: {os:?}");
+    assert!(
+        os.as_deref().is_some_and(|h| !h.is_empty()),
+        "no hostname from the OS: {os:?}"
+    );
     let name = crate::default_display_name();
     assert_ne!(name, "cli");
-    assert!(!name.contains('@'), "the default must not carry the user: {name}");
+    assert!(
+        !name.contains('@'),
+        "the default must not carry the user: {name}"
+    );
 }
 
 // --- C1: the writer refuses to re-key an existing record ----------------------
@@ -4434,24 +4521,25 @@ fn c1_secret_only_write_to_existing_name_is_refused() {
             None,
             false,
         );
-        assert!(res.is_err(), "secret-only re-key via '{alias}' must be refused");
+        assert!(
+            res.is_err(),
+            "secret-only re-key via '{alias}' must be refused"
+        );
         let after = std::fs::read_to_string(dir.join("devices.json")).unwrap();
         assert_eq!(after, before, "the existing record must be byte-identical");
     }
     // Writing back the SAME secret is not a re-key.
-    assert!(
-        crate::devices_store::devices_upsert_atomic(
-            "laptop",
-            Some(&"a".repeat(64)),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        )
-        .is_ok()
-    );
+    assert!(crate::devices_store::devices_upsert_atomic(
+        "laptop",
+        Some(&"a".repeat(64)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .is_ok());
 }
 
 #[test]
@@ -4471,7 +4559,11 @@ fn c1_new_name_is_accepted() {
     )
     .unwrap();
     assert_eq!(stored, "phone");
-    assert!(!device_allows_at(&dir.join("devices.json"), "phone", "shell"));
+    assert!(!device_allows_at(
+        &dir.join("devices.json"),
+        "phone",
+        "shell"
+    ));
 }
 
 #[test]
@@ -4507,8 +4599,7 @@ fn c1_network_secret_lands_in_a_new_record() {
     assert!(arr[1].get("caps").is_none(), "no grants carried over");
     // A secret any record already holds is refused.
     assert!(
-        crate::devices_store::insert_new_peer_record(&mut arr, "x", &"a".repeat(64), None)
-            .is_err()
+        crate::devices_store::insert_new_peer_record(&mut arr, "x", &"a".repeat(64), None).is_err()
     );
 }
 
@@ -4516,7 +4607,14 @@ fn c1_network_secret_lands_in_a_new_record() {
 
 /// Two devices of MY fleet (both certified by my user key), with the owner key
 /// on disk, so the real writers and the real gate inputs run.
-fn fleet_pair_fixture(tag: &str) -> (std::path::PathBuf, identity::UserKey, identity::DeviceCert, identity::DeviceCert) {
+fn fleet_pair_fixture(
+    tag: &str,
+) -> (
+    std::path::PathBuf,
+    identity::UserKey,
+    identity::DeviceCert,
+    identity::DeviceCert,
+) {
     let dir = td(tag);
     let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
     let now = identity::now_secs();
@@ -4553,11 +4651,14 @@ fn apply_and_save(dir: &std::path::Path, ops: &[crate::capability::CapOp]) {
     let mut store = crate::capability::load_cap_store(dir);
     let hdr = store
         .iter()
-        .find(|e| e["type"].as_str() == Some("cap_header") && e["resource"].as_str() == Some("self"))
+        .find(|e| {
+            e["type"].as_str() == Some("cap_header") && e["resource"].as_str() == Some("self")
+        })
         .and_then(crate::capability::CapHeader::from_json)
         .expect("self header");
     for op in ops {
-        crate::capability::apply_cap_op(&mut store, &hdr, op, crate::capability::now_secs()).unwrap();
+        crate::capability::apply_cap_op(&mut store, &hdr, op, crate::capability::now_secs())
+            .unwrap();
     }
     crate::capability::save_and_list_revoked(&store, dir).unwrap();
 }
@@ -4576,9 +4677,15 @@ fn grant_to_one_fleet_device_does_not_authorize_its_sibling() {
         .find(|e| e["type"].as_str() == Some("cap_grant"))
         .expect("grant stored");
     assert_eq!(grant["targetKind"].as_u64(), Some(0x01));
-    assert_eq!(grant["target"].as_str(), Some(hex::encode(laptop.device_pub).as_str()));
+    assert_eq!(
+        grant["target"].as_str(),
+        Some(hex::encode(laptop.device_pub).as_str())
+    );
 
-    assert!(explicit_shell(&dir, &laptop), "the granted device holds shell");
+    assert!(
+        explicit_shell(&dir, &laptop),
+        "the granted device holds shell"
+    );
     assert!(
         !explicit_shell(&dir, &desktop),
         "granting laptop must not grant its same-owner sibling"
@@ -4612,7 +4719,10 @@ fn revoking_one_fleet_device_leaves_its_sibling_granted() {
     apply_and_save(&dir, &ops);
 
     assert!(!explicit_shell(&dir, &laptop), "laptop's grant is revoked");
-    assert!(explicit_shell(&dir, &desktop), "revoking laptop must leave desktop untouched");
+    assert!(
+        explicit_shell(&dir, &desktop),
+        "revoking laptop must leave desktop untouched"
+    );
 
     // Regrant after the revoke lands above the tombstone instead of being
     // refused by it.
@@ -4654,18 +4764,28 @@ fn forget_revokes_the_forgotten_keys_grants_and_only_those() {
 
     crate::fleet_support::forget_device("laptop", crate::identity::now_secs()).unwrap();
 
-    assert!(!explicit_shell(&dir, &laptop), "a forgotten key keeps no grant");
-    assert!(explicit_shell(&dir, &desktop), "forgetting laptop leaves desktop's grant");
+    assert!(
+        !explicit_shell(&dir, &laptop),
+        "a forgotten key keeps no grant"
+    );
+    assert!(
+        explicit_shell(&dir, &desktop),
+        "forgetting laptop leaves desktop's grant"
+    );
     // Replaying the grant op it held is refused by the tombstone's version.
     let mut store = crate::capability::load_cap_store(&dir);
     let hdr = store
         .iter()
-        .find(|e| e["type"].as_str() == Some("cap_header") && e["resource"].as_str() == Some("self"))
+        .find(|e| {
+            e["type"].as_str() == Some("cap_header") && e["resource"].as_str() == Some("self")
+        })
         .and_then(crate::capability::CapHeader::from_json)
         .expect("self header");
-    let replay = crate::capability::CapOp::from_json(&old_grant).expect("the stored grant parses as an op");
+    let replay =
+        crate::capability::CapOp::from_json(&old_grant).expect("the stored grant parses as an op");
     assert!(
-        crate::capability::apply_cap_op(&mut store, &hdr, &replay, crate::capability::now_secs()).is_err(),
+        crate::capability::apply_cap_op(&mut store, &hdr, &replay, crate::capability::now_secs())
+            .is_err(),
         "the forgotten key's old grant must not apply again"
     );
     unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
@@ -4742,11 +4862,9 @@ fn fleet_merge_refuses_a_grant_beaten_by_a_local_tombstone() {
     );
     apply_and_save(&dir, &ops);
     // The tombstone is not handed out as fleet policy.
-    assert!(
-        crate::owner_signed_cap_ops()
-            .iter()
-            .all(|e| e["type"].as_str() != Some(crate::capability::CAP_TOMBSTONE_TYPE))
-    );
+    assert!(crate::owner_signed_cap_ops()
+        .iter()
+        .all(|e| e["type"].as_str() != Some(crate::capability::CAP_TOMBSTONE_TYPE)));
     // A peer relaying the OLD (still validly signed) grant cannot restore it.
     assert_eq!(crate::merge_owner_cap_ops(&[grant_json]), 0);
     assert!(!explicit_shell(&dir, &laptop));
@@ -4783,15 +4901,25 @@ fn join_leaves_a_certless_record_named_like_the_owner_untouched() {
             identity::IntroScope::Device.to_byte(),
         )
         .unwrap();
-        assert_eq!(arr[0], record, "{label}: the existing record must be untouched");
-        assert_eq!(stored, "owner-2", "{label}: the owner lands in a new record");
+        assert_eq!(
+            arr[0], record,
+            "{label}: the existing record must be untouched"
+        );
+        assert_eq!(
+            stored, "owner-2",
+            "{label}: the owner lands in a new record"
+        );
         assert_eq!(arr.len(), 2);
         assert_eq!(
             arr[1]["deviceCert"]["devicePub"].as_str(),
             Some(hex::encode(owner_cert.device_pub).as_str())
         );
         assert_eq!(arr[1]["secret"].as_str(), Some("c".repeat(64).as_str()));
-        assert_eq!(arr[1]["caps"], json!(["transfer"]), "{label}: no grants carried over");
+        assert_eq!(
+            arr[1]["caps"],
+            json!(["transfer"]),
+            "{label}: no grants carried over"
+        );
     }
 }
 
@@ -4821,17 +4949,15 @@ fn join_updates_only_the_record_pinned_to_the_owner_key() {
     let mut arr = vec![json!({"name": "owner", "secret": "a".repeat(64), "v": 2,
                               "deviceCert": other.to_json()})];
     let before = arr.clone();
-    assert!(
-        crate::devices_store::place_joined_owner(
-            &mut arr,
-            "owner",
-            &"d".repeat(64),
-            &owner_cert,
-            &["transfer".to_string()],
-            identity::IntroScope::Device.to_byte(),
-        )
-        .is_err()
-    );
+    assert!(crate::devices_store::place_joined_owner(
+        &mut arr,
+        "owner",
+        &"d".repeat(64),
+        &owner_cert,
+        &["transfer".to_string()],
+        identity::IntroScope::Device.to_byte(),
+    )
+    .is_err());
     assert_eq!(arr, before);
 }
 
@@ -4841,7 +4967,11 @@ fn join_updates_only_the_record_pinned_to_the_owner_key() {
 fn a_typed_refusal_reaches_the_sender_in_the_receivers_words() {
     use crate::send_cmd::refusal_text;
     // A refusal: the reason token marks it, the sentence is shown.
-    let v = protocol::refuse_msg("id1", "no_space", "receiver is out of disk space for a.bin (needs 3.0 MB, has 2.0 MB)");
+    let v = protocol::refuse_msg(
+        "id1",
+        "no_space",
+        "receiver is out of disk space for a.bin (needs 3.0 MB, has 2.0 MB)",
+    );
     assert_eq!(
         refusal_text(&v).as_deref(),
         Some("receiver is out of disk space for a.bin (needs 3.0 MB, has 2.0 MB)")
@@ -4849,7 +4979,8 @@ fn a_typed_refusal_reaches_the_sender_in_the_receivers_words() {
     // A plain decline is a person saying no, not a refusal.
     assert_eq!(refusal_text(&protocol::decline_msg("id1")), None);
     // Peer-supplied text is bounded and has no control characters.
-    let hostile = protocol::refuse_msg("id1", "io", &format!("bad\x1b[2Jthing{}", "x".repeat(1000)));
+    let hostile =
+        protocol::refuse_msg("id1", "io", &format!("bad\x1b[2Jthing{}", "x".repeat(1000)));
     let shown = refusal_text(&hostile).unwrap();
     assert!(!shown.chars().any(|c| c.is_control()), "{shown:?}");
     assert!(shown.chars().count() <= 300);
@@ -4870,7 +5001,10 @@ fn a_full_disk_is_named_with_both_sizes_never_called_corruption() {
     assert_eq!(token, "no_space");
     assert!(msg.contains("out of disk space"), "{msg}");
     assert!(msg.contains("needs") && msg.contains("has"), "{msg}");
-    assert!(!msg.contains("checksum") && !msg.contains("corrupt"), "{msg}");
+    assert!(
+        !msg.contains("checksum") && !msg.contains("corrupt"),
+        "{msg}"
+    );
     let (token, msg) = crate::recv_files::storage_refusal(
         Some(platform::StorageFailure::NameTooLong),
         "x.bin",
@@ -4889,7 +5023,10 @@ fn the_no_peer_hint_names_who_we_were_waiting_for() {
     use crate::send_cmd::no_peer_hint;
     // CLI to CLI: a device is another tunlion, never "the page".
     let to_dev = no_peer_hint(Some("laptop"), false, None);
-    assert!(to_dev.contains("'laptop'") && to_dev.contains("tunlion up"), "{to_dev}");
+    assert!(
+        to_dev.contains("'laptop'") && to_dev.contains("tunlion up"),
+        "{to_dev}"
+    );
     assert!(!to_dev.contains("page"), "{to_dev}");
     // Only a code can be opened in a browser.
     let code = no_peer_hint(None, true, None);
@@ -4909,13 +5046,25 @@ fn a_detached_up_never_follows_its_own_log() {
     let src = include_str!("up_logs.rs").replace("\r\n", "\n");
     let body = &src[src.find("pub(crate) async fn up_cmd").unwrap()..];
     let body = &body[..body.find("\n}\n").unwrap()];
-    assert!(body.contains("stdio_is_file(&console_log)"), "headless must compare the console with daemon.log");
-    assert!(body.contains("InstanceLock::try_acquire"), "the election must be the lock, not the pidfile");
+    assert!(
+        body.contains("stdio_is_file(&console_log)"),
+        "headless must compare the console with daemon.log"
+    );
+    assert!(
+        body.contains("InstanceLock::try_acquire"),
+        "the election must be the lock, not the pidfile"
+    );
     let lock_at = body.find("InstanceLock::try_acquire").unwrap();
     let pid_at = body.find("write_pidfile()").unwrap();
-    assert!(lock_at < pid_at, "the lock must be taken before the pidfile is written");
+    assert!(
+        lock_at < pid_at,
+        "the lock must be taken before the pidfile is written"
+    );
     let logs = &src[src.find("pub(crate) async fn logs_cmd").unwrap()..];
-    assert!(logs.contains("stdio_is_file(&console)"), "logs -f must refuse to follow its own output file");
+    assert!(
+        logs.contains("stdio_is_file(&console)"),
+        "logs -f must refuse to follow its own output file"
+    );
 }
 
 /// `exec bravo -- hostname` said "exec denied by bravo" about a decision this
@@ -4925,12 +5074,29 @@ fn a_detached_up_never_follows_its_own_log() {
 fn a_local_ceiling_refusal_says_it_was_decided_here_and_how_to_widen_it() {
     let caps = vec!["transfer".to_string(), "mount".to_string()];
     let m = crate::identity_state::ceiling_refusal_here("exec", "bravo", "shell", &caps);
-    assert!(m.starts_with("exec refused here, before contacting bravo"), "{m}");
+    assert!(
+        m.starts_with("exec refused here, before contacting bravo"),
+        "{m}"
+    );
     assert!(!m.contains("denied by bravo"), "{m}");
-    assert!(m.contains("(transfer, mount)") && m.contains("does not include shell"), "{m}");
-    assert!(m.contains("tunlion add --for bravo --allow transfer,mount,shell"), "{m}");
-    assert!(m.contains("tunlion reset -y") && m.contains("tunlion join --invite-file bravo-invite.txt"), "{m}");
-    let mount = crate::identity_state::ceiling_refusal_here("mount", "bravo", "mount", &["transfer".to_string()]);
+    assert!(
+        m.contains("(transfer, mount)") && m.contains("does not include shell"),
+        "{m}"
+    );
+    assert!(
+        m.contains("tunlion add --for bravo --allow transfer,mount,shell"),
+        "{m}"
+    );
+    assert!(
+        m.contains("tunlion reset -y") && m.contains("tunlion join --invite-file bravo-invite.txt"),
+        "{m}"
+    );
+    let mount = crate::identity_state::ceiling_refusal_here(
+        "mount",
+        "bravo",
+        "mount",
+        &["transfer".to_string()],
+    );
     assert!(mount.contains("--allow transfer,mount"), "{mount}");
 }
 
@@ -4994,7 +5160,7 @@ fn a_relay_peer_that_went_silent_is_not_present() {
 /// over a live link.
 #[test]
 fn a_roster_announcement_does_not_refresh_last_seen() {
-    let src = include_str!("recv_cmd.rs");
+    let src = include_str!("../../crates/filament-peerloop/src/recv/dispatch.rs");
     let at = src
         .find("known device '{n}' appeared, connecting\"")
         .expect("the known-device announcement branch exists");
@@ -5021,12 +5187,14 @@ fn every_printed_relink_chain_runs_against_a_store() {
         let cli = crate::Cli::try_parse_from(&argv)
             .unwrap_or_else(|e| panic!("`{step}` does not parse: {e}"));
         match cli.cmd {
-            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Forget { name }), .. }) => {
-                crate::fleet_support::forget_device(&name, now).map(|_| ())
-            }
-            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Rename { old, new }), .. }) => {
-                crate::fleet_support::rename_device(&old, &new)
-            }
+            Some(crate::Cmd::Devices {
+                action: Some(crate::DevicesAction::Forget { name }),
+                ..
+            }) => crate::fleet_support::forget_device(&name, now).map(|_| ()),
+            Some(crate::Cmd::Devices {
+                action: Some(crate::DevicesAction::Rename { old, new }),
+                ..
+            }) => crate::fleet_support::rename_device(&old, &new),
             // Steps for another machine, or that mint (add/join), are parsed
             // above; the store-side steps are the ones that dead-ended.
             _ => Ok(()),
@@ -5036,7 +5204,10 @@ fn every_printed_relink_chain_runs_against_a_store() {
         let dir = std::env::temp_dir().join(format!(
             "fil-chain-{tag}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
@@ -5064,9 +5235,17 @@ fn every_printed_relink_chain_runs_against_a_store() {
     for step in &steps {
         run(step, now).unwrap_or_else(|e| panic!("`{step}` from \"{hint}\" failed: {e}"));
     }
-    assert_eq!(crate::device_view::device_cert_for("p9-b").unwrap().device_pub, new.device_pub);
+    assert_eq!(
+        crate::device_view::device_cert_for("p9-b")
+            .unwrap()
+            .device_pub,
+        new.device_pub
+    );
     assert!(crate::device_view::device_cert_for("p9-b-2").is_none());
-    assert!(device_cert_revoked(&old.device_pub), "the forgotten live key stays refused");
+    assert!(
+        device_cert_revoked(&old.device_pub),
+        "the forgotten live key stays refused"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 
     // No successor yet, and `add <name>` on a taken name: the forget each
@@ -5079,7 +5258,10 @@ fn every_printed_relink_chain_runs_against_a_store() {
         for step in crate::reset_hints::hint_commands(&hint) {
             run(&step, now).unwrap_or_else(|e| panic!("`{step}` from \"{hint}\" failed: {e}"));
         }
-        assert!(crate::device_view::device_cert_for("p9-b").is_none(), "the name is free: {hint}");
+        assert!(
+            crate::device_view::device_cert_for("p9-b").is_none(),
+            "the name is free: {hint}"
+        );
         assert!(device_cert_revoked(&old.device_pub));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5113,7 +5295,10 @@ fn every_reenrolment_recipe_runs_as_printed_in_a_script() {
             .filter_map(|l| {
                 let t = l.trim_start();
                 let t = match t.strip_prefix("on ") {
-                    Some(rest) => rest.split_once(':').map(|(_, r)| r.trim_start()).unwrap_or(t),
+                    Some(rest) => rest
+                        .split_once(':')
+                        .map(|(_, r)| r.trim_start())
+                        .unwrap_or(t),
                     None => t,
                 };
                 t.starts_with("tunlion ").then(|| t.to_string())
@@ -5151,11 +5336,19 @@ fn every_reenrolment_recipe_runs_as_printed_in_a_script() {
                         ..
                     })
             );
-            assert!(!confirms || cli.yes, "{what}: `{cmd}` confirms and would fail in a script");
+            assert!(
+                !confirms || cli.yes,
+                "{what}: `{cmd}` confirms and would fail in a script"
+            );
         }
-        assert_eq!(cmds.last().map(String::as_str), Some("tunlion up --detach"), "{what}:\n{text}");
+        assert_eq!(
+            cmds.last().map(String::as_str),
+            Some("tunlion up --detach"),
+            "{what}:\n{text}"
+        );
         assert!(
-            cmds.iter().any(|c| c == "tunlion join --invite-file p9-b-invite.txt --name p9-b"),
+            cmds.iter()
+                .any(|c| c == "tunlion join --invite-file p9-b-invite.txt --name p9-b"),
             "{what}:\n{text}"
         );
 
@@ -5163,7 +5356,10 @@ fn every_reenrolment_recipe_runs_as_printed_in_a_script() {
         let dir = std::env::temp_dir().join(format!(
             "fil-recipe-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
@@ -5181,13 +5377,19 @@ fn every_reenrolment_recipe_runs_as_printed_in_a_script() {
         let forget = &cmds[0];
         let argv: Vec<&str> = forget.split_whitespace().collect();
         match crate::Cli::try_parse_from(&argv).unwrap().cmd {
-            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Forget { name }), .. }) => {
+            Some(crate::Cmd::Devices {
+                action: Some(crate::DevicesAction::Forget { name }),
+                ..
+            }) => {
                 crate::fleet_support::forget_device(&name, now)
                     .unwrap_or_else(|e| panic!("{what}: `{forget}` failed: {e}"));
             }
             _ => panic!("{what}: the recipe does not open with a forget: `{forget}`"),
         }
-        assert!(crate::device_view::device_cert_for("p9-b").is_none(), "{what}: the name is still held");
+        assert!(
+            crate::device_view::device_cert_for("p9-b").is_none(),
+            "{what}: the name is still held"
+        );
         unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5201,11 +5403,17 @@ fn a_join_filed_under_another_name_says_so() {
     use clap::Parser;
     assert_eq!(crate::enrollment::renamed_note("beta", "beta"), None);
     let note = crate::enrollment::renamed_note("beta", "beta-2").expect("a renamed join warns");
-    assert!(note.contains("'beta'") && note.contains("'beta-2'"), "{note}");
+    assert!(
+        note.contains("'beta'") && note.contains("'beta-2'"),
+        "{note}"
+    );
     let tail = &note[note.find("tunlion ").unwrap()..];
     for cmd in tail.split(" && ") {
         let argv: Vec<&str> = cmd.split_whitespace().collect();
-        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "`{cmd}` does not parse");
+        assert!(
+            crate::Cli::try_parse_from(&argv).is_ok(),
+            "`{cmd}` does not parse"
+        );
     }
 }
 
@@ -5230,7 +5438,10 @@ fn every_reenrolment_command_runs_in_a_script_as_printed() {
         .filter_map(|l| {
             let t = l.trim_start();
             let t = match t.strip_prefix("on ") {
-                Some(rest) => rest.split_once(':').map(|(_, r)| r.trim_start()).unwrap_or(t),
+                Some(rest) => rest
+                    .split_once(':')
+                    .map(|(_, r)| r.trim_start())
+                    .unwrap_or(t),
                 None => t,
             };
             t.starts_with("tunlion ").then_some(t)
@@ -5251,7 +5462,10 @@ fn every_reenrolment_command_runs_in_a_script_as_printed() {
                     ..
                 })
         );
-        assert!(!asks || cli.yes, "`{cmd}` asks for confirmation and would fail in a script");
+        assert!(
+            !asks || cli.yes,
+            "`{cmd}` asks for confirmation and would fail in a script"
+        );
     }
     assert_eq!(cmds.last().copied(), Some("tunlion up --detach"), "{s}");
 }
@@ -5267,16 +5481,34 @@ fn a_barred_device_is_named_for_why_and_live_devices_are_not_barred() {
         json!({ "name": "gone-by", "principalKind": "delegated", "principalExpires": 10, "principalCeiling": ["transfer"] }),
         json!({ "name": "fine" }),
     ];
-    assert_eq!(request_bar_in(&store, "rev", now), Some(RequestBar::Revoked));
-    assert!(matches!(request_bar_in(&store, "gone-by", now), Some(RequestBar::Expired(_))));
-    assert_eq!(request_bar_in(&store, "forgotten", now), Some(RequestBar::Forgotten));
+    assert_eq!(
+        request_bar_in(&store, "rev", now),
+        Some(RequestBar::Revoked)
+    );
+    assert!(matches!(
+        request_bar_in(&store, "gone-by", now),
+        Some(RequestBar::Expired(_))
+    ));
+    assert_eq!(
+        request_bar_in(&store, "forgotten", now),
+        Some(RequestBar::Forgotten)
+    );
     assert_eq!(request_bar_in(&store, "fine", now), None);
 
     let r = request_bar_refusal(2, "guest2", RequestBar::Revoked);
-    assert!(r.contains("revoked") && r.contains("tunlion devices restore guest2"), "{r}");
+    assert!(
+        r.contains("revoked") && r.contains("tunlion devices restore guest2"),
+        "{r}"
+    );
     let e = request_bar_refusal(2, "guest2", RequestBar::Expired(10));
-    assert!(e.contains("expired") && e.contains("tunlion add --for guest2"), "{e}");
-    assert!(!e.contains("approve"), "an expired device is never told to approve: {e}");
+    assert!(
+        e.contains("expired") && e.contains("tunlion add --for guest2"),
+        "{e}"
+    );
+    assert!(
+        !e.contains("approve"),
+        "an expired device is never told to approve: {e}"
+    );
 }
 
 /// The browser's wasm PAKE binds `pake::BROWSER_SCOPE` into its confirmation
@@ -5286,5 +5518,8 @@ fn a_barred_device_is_named_for_why_and_live_devices_are_not_barred() {
 /// from 2026-07-26 until this test existed.
 #[test]
 fn browser_pake_scope_matches_the_cli_code_flows() {
-    assert_eq!(crate::pake::BROWSER_SCOPE, identity::IntroScope::Device.to_byte());
+    assert_eq!(
+        crate::pake::BROWSER_SCOPE,
+        identity::IntroScope::Device.to_byte()
+    );
 }
