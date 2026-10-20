@@ -17,8 +17,8 @@ path = "src/main.rs"
 
 [features]
 default = ["mesh", "mount-server", "forward-server", "dispatch"]
-mesh = ["filament-peerloop/mesh"]
-mount-server = ["filament-peerloop/mount-server"]
+mesh = ["filament-peerloop/mesh", "dispatch"]
+mount-server = ["filament-peerloop/mount-server", "dispatch"]
 # Inbound local forward serving: dial a peer-requested local socket. Default-on
 # for the CLI; reduced engine profiles omit the dial implementation.
 forward-server = ["filament-peerloop/forward-server"]
