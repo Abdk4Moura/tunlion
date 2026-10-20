@@ -664,14 +664,7 @@ impl RecvServers for CliRecv {
         muxes: &mut HashMap<String, Arc<Mux>>,
         share_root: &Path,
     ) {
-        #[cfg(feature = "mount-server")]
-        {
-            let _ = crate::mount_recv::handle_mount_open(conn, pid, v, muxes, share_root).await;
-        }
-        #[cfg(not(feature = "mount-server"))]
-        {
-            let _ = (conn, pid, v, muxes, share_root);
-        }
+        crate::platform::open_mount(conn, pid, v, muxes, share_root).await;
     }
 
     async fn ssh_sign(

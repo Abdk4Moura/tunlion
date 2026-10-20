@@ -101,6 +101,26 @@ pub(crate) async fn mount_health(req: Req, _mounts: &crate::DaemonMounts) {
     drop(req);
 }
 
+#[cfg(feature = "mount-server")]
+pub(crate) async fn open_mount(
+    conn: &mut Conn,
+    pid: &str,
+    v: &serde_json::Value,
+    muxes: &mut std::collections::HashMap<String, std::sync::Arc<filament_peerloop::l2::Mux>>,
+    share_root: &std::path::Path,
+) {
+    let _ = crate::mount_recv::handle_mount_open(conn, pid, v, muxes, share_root).await;
+}
+#[cfg(not(feature = "mount-server"))]
+pub(crate) async fn open_mount(
+    _conn: &mut Conn,
+    _pid: &str,
+    _v: &serde_json::Value,
+    _muxes: &mut std::collections::HashMap<String, std::sync::Arc<filament_peerloop::l2::Mux>>,
+    _share_root: &std::path::Path,
+) {
+}
+
 #[cfg(unix)]
 pub(crate) fn remove_mount(host: &dyn HostServices, local: &str) {
     let _ = host.remove_mount(local);
