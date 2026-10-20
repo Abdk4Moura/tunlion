@@ -77,9 +77,17 @@ pub(crate) fn link_died_error(peer: &str, detail: &str) -> anyhow::Error {
 }
 
 pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
-    // One implementation: the identity service owns the stored-record lookup,
-    // the display-name fallback and the on-demand self-cert mint.
-    crate::identity_lifecycle::service().local_device_cert()
+    // One implementation: the library owns the stored-record lookup, the
+    // display-name fallback and the on-demand self-cert mint. Calling the free
+    // function (not constructing an IdentityService) keeps a receive loop's
+    // per-instance drop-once state intact for callers that only need the cert.
+    filament_peerloop::recv::identity::local_device_cert(
+        &crate::devices_store::store(),
+        &filament_peerloop::recv::store::OverlayKey::new(
+            crate::platform::Paths::config_path("overlay.ed25519"),
+        ),
+        &display_name(),
+    )
 }
 
 /// Restores the pre-U1 precondition for scripts that want to fail fast: with

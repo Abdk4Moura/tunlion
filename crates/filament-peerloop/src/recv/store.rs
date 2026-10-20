@@ -213,13 +213,50 @@ impl std::fmt::Display for CorruptStore {
 impl std::error::Error for CorruptStore {}
 
 fn create_private_dir_all(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Walk up to the deepest existing ancestor, then create downwards, so
+        // each directory WE create is tightened and nothing pre-existing is.
+        // `create_dir_all` alone asks for 0777 and lets umask decide, which
+        // under `umask 0000` leaves the config dir and identity/ world-writable.
+        let mut missing = Vec::new();
+        let mut cur = Some(dir);
+        while let Some(p) = cur {
+            if p.as_os_str().is_empty() || p.exists() {
+                break;
+            }
+            missing.push(p.to_path_buf());
+            cur = p.parent();
+        }
+        for p in missing.iter().rev() {
+            match std::fs::DirBuilder::new().mode(0o700).create(p) {
+                Ok(()) => tighten_new_dir(p),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && p.is_dir() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+fn tighten_new_dir(dir: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -838,8 +875,17 @@ impl DeviceStore {
         if let Ok(Some(key)) = UserKey::load(&self.keystore()) {
             return Some(key.public_key_bytes());
         }
-        let local_device_pub = local_device_pub?;
-        self.own_cert_ignoring_expiry(local_device_pub)
+        // The old process path did not require the overlay key to be readable
+        // before reading the certificate's issuer: a joined device with a
+        // broken overlay key still answered "who do I answer to". Keep that
+        // safe fallback, then prefer the local-key-matched certificate when
+        // the overlay key is available.
+        if let Some(cert) = local_device_pub.and_then(|p| self.own_cert_ignoring_expiry(p)) {
+            return Some(cert.user_pub);
+        }
+        self.local_device_cert_record()
+            .as_ref()
+            .and_then(|record| DeviceCert::from_json(&record["cert"]))
             .map(|cert| cert.user_pub)
     }
 
@@ -975,8 +1021,15 @@ impl DeviceStore {
     /// Merge fleet policy received from a peer, keeping only what the OWNER
     /// signed. Returns how many were newly stored.
     pub fn merge_owner_cap_ops(&self, ops: &[Value]) -> usize {
+        self.merge_owner_cap_ops_outcome(ops).unwrap_or(0)
+    }
+
+    /// The diagnosable form of [`DeviceStore::merge_owner_cap_ops`]. A storage
+    /// failure is returned to the adapter, which can log it; the port method
+    /// keeps its `usize` contract and reports "nothing merged" (0) on error.
+    pub fn merge_owner_cap_ops_outcome(&self, ops: &[Value]) -> anyhow::Result<usize> {
         let Some(owner) = self.owner_pub else {
-            return 0;
+            return Ok(0);
         };
         let mut store = self.load_cap_store();
         let now = cap_now_secs();
@@ -998,13 +1051,10 @@ impl DeviceStore {
             }
         }
         if added > 0 {
-            if self.save_cap_store(&store).is_err() {
-                // Same as the CLI: a storage failure is reported to the caller
-                // as "nothing merged", never as a partial success.
-                return 0;
-            }
+            self.save_cap_store(&store)
+                .map_err(|e| anyhow::anyhow!("fleet policy not stored: {e}"))?;
         }
-        added
+        Ok(added)
     }
 }
 
@@ -1670,5 +1720,197 @@ mod tests {
         assert_eq!(sanitize_device_name(dirty), "pixel");
         assert_eq!(sanitize_device_name("  lap\u{7}top \n"), "laptop");
         assert_eq!(sanitize_device_name("agboola@pop-os"), "agboola@pop-os");
+    }
+}
+
+#[cfg(test)]
+mod store_guards {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{Arc, Barrier};
+
+    fn unique(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fil-guard-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn competing_writers_lose_no_update() {
+        let root = unique("writers");
+        let store = DeviceStore::open(&root);
+        store
+            .with_devices_mut(|arr| {
+                arr.push(json!({"name": "base", "secret": "s0"}));
+                Ok(())
+            })
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut threads = Vec::new();
+        for i in 0..2 {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .with_devices_mut(|arr| {
+                        arr.push(json!({"name": format!("w{i}"), "secret": format!("s{i}")}));
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let names: Vec<String> = store
+            .devices_records()
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(names.contains(&"base".to_string()));
+        assert!(names.contains(&"w0".to_string()));
+        assert!(names.contains(&"w1".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_corrupt_store_is_refused_and_never_overwritten() {
+        let root = unique("corrupt");
+        std::fs::create_dir_all(&root).unwrap();
+        let p = root.join(DEVICES_FILE);
+        let garbage = b"{garbage";
+        std::fs::write(&p, garbage).unwrap();
+        let store = DeviceStore::open(&root);
+        let error = store.devices_remove("alpha").unwrap_err();
+        assert!(error.downcast_ref::<CorruptStore>().is_some());
+        assert_eq!(std::fs::read(&p).unwrap(), garbage);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cap_store_keeps_a_backup_and_refuses_to_write_over_damage() {
+        let root = unique("caps");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        let p = store.cap_store_path();
+        std::fs::write(&p, br#"[{"a":1}]"#).unwrap();
+        store.save_cap_store(&[json!({"b": 2})]).unwrap();
+        assert!(std::fs::read_to_string(&p).unwrap().contains("\"b\""));
+        assert!(std::fs::read_to_string(backup_path(&p))
+            .unwrap()
+            .contains("\"a\""));
+
+        let garbage = b"{garbage";
+        std::fs::write(&p, garbage).unwrap();
+        assert!(store.save_cap_store(&[json!({"c": 3})]).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), garbage);
+
+        // A failed backup is best effort and never blocks the write it protects.
+        std::fs::write(&p, br#"[{"ok":true}]"#).unwrap();
+        let bak = backup_path(&p);
+        let _ = std::fs::remove_file(&bak);
+        std::fs::create_dir(&bak).unwrap();
+        assert!(store.save_cap_store(&[json!({"d": 4})]).is_ok());
+        assert!(std::fs::read_to_string(&p).unwrap().contains("\"d\""));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn armed_state_needs_a_key_id_and_does_not_cross_instances() {
+        let root = unique("armed");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let future = cap_now_secs() + 600;
+        std::fs::write(
+            a.join("armed.json"),
+            json!([{"key_id": "aa".repeat(32), "expires": future}]).to_string(),
+        )
+        .unwrap();
+        let store_a = DeviceStore::open(&a);
+        let store_b = DeviceStore::open(&b);
+        assert!(store_a.is_armed());
+        assert!(!store_b.is_armed());
+
+        std::fs::write(
+            a.join("armed.json"),
+            json!([{"expires": future}]).to_string(),
+        )
+        .unwrap();
+        assert!(
+            !store_a.is_armed(),
+            "an entry without a key id is not armed"
+        );
+        std::fs::write(
+            a.join("armed.json"),
+            json!([{"key_id": "aa".repeat(32), "expires": cap_now_secs() - 1}]).to_string(),
+        )
+        .unwrap();
+        assert!(!store_a.is_armed(), "an expired entry is not armed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_pub_falls_back_to_the_local_certificate_issuer() {
+        let root = unique("owner-fallback");
+        let store = DeviceStore::open(&root);
+        let user = UserKey::generate().unwrap();
+        let cert = DeviceCert::certify(&user, [7u8; 32], now_secs(), 60).unwrap();
+        store
+            .write_local_device_cert_record(&json!({"name": "joined", "cert": cert.to_json()}))
+            .unwrap();
+        assert_eq!(
+            store.owner_pub_for_resources(None),
+            Some(user.public_key_bytes()),
+            "a broken/unreadable overlay key must not hide the certificate issuer"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_directory_path_is_a_noop() {
+        create_private_dir_all(Path::new("")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_roots_are_private_and_existing_ancestors_are_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = unique("perms");
+        let deep = root.join("a").join("b").join("c");
+        create_private_dir_all(&deep).unwrap();
+        for path in [root.join("a"), root.join("a").join("b"), deep] {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} must be owner-only",
+                path.display()
+            );
+        }
+        let existing = root.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = existing.join("child");
+        create_private_dir_all(&child).unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "an existing ancestor's mode is the user's choice"
+        );
+        assert_eq!(
+            std::fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

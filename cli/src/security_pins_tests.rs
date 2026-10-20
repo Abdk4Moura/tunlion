@@ -233,6 +233,30 @@ fn unreadable_devices_store_is_not_overwritten() {
     })
 }
 
+/// A direct store mutation (not routed through `devices_store::with_devices_mut`)
+/// must still classify as the same exit-2 / `corrupt_state` answer. The library
+/// returns its typed `CorruptStore`; the CLI's classifier is what makes every
+/// adapter path agree.
+#[test]
+fn a_direct_mutation_over_a_corrupt_store_is_still_corrupt_state() {
+    with_cfg(|dir| {
+        let p = dir.join("devices.json");
+        let garbage = b"{garbage";
+        std::fs::write(&p, garbage).unwrap();
+        let e = crate::device_caps::mark_bounded_cap_source("alpha", "shell", "owner")
+            .expect_err("a direct mutation proceeded over a corrupt store");
+        assert_eq!(
+            crate::exit_codes::classify(&e),
+            crate::exit_codes::ExitKind::Usage
+        );
+        assert_eq!(
+            crate::exit_codes::json_code(&e),
+            crate::exit_codes::CORRUPT_STATE
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), garbage);
+    })
+}
+
 /// A new device whose name collides (case-insensitively) with existing ones
 /// lands on a fresh suffixed name and never on an existing record.
 #[test]

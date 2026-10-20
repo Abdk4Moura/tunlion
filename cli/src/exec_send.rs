@@ -262,9 +262,14 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
     // keeps a signal's handler installed once registered, so a listener per
     // attempt would leave the gaps between attempts swallowing Ctrl-C.
     let mut interrupted: Interrupted = Box::pin(interruption());
+    // One identity service for the whole invocation, retries included: the
+    // drop-once bookkeeping belongs to the flow, not to one attempt.
+    let identity = crate::identity_lifecycle::service_with_log(std::sync::Arc::new(
+        crate::host_impl::CliLog,
+    ));
     loop {
         attempt += 1;
-        match exec_once(server, peer, relay, &opts, &mut interrupted).await {
+        match exec_once(server, peer, relay, &opts, &mut interrupted, &identity).await {
             Ok(code) => return Ok(code),
             Err(e)
                 if attempt < ATTEMPTS
@@ -297,6 +302,7 @@ async fn exec_once(
     relay: bool,
     opts: &ExecOpts,
     interrupted: &mut Interrupted,
+    identity: &filament_peerloop::recv::identity::IdentityService,
 ) -> Result<i32> {
     // Signals are handled from the first moment, not only once the session
     // runs: a SIGTERM during bring-up or the open used to take the default
@@ -381,7 +387,7 @@ async fn exec_once(
                     // comment states which key is which, and why the path can
                     // only ever sign as itself.
                     if v.get("type").and_then(|t| t.as_str()) == Some("identity-nonce-challenge") {
-                        respond_to_identity_challenge(&t, &v).await;
+                        respond_to_identity_challenge(identity, &t, &v).await;
                     }
                     if v.get("type").and_then(|t| t.as_str()) == Some("exec-open-ack")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
@@ -559,7 +565,7 @@ async fn exec_once(
                         if v.get("type").and_then(|t| t.as_str())
                             == Some("identity-nonce-challenge")
                         {
-                            respond_to_identity_challenge(&t, &v).await;
+                            respond_to_identity_challenge(identity, &t, &v).await;
                         }
                         if v.get("type").and_then(|t| t.as_str()) == Some("exec-close")
                             && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)

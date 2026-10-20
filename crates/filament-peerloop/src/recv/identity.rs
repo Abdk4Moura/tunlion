@@ -94,6 +94,15 @@ impl IdentityService {
         ));
     }
 
+    /// The one invalid-expose drop path: one user-visible line per
+    /// `(pid, why)` for this instance, plus a debug line for every occurrence.
+    fn reject_expose(&self, pid: &str, why: &'static str) -> bool {
+        self.note_drop(pid, why);
+        self.log
+            .debug(&format!("identity-expose dropped for {pid}: {why}"));
+        false
+    }
+
     /// Whether a recorded challenge hold has served its whole deadline. Pure.
     pub fn hold_expired(&self, deadline: Instant, now: Instant) -> bool {
         now >= deadline
@@ -102,23 +111,7 @@ impl IdentityService {
     /// This device's certificate, minting the self-cert on demand exactly where
     /// the CLI always did.
     pub fn local_device_cert(&self) -> Option<DeviceCert> {
-        let overlay_pub = self.overlay.public_key_bytes().ok();
-        if let Some(cert) = self
-            .store
-            .local_device_cert(overlay_pub.as_ref(), &self.display_name)
-        {
-            return Some(cert);
-        }
-        if let (Ok(Some(user_key)), Ok(overlay_pub)) = (
-            UserKey::load(&self.store.keystore()),
-            self.overlay.public_key_bytes(),
-        ) {
-            if let Ok(cert) = DeviceCert::certify(&user_key, overlay_pub, now_secs(), CERT_TTL_SECS)
-            {
-                return Some(cert);
-            }
-        }
-        None
+        local_device_cert(&self.store, &self.overlay, &self.display_name)
     }
 
     async fn send_identity_challenge(
@@ -210,12 +203,7 @@ impl IdentityService {
         v: &Value,
         identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool {
-        let fail = |why: &'static str| {
-            self.note_drop(pid, why);
-            self.log
-                .debug(&format!("identity-expose dropped for {pid}: {why}"));
-            false
-        };
+        let fail = |why: &'static str| self.reject_expose(pid, why);
         let nonce_hex = v["nonce"].as_str().unwrap_or_default();
         let Ok(nonce_bytes) = hex::decode(nonce_hex) else {
             return fail("malformed nonce");
@@ -634,6 +622,29 @@ impl IdentityService {
     }
 }
 
+/// This device's certificate, minting the self-cert on demand exactly where
+/// the CLI always did. Free-standing so a caller that only needs the cert (the
+/// CLI's one-shot commands) does not construct an IdentityService and thereby
+/// reset its drop-once state.
+pub fn local_device_cert(
+    store: &DeviceStore,
+    overlay: &OverlayKey,
+    display_name: &str,
+) -> Option<DeviceCert> {
+    let overlay_pub = overlay.public_key_bytes().ok();
+    if let Some(cert) = store.local_device_cert(overlay_pub.as_ref(), display_name) {
+        return Some(cert);
+    }
+    if let (Ok(Some(user_key)), Ok(overlay_pub)) =
+        (UserKey::load(&store.keystore()), overlay.public_key_bytes())
+    {
+        if let Ok(cert) = DeviceCert::certify(&user_key, overlay_pub, now_secs(), CERT_TTL_SECS) {
+            return Some(cert);
+        }
+    }
+    None
+}
+
 /// The intro scope a vouch stores. A vouch introduces a DEVICE, not a user.
 pub const VOUCH_CERT_SCOPE: u8 = 0x01; // IntroScope::Device
 
@@ -646,5 +657,55 @@ fn short_duration(secs: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::{Level, VecLog};
+
+    fn service(root: &std::path::Path, log: Arc<VecLog>) -> IdentityService {
+        IdentityService::new(
+            DeviceStore::open(root),
+            OverlayKey::new(root.join("overlay.ed25519")),
+            "test-device",
+            0,
+            log,
+        )
+    }
+
+    #[test]
+    fn a_drop_is_logged_once_per_instance_and_instances_are_isolated() {
+        let root = std::env::temp_dir().join(format!("fil-id-{}-{}", std::process::id(), line!()));
+        let log = Arc::new(VecLog::new());
+        let one = service(&root, log.clone());
+        assert!(!one.reject_expose("peer", "malformed nonce"));
+        assert!(!one.reject_expose("peer", "malformed nonce"));
+        let lines = log.take();
+        assert_eq!(
+            lines.iter().filter(|(l, _)| *l == Level::Info).count(),
+            1,
+            "one drop line for the instance, not one per call"
+        );
+        assert_eq!(
+            lines.iter().filter(|(l, _)| *l == Level::Debug).count(),
+            2,
+            "the per-occurrence debug line is preserved"
+        );
+
+        let second_log = Arc::new(VecLog::new());
+        let two = service(&root, second_log.clone());
+        assert!(!two.reject_expose("peer", "malformed nonce"));
+        assert_eq!(
+            second_log
+                .take()
+                .iter()
+                .filter(|(l, _)| *l == Level::Info)
+                .count(),
+            1,
+            "a second service has its own drop-once state"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -45,35 +45,35 @@ pub(crate) fn service_with_log(log: Arc<dyn LogSink>) -> IdentityService {
     )
 }
 
-/// The process-wide terminal sink. Used by the one-shot sender, which has no
-/// `CliRecv` to borrow a sink from.
-pub(crate) fn service() -> IdentityService {
-    service_with_log(Arc::new(crate::host_impl::CliLog))
-}
-
 pub(crate) async fn issue_proven_challenge_and_hold(
+    identity: &IdentityService,
     conn: &crate::Conn,
     pid: &str,
     t: &Arc<dyn Transport>,
     pending_proven: &Arc<std::sync::Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
     identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
 ) {
-    service()
+    identity
         .issue_proven_challenge_and_hold(conn, pid, t, pending_proven, identity_nonces)
         .await
 }
 
-pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Value) {
-    service().respond_to_identity_challenge(t, v).await
+pub(crate) async fn respond_to_identity_challenge(
+    identity: &IdentityService,
+    t: &Arc<dyn Transport>,
+    v: &Value,
+) {
+    identity.respond_to_identity_challenge(t, v).await
 }
 
 pub(crate) fn handle_identity_expose(
+    identity: &IdentityService,
     conn: &mut crate::Conn,
     pid: &str,
     v: &Value,
     identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
 ) -> bool {
-    service().handle_identity_expose(conn, pid, v, identity_nonces)
+    identity.handle_identity_expose(conn, pid, v, identity_nonces)
 }
 
 pub(crate) fn hold_expired(deadline: Instant, now: Instant) -> bool {
@@ -81,11 +81,12 @@ pub(crate) fn hold_expired(deadline: Instant, now: Instant) -> bool {
 }
 
 pub(crate) async fn resend_identity_challenge(
+    identity: &IdentityService,
     conn: &crate::Conn,
     pid: &str,
     identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
 ) -> bool {
-    service()
+    identity
         .resend_identity_challenge(conn, pid, identity_nonces)
         .await
 }

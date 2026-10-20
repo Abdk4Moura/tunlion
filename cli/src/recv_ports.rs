@@ -25,6 +25,7 @@ use filament_peerloop::l2::forward;
 use filament_peerloop::l2::Mux;
 use filament_peerloop::recv::dispatch::{self, settle_timeout_reason};
 use filament_peerloop::recv::dispatch::{ParkKind, ParkedOpen};
+use filament_peerloop::recv::identity::IdentityService;
 use filament_peerloop::recv::ports::{
     RawMode, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvPrompt, RecvServers, RecvStore,
 };
@@ -46,6 +47,9 @@ use tokio::sync::mpsc;
 
 pub struct CliRecv {
     pub log: Arc<dyn LogSink>,
+    /// One identity service for this receive loop. Its drop-once state is
+    /// per-instance and must outlive individual dispatch calls.
+    pub identity: IdentityService,
     pub pty_sessions: std::sync::Arc<l2::PtySessions>,
     pub warm_ptys: crate::WarmPtys,
     pub liveness: crate::LivenessProbes,
@@ -58,8 +62,10 @@ pub struct CliRecv {
 
 impl Default for CliRecv {
     fn default() -> Self {
+        let log: Arc<dyn LogSink> = Arc::new(filament_peerloop::host::NoLog);
         Self {
-            log: Arc::new(filament_peerloop::host::NoLog),
+            identity: crate::identity_lifecycle::service_with_log(log.clone()),
+            log,
             pty_sessions: l2::PtySessions::new(),
             warm_ptys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             liveness: crate::LivenessProbes::new(),
@@ -77,15 +83,15 @@ impl Default for CliRecv {
 
 impl CliRecv {
     pub fn new(log: Arc<dyn LogSink>) -> Self {
-        Self {
-            log,
-            ..Self::default()
-        }
+        let mut recv = Self::default();
+        recv.log = log;
+        recv.identity = crate::identity_lifecycle::service_with_log(recv.log.clone());
+        recv
     }
 
     /// The identity service for this receive loop, sharing its log sink.
-    fn identity(&self) -> filament_peerloop::recv::identity::IdentityService {
-        crate::identity_lifecycle::service_with_log(self.log.clone())
+    fn identity(&self) -> &IdentityService {
+        &self.identity
     }
 }
 
@@ -113,10 +119,13 @@ impl RecvIdentity for CliRecv {
         v: &Value,
         identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool {
-        self.identity().handle_identity_expose(conn, pid, v, identity_nonces)
+        self.identity()
+            .handle_identity_expose(conn, pid, v, identity_nonces)
     }
     fn store_provisional_identity(&self, name: &str, cert: &identity::DeviceCert) -> Result<()> {
-        self.identity().store().store_provisional_identity(name, cert)
+        self.identity()
+            .store()
+            .store_provisional_identity(name, cert)
     }
     fn load_provisional_identity(&self, name: &str) -> Option<identity::DeviceCert> {
         self.identity().store().load_provisional_identity(name)

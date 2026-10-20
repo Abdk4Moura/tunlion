@@ -15,7 +15,7 @@ use crate::device_view::device_cert_revoked;
 use crate::devices_store::{devices_load, devices_path, with_devices_mut};
 use crate::{
     DeadlineClock, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, fleet_ui, identity,
-    load_owner_key,
+    load_owner_key, ui,
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -60,14 +60,23 @@ pub(crate) fn owner_signed_cap_ops() -> Vec<Value> {
 /// and duplicates are skipped so repeated pushes are idempotent. Returns how many
 /// were newly stored.
 pub(crate) fn merge_owner_cap_ops(ops: &[Value]) -> usize {
-    let added = crate::devices_store::store_with_owner().merge_owner_cap_ops(ops);
-    if added > 0 {
-        // The CLI keeps a process-local cap-store read cache; the library writes
-        // the same `caps.json` through the same atomic writer, so drop the cache
-        // exactly where `save_cap_store` used to.
-        crate::capability::invalidate_cap_cache();
+    match crate::devices_store::store_with_owner().merge_owner_cap_ops_outcome(ops) {
+        Ok(added) => {
+            if added > 0 {
+                // The CLI keeps a process-local cap-store read cache; the library
+                // writes the same `caps.json` through the same atomic writer, so
+                // drop the cache exactly where `save_cap_store` used to.
+                crate::capability::invalidate_cap_cache();
+            }
+            added
+        }
+        Err(e) => {
+            // The library has no terminal sink; the adapter keeps the old debug
+            // line for a fleet policy that could not be stored.
+            ui::debug(&format!("{e}"));
+            0
+        }
     }
-    added
 }
 
 pub(crate) fn owner_cap_header() -> Option<Value> {
