@@ -29,12 +29,12 @@ pub use mux::{
     ExecCtl, L2_SID_BASE, MAX_STREAMS_PER_LINK, Mux, OpenOutcome, OpenVerdict, PipeItem,
     TreeSignal, is_l2_sid, serve_stream, wire_sid,
 };
+pub use warm::{open_stream, open_stream_verified_reason, WarmOpen};
 #[cfg(unix)]
 pub use warm::{
-    open_pty_stream_verified, open_stream_verified_reason, serve_opened_stream,
-    serve_verified_stream, warm_verify_window, WarmOpen, WarmPtyVerdict,
+    open_pty_stream_verified, serve_opened_stream, serve_verified_stream, warm_verify_window,
+    WarmPtyVerdict,
 };
-pub use warm::open_stream;
 
 /// Process-wide live-PTY cap shared by acceptors and hosts.
 pub const MAX_PTYS_GLOBAL: usize = 32;
