@@ -143,6 +143,10 @@ pub async fn open_sync(
                         dry_run,
                         stream: rx,
                         max_record_bytes: crate::sync::MAX_SYNC_RECORD_BYTES,
+                        #[cfg(test)]
+                        finalization_gate: None,
+                        #[cfg(test)]
+                        staging_gate: None,
                     },
                 );
                 return Some((sid, crate::recv::dispatch::SyncTask(task)));

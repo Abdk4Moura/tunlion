@@ -41,6 +41,7 @@ use crate::shell_gate::PeerAuthz;
 use crate::shell_gate::ShellPolicy;
 use crate::{refusal, test_hooks};
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use filament_cap::capability as cap;
 #[cfg(feature = "fleet")]
 use filament_fleet as fleet;
@@ -968,16 +969,10 @@ impl RecvCleanup {
     }
 }
 
-pub fn report_sync_join(
-    log: &dyn LogSink,
-    pid: &str,
-    sid: u32,
-    result: Result<std::result::Result<(), String>, tokio::task::JoinError>,
-) {
+pub fn report_sync_join(log: &dyn LogSink, pid: &str, sid: u32, result: Result<(), String>) {
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => log.say(&format!("sync: {pid}/{sid} ended: {error}")),
-        Err(error) => log.say(&format!("sync: {pid}/{sid} server task failed: {error}")),
+        Ok(()) => {}
+        Err(error) => log.say(&format!("sync: {pid}/{sid} ended: {error}")),
     }
 }
 
@@ -4783,7 +4778,7 @@ async fn recv_run(
                     let _ = t
                         .send_control(&json!({
                             "type": "l3-nonce",
-                            "nonce": b64(&nonce),
+                            "nonce": base64::engine::general_purpose::STANDARD.encode(&nonce),
                         }))
                         .await;
                 }
@@ -8948,7 +8943,7 @@ fn nonce_binding(
 ) -> Option<Vec<u8>> {
     if t.as_any().is::<net::DataChannelTransport>() {
         let (a, b) = fps?;
-        Some(filament_overlay::dtls_channel_binding(a, b, nonce))
+        Some(dtls_channel_binding(a, b, nonce))
     } else {
         Some(nonce.to_vec())
     }
@@ -8972,6 +8967,22 @@ fn in_binding(
 ) -> Option<Vec<u8>> {
     t.channel_binding()
         .or_else(|| ours.get(pid).and_then(|n| nonce_binding(t, fps, n)))
+}
+
+fn dtls_channel_binding(fp_a: &str, fp_b: &str, nonce: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    const LABEL: &[u8] = b"filament/dtls-link-binding/v1\0";
+    let a = fp_a.trim().to_ascii_uppercase();
+    let b = fp_b.trim().to_ascii_uppercase();
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = Sha256::new();
+    h.update(LABEL);
+    h.update((lo.len() as u32).to_be_bytes());
+    h.update(lo.as_bytes());
+    h.update((hi.len() as u32).to_be_bytes());
+    h.update(hi.as_bytes());
+    h.update(nonce);
+    h.finalize().to_vec()
 }
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
