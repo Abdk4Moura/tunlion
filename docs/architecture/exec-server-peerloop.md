@@ -1,8 +1,9 @@
 # Exec acceptor in `filament-peerloop`
 
 Status: implementation branch `work/exec-server-peerloop`, rebased onto #542
-`7748ab1fe554785b0bcecef2c81b271f6eb7fd11` (the review-approved branch was
-`b77dbcb2` on the earlier `e86ed8ee` base).
+`bfd097e9fee56b58320cfe0908b00eeecec5ba78`. The review-approved branch was
+`b77dbcb2` on the earlier `e86ed8ee` base; the remote verification below ran on
+the same exec code at `afb631e5` over `7748ab1f`.
 
 ## What moved
 
@@ -75,3 +76,26 @@ that port rather than reimplemented in the exec module.
 - CI compiles the library/CLI with `exec-server` off in the existing Android
   boundary jobs. The remote worker additionally ran
   `--no-default-features --features exec-server` to prove feature implication.
+
+## Remote verification (2026-10-20)
+
+Tested source `afb631e5df240660eed73caf115c2509c87c79f3`, tarball
+`exec-server-afb631e5df24.tar.gz` (sha256
+`71469b442b95d40d06c032ef02ec190c01bfa6997b03ec4cdfc1ac360a08cff7`).
+
+- `cargo test -p filament-peerloop --lib --locked` — 372 passed.
+- `cargo test -p filament-peerloop --lib --locked --no-default-features
+  --features exec-server` — 281 passed (proves `exec-server` implies `dispatch`).
+- `cargo test -p filament-peerloop --lib --locked --no-default-features
+  --features dispatch` — 277 passed, including both reduced-refusal tests.
+- `cargo check -p filament-cli --locked --no-default-features --features
+  mesh,mount-server` — passed.
+- Release binary from the same source + `cli/tests/exec-gates.sh` — **21/21
+  passed** (argv/streams/stdin/EPIPE/exit/signal/bulk/rsync/initiator death/
+  revocation/daemon kill/forget/shell-user).
+
+Worker artifacts: `/home/runner/work/_temp/tunlion-work/results/exec-server-afb631e5df24/`.
+The shared `build.lock` was held by an unrelated invisible job during this run,
+so the job used its own target under
+`jobs/exec-server-afb631e5df24/cargo-target` with `CARGO_BUILD_JOBS=2`; no
+other job's files or target were touched.
