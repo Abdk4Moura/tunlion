@@ -1,0 +1,87 @@
+name: windows-devloop
+
+# A leased, warm Windows runner for fast iteration. Dispatch it with a branch
+# and a duration; it polls that branch and rebuilds only when the tip or the
+# command file changes, so incremental cargo state and the warm target survive
+# across iterations inside one job. Not a merge gate: normal CI still decides.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to poll and test
+        required: true
+        default: ci/windows-devloop
+      minutes:
+        description: Lease duration in minutes (max 330)
+        required: true
+        default: "120"
+
+concurrency:
+  group: windows-devloop
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  devloop:
+    runs-on: windows-latest
+    timeout-minutes: 340
+    env:
+      DEVPUSH_BRANCH: ${{ inputs.branch }}
+      DEVPUSH_MINUTES: ${{ inputs.minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: win-devloop-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            win-devloop-
+
+      - name: Loop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $branch = $env:DEVPUSH_BRANCH
+          $deadline = (Get-Date).AddMinutes([int]$env:DEVPUSH_MINUTES)
+          Write-Host "DEVPUSH lease start branch=$branch minutes=$($env:DEVPUSH_MINUTES)"
+          $last = ""
+          while ((Get-Date) -lt $deadline) {
+            git fetch --depth=1 origin $branch 2>&1 | Out-Null
+            git reset --hard FETCH_HEAD 2>&1 | Out-Null
+            $sha = (git rev-parse --short HEAD).Trim()
+            $cmd = "cargo check --workspace --all-targets --locked"
+            if (Test-Path .devloop/cmd.txt) {
+              $line = Get-Content .devloop/cmd.txt -TotalCount 1
+              if ($line -and $line.Trim()) { $cmd = $line.Trim() }
+            }
+            if (Test-Path .devloop/stop) {
+              Write-Host "DEVPUSH stop requested at $sha"
+              break
+            }
+            $key = "$sha|$cmd"
+            if ($key -ne $last) {
+              Write-Host "DEVPUSH head=$sha"
+              Write-Host "DEVCMD $cmd"
+              $sw = [Diagnostics.Stopwatch]::StartNew()
+              cmd.exe /c $cmd 2>&1
+              $code = $LASTEXITCODE
+              $status = if ($code -eq 0) { "ok" } else { "fail" }
+              Write-Host ("DEVRESULT {0} code={1} secs={2}" -f $status, $code, [int]$sw.Elapsed.TotalSeconds)
+              $last = $key
+            }
+            Start-Sleep -Seconds 15
+          }
+          Write-Host "DEVPUSH lease end"
