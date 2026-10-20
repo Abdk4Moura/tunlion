@@ -17,6 +17,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// What an open does once admission has passed and the session store answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PtyAction {
+    Reattach,
+    Spawn,
+    /// A resume-only open whose session is gone: close with NO_SUCH_SESSION.
+    CloseNoSession,
+}
+
+pub fn pty_open_action(live_session: bool, resume: bool) -> PtyAction {
+    if live_session {
+        PtyAction::Reattach
+    } else if resume {
+        PtyAction::CloseNoSession
+    } else {
+        PtyAction::Spawn
+    }
+}
+
 /// A live PTY session. The host owns the child and IO; the library owns the
 /// session identity and which link/sid it is attached to.
 pub trait PtySession: Send + Sync {
@@ -154,48 +173,57 @@ pub async fn open_pty(
         .entry(pid.clone())
         .or_insert_with(|| l2::Mux::new(t.clone(), conn.host.clone()))
         .clone();
-    if let Some(sess) = backend.get_live(&session_id).await {
-        if mux.at_stream_cap().await {
-            conn.log
-                .say("l2: pty reattach refused: too many streams on this link");
+    let live_session = backend.get_live(&session_id).await;
+    match pty_open_action(live_session.is_some(), resume) {
+        PtyAction::Reattach => {
+            let Some(sess) = live_session else { return };
+            if mux.at_stream_cap().await {
+                conn.log
+                    .say("l2: pty reattach refused: too many streams on this link");
+                let _ = t
+                    .send_control(
+                        &json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }),
+                    )
+                    .await;
+                return;
+            }
+            let Some(rx) = mux.register_stream(sid).await else {
+                conn.log
+                    .say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
+                let _ = t
+                    .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
+                    .await;
+                return;
+            };
+            let (rtx, rrx) = mpsc::unbounded_channel::<(u16, u16)>();
+            mux.register_resizer(sid, rtx).await;
             let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
+                .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
+                .await;
+            sess.attach(t.clone(), sid, plan.resume_from);
+            sess.resize(cols, rows);
+            bindings
+                .entry(pid.clone())
+                .or_default()
+                .insert(sid, session_id.clone());
+            backend.start_pumps(sess.clone(), rx, rrx);
+            conn.log.say(&format!(
+                "l2: pty REATTACHED to '{}', {cols}x{rows}",
+                dev.unwrap_or_default()
+            ));
+            return;
+        }
+        PtyAction::CloseNoSession => {
+            let _ = t
+                .send_control(&json!({
+                    "type": "l2-close",
+                    "sid": sid,
+                    "err": crate::l2::NO_SUCH_SESSION,
+                }))
                 .await;
             return;
         }
-        let Some(rx) = mux.register_stream(sid).await else {
-            conn.log
-                .say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
-            let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
-                .await;
-            return;
-        };
-        let (rtx, rrx) = mpsc::unbounded_channel::<(u16, u16)>();
-        mux.register_resizer(sid, rtx).await;
-        let _ = t
-            .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
-            .await;
-        sess.attach(t.clone(), sid, plan.resume_from);
-        sess.resize(cols, rows);
-        bindings
-            .entry(pid.clone())
-            .or_default()
-            .insert(sid, session_id.clone());
-        backend.start_pumps(sess.clone(), rx, rrx);
-        conn.log.say(&format!(
-            "l2: pty REATTACHED to '{}', {cols}x{rows}",
-            dev.unwrap_or_default()
-        ));
-        return;
-    }
-    if resume {
-        let _ = t
-            .send_control(
-                &json!({ "type": "l2-close", "sid": sid, "err": crate::l2::NO_SUCH_SESSION }),
-            )
-            .await;
-        return;
+        PtyAction::Spawn => {}
     }
     if mux.at_stream_cap().await {
         conn.log
@@ -339,3 +367,16 @@ pub async fn detach_link_ptys(
 
 #[allow(dead_code)]
 fn _bytes(_: Bytes) {}
+
+#[cfg(test)]
+mod tests {
+    use super::{pty_open_action, PtyAction};
+
+    #[test]
+    fn reattach_wins_over_resume_and_resume_without_a_session_closes() {
+        assert_eq!(pty_open_action(true, false), PtyAction::Reattach);
+        assert_eq!(pty_open_action(true, true), PtyAction::Reattach);
+        assert_eq!(pty_open_action(false, true), PtyAction::CloseNoSession);
+        assert_eq!(pty_open_action(false, false), PtyAction::Spawn);
+    }
+}
