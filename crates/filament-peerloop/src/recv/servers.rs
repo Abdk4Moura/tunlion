@@ -119,6 +119,22 @@ fn _transport(_: &Arc<dyn Transport>) {}
 
 /// Directory-sync admission and serving. The protocol and task ownership are
 /// library code; the host supplies only the drop directory and request queue.
+#[cfg(not(feature = "mount-server"))]
+pub async fn open_sync(
+    transport_of: impl Fn(&str) -> Option<Arc<dyn Transport>>,
+    pid: &str,
+    v: &Value,
+) -> Option<(u32, crate::recv::dispatch::SyncTask)> {
+    if let Some((sid, close)) = sync_unavailable_close(v) {
+        if let Some(t) = transport_of(pid) {
+            let _ = t.send_control(&close).await;
+        }
+        let _ = sid;
+    }
+    None
+}
+
+#[cfg(feature = "mount-server")]
 #[allow(clippy::too_many_arguments)]
 pub async fn open_sync(
     ports: &RecvPorts,
@@ -229,20 +245,76 @@ pub async fn open_sync(
 mod reduced_tests {
     use super::*;
 
-    #[test]
-    fn reduced_sync_open_closes_with_a_named_unavailable_error() {
-        let (sid, close) = sync_unavailable_close(&json!({
-            "type": "sync-open",
-            "sid": 0x8000_0101u32,
-            "root": "docs",
-        }))
-        .expect("a well-formed sync-open gets an explicit close");
-        assert_eq!(sid, 0x8000_0101u32);
+    #[derive(Default)]
+    struct RecordingTransport {
+        controls: std::sync::Mutex<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl filament_transport::net::Transport for RecordingTransport {
+        async fn send_control(&self, msg: &Value) -> anyhow::Result<()> {
+            self.controls.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            64 * 1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn reduced_sync_open_sends_the_actual_close_frame() {
+        let transport = Arc::new(RecordingTransport::default());
+        let t: Arc<dyn filament_transport::net::Transport> = transport.clone();
+        let result = open_sync(
+            |_| Some(t),
+            "peer",
+            &json!({
+                "type": "sync-open",
+                "sid": 0x8000_0101u32,
+                "root": "docs",
+            }),
+        )
+        .await;
+        assert!(result.is_none());
+        let controls = transport.controls.lock().unwrap();
+        assert_eq!(controls.len(), 1);
+        let close = &controls[0];
         assert_eq!(close["type"], "l2-close");
         assert_eq!(close["sid"], 0x8000_0101u32);
         assert!(close["err"]
             .as_str()
             .unwrap()
             .contains("sync receive is not available in this build"));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_open_sync(
+    ports: &RecvPorts,
+    host: &dyn HostServices,
+    conn: &mut crate::conn::Conn,
+    pid: &str,
+    v: &Value,
+    muxes: &mut HashMap<String, Arc<Mux>>,
+    drop_dir: &std::path::Path,
+    parked: &mut Vec<ParkedOpen>,
+) -> Option<(u32, crate::recv::dispatch::SyncTask)> {
+    #[cfg(feature = "mount-server")]
+    {
+        open_sync(ports, host, conn, pid, v, muxes, drop_dir, parked).await
+    }
+    #[cfg(not(feature = "mount-server"))]
+    {
+        let _ = (host, muxes, drop_dir, parked);
+        open_sync(|p| conn.transport_of(p), pid, v).await
     }
 }
