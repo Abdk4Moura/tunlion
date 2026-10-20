@@ -73,7 +73,10 @@ def main():
                 count = check_graph(graph, mesh=profile in ("mesh", "default", "mesh-nofleet"))
             except RuntimeError as error:
                 raise RuntimeError(f"{label}: {error}\n{graph}") from error
-            print(f"PASS: {label}: {count} packages; mesh={profile in ('mesh', 'default')}")
+            print(
+                f"PASS: {label}: {count} packages; "
+                f"mesh={profile in ('mesh', 'default', 'mesh-nofleet')}"
+            )
 
 
 if __name__ == "__main__":

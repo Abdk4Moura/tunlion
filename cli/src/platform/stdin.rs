@@ -20,9 +20,21 @@ pub fn spawn_stdin(
 ) -> Option<Box<dyn StdinOwner>> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
-    let handle = std::thread::spawn(move || reader_loop(tx, question_open, present, stop_thread));
+    let thread_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let id_thread = thread_id.clone();
+    let handle = std::thread::spawn(move || {
+        #[cfg(windows)]
+        id_thread.store(
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+            Ordering::Release,
+        );
+        #[cfg(not(windows))]
+        let _ = &id_thread;
+        reader_loop(tx, question_open, present, stop_thread)
+    });
     Some(Box::new(CliStdin {
         stop,
+        thread_id,
         handle: Some(handle),
     }))
 }
@@ -109,6 +121,7 @@ fn input_ready(timeout_ms: i32) -> bool {
 #[cfg(any(all(unix, not(target_os = "android")), windows))]
 struct CliStdin {
     stop: Arc<AtomicBool>,
+    thread_id: Arc<std::sync::atomic::AtomicU32>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -116,12 +129,49 @@ struct CliStdin {
 impl StdinOwner for CliStdin {
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        #[cfg(windows)]
+        cancel_pending_read(self.thread_id.load(Ordering::Acquire));
     }
     fn join(&mut self) -> bool {
-        self.handle
-            .take()
-            .map(|handle| handle.join().is_ok())
-            .unwrap_or(true)
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        #[cfg(windows)]
+        {
+            // The cancellable read should return at once. Bound the join so a
+            // console that ignores cancellation cannot hold cleanup hostage;
+            // false means the CLI detaches and keeps cleaning up.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !handle.is_finished() {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            handle.join().is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            handle.join().is_ok()
+        }
+    }
+}
+
+#[cfg(windows)]
+fn cancel_pending_read(thread_id: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_TERMINATE};
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+    if thread_id == 0 {
+        return;
+    }
+    // SAFETY: OpenThread only observes the id; the handle is closed here.
+    let handle = unsafe { OpenThread(THREAD_TERMINATE, 0, thread_id) };
+    if handle != 0 {
+        unsafe {
+            let _ = CancelSynchronousIo(handle);
+            let _ = CloseHandle(handle);
+        }
     }
 }
 
@@ -129,5 +179,53 @@ impl StdinOwner for CliStdin {
 impl Drop for CliStdin {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn stop_joins_a_pending_windows_reader_within_bounds() {
+        use super::spawn_stdin;
+        use filament_peerloop::present::NoScreen;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let question = Arc::new(AtomicBool::new(false));
+        let mut owner =
+            spawn_stdin(tx, question, Arc::new(NoScreen)).expect("Windows has an owned reader");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        owner.stop();
+        let joined = owner.join();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "join must be bounded"
+        );
+        // A closed pipe exits, a console read is cancelled; either way the
+        // adapter reports the truth rather than a fabricated success.
+        let _ = joined;
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn unix_reader_is_owned_and_bounded_on_stop() {
+        use super::spawn_stdin;
+        use filament_peerloop::present::NoScreen;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let question = Arc::new(AtomicBool::new(false));
+        let mut owner =
+            spawn_stdin(tx, question, Arc::new(NoScreen)).expect("unix has an owned reader");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        owner.stop();
+        let _ = owner.join();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "poll-based stop/join is bounded"
+        );
     }
 }

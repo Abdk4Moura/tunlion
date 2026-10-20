@@ -33,6 +33,26 @@ impl Tasks {
         self.0.push(task);
     }
 
+    /// Join tasks that already finished, keeping live ones owned. Called on
+    /// loop ticks and before admitting a new per-open task, so a daemon does
+    /// not accumulate one handle per forwarded/mounted session for its life.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub async fn reap(&mut self, log: &dyn LogSink) {
+        let (done, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|task| task.is_finished());
+        self.0 = live;
+        for task in done {
+            if let Err(error) = task.await {
+                log.say(&format!("recv: per-open task failed: {error}"));
+            }
+        }
+    }
+
     pub async fn stop(&mut self) {
         for task in &self.0 {
             task.abort();

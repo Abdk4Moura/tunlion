@@ -208,6 +208,12 @@ pub fn hold_expired(deadline: Instant, now: Instant) -> bool {
     now >= deadline
 }
 
+/// The fleet presence branch exists only when a verifier is compiled in.
+/// Without it, an unsolicited presence must never start a direct dial/adopt.
+pub fn fleet_presence_allowed(is_fleet_channel: bool) -> bool {
+    cfg!(feature = "fleet") && is_fleet_channel
+}
+
 /// The settle timeout reason, shared by the expiry deny and the client.
 pub fn settle_timeout_reason(ms: u64) -> String {
     format!("identity not proven within {ms} ms; retry")
@@ -2096,14 +2102,12 @@ async fn recv_run(
             conn.present.clear_sticky();
             let secs = timeout.unwrap_or(0);
             let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
-            return Err(anyhow::Error::new(DispatchFailure {
-                kind: DispatchFailureKind::Unreachable,
-                message: format!("nothing arrived within {secs}s: no sender offered a transfer"),
-            }));
+            return Err(anyhow::Error::new(receive_timeout_failure(secs)));
         }
         if daemon {
             cleanup.watchdog.tick(log.clone());
         }
+        cleanup.tasks.reap(log.as_ref()).await;
         let ev = tokio::select! {
             biased;
             // Warm-link reuse request from a sibling process. Handle it inline
@@ -4243,10 +4247,11 @@ async fn recv_run(
                             crate::recv::revocation::bind_brokered_link(l, &broker);
                         }
                     }
-                } else if ports
-                    .identity
-                    .is_fleet_channel(v["channel"].as_str().unwrap_or(""))
-                {
+                } else if fleet_presence_allowed(
+                    ports
+                        .identity
+                        .is_fleet_channel(v["channel"].as_str().unwrap_or("")),
+                ) {
                     // Fleet auto-mesh: a device is present on our fleet meeting
                     // point. We hold NO pair secret for it, so this is the
                     // secretless presence path (same shape as the enrollment
@@ -4255,11 +4260,8 @@ async fn recv_run(
                     // verifies, the link is in `fleet_pending` and authorizes
                     // nothing.
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
-                    if cfg!(feature = "fleet") && !pid.is_empty() && !fleet_verified.contains(&pid)
-                    {
-                        if cfg!(feature = "fleet") {
-                            fleet_pending.insert(pid.clone());
-                        }
+                    if !pid.is_empty() && !fleet_verified.contains(&pid) {
+                        fleet_pending.insert(pid.clone());
                     }
                     // Dial direct-QUIC keyed by the fleet secret. It must be
                     // direct, not the WebRTC fallback: only a direct link exposes
@@ -9811,10 +9813,29 @@ mod lifecycle_tests {
         })
     }
 
+    #[tokio::test]
+    async fn finished_per_open_tasks_are_reaped_while_live_ones_stay_owned() {
+        let mut tasks = crate::recv::lifecycle::Tasks::default();
+        for _ in 0..32 {
+            tasks.push(tokio::spawn(async {}));
+        }
+        let (live_tx, live_rx) = tokio::sync::oneshot::channel::<()>();
+        tasks.push(tokio::spawn(async move {
+            let _ = live_rx.await;
+        }));
+        let _keep_live = live_tx;
+        tasks.reap(&NoLog).await;
+        // A private field is visible to this child module: exactly the live
+        // per-open task remains, so cleanup still owns it.
+        assert_eq!(tasks.len(), 1);
+        tasks.stop().await;
+        assert_eq!(tasks.len(), 0);
+    }
+
     struct FakeStdin {
         stopped: Arc<AtomicBool>,
         joined: Arc<AtomicBool>,
-        tx: mpsc::UnboundedSender<Ev>,
+        handle: Option<std::thread::JoinHandle<()>>,
     }
     impl crate::recv::ports::StdinOwner for FakeStdin {
         fn stop(&mut self) {
@@ -9822,30 +9843,43 @@ mod lifecycle_tests {
         }
         fn join(&mut self) -> bool {
             self.joined.store(true, Ordering::SeqCst);
-            // A stopped reader posts nothing: drop its sender.
-            let _ = &self.tx;
-            true
+            self.handle.take().map(|h| h.join().is_ok()).unwrap_or(true)
         }
     }
 
     #[tokio::test]
-    async fn cleanup_stops_and_joins_the_owned_stdin_reader() {
+    async fn cleanup_stops_and_joins_an_active_stdin_sender() {
         let stopped = Arc::new(AtomicBool::new(false));
         let joined = Arc::new(AtomicBool::new(false));
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let stop_thread = stopped.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::SeqCst) {
+                if tx.send(Ev::StdinLine("tick".into())).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        // The sender is provably active before cleanup starts.
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("active sender")
+            .expect("an event");
         let mut cleanup = RecvCleanup {
             stdin: Some(Box::new(FakeStdin {
                 stopped: stopped.clone(),
                 joined: joined.clone(),
-                tx,
+                handle: Some(handle),
             })),
             ..RecvCleanup::default()
         };
         cleanup.finish(&NoLog).await;
-        assert!(stopped.load(Ordering::SeqCst), "stop is called before join");
-        assert!(joined.load(Ordering::SeqCst), "the reader is joined");
-        // Anything the reader tries after the join cannot reach the loop.
-        assert!(rx.try_recv().is_err(), "no StdinLine after cleanup");
+        assert!(stopped.load(Ordering::SeqCst), "stop before join");
+        assert!(joined.load(Ordering::SeqCst), "join completed");
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(rx.try_recv().is_err(), "no StdinLine after stop+join");
     }
 
     #[cfg(feature = "mount-server")]
@@ -10209,6 +10243,15 @@ mod inventory {
         "a_deny_about_missing_proof_still_parks",
         "a_policy_decline_carries_its_reason",
     ];
+
+    #[test]
+    fn fleet_presence_is_disabled_without_a_verifier() {
+        #[cfg(not(feature = "fleet"))]
+        assert!(!super::fleet_presence_allowed(true));
+        #[cfg(feature = "fleet")]
+        assert!(super::fleet_presence_allowed(true));
+        assert!(!super::fleet_presence_allowed(false));
+    }
 
     #[test]
     fn every_receive_loop_test_is_present_once() {

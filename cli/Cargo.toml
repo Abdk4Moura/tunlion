@@ -185,6 +185,7 @@ windows-sys = { version = "0.59", features = [
     # limit struct is gated on.
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_System_IO",
 ] }
 
 # The PTY crate pulls in `serial`/`termios`, which do not build for Android. A
