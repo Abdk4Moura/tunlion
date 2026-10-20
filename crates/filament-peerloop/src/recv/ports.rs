@@ -892,7 +892,8 @@ pub(crate) mod test_support {
             _: mpsc::UnboundedSender<Ev>,
             _: Arc<std::sync::atomic::AtomicBool>,
             _: Arc<dyn crate::present::Presentation>,
-        ) {
+        ) -> Option<Box<dyn StdinOwner>> {
+            None
         }
     }
 

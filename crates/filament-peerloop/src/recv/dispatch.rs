@@ -640,8 +640,42 @@ pub struct RecvCleanup {
     trace: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
+/// One served sync task. In a reduced profile the type is inert so the loop's
+/// ownership methods stay unconditional.
+#[cfg(feature = "mount-server")]
+pub(crate) struct SyncTask(pub(crate) crate::sync::serving::SyncServeTask);
+#[cfg(not(feature = "mount-server"))]
+pub(crate) struct SyncTask;
+
+impl SyncTask {
+    #[cfg(feature = "mount-server")]
+    fn cancel(&self) {
+        self.0.cancel();
+    }
+    #[cfg(not(feature = "mount-server"))]
+    fn cancel(&self) {}
+
+    #[cfg(feature = "mount-server")]
+    async fn join(self) -> Result<(), String> {
+        self.0.join().await
+    }
+    #[cfg(not(feature = "mount-server"))]
+    async fn join(self) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[cfg(feature = "mount-server")]
+    fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+    #[cfg(not(feature = "mount-server"))]
+    fn is_finished(&self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone, Default)]
-struct SyncTasks(Arc<Mutex<HashMap<(String, u32), crate::sync::serving::SyncServeTask>>>);
+struct SyncTasks(Arc<Mutex<HashMap<(String, u32), SyncTask>>>);
 
 /// Owns the blocking `pwrite_at`/stdout writers admitted by this invocation.
 ///
@@ -5700,6 +5734,7 @@ async fn recv_run(
                 // #30: respond to identity nonce challenge by producing a
                 // possession_sig (0x02) over the peer-provided nonce. The
                 // challenger verifies and upgrades our binding to Proven.
+                #[cfg(feature = "mesh")]
                 Some("identity-nonce-challenge") => {
                     // #30: shared responder (also used by send_cmd) proves
                     // device-key possession so the challenger upgrades us to Proven.
@@ -5716,6 +5751,7 @@ async fn recv_run(
                 }
                 // #30: received possession-sig from peer after our challenge.
                 // Verify, upgrade binding to Proven so capability gates pass.
+                #[cfg(feature = "mesh")]
                 Some("identity-expose") => {
                     log.debug(&format!("identity-expose received on {pid}"));
                     if ports.identity.handle_identity_expose(
@@ -6777,6 +6813,7 @@ async fn recv_run(
                         // For identity layer, after introduction, generate nonce challenge to learn peer's identity (0x02 path)
                         // Challenge carries ONLY {nonce, receiver_device_pub} per correction A
                         // Receiver_device_pub is our own overlay key (always exists, not cert-or-zeros)
+                        #[cfg(feature = "mesh")]
                         if let Ok(own_dpub) = host.overlay_pubkey() {
                             if let Some(t) = conn.transport_of(&pid) {
                                 use ring::rand::{SecureRandom, SystemRandom};
@@ -6796,6 +6833,7 @@ async fn recv_run(
                         }
                     }
                 }
+                #[cfg(feature = "mesh")]
                 Some("identity-nonce-challenge") => {
                     // Received challenge as sender: peer wants to learn our identity, we must respond with sealed cert + possession sig
                     // Challenge carries ONLY {nonce, receiver_device_pub} per correction A, no scope/caps/user data
@@ -6853,6 +6891,7 @@ async fn recv_run(
                         }
                     }
                 }
+                #[cfg(feature = "mesh")]
                 Some("identity-expose") => {
                     // Received sealed or unsealed identity-expose for introduce path (0x02)
                     // For PAKE path we already handle sealed with possession in pair_cmd, this is for introduce path
@@ -9745,7 +9784,7 @@ mod lifecycle_tests {
             .track_sync_task(
                 "peer-finished".into(),
                 0x8000_0101,
-                sync_server(finished_rx),
+                SyncTask(sync_server(finished_rx)),
                 &NoLog,
             )
             .await;
@@ -9775,7 +9814,7 @@ mod lifecycle_tests {
             .track_sync_task(
                 "peer-revoked".into(),
                 0x8000_0102,
-                sync_server(cancel_rx),
+                SyncTask(sync_server(cancel_rx)),
                 &NoLog,
             )
             .await;
@@ -9784,7 +9823,7 @@ mod lifecycle_tests {
             .track_sync_task(
                 "peer-live".into(),
                 0x8000_0103,
-                sync_server(survivor_rx),
+                SyncTask(sync_server(survivor_rx)),
                 &NoLog,
             )
             .await;

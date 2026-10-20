@@ -10,6 +10,7 @@ use filament_transport::net::Transport;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+#[async_trait::async_trait]
 pub trait MeshTunnel: Send + Sync + 'static {
     fn my_addr(&self) -> Option<Ipv6Addr>;
     fn my_addr_v4(&self) -> Option<Ipv4Addr>;
