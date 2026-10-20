@@ -1281,7 +1281,7 @@ mod tests {
             core.start_with_dispatch(|_, _| async { Ok::<(), String>(()) }),
             Err(CoreError::EngineAlreadyRunning)
         );
-        gate_tx.send(()).unwrap();
+        let _ = gate_tx.send(());
         start.join().unwrap().unwrap();
         assert_eq!(core.status().unwrap().engine, EngineState::Running);
         core.stop_blocking().unwrap();
@@ -1314,7 +1314,7 @@ mod tests {
         core.stop_blocking().unwrap();
         assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
         // Release the harness even though the engine is already joined.
-        gate_tx.send(()).unwrap();
+        let _ = gate_tx.send(());
         assert!(start.join().unwrap().is_err());
         let probe = DeviceStore::open(core.config_dir());
         assert!(
