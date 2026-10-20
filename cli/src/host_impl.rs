@@ -391,12 +391,13 @@ impl HostServices for CliHost {
     }
     fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<LiveCut> {
         let cut = crate::identity_state::live_session_cut(idev)?;
-        let cause = match cut {
-            crate::identity_state::LiveCut::Revoked => LiveCutCause::Revoked,
-            crate::identity_state::LiveCut::Expired(_) => LiveCutCause::Expired,
+        let (cause, expires_at) = match cut {
+            crate::identity_state::LiveCut::Revoked => (LiveCutCause::Revoked, None),
+            crate::identity_state::LiveCut::Expired(at) => (LiveCutCause::Expired, Some(at)),
         };
         Some(LiveCut {
             cause,
+            expires_at,
             reason: cut.reason_for(idev),
         })
     }

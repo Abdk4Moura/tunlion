@@ -203,6 +203,10 @@ impl LogSink for VecLog {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveCut {
     pub cause: LiveCutCause,
+    /// The invitation end in UTC seconds for an expiry, so a caller can build
+    /// the re-invite frame without parsing the human reason back into a time.
+    /// `None` for a revocation, or a host whose reason did not name one.
+    pub expires_at: Option<u64>,
     pub reason: String,
 }
 

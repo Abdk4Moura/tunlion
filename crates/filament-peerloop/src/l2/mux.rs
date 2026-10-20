@@ -1024,6 +1024,7 @@ mod tests {
         fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<crate::host::LiveCut> {
             idev.map(|_| crate::host::LiveCut {
                 cause: LiveCutCause::Revoked,
+                expires_at: None,
                 reason: self.0.to_string(),
             })
         }

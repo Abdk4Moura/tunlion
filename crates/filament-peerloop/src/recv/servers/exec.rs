@@ -5,6 +5,12 @@
 //! here. With the feature off, a reduced build answers a well-formed open with
 //! a NAMED `l2-close` instead of silence, exactly like the reduced sync
 //! receiver. No process backend is compiled in that profile.
+//!
+//! The reduced arm deliberately runs BEFORE admission: it has no serving gate
+//! or transport lookup beyond the link's transport, so it answers only a
+//! syntactically valid L2-half sid. A low-half or oversized sid is ignored,
+//! never coerced into an L2 stream; every other serving-off/denial rule stays
+//! in the full state machine's `admit_exec_open`.
 
 use crate::conn::Conn;
 #[cfg(feature = "exec-server")]
@@ -26,6 +32,12 @@ pub const EXEC_SERVER_UNAVAILABLE: &str = "exec receive is not available in this
 /// has no exec state machine. Testable without a Conn.
 pub fn exec_unavailable_close(v: &Value) -> Option<(u32, Value)> {
     let sid = crate::l2::wire_sid(v)?;
+    // Parity with the mount/sync reduced refusals: only a valid L2-half sid
+    // names a stream this build could have opened. A low-half or wrapped value
+    // is not an exec stream and must not be echoed into an `l2-close`.
+    if !crate::l2::is_l2_sid(sid) {
+        return None;
+    }
     Some((
         sid,
         json!({
@@ -83,5 +95,21 @@ mod reduced_tests {
             .as_str()
             .unwrap()
             .contains("exec receive is not available in this build"));
+    }
+
+    #[test]
+    fn reduced_exec_open_ignores_a_non_l2_sid() {
+        for sid in [7u64, 0u64, u32::MAX as u64 + 1] {
+            assert!(
+                exec_unavailable_close(&json!({
+                    "type": "exec-open",
+                    "sid": sid,
+                    "err_sid": 0x8000_0102u32,
+                    "argv": ["true"],
+                }))
+                .is_none(),
+                "sid {sid} is not a valid L2-half stream"
+            );
+        }
     }
 }

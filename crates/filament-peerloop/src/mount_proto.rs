@@ -2338,6 +2338,7 @@ mod tests {
         fn live_session_cut(&self, _idev: Option<&[u8; 32]>) -> Option<crate::host::LiveCut> {
             Some(crate::host::LiveCut {
                 cause: crate::host::LiveCutCause::Revoked,
+                expires_at: None,
                 reason: "device revoked".into(),
             })
         }

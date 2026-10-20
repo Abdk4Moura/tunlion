@@ -42,7 +42,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// Grace each gentler signal gets before the next, harder one.
@@ -347,7 +347,7 @@ pub async fn serve_exec(
     let _ = t
         .send_control(&json!({ "type": "exec-open-ack", "sid": sid, "out": sid, "err": err_sid }))
         .await;
-    let mut stdout = match child.take_stdout() {
+    let stdout = match child.take_stdout() {
         Some(s) => s,
         None => {
             let _ = t
@@ -356,7 +356,7 @@ pub async fn serve_exec(
             return;
         }
     };
-    let mut stderr = match child.take_stderr() {
+    let stderr = match child.take_stderr() {
         Some(s) => s,
         None => {
             let _ = t
@@ -658,7 +658,13 @@ pub async fn serve_exec(
                         "err": reason,
                     });
                     if matches!(&cut, Some(c) if c.cause == crate::host::LiveCutCause::Expired) {
-                        let at = expired_at_from_reason(&reason);
+                        // The host carries the invitation end as a typed fact;
+                        // parsing the reason is only the compatibility fallback
+                        // for an older host that did not fill `expires_at`.
+                        let at = cut
+                            .as_ref()
+                            .and_then(|c| c.expires_at)
+                            .or_else(|| expired_at_from_reason(&reason));
                         let r = match at {
                             Some(at) => Refusal::expired(
                                 at,

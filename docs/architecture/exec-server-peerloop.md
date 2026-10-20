@@ -1,7 +1,8 @@
 # Exec acceptor in `filament-peerloop`
 
-Status: implementation branch `work/exec-server-peerloop`, based on the
-immutable #542 head `e86ed8ee66388851de9b99b4145a7ae864690d44`.
+Status: implementation branch `work/exec-server-peerloop`, rebased onto #542
+`7748ab1fe554785b0bcecef2c81b271f6eb7fd11` (the review-approved branch was
+`b77dbcb2` on the earlier `e86ed8ee` base).
 
 ## What moved
 
@@ -26,12 +27,20 @@ or an ambient global.
 
 New Cargo features:
 
-- `filament-peerloop/exec-server` (default on)
+- `filament-peerloop/exec-server` (default on) implies `dispatch`, because the
+  exec module imports `recv::dispatch`; `--no-default-features --features
+  exec-server` is therefore also a valid compile profile.
 - `filament-cli/exec-server` (default on), which also compiles the CLI adapter.
 
-Reduced profiles (`--no-default-features --features dispatch`, Android's
-CLI check with `mesh,mount-server`) leave `exec-server` off. They still answer a
-well-formed `exec-open` with the named refusal; no spawn backend is compiled.
+Reduced profiles that explicitly omit defaults (`--no-default-features
+--features dispatch`, or the CLI's `mesh,mount-server` check) leave
+`exec-server` off. They answer a well-formed L2-half `exec-open` with the named
+refusal and compile no CLI spawn backend.
+
+Android nuance: this is NOT a claim that phones never serve exec. A default
+Android CLI release (default features on) compiles `exec-server` and its process
+adapter exactly as the default desktop CLI does. Only a reduced profile that
+explicitly disables default features omits it.
 
 ## #542 rebase overlap
 
@@ -64,4 +73,5 @@ that port rather than reimplemented in the exec module.
 - The existing real-binary `cli/tests/exec-gates.sh` (gates A-R) remains the
   end-to-end proof and is unchanged.
 - CI compiles the library/CLI with `exec-server` off in the existing Android
-  boundary jobs.
+  boundary jobs. The remote worker additionally ran
+  `--no-default-features --features exec-server` to prove feature implication.

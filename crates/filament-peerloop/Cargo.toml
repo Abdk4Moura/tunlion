@@ -42,9 +42,11 @@ forward-server = []
 # Inbound `exec-open` serving: argv-exact direct spawn, separate stdout/stderr
 # stream pumps, heartbeat/revocation cancellation. The protocol lives in the
 # library behind this feature; the host supplies a process primitive only.
-# Reduced profiles omit it so no process backend compiles, and a well-formed
-# open gets a named refusal.
-exec-server = []
+# It implies `dispatch` because the module imports `recv::dispatch`. A profile
+# that explicitly omits defaults compiles no process backend, and a well-formed
+# L2-half open gets a named refusal. Default builds (including the Android CLI
+# release unless it opts out of defaults) do compile the exec backend.
+exec-server = ["dispatch"]
 # Fault-injection hooks the peer-loop paths read. The CLI forwards its own
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
