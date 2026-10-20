@@ -1,9 +1,10 @@
 # Exec acceptor in `filament-peerloop`
 
-Status: implementation branch `work/exec-server-peerloop`, rebased onto #542
-`bfd097e9fee56b58320cfe0908b00eeecec5ba78`. The review-approved branch was
-`b77dbcb2` on the earlier `e86ed8ee` base; the remote verification below ran on
-the same exec code at `afb631e5` over `7748ab1f`.
+Status: implementation branch `work/exec-server-peerloop`, rebased onto `main`
+`1c74c4a99d27080936ca3ece993f2b685a868383` (the dispatch/identity/enrollment/
+roster/Core-host stack). The review-approved branch was `b77dbcb2` on the
+earlier `e86ed8ee` base; the remote verification below ran on the same exec code
+at `afb631e5` over `7748ab1f`.
 
 ## What moved
 
