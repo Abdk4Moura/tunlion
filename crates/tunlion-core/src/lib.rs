@@ -1368,6 +1368,49 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_publication_and_stop_never_leaves_a_stale_lease() {
+        let core = Arc::new(core());
+        let mut claim = StartClaim::acquire(&core).unwrap();
+        let lease = DeviceStore::open(core.config_dir())
+            .try_acquire_engine_lease()
+            .unwrap()
+            .expect("the test owns the root");
+        let (handle, engine, _watch) = core
+            .spawn_engine(|stop, readiness| async move {
+                readiness.publish(|| {});
+                stop.run(std::future::pending::<()>()).await;
+                Ok::<(), String>(())
+            })
+            .unwrap();
+        claim.install(engine).unwrap();
+
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        let publish_core = Arc::clone(&core);
+        let publish_handle = handle.clone();
+        let publish_gate = Arc::clone(&gate);
+        let publish = std::thread::spawn(move || {
+            publish_gate.wait();
+            publish_core.publish_started(&publish_handle, lease)
+        });
+        let stop_core = Arc::clone(&core);
+        let stop_gate = Arc::clone(&gate);
+        let stop = std::thread::spawn(move || {
+            stop_gate.wait();
+            stop_core.stop_blocking()
+        });
+        gate.wait();
+        let _ = publish.join().unwrap();
+        stop.join().unwrap().unwrap();
+
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "the race must release the lease exactly once"
+        );
+    }
+
+    #[test]
     fn a_second_core_on_the_same_root_is_refused_by_the_engine_lease() {
         let dir = tempfile::tempdir().unwrap();
         let first = Core::open(dir.path()).unwrap();
