@@ -77,7 +77,7 @@ pub async fn open_forward(
                 )
                 .await
                 {
-                    return;
+                    return None;
                 }
             }
             conn.log
