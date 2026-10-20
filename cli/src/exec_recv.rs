@@ -944,7 +944,7 @@ pub(crate) async fn handle_exec_open(
     shell_user: &Option<String>,
     l2_muxes: &mut std::collections::HashMap<String, Arc<l2::Mux>>,
     serving: bool,
-    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
+    parked: &mut Vec<filament_peerloop::recv::dispatch::ParkedOpen>,
 ) {
     use filament_peerloop::shell::admit::{ShellAdmission, ShellAdmissionConfig};
     let admission = filament_peerloop::shell::admit::admit_exec_open(

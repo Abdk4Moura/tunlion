@@ -435,9 +435,9 @@ pub mod serving {
         /// Maximum individual length-prefixed record, including the manifest.
         pub max_record_bytes: usize,
         #[cfg(test)]
-        finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        pub(crate) finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
         #[cfg(test)]
-        staging_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        pub(crate) staging_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     }
 
     /// Owns the exclusively created `.part` entry until it is atomically

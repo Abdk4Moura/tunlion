@@ -16,12 +16,15 @@ name = "tunlion"
 path = "src/main.rs"
 
 [features]
-default = ["mesh", "mount-server", "forward-server"]
-mesh = ["filament-peerloop/mesh"]
-mount-server = ["filament-peerloop/mount-server"]
+default = ["mesh", "mount-server", "forward-server", "dispatch", "fleet"]
+mesh = ["filament-peerloop/mesh", "dispatch"]
+mount-server = ["filament-peerloop/mount-server", "dispatch"]
 # Inbound local forward serving: dial a peer-requested local socket. Default-on
 # for the CLI; reduced engine profiles omit the dial implementation.
-forward-server = ["filament-peerloop/forward-server"]
+forward-server = ["filament-peerloop/forward-server", "dispatch"]
+# The receive dispatch loop and its host capability traits.
+dispatch = ["filament-peerloop/dispatch"]
+fleet = ["filament-peerloop/fleet"]
 # Static builds need no feature: the musl target alone produces a static-pie
 # binary because the whole TLS tree is rustls. A `static` feature that vendored
 # OpenSSL (a rust_socketio/native-tls leftover, ledger C16) was removed on
@@ -40,7 +43,7 @@ forward-server = ["filament-peerloop/forward-server"]
 test-hooks = ["filament-transport/test-hooks", "filament-peerloop/test-hooks"]
 # Dev-debug logging (TRACE / STALL / worker-ports internals). Stripped from
 # default release builds so no debug strings reach the shipped binary.
-debug-logs = ["filament-transport/debug-logs"]
+debug-logs = ["filament-transport/debug-logs", "filament-peerloop/debug-logs"]
 # Opt-in cross-platform mount adapters. Linux FUSE remains default-on and does
 # not require a feature. macOS needs macFUSE SDK; Windows needs WinFsp SDK.
 # These are OFF by default so stock CI runners (which lack the SDKs) stay green.
@@ -182,6 +185,7 @@ windows-sys = { version = "0.59", features = [
     # limit struct is gated on.
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_System_IO",
 ] }
 
 # The PTY crate pulls in `serial`/`termios`, which do not build for Android. A

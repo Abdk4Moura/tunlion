@@ -120,6 +120,40 @@ impl HostServices for CliHost {
     fn settings_get_bool(&self, key: &str) -> bool {
         crate::settings::get_bool(key, None)
     }
+    fn settings_get_bool_for(&self, key: &str, peer: Option<&str>) -> bool {
+        crate::settings::get_bool(key, peer)
+    }
+    fn create_private_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        crate::platform::create_private_dir_all(dir)
+    }
+    fn publish_received_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        crate::platform::publish_received_file(file)
+    }
+    fn extract_received_archive(
+        &self,
+        path: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> std::result::Result<usize, String> {
+        crate::settings::extract_archive(path, dir).map_err(|e| e.to_string())
+    }
+    fn record_received_file(&self, record: &filament_peerloop::recv::files::ReceivedFileRecord) {
+        crate::transfer_history::append(&[crate::transfer_history::Record {
+            time: record.time,
+            direction: "in",
+            peer: record.peer.clone(),
+            file: record.file.clone(),
+            stored: record.stored.clone(),
+            bytes: record.bytes,
+            sha256: record.sha256.clone(),
+            ok: record.ok,
+        }]);
+    }
+    fn append_receive_log(&self, line: &str) {
+        use std::io::Write as _;
+        if let Ok(mut f) = crate::platform::open_private_log(&crate::up_log(), false) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
     fn user_key(&self) -> Option<crate::identity::UserKey> {
         crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
             .ok()
@@ -266,12 +300,8 @@ impl HostServices for CliHost {
     fn principal_ceiling_for(&self, name: &str) -> Option<Vec<String>> {
         crate::principal_ceiling_for(name)
     }
-    fn persisted_principal_for_cert(
-        &self,
-        cert: &filament_id::DeviceCert,
-    ) -> PersistedPrincipal {
-        let (kind, not_after, max_offline, last_seen) =
-            crate::persisted_principal_for_cert(cert);
+    fn persisted_principal_for_cert(&self, cert: &filament_id::DeviceCert) -> PersistedPrincipal {
+        let (kind, not_after, max_offline, last_seen) = crate::persisted_principal_for_cert(cert);
         PersistedPrincipal {
             kind,
             not_after,
@@ -363,6 +393,9 @@ impl HostServices for CliHost {
     }
     fn signaling_snapshot(&self) -> serde_json::Value {
         crate::signaling_health::snapshot_json()
+    }
+    fn report_signaling(&self, snapshot: serde_json::Value) {
+        crate::signaling_health::report(snapshot)
     }
     fn launch_report(
         &self,

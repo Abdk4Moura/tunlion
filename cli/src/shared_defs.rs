@@ -14,7 +14,7 @@ use crate::net::Transport;
 use crate::pake_ceremony::Ceremony;
 use crate::recv_files::IncomingFile;
 use serde_json::Value;
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,8 @@ pub(crate) static REMEMBER_STORED: std::sync::atomic::AtomicBool =
 /// settles it. The sender says ONE outcome: it used to print "remembered this
 /// device as 'x'" when it stored its half and then "declined to be
 /// remembered, nothing stored" when the receiver said no.
-pub(crate) static REMEMBER_STORED_AS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub(crate) static REMEMBER_STORED_AS: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
 
 /// Set once the receiver answered the remember offer (yes or no), so the
 /// outcome has been said.
@@ -65,7 +66,11 @@ pub(crate) static REMEMBER_ANSWERED: std::sync::atomic::AtomicBool =
 /// (exit 9), and a warning must not suggest a command that fails. Pure.
 pub(crate) fn remember_not_stored_msg(name: &str, sending: bool, has_identity: bool) -> String {
     let other = if sending { "receiver" } else { "sender" };
-    let first = if has_identity { "" } else { "tunlion init  (this device has no identity yet), then  " };
+    let first = if has_identity {
+        ""
+    } else {
+        "tunlion init  (this device has no identity yet), then  "
+    };
     format!(
         "--remember {name}: nothing was remembered. Both sides must pass --remember on the same code transfer, \
          and the {other} did not. To pair this device for good:  {first}tunlion add {name}  (and `tunlion join <code>` on the other side)"
@@ -273,7 +278,7 @@ pub(crate) struct TtyGuard {
 
 #[cfg(test)]
 mod tests {
-    use crate::{MAX_PENDING, PendingRequest, ShellPolicy, add_pending_request};
+    use crate::{add_pending_request, PendingRequest, ShellPolicy, MAX_PENDING};
 
     /// RC lab item 10: the default signaling server is the tunlion host.
     #[test]
@@ -286,10 +291,19 @@ mod tests {
     #[test]
     fn the_remember_warning_names_init_first_without_an_identity() {
         let without = super::remember_not_stored_msg("x", true, false);
-        assert!(without.contains("tunlion init") && without.contains("tunlion add x"), "{without}");
-        assert!(without.find("tunlion init") < without.find("tunlion add x"), "{without}");
+        assert!(
+            without.contains("tunlion init") && without.contains("tunlion add x"),
+            "{without}"
+        );
+        assert!(
+            without.find("tunlion init") < without.find("tunlion add x"),
+            "{without}"
+        );
         let with = super::remember_not_stored_msg("x", true, true);
-        assert!(!with.contains("tunlion init") && with.contains("tunlion add x"), "{with}");
+        assert!(
+            !with.contains("tunlion init") && with.contains("tunlion add x"),
+            "{with}"
+        );
     }
 
     #[test]

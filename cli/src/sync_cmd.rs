@@ -15,13 +15,13 @@ use crate::conn::Conn;
 use crate::l2;
 use crate::net::{Ev, Transport};
 use crate::ui;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use filament_peerloop::sync::{self, SyncAccepted, SyncAdmission};
 pub(crate) use filament_peerloop::sync::{
     diff, hash_file, walk_manifest, Entry, Need, Plan, SYNC_CHUNK,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,7 +110,9 @@ async fn next_json(
     recs: &mut Records,
     timeout: Duration,
 ) -> Result<Value> {
-    Ok(serde_json::from_slice(&next_rec(pipe, rx, mux, sid, recs, timeout).await?)?)
+    Ok(serde_json::from_slice(
+        &next_rec(pipe, rx, mux, sid, recs, timeout).await?,
+    )?)
 }
 
 // ------------------------------------------------------------ initiator -----
@@ -189,18 +191,33 @@ impl Tally {
 
     /// Local entries that reached a state: must equal `files_total`.
     pub(crate) fn accounted(&self) -> u64 {
-        ["sent", "updated", "same", "skipped", "failed", "would send", "would update"]
-            .iter()
-            .map(|s| self.count(s))
-            .sum()
+        [
+            "sent",
+            "updated",
+            "same",
+            "skipped",
+            "failed",
+            "would send",
+            "would update",
+        ]
+        .iter()
+        .map(|s| self.count(s))
+        .sum()
     }
 
     /// The summary `data` object (without the per-file list).
     pub(crate) fn summary(&self, dry_run: bool, exit: i32) -> Value {
         let mut counts = json!({ "total": self.files_total });
         for s in [
-            "sent", "updated", "same", "skipped", "failed", "deleted",
-            "would send", "would update", "would delete",
+            "sent",
+            "updated",
+            "same",
+            "skipped",
+            "failed",
+            "deleted",
+            "would send",
+            "would update",
+            "would delete",
         ] {
             counts[s.replace(' ', "_")] = json!(self.count(s));
         }
@@ -305,14 +322,26 @@ pub(crate) async fn run(
             } else {
                 let c = |k: &str| rep.tally.count(k);
                 // On a dry run nothing moved: say what WOULD, in bytes.
-                let moved = if opts.dry_run { rep.tally.bytes_would_move } else { rep.tally.bytes_moved };
+                let moved = if opts.dry_run {
+                    rep.tally.bytes_would_move
+                } else {
+                    rep.tally.bytes_moved
+                };
                 ui::say(&format!(
                     "  {} {} of {} {}{}: {} sent, {} updated, {} same, {} skipped{}{}",
-                    if partial { ui::glyph_warn() } else { ui::glyph_ok() },
+                    if partial {
+                        ui::glyph_warn()
+                    } else {
+                        ui::glyph_ok()
+                    },
                     crate::human(moved),
                     crate::human(total),
                     if opts.dry_run { "would move" } else { "moved" },
-                    if opts.dry_run { " (dry run, nothing moved)" } else { "" },
+                    if opts.dry_run {
+                        " (dry run, nothing moved)"
+                    } else {
+                        ""
+                    },
                     c("sent") + c("would send"),
                     c("updated") + c("would update"),
                     c("same"),
@@ -322,7 +351,11 @@ pub(crate) async fn run(
                     } else {
                         String::new()
                     },
-                    if partial { format!(", {} FAILED", c("failed")) } else { String::new() },
+                    if partial {
+                        format!(", {} FAILED", c("failed"))
+                    } else {
+                        String::new()
+                    },
                 ));
                 // Say WHERE: `sync dir peer:proj` lands under the peer's drop
                 // folder, which the output never said, so the files looked lost.
@@ -380,7 +413,11 @@ async fn sync_inner(
         .canonicalize()
         .map_err(|e| fail(2, "usage", format!("{}: {e}", local.display())))?;
     if !local.is_dir() {
-        return Err(fail(2, "usage", format!("{} is not a directory", local.display())));
+        return Err(fail(
+            2,
+            "usage",
+            format!("{} is not a directory", local.display()),
+        ));
     }
     crate::identity_state::require_known_device(peer)
         .map_err(|e| fail(3, "unknown_device", e.to_string()))?;
@@ -400,7 +437,13 @@ async fn sync_inner(
             return Err(fail(3, "unknown_device", e.to_string()));
         }
         Ok(Err(e)) => return Err(fail(6, "unreachable", e.to_string())),
-        Err(_) => return Err(fail(6, "unreachable", format!("couldn't reach '{peer}' in 45s"))),
+        Err(_) => {
+            return Err(fail(
+                6,
+                "unreachable",
+                format!("couldn't reach '{peer}' in 45s"),
+            ))
+        }
     };
     guard.forget();
     let mux = l2::Mux::new(t.clone(), crate::host_impl::cli_host());
@@ -437,17 +480,35 @@ async fn sync_inner(
         }
     })
     .await
-    .map_err(|_| fail(6, "unreachable", format!("no answer from '{peer}' (is `tunlion up` running there?)")))?;
+    .map_err(|_| {
+        fail(
+            6,
+            "unreachable",
+            format!("no answer from '{peer}' (is `tunlion up` running there?)"),
+        )
+    })?;
     match ack {
         Err(reason) => {
-            return Err(fail(4, "denied", format!("'{peer}' refused sync: {reason}")));
+            return Err(fail(
+                4,
+                "denied",
+                format!("'{peer}' refused sync: {reason}"),
+            ));
         }
         Ok(dest) => rep.dest = dest,
     }
     let mut recs = Records::default();
     send_json(&t, sid, &json!({ "type": "manifest", "files": files })).await?;
     let plan: Plan = serde_json::from_value(
-        next_json(&mut pipe, Some(&mut rx), &mux, sid, &mut recs, Duration::from_secs(300)).await?,
+        next_json(
+            &mut pipe,
+            Some(&mut rx),
+            &mux,
+            sid,
+            &mut recs,
+            Duration::from_secs(300),
+        )
+        .await?,
     )?;
 
     for (p, why) in &skipped {
@@ -458,13 +519,19 @@ async fn sync_inner(
     }
     let by_path: BTreeMap<&str, &Entry> = files.iter().map(|e| (e.p.as_str(), e)).collect();
     for n in &plan.need {
-        let Some(e) = by_path.get(n.p.as_str()) else { continue };
+        let Some(e) = by_path.get(n.p.as_str()) else {
+            continue;
+        };
         // `n.chunks` comes off the wire, so its indices are the PEER's claim,
         // not ours. `saturating_*` keeps an index past the end of the file from
         // panicking this side in a debug build (and from wrapping in release);
         // such a chunk reads zero bytes and the receiver refuses it by range.
         let bytes: u64 = (n.chunks.iter())
-            .map(|&i| e.size.saturating_sub((i as u64).saturating_mul(SYNC_CHUNK)).min(SYNC_CHUNK))
+            .map(|&i| {
+                e.size
+                    .saturating_sub((i as u64).saturating_mul(SYNC_CHUNK))
+                    .min(SYNC_CHUNK)
+            })
             .sum();
         let state = match (opts.dry_run, n.new) {
             (true, true) => "would send",
@@ -476,7 +543,12 @@ async fn sync_inner(
             rep.line(state, &n.p, bytes, None);
             continue;
         }
-        send_json(&t, sid, &json!({ "type": "file", "p": e.p, "size": e.size, "full": e.full, "mtime": e.mtime })).await?;
+        send_json(
+            &t,
+            sid,
+            &json!({ "type": "file", "p": e.p, "size": e.size, "full": e.full, "mtime": e.mtime }),
+        )
+        .await?;
         let mut f = std::fs::File::open(local.join(&e.p))?;
         let mut buf = vec![0u8; SYNC_CHUNK as usize];
         for &i in &n.chunks {
@@ -494,11 +566,24 @@ async fn sync_inner(
             send_rec(&t, sid, &buf[..got]).await?;
         }
         send_json(&t, sid, &json!({ "type": "file-end" })).await?;
-        let ack = next_json(&mut pipe, Some(&mut rx), &mux, sid, &mut recs, Duration::from_secs(300)).await?;
+        let ack = next_json(
+            &mut pipe,
+            Some(&mut rx),
+            &mux,
+            sid,
+            &mut recs,
+            Duration::from_secs(300),
+        )
+        .await?;
         if ack["ok"].as_bool() == Some(true) {
             rep.line(state, &n.p, bytes, None);
         } else {
-            rep.line("failed", &n.p, bytes, Some(ack["err"].as_str().unwrap_or("receiver refused the file")));
+            rep.line(
+                "failed",
+                &n.p,
+                bytes,
+                Some(ack["err"].as_str().unwrap_or("receiver refused the file")),
+            );
         }
     }
     if !opts.delete {
@@ -511,8 +596,21 @@ async fn sync_inner(
             }
         } else {
             send_json(&t, sid, &json!({ "type": "delete", "paths": plan.extra })).await?;
-            let ack = next_json(&mut pipe, Some(&mut rx), &mux, sid, &mut recs, Duration::from_secs(120)).await?;
-            for p in ack["paths"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+            let ack = next_json(
+                &mut pipe,
+                Some(&mut rx),
+                &mux,
+                sid,
+                &mut recs,
+                Duration::from_secs(120),
+            )
+            .await?;
+            for p in ack["paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+            {
                 rep.line("deleted", p, 0, None);
             }
         }
@@ -532,82 +630,6 @@ fn sync_destination(peer: &str, remote_dir: &str, dest: Option<&str>) -> String 
         Some(d) => format!("{peer}:{d}"),
         None => format!("{peer}:{remote_dir} (under {peer}'s drop folder)"),
     }
-}
-
-/// Accept one `sync-open` by delegating admission to the library.
-///
-/// The endpoint owns path bounds, the transfer gate, the shared-mux
-/// capacity/collision rule, registration and the ack. What stays here is the
-/// receive driver's policy: parking an unproven-identity deny for re-drive,
-/// raising the owner's consent request, and returning the accepted serving
-/// task to the receive driver for lifecycle ownership.
-pub(crate) async fn handle_sync_open(
-    conn: &mut Conn,
-    pid: &str,
-    v: &Value,
-    muxes: &mut l2::MuxMap,
-    drop_dir: &Path,
-    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
-) -> Option<(u32, sync::serving::SyncServeTask)> {
-    match sync::admit_sync_open(conn, pid, v, muxes, drop_dir).await {
-        SyncAdmission::Accepted(a) => {
-            let SyncAccepted {
-                sid,
-                who,
-                root,
-                dry_run,
-                delete,
-                rx,
-                mux,
-                transport: t,
-            } = a;
-            ui::say(&format!(
-                "sync: '{who}' -> {}{}",
-                root.display(),
-                if dry_run { " (dry run)" } else { "" }
-            ));
-            let task = sync::serving::spawn_sync_server(sync::serving::SyncServeConfig {
-                transport: t,
-                mux,
-                sid,
-                root,
-                delete,
-                dry_run,
-                stream: rx,
-                max_record_bytes: filament_peerloop::sync::MAX_SYNC_RECORD_BYTES,
-            });
-            return Some((sid, task));
-        }
-        SyncAdmission::Denied(d) => {
-            // Settle-then-evaluate, as exec does: a deny that rests on a
-            // not-yet-proven identity parks for re-drive on proof.
-            if crate::recv_cmd::park_on_deny(
-                parked,
-                conn,
-                pid,
-                crate::recv_cmd::ParkKind::Sync,
-                &d.transport,
-                d.park.sid,
-                v,
-                &d.park.reason,
-            )
-            .await
-            {
-                return None;
-            }
-            let name = conn.link(pid).and_then(|l| l.verified_name.clone());
-            crate::enqueue_if_requestable(name.as_deref().unwrap_or("<unverified>"), "transfer");
-            let err = d.err();
-            ui::say(&format!("sync: refused: {err}"));
-            let _ = d.transport.send_control(&d.close_frame()).await;
-        }
-        SyncAdmission::Refused(r) => {
-            ui::say(&format!("sync: refused: {}", r.reason));
-            let _ = r.transport.send_control(&r.close).await;
-        }
-        SyncAdmission::Ignored => {}
-    }
-    None
 }
 
 #[cfg(test)]
@@ -641,7 +663,11 @@ mod tests {
     #[test]
     fn sync_counters_add_up() {
         // The reported run: three files of 2 bytes each, 1 sent and 2 same.
-        let mut t = Tally { files_total: 3, bytes_total: 6, ..Default::default() };
+        let mut t = Tally {
+            files_total: 3,
+            bytes_total: 6,
+            ..Default::default()
+        };
         t.record("sent", 2);
         t.record("same", 0);
         t.record("same", 0);
@@ -653,29 +679,55 @@ mod tests {
         assert_eq!(s["counts"]["updated"], json!(0));
         assert_eq!(s["bytes"]["total"], json!(6));
         assert_eq!(s["bytes"]["moved"], json!(2));
-        assert_eq!(s["moved"], s["bytes"]["moved"], "the schema-1 name is bytes");
-        assert_eq!(s["total"], s["bytes"]["total"], "the schema-1 name is bytes");
+        assert_eq!(
+            s["moved"], s["bytes"]["moved"],
+            "the schema-1 name is bytes"
+        );
+        assert_eq!(
+            s["total"], s["bytes"]["total"],
+            "the schema-1 name is bytes"
+        );
 
         // A failed file's bytes did not move; a skipped entry is counted.
-        let mut f = Tally { files_total: 4, bytes_total: 30, ..Default::default() };
+        let mut f = Tally {
+            files_total: 4,
+            bytes_total: 30,
+            ..Default::default()
+        };
         f.record("sent", 10);
         f.record("updated", 4);
         f.record("failed", 9);
         f.record("skipped", 0);
         f.record("deleted", 0);
-        assert_eq!(f.accounted(), 4, "deleted is a remote file, not part of total");
+        assert_eq!(
+            f.accounted(),
+            4,
+            "deleted is a remote file, not part of total"
+        );
         assert_eq!(f.bytes_moved, 14);
         let s = f.summary(false, 8);
         assert_eq!(s["counts"]["failed"], json!(1));
         assert_eq!(s["counts"]["deleted"], json!(1));
-        let parts: u64 = ["sent", "updated", "same", "skipped", "failed", "would_send", "would_update"]
-            .iter()
-            .map(|k| s["counts"][*k].as_u64().unwrap())
-            .sum();
+        let parts: u64 = [
+            "sent",
+            "updated",
+            "same",
+            "skipped",
+            "failed",
+            "would_send",
+            "would_update",
+        ]
+        .iter()
+        .map(|k| s["counts"][*k].as_u64().unwrap())
+        .sum();
         assert_eq!(parts, s["counts"]["total"].as_u64().unwrap());
 
         // A dry run moves nothing and says what would have.
-        let mut d = Tally { files_total: 2, bytes_total: 7, ..Default::default() };
+        let mut d = Tally {
+            files_total: 2,
+            bytes_total: 7,
+            ..Default::default()
+        };
         d.record("would send", 5);
         d.record("would update", 2);
         let s = d.summary(true, 0);
@@ -696,12 +748,23 @@ mod tests {
     fn chunk_hashes_cover_the_file_and_agree_with_the_whole_digest() {
         let d = tmp("hash");
         let p = d.join("f");
-        let data: Vec<u8> = (0..(SYNC_CHUNK as usize * 2 + 17)).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..(SYNC_CHUNK as usize * 2 + 17))
+            .map(|i| (i % 251) as u8)
+            .collect();
         std::fs::write(&p, &data).unwrap();
         let (full, chunks) = hash_file(&p).unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(Some(full), crate::recv_files::full_hash(&p));
-        assert_eq!(hash_file(&d.join({ std::fs::write(d.join("e"), b"").unwrap(); "e" })).unwrap().1.len(), 0);
+        assert_eq!(
+            hash_file(&d.join({
+                std::fs::write(d.join("e"), b"").unwrap();
+                "e"
+            }))
+            .unwrap()
+            .1
+            .len(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -717,10 +780,15 @@ mod tests {
         // platform branching outside it has a budget of 0 (docs/architecture/PLATFORM.md).
         let linked = crate::platform::symlink(Path::new("/etc/passwd"), &d.join("link")).is_ok();
         if !linked {
-            crate::ui::say("note: this platform would not create a symlink; the symlink arm is skipped");
+            crate::ui::say(
+                "note: this platform would not create a symlink; the symlink arm is skipped",
+            );
         }
         let (local, skipped) = walk_manifest(&d).unwrap();
-        assert_eq!(local.iter().map(|e| e.p.as_str()).collect::<Vec<_>>(), ["big", "sub/small"]);
+        assert_eq!(
+            local.iter().map(|e| e.p.as_str()).collect::<Vec<_>>(),
+            ["big", "sub/small"]
+        );
         if linked {
             assert_eq!(skipped, vec![("link".to_string(), "symlink".to_string())]);
         }
@@ -736,7 +804,14 @@ mod tests {
         let (remote, _) = walk_manifest(&r).unwrap();
         let plan = diff(&local, &remote);
         assert_eq!(plan.same, vec!["sub/small".to_string()]);
-        assert_eq!(plan.need, vec![Need { p: "big".into(), new: false, chunks: vec![1] }]);
+        assert_eq!(
+            plan.need,
+            vec![Need {
+                p: "big".into(),
+                new: false,
+                chunks: vec![1]
+            }]
+        );
         assert_eq!(plan.extra, vec!["stray".to_string()]);
         // Empty remote: everything is new, every chunk needed.
         let plan = diff(&local, &[]);

@@ -16,6 +16,12 @@ PROFILES = {
     "minimal": ["--no-default-features"],
     "default": [],
     "mesh": ["--no-default-features", "--features", "filament-peerloop/mesh"],
+    "dispatch": ["--no-default-features", "--features", "filament-peerloop/dispatch"],
+    "mesh-nofleet": [
+        "--no-default-features",
+        "--features",
+        "filament-peerloop/mesh,filament-peerloop/dispatch",
+    ],
 }
 TARGETS = (None, "aarch64-linux-android", "x86_64-linux-android")
 COMMON = {"filament-peerloop", "filament-id", "filament-cap",
@@ -64,10 +70,13 @@ def main():
             if args.output_dir:
                 (args.output_dir / f"{label}.txt").write_text(graph)
             try:
-                count = check_graph(graph, mesh=profile != "minimal")
+                count = check_graph(graph, mesh=profile in ("mesh", "default", "mesh-nofleet"))
             except RuntimeError as error:
                 raise RuntimeError(f"{label}: {error}\n{graph}") from error
-            print(f"PASS: {label}: {count} packages; mesh={profile != 'minimal'}")
+            print(
+                f"PASS: {label}: {count} packages; "
+                f"mesh={profile in ('mesh', 'default', 'mesh-nofleet')}"
+            )
 
 
 if __name__ == "__main__":

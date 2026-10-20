@@ -84,6 +84,22 @@ pub struct RefusedOutcome {
     pub message: String,
 }
 
+/// A refusal that ends a receive, carrying its outcome kind so a host adapter
+/// can map it onto its own exit taxonomy (the library owns no exit codes).
+#[derive(Debug)]
+pub struct RefusedFailure {
+    pub kind: OutcomeKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for RefusedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RefusedFailure {}
+
 /// The `error` object's data for a `--json` result. The caller supplies its
 /// own code/exit/message mapping; this is pure data.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,7 +462,10 @@ mod tests {
         let second_object = second.result_object("/tmp/in", None);
         assert_eq!(second_object["files"].as_array().unwrap().len(), 1);
         assert_eq!(second_object["files"][0]["file"], json!("q.bin"));
-        assert_eq!(second_object["files"][0]["refusal"]["reason"], json!("declined"));
+        assert_eq!(
+            second_object["files"][0]["refusal"]["reason"],
+            json!("declined")
+        );
     }
 
     /// A clone is a handle to the same invocation's report, not a fresh or

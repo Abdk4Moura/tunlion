@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [minimal, default]
+        profile: [minimal, default, dispatch, mesh-nofleet]
     env:
       # Separate jobs and target directories prevent workspace/CLI feature
       # unification from hiding a broken mesh-disabled build.
@@ -59,7 +59,12 @@ jobs:
           flags=()
           if [[ "$PROFILE" == minimal ]]; then
             flags+=(--no-default-features)
+          elif [[ "$PROFILE" == dispatch ]]; then
+            flags+=(--no-default-features --features dispatch)
+          elif [[ "$PROFILE" == mesh-nofleet ]]; then
+            flags+=(--no-default-features --features mesh,dispatch)
           fi
+          echo "peerloop profile=$PROFILE flags=${flags[*]}"
           cargo check --locked -p filament-peerloop --all-targets "${flags[@]}"
           cargo test --locked -p filament-peerloop --lib "${flags[@]}"
           cargo test --locked -p filament-peerloop --doc "${flags[@]}"

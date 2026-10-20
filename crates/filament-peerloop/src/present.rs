@@ -53,6 +53,12 @@ pub trait Progress: Send + Sync {
 pub trait Presentation: Send + Sync + 'static {
     /// Drop the sticky status line, if one is up.
     fn clear_sticky(&self);
+    /// Put a non-question status line in the sticky area.
+    fn sticky(&self, _line: &str) {}
+    /// The spinner glyph a live status line starts with.
+    fn pulse(&self) -> &'static str {
+        "·"
+    }
     /// Put `question` at the front of the sticky area, marked as waiting on the
     /// person. Returns whether a screen actually fronts it; see [`Ask`].
     #[must_use = "an unfronted question still needs to reach a person: handle Ask::Unshown"]

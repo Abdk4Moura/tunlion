@@ -811,6 +811,16 @@ pub fn sticky_ask(line: &str) {
     sticky(&format!("  {} {}", knock(), line.trim_start()));
 }
 
+/// Echo one raw-mode keystroke (raw mode disables terminal echo).
+pub fn echo_char(c: char) {
+    eprint!("{c}");
+}
+
+/// Erase one echoed keystroke.
+pub fn erase_one() {
+    eprint!("\x08 \x08");
+}
+
 pub fn clear_sticky() {
     let had = STICKY.lock().map(|mut s| s.take().is_some()).unwrap_or(false);
     if had && caps().live {
