@@ -1,7 +1,9 @@
 # The engine driver, and what is still linked out
 
-> Status: first production-used driver path landed. The receive **dispatch
-> body** is still in the CLI. `Core::start` therefore still refuses by name.
+> Status: the receive **dispatch body** is library-owned now. It lives in
+> `filament-peerloop::recv::dispatch`; the CLI is the process adapter.
+> `Core::start` still refuses by name because it has no host composition for
+> the dispatch's capability ports yet.
 
 ## What moved
 
@@ -73,28 +75,53 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
 
 ## What is still linked out, and why `Core::start` refuses
 
-The dispatch body is `cli/src/recv_cmd.rs::recv_run` — roughly 7,700 lines
-spanning the outer accept loop and ~40 `Ev` arms, reaching ~118 crate-root
-items across ~40 CLI modules. Moving it is the `filament-peerloop` step of
-`docs/design-libfilament.md` ("one driver replacing the eight hand-written
-loops"), assembled from the crates below it. The sectors that still carry CLI
-config/devices/session state (a non-exhaustive audit at this commit):
+`recv_run` moved to `crates/filament-peerloop/src/recv/dispatch.rs` with the
+transfer/consent/file arms, the reconnect loop, cleanup and the file/event
+helpers. The CLI's `recv_cmd` builds a `RecvPorts` and calls
+`recv::dispatch::drive`; `up_cmd` reaches the same path.
 
-- transfer session admission, offers, `Ev::Control`, `Ev::Chunk`,
-  `Ev::MaybeComplete` and `cli/src/session.rs` pumps;
-- identity challenge / expose / cert-renew / auth-key-enroll responses and the
-  provisional-identity store (`cli/src/identity_lifecycle.rs`,
-  `identity_state.rs`);
-- the device store (`devices_load`, `devices_touch`, …) and capability writes;
-- the daemon control server handlers that carry `l2::Mux`, `DaemonMounts` and
-  the persistent mount store (`cli/src/daemon_ctl.rs`);
-- mount restore, pty/exec-store bindings (`WarmPtys`), sshd, L3 proxy,
-  subnet-forward reconciliation, roster/presence pushes and sdnotify.
+The loop no longer names a CLI function. The remaining machine-bound sectors
+arrive through five narrow traits in `recv::ports`:
 
-Until those are library-callable, the safe outcome is the one the code keeps:
-`Core::start` returns `EngineNotLinked`, and an Android caller that wants the
-receive loop keeps using the reviewable CLI surface. The engine runtime is no
-longer the blocker; the dispatch body's sectors are.
+- `RecvIdentity` — proof/expose, cert renewal, auth-key enrolment, provisional
+  identity, device naming/revocation and the fleet host answers. The CLI
+  implementation forwards to `identity_lifecycle`, `renewal_lifecycle`,
+  `device_view`, `identity_state` and `fleet`.
+- `RecvStore` — the mutating half of the devices/capability store
+  (`devices_store`, `device_caps`).
+- `RecvServers` — the optional inbound servers: PTY, exec, forward, sync, mount
+  and ssh-sign, plus live `expose` reconciliation. The CLI implementation
+  forwards to `l2`'s PTY sessions, `exec_recv`, `sync_cmd`, `mount_recv`,
+  `ssh_ca` and `expose`.
+- `RecvDaemon` — warm links, mounts, bootstraps, reach liveness, revocation
+  snapshots and the userspace proxy. The CLI implementation forwards to
+  `daemon_ctl`, `revocation_live`, `wg`, `subnet_forward`, `sshd` and
+  `proxy_state`.
+- `RecvPrompt` — the code prompt/confirmation and raw-mode guard.
+
+`RecvEnv` is the process snapshot the CLI resolves (name, uid, terminal
+interactivity, quiet window, L2/direct posture, consent token).
+
+For Core, the blocker is now **composition, not dispatch**: there is no
+non-CLI implementation of `RecvIdentity`/`RecvStore`/`RecvServers`/`RecvDaemon`.
+`Core::start` therefore keeps returning `EngineNotLinked`; an embedder that
+supplies those and the existing `HostServices` uses `start_with_dispatch` with
+`recv::dispatch::drive` today.
+
+Next linkage work, in order:
+
+1. Add a `CoreHost` composition that implements `HostServices`, `RecvEnv` and
+   the five ports for an embedder with no CLI modules (the server sectors can
+   be omitted behind the `dispatch` feature's server capability; reduced
+   profiles already omit them).
+2. Move the device-store mutations behind `HostServices` (or a storage crate) so
+   `RecvStore` has a host-neutral implementation.
+3. Move the identity lifecycle handlers into a `recv-identity` library feature,
+   using `filament-id`/`filament-cap` and the host store instead of CLI
+   `identity_lifecycle`/`renewal_lifecycle`.
+4. Have `Core::start` construct `HostServices + RecvPorts` and call
+   `Engine::start(..., recv::dispatch::drive(...))`; only then remove the
+   `EngineNotLinked` arm.
 
 ## Verification
 

@@ -6,12 +6,19 @@
 //!
 //! The engine runtime now lives in `filament_peerloop::driver::Engine`: one
 //! cancellation latch, one publish-once readiness edge, one owned dispatch task
-//! with `stop`/`wait`. `Core` owns that runtime per instance. What is still not
-//! library-callable is the receive **dispatch body** (`cli/src/recv_cmd.rs::
-//! recv_run`), whose sectors still read CLI config/devices/mount/session state.
-//! `Core::start` therefore stays honest and refuses by name; a Rust embedder
-//! that has the real dispatch calls `start_with_dispatch`, the same driver the
-//! CLI `up` path runs. See `docs/android-ffi.md`.
+//! with `stop`/`wait`. `Core` owns that runtime per instance.
+//!
+//! The receive **dispatch body** moved into
+//! `filament_peerloop::recv::dispatch` (feature `dispatch`); the CLI is now the
+//! process adapter around it. `Core::start` still refuses by name because Core
+//! does not yet have a host composition for the dispatch's capability ports
+//! (`RecvIdentity`, `RecvStore`, `RecvServers`, `RecvDaemon`, `RecvPrompt`).
+//! Those interfaces exist and the loop calls them; what is missing is a
+//! non-CLI implementation of the identity/server sectors (today they forward to
+//! `cli/src/identity_lifecycle.rs`, `renewal_lifecycle.rs`, `daemon_ctl.rs` and
+//! the optional PTY/exec/ssh servers). A Rust embedder with that composition
+//! calls `start_with_dispatch` today. See `docs/engine-driver.md` and
+//! `docs/android-ffi.md`.
 
 uniffi::setup_scaffolding!();
 
@@ -593,7 +600,10 @@ mod tests {
         let fingerprint = pending.fingerprint();
         let spaced = phrase.split_whitespace().collect::<Vec<_>>().join("  ");
         assert_eq!(core.commit_identity(pending, &spaced).unwrap(), fingerprint);
-        assert_eq!(core.fingerprint().unwrap().as_deref(), Some(fingerprint.as_str()));
+        assert_eq!(
+            core.fingerprint().unwrap().as_deref(),
+            Some(fingerprint.as_str())
+        );
         match core.begin_identity() {
             Err(CoreError::AlreadyExists) => {}
             Ok(_) => panic!("begin_identity minted a second identity"),
@@ -942,7 +952,10 @@ mod tests {
         let phrase = pending.phrase();
         let fingerprint = core.commit_identity(pending, &phrase).unwrap();
         let again = Core::open(dir.path()).unwrap();
-        assert_eq!(again.fingerprint().unwrap().as_deref(), Some(fingerprint.as_str()));
+        assert_eq!(
+            again.fingerprint().unwrap().as_deref(),
+            Some(fingerprint.as_str())
+        );
         assert_eq!(again.status().unwrap().engine, EngineState::NotLinked);
     }
 }

@@ -44,7 +44,13 @@ What is here:
   transfer target.
 - **`petname`** -- `link_petname` and the rule it encodes: a device lookup joins on
   the petname a link PROVED it reaches, never on the broadcast display name.
-- **`recv`** -- the host-free receive mechanics: untrusted-name collisions, the
+- **`recv`** -- the host-free receive mechanics plus the production dispatch.
+  `recv::dispatch` is the one receive event loop (the CLI `recv`/`up` path);
+  `recv::ports` is its narrow capability boundary (identity, device store,
+  optional servers, daemon control, prompt), and `recv::files`, `recv::events`,
+  `recv::lifecycle`, `recv::ceremony`, `recv::signaling_health`,
+  `recv::fleet` and `recv::revocation` own the pieces that moved with it.
+  The receive mechanics are: untrusted-name collisions, the
   whole-file digest, the `.part.meta` sidecar and resumable-partial lifecycle,
   the storage-failure vocabulary, the in-order stdout sink, `IncomingFile`, the
   whole-file verify and the confinement-safe `.part` open. Its
