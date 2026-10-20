@@ -412,24 +412,60 @@ pub async fn pty_resize(
     }
 }
 
+/// Does this link's stored session key name the client's raw id?
+///
+/// Admission stores `<verified device|pid>\u{1}<client id>`; the browser sends
+/// only its raw client id. Both the raw form (a programmatic caller that holds
+/// the scoped key) and the suffix after the one acceptor-inserted separator
+/// match.
+fn scoped_session_matches(stored: &str, raw: &str) -> bool {
+    stored == raw
+        || stored
+            .split_once('\u{1}')
+            .is_some_and(|(_, client_id)| client_id == raw)
+}
+
 pub async fn pty_close(
     ports: &RecvPorts,
     pid: &str,
     v: &Value,
     bindings: &mut HashMap<String, HashMap<u32, String>>,
 ) {
-    if let Some(session_id) = v["session"].as_str() {
+    let Some(raw) = v["session"].as_str().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    // Resolve ONLY inside the closing link's own bindings. The session store is
+    // process-wide and keyed by the device-scoped id, so a frame-named key
+    // would let any peer end/forget another device's shell. A key this link
+    // never opened is not this link's to close.
+    let Some(sid_map) = bindings.get(pid) else {
+        return;
+    };
+    let matches: Vec<(u32, String)> = sid_map
+        .iter()
+        .filter(|(_, stored)| scoped_session_matches(stored, raw))
+        .map(|(sid, stored)| (*sid, stored.clone()))
+        .collect();
+    if matches.is_empty() {
+        return;
+    }
+    let mut ended: Vec<&str> = Vec::new();
+    for (_, session_id) in &matches {
+        if ended.contains(&session_id.as_str()) {
+            continue;
+        }
         if let Some(sess) = ports.pty.get_live(session_id).await {
             sess.end();
         }
         // The end is asynchronous and the handle may still look live until the
         // session task observes it. Forget the id unconditionally so a re-open
-        // with the same stable id SPAWNS a fresh shell instead of reattaching
-        // to the one being torn down.
+        // with the same stable id SPAWNS a fresh shell instead of reattaching to
+        // the one being torn down.
         ports.pty.forget(session_id).await;
-        if let Some(sid_map) = bindings.get_mut(pid) {
-            sid_map.retain(|_, id| id != session_id);
-        }
+        ended.push(session_id.as_str());
+    }
+    if let Some(sid_map) = bindings.get_mut(pid) {
+        sid_map.retain(|sid, _| !matches.iter().any(|(matched, _)| matched == sid));
     }
 }
 
@@ -468,6 +504,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const PID: &str = "pty-peer";
+    const PID_B: &str = "pty-peer-b";
     const SID: u32 = L2_SID_BASE + 9;
     const DEVICE: [u8; 32] = [5; 32];
     /// The stable, device-scoped id the admission plan derives for `client-1`
@@ -572,6 +609,37 @@ mod tests {
         }
     }
 
+    fn link(
+        pid: &str,
+        t: Arc<CaptureTransport>,
+        verified_name: &str,
+        host: Arc<dyn HostServices>,
+    ) -> Link {
+        Link {
+            peer: None,
+            info: json!({"id": pid}),
+            name: "display name".into(),
+            uid: None,
+            transport: Some(t),
+            workers: vec![],
+            generation: 1,
+            attempts: 0,
+            trusted: true,
+            expected_secret: None,
+            verified_name: Some(verified_name.into()),
+            presence: Presence::Ready,
+            direct: true,
+            direct_route: "direct-quic",
+            established_at: None,
+            identity_device_pub: Some(DEVICE),
+            identity_user_pub: Some([3; 32]),
+            identity_binding: BindingStrength::Proven,
+            identity_cert_expires: Some(1000),
+            principal_kind: cap::PrincipalKind::OwnerDevice,
+            host,
+        }
+    }
+
     async fn connection(t: Arc<CaptureTransport>, log: Arc<VecLog>) -> Conn {
         let (sio, _far) = filament_signal::Client::loopback().await.unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -589,32 +657,7 @@ mod tests {
             log,
             host.clone(),
         );
-        conn.links.insert(
-            PID.into(),
-            Link {
-                peer: None,
-                info: json!({"id": PID}),
-                name: "display name".into(),
-                uid: None,
-                transport: Some(t),
-                workers: vec![],
-                generation: 1,
-                attempts: 0,
-                trusted: true,
-                expected_secret: None,
-                verified_name: Some("phone".into()),
-                presence: Presence::Ready,
-                direct: true,
-                direct_route: "direct-quic",
-                established_at: None,
-                identity_device_pub: Some(DEVICE),
-                identity_user_pub: Some([3; 32]),
-                identity_binding: BindingStrength::Proven,
-                identity_cert_expires: Some(1000),
-                principal_kind: cap::PrincipalKind::OwnerDevice,
-                host,
-            },
-        );
+        conn.links.insert(PID.into(), link(PID, t, "phone", host));
         conn
     }
 
@@ -951,6 +994,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_only_resolves_ids_this_link_opened() {
+        let mut h = harness(true).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
+
+        // Link B presents link A's scoped value, then A's raw client id.
+        // Neither is in B's own bindings, so B may end/forget nothing.
+        let host = h.conn.host.clone();
+        h.conn.links.insert(
+            PID_B.into(),
+            link(
+                PID_B,
+                Arc::new(CaptureTransport::default()),
+                "phone-b",
+                host,
+            ),
+        );
+        for presented in [SESSION, "client-1"] {
+            pty_close(
+                &h.ports,
+                PID_B,
+                &json!({"type": "pty-close", "session": presented}),
+                &mut h.bindings,
+            )
+            .await;
+            assert_eq!(
+                h.c.ends.load(Ordering::SeqCst),
+                0,
+                "link B cannot end link A's shell with {presented:?}"
+            );
+            assert_eq!(h.c.forgets.load(Ordering::SeqCst), 0);
+        }
+        assert!(
+            !h.live.lock().unwrap().is_empty(),
+            "link A's session is untouched"
+        );
+        assert_eq!(h.bindings[PID][&SID], SESSION, "A's binding is untouched");
+
+        // A's own raw client id still closes A's session.
+        pty_close(
+            &h.ports,
+            PID,
+            &json!({"type": "pty-close", "session": "client-1"}),
+            &mut h.bindings,
+        )
+        .await;
+        assert_eq!(h.c.ends.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.forgets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn close_then_open_with_the_same_session_spawns_fresh_and_never_reattaches() {
         let mut h = harness(true).await;
         open(&mut h, &open_frame("client-1", false)).await;
@@ -961,7 +1055,9 @@ mod tests {
         pty_close(
             &h.ports,
             PID,
-            &json!({"type": "pty-close", "session": SESSION}),
+            // The browser sends its RAW client id, not the device-scoped key
+            // admission stored.
+            &json!({"type": "pty-close", "session": "client-1"}),
             &mut h.bindings,
         )
         .await;

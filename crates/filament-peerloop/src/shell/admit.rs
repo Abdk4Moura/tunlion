@@ -625,6 +625,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_session_id_cannot_carry_the_scope_separator() {
+        let host = TestHost::new(Verdict::Allow);
+        let t = Arc::new(CaptureTransport::default());
+        let (mut conn, _far) = connection(host, t, Some("phone")).await;
+        let policy = ShellPolicy::Granted;
+        // The separator is the acceptor's, so a client that spells a scoped id
+        // must not get it re-scoped (or matched) as if it were another device's.
+        let v = pty_frame(json!({"session": "phone\u{1}victim"}));
+        let out = admit_pty_open(&mut conn, PID, &v, &cfg(&policy, true), || false).await;
+        let ShellAdmission::Admitted { plan, .. } = out else {
+            panic!("gate allows");
+        };
+        assert_eq!(
+            plan.session,
+            format!("{PID}:{SID:#x}"),
+            "a client id carrying the separator falls back to the per-sid id"
+        );
+    }
+
+    #[tokio::test]
     async fn exec_plan_carries_argv_and_the_admission_identity() {
         let host = TestHost::new(Verdict::Allow);
         let t = Arc::new(CaptureTransport::default());

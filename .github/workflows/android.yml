@@ -116,12 +116,53 @@ jobs:
             target
           key: android-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: android-${{ matrix.target }}-
-      - name: Build
+      - name: Assert server backends are excluded
+        run: |
+          # The shipped Android CLI is an explicit reduced profile. Prove the
+          # opt-in inbound serving backends are absent from the resolved graph
+          # instead of relying on a runtime refusal: transfer and the shell
+          # CLIENT stay compiled, but this artifact does not serve PTY/forward
+          # (or exec, once that feature exists). sshd/shell-bootstrap has no
+          # Cargo feature in this tree, so it is not part of this assertion.
+          python3 - <<'PY'
+          import json, subprocess, sys
+          meta = json.loads(
+              subprocess.check_output(
+                  [
+                      "cargo", "metadata", "--locked", "--format-version", "1",
+                      "--no-default-features", "--features", "mesh,mount-server",
+                  ],
+                  cwd="cli",
+              )
+          )
+          wanted = {"filament-cli": {"mesh", "mount-server"},
+                    "filament-peerloop": {"mesh", "mount-server", "dispatch"}}
+          forbidden = {"forward-server", "pty-server", "exec-server"}
+          package_names = {p["id"]: p["name"] for p in meta["packages"]}
+          seen = set()
+          for node in meta["resolve"]["nodes"]:
+              name = package_names.get(node["id"])
+              if name not in wanted:
+                  continue
+              got = set(node["features"])
+              leaked = got & forbidden
+              if leaked:
+                  sys.exit(f"{name} enables server backend(s): {sorted(leaked)}")
+              if not wanted[name] <= got:
+                  sys.exit(f"{name} missing reduced-profile features {sorted(wanted[name] - got)}")
+              print(f"{name}: {sorted(got)}")
+              seen.add(name)
+          if seen != set(wanted):
+              sys.exit(f"feature graph did not resolve {sorted(set(wanted) - seen)}")
+          print("reduced Android feature graph verified")
+          PY
+      - name: Build reduced Android CLI (no inbound server backends)
         working-directory: cli
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           echo "NDK: $ANDROID_NDK_HOME"
-          cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --bin tunlion
+          cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --bin tunlion \
+            --no-default-features --features mesh,mount-server
       - name: Stage
         run: |
           mkdir -p out
