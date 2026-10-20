@@ -3,7 +3,9 @@ name: windows-devloop
 # A leased, warm Windows runner for fast iteration. Dispatch it with a branch
 # and a duration; it polls that branch and rebuilds only when the tip or the
 # command file changes, so incremental cargo state and the warm target survive
-# across iterations inside one job. Not a merge gate: normal CI still decides.
+# across iterations inside one job. Results are pushed to RESULTS_BRANCH after
+# every iteration so they can be read while the job is still running.
+# Not a merge gate: normal CI still decides.
 
 on:
   workflow_dispatch:
@@ -22,7 +24,10 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  DEVPUSH_RESULTS_BRANCH: ci/devloop-results
 
 jobs:
   devloop:
@@ -55,6 +60,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           $branch = $env:DEVPUSH_BRANCH
+          $results = $env:DEVPUSH_RESULTS_BRANCH
           $deadline = (Get-Date).AddMinutes([int]$env:DEVPUSH_MINUTES)
           Write-Host "DEVPUSH lease start branch=$branch minutes=$($env:DEVPUSH_MINUTES)"
           $last = ""
@@ -76,10 +82,26 @@ jobs:
               Write-Host "DEVPUSH head=$sha"
               Write-Host "DEVCMD $cmd"
               $sw = [Diagnostics.Stopwatch]::StartNew()
-              cmd.exe /c $cmd 2>&1
+              $out = cmd.exe /c "$cmd 2>&1"
               $code = $LASTEXITCODE
+              $out | ForEach-Object { Write-Host $_ }
               $status = if ($code -eq 0) { "ok" } else { "fail" }
-              Write-Host ("DEVRESULT {0} code={1} secs={2}" -f $status, $code, [int]$sw.Elapsed.TotalSeconds)
+              $line = "DEVRESULT {0} code={1} secs={2} head={3} cmd={4}" -f $status, $code, [int]$sw.Elapsed.TotalSeconds, $sha, $cmd
+              Write-Host $line
+              $body = "head=$sha`ncmd=$cmd`n$line`n`n" + ($out -join "`n")
+              $tmp = Join-Path $env:RUNNER_TEMP "devloop-results"
+              if (-not (Test-Path $tmp)) {
+                git clone --depth=1 "https://x-access-token:$env:GITHUB_TOKEN@github.com/$env:GITHUB_REPOSITORY" $tmp 2>&1 | Out-Null
+              }
+              if (Test-Path $tmp) {
+                Push-Location $tmp
+                git checkout -B $results 2>&1 | Out-Null
+                Set-Content -Path "last.log" -Value $body
+                git add last.log 2>&1 | Out-Null
+                git -c user.name=devloop -c user.email=devloop@local commit -q -m "devloop: $sha $status" 2>&1 | Out-Null
+                git push -f origin $results 2>&1 | Out-Null
+                Pop-Location
+              }
               $last = $key
             }
             Start-Sleep -Seconds 15
