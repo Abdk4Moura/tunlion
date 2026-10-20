@@ -91,9 +91,10 @@ the host-effect surface, not a split target):
   explicit store root, overlay-key path and log sink. Auth-key enrolment lives
   in `recv::enrollment` with its own `EnrollmentState` (nonces, live burns,
   rate-limit windows) and the durable `used-invitations`/`armed` reads on the
-  same explicit store. The CLI forwards all of them. Roster/depart and the fleet
-  rendezvous answers still forward to `roster`, `membership` and `fleet`; their
-  exact host facts are named below.
+  same explicit store. Roster verification/storage and the depart signature
+  binding moved to `recv::roster` and `recv::membership`; the fleet rendezvous
+  facts moved to `recv::fleet_rv::FleetService` with an explicit announce path
+  and route list. The CLI forwards all of them.
 - `RecvStore` — the mutating half of the devices/capability store. Its
   host-neutral implementation now lives in `recv::store`: a `DeviceStore`
   opened on an explicit root implements the whole port (device records, the
@@ -116,10 +117,11 @@ For Core, the blocker is now **composition**. `RecvStore` has a non-CLI
 implementation (`recv::store::DeviceStore`, opened on the Core's config
 directory with that instance's owner key), and the identity proof/expose/renew
 handlers have a non-CLI implementation (`recv::identity::IdentityService`,
-built from that store plus an explicit `OverlayKey` path). The remaining
-blockers are the roster/depart and fleet rendezvous answers (files that have
-not moved), and `RecvServers`/`RecvDaemon`. Auth-key enrolment now has an
-instance-owned runtime and a non-CLI handler in `recv::enrollment`.
+built from that store plus an explicit `OverlayKey` path). Auth-key enrolment
+has an instance-owned runtime and a non-CLI handler in `recv::enrollment`;
+roster/depart live in `recv::roster`/`recv::membership`; fleet facts live in
+`recv::fleet_rv`. The remaining non-CLI sectors are `RecvServers`,
+`RecvDaemon` and `RecvPrompt`.
 `Core::start` therefore keeps returning `EngineNotLinked`; an embedder that
 supplies those and the existing `HostServices` uses `start_with_dispatch` with
 `recv::dispatch::drive` today.
@@ -131,10 +133,10 @@ Next linkage work, in order:
    server sectors can be omitted behind the `dispatch` feature's server
    capability; reduced profiles already omit them). Its `RecvStore` is a
    `recv::store::DeviceStore` opened on the Core's config directory.
-2. Move the remaining identity handlers (roster/depart, fleet rendezvous) into
-   the same library feature. The store, overlay key, proof/expose/renew rules and
-   the instance-owned enrollment runtime are already there; the outstanding
-   host facts are the roster file and the remaining fleet rendezvous answers.
+2. Add the `RecvServers`/`RecvDaemon`/`RecvPrompt` compositions (or an explicit
+   reduced profile that refuses them honestly). The identity/store/roster/depart
+   and fleet facts are already library-owned; there is no remaining identity
+   handler in the CLI adapter.
 3. Have `Core::start` construct `HostServices + RecvPorts` and call
    `Engine::start(..., recv::dispatch::drive(...))`; only then remove the
    `EngineNotLinked` arm.

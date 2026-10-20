@@ -26,6 +26,7 @@ use filament_peerloop::l2::Mux;
 use filament_peerloop::recv::dispatch::{self, settle_timeout_reason};
 use filament_peerloop::recv::dispatch::{ParkKind, ParkedOpen};
 use filament_peerloop::recv::enrollment::EnrollmentService;
+use filament_peerloop::recv::fleet_rv::FleetService;
 use filament_peerloop::recv::identity::IdentityService;
 use filament_peerloop::recv::ports::{
     RawMode, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvPrompt, RecvServers, RecvStore,
@@ -54,6 +55,8 @@ pub struct CliRecv {
     /// One enrollment runtime for this receive loop: nonces, live burns and
     /// rate-limit windows are per instance, never process globals.
     pub enrollment: EnrollmentService,
+    /// Fleet rendezvous facts with this instance's explicit root/key/routes.
+    pub fleet: FleetService,
     pub pty_sessions: std::sync::Arc<l2::PtySessions>,
     pub warm_ptys: crate::WarmPtys,
     pub liveness: crate::LivenessProbes,
@@ -62,6 +65,18 @@ pub struct CliRecv {
     pub last_mount_check: Instant,
     #[cfg(feature = "mesh")]
     pub exposer: Option<Arc<crate::expose::Exposer>>,
+}
+
+fn fleet_service() -> FleetService {
+    FleetService::new(
+        crate::devices_store::store(),
+        filament_peerloop::recv::store::OverlayKey::new(
+            crate::platform::Paths::config_path("overlay.ed25519"),
+        ),
+        crate::platform::Paths::config_path("overlay.announce-seq"),
+        crate::display_name(),
+        crate::l3::advertised_prefixes(),
+    )
 }
 
 fn enrollment_service(log: Arc<dyn LogSink>) -> EnrollmentService {
@@ -81,6 +96,7 @@ impl Default for CliRecv {
         Self {
             identity: crate::identity_lifecycle::service_with_log(log.clone()),
             enrollment: enrollment_service(log.clone()),
+            fleet: fleet_service(),
             log,
             pty_sessions: l2::PtySessions::new(),
             warm_ptys: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -103,6 +119,7 @@ impl CliRecv {
         recv.log = log;
         recv.identity = crate::identity_lifecycle::service_with_log(recv.log.clone());
         recv.enrollment = enrollment_service(recv.log.clone());
+        recv.fleet = fleet_service();
         recv
     }
 
@@ -214,7 +231,12 @@ impl RecvIdentity for CliRecv {
         owner_pub: &[u8; 32],
         now: u64,
     ) -> Result<bool> {
-        crate::roster::verify_and_store_roster(blob, owner_pub, now)
+        filament_peerloop::recv::roster::verify_and_store_roster(
+            self.identity.store(),
+            blob,
+            owner_pub,
+            now,
+        )
     }
     fn verify_depart(
         &self,
@@ -222,22 +244,26 @@ impl RecvIdentity for CliRecv {
         msg: &str,
         sig: &[u8; 64],
     ) -> std::result::Result<(), &'static str> {
-        crate::membership::verify_depart(device_pub, msg, sig)
+        filament_peerloop::recv::membership::verify_depart(device_pub, msg, sig)
     }
     fn fleet_channel(&self) -> Option<String> {
-        crate::fleet::channel()
+        self.fleet.channel()
     }
     fn fleet_rv(&self) -> Option<String> {
-        crate::fleet::rv()
+        self.fleet.rv()
     }
     fn is_fleet_channel(&self, ch: &str) -> bool {
-        crate::fleet::is_fleet_channel(ch)
+        self.fleet.is_fleet_channel(ch)
     }
     fn make_fleet_hello(&self, cb: &[u8], name: &str) -> Result<Value> {
-        crate::fleet::make_hello(cb, name)
+        // The route list is a live config fact; resolve it at hello time and
+        // hand it to the library explicitly.
+        self.fleet
+            .with_routes(crate::l3::advertised_prefixes())
+            .make_hello(cb, name)
     }
     fn fleet_owner_pub(&self) -> Option<[u8; 32]> {
-        crate::fleet::my_owner_pub()
+        self.fleet.owner_pub()
     }
 }
 
@@ -837,7 +863,12 @@ impl RecvDaemon for CliRecv {
         owner_pub: &[u8; 32],
         now: u64,
     ) -> Result<bool> {
-        crate::roster::verify_and_store_roster(blob, owner_pub, now)
+        filament_peerloop::recv::roster::verify_and_store_roster(
+            self.identity.store(),
+            blob,
+            owner_pub,
+            now,
+        )
     }
     fn verify_depart(
         &self,
@@ -845,7 +876,7 @@ impl RecvDaemon for CliRecv {
         msg: &str,
         sig: &[u8; 64],
     ) -> std::result::Result<(), &'static str> {
-        crate::membership::verify_depart(device_pub, msg, sig)
+        filament_peerloop::recv::membership::verify_depart(device_pub, msg, sig)
     }
     fn fleet_share_root(&self) -> PathBuf {
         crate::fleet_support::fleet_share_root()
