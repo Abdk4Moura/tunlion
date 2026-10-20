@@ -872,7 +872,9 @@ impl DeviceStore {
         let before = arr.len();
         let entries: Vec<Value> = arr
             .into_iter()
-            .filter(|e| e["expires"].as_u64().is_some_and(|exp| exp > now))
+            .filter(|e| {
+                e["key_id"].as_str().is_some() && e["expires"].as_u64().is_some_and(|exp| exp > now)
+            })
             .collect();
         if entries.len() != before {
             if let Ok(body) = serde_json::to_string_pretty(&entries) {
