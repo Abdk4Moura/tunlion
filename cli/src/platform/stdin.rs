@@ -150,14 +150,14 @@ mod win {
         CloseHandle, GetLastError, ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileType, ReadFile, SetFileCompletionNotificationModes,
-        FILE_SKIP_COMPLETION_PORT_ON_SUCCESS, FILE_TYPE_CHAR,
+        GetFileType, ReadFile, SetFileCompletionNotificationModes, FILE_TYPE_CHAR,
     };
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, ReadConsoleInputW,
         INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE,
     };
     use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
+    use windows_sys::Win32::System::WindowsProgramming::FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     pub struct WindowsStdin {
