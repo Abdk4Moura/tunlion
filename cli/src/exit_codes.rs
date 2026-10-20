@@ -175,11 +175,22 @@ pub(crate) const CORRUPT_STATE: &str = "corrupt_state";
 /// The `error.code` a `--json` reader gets for `e`: its kind's token, or
 /// `corrupt_state` for a corrupt state file.
 pub(crate) fn json_code(e: &anyhow::Error) -> &'static str {
-    if e.chain().any(|c| c.downcast_ref::<CorruptState>().is_some()) {
+    if e.chain().any(|c| is_corrupt_state(c)) {
         CORRUPT_STATE
     } else {
         classify(e).token()
     }
+}
+
+/// A corrupt state file, wherever the error originated. `devices_store` maps
+/// the library's `CorruptStore` at its boundary, but direct store mutations
+/// (cap writes, touch, remove, provisional writes) return it unchanged. Both
+/// shapes are the same exit-2/`corrupt_state` answer to a script.
+fn is_corrupt_state(cause: &(dyn std::error::Error + 'static)) -> bool {
+    cause.downcast_ref::<CorruptState>().is_some()
+        || cause
+            .downcast_ref::<filament_peerloop::recv::store::CorruptStore>()
+            .is_some()
 }
 
 /// An error of a known kind.
@@ -219,7 +230,7 @@ pub(crate) fn classify(e: &anyhow::Error) -> ExitKind {
         if let Some(r) = cause.downcast_ref::<Reported>() {
             return r.0;
         }
-        if cause.downcast_ref::<CorruptState>().is_some() {
+        if is_corrupt_state(cause) {
             return ExitKind::Usage;
         }
     }

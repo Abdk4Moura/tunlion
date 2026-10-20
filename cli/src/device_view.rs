@@ -11,12 +11,11 @@
 //! The fourteen that other files call are `pub(crate)` here because anyhow::{ Result };
 use crate::delegated_device_state;
 use crate::device_caps::effective_device_caps;
-use crate::devices_store::{devices_path, devices_upsert_atomic, with_devices_mut};
+use crate::devices_store::{devices_path, devices_upsert_atomic};
 use crate::fleet_ui;
 use crate::identity;
 use crate::load_owner_key;
 use crate::local_device_cert;
-use crate::sweep_lapsed;
 use crate::ui;
 use crate::warm_device_names;
 use anyhow::Result;
@@ -67,15 +66,7 @@ pub(crate) fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Res
 /// is stored and never reopens when that certificate dies. Use
 /// [`device_cert_valid_for`] for any decision that should reopen on expiry.
 pub(crate) fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p).ok()?;
-    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
-    for d in arr {
-        if d["name"].as_str() == Some(name) {
-            return identity::DeviceCert::from_json(&d["deviceCert"]);
-        }
-    }
-    None
+    crate::devices_store::store().device_cert_for(name)
 }
 
 /// The certificate stored for `name` IF it is still valid right now.
@@ -86,7 +77,7 @@ pub(crate) fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
 /// still present to anything that only checks existence, with `devices forget`
 /// as the sole exit.
 pub(crate) fn device_cert_valid_for(name: &str) -> Option<identity::DeviceCert> {
-    device_cert_for(name).filter(|c| c.verify(identity::now_secs()).is_ok())
+    crate::devices_store::store().device_cert_valid_for(name)
 }
 
 /// Is `name` a device we hold an INDEX entry for but no pair secret?
@@ -103,97 +94,40 @@ pub(crate) fn device_cert_valid_for(name: &str) -> Option<identity::DeviceCert> 
 /// `tunlion devices` is listing X on the next line. For `revoke` that is worse
 /// than confusing: a device you can SEE but cannot revoke.
 pub(crate) fn device_record_exists(name: &str) -> bool {
-    let Ok(raw) = std::fs::read_to_string(devices_path()) else {
-        return false;
-    };
-    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else {
-        return false;
-    };
-    arr.iter().any(|d| d["name"].as_str() == Some(name))
+    crate::devices_store::store().device_record_exists(name)
 }
 
 pub(crate) fn device_name_for_pub(device_pub: &[u8; 32]) -> Option<String> {
-    let raw = std::fs::read_to_string(devices_path()).ok()?;
-    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
-    let key = hex::encode(device_pub);
-    arr.iter()
-        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
-        .and_then(|d| d["name"].as_str().map(str::to_string))
+    crate::devices_store::store().device_name_for_pub(device_pub)
 }
 
 /// Is this device record revoked (the certificate marker, or a durable device
 /// revoke)? The one test `devices`, `send` and `forget` share. Pure.
 pub(crate) fn record_is_revoked(record: &Value) -> bool {
-    record["certRevoked"].as_bool() == Some(true)
-        || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED)
+    filament_peerloop::recv::store::record_is_revoked(record)
 }
 
 /// Is the stored record named `name` revoked? False when there is no record.
 pub(crate) fn device_record_revoked(name: &str) -> bool {
-    std::fs::read_to_string(devices_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
-        .unwrap_or_default()
-        .iter()
-        .any(|d| d["name"].as_str() == Some(name) && record_is_revoked(d))
+    crate::devices_store::store().device_record_revoked(name)
 }
 
 pub(crate) fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
-    // A revocation kept by KEY, apart from any record: what `devices forget`
-    // leaves behind for a certificate that is still valid. Checked first, so a
-    // forgotten key stays refused whatever the device store holds.
-    if crate::fleet_support::device_key_revoked(device_pub, crate::identity::now_secs()) {
-        return true;
-    }
-    let p = devices_path();
-    // A GENUINELY ABSENT store means no device records at all: every peer is
-    // unknown, not revoked (a fresh init has no devices.json until the first
-    // pair). An EXISTING store that is unreadable or unparseable FAILS CLOSED
-    // to revoked: a corrupt store must not silently un-revoke every device
-    // (advisor ruling). `exists()` is NOT the absence check: it returns false
-    // on permission-denied too, which would take the un-revoke branch. Use
-    // metadata and distinguish NotFound (absent) from every other error
-    // (exists but unreadable: fail closed).
-    match std::fs::metadata(&p) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
-        Ok(_) => {}
-    }
-    let Ok(raw) = std::fs::read_to_string(&p) else {
-        return true;
-    };
-    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else {
-        return true;
-    };
-    let key = hex::encode(device_pub);
-    match arr
-        .iter()
-        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
-    {
-        None => false, // unknown device, not revoked
-        Some(d) => d["certRevoked"].as_bool().unwrap_or(false),
-    }
+    // The store checks the separate revoked-key list first, then the record,
+    // and fails closed on damage. One implementation, in the library.
+    crate::devices_store::store().device_cert_revoked(device_pub)
 }
 
 /// The full record for a device identified by its cert's device_pub, if any.
 /// Used by the enrollment path to decide revive (lapsed) vs refuse (revoked).
 pub(crate) fn devices_find_by_device_pub(device_pub: &[u8; 32]) -> Option<Value> {
-    let p = devices_path();
-    let Ok(raw) = std::fs::read_to_string(&p) else {
-        return None;
-    };
-    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else {
-        return None;
-    };
-    let key = hex::encode(device_pub);
-    arr.into_iter()
-        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
+    crate::devices_store::store().devices_find_by_device_pub(device_pub)
 }
 
 /// Sweep the device store for lapsed delegated records. Called periodically by
 /// the daemon. Returns how many records newly lapsed.
 pub(crate) fn devices_sweep_lapsed(now: u64) -> usize {
-    with_devices_mut(|arr| Ok(sweep_lapsed(arr, now))).unwrap_or(0)
+    crate::devices_store::store().devices_sweep_lapsed(now)
 }
 
 /// Update the `lastSeen` timestamp and overlay addresses for a known device.
@@ -203,11 +137,7 @@ pub(crate) fn devices_touch(
     v6: Option<std::net::Ipv6Addr>,
     v4: Option<std::net::Ipv4Addr>,
 ) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = devices_touch_at(name, v6, v4, now);
+    crate::devices_store::store().devices_touch(name, v6, v4);
 }
 
 /// Clock-injectable form of `devices_touch` so the liveness tests can advance
@@ -218,33 +148,12 @@ pub(crate) fn devices_touch_at(
     v4: Option<std::net::Ipv4Addr>,
     now: u64,
 ) -> Result<()> {
-    with_devices_mut(|arr| {
-        for d in arr.iter_mut() {
-            if d["name"].as_str() == Some(name) {
-                d["lastSeen"] = json!(now);
-                if let Some(v6) = v6 {
-                    d["overlayV6"] = json!(v6.to_string());
-                }
-                if let Some(v4) = v4 {
-                    d["overlayV4"] = json!(v4.to_string());
-                }
-                break;
-            }
-        }
-        Ok(())
-    })
+    crate::devices_store::store().devices_touch_at(name, v6, v4, now)
 }
 
 /// Read the `lastSeen` timestamp and overlay addresses for a known device.
 pub(crate) fn devices_info(name: &str) -> Option<(u64, Option<String>, Option<String>)> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(p).ok()?;
-    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
-    let d = arr.iter().find(|d| d["name"].as_str() == Some(name))?;
-    let last_seen = d["lastSeen"].as_u64();
-    let v6 = d["overlayV6"].as_str().map(|s| s.to_string());
-    let v4 = d["overlayV4"].as_str().map(|s| s.to_string());
-    Some((last_seen.unwrap_or(0), v6, v4))
+    crate::devices_store::store().devices_info(name)
 }
 
 /// How long this device's certificate has left, in the words of what actually
@@ -387,11 +296,8 @@ pub(crate) fn same_owner_key() -> Option<[u8; 32]> {
 /// This device's own certificate as stored, WITHOUT the expiry check: for
 /// saying "your access expired" truthfully, never for authorizing anything.
 pub(crate) fn own_cert_ignoring_expiry() -> Option<identity::DeviceCert> {
-    let raw = std::fs::read_to_string(crate::local_device_cert_path()).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    let cert = identity::DeviceCert::from_json(&value["cert"])?;
     let overlay_pub = crate::overlay::overlay_pubkey_bytes().ok()?;
-    (cert.device_pub == overlay_pub).then_some(cert)
+    crate::devices_store::store().own_cert_ignoring_expiry(&overlay_pub)
 }
 
 /// The row label for the owner this device joined, once this device's own

@@ -16,8 +16,6 @@ use crate::certify_local_device;
 use crate::config_set;
 use crate::conn::Conn;
 use crate::default_drop_dir;
-use crate::device_view::device_cert_for;
-use crate::devices_store::devices_path;
 use crate::display_name;
 use crate::enrollment::enroll_cmd;
 use crate::fleet_support::ensure_self_genesis_header;
@@ -43,89 +41,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
-/// Resolve the persisted principal record for a device cert. Returns
-/// `(kind, not_after, max_offline, last_seen)`. A missing or malformed record
-/// FAILS CLOSED as a ceiling-less delegated principal (denies everything), so
-/// a half-persisted record can never silently become an owner.
-pub(crate) fn principal_from_records(
-    records: &[Value],
-    cert: &identity::DeviceCert,
-    own_user_pub: Option<&[u8; 32]>,
-) -> (
-    crate::capability::PrincipalKind,
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
-) {
-    let record = records.iter().find(|record| {
-        identity::DeviceCert::from_json(&record["deviceCert"])
-            .map(|stored| stored.device_pub == cert.device_pub)
-            .unwrap_or(false)
-    });
-    if let Some(record) = record {
-        if record["principalKind"].is_null() {
-            return (
-                crate::capability::PrincipalKind::OwnerDevice,
-                None,
-                None,
-                None,
-            );
-        }
-        if record["principalKind"].as_str() == Some("delegated") {
-            let caps = record["principalCeiling"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let expires = record["principalExpires"].as_u64().unwrap_or(0);
-            let max_offline = record["principalMaxOffline"].as_u64();
-            let last_seen = record["lastSeen"].as_u64();
-            return (
-                crate::capability::PrincipalKind::Delegated { caps },
-                Some(expires),
-                max_offline,
-                last_seen,
-            );
-        }
-        return (
-            crate::capability::PrincipalKind::Delegated { caps: Vec::new() },
-            Some(0),
-            None,
-            None,
-        );
-    }
-    let is_same_owner = own_user_pub
-        .map(|owner| *owner == cert.user_pub)
-        .unwrap_or(false);
-    if is_same_owner {
-        return (
-            crate::capability::PrincipalKind::Delegated { caps: Vec::new() },
-            Some(0),
-            None,
-            None,
-        );
-    }
-    (
-        crate::capability::PrincipalKind::OwnerDevice,
-        None,
-        None,
-        None,
-    )
-}
+/// Resolve the persisted principal record for a device cert. The pure rule
+/// moved to `filament_peerloop::recv::store` with the store it reads; this
+/// name stays so every caller keeps resolving.
+pub(crate) use filament_peerloop::recv::store::principal_from_records;
 
 /// This device's own access has ended: its certificate (for an invited device,
 /// the invitation's end) is at or past `now`. Read without verifying, because an
 /// expired certificate fails verification and that expiry is the very fact asked
 /// about. None when there is no certificate, it is not ours, or it has no end.
 pub(crate) fn own_access_ended_at(now: u64) -> Option<u64> {
-    let raw = std::fs::read_to_string(local_device_cert_path()).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    let cert = identity::DeviceCert::from_json(&value["cert"])?;
     let ours = crate::overlay::overlay_pubkey_bytes().ok()?;
+    let cert = crate::devices_store::store().own_cert_ignoring_expiry(&ours)?;
     own_access_ended(&cert, &ours, now)
 }
 
@@ -150,62 +77,17 @@ pub(crate) fn link_died_error(peer: &str, detail: &str) -> anyhow::Error {
 }
 
 pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
-    if let (Ok(raw), Ok(overlay_pub)) = (
-        std::fs::read_to_string(local_device_cert_path()),
-        crate::overlay::overlay_pubkey_bytes(),
-    ) {
-        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
-            if let Some(cert) = identity::DeviceCert::from_json(&value["cert"]) {
-                if cert.device_pub == overlay_pub && cert.verify(identity::now_secs()).is_ok() {
-                    return Some(cert);
-                }
-            }
-        }
-    }
-    // Try display name first
-    if let Some(cert) = device_cert_for(&display_name()) {
-        if cert.verify(identity::now_secs()).is_ok() {
-            return Some(cert);
-        }
-    }
-    // Fallback: find any cert whose device_pub matches overlay key
-    if let Ok(overlay_pub) = crate::overlay::overlay_pubkey_bytes() {
-        let p = devices_path();
-        if let Ok(raw) = std::fs::read_to_string(&p) {
-            if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
-                for d in arr {
-                    if let Some(cert) = identity::DeviceCert::from_json(&d["deviceCert"]) {
-                        if cert.device_pub == overlay_pub
-                            && cert.verify(identity::now_secs()).is_ok()
-                        {
-                            return Some(cert);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Final fallback: MINT the self-cert on demand from the user key + overlay key.
-    // `identity init` creates the user key but no stored self device-cert, so without
-    // this local_device_cert() is None, pairing never runs identity-expose (it is gated
-    // on this fn), the peer stays secret-only (binding Inferred), and under authoritative
-    // the #21 proven-gate denies EVERY peer. Minting here (deterministic in user_pub and
-    // device_pub; only the timestamps vary) makes the Proven-binding path reachable for
-    // freshly-onboarded and already-onboarded identities alike, without a peer-store entry.
-    if let (Ok(Some(uk)), Ok(overlay_pub)) = (
-        identity::UserKey::load(&crate::platform::PlatformKeyStore),
-        crate::overlay::overlay_pubkey_bytes(),
-    ) {
-        if let Ok(cert) = identity::DeviceCert::certify(
-            &uk,
-            overlay_pub,
-            identity::now_secs(),
-            identity::CERT_TTL_SECS,
-        ) {
-            return Some(cert);
-        }
-    }
-    None
+    // One implementation: the library owns the stored-record lookup, the
+    // display-name fallback and the on-demand self-cert mint. Calling the free
+    // function (not constructing an IdentityService) keeps a receive loop's
+    // per-instance drop-once state intact for callers that only need the cert.
+    filament_peerloop::recv::identity::local_device_cert(
+        &crate::devices_store::store(),
+        &filament_peerloop::recv::store::OverlayKey::new(
+            crate::platform::Paths::config_path("overlay.ed25519"),
+        ),
+        &display_name(),
+    )
 }
 
 /// Restores the pre-U1 precondition for scripts that want to fail fast: with

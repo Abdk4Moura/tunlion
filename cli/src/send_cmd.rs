@@ -792,6 +792,11 @@ pub(crate) async fn send_cmd(
         .as_ref()
         .map(|(n, _)| format!("'{n}'"))
         .unwrap_or_else(|| "the receiver".to_string());
+    // One identity service for this send flow: repeated challenges must share
+    // its drop-once bookkeeping, not rebuild it per event.
+    let identity = crate::identity_lifecycle::service_with_log(Arc::new(
+        crate::host_impl::CliLog,
+    ));
 
     loop {
         // Never a silent minute: while the peer has not connected, or has
@@ -1876,7 +1881,7 @@ pub(crate) async fn send_cmd(
                 // the is_active guard so it fires as soon as the challenge lands.
                 Some("identity-nonce-challenge") => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        respond_to_identity_challenge(&t, &v).await;
+                        respond_to_identity_challenge(&identity, &t, &v).await;
                     }
                 }
                 // Enroller receives the daemon's nonce challenge — build

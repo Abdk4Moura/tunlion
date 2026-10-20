@@ -17,7 +17,6 @@ use crate::file_io::pidfile;
 use crate::shared_defs::ServiceManager;
 use crate::{platform, same_executable, settings};
 use anyhow::{Result, bail};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// True if ANY known device has been granted the `shell` capability. The daemon
@@ -29,11 +28,11 @@ use std::path::{Path, PathBuf};
 /// every non-granted device, so this does NOT broaden access, it only honors the
 /// grants that already exist.
 pub(crate) fn any_shell_grant() -> bool {
-    !shell_grant_names_at(&devices_path()).is_empty()
+    crate::devices_store::store().any_shell_grant()
 }
 
 pub(crate) fn any_shell_grant_at(path: &Path) -> bool {
-    !shell_grant_names_at(path).is_empty()
+    !filament_peerloop::recv::store::shell_grant_names_at(path).is_empty()
 }
 
 /// `any_shell_grant`, re-read whenever devices.json changes.
@@ -77,26 +76,7 @@ pub(crate) fn shell_grant_names() -> Vec<String> {
 }
 
 pub(crate) fn shell_grant_names_at(path: &Path) -> Vec<String> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(arr) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = arr
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|d| {
-            d.get("caps")
-                .and_then(|c| c.as_array())
-                .map(|list| list.iter().any(|c| c.as_str() == Some("shell")))
-                .unwrap_or(false)
-        })
-        .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
-        .collect();
-    names.sort();
-    names
+    filament_peerloop::recv::store::shell_grant_names_at(path)
 }
 
 /// True when an `up` daemon is currently running (drives the "takes effect on

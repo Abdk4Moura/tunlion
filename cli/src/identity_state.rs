@@ -13,76 +13,17 @@
 //! #[test] fn that sat between mint_capability and mark_lapsed_now stayed in main.rs.
 use crate::device_view::device_cert_revoked;
 use crate::devices_store::{devices_load, devices_path, with_devices_mut};
-use crate::identity_flow::principal_from_records;
 use crate::{
-    DeadlineClock, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, fleet, fleet_ui, identity,
-    load_owner_key, local_device_cert_path, ui,
+    DeadlineClock, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, fleet_ui, identity,
+    load_owner_key, ui,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Strip terminal escape sequences and control characters from a device petname
-/// before it is stored. A name typed or pasted in a terminal can capture the
-/// terminal's own device-attributes reply (`ESC[?1;2c...`); that junk then never
-/// matches `--to <name>`, silently breaking targeting (observed live: a `send
-/// --to pixel` whose stored name was `...escapes...pixel` fell back to the local
-/// room and the Pixel never received). Keep only printable, non-control chars.
-pub(crate) fn sanitize_device_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut chars = name.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // ESC: drop a CSI escape (`ESC [ ... final-letter`) wholesale.
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&n) = chars.peek() {
-                    chars.next();
-                    if n.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            continue; // also drops a lone/other ESC
-        }
-        if !c.is_control() {
-            out.push(c);
-        }
-    }
-    out.trim().to_string()
-}
-
-/// The single moment a delegated device stops being recognized:
-/// `min(cert_expiry, not_after, last_seen + max_offline)`. Each term is a
-/// hard bound; whichever comes first is the truth, and the returned clock says
-/// which one it was. `last_seen == 0` (never seen) does NOT start the budget
-/// clock, so a freshly enrolled or legacy device is governed by its absolute
-/// bounds until its first observation.
-pub(crate) fn effective_principal_deadline(
-    cert_expires: u64,
-    not_after: Option<u64>,
-    last_seen: Option<u64>,
-    max_offline: Option<u64>,
-) -> (u64, DeadlineClock) {
-    let mut deadline = cert_expires;
-    let mut clock = DeadlineClock::CertExpiry;
-    if let Some(na) = not_after {
-        if na < deadline {
-            deadline = na;
-            clock = DeadlineClock::AbsoluteStop;
-        }
-    }
-    if let (Some(ls), Some(mo)) = (last_seen, max_offline) {
-        if ls > 0 {
-            let budget_deadline = ls.saturating_add(mo);
-            if budget_deadline < deadline {
-                deadline = budget_deadline;
-                clock = DeadlineClock::LivenessBudget;
-            }
-        }
-    }
-    (deadline, clock)
-}
+pub(crate) use filament_peerloop::recv::store::{
+    effective_principal_deadline, sanitize_device_name,
+};
 
 pub(crate) fn persisted_principal_for_cert(
     cert: &identity::DeviceCert,
@@ -92,12 +33,8 @@ pub(crate) fn persisted_principal_for_cert(
     Option<u64>,
     Option<u64>,
 ) {
-    let records = std::fs::read_to_string(devices_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
-        .unwrap_or_default();
     let own_user_pub = load_owner_key().map(|owner| owner.public_key_bytes());
-    principal_from_records(&records, cert, own_user_pub.as_ref())
+    crate::devices_store::store().persisted_principal_for_cert(cert, own_user_pub.as_ref())
 }
 
 /// Our own signed `cap_header` for resource "self", if this device has one.
@@ -112,24 +49,7 @@ pub(crate) fn persisted_principal_for_cert(
 /// the same thing on every device in the fleet, which is what makes distributing
 /// them coherent rather than a category error.
 pub(crate) fn owner_signed_cap_ops() -> Vec<Value> {
-    let dir = crate::settings::config_dir();
-    let store = crate::capability::load_cap_store(&dir);
-    let Some(owner) = fleet::my_owner_pub() else {
-        return Vec::new();
-    };
-    store
-        .into_iter()
-        .filter(|e| {
-            // A revoke tombstone parses as an op too, but it is a LOCAL version
-            // record, not policy to hand out: a receiver merges by appending,
-            // so a relayed tombstone would sit beside the grant it should have
-            // beaten and change nothing.
-            e.get("type").and_then(|v| v.as_str()) != Some(crate::capability::CAP_TOMBSTONE_TYPE)
-                && crate::capability::CapOp::from_json(e)
-                    .map(|op| op.grantor == owner)
-                    .unwrap_or(false)
-        })
-        .collect()
+    crate::devices_store::store_with_owner().owner_signed_cap_ops()
 }
 
 /// Merge fleet policy received from a peer, keeping only what the OWNER signed.
@@ -140,40 +60,23 @@ pub(crate) fn owner_signed_cap_ops() -> Vec<Value> {
 /// and duplicates are skipped so repeated pushes are idempotent. Returns how many
 /// were newly stored.
 pub(crate) fn merge_owner_cap_ops(ops: &[Value]) -> usize {
-    let Some(owner) = fleet::my_owner_pub() else {
-        return 0;
-    };
-    let dir = crate::settings::config_dir();
-    let mut store = crate::capability::load_cap_store(&dir);
-    let now = crate::capability::now_secs();
-    let mut added = 0usize;
-    for v in ops {
-        let Some(op) = crate::capability::CapOp::from_json(v) else {
-            continue;
-        };
-        if op.grantor != owner || op.verify(&owner, now).is_err() {
-            continue;
+    match crate::devices_store::store_with_owner().merge_owner_cap_ops_outcome(ops) {
+        Ok(added) => {
+            if added > 0 {
+                // The CLI keeps a process-local cap-store read cache; the library
+                // writes the same `caps.json` through the same atomic writer, so
+                // drop the cache exactly where `save_cap_store` used to.
+                crate::capability::invalidate_cap_cache();
+            }
+            added
         }
-        // An op at or below a local revoke tombstone is a replay of something
-        // this device already saw revoked. Owner-signed is not enough: the
-        // signature on the old grant is still valid, which is exactly why the
-        // tombstone keeps the version it beat.
-        if crate::capability::superseded_by_tombstone(&store, &op) {
-            continue;
-        }
-        let dup = store.iter().any(|e| e == v);
-        if !dup {
-            store.push(v.clone());
-            added += 1;
+        Err(e) => {
+            // The library has no terminal sink; the adapter keeps the old debug
+            // line for a fleet policy that could not be stored.
+            ui::debug(&format!("{e}"));
+            0
         }
     }
-    if added > 0 {
-        if let Err(e) = crate::capability::save_cap_store(&dir, &store) {
-            ui::debug(&format!("fleet policy not stored: {e}"));
-            return 0;
-        }
-    }
-    added
 }
 
 pub(crate) fn owner_cap_header() -> Option<Value> {
@@ -326,12 +229,8 @@ pub(crate) fn certify_local_device(
         identity::now_secs(),
         identity::CERT_TTL_SECS,
     )?;
-    let path = local_device_cert_path();
-    crate::platform::SecretFile::write_str(
-        &path,
-        &serde_json::to_string_pretty(&json!({ "name": name, "cert": cert.to_json() }))?,
-    )
-    .with_context(|| format!("write local device certificate to {}", path.display()))?;
+    let body = json!({ "name": name, "cert": cert.to_json() });
+    crate::devices_store::store().write_local_device_cert_record(&body)?;
     Ok(cert)
 }
 
@@ -509,29 +408,11 @@ pub(crate) fn delegated_access_for(device_pub: &[u8; 32]) -> Option<DelegatedAcc
 /// What to re-invite an expired delegated device with: the ceiling it was
 /// admitted with and the lifetime its invitation granted (`principalIssued`,
 /// stamped at enrolment, to `principalExpires`). Pure.
-pub(crate) fn reinvite_from_record(record: &Value) -> Option<crate::refusal::Reinvite> {
-    let access = delegated_access_from_record(record)?;
-    let end = record["principalExpires"].as_u64()?;
-    let start = record["principalIssued"]
-        .as_u64()
-        .or_else(|| record["addedAt"].as_u64())
-        .unwrap_or(end);
-    let ceiling: Vec<String> = access.ceiling.into_iter().filter(|c| !c.starts_with("route:")).collect();
-    (!ceiling.is_empty()).then(|| crate::refusal::Reinvite {
-        ceiling,
-        lifetime: end.saturating_sub(start).max(1),
-    })
-}
+pub(crate) use filament_peerloop::recv::store::reinvite_from_record;
 
 /// [`reinvite_from_record`] for the device with this key.
 pub(crate) fn reinvite_for(device_pub: &[u8; 32]) -> Option<crate::refusal::Reinvite> {
-    let hex = hex::encode(device_pub);
-    let raw = std::fs::read_to_string(devices_path()).ok()?;
-    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
-    let record = arr
-        .iter()
-        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))?;
-    reinvite_from_record(record)
+    crate::devices_store::store().reinvite_for(device_pub)
 }
 
 /// The one wording for a device revoked here, at open and mid-session.
@@ -650,27 +531,7 @@ pub(crate) fn mint_capability(raw: &str) -> Result<String> {
 /// Mark a device record lapsed immediately (advisory depart, or manual). The
 /// record is KEPT (option b): evidence survives. Returns the device name.
 pub(crate) fn mark_lapsed_now(device_pub: &[u8; 32]) -> Option<String> {
-    let key = hex::encode(device_pub);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    with_devices_mut(|arr| {
-        let name = arr
-            .iter()
-            .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
-            .and_then(|d| d["name"].as_str().map(str::to_string))
-            .ok_or_else(|| anyhow::anyhow!("device not in the store"))?;
-        for d in arr.iter_mut() {
-            if d["name"].as_str() == Some(&name) {
-                d["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
-                d["lapsedAt"] = json!(now);
-                break;
-            }
-        }
-        Ok(name)
-    })
-    .ok()
+    crate::devices_store::store().mark_lapsed_now(device_pub)
 }
 #[cfg(test)]
 mod tests {

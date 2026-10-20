@@ -25,6 +25,7 @@ use filament_peerloop::l2::forward;
 use filament_peerloop::l2::Mux;
 use filament_peerloop::recv::dispatch::{self, settle_timeout_reason};
 use filament_peerloop::recv::dispatch::{ParkKind, ParkedOpen};
+use filament_peerloop::recv::identity::IdentityService;
 use filament_peerloop::recv::ports::{
     RawMode, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvPrompt, RecvServers, RecvStore,
 };
@@ -46,6 +47,9 @@ use tokio::sync::mpsc;
 
 pub struct CliRecv {
     pub log: Arc<dyn LogSink>,
+    /// One identity service for this receive loop. Its drop-once state is
+    /// per-instance and must outlive individual dispatch calls.
+    pub identity: IdentityService,
     pub pty_sessions: std::sync::Arc<l2::PtySessions>,
     pub warm_ptys: crate::WarmPtys,
     pub liveness: crate::LivenessProbes,
@@ -58,8 +62,10 @@ pub struct CliRecv {
 
 impl Default for CliRecv {
     fn default() -> Self {
+        let log: Arc<dyn LogSink> = Arc::new(filament_peerloop::host::NoLog);
         Self {
-            log: Arc::new(filament_peerloop::host::NoLog),
+            identity: crate::identity_lifecycle::service_with_log(log.clone()),
+            log,
             pty_sessions: l2::PtySessions::new(),
             warm_ptys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             liveness: crate::LivenessProbes::new(),
@@ -77,10 +83,15 @@ impl Default for CliRecv {
 
 impl CliRecv {
     pub fn new(log: Arc<dyn LogSink>) -> Self {
-        Self {
-            log,
-            ..Self::default()
-        }
+        let mut recv = Self::default();
+        recv.log = log;
+        recv.identity = crate::identity_lifecycle::service_with_log(recv.log.clone());
+        recv
+    }
+
+    /// The identity service for this receive loop, sharing its log sink.
+    fn identity(&self) -> &IdentityService {
+        &self.identity
     }
 }
 
@@ -94,17 +105,12 @@ impl RecvIdentity for CliRecv {
         pending_proven: &Arc<std::sync::Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
         identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) {
-        crate::identity_lifecycle::issue_proven_challenge_and_hold(
-            conn,
-            pid,
-            t,
-            pending_proven,
-            identity_nonces,
-        )
-        .await
+        self.identity()
+            .issue_proven_challenge_and_hold(conn, pid, t, pending_proven, identity_nonces)
+            .await
     }
     async fn respond_to_identity_challenge(&self, t: &Arc<dyn Transport>, v: &Value) {
-        crate::identity_lifecycle::respond_to_identity_challenge(t, v).await
+        self.identity().respond_to_identity_challenge(t, v).await
     }
     fn handle_identity_expose(
         &self,
@@ -113,28 +119,33 @@ impl RecvIdentity for CliRecv {
         v: &Value,
         identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool {
-        crate::identity_lifecycle::handle_identity_expose(conn, pid, v, identity_nonces)
+        self.identity()
+            .handle_identity_expose(conn, pid, v, identity_nonces)
     }
     fn store_provisional_identity(&self, name: &str, cert: &identity::DeviceCert) -> Result<()> {
-        crate::identity_lifecycle::store_provisional_identity(name, cert)
+        self.identity()
+            .store()
+            .store_provisional_identity(name, cert)
     }
     fn load_provisional_identity(&self, name: &str) -> Option<identity::DeviceCert> {
-        crate::identity_lifecycle::load_provisional_identity(name)
+        self.identity().store().load_provisional_identity(name)
     }
     fn clear_provisional_identity(&self, name: &str) {
-        crate::identity_lifecycle::clear_provisional_identity(name)
+        self.identity().store().clear_provisional_identity(name)
     }
     fn local_device_cert(&self) -> Option<identity::DeviceCert> {
-        crate::local_device_cert()
+        self.identity().local_device_cert()
     }
     async fn maybe_request_cert_renewal(&self, conn: &Conn, pid: &str) {
-        crate::renewal_lifecycle::maybe_request_cert_renewal(conn, pid).await
+        self.identity().maybe_request_cert_renewal(conn, pid).await
     }
     async fn respond_to_cert_renew_request(&self, conn: &mut Conn, pid: String) {
-        crate::renewal_lifecycle::respond_to_cert_renew_request(conn, pid).await
+        self.identity()
+            .respond_to_cert_renew_request(conn, pid)
+            .await
     }
     async fn handle_cert_renew_ack(&self, v: &Value) {
-        crate::renewal_lifecycle::handle_cert_renew_ack(v).await
+        self.identity().handle_cert_renew_ack(v).await
     }
     async fn respond_to_auth_key_enroll_request(&self, conn: &mut Conn, pid: String, v: Value) {
         crate::renewal_lifecycle::respond_to_auth_key_enroll_request(conn, pid, v).await
@@ -143,10 +154,10 @@ impl RecvIdentity for CliRecv {
         crate::renewal_lifecycle::handle_auth_key_enroll_response(conn, pid, v).await
     }
     fn gate_settle_ms(&self) -> u64 {
-        crate::identity_state::gate_settle_ms()
+        self.identity().gate_settle_ms()
     }
     fn hold_expired(&self, held: Instant) -> bool {
-        crate::identity_lifecycle::hold_expired(held, Instant::now())
+        held <= Instant::now()
     }
     async fn resend_identity_challenge(
         &self,
@@ -154,25 +165,27 @@ impl RecvIdentity for CliRecv {
         pid: &str,
         identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool {
-        crate::identity_lifecycle::resend_identity_challenge(conn, pid, identity_nonces).await
+        self.identity()
+            .resend_identity_challenge(conn, pid, identity_nonces)
+            .await
     }
     fn device_name_for_pub(&self, device_pub: &[u8; 32]) -> Option<String> {
-        crate::device_view::device_name_for_pub(device_pub)
+        self.identity().device_name_for_pub(device_pub)
     }
     fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool {
-        crate::device_view::device_cert_revoked(device_pub)
+        self.identity().device_cert_revoked(device_pub)
     }
     fn owner_pub_for_resources(&self) -> Option<[u8; 32]> {
-        crate::owner_pub_for_resources()
+        self.identity().owner_pub_for_resources()
     }
     fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<refusal::Reinvite> {
-        crate::identity_state::reinvite_for(device_pub)
+        self.identity().reinvite_for(device_pub)
     }
     fn enroll_channel(&self, public_key: &[u8; 32]) -> String {
-        crate::ephemeral::enroll_channel(public_key)
+        self.identity().enroll_channel(public_key)
     }
     fn is_armed(&self) -> bool {
-        crate::armed::is_armed()
+        self.identity().is_armed()
     }
     fn verify_and_store_roster(
         &self,
@@ -268,11 +281,9 @@ impl RecvStore for CliRecv {
         cert: &identity::DeviceCert,
         scope: u8,
     ) -> Result<()> {
-        crate::devices_store::with_devices_mut(|arr| {
-            identity::apply_peer_identity(arr, name, cert, scope)
-                .map_err(|e| anyhow::anyhow!("{e}"))
-        })
-        .map(|_| ())
+        self.identity()
+            .store()
+            .promote_provisional_identity(name, cert, scope)
     }
     fn mark_bounded_cap_source(&self, name: &str, capability: &str, source: &str) -> Result<()> {
         crate::device_caps::mark_bounded_cap_source(name, capability, source)

@@ -4835,6 +4835,11 @@ async fn shell_bootstrap(
     // must not hang us forever). Capture it, then ALWAYS tear this link down
     // BEFORE returning, so the ssh data link (netcat ProxyCommand) is the only
     // boxA peer the acceptor sees, no concurrent same-device supersede churn.
+    // One identity service for this bootstrap flow: the acceptor may challenge
+    // more than once, and a rebuilt service would forget what it already logged.
+    let identity = crate::identity_lifecycle::service_with_log(std::sync::Arc::new(
+        crate::host_impl::CliLog,
+    ));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     let verdict: Result<BootstrapInfo> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -4851,7 +4856,7 @@ async fn shell_bootstrap(
                 // so our binding is upgraded to Proven; otherwise the acceptor
                 // refuses the bootstrap on Inferred ("identity not proven").
                 Some("identity-nonce-challenge") => {
-                    crate::respond_to_identity_challenge(&t, &v).await;
+                    crate::respond_to_identity_challenge(&identity, &t, &v).await;
                     continue;
                 }
                 // The acceptor SAYS why it refused, in an l2-close `err`. This

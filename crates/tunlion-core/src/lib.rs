@@ -13,12 +13,16 @@
 //! process adapter around it. `Core::start` still refuses by name because Core
 //! does not yet have a host composition for the dispatch's capability ports
 //! (`RecvIdentity`, `RecvStore`, `RecvServers`, `RecvDaemon`, `RecvPrompt`).
-//! Those interfaces exist and the loop calls them; what is missing is a
-//! non-CLI implementation of the identity/server sectors (today they forward to
-//! `cli/src/identity_lifecycle.rs`, `renewal_lifecycle.rs`, `daemon_ctl.rs` and
-//! the optional PTY/exec/ssh servers). A Rust embedder with that composition
-//! calls `start_with_dispatch` today. See `docs/engine-driver.md` and
-//! `docs/android-ffi.md`.
+//! Those interfaces exist and the loop calls them. `RecvStore` and the
+//! proof/expose/renew half of `RecvIdentity` now have host-neutral
+//! implementations (`recv::store::DeviceStore` and
+//! `recv::identity::IdentityService`, built from an explicit config directory
+//! and overlay-key path). The remaining non-CLI gap is auth-key enrolment plus
+//! the fleet/roster host facts and the optional server/daemon sectors (today
+//! they forward to `cli/src/renewal_lifecycle.rs`, `roster.rs`, `membership.rs`,
+//! `fleet.rs`, `daemon_ctl.rs` and the optional PTY/exec/ssh servers). A Rust
+//! embedder with that composition calls `start_with_dispatch` today. See
+//! `docs/engine-driver.md` and `docs/android-ffi.md`.
 
 uniffi::setup_scaffolding!();
 

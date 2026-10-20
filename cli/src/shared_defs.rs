@@ -129,21 +129,14 @@ pub(crate) use filament_peerloop::recv::PartMeta;
 
 /// The three clocks that can end a delegated device's recognition. The binding
 /// one is whichever expires first; the state display names it so "X time left"
-/// never lies about which bound is actually in charge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeadlineClock {
-    /// The device certificate's own expiry (`verify` fails past it).
-    CertExpiry,
-    /// The signed absolute stop (`not_after` from the auth key).
-    AbsoluteStop,
-    /// The liveness budget (`last_seen + effective_max_offline`).
-    LivenessBudget,
-}
+/// never lies about which bound is actually in charge. The enum lives with the
+/// store that computes it; this name is the CLI's existing import path.
+pub(crate) use filament_peerloop::recv::store::DeadlineClock;
 
 /// Terminal principal states written to `principalState` on a device record.
-pub(crate) const PRINCIPAL_STATE_LAPSED: &str = "lapsed";
-
-pub(crate) const PRINCIPAL_STATE_REVOKED: &str = "revoked";
+pub(crate) use filament_peerloop::recv::store::{
+    PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED,
+};
 
 /// Display name for a fleet link before its certificate names it. Contains a
 /// space and a colon so it cannot collide with a device petname, and it is never

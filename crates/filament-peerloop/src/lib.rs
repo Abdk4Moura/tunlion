@@ -43,11 +43,14 @@
 //! What the crate still does NOT contain:
 //! - the command surface (`send_cmd`, `recv_cmd`, the daemons, the roster UI):
 //!   those decide what a person asked for and render it.
-//! - anything that reads settings, devices.json, the keystore or a `Paths`:
-//!   `host` defines the `LogSink` and `HostServices` traits the peer loop asks
-//!   through, plus host-free defaults, and the CLI implements them. `present`
-//!   does the same for terminal state (the sticky line, a waiting question,
-//!   transfer bars, the clipboard, a raw-mode echo).
+//! - anything that resolves a config directory, a `Paths`, or a keystore from
+//!   the process environment. `host` defines the `LogSink` and `HostServices`
+//!   traits the peer loop asks through, and the CLI implements them. `present`
+//!   does the same for terminal state. One deliberate exception is
+//!   `recv::store` and `recv::identity`: they read and write `devices.json`, the
+//!   capability store, the identity sidecars and the overlay key, but every
+//!   entry point is built from an explicit root/key path and nothing in them
+//!   consults the environment.
 //! Nothing here calls back into the CLI; the CLI depends on this crate.
 
 #![cfg_attr(not(feature = "mesh"), doc = include_str!("mesh_disabled.md"))]

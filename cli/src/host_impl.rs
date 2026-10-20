@@ -64,6 +64,9 @@ impl LogSink for CliLog {
     fn enabled(&self, level: Level) -> bool {
         crate::ui::enabled(level_to_ui(level))
     }
+    fn caution(&self, title: &str, body: Option<&str>, actions: &[String]) {
+        crate::ui::caution(title, body, actions);
+    }
 }
 
 fn tone_to_ui(tone: Tone) -> crate::ui::Tone {
@@ -489,11 +492,6 @@ pub(crate) fn dropped_no_transport(pid: &str, what: &str) {
 /// Defined here (re-exported from `conn`) because its callers include frozen
 /// modules; it reads the keystore and the config dir, which is host business.
 pub(crate) fn owner_pub_for_resources() -> Option<[u8; 32]> {
-    if let Ok(Some(k)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-        return Some(k.public_key_bytes());
-    }
-    let raw = std::fs::read_to_string(crate::local_device_cert_path()).ok()?;
-    let record: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let cert = crate::identity::DeviceCert::from_json(&record["cert"])?;
-    Some(cert.user_pub)
+    let local_pub = crate::overlay::overlay_pubkey_bytes().ok();
+    crate::devices_store::store().owner_pub_for_resources(local_pub.as_ref())
 }

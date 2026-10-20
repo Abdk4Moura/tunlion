@@ -8,8 +8,6 @@
 //! Moved as ELEVEN separate blocks scattered from L992 to L3929; nothing between
 //! them is part of this module. NO CFG ANYWHERE: neither these bodies nor any
 //! dependency they use anyhow::{ Result };
-use crate::PRINCIPAL_STATE_LAPSED;
-use crate::PRINCIPAL_STATE_REVOKED;
 use crate::ShellPolicy;
 use crate::config_get;
 use crate::conn::Conn;
@@ -17,7 +15,6 @@ use crate::default_drop_dir;
 use crate::device_view::device_cert_for;
 use crate::devices_store::devices_path;
 use crate::display_name;
-use crate::effective_principal_deadline;
 use crate::fleet;
 use crate::identity;
 use crate::load_owner_key;
@@ -163,10 +160,7 @@ pub(crate) fn key_revocation_in_force(entries: &[Value], device_pub: &[u8; 32], 
 
 /// Is this device key revoked by a revocation kept apart from any record?
 pub(crate) fn device_key_revoked(device_pub: &[u8; 32], now: u64) -> bool {
-    match load_key_revocations_at(&key_revocations_path()) {
-        Ok(entries) => key_revocation_in_force(&entries, device_pub, now),
-        Err(()) => true,
-    }
+    crate::devices_store::store().device_key_revoked(device_pub, now)
 }
 
 /// Record `cert`'s key as revoked until the certificate expires, pruning
@@ -504,32 +498,7 @@ pub(crate) fn fleet_indexed_name(name: &str) -> bool {
 /// KEPT as evidence (a vanished record is indistinguishable from one never
 /// there). Returns how many records newly lapsed.
 pub(crate) fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
-    let mut changed = 0;
-    for record in records.iter_mut() {
-        if record["principalKind"].as_str() != Some("delegated") {
-            continue;
-        }
-        if record["certRevoked"].as_bool() == Some(true)
-            || record["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED)
-            || record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED)
-        {
-            continue;
-        }
-        let Some(cert) = identity::DeviceCert::from_json(&record["deviceCert"]) else {
-            continue;
-        };
-        let not_after = record["principalExpires"].as_u64();
-        let last_seen = record["lastSeen"].as_u64();
-        let max_offline = record["principalMaxOffline"].as_u64();
-        let (deadline, _clock) =
-            effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
-        if deadline <= now {
-            record["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
-            record["lapsedAt"] = json!(now);
-            changed += 1;
-        }
-    }
-    changed
+    filament_peerloop::recv::store::sweep_lapsed(records, now)
 }
 
 /// The read-only SHARE ROOT a same-owner fleet device may mount without an
