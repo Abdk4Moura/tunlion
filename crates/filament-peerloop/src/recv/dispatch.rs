@@ -200,6 +200,11 @@ impl std::fmt::Display for DispatchFailure {
 }
 impl std::error::Error for DispatchFailure {}
 
+/// A possession challenge's hold is over at its deadline.
+pub fn hold_expired(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
 /// The settle timeout reason, shared by the expiry deny and the client.
 pub fn settle_timeout_reason(ms: u64) -> String {
     format!("identity not proven within {ms} ms; retry")
@@ -3437,6 +3442,7 @@ async fn recv_run(
             daemon,
             &report,
             &mut st.completed,
+            &ports.env.delivery,
         )
         .await?;
 
@@ -8640,6 +8646,7 @@ async fn recv_run(
                         daemon,
                         &report,
                         &mut st.completed,
+                        &ports.env.delivery,
                     )
                     .await?;
                     if st.completed == 0 {
@@ -8677,6 +8684,7 @@ async fn recv_run(
                         daemon,
                         &report,
                         &mut st.completed,
+                        &ports.env.delivery,
                     )
                     .await?;
                     if st.completed == 0 {
@@ -9110,7 +9118,7 @@ mod offer_consent_tests {
 
     #[test]
     fn the_receive_help_promises_what_the_code_path_does() {
-        let help = include_str!("cli_def.rs");
+        let help = include_str!("../../../../cli/src/cli_def.rs");
         assert!(help.contains("`receive <code>` never asks"));
     }
 }
@@ -9211,6 +9219,7 @@ mod lifecycle_tests {
     use super::*;
     use crate::driver::{Cancellation, DriverOutcome, Readiness};
     use crate::host::{NoHost, NoLog};
+    use crate::recv::ports::RecvEnv;
 
     async fn invalid_receive_with(
         stop: &Cancellation,
@@ -9931,16 +9940,10 @@ mod settle_tests {
     fn challenge_hold_expires_at_its_deadline() {
         let now = Instant::now();
         let deadline = now + Duration::from_secs(20);
-        assert!(!crate::identity_lifecycle::hold_expired(deadline, now));
-        assert!(!crate::identity_lifecycle::hold_expired(
-            deadline,
-            now + Duration::from_secs(19)
-        ));
-        assert!(crate::identity_lifecycle::hold_expired(deadline, deadline));
-        assert!(crate::identity_lifecycle::hold_expired(
-            deadline,
-            deadline + Duration::from_secs(1)
-        ));
+        assert!(!hold_expired(deadline, now));
+        assert!(!hold_expired(deadline, now + Duration::from_secs(19)));
+        assert!(hold_expired(deadline, deadline));
+        assert!(hold_expired(deadline, deadline + Duration::from_secs(1)));
     }
 
     #[test]
@@ -9963,7 +9966,7 @@ mod expiry_redrive_tests {
     #[test]
     fn the_redrive_never_overturns_a_final_deny() {
         for reason in [
-            crate::capability::expired_reason(1_760_000_000),
+            crate::refusal::expired_reason(1_760_000_000),
             crate::capability::CEILING_REASON.to_string(),
             cap::REVOKED_REASON.to_string(),
             "device revoked".to_string(),
@@ -9999,7 +10002,7 @@ mod expiry_redrive_tests {
     /// "access expired at ..." instead of a bare "declined".
     #[test]
     fn a_policy_decline_carries_its_reason() {
-        let r = crate::capability::expired_reason(1_760_000_000);
+        let r = crate::refusal::expired_reason(1_760_000_000);
         let m = policy_decline_msg("x", Some(&r));
         assert_eq!(m["type"], "file-decline");
         assert_eq!(m["reason"], "expired");
