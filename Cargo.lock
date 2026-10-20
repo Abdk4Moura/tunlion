@@ -4082,6 +4082,7 @@ dependencies = [
  "async-trait",
  "filament-cap",
  "filament-id",
+ "filament-pair",
  "filament-peerloop",
  "filament-signal",
  "filament-transport",

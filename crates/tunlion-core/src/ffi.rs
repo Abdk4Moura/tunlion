@@ -5,9 +5,10 @@
 //! pending identity lives behind a `Mutex<Option<..>>` and `commit_identity`
 //! takes the value.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::{Core, CoreError, Status, UncommittedIdentity};
+use crate::{Core, CoreError, ReceiveSummary, Status, UncommittedIdentity};
 
 /// A core opened on a directory the caller owns.
 #[derive(uniffi::Object)]
@@ -76,6 +77,30 @@ impl CoreSession {
     /// FFI boundary.
     pub fn stop(&self) -> Result<(), CoreError> {
         self.inner.stop_blocking()
+    }
+
+    /// Receive one transfer by code with the real one-shot dispatch.
+    ///
+    /// Synchronous across the FFI boundary: this **blocks** until the transfer
+    /// completes, the caller's `timeout` (seconds) expires with nothing
+    /// received, the sender/refusal path ends, or `stop` cancels it. Call it
+    /// off the UI thread; no Tokio runtime crosses the boundary and the
+    /// library owns its runtime.
+    ///
+    /// A malformed code fails with `Usage` before any network work.
+    /// Cancellation fails with `Cancelled`, never a fake empty success. A wait
+    /// that ends with nothing received fails with `Unreachable` (the CLI's
+    /// exit 6). Files stored or refused before the end are returned in the
+    /// summary instead of being dropped.
+    pub fn receive_code(
+        &self,
+        code: String,
+        dir: String,
+        yes: bool,
+        timeout: Option<u64>,
+    ) -> Result<ReceiveSummary, CoreError> {
+        self.inner
+            .receive_code(code, PathBuf::from(dir), yes, timeout)
     }
 }
 
@@ -158,6 +183,16 @@ mod tests {
     fn stop_without_a_started_engine_is_a_synchronous_no_op() {
         let core = session();
         core.stop().unwrap();
+        assert_eq!(core.status().unwrap().engine, crate::EngineState::NotLinked);
+    }
+
+    #[test]
+    fn receive_code_refuses_a_malformed_code_across_the_boundary() {
+        let core = session();
+        assert!(matches!(
+            core.receive_code("not-a-code".to_string(), core.config_dir(), true, Some(1)),
+            Err(CoreError::Usage(_))
+        ));
         assert_eq!(core.status().unwrap().engine, crate::EngineState::NotLinked);
     }
 }

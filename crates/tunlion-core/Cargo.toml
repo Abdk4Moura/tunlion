@@ -28,6 +28,10 @@ fleet = ["filament-peerloop/fleet", "filament-peerloop/mesh"]
 
 [dependencies]
 filament-id = { path = "../filament-id", version = "0.1.2" }
+# The shared spoken-code normalizer/splitter. The CLI's claim entry and the
+# receive dispatch use the same functions, so a Core receive validates the same
+# words-NNNN shape instead of growing a second parser.
+filament-pair = { path = "../filament-pair", version = "0.1.0" }
 # The engine runtime the library owns. Reduced profile on purpose: an Android
 # library compiles no mount/forward/mesh server sectors it does not serve.
 filament-peerloop = { path = "../filament-peerloop", version = "0.1.0", default-features = false, features = ["dispatch"] }
