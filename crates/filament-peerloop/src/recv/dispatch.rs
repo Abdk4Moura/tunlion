@@ -2629,18 +2629,18 @@ async fn recv_run(
                         }
                     }
                     ParkKind::Forward => {
-                        ports
-                            .servers
-                            .open_forward(
-                                &mut conn,
-                                p.pid.clone(),
-                                &p.v,
-                                &shell_policy,
-                                &mut l2_muxes,
-                                l2_enabled,
-                                &mut parked_opens,
-                            )
-                            .await;
+                        crate::recv::servers::open_forward(
+                            &ports,
+                            host.as_ref(),
+                            &mut conn,
+                            p.pid.clone(),
+                            &p.v,
+                            &shell_policy,
+                            &mut l2_muxes,
+                            l2_enabled,
+                            &mut parked_opens,
+                        )
+                        .await;
                     }
                 }
             }
@@ -6006,18 +6006,18 @@ async fn recv_run(
                 Some("l2-close") | Some("l2-open")
                     if l2_enabled || v["type"].as_str() == Some("l2-close") =>
                 {
-                    ports
-                        .servers
-                        .open_forward(
-                            &mut conn,
-                            pid.clone(),
-                            &v,
-                            &shell_policy,
-                            &mut l2_muxes,
-                            l2_enabled,
-                            &mut parked_opens,
-                        )
-                        .await;
+                    crate::recv::servers::open_forward(
+                        &ports,
+                        host.as_ref(),
+                        &mut conn,
+                        pid.clone(),
+                        &v,
+                        &shell_policy,
+                        &mut l2_muxes,
+                        l2_enabled,
+                        &mut parked_opens,
+                    )
+                    .await;
                 }
                 // Seamless-shell bootstrap (acceptor). Opt-in (TUNLION_L2=1).
                 // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY

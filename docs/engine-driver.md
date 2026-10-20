@@ -81,7 +81,8 @@ helpers. The CLI's `recv_cmd` builds a `RecvPorts` and calls
 `recv::dispatch::drive`; `up_cmd` reaches the same path.
 
 The loop no longer names a CLI function. The remaining machine-bound sectors
-arrive through five narrow traits in `recv::ports`:
+arrive through grouped capability traits in `recv::ports` (their method count is
+the host-effect surface, not a split target):
 
 - `RecvIdentity` — proof/expose, cert renewal, auth-key enrolment, provisional
   identity, device naming/revocation and the fleet host answers. The CLI
@@ -89,10 +90,9 @@ arrive through five narrow traits in `recv::ports`:
   `device_view`, `identity_state` and `fleet`.
 - `RecvStore` — the mutating half of the devices/capability store
   (`devices_store`, `device_caps`).
-- `RecvServers` — the optional inbound servers: PTY, exec, forward, sync, mount
-  and ssh-sign, plus live `expose` reconciliation. The CLI implementation
-  forwards to `l2`'s PTY sessions, `exec_recv`, `sync_cmd`, `mount_recv`,
-  `ssh_ca` and `expose`.
+- `RecvServers` — the process effects of the optional inbound servers. The
+  forward admission protocol moved to `recv::servers::open_forward`; the CLI
+  still supplies PTY/exec/sync/mount/ssh primitives through this boundary.
 - `RecvDaemon` — warm links, mounts, bootstraps, reach liveness, revocation
   snapshots and the userspace proxy. The CLI implementation forwards to
   `daemon_ctl`, `revocation_live`, `wg`, `subnet_forward`, `sshd` and

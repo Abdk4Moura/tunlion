@@ -547,86 +547,6 @@ impl RecvServers for CliRecv {
     /// that are the receive driver's: the caller-owned parking map and the dial
     /// task (`Mux::dial_and_serve`). A parked forward open is re-driven straight
     /// into this same function, so every input is re-gathered.
-    async fn open_forward(
-        &mut self,
-        conn: &mut Conn,
-        pid: String,
-        v: &Value,
-        shell_policy: &ShellPolicy,
-        l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
-        l2_enabled: bool,
-        parked: &mut Vec<ParkedOpen>,
-    ) {
-        // Host/config inputs stay here: the endpoint reads no environment or file.
-        let l2_forced = std::env::var("TUNLION_L2")
-            .map(|x| x == "1")
-            .unwrap_or(false);
-        let is_exposed = |port: u16| crate::expose::load().iter().any(|b| b.port == port);
-        let target_allowed = |name: &str, host: &str, port: u16| {
-            crate::l2_policy::l2_target_allowed(name, host, port)
-        };
-        let cfg = forward::ForwardConfig {
-            shell_policy,
-            l2_enabled,
-            l2_forced,
-            is_exposed: &is_exposed,
-            target_allowed: &target_allowed,
-        };
-        match forward::admit_forward_open(conn, &pid, v, l2_muxes, &cfg).await {
-            forward::ForwardAdmission::Accepted {
-                sid,
-                host,
-                port,
-                rx,
-                mux,
-            } => {
-                // The peer's device key, resolved again for the live stream's
-                // revocation re-check (the gate resolved the same value).
-                let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
-                tokio::spawn(mux.dial_and_serve(sid, host, port, rx, spawn_idev));
-            }
-            forward::ForwardAdmission::Denied(d) => {
-                // Settle-then-evaluate: the verdict above may rest on stale
-                // (unproven) identity. Park for re-drive on proof when the deny is
-                // attributable to it; otherwise the live verdict stands.
-                if let Some(p) = &d.park {
-                    if park_on_deny(
-                        parked,
-                        conn,
-                        &pid,
-                        ParkKind::Forward,
-                        &d.transport,
-                        p.sid,
-                        v,
-                        &p.reason,
-                    )
-                    .await
-                    {
-                        return;
-                    }
-                }
-                conn.log
-                    .say(&format!("l2: refused stream {:#x}: {}", d.sid, d.reason));
-                let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                let close = d.close_frame(who, || {
-                    conn.link(&pid)
-                        .and_then(|l| l.identity_device_pub)
-                        .and_then(|d| crate::identity_state::reinvite_for(&d))
-                });
-                let _ = d.transport.send_control(&close).await;
-            }
-            forward::ForwardAdmission::Refused(r) => {
-                // Log refused dials at INFO (visible by default, suppressed under
-                // -q) - a refused SSRF/port-scan or untrusted/over-cap open is a
-                // security event the operator should see.
-                conn.log
-                    .say(&format!("l2: refused stream {:#x}: {}", r.sid, r.reason));
-                let _ = r.transport.send_control(&r.close).await;
-            }
-            forward::ForwardAdmission::Ignored => {}
-        }
-    }
-
     async fn open_exec(
         &mut self,
         conn: &mut Conn,
@@ -679,6 +599,12 @@ impl RecvServers for CliRecv {
         crate::ssh_ca::handle_ssh_sign(conn, pid, t, v, policy, parked).await
     }
 
+    fn is_exposed(&self, port: u16) -> bool {
+        crate::expose::load().iter().any(|b| b.port == port)
+    }
+    fn forward_target_allowed(&self, name: &str, host: &str, port: u16) -> bool {
+        crate::l2_policy::l2_target_allowed(name, host, port)
+    }
     async fn pty_resize(
         &mut self,
         pid: &str,

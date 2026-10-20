@@ -267,17 +267,6 @@ pub trait RecvServers: Send + Sync {
         parked: &mut Vec<crate::recv::dispatch::ParkedOpen>,
     );
     #[allow(clippy::too_many_arguments)]
-    async fn open_forward(
-        &mut self,
-        conn: &mut Conn,
-        pid: String,
-        v: &Value,
-        policy: &ShellPolicy,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        l2_enabled: bool,
-        parked: &mut Vec<crate::recv::dispatch::ParkedOpen>,
-    );
-    #[allow(clippy::too_many_arguments)]
     async fn open_sync(
         &mut self,
         conn: &mut Conn,
@@ -307,6 +296,10 @@ pub trait RecvServers: Send + Sync {
         parked: &mut Vec<crate::recv::dispatch::ParkedOpen>,
     );
     /// A `pty-resize` control for a stable session id.
+    /// Is this local port explicitly exposed through the overlay?
+    fn is_exposed(&self, port: u16) -> bool;
+    /// May a peer forward to this local target? (address/SSRF policy)
+    fn forward_target_allowed(&self, name: &str, host: &str, port: u16) -> bool;
     async fn pty_resize(
         &mut self,
         pid: &str,
@@ -718,17 +711,6 @@ pub(crate) mod test_support {
             _: &mut Vec<ParkedOpen>,
         ) {
         }
-        async fn open_forward(
-            &mut self,
-            _: &mut Conn,
-            _: String,
-            _: &Value,
-            _: &ShellPolicy,
-            _: &mut HashMap<String, Arc<Mux>>,
-            _: bool,
-            _: &mut Vec<ParkedOpen>,
-        ) {
-        }
         async fn open_sync(
             &mut self,
             _: &mut Conn,
@@ -759,6 +741,10 @@ pub(crate) mod test_support {
             _: &mut Vec<ParkedOpen>,
         ) {
         }
+        /// Is this local port explicitly exposed through the overlay?
+        fn is_exposed(&self, port: u16) -> bool;
+        /// May a peer forward to this local target? (address/SSRF policy)
+        fn forward_target_allowed(&self, name: &str, host: &str, port: u16) -> bool;
         async fn pty_resize(
             &mut self,
             _: &str,
