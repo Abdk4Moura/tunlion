@@ -541,7 +541,7 @@ pub async fn sign(
     let argv = build_sign_argv(ca_path, &pub_file, key_id, principal, validity, serial);
     let status = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new(keygen_bin)
+        crate::process::tokio_command(keygen_bin)
             .kill_on_drop(true)
             .args(&argv)
             .stdin(std::process::Stdio::null())

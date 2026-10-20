@@ -198,7 +198,7 @@ pub async fn handle_mount(
     }
 
     // Check sshfs is available.
-    if std::process::Command::new("which")
+    if crate::process::command("which")
         .arg("sshfs")
         .output()
         .map(|o| !o.status.success())
@@ -267,7 +267,7 @@ pub async fn handle_mount(
     }
 
     // Spawn sshfs via tokio so we get a Child we can kill later.
-    let child = match tokio::process::Command::new("sshfs")
+    let child = match crate::process::tokio_command("sshfs")
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -340,7 +340,7 @@ async fn unmount_persistent(host: &dyn HostServices, target: &str, log: &dyn Log
             }
 
             let path = &entry.local;
-            let status = tokio::process::Command::new("fusermount")
+            let status = crate::process::tokio_command("fusermount")
                 .arg("-u")
                 .arg(path)
                 .status()
@@ -352,7 +352,7 @@ async fn unmount_persistent(host: &dyn HostServices, target: &str, log: &dyn Log
                     Ok(())
                 }
                 _ => {
-                    let status = tokio::process::Command::new("umount")
+                    let status = crate::process::tokio_command("umount")
                         .arg(path)
                         .status()
                         .await?;
@@ -369,7 +369,7 @@ async fn unmount_persistent(host: &dyn HostServices, target: &str, log: &dyn Log
         }
         None => {
             if Path::new(target).exists() {
-                let status = tokio::process::Command::new("fusermount")
+                let status = crate::process::tokio_command("fusermount")
                     .arg("-u")
                     .arg(target)
                     .status()
@@ -380,7 +380,7 @@ async fn unmount_persistent(host: &dyn HostServices, target: &str, log: &dyn Log
                         Ok(())
                     }
                     _ => {
-                        let status = tokio::process::Command::new("umount")
+                        let status = crate::process::tokio_command("umount")
                             .arg(target)
                             .status()
                             .await?;

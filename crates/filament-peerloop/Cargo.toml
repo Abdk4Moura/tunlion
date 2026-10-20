@@ -126,7 +126,12 @@ libc = "0.2"
 # the handle's attributes, exactly as the CLI's copy did. Same pinned version and
 # features as the CLI, so the moved code compiles here unchanged.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_System_Console",
+] }
 
 [dev-dependencies]
 # The moved tests: a fake signaling websocket (ring) and capability-store JSON

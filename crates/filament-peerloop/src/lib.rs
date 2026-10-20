@@ -81,6 +81,7 @@ pub mod mount_proto;
 pub mod mesh;
 mod petname;
 pub mod present;
+pub mod process;
 pub mod recv;
 pub mod refusal;
 pub mod resilience;
