@@ -1,11 +1,10 @@
-//! The owned stdin reader for an interactive receive.
+//! The stdin reader for an interactive receive.
 //!
-//! Unix polls stdin and checks an atomic stop flag. Windows uses two explicit
-//! strategies: console input is read with `ReadConsoleInputW` only after
-//! `WaitForMultipleObjects` says an event (or stop) is ready; redirected stdin
-//! uses overlapped `ReadFile` and waits on the stop event, so cancellation
-//! completes the I/O before the buffer is released. Android has no terminal
-//! composition and returns `None`.
+//! Unix is owned and cancellable: poll stdin, check an atomic stop flag, and
+//! report `Joined`/`Detached`. Windows is the CLI's process-lifetime detached
+//! reader (the pre-#542 behavior): a blocking thread the engine does not own or
+//! join, reported as `External`. Android has no terminal composition and
+//! returns `None`.
 
 use filament_peerloop::present::Presentation;
 use filament_peerloop::recv::ports::{StdinOutcome, StdinOwner};

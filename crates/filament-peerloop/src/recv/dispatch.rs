@@ -4288,10 +4288,13 @@ async fn recv_run(
                             crate::recv::revocation::bind_brokered_link(l, &broker);
                         }
                     }
-                } else if fleet_presence_allowed(
+                } else if let Some(effect) = fleet_presence_effect(
                     ports
                         .identity
                         .is_fleet_channel(v["channel"].as_str().unwrap_or("")),
+                    &conn.my_id,
+                    v["id"].as_str().unwrap_or(""),
+                    ports.identity.fleet_rv().is_some(),
                 ) {
                     // Fleet auto-mesh: a device is present on our fleet meeting
                     // point. We hold NO pair secret for it, so this is the
@@ -10299,6 +10302,8 @@ mod inventory {
     ];
 
     #[test]
+    // Covers the production selector used by the fleet-channel presence branch
+    // plus that branch's `effect` value; it does not drive a full Conn event.
     fn fleet_presence_is_disabled_without_a_verifier() {
         #[cfg(not(feature = "fleet"))]
         {
