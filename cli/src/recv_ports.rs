@@ -955,8 +955,9 @@ impl RecvDaemon for CliRecv {
                 .await;
         }
     }
-    async fn reach_pong(&mut self, _conn: &Conn, pid: &str, v: &Value) {
-        self.liveness.answered(None, pid, v);
+    async fn reach_pong(&mut self, conn: &Conn, pid: &str, v: &Value) {
+        let peer = conn.links.get(pid).and_then(|l| l.verified_name.as_deref());
+        self.liveness.answered(peer, pid, v);
     }
     fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
         crate::link_manager::peer_present(alive, direct, heard_ms, idle_ms)

@@ -6000,10 +6000,6 @@ async fn recv_run(
                     // Only THIS loop's registry, bound to the link the pong
                     // actually arrived on and the peer that link names. A pong
                     // on another engine's link cannot complete this probe.
-                    let peer = conn
-                        .links
-                        .get(&pid)
-                        .and_then(|l| l.verified_name.as_deref());
                     ports.daemon.reach_pong(&conn, &pid, &v).await;
                 }
                 Some("l2-open-ack") => {
