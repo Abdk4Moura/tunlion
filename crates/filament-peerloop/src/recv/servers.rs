@@ -5,6 +5,8 @@
 //! host supplies only its configuration answers (`is_exposed`,
 //! `forward_target_allowed`) and the optional dial implementation.
 
+pub mod exec;
+
 use crate::host::HostServices;
 use crate::l2::forward;
 use crate::l2::Mux;

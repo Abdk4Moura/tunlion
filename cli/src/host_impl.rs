@@ -272,6 +272,15 @@ impl HostServices for CliHost {
     fn device_allows(&self, name: &str, capability: &str) -> bool {
         crate::device_caps::device_allows(name, capability)
     }
+    fn device_key_known(&self, device_pub: &[u8; 32]) -> bool {
+        crate::device_view::devices_find_by_device_pub(device_pub).is_some()
+    }
+    fn gate_settle_ms(&self) -> u64 {
+        crate::identity_state::gate_settle_ms()
+    }
+    fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<filament_peerloop::refusal::Reinvite> {
+        crate::identity_state::reinvite_for(device_pub)
+    }
     fn ceiling_covers_action(&self, device_pub: Option<&[u8; 32]>, action: &str) -> bool {
         crate::identity_state::ceiling_covers_action(device_pub, action)
     }
@@ -390,6 +399,9 @@ impl HostServices for CliHost {
             cause,
             reason: cut.reason_for(idev),
         })
+    }
+    fn peer_liveness_alive(&self, idev: Option<&[u8; 32]>) -> Option<bool> {
+        crate::identity_state::peer_liveness_alive(idev)
     }
     fn revoke_recheck_interval(&self) -> Duration {
         crate::revoke_recheck_interval()

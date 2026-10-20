@@ -515,6 +515,21 @@ pub trait HostServices: Send + Sync + 'static {
     fn device_allows(&self, _name: &str, _capability: &str) -> bool {
         false
     }
+    /// Is this device key present in the host's device store at all? Used by
+    /// the settle-then-evaluate park: a key with no record can never become
+    /// Proven and must not occupy hold budget.
+    fn device_key_known(&self, _device_pub: &[u8; 32]) -> bool {
+        false
+    }
+    /// How long an unproven shell-class open may be parked for proof.
+    fn gate_settle_ms(&self) -> u64 {
+        0
+    }
+    /// The re-invite that restores this device's original invitation, when the
+    /// host's identity store knows it. A denial or expiry frame carries it.
+    fn reinvite_for(&self, _device_pub: &[u8; 32]) -> Option<crate::refusal::Reinvite> {
+        None
+    }
     /// Does the persisted, owner-signed enrolment ceiling cover `action` for
     /// this device key? Read fresh, never cached; an inert host has no ceiling
     /// and so covers nothing.
@@ -641,6 +656,12 @@ pub trait HostServices: Send + Sync + 'static {
     /// An inert host has no device store and no invitation deadlines, so it has
     /// no opinion: silence is the honest answer, not a fabricated "still fine".
     fn live_session_cut(&self, _idev: Option<&[u8; 32]>) -> Option<LiveCut> {
+        None
+    }
+    /// Is this peer's composed access deadline still ahead? `None` means the
+    /// host cannot resolve the identity (no opinion); `Some(false)` ends a live
+    /// session. Revocation has its own check in [`live_session_cut`](Self::live_session_cut).
+    fn peer_liveness_alive(&self, _idev: Option<&[u8; 32]>) -> Option<bool> {
         None
     }
     /// The cadence a long-lived stream re-asks [`live_session_cut`](Self::live_session_cut).
