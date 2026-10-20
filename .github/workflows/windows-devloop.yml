@@ -98,9 +98,10 @@ jobs:
               if (Test-Path $tmp) {
                 Push-Location $tmp
                 git checkout -B $results 2>&1 | Out-Null
-                Set-Content -Path "last.log" -Value $body
-                git add last.log 2>&1 | Out-Null
-                git -c user.name=devloop -c user.email=devloop@local commit -q -m "devloop: $sha $status" 2>&1 | Out-Null
+                # Always advance with an empty commit: the subject is the live
+                # signal, and it cannot be swallowed by .gitignore.
+                $tail = ($out | Select-Object -Last 40) -join "`n"
+                git -c user.name=devloop -c user.email=devloop@local commit --allow-empty -q -m "DEVRESULT $status code=$code secs=$([int]$sw.Elapsed.TotalSeconds) head=$sha" -m "cmd: $cmd`n`n$tail" 2>&1 | Out-Null
                 git push -f origin $results 2>&1 | Out-Null
                 Pop-Location
               }
