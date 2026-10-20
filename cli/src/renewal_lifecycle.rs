@@ -9,6 +9,7 @@
 //! cannot move without inventing one.
 use crate::identity;
 use crate::ui;
+use crate::Conn;
 use crate::{
     PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, capability_list_summary,
     devices_find_by_device_pub, devices_upsert_atomic, display_name, enrollment_refusal,
