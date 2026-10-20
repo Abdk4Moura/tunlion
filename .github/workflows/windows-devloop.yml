@@ -57,6 +57,8 @@ jobs:
 
       - name: Loop
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Continue"
           $branch = $env:DEVPUSH_BRANCH
