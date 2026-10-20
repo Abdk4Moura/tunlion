@@ -253,9 +253,9 @@ mod win {
             } else {
                 pipe_loop(input, stop, tx, question_open, present)
             };
-            if let Some(reason) = outcome {
+            if let Some(text) = outcome {
                 if let Ok(mut slot) = reason.lock() {
-                    *slot = Some(reason);
+                    *slot = Some(text);
                 }
             }
         });
