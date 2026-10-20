@@ -554,6 +554,13 @@ pub(crate) mod test_support {
         fn reinvite_for(&self, _: &[u8; 32]) -> Option<crate::refusal::Reinvite> {
             None
         }
+        fn reinvite_refusal(
+            &self,
+            refusal: crate::refusal::Refusal,
+            _: Option<&[u8; 32]>,
+        ) -> crate::refusal::Refusal {
+            refusal
+        }
         fn enroll_channel(&self, _: &[u8; 32]) -> String {
             String::new()
         }
