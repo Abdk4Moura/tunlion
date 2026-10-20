@@ -1,21 +1,53 @@
 //! PTY-open orchestration: admission, reattach-vs-spawn, mux registration,
 //! ack/replay ordering and session identity. Process spawn, PTY IO, user-drop
-//! argv resolution and the process-wide PTY cap are host effects behind
-//! [`PtyBackend`]; this module owns every protocol/state decision.
+//! argv resolution, the process-wide PTY cap and the session map are host
+//! effects behind [`PtyBackend`]; this module owns every protocol/state
+//! decision.
+//!
+//! `pty-server` is default-on. A build without it keeps the frame vocabulary
+//! and the shared admission code, compiles no PTY backend, and answers a
+//! well-formed open with a NAMED `l2-close` instead of silence, exactly like
+//! the reduced sync and exec receivers.
 
 use crate::conn::Conn;
 use crate::l2::{self, Mux};
-use crate::recv::dispatch::{park_on_deny, ParkKind, ParkedOpen};
+use crate::recv::dispatch::ParkedOpen;
+#[cfg(feature = "pty-server")]
+use crate::recv::dispatch::{park_on_deny, ParkKind};
 use crate::recv::ports::RecvPorts;
+#[cfg(feature = "pty-server")]
 use crate::shell::ShellHost;
 use crate::shell_gate::ShellPolicy;
 use async_trait::async_trait;
-use bytes::Bytes;
 use filament_transport::net::Transport;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// The named refusal a build without `pty-server` sends.
+pub const PTY_SERVER_UNAVAILABLE: &str = "pty receive is not available in this build";
+
+/// The honest close for a reduced build that admitted the frame vocabulary but
+/// has no PTY state machine. Testable without a Conn.
+pub fn pty_unavailable_close(v: &Value) -> Option<(u32, Value)> {
+    let sid = l2::wire_sid(v)?;
+    Some((
+        sid,
+        json!({
+            "type": "l2-close",
+            "sid": sid,
+            "err": PTY_SERVER_UNAVAILABLE,
+        }),
+    ))
+}
+
+/// Admission-free named refusal for a build with `pty-server` off.
+pub async fn open_pty_unavailable(conn: &Conn, pid: &str, v: &Value) {
+    if let (Some((_, close)), Some(t)) = (pty_unavailable_close(v), conn.transport_of(pid)) {
+        let _ = t.send_control(&close).await;
+    }
+}
 
 /// What an open does once admission has passed and the session store answered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,9 +72,11 @@ pub fn pty_open_action(live_session: bool, resume: bool) -> PtyAction {
 /// session identity and which link/sid it is attached to.
 pub trait PtySession: Send + Sync {
     /// Downcast seam for the host's pump task (the library never inspects it).
-    fn as_any(&self) -> &dyn std::any::Any {
-        &()
-    }
+    ///
+    /// REQUIRED, deliberately: a host that cannot name its own session type
+    /// must fail to compile here rather than default to `&()` and silently
+    /// start no pumps after the ack, which hangs the initiator.
+    fn as_any(&self) -> &dyn std::any::Any;
     fn attach(&self, t: Arc<dyn Transport>, sid: u32, resume_from: Option<u64>);
     fn resize(&self, cols: u16, rows: u16);
     fn detach(&self);
@@ -75,6 +109,14 @@ pub trait PtyBackend: Send + Sync {
         spec: PtySpawnSpec,
         reservation: Box<dyn std::any::Any + Send>,
     ) -> Option<Arc<dyn PtySession>>;
+    /// Drop the host's record of a session that has just been ended.
+    ///
+    /// REQUIRED, deliberately: `end()` is asynchronous, so a `pty-close`
+    /// followed by a re-open with the same stable id must not find the dying
+    /// handle and take the reattach path. The host's session map is the only
+    /// place that can answer "is this id still live", so it is the only place
+    /// that can forget it.
+    async fn forget(&self, session_id: &str);
     /// Pump inbound stream bytes and resize events into the session.
     fn start_pumps(
         &self,
@@ -82,14 +124,16 @@ pub trait PtyBackend: Send + Sync {
         input: mpsc::Receiver<PipeItem>,
         resize: mpsc::UnboundedReceiver<(u16, u16)>,
     );
-    /// Resolve the shell argv/user-drop policy. `can_use_user` drives admission.
-    fn shell_argv(&self, shell_user: &Option<String>) -> (Vec<String>, bool);
+    /// Resolve the shell argv. Whether the user drop can actually run is a
+    /// separate admission fact: [`PtyBackend::user_drop_available`].
+    fn shell_argv(&self, shell_user: &Option<String>) -> Vec<String>;
     /// The host's user-drop explanation is empty when the drop can run.
     fn user_drop_available(&self, shell_user: &Option<String>) -> bool;
 }
 
 pub type PipeItem = l2::PipeItem;
 
+#[cfg(feature = "pty-server")]
 #[allow(clippy::too_many_arguments)]
 pub async fn open_pty(
     ports: &RecvPorts,
@@ -233,10 +277,13 @@ pub async fn open_pty(
             .await;
         return;
     }
+    // The cap is the host's: `reserve` returns the one slot it enforces, and
+    // the same figure is named in the log, so the refusal cannot drift from
+    // the check. No second constant lives here.
     let Some(reservation) = backend.reserve() else {
         conn.log.say(&format!(
             "l2: pty refused: too many PTYs (global cap {})",
-            crate::l2::MAX_PTYS_GLOBAL
+            l2::MAX_PTYS_GLOBAL
         ));
         let _ = t
             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
@@ -259,7 +306,7 @@ pub async fn open_pty(
     // The argv is resolved by the host's shell policy (its shell program and
     // user-drop decision), then the host spawns; the library keeps the framing
     // and session identity.
-    let (shell_argv, _) = backend.shell_argv(shell_user);
+    let shell_argv = backend.shell_argv(shell_user);
     let shell_host = ShellHost::new(&shell_argv);
     let argv = if pty_cmd.is_empty() {
         shell_host.interactive_args()
@@ -293,6 +340,26 @@ pub async fn open_pty(
             mux.drop_pty(sid).await;
         }
     }
+}
+
+/// A build with `pty-server` off compiles no orchestration and no backend. The
+/// frame is answered by name instead of silence, so the initiator fails fast
+/// with a reason rather than waiting out its open deadline.
+#[cfg(not(feature = "pty-server"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn open_pty(
+    _ports: &RecvPorts,
+    conn: &mut Conn,
+    pid: String,
+    v: &Value,
+    _shell_policy: &ShellPolicy,
+    _shell_user: &Option<String>,
+    _muxes: &mut HashMap<String, Arc<Mux>>,
+    _bindings: &mut HashMap<String, HashMap<u32, String>>,
+    _l2_enabled: bool,
+    _parked: &mut Vec<ParkedOpen>,
+) {
+    open_pty_unavailable(conn, &pid, v).await;
 }
 
 pub async fn retire_link(
@@ -345,6 +412,11 @@ pub async fn pty_close(
         if let Some(sess) = ports.pty.get_live(session_id).await {
             sess.end();
         }
+        // The end is asynchronous and the handle may still look live until the
+        // session task observes it. Forget the id unconditionally so a re-open
+        // with the same stable id SPAWNS a fresh shell instead of reattaching
+        // to the one being torn down.
+        ports.pty.forget(session_id).await;
         if let Some(sid_map) = bindings.get_mut(pid) {
             sid_map.retain(|_, id| id != session_id);
         }
@@ -365,18 +437,569 @@ pub async fn detach_link_ptys(
     }
 }
 
-#[allow(dead_code)]
-fn _bytes(_: Bytes) {}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "pty-server"))]
 mod tests {
-    use super::{pty_open_action, PtyAction};
+    use super::{
+        open_pty, pty_close, pty_open_action, PtyAction, PtyBackend, PtySession, PtySpawnSpec,
+    };
+    use crate::conn::{Conn, Link, Presence};
+    use crate::host::{CapGate, HostServices, NoHost, VecLog};
+    use crate::l2::{Mux, MuxMap, L2_SID_BASE, MAX_PTYS_GLOBAL, NO_SUCH_SESSION};
+    use crate::recv::ports::{test_support, RecvEnv, RecvPorts};
+    use crate::refusal::SHELL_OFF_REASON;
+    use crate::shell_gate::ShellPolicy;
+    use filament_cap::capability as cap;
+    use filament_cap::capability::BindingStrength;
+    use filament_transport::net::Transport;
+    use serde_json::{json, Value};
+    use std::any::Any;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn reattach_wins_over_resume_and_resume_without_a_session_closes() {
+    const PID: &str = "pty-peer";
+    const SID: u32 = L2_SID_BASE + 9;
+    const DEVICE: [u8; 32] = [5; 32];
+    /// The stable, device-scoped id the admission plan derives for `client-1`
+    /// from the verified device name.
+    const SESSION: &str = "phone\u{1}client-1";
+
+    #[tokio::test]
+    async fn reattach_wins_over_resume_and_resume_without_a_session_closes() {
         assert_eq!(pty_open_action(true, false), PtyAction::Reattach);
         assert_eq!(pty_open_action(true, true), PtyAction::Reattach);
         assert_eq!(pty_open_action(false, true), PtyAction::CloseNoSession);
         assert_eq!(pty_open_action(false, false), PtyAction::Spawn);
+    }
+
+    #[derive(Default)]
+    struct CaptureTransport {
+        controls: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for CaptureTransport {
+        async fn send_control(&self, msg: &Value) -> anyhow::Result<()> {
+            self.controls.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            64 * 1024
+        }
+        fn is_alive(&self) -> bool {
+            true
+        }
+        fn is_dead(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A host that admits every shell gate: these tests are about the order of
+    /// the backend/mux effects, not the capability matrix (shell/admit.rs owns
+    /// that).
+    struct AllowHost;
+
+    #[async_trait::async_trait]
+    impl HostServices for AllowHost {
+        // The host facts the gate reads even on the allow path: inert answers,
+        // as `NoHost` gives, except that this host grants `shell`.
+        fn settings_get_str(&self, key: &str) -> Option<String> {
+            NoHost.settings_get_str(key)
+        }
+        fn devices_load(&self) -> Vec<(String, String)> {
+            NoHost.devices_load()
+        }
+        fn is_self_uid(&self, a: &str, b: Option<&str>) -> bool {
+            NoHost.is_self_uid(a, b)
+        }
+        fn rejoin_unwarned(&self) -> std::time::Duration {
+            NoHost.rejoin_unwarned()
+        }
+        fn relay_banner(&self) -> String {
+            NoHost.relay_banner()
+        }
+        fn relay_forbidden(&self) -> bool {
+            NoHost.relay_forbidden()
+        }
+        fn channel_of(&self, secret: &str) -> String {
+            NoHost.channel_of(secret)
+        }
+        fn roster_snapshot_json(&self) -> Option<String> {
+            NoHost.roster_snapshot_json()
+        }
+        fn fleet_rv_present(&self) -> bool {
+            false
+        }
+        fn now_secs(&self) -> u64 {
+            100
+        }
+        fn device_allows(&self, _name: &str, _capability: &str) -> bool {
+            true
+        }
+        fn cert_revoked_for(&self, _device_pub: Option<&[u8; 32]>) -> bool {
+            false
+        }
+        fn device_capability_denied(&self, _name: &str, _capability: &str) -> bool {
+            false
+        }
+        fn principal_ceiling_for(&self, _name: &str) -> Option<Vec<String>> {
+            None
+        }
+        fn ceiling_covers_action(&self, _device_pub: Option<&[u8; 32]>, _action: &str) -> bool {
+            false
+        }
+        fn cap_gate_effective(&self, _gate: CapGate<'_>) -> cap::GateDecision {
+            cap::GateDecision::Allow
+        }
+    }
+
+    async fn connection(t: Arc<CaptureTransport>, log: Arc<VecLog>) -> Conn {
+        let (sio, _far) = filament_signal::Client::loopback().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let host: Arc<dyn HostServices> = Arc::new(AllowHost);
+        let mut conn = Conn::for_command(
+            filament_transport::TransportContext::default(),
+            "http://127.0.0.1:9",
+            sio,
+            tx,
+            "me".into(),
+            false,
+            None,
+            false,
+            false,
+            log,
+            host.clone(),
+        );
+        conn.links.insert(
+            PID.into(),
+            Link {
+                peer: None,
+                info: json!({"id": PID}),
+                name: "display name".into(),
+                uid: None,
+                transport: Some(t),
+                workers: vec![],
+                generation: 1,
+                attempts: 0,
+                trusted: true,
+                expected_secret: None,
+                verified_name: Some("phone".into()),
+                presence: Presence::Ready,
+                direct: true,
+                direct_route: "direct-quic",
+                established_at: None,
+                identity_device_pub: Some(DEVICE),
+                identity_user_pub: Some([3; 32]),
+                identity_binding: BindingStrength::Proven,
+                identity_cert_expires: Some(1000),
+                principal_kind: cap::PrincipalKind::OwnerDevice,
+                host,
+            },
+        );
+        conn
+    }
+
+    /// Every effect the library is allowed to cause on the host, counted.
+    #[derive(Default)]
+    struct Counters {
+        lookups: AtomicUsize,
+        reserves: AtomicUsize,
+        spawns: AtomicUsize,
+        forgets: AtomicUsize,
+        attaches: AtomicUsize,
+        ends: AtomicUsize,
+        reserve_ok: AtomicBool,
+        /// Whether the ack was already on the wire when `spawn` was called.
+        acked_at_spawn: Mutex<Vec<bool>>,
+    }
+
+    struct FakeSession {
+        c: Arc<Counters>,
+    }
+
+    impl PtySession for FakeSession {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn attach(&self, _t: Arc<dyn Transport>, _sid: u32, _resume_from: Option<u64>) {
+            self.c.attaches.fetch_add(1, Ordering::SeqCst);
+        }
+        fn resize(&self, _cols: u16, _rows: u16) {}
+        fn detach(&self) {}
+        fn end(&self) {
+            // The real `end()` is asynchronous: the session task has not
+            // necessarily marked the handle dead when the close returns. The
+            // fake keeps it in the map until `forget`, which is exactly the
+            // window the close->reopen regression lives in.
+            self.c.ends.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct FakePty {
+        c: Arc<Counters>,
+        live: Arc<Mutex<HashMap<String, Arc<FakeSession>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PtyBackend for FakePty {
+        async fn get_live(&self, session_id: &str) -> Option<Arc<dyn PtySession>> {
+            self.c.lookups.fetch_add(1, Ordering::SeqCst);
+            self.live
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .map(|s| s.clone() as Arc<dyn PtySession>)
+        }
+        fn reserve(&self) -> Option<Box<dyn Any + Send>> {
+            self.c.reserves.fetch_add(1, Ordering::SeqCst);
+            self.c
+                .reserve_ok
+                .load(Ordering::SeqCst)
+                .then(|| Box::new(()) as Box<dyn Any + Send>)
+        }
+        async fn spawn(
+            &self,
+            spec: PtySpawnSpec,
+            _reservation: Box<dyn Any + Send>,
+        ) -> Option<Arc<dyn PtySession>> {
+            let acked = spec
+                .transport
+                .as_any()
+                .downcast_ref::<CaptureTransport>()
+                .map(|t| {
+                    t.controls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|v| v["type"] == "pty-open-ack")
+                })
+                .unwrap_or(false);
+            self.c.acked_at_spawn.lock().unwrap().push(acked);
+            self.c.spawns.fetch_add(1, Ordering::SeqCst);
+            let sess = Arc::new(FakeSession { c: self.c.clone() });
+            self.live
+                .lock()
+                .unwrap()
+                .insert(spec.session_id.clone(), sess.clone());
+            Some(sess)
+        }
+        async fn forget(&self, session_id: &str) {
+            self.c.forgets.fetch_add(1, Ordering::SeqCst);
+            self.live.lock().unwrap().remove(session_id);
+        }
+        fn start_pumps(
+            &self,
+            _session: Arc<dyn PtySession>,
+            _input: tokio::sync::mpsc::Receiver<crate::recv::servers::shell::PipeItem>,
+            _resize: tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>,
+        ) {
+        }
+        fn shell_argv(&self, _shell_user: &Option<String>) -> Vec<String> {
+            vec!["/bin/sh".into()]
+        }
+        fn user_drop_available(&self, _shell_user: &Option<String>) -> bool {
+            false
+        }
+    }
+
+    struct Harness {
+        conn: Conn,
+        ports: RecvPorts,
+        t: Arc<CaptureTransport>,
+        log: Arc<VecLog>,
+        muxes: MuxMap,
+        bindings: HashMap<String, HashMap<u32, String>>,
+        c: Arc<Counters>,
+        live: Arc<Mutex<HashMap<String, Arc<FakeSession>>>>,
+    }
+
+    async fn harness(admitting: bool) -> Harness {
+        let c = Arc::new(Counters::default());
+        c.reserve_ok.store(admitting, Ordering::SeqCst);
+        let live = Arc::new(Mutex::new(HashMap::new()));
+        let backend = FakePty {
+            c: c.clone(),
+            live: live.clone(),
+        };
+        let t = Arc::new(CaptureTransport::default());
+        let log = Arc::new(VecLog::new());
+        let conn = connection(t.clone(), log.clone()).await;
+        let ports = RecvPorts::new(
+            Arc::new(test_support::NoIdentity),
+            Arc::new(test_support::NoStore),
+            Box::new(test_support::NoServers),
+            Box::new(test_support::NoDaemon),
+            Arc::new(test_support::NoPrompt),
+            Box::new(backend),
+            Arc::new(crate::present::NoScreen),
+            RecvEnv::default(),
+        );
+        Harness {
+            conn,
+            ports,
+            t,
+            log,
+            muxes: MuxMap::new(),
+            bindings: HashMap::new(),
+            c,
+            live,
+        }
+    }
+
+    fn open_frame(session: &str, resume: bool) -> Value {
+        json!({
+            "type": "pty-open",
+            "sid": SID,
+            "session": session,
+            "term": "xterm-256color",
+            "cols": 80,
+            "rows": 24,
+            "resume": resume,
+        })
+    }
+
+    async fn open(h: &mut Harness, frame: &Value) {
+        open_pty(
+            &h.ports,
+            &mut h.conn,
+            PID.into(),
+            frame,
+            &ShellPolicy::Granted,
+            &None,
+            &mut h.muxes,
+            &mut h.bindings,
+            true,
+            &mut Vec::new(),
+        )
+        .await;
+    }
+
+    async fn pre_register(h: &mut Harness) -> tokio::sync::mpsc::Receiver<super::PipeItem> {
+        let mux = Mux::new(h.t.clone(), h.conn.host.clone());
+        let keep = mux.register_stream(SID).await.expect("sid is free");
+        h.muxes.insert(PID.into(), mux);
+        keep
+    }
+
+    fn controls(h: &Harness) -> Vec<Value> {
+        h.t.controls.lock().unwrap().clone()
+    }
+
+    fn log_has(h: &Harness, needle: &str) -> bool {
+        h.log.take().iter().any(|(_, line)| line.contains(needle))
+    }
+
+    #[tokio::test]
+    async fn admission_precedes_every_backend_effect() {
+        let mut h = harness(true).await;
+        // Serving off: the admission endpoint answers shell-off and the handler
+        // returns before it ever looks up a session, takes a cap slot or spawns.
+        open_pty(
+            &h.ports,
+            &mut h.conn,
+            PID.into(),
+            &open_frame("client-1", false),
+            &ShellPolicy::Granted,
+            &None,
+            &mut h.muxes,
+            &mut h.bindings,
+            false,
+            &mut Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            controls(&h),
+            vec![json!({
+                "type": "l2-close",
+                "sid": SID,
+                "err": SHELL_OFF_REASON,
+                "code": "shell-off",
+                "as": "phone",
+            })]
+        );
+        assert_eq!(h.c.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(h.c.reserves.load(Ordering::SeqCst), 0);
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 0);
+        assert!(h.muxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_registers_the_stream_acks_and_only_then_spawns() {
+        let mut h = harness(true).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+
+        assert_eq!(
+            controls(&h),
+            vec![json!({"type": "pty-open-ack", "sid": SID})],
+            "the ack is the only control, and it precedes the spawn"
+        );
+        assert_eq!(h.c.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.reserves.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.c.acked_at_spawn.lock().unwrap().as_slice(),
+            &[true],
+            "the initiator is acked before the host is asked to spawn"
+        );
+        assert_eq!(
+            h.muxes[PID].live_sids().await,
+            vec![SID],
+            "the stream is registered before the spawn"
+        );
+        assert_eq!(h.bindings[PID][&SID], SESSION);
+    }
+
+    #[tokio::test]
+    async fn global_cap_refusal_uses_the_shared_cap_and_never_acks() {
+        let mut h = harness(false).await;
+        let _keep = pre_register(&mut h).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+
+        assert_eq!(h.c.reserves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            controls(&h),
+            vec![json!({"type": "l2-close", "sid": SID, "err": "too many streams"})]
+        );
+        assert_eq!(
+            h.muxes[PID].live_sids().await,
+            vec![SID],
+            "the refusal does not displace the stream that already owns the sid"
+        );
+        assert!(
+            log_has(&h, &format!("global cap {MAX_PTYS_GLOBAL}")),
+            "the refusal names the one shared cap, not a second copy"
+        );
+        assert!(h.bindings.is_empty());
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sid_collision_is_refused_after_the_reservation_and_before_the_ack() {
+        let mut h = harness(true).await;
+        let _keep = pre_register(&mut h).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+
+        assert_eq!(h.c.reserves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            controls(&h),
+            vec![json!({"type": "l2-close", "sid": SID, "err": "sid in use"})]
+        );
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(h.muxes[PID].live_sids().await, vec![SID]);
+        assert!(h.bindings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_session_closes_before_cap_and_collision() {
+        let mut h = harness(false).await;
+        let _keep = pre_register(&mut h).await;
+        open(&mut h, &open_frame("client-1", true)).await;
+
+        assert_eq!(
+            controls(&h),
+            vec![json!({"type": "l2-close", "sid": SID, "err": NO_SUCH_SESSION})]
+        );
+        assert_eq!(
+            h.c.reserves.load(Ordering::SeqCst),
+            0,
+            "a resume close is decided before the cap is consulted"
+        );
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reattach_attaches_and_never_spawns() {
+        let mut h = harness(true).await;
+        h.live
+            .lock()
+            .unwrap()
+            .insert(SESSION.into(), Arc::new(FakeSession { c: h.c.clone() }));
+        open(&mut h, &open_frame("client-1", false)).await;
+
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            h.c.reserves.load(Ordering::SeqCst),
+            0,
+            "a reattach takes no PTY slot"
+        );
+        assert_eq!(
+            controls(&h),
+            vec![json!({"type": "pty-open-ack", "sid": SID})]
+        );
+        assert_eq!(h.bindings[PID][&SID], SESSION);
+    }
+
+    #[tokio::test]
+    async fn close_then_open_with_the_same_session_spawns_fresh_and_never_reattaches() {
+        let mut h = harness(true).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
+
+        // The client closes the shell (the ✕ / unmount path). `end()` is
+        // asynchronous, so the handle is still in the map until `forget`.
+        pty_close(
+            &h.ports,
+            PID,
+            &json!({"type": "pty-close", "session": SESSION}),
+            &mut h.bindings,
+        )
+        .await;
+        assert_eq!(h.c.ends.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.forgets.load(Ordering::SeqCst), 1);
+        assert!(h.live.lock().unwrap().is_empty(), "the id is forgotten");
+        assert!(h.bindings[PID].is_empty());
+        // The stream itself is torn down by the inbound `l2-close` for the
+        // closed terminal, not by `pty-close`; do it here so the re-open is
+        // decided by session identity alone.
+        h.muxes[PID].drop_pty(SID).await;
+
+        // Re-opening the SAME stable id after the close must spawn a fresh
+        // shell. Before `forget` this reattached to the dying handle.
+        open(&mut h, &open_frame("client-1", false)).await;
+        assert_eq!(
+            h.c.spawns.load(Ordering::SeqCst),
+            2,
+            "close->reopen spawns a fresh shell"
+        );
+        assert_eq!(
+            h.c.attaches.load(Ordering::SeqCst),
+            0,
+            "close->reopen never takes the reattach path"
+        );
+        assert_eq!(h.c.forgets.load(Ordering::SeqCst), 1);
+        assert_eq!(h.bindings[PID][&SID], SESSION);
+    }
+}
+
+#[cfg(all(test, not(feature = "pty-server")))]
+mod reduced_tests {
+    use super::*;
+
+    #[test]
+    fn reduced_pty_open_closes_with_a_named_unavailable_error() {
+        let (sid, close) = pty_unavailable_close(&json!({
+            "type": "pty-open",
+            "sid": 0x8000_0101u32,
+            "session": "client-1",
+        }))
+        .expect("a well-formed pty-open gets an explicit close");
+        assert_eq!(sid, 0x8000_0101u32);
+        assert_eq!(close["type"], "l2-close");
+        assert_eq!(close["sid"], 0x8000_0101u32);
+        assert!(close["err"]
+            .as_str()
+            .unwrap()
+            .contains("pty receive is not available in this build"));
     }
 }

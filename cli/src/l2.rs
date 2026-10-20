@@ -51,7 +51,10 @@ pub(crate) use filament_peerloop::l2::MuxMap;
 /// H-1 (DoS): process-wide cap on concurrently live PTYs across ALL links. Each
 /// PTY is a login shell + threads, so this bounds total resource use even if many
 /// links each stay under the per-link cap. Refused opens get an `l2-close`.
-pub const MAX_PTYS_GLOBAL: usize = 32;
+///
+/// Re-exported from the library, which also names the figure in its refusal
+/// log: one definition, so the check and the message cannot drift apart.
+pub use filament_peerloop::l2::MAX_PTYS_GLOBAL;
 
 /// Process-wide live-PTY counter (incremented just before a PTY session task is
 /// spawned, decremented when it ends, see `PtyGuard`). The acceptor checks it
@@ -2544,7 +2547,10 @@ impl Drop for RawGuard {
 /// shell exited while we were away (or on the warm path, which cannot tell a
 /// clean exit from a drop, see `pty_cmd`). It is the normal end of a session,
 /// never a refusal. The wire string is fixed: older acceptors send exactly it.
-pub(crate) const NO_SUCH_SESSION: &str = "no such session";
+///
+/// Re-exported from the library, which sends it: the string we compare against
+/// is the string this build sends, not a second copy of it.
+pub(crate) use filament_peerloop::l2::NO_SUCH_SESSION;
 
 /// Why a single PTY attach ended.
 enum PtyOutcome {

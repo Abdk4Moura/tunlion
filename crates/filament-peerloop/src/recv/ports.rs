@@ -240,7 +240,6 @@ pub trait RecvStore: Send + Sync {
 #[async_trait]
 pub trait RecvServers: Send + Sync {
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn open_exec(
         &mut self,
         conn: &mut Conn,
@@ -263,13 +262,10 @@ pub trait RecvServers: Send + Sync {
         policy: &ShellPolicy,
         parked: &mut Vec<crate::recv::dispatch::ParkedOpen>,
     );
-    /// A `pty-resize` control for a stable session id.
     /// Is this local port explicitly exposed through the overlay?
     fn is_exposed(&self, port: u16) -> bool;
     /// May a peer forward to this local target? (address/SSRF policy)
     fn forward_target_allowed(&self, name: &str, host: &str, port: u16) -> bool;
-    /// A `pty-close` control: end the shell and forget the session.
-    /// A link's transport died: detach (not kill) its live PTY sessions.
     /// Route `exec-alive`/`exec-signal` to the exec session on this link.
     async fn exec_control(
         &mut self,
@@ -853,6 +849,7 @@ pub(crate) mod test_support {
         ) -> Option<Arc<dyn crate::recv::servers::shell::PtySession>> {
             None
         }
+        async fn forget(&self, _: &str) {}
         fn start_pumps(
             &self,
             _: Arc<dyn crate::recv::servers::shell::PtySession>,
@@ -860,8 +857,8 @@ pub(crate) mod test_support {
             _: mpsc::UnboundedReceiver<(u16, u16)>,
         ) {
         }
-        fn shell_argv(&self, _: &Option<String>) -> (Vec<String>, bool) {
-            (Vec::new(), false)
+        fn shell_argv(&self, _: &Option<String>) -> Vec<String> {
+            Vec::new()
         }
         fn user_drop_available(&self, _: &Option<String>) -> bool {
             false

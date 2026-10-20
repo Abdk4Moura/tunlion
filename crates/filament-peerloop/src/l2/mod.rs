@@ -25,8 +25,8 @@ use std::sync::Arc;
 pub type MuxMap = HashMap<String, Arc<mux::Mux>>;
 
 pub use mux::{
-    is_l2_sid, serve_stream, wire_sid, ExecCtl, Mux, OpenOutcome, OpenVerdict, PipeItem,
-    TreeSignal, L2_SID_BASE, MAX_STREAMS_PER_LINK,
+    ExecCtl, L2_SID_BASE, MAX_STREAMS_PER_LINK, Mux, OpenOutcome, OpenVerdict, PipeItem,
+    TreeSignal, is_l2_sid, serve_stream, wire_sid,
 };
 
 /// Process-wide live-PTY cap shared by acceptors and hosts.

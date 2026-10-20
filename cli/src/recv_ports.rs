@@ -32,6 +32,7 @@ use filament_peerloop::recv::ports::{
     RawMode, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvPrompt, RecvServers, RecvStore,
 };
 use filament_peerloop::recv::report::RecvReport;
+use filament_peerloop::recv::servers::shell::{PipeItem, PtyBackend, PtySession, PtySpawnSpec};
 use filament_peerloop::recv::IncomingFile;
 use filament_peerloop::recv::MeshTunnel;
 use filament_peerloop::session::Session;
@@ -133,29 +134,46 @@ impl CliRecv {
     }
 }
 
+/// The receive loop's PTY capability.
+///
+/// With `pty-server` on this is the CLI's persistent-session backend: the
+/// library owns every protocol decision, and every process effect (spawn, IO,
+/// cap, session map) stays here. With it off no backend compiles; the library
+/// answers a `pty-open` by name before this value would ever be called.
+pub fn pty_backend(sessions: Arc<l2::PtySessions>) -> Box<dyn PtyBackend> {
+    #[cfg(feature = "pty-server")]
+    {
+        Box::new(CliPty { sessions })
+    }
+    #[cfg(not(feature = "pty-server"))]
+    {
+        let _ = sessions;
+        Box::new(ReducedPty)
+    }
+}
+
+#[cfg(feature = "pty-server")]
 pub struct CliPty {
     pub sessions: Arc<l2::PtySessions>,
 }
 
+#[cfg(feature = "pty-server")]
 #[async_trait::async_trait]
-impl filament_peerloop::recv::servers::shell::PtyBackend for CliPty {
-    async fn get_live(
-        &self,
-        session_id: &str,
-    ) -> Option<Arc<dyn filament_peerloop::recv::servers::shell::PtySession>> {
+impl PtyBackend for CliPty {
+    async fn get_live(&self, session_id: &str) -> Option<Arc<dyn PtySession>> {
         self.sessions
             .get_live(session_id)
             .await
-            .map(|s| Arc::new(s) as Arc<dyn filament_peerloop::recv::servers::shell::PtySession>)
+            .map(|s| Arc::new(s) as Arc<dyn PtySession>)
     }
     fn reserve(&self) -> Option<Box<dyn std::any::Any + Send>> {
         l2::PtyGuard::try_acquire().map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
     }
     async fn spawn(
         &self,
-        spec: filament_peerloop::recv::servers::shell::PtySpawnSpec,
+        spec: PtySpawnSpec,
         reservation: Box<dyn std::any::Any + Send>,
-    ) -> Option<Arc<dyn filament_peerloop::recv::servers::shell::PtySession>> {
+    ) -> Option<Arc<dyn PtySession>> {
         let guard = reservation.downcast::<l2::PtyGuard>().ok()?;
         let handle = l2::spawn_pty_session(
             self.sessions.clone(),
@@ -173,10 +191,17 @@ impl filament_peerloop::recv::servers::shell::PtyBackend for CliPty {
         .await?;
         Some(Arc::new(handle))
     }
+    async fn forget(&self, session_id: &str) {
+        // The session task also removes itself when it exits, but that is
+        // asynchronous: an explicit close must make the id absent NOW so the
+        // very next open with the same stable id spawns instead of reattaching
+        // to the handle that is still being torn down.
+        self.sessions.remove(session_id).await;
+    }
     fn start_pumps(
         &self,
-        session: Arc<dyn filament_peerloop::recv::servers::shell::PtySession>,
-        input: tokio::sync::mpsc::Receiver<filament_peerloop::recv::servers::shell::PipeItem>,
+        session: Arc<dyn PtySession>,
+        input: tokio::sync::mpsc::Receiver<PipeItem>,
         resize: tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>,
     ) {
         let Some(handle) = session.as_any().downcast_ref::<l2::PtySessionHandle>() else {
@@ -184,16 +209,57 @@ impl filament_peerloop::recv::servers::shell::PtyBackend for CliPty {
         };
         spawn_session_pumps(handle.clone(), input, resize);
     }
-    fn shell_argv(&self, shell_user: &Option<String>) -> (Vec<String>, bool) {
-        shell_argv(None, shell_user.as_deref())
+    fn shell_argv(&self, shell_user: &Option<String>) -> Vec<String> {
+        shell_argv(None, shell_user.as_deref()).0
     }
     fn user_drop_available(&self, shell_user: &Option<String>) -> bool {
+        // One source for the admission fact: `--shell-user` is set, this
+        // process is not root, and the platform can actually drop to it.
         shell_user.is_some()
             && shell_root_note().is_empty()
             && shell_argv(None, shell_user.as_deref()).1
     }
 }
 
+/// A build without `pty-server` compiles no CLI PTY backend: the library
+/// answers `pty-open` with a named close, so this value is never called. The
+/// port still needs a value, not a second implementation.
+#[cfg(not(feature = "pty-server"))]
+struct ReducedPty;
+
+#[cfg(not(feature = "pty-server"))]
+#[async_trait::async_trait]
+impl PtyBackend for ReducedPty {
+    async fn get_live(&self, _: &str) -> Option<Arc<dyn PtySession>> {
+        None
+    }
+    fn reserve(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
+    async fn spawn(
+        &self,
+        _: PtySpawnSpec,
+        _: Box<dyn std::any::Any + Send>,
+    ) -> Option<Arc<dyn PtySession>> {
+        None
+    }
+    async fn forget(&self, _: &str) {}
+    fn start_pumps(
+        &self,
+        _: Arc<dyn PtySession>,
+        _: tokio::sync::mpsc::Receiver<PipeItem>,
+        _: tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>,
+    ) {
+    }
+    fn shell_argv(&self, _: &Option<String>) -> Vec<String> {
+        Vec::new()
+    }
+    fn user_drop_available(&self, _: &Option<String>) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "pty-server")]
 impl filament_peerloop::recv::servers::shell::PtySession for l2::PtySessionHandle {
     fn as_any(&self) -> &dyn std::any::Any {
         self
