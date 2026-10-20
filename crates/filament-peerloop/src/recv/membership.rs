@@ -34,45 +34,47 @@ pub fn verify_depart(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filament_id::UserKey;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
-    fn device() -> (UserKey, [u8; 32]) {
-        let user = UserKey::from_seed(&[4u8; 32]).unwrap();
-        let pubkey = user.public_key_bytes();
-        (user, pubkey)
+    fn key(seed: [u8; 32]) -> (Ed25519KeyPair, [u8; 32]) {
+        let kp = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let mut public = [0u8; 32];
+        public.copy_from_slice(kp.public_key().as_ref());
+        (kp, public)
+    }
+
+    fn sign(kp: &Ed25519KeyPair, msg: &[u8]) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out.copy_from_slice(kp.sign(msg).as_ref());
+        out
     }
 
     #[test]
     fn a_forged_or_wrong_text_depart_is_refused() {
-        let (key, pubkey) = device();
-        let msg = depart_message(&pubkey);
-        let sig = key.sign(msg.as_bytes());
-        assert!(verify_depart(&pubkey, &msg, &sig).is_ok());
+        let (kp, public) = key([4u8; 32]);
+        let msg = depart_message(&public);
+        assert!(verify_depart(&public, &msg, &sign(&kp, msg.as_bytes())).is_ok());
 
         // Replaying another signed text (a pairing-style possession proof)
         // under its own message must not count as a departure.
-        let other = format!("filament-pair-proof:{}", hex::encode(pubkey));
-        let other_sig = key.sign(other.as_bytes());
-        assert!(verify_depart(&pubkey, &other, &other_sig).is_err());
+        let other = format!("filament-pair-proof:{}", hex::encode(public));
+        let other_sig = sign(&kp, other.as_bytes());
+        assert!(verify_depart(&public, &other, &other_sig).is_err());
 
         // A different device key cannot sign for this one.
-        let (other_key, _) = {
-            let user = UserKey::from_seed(&[5u8; 32]).unwrap();
-            let pubkey = user.public_key_bytes();
-            (user, pubkey)
-        };
-        let forged = other_key.sign(msg.as_bytes());
-        assert!(verify_depart(&pubkey, &msg, &forged).is_err());
+        let (forger, _) = key([5u8; 32]);
+        assert!(verify_depart(&public, &msg, &sign(&forger, msg.as_bytes())).is_err());
     }
 
     #[test]
     fn an_expired_departure_is_the_owner_s_liveness_decision_not_this_policy() {
         // Departure has no timestamp: expiry is enforced by the owner's
         // delegated deadline/revocation state, not by a signed clock here.
-        // This test documents that a valid signature is the only input.
-        let (key, pubkey) = device();
-        let msg = depart_message(&pubkey);
-        let sig = key.sign(msg.as_bytes());
-        assert_eq!(verify_depart(&pubkey, &msg, &sig), Ok(()));
+        let (kp, public) = key([6u8; 32]);
+        let msg = depart_message(&public);
+        assert_eq!(
+            verify_depart(&public, &msg, &sign(&kp, msg.as_bytes())),
+            Ok(())
+        );
     }
 }
