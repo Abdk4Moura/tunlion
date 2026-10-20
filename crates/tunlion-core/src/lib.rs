@@ -1256,9 +1256,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::fs::write(dir.path().join("config"), format!("server http://{addr}\n")).unwrap();
         let (gate_tx, gate_rx) = std::sync::mpsc::channel();
-        let (server, _accepted) = gated_signaling_stub(listener, gate_rx);
+        let (server, accepted) = gated_signaling_stub(listener, gate_rx);
         let start_core = Arc::clone(&core);
         let start = std::thread::spawn(move || start_core.start());
+        accepted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the engine reached the signaling stub");
 
         let mut observed = false;
         for _ in 0..10_000 {
