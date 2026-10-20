@@ -96,8 +96,9 @@ fn input_ready(timeout_ms: i32) -> bool {
 
 #[cfg(windows)]
 fn input_ready(timeout_ms: i32) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
-    use windows_sys::Win32::System::Threading::{WaitForSingleObject, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
     // SAFETY: GetStdHandle has no preconditions; the wait only observes it.
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let timeout = u32::try_from(timeout_ms).unwrap_or(100);
