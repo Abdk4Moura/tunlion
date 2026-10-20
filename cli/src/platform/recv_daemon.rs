@@ -4,7 +4,7 @@
 
 use filament_peerloop::conn::Conn;
 use filament_peerloop::control::Req;
-use filament_peerloop::host::HostServices;
+use filament_peerloop::host::{HostServices, LogSink};
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -145,6 +145,22 @@ pub(crate) async fn open_mount(
     _v: &serde_json::Value,
     _muxes: &mut std::collections::HashMap<String, std::sync::Arc<filament_peerloop::l2::Mux>>,
     _share_root: &std::path::Path,
+) {
+}
+
+#[cfg(all(feature = "mount-daemon", unix))]
+pub(crate) async fn mount_health_tick(
+    host: &dyn HostServices,
+    mounts: &mut crate::DaemonMounts,
+    log: &dyn LogSink,
+) {
+    mounts.health_tick(host, log).await;
+}
+#[cfg(not(all(feature = "mount-daemon", unix)))]
+pub(crate) async fn mount_health_tick(
+    _host: &dyn HostServices,
+    _mounts: &mut crate::DaemonMounts,
+    _log: &dyn LogSink,
 ) {
 }
 

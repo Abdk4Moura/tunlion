@@ -677,10 +677,7 @@ impl RecvDaemon for CliRecv {
         crate::platform::mount_health(req, &self.daemon_mounts).await
     }
     async fn mount_health_tick(&mut self, host: &dyn HostServices) {
-        #[cfg(all(feature = "mount-daemon", unix))]
-        self.daemon_mounts.health_tick(host, self.log.as_ref()).await;
-        #[cfg(not(all(feature = "mount-daemon", unix)))]
-        let _ = host;
+        crate::platform::mount_health_tick(host, &mut self.daemon_mounts, self.log.as_ref()).await;
     }
     async fn warm_bootstrap(&mut self, conn: &Conn, _tx: &mpsc::UnboundedSender<Ev>, req: Req) {
         crate::platform::warm_bootstrap(conn, &mut self.pending_bootstrap, req).await
