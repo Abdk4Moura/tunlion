@@ -423,11 +423,12 @@ impl Core {
         );
         let inbox = self.dir.join("inbox");
         fs::create_dir_all(&inbox).map_err(io_err)?;
-        let settings_for_transport = settings.clone();
+        let settings_for_peer = settings.clone();
+        let settings_for_membership = settings.clone();
         let transport_context = TransportContext::new(
             Some(self.dir.join("signaling-dns.json")),
-            move |key, peer| settings_for_transport.setting(key, peer),
-            move |peer| settings_for_transport.membership(peer),
+            move |key, peer| settings_for_peer.setting(key, peer),
+            move |peer| settings_for_membership.membership(peer),
         );
         let engine_dir = inbox;
         let dispatch = move |stop: Cancellation, readiness: Readiness| async move {

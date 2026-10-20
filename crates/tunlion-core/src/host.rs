@@ -12,11 +12,11 @@
 
 use crate::CoreError;
 use async_trait::async_trait;
-use filament_cap::capability::{CapGate, GateDecision};
+use filament_cap::capability::{expired_reason, GateDecision};
 use filament_id::{now_secs, DeviceCert, UserKey};
 use filament_peerloop::conn::Conn;
 use filament_peerloop::host::{
-    DelegatedAccess, HostServices, LiveCut, LogSink, PersistedPrincipal,
+    CapGate, DelegatedAccess, HostServices, LiveCut, LiveCutCause, LogSink, PersistedPrincipal,
 };
 use filament_peerloop::l2::Mux;
 use filament_peerloop::recv::enrollment::EnrollmentService;
@@ -181,6 +181,7 @@ impl CoreHost {
     }
 }
 
+#[async_trait]
 impl HostServices for CoreHost {
     fn now_secs(&self) -> u64 {
         now_secs()
@@ -386,11 +387,17 @@ impl HostServices for CoreHost {
     fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<LiveCut> {
         let idev = idev?;
         if self.store.device_cert_revoked(idev) {
-            return Some(LiveCut::Revoked);
+            return Some(LiveCut {
+                cause: LiveCutCause::Revoked,
+                reason: "device revoked".to_string(),
+            });
         }
         delegated_access_for(&self.store, idev)
             .filter(|access| access.expired(now_secs()))
-            .map(|access| LiveCut::Expired(access.deadline))
+            .map(|access| LiveCut {
+                cause: LiveCutCause::Expired,
+                reason: expired_reason(access.deadline),
+            })
     }
 
     fn revoke_recheck_interval(&self) -> Duration {
@@ -840,27 +847,6 @@ impl RecvDaemon for CoreDaemon {
     fn mark_daemon_ready(&mut self) {}
     fn record_proxy(&self, _bind: &str, _port: u16) {}
     fn maybe_hint_local_wedge(&mut self, _shown: &mut bool) {}
-    fn wg_usable(&self) -> bool {
-        false
-    }
-    fn wg_claim_attempt(&self, _addr: &str) -> bool {
-        false
-    }
-    fn wg_release_attempt(&mut self, _addr: &str) {}
-    fn wg_local_offer(&mut self) -> anyhow::Result<(String, u16)> {
-        anyhow::bail!("wireguard is not served by this core profile")
-    }
-    async fn wg_adopt_peer(
-        &mut self,
-        _peer_pub: &str,
-        _peer_overlay: &str,
-        _our_overlay: &str,
-        _mtu: u32,
-        _peer_underlay: std::net::IpAddr,
-        _peer_wg_port: u16,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("wireguard is not served by this core profile")
-    }
     fn subnet_enable(
         &mut self,
         _ifname: &str,
