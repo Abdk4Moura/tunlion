@@ -16,7 +16,19 @@ name = "tunlion"
 path = "src/main.rs"
 
 [features]
-default = ["mesh", "mount-server", "forward-server", "exec-server", "pty-server", "dispatch", "fleet"]
+default = [
+    "mesh",
+    "mount-server",
+    "mount-daemon",
+    "forward-server",
+    "exec-server",
+    "pty-server",
+    "ssh-sign",
+    "ssh-bootstrap",
+    "ssh-server",
+    "dispatch",
+    "fleet",
+]
 mesh = ["filament-peerloop/mesh", "filament-peerloop/fleet", "dispatch"]
 mount-server = ["filament-peerloop/mount-server", "dispatch"]
 # Inbound local forward serving: dial a peer-requested local socket. Default-on
@@ -31,6 +43,18 @@ exec-server = ["filament-peerloop/exec-server", "dispatch"]
 # profiles leave both out and the library answers a well-formed open with a
 # named refusal.
 pty-server = ["filament-peerloop/pty-server", "dispatch"]
+# B-side SSH certificate signing (CA key + ledger). Client `shell --ssh` does
+# not need it; the server half is omitted from reduced profiles.
+ssh-sign = ["filament-peerloop/ssh-sign", "dispatch"]
+# Inbound shell-bootstrap key install (authorized_keys). Off compiles no
+# install path and the peer receives an explicit deny.
+ssh-bootstrap = ["filament-peerloop/ssh-bootstrap", "dispatch"]
+# sshd configuration/CA-trust helpers (host-side /etc/ssh). Never part of a
+# phone profile.
+ssh-server = []
+# Daemon mount control plane (sshfs spawn/store). The wire/admission feature is
+# separate; reduced profiles keep `mount-server` off or omit this.
+mount-daemon = ["filament-peerloop/mount-daemon", "dispatch"]
 # The receive dispatch loop and its host capability traits.
 dispatch = ["filament-peerloop/dispatch"]
 fleet = ["filament-peerloop/fleet"]

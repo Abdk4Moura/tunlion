@@ -529,7 +529,35 @@ impl RecvServers for CliRecv {
         policy: &ShellPolicy,
         parked: &mut Vec<ParkedOpen>,
     ) {
-        crate::ssh_ca::handle_ssh_sign(conn, pid, t, v, policy, parked).await
+        #[cfg(feature = "ssh-sign")]
+        filament_peerloop::ssh_ca::handle_ssh_sign(
+            &crate::ssh_ca::CliSshCaHost,
+            conn,
+            pid,
+            t,
+            v,
+            policy,
+            parked,
+        )
+        .await;
+        #[cfg(not(feature = "ssh-sign"))]
+        {
+            let _ = (conn, policy, parked);
+            // The wire vocabulary is common; the signer is not compiled in this
+            // reduced profile. Refuse a well-formed L2 sid by name so the
+            // initiator reports a build limitation instead of timing out.
+            if let Some(sid) = filament_peerloop::l2::wire_sid(v)
+                .filter(filament_peerloop::l2::is_l2_sid)
+            {
+                let _ = t
+                    .send_control(&json!({
+                        "type": "l2-close",
+                        "sid": sid,
+                        "err": "ssh certificate signing is not available in this build",
+                    }))
+                    .await;
+            }
+        }
     }
 
     fn is_exposed(&self, port: u16) -> bool {
@@ -649,32 +677,10 @@ impl RecvDaemon for CliRecv {
         crate::platform::mount_health(req, &self.daemon_mounts).await
     }
     async fn mount_health_tick(&mut self, host: &dyn HostServices) {
-        let dead_locals: Vec<String> = self
-            .daemon_mounts
-            .entries
-            .iter()
-            .filter_map(|(local, _entry)| {
-                let is_alive = host.is_mount_point(local);
-                let path_exists = Path::new(local).exists();
-                if !path_exists || !is_alive {
-                    Some(local.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for local in dead_locals {
-            if let Some(entry) = self.daemon_mounts.entries.remove(&local) {
-                self.log.say(&format!(
-                    "mount {local} is gone, removing from daemon tracking (was {}:{})",
-                    entry.peer, entry.remote
-                ));
-                if let Some(mut child) = self.daemon_mounts.children.remove(&local) {
-                    let _ = child.kill().await;
-                }
-                crate::platform::remove_mount(host, &local);
-            }
-        }
+        #[cfg(feature = "mount-daemon")]
+        self.daemon_mounts.health_tick(host, self.log.as_ref()).await;
+        #[cfg(not(feature = "mount-daemon"))]
+        let _ = host;
     }
     async fn warm_bootstrap(&mut self, conn: &Conn, _tx: &mpsc::UnboundedSender<Ev>, req: Req) {
         crate::platform::warm_bootstrap(conn, &mut self.pending_bootstrap, req).await
@@ -768,7 +774,15 @@ impl RecvDaemon for CliRecv {
         crate::subnet_forward::enable(ifname, prefixes, snat).map(|_| ())
     }
     fn configure_sshd_overlay(&mut self, v6: &str, v4: &str) -> Result<()> {
-        crate::sshd::configure_sshd_overlay(v6, v4)
+        #[cfg(feature = "ssh-server")]
+        {
+            crate::sshd::configure_sshd_overlay(v6, v4)
+        }
+        #[cfg(not(feature = "ssh-server"))]
+        {
+            let _ = (v6, v4);
+            anyhow::bail!("sshd configuration is not available in this build")
+        }
     }
     async fn start_overlay_servers(&mut self, _host: &dyn HostServices) -> Vec<String> {
         Vec::new()

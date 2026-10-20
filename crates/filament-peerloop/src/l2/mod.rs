@@ -15,6 +15,7 @@
 pub mod forward;
 pub mod mux;
 pub mod policy;
+pub mod warm;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +29,12 @@ pub use mux::{
     ExecCtl, L2_SID_BASE, MAX_STREAMS_PER_LINK, Mux, OpenOutcome, OpenVerdict, PipeItem,
     TreeSignal, is_l2_sid, serve_stream, wire_sid,
 };
+#[cfg(unix)]
+pub use warm::{
+    open_pty_stream_verified, open_stream_verified_reason, serve_opened_stream,
+    serve_verified_stream, warm_verify_window, WarmOpen, WarmPtyVerdict,
+};
+pub use warm::open_stream;
 
 /// Process-wide live-PTY cap shared by acceptors and hosts.
 pub const MAX_PTYS_GLOBAL: usize = 32;

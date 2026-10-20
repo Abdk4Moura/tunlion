@@ -6226,6 +6226,7 @@ async fn recv_run(
                     }
                     continue;
                 }
+                #[cfg(feature = "ssh-bootstrap")]
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {
                         crate::conn::dropped_no_transport(log.as_ref(), &pid, "shell-bootstrap");
@@ -6443,6 +6444,18 @@ async fn recv_run(
                                 .await;
                         }
                     }
+                }
+                #[cfg(not(feature = "ssh-bootstrap"))]
+                Some("shell-bootstrap") if l2_enabled => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": "ssh bootstrap is not available in this build",
+                            }))
+                            .await;
+                    }
+                    continue;
                 }
                 // web-shell (browser terminal): spawn a login shell in a PTY and
                 // bridge it to a sid stream. Same deny-by-default gate as

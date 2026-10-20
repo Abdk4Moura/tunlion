@@ -457,6 +457,290 @@ pub fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
     pending.retain(|_, waiters| !waiters.is_empty());
 }
 
+/// Warm PTY session -> (link pid, stream sid), so a later `pty-resize` can find
+/// the stream. Shared by the daemon handlers.
+pub type WarmPtys = std::sync::Arc<std::sync::Mutex<HashMap<String, (String, u32)>>>;
+
+/// Dispatch one warm-reuse control request to the right handler. Warm reuse is
+/// unix-only (the control socket is a unix-domain socket); on non-unix `control::Req`
+/// is uninhabited so this is never reached - it only keeps the event loop portable.
+#[cfg(not(unix))]
+pub async fn handle_warm_req(
+    _conn: &Conn,
+    _l2_muxes: &mut crate::l2::MuxMap,
+    _warm_ptys: &WarmPtys,
+    _probes: &LivenessProbes,
+    _tx: &tokio::sync::mpsc::UnboundedSender<filament_transport::net::Ev>,
+    req: control::Req,
+) {
+    match req {}
+}
+
+#[cfg(unix)]
+pub async fn handle_warm_req(
+    conn: &Conn,
+    l2_muxes: &mut crate::l2::MuxMap,
+    warm_ptys: &WarmPtys,
+    probes: &LivenessProbes,
+    tx: &tokio::sync::mpsc::UnboundedSender<filament_transport::net::Ev>,
+    req: control::Req,
+) {
+    match &req.kind {
+        control::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, tx, req).await,
+        // Dial is handled inline in the daemon loop (it needs the L3 manager);
+        // answer defensively if it ever reaches here.
+        control::ReqKind::Dial { .. } => req.reject("dial not handled here").await,
+        control::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
+        control::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
+        control::ReqKind::Ping { .. } => handle_warm_ping(conn, probes, req).await,
+        // Bootstrap is dispatched before this (it defers its reply), so it never
+        // reaches here; reject defensively so a future caller falls back to cold.
+        control::ReqKind::Bootstrap { .. } => req.reject("bootstrap not handled here").await,
+        // Reconfigure is handled inline in the daemon loop (it mutates loop state),
+        // so it never reaches this dispatcher; answer defensively if it ever does.
+        control::ReqKind::Reconfigure { .. } => {
+            req.reply(&json!({ "ok": true, "live": false })).await
+        }
+        // ReqKind::Arm is gone: the mint writes armed.json directly (no IPC),
+        // and the per-tick arm-gate reads it. See cli/src/armed.rs.
+        // ReloadExpose is likewise handled inline in the daemon loop (it owns the
+        // Exposer); answer defensively if it ever reaches here.
+        control::ReqKind::ReloadExpose => {
+            req.reply(&json!({ "ok": true, "live": false, "count": 0 }))
+                .await
+        }
+        // Reload is handled inline in the daemon loop (it self-SIGTERMs); answer
+        // defensively if it ever reaches here.
+        control::ReqKind::Reload => req.reply(&json!({ "ok": true, "reloading": false })).await,
+        // Wake is handled inline in the daemon loop (its whole purpose is to make
+        // the loop iterate); answer defensively if it ever reaches here.
+        control::ReqKind::Wake => req.reply(&json!({ "ok": true })).await,
+        // RevocationSync is handled inline in the daemon loop (it owns the
+        // device list and the links it must close). Never confirm it from here:
+        // `ok:false` makes the caller say the revocation is not yet confirmed.
+        control::ReqKind::RevocationSync => req.reply(&json!({ "ok": false })).await,
+        // Mount/Unmount/ListMounts/MountHealth are handled inline in the daemon
+        // loop (they need access to DaemonMounts); answer defensively if reached.
+        control::ReqKind::Mount { .. } => req.reject("mount not handled here").await,
+        control::ReqKind::Unmount { .. } => req.reject("unmount not handled here").await,
+        control::ReqKind::ListMounts => req.reject("list-mounts not handled here").await,
+        control::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
+        control::ReqKind::CapStatus => req.reject("cap-status not handled here").await,
+        control::ReqKind::ListWarm => req.reject("list-warm not handled here").await,
+        control::ReqKind::FleetRendezvous { .. } => {
+            req.reject("fleet-rendezvous not handled here").await
+        }
+        control::ReqKind::ListPending => req.reject("list-pending not handled here").await,
+        control::ReqKind::ApproveRequest { .. } => req.reject("approve-request not handled here").await,
+        control::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
+    }
+}
+
+/// DEBUG: every link that names `peer`, and which one the warm path chose, so
+/// a slow warm open on a peer with more than one link is diagnosable.
+#[cfg(unix)]
+fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
+    for (p, l) in conn.links.iter() {
+        if !l.verified_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(peer)) {
+            continue;
+        }
+        conn.log.debug(&format!(
+            "warm-pick '{peer}': pid={p} chosen={} direct={} alive={} age_ms={:?} deferred_left={}",
+            p == chosen,
+            l.direct,
+            l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
+            l.established_at.map(|t| t.elapsed().as_millis()),
+            conn.deferred_left.contains_key(p),
+        ));
+    }
+}
+
+/// Warm-reuse: open a raw L2 stream to `peer:rport` over its existing link and
+/// bridge it to the client's unix socket (netcat/ssh/forward fast path).
+#[cfg(unix)]
+pub async fn handle_warm_open(
+    conn: &Conn,
+    l2_muxes: &mut crate::l2::MuxMap,
+    tx: &tokio::sync::mpsc::UnboundedSender<filament_transport::net::Ev>,
+    req: control::Req,
+) {
+    let control::ReqKind::Open { peer, rport } = &req.kind else {
+        return;
+    };
+    let (peer, rport) = (peer.clone(), *rport);
+    let Some((pid, t)) = warm_link_for(conn, &peer) else {
+        log_warm_miss(conn, &peer);
+        req.reject("no warm link to that peer").await;
+        return;
+    };
+    log_warm_pick(conn, &peer, &pid);
+    // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to.
+    let mux = l2_muxes
+        .entry(pid.clone())
+        .or_insert_with(|| crate::l2::Mux::new(t, conn.host.clone()))
+        .clone();
+    let tx = tx.clone();
+    let log = conn.log.clone();
+    // SELF-HEALING warm-reuse: VERIFY the held link still delivers BEFORE committing
+    // the client. Open the stream and wait for the first inbound frame (sshd's
+    // banner - the byte we needed anyway, so a healthy link pays ~1 RTT and nothing
+    // extra), then accept. A zombie link (alive at the QUIC layer but black-holing
+    // new streams - the popos hang) yields nothing within the window, so we DROP it
+    // (the loop re-forms a healthy one, keeping warm-reuse fast) and REJECT, which
+    // makes the client's `try_open` return None and fall straight through to a fresh
+    // establish. Verifying before accepting is what makes the fallback INSTANT: an
+    // accepted-then-dead connection would instead stall the client until ITS own
+    // timeout (the 25s ssh ConnectTimeout we measured). Spawned so the verify wait
+    // never blocks the event loop (F8).
+    tokio::spawn(async move {
+        match crate::l2::open_stream_verified_reason(&mux, rport, crate::l2::warm_verify_window()).await {
+            crate::l2::WarmOpen::Opened(sid, first, rx) => {
+                let sock = req.accept().await;
+                crate::l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+            }
+            // The peer ANSWERED: the link is healthy, keep it, and relay the
+            // reason so the client can show it (it used to be read as a zombie).
+            crate::l2::WarmOpen::Refused(reason) => {
+                log.debug(&format!(
+                    "tunlion: warm open to '{peer}':{rport} refused by the peer ({reason})"
+                ));
+                req.reject(&format!("refused: {reason}")).await;
+            }
+            crate::l2::WarmOpen::Dead(e) => {
+                log.debug(&format!(
+                    "tunlion: warm link to '{peer}' is a zombie ({e}); dropping + establishing fresh"
+                ));
+                let _ = tx.send(filament_transport::net::Ev::DropLink(pid));
+                req.reject("warm link unresponsive; establishing fresh")
+                    .await;
+            }
+        }
+    });
+}
+
+/// Warm-reuse: open a PTY on `peer` over its existing link and bridge it to the
+/// client's stdio socket (the `tunlion shell` fast path). Records the session->sid
+/// so a later `pty-resize` can find it; the entry is dropped when the bridge ends.
+#[cfg(unix)]
+pub async fn handle_warm_pty(
+    conn: &Conn,
+    l2_muxes: &mut crate::l2::MuxMap,
+    warm_ptys: &WarmPtys,
+    tx: &tokio::sync::mpsc::UnboundedSender<filament_transport::net::Ev>,
+    req: control::Req,
+) {
+    let control::ReqKind::Pty {
+        peer,
+        session,
+        cols,
+        rows,
+        term,
+        cmd,
+    } = &req.kind
+    else {
+        return;
+    };
+    let (peer, session, cols, rows, term, cmd) = (
+        peer.clone(),
+        session.clone(),
+        *cols,
+        *rows,
+        term.clone(),
+        cmd.clone(),
+    );
+    let Some((pid, t)) = warm_link_for(conn, &peer) else {
+        log_warm_miss(conn, &peer);
+        req.reject("no warm link to that peer").await;
+        return;
+    };
+    let mux = l2_muxes
+        .entry(pid.clone())
+        .or_insert_with(|| crate::l2::Mux::new(t, conn.host.clone()))
+        .clone();
+    let warm_ptys = warm_ptys.clone();
+    let tx = tx.clone();
+    let log = conn.log.clone();
+    let verify = crate::l2::warm_verify_window();
+    // SELF-HEALING warm pty, same shape as handle_warm_open: VERIFY the held link
+    // delivers (the shell prompt / replayed buffer, sent unprompted, is the first
+    // frame) BEFORE recording the session and accepting the terminal. On a zombie
+    // link we DROP it and REJECT, so the client falls straight through to a cold
+    // pty rather than getting a dead terminal. Spawned so the verify wait never
+    // blocks the event loop (F8).
+    tokio::spawn(async move {
+        match crate::l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, &cmd, verify).await {
+            crate::l2::WarmPtyVerdict::Opened(sid, first, rx_pipe) => {
+                if let Ok(mut m) = warm_ptys.lock() {
+                    m.insert(session.clone(), (pid, sid));
+                }
+                let sock = req.accept().await;
+                crate::l2::serve_verified_stream(mux, sid, sock, first, rx_pipe).await;
+                // Bridge ended (shell exit / client gone / link drop): drop our
+                // entry, but only if it is still ours (a reconnect may have
+                // replaced it).
+                if let Ok(mut m) = warm_ptys.lock() {
+                    if m.get(&session).map(|(_, s)| *s == sid).unwrap_or(false) {
+                        m.remove(&session);
+                    }
+                }
+            }
+            crate::l2::WarmPtyVerdict::Refused(reason) => {
+                log.debug(&format!(
+                    "tunlion: warm pty to '{peer}' refused by the peer ({reason})"
+                ));
+                req.reject(&format!("refused: {reason}")).await;
+            }
+            crate::l2::WarmPtyVerdict::LinkDead => {
+                log.debug(&format!(
+                    "tunlion: warm pty link to '{peer}' died; dropping + establishing fresh"
+                ));
+                let _ = tx.send(filament_transport::net::Ev::DropLink(pid));
+                req.reject("warm link unresponsive; establishing fresh")
+                    .await;
+            }
+            crate::l2::WarmPtyVerdict::Silent => {
+                // Clean end, no output: accept and drop at once so the
+                // client reads EOF as exit 0 (the cold path's Exited).
+                // Nothing is recorded (no live session exists to reattach).
+                log.debug(&format!(
+                    "tunlion: warm pty to '{peer}' exited cleanly with no output"
+                ));
+                let _sock = req.accept().await;
+            }
+        }
+    });
+}
+
+/// Warm-reuse: relay a window-size change to an already-open warm PTY (by session).
+#[cfg(unix)]
+pub async fn handle_warm_resize(
+    l2_muxes: &crate::l2::MuxMap,
+    warm_ptys: &WarmPtys,
+    req: control::Req,
+) {
+    let control::ReqKind::Resize {
+        session,
+        cols,
+        rows,
+    } = &req.kind
+    else {
+        return;
+    };
+    let (cols, rows) = (*cols, *rows);
+    let target = warm_ptys.lock().ok().and_then(|m| m.get(session).cloned());
+    if let Some((pid, sid)) = target {
+        if let Some(mux) = l2_muxes.get(&pid) {
+            let _ = mux
+                .transport()
+                .send_control(
+                    &json!({ "type": "pty-resize", "sid": sid, "cols": cols, "rows": rows }),
+                )
+                .await;
+        }
+    }
+    req.accept().await; // close the client's short connection cleanly
+}
+
 #[cfg(test)]
 mod liveness_tests {
     use super::*;

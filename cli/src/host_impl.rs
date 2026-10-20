@@ -242,6 +242,41 @@ impl HostServices for CliHost {
     fn remove_mount(&self, local: &str) -> Result<(), String> {
         crate::mount::remove_mount(local).map_err(|e| e.to_string())
     }
+    async fn prepare_mount_transport(
+        &self,
+        server: &str,
+        peer: &str,
+        relay: bool,
+        port: u16,
+    ) -> Result<filament_peerloop::host::MountTransport, String> {
+        let info = crate::l2::ensure_peer_bootstrap_port(server, peer, relay, port, false)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(filament_peerloop::host::MountTransport {
+            login: info.login.clone(),
+            host: info.host.clone(),
+            rport: info.rport,
+            key_path: info.key_path.clone(),
+            known_hosts_path: info.known_hosts_path.clone(),
+            direct_dest: crate::l2::l3_dest(&info),
+        })
+    }
+    fn write_private_file(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+        crate::platform::SecretFile::write(path, data)
+    }
+    fn device_cap_expiry(&self, name: &str, capability: &str) -> Option<u64> {
+        let raw = std::fs::read_to_string(self.config_dir().join("devices.json")).ok()?;
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&raw).ok()?;
+        arr.iter()
+            .find(|d| d["name"].as_str() == Some(name))
+            .and_then(|d| d["capExpires"][capability].as_u64())
+    }
+    fn device_known(&self, device_pub: &[u8; 32]) -> bool {
+        crate::device_view::devices_find_by_device_pub(device_pub).is_some()
+    }
+    fn gate_settle_ms(&self) -> u64 {
+        crate::identity_state::gate_settle_ms()
+    }
     fn ensure_self_genesis_header(&self, user_key: &crate::identity::UserKey) -> bool {
         crate::ensure_self_genesis_header(&self.config_dir(), user_key)
     }

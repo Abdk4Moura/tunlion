@@ -1125,6 +1125,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // Arm SSH-CA sshd trust when serving shell (best-effort, loud):
             // the daemon needs the CA lines + principals entry before cert
             // logins can land. Never fails the command (no new root rule).
+            #[cfg(feature = "ssh-server")]
             if shell || shell_only.as_ref().is_some_and(|s| !s.is_empty()) {
                 crate::sshd::arm_ssh_ca_for_serving().await;
             }
@@ -2274,6 +2275,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 }
             }
+            #[cfg(feature = "ssh-server")]
             if capability == "shell" {
                 crate::sshd::arm_ssh_ca_for_serving().await;
             }

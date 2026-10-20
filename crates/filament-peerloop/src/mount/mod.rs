@@ -7,6 +7,8 @@
 //! `fleet_share_root`, `TUNLION_L2` or a settings file.
 
 pub mod gate;
+#[cfg(all(feature = "mount-daemon", unix))]
+pub mod daemon;
 
 use crate::conn::{Conn, dropped_no_transport};
 use crate::host::CapGate;

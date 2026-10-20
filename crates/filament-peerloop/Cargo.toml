@@ -23,7 +23,18 @@ categories = ["network-programming"]
 
 [features]
 # Compatibility: existing consumers, including the CLI, keep the mesh API.
-default = ["mesh", "mount-server", "forward-server", "dispatch", "fleet", "exec-server", "pty-server"]
+default = [
+    "mesh",
+    "mount-server",
+    "mount-daemon",
+    "forward-server",
+    "dispatch",
+    "fleet",
+    "exec-server",
+    "pty-server",
+    "ssh-sign",
+    "ssh-bootstrap",
+]
 mesh = ["dep:filament-overlay"]
 # The receive dispatch loop and its host capability traits. Default-on for the
 # CLI; a reduced consumer that only wants the mechanics can omit it.
@@ -34,6 +45,11 @@ fleet = ["dep:filament-fleet"]
 # Inbound filesystem serving is opt-out for existing consumers, but absent from
 # reduced engine profiles. The wire/control vocabulary remains available.
 mount-server = []
+# The daemon's mount control plane: sshfs spawn/track, the persistent mount
+# record, unmount/list/health. Implies the wire vocabulary and admission in
+# `mount-server`. A reduced profile compiles neither backend nor store; the
+# control handler answers with a named refusal.
+mount-daemon = ["mount-server"]
 # Inbound local forward serving: accept an `l2-open` and dial the peer's
 # requested local socket. Reduced engine profiles omit it so no local dial
 # implementation compiles; the wire vocabulary and the admission policy stay
@@ -53,6 +69,14 @@ exec-server = ["dispatch"]
 # the module lives in `recv::servers`. A profile that explicitly omits defaults
 # compiles no PTY backend, and a well-formed open gets a named refusal.
 pty-server = ["dispatch"]
+# The B-side SSH certificate signer: request validation, the shared shell gate,
+# the CA key/signing op, the issuance ledger and refusal frames. Off means no
+# signer compiles and a well-formed request is refused by name.
+ssh-sign = []
+# The inbound `shell-bootstrap` install path (managed authorized_keys block).
+# Off means the install call and its validation do not compile; the peer gets a
+# named `shell-bootstrap-deny`.
+ssh-bootstrap = ["dep:authkeys-managed"]
 # Fault-injection hooks the peer-loop paths read. The CLI forwards its own
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
@@ -62,7 +86,7 @@ debug-logs = []
 # Versions copied verbatim from cli/Cargo.toml, so the dependency graph and
 # behaviour match the CLI build these modules came from.
 anyhow = "1.0.102"
-authkeys-managed = { path = "../authkeys-managed", version = "0.1.2" }
+authkeys-managed = { path = "../authkeys-managed", version = "0.1.2", optional = true }
 async-trait = "0.1.89"
 # The mount protocol's path encoding: raw unix bytes, lossy UTF-8 elsewhere.
 base64 = "0.22"

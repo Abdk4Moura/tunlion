@@ -280,6 +280,7 @@ mod l3;
 #[cfg(l3)]
 mod wg;
 mod shutdown;
+#[cfg(feature = "ssh-server")]
 mod sshd;
 mod sshkeys;
 mod local;
