@@ -14,14 +14,20 @@
 //! authorized_keys fallback.
 
 use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ssh-sign")]
 use std::sync::Arc;
 
+#[cfg(feature = "ssh-sign")]
 use crate::conn::Conn;
+#[cfg(feature = "ssh-sign")]
 use crate::recv::dispatch::{park_on_deny, ParkKind, ParkedOpen};
+#[cfg(feature = "ssh-sign")]
 use crate::shell_gate::{gather_shell_gate_inputs, ssh_gate_decision, ShellPolicy};
+#[cfg(feature = "ssh-sign")]
 use filament_cap::capability::CAP_SHELL;
+#[cfg(feature = "ssh-sign")]
 use filament_transport::net::Transport;
 
 /// Hard max certificate lifetime: 24h, per contract. The setting clamps here.
@@ -580,6 +586,7 @@ pub async fn handle_ssh_sign(
     shell_policy: &ShellPolicy,
     parked: &mut Vec<ParkedOpen>,
 ) {
+    use serde_json::json;
     // Refusals are GENERIC on the wire: every deny looks identical out
     // there, so a refused peer cannot oracle which check failed. The detail
     // goes to the local log only (the malformed-frame case below is the
