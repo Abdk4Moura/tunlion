@@ -33,33 +33,33 @@ use std::time::{Duration, Instant};
 /// A connection that stayed up this long has earned a fresh backoff ladder.
 /// Anything shorter counts as part of the same outage, so a link that drops
 /// right after every re-dial backs off instead of re-dialing at full speed.
-pub(crate) const STABLE_AFTER: Duration = Duration::from_secs(30);
+pub const STABLE_AFTER: Duration = Duration::from_secs(30);
 
 /// How long the silence watchdog's forced `sync` probe gets to be answered,
 /// counted from when it was sent, before the link is declared dead. The same
 /// as the probe's own ack timeout (`net::heartbeat`).
-pub(crate) const PROBE_WINDOW: Duration = Duration::from_secs(5);
+pub const PROBE_WINDOW: Duration = Duration::from_secs(5);
 
 /// First re-dial delay, doubled per attempt.
 const BASE_MS: u64 = 500;
 
 /// Ceiling for the doubled delay (before jitter).
-pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(15);
+pub const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
 /// Re-dials within [`FLAP_WINDOW`] at or above which a connected link is
 /// reported as flapping rather than healthy.
-pub(crate) const FLAP_THRESHOLD: usize = 4;
-pub(crate) const FLAP_WINDOW: Duration = Duration::from_secs(120);
+pub const FLAP_THRESHOLD: usize = 4;
+pub const FLAP_WINDOW: Duration = Duration::from_secs(120);
 
 /// A run of identical log lines prints once per window, then once more with
 /// the count of what it swallowed.
-pub(crate) const COLLAPSE_WINDOW: Duration = Duration::from_secs(60);
+pub const COLLAPSE_WINDOW: Duration = Duration::from_secs(60);
 
 /// The wait before re-dial `attempt` (0-based): 0.5 s doubling to a 15 s cap,
 /// with +/-25% jitter taken from `unit` in [0, 1). Never below 0.375 s, so no
 /// sequence of attempts is a tight loop, and never above 18.75 s, so recovery
 /// after the cause clears is bounded. Pure; the caller supplies the randomness.
-pub(crate) fn reconnect_delay(attempt: u32, unit: f64) -> Duration {
+pub fn reconnect_delay(attempt: u32, unit: f64) -> Duration {
     let base = BASE_MS
         .saturating_mul(1u64 << attempt.min(6))
         .min(MAX_BACKOFF.as_millis() as u64) as f64;
@@ -74,7 +74,7 @@ pub(crate) fn reconnect_delay(attempt: u32, unit: f64) -> Duration {
 
 /// A uniform value in [0, 1) for [`reconnect_delay`]. Two daemons that lost the
 /// same server at the same moment must not re-dial in lockstep.
-pub(crate) fn jitter_unit() -> f64 {
+pub fn jitter_unit() -> f64 {
     let mut b = [0u8; 4];
     if getrandom::getrandom(&mut b).is_err() {
         return 0.5;
@@ -85,7 +85,7 @@ pub(crate) fn jitter_unit() -> f64 {
 /// The attempt counter to use for the re-dial after a close. `up_for` is how
 /// long the connection that just closed had been up (None if it never came up).
 /// Only a connection that proved itself stable resets the ladder.
-pub(crate) fn attempt_after_close(attempt: u32, up_for: Option<Duration>) -> u32 {
+pub fn attempt_after_close(attempt: u32, up_for: Option<Duration>) -> u32 {
     match up_for {
         Some(d) if d >= STABLE_AFTER => 0,
         _ => attempt,
@@ -94,7 +94,7 @@ pub(crate) fn attempt_after_close(attempt: u32, up_for: Option<Duration>) -> u32
 
 /// Is a close for connection `closed` the loss of the CURRENT connection?
 /// A close of any earlier connection is history: the loop already replaced it.
-pub(crate) fn close_is_current(closed: u64, current: u64) -> bool {
+pub fn close_is_current(closed: u64, current: u64) -> bool {
     closed == current
 }
 
@@ -108,7 +108,7 @@ impl LogCollapse {
     /// The line to print for this occurrence of `key`, or None to swallow it.
     /// The first occurrence prints; later ones within [`COLLAPSE_WINDOW`] are
     /// counted; the first after the window prints with that count.
-    pub(crate) fn admit(&mut self, key: &'static str, line: &str, now: Instant) -> Option<String> {
+    pub fn admit(&mut self, key: &'static str, line: &str, now: Instant) -> Option<String> {
         match self.runs.get_mut(key) {
             None => {
                 self.runs.insert(key, (now, 0));
@@ -154,7 +154,7 @@ fn with_health<R>(f: impl FnOnce(&mut Health) -> R) -> R {
 }
 
 /// The serving loop starts with a connected link.
-pub(crate) fn note_serving() {
+pub fn note_serving() {
     with_health(|h| {
         h.tracked = true;
         h.connected = true;
@@ -163,7 +163,7 @@ pub(crate) fn note_serving() {
 }
 
 /// The current link is down (closed, or silent past the watchdog).
-pub(crate) fn note_down(reason: &str) {
+pub fn note_down(reason: &str) {
     with_health(|h| {
         h.tracked = true;
         if h.connected {
@@ -175,7 +175,7 @@ pub(crate) fn note_down(reason: &str) {
 }
 
 /// A re-dial connected.
-pub(crate) fn note_redialed() {
+pub fn note_redialed() {
     with_health(|h| {
         let now = Instant::now();
         h.tracked = true;
@@ -193,7 +193,7 @@ pub(crate) fn note_redialed() {
 }
 
 /// The word for a link's state. Pure, so the thresholds are testable.
-pub(crate) fn state_word(tracked: bool, connected: bool, redials_in_window: usize) -> &'static str {
+pub fn state_word(tracked: bool, connected: bool, redials_in_window: usize) -> &'static str {
     match (tracked, connected) {
         (false, _) => "unknown",
         (true, false) => "reconnecting",
@@ -203,7 +203,7 @@ pub(crate) fn state_word(tracked: bool, connected: bool, redials_in_window: usiz
 }
 
 /// The `signaling` object of the daemon's `cap-status` reply.
-pub(crate) fn snapshot_json() -> Value {
+pub fn snapshot_json() -> Value {
     with_health(|h| {
         let now = Instant::now();
         let recent = h
