@@ -3300,7 +3300,19 @@ fn internal_subcommand_invocations_name_real_verbs() {
         })
         .collect();
     let mut checked = 0usize;
-    for (f, text) in product_sources() {
+    // The daemon's mount spawn and warm handlers moved into the peer-loop crate;
+    // their internal subcommand invocations are still product code. Scan those
+    // files too so the audit follows the code instead of losing a site.
+    let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../crates/filament-peerloop/src");
+    let mut sources = product_sources();
+    for rel in ["daemon_ctl.rs", "l2/warm.rs", "mount/daemon.rs", "ssh_ca.rs"] {
+        let path = crate_src.join(rel);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            sources.push((format!("peerloop/{rel}"), text));
+        }
+    }
+    for (f, text) in sources {
         for line in text.lines() {
             let bytes = line.as_bytes();
             let mut i = 0usize;
