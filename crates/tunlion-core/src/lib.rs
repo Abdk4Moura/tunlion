@@ -17,11 +17,12 @@
 //! proof/expose/renew and auth-key enrolment parts of `RecvIdentity` now have
 //! host-neutral implementations (`recv::store::DeviceStore`,
 //! `recv::identity::IdentityService` and `recv::enrollment::EnrollmentService`,
-//! built from an explicit config directory and overlay-key path). The remaining
-//! non-CLI gap is the fleet/roster host facts and the optional server/daemon
-//! sectors (today they forward to `cli/src/roster.rs`, `membership.rs`,
-//! `fleet.rs`, `daemon_ctl.rs` and the optional PTY/exec/ssh servers). A Rust
-//! embedder with that composition calls `start_with_dispatch` today. See
+//! built from an explicit config directory and overlay-key path). Roster/depart
+//! and the fleet rendezvous facts now live in `recv::roster`,
+//! `recv::membership` and `recv::fleet_rv` with explicit roots/keys/routes. The
+//! remaining non-CLI gap is the optional server/daemon sectors (today they
+//! forward to `cli/src/daemon_ctl.rs` and the optional PTY/exec/ssh servers). A
+//! Rust embedder with that composition calls `start_with_dispatch` today. See
 //! `docs/engine-driver.md` and `docs/android-ffi.md`.
 
 uniffi::setup_scaffolding!();

@@ -69,9 +69,13 @@ pub mod files;
 #[cfg(feature = "dispatch")]
 pub mod fleet;
 #[cfg(all(feature = "dispatch", feature = "mesh"))]
+pub mod fleet_rv;
+#[cfg(all(feature = "dispatch", feature = "mesh"))]
 pub mod identity;
 #[cfg(feature = "dispatch")]
 pub mod lifecycle;
+#[cfg(all(feature = "dispatch", feature = "mesh"))]
+pub mod membership;
 #[cfg(not(feature = "mesh"))]
 pub mod mesh_stub;
 #[cfg(feature = "dispatch")]
@@ -80,6 +84,8 @@ pub mod renewal;
 pub mod report;
 #[cfg(feature = "dispatch")]
 pub mod revocation;
+#[cfg(all(feature = "dispatch", feature = "mesh"))]
+pub mod roster;
 #[cfg(feature = "dispatch")]
 pub mod servers;
 #[cfg(feature = "dispatch")]

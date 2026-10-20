@@ -21,34 +21,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// PROTOCOL LITERAL: frozen, do not rename. The exact bytes a departing device
-/// signs; released builds send and must be recognised by exactly this text.
-pub(crate) const DEPART_MSG_PREFIX: &str = "filament-depart:v1:";
-
-/// The one message a depart request may carry for `device_pub`.
-pub(crate) fn depart_message(device_pub: &[u8; 32]) -> String {
-    format!("{DEPART_MSG_PREFIX}{}", hex::encode(device_pub))
-}
-
-/// Accept a depart request only when `msg` is EXACTLY the depart message for
-/// `device_pub` and `sig` is that key's signature over it.
-///
-/// Verifying the signature over whatever text the sender supplied was not
-/// enough: the same device key signs other things (pairing and enrollment
-/// possession proofs), so any of those signatures, replayed with its own text
-/// as `msg`, passed the check and marked the device lapsed. The expected text
-/// is rebuilt from the key, never taken from the wire.
-pub(crate) fn verify_depart(
-    device_pub: &[u8; 32],
-    msg: &str,
-    sig: &[u8; 64],
-) -> std::result::Result<(), &'static str> {
-    if msg != depart_message(device_pub) {
-        return Err("message is not the depart message for that device key");
-    }
-    crate::identity::verify_possession_sig(device_pub, msg.as_bytes(), sig)
-        .map_err(|_| "signature does not verify for that device key")
-}
+pub(crate) use filament_peerloop::recv::membership::{
+    DEPART_MSG_PREFIX, depart_message, verify_depart,
+};
 
 /// Advisory end-of-life verb for a joined device: tell the owner to free the
 /// slot NOW instead of paying out the whole offline budget. NEVER load-bearing:
