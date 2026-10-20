@@ -1839,17 +1839,25 @@ mod tests {
             .try_acquire_engine_lease()
             .unwrap()
             .expect("the test owns the root");
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
         let (handle, engine, _watch) = core
-            .spawn_engine(|_stop, readiness| async move {
+            .spawn_engine(move |_stop, readiness| async move {
                 readiness.publish(|| {});
+                let _ = returned_tx.send(());
                 Ok::<(), String>(())
             })
             .unwrap();
+        returned_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dispatch must reach its return");
+        // The future has returned; let the runtime record the JoinHandle as
+        // finished. This is a bounded scheduler handoff, not a sleep-based
+        // synchronisation point.
         for _ in 0..10_000 {
             if engine.is_finished() {
                 break;
             }
-            handle.block_on(async { tokio::task::yield_now().await });
+            std::thread::yield_now();
         }
         assert!(engine.is_finished(), "the test dispatch must finish");
         claim.install(engine).unwrap();
