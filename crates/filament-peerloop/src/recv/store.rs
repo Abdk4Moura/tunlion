@@ -118,11 +118,13 @@ impl KeyStore for RootKeyStore {
 /// unchanged (PKCS8, owner-only, generated on first use); only the path is now
 /// a constructor argument, so a Core instance never reads another instance's
 /// key or an environment variable.
+#[cfg(feature = "mesh")]
 #[derive(Clone, Debug)]
 pub struct OverlayKey {
     path: PathBuf,
 }
 
+#[cfg(feature = "mesh")]
 impl OverlayKey {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }

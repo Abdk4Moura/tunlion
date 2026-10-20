@@ -66,7 +66,7 @@ pub mod events;
 pub mod files;
 #[cfg(feature = "dispatch")]
 pub mod fleet;
-#[cfg(feature = "dispatch")]
+#[cfg(all(feature = "dispatch", feature = "mesh"))]
 pub mod identity;
 #[cfg(feature = "dispatch")]
 pub mod lifecycle;
