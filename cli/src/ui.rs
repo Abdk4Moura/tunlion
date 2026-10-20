@@ -122,19 +122,9 @@ pub fn caps() -> &'static Caps {
         let unicode = unicode_from(var("LC_ALL"), var("LC_CTYPE"), var("LANG"), &term);
         let live = live_from(tty, &term);
         let depth = crate::style::depth_from(var("COLORTERM").as_deref(), &term);
-        let bg =
-            crate::style::bg_from(var("TUNLION_THEME").as_deref(), var("COLORFGBG").as_deref());
-        let reduced_motion =
-            crate::style::reduced_motion_from(var("TUNLION_REDUCED_MOTION").as_deref());
-        Caps {
-            tty,
-            live,
-            color,
-            unicode,
-            depth,
-            bg,
-            reduced_motion,
-        }
+        let bg = crate::style::bg_from(var("TUNLION_THEME").as_deref(), var("COLORFGBG").as_deref());
+        let reduced_motion = crate::style::reduced_motion_from(var("TUNLION_REDUCED_MOTION").as_deref());
+        Caps { tty, live, color, unicode, depth, bg, reduced_motion }
     })
 }
 
@@ -150,12 +140,7 @@ pub fn live_from(tty: bool, term: &str) -> bool {
 /// decides (an empty LC_ALL is unset, not "C"). `TERM=dumb` is ASCII whatever
 /// the locale: a dumb terminal promises nothing beyond it. With no locale at
 /// all, Windows (UTF-16 native consoles) says yes and everything else no.
-pub fn unicode_from(
-    lc_all: Option<String>,
-    lc_ctype: Option<String>,
-    lang: Option<String>,
-    term: &str,
-) -> bool {
+pub fn unicode_from(lc_all: Option<String>, lc_ctype: Option<String>, lang: Option<String>, term: &str) -> bool {
     if term == "dumb" {
         return false;
     }
@@ -267,10 +252,7 @@ fn fold_decision(seen: &mut FoldMap, line: &str, now: Instant) -> Option<u64> {
 pub fn folded_line(line: &str, folded: u64) -> String {
     match folded {
         0 => line.to_string(),
-        n => format!(
-            "{line}  (and {n} more like it in the last {}s)",
-            DEDUP_WINDOW.as_secs()
-        ),
+        n => format!("{line}  (and {n} more like it in the last {}s)", DEDUP_WINDOW.as_secs()),
     }
 }
 
@@ -287,12 +269,10 @@ pub fn say_folded(line: &str) {
         return;
     }
     let folded = match FOLD.lock() {
-        Ok(mut g) => {
-            match fold_decision(g.get_or_insert_with(FoldMap::new), line, Instant::now()) {
-                Some(n) => n,
-                None => return,
-            }
-        }
+        Ok(mut g) => match fold_decision(g.get_or_insert_with(FoldMap::new), line, Instant::now()) {
+            Some(n) => n,
+            None => return,
+        },
         // A poisoned fold never costs a line: print it unfolded.
         Err(_) => 0,
     };
@@ -302,11 +282,7 @@ pub fn say_folded(line: &str) {
 /// The line as it is written: ASCII glyphs on an ASCII terminal, and the
 /// timestamp in daemon-log mode.
 fn decorate(line: &str) -> String {
-    let line = if caps().unicode {
-        line.to_string()
-    } else {
-        ascii_glyphs(line)
-    };
+    let line = if caps().unicode { line.to_string() } else { ascii_glyphs(line) };
     if !DAEMON_LOG.load(Ordering::Relaxed) {
         return line;
     }
@@ -356,20 +332,12 @@ pub fn paint(tone: Tone, s: &str) -> String {
 /// For renderers that write their own lines (pickers, the code entry).
 pub fn tone_code(tone: Tone) -> String {
     let c = caps();
-    if c.color {
-        ansi_code(tone, c.depth, c.bg)
-    } else {
-        String::new()
-    }
+    if c.color { ansi_code(tone, c.depth, c.bg) } else { String::new() }
 }
 
 /// The escape that ends a `tone_code` span, or nothing when color is off.
 pub fn tone_reset() -> &'static str {
-    if caps().color {
-        "\x1b[0m"
-    } else {
-        ""
-    }
+    if caps().color { "\x1b[0m" } else { "" }
 }
 
 /// A heading of `/`-separated parts (`TUNLION  /  3 DEVICES  /  AVAILABLE`,
@@ -435,11 +403,7 @@ pub fn strip_ansi(s: &str) -> String {
 pub fn out_line(s: &str) {
     // println! (not writeln!) on purpose: a closed pipe must take the same
     // path as every other stdout write (see exit_quietly_on_broken_pipe).
-    let line = if stdout_color() {
-        s.to_string()
-    } else {
-        strip_ansi(s)
-    };
+    let line = if stdout_color() { s.to_string() } else { strip_ansi(s) };
     println!("{line}");
 }
 
@@ -478,74 +442,34 @@ pub fn paint_when(color: bool, tone: Tone, s: &str) -> String {
 }
 
 pub fn glyph_ok() -> &'static str {
-    if caps().unicode {
-        "✓"
-    } else {
-        "ok"
-    }
+    if caps().unicode { "✓" } else { "ok" }
 }
 pub fn glyph_err() -> &'static str {
-    if caps().unicode {
-        "✗"
-    } else {
-        "x"
-    }
+    if caps().unicode { "✗" } else { "x" }
 }
 pub fn glyph_arrow() -> &'static str {
-    if caps().unicode {
-        "→"
-    } else {
-        "->"
-    }
+    if caps().unicode { "→" } else { "->" }
 }
 pub fn glyph_fleet() -> &'static str {
-    if caps().unicode {
-        "●"
-    } else {
-        "[fleet]"
-    }
+    if caps().unicode { "●" } else { "[fleet]" }
 }
 pub fn glyph_extern() -> &'static str {
-    if caps().unicode {
-        "○"
-    } else {
-        "[extern]"
-    }
+    if caps().unicode { "○" } else { "[extern]" }
 }
 pub fn glyph_review() -> &'static str {
-    if caps().unicode {
-        "◐"
-    } else {
-        "[review]"
-    }
+    if caps().unicode { "◐" } else { "[review]" }
 }
 pub fn glyph_mesh() -> &'static str {
-    if caps().unicode {
-        "◇"
-    } else {
-        "[mesh]"
-    }
+    if caps().unicode { "◇" } else { "[mesh]" }
 }
 pub fn glyph_warn() -> &'static str {
-    if caps().unicode {
-        "⚠"
-    } else {
-        "!"
-    }
+    if caps().unicode { "⚠" } else { "!" }
 }
 pub fn glyph_deliberate() -> &'static str {
-    if caps().unicode {
-        "⚠"
-    } else {
-        "!"
-    }
+    if caps().unicode { "⚠" } else { "!" }
 }
 pub fn glyph_echo() -> &'static str {
-    if caps().unicode {
-        "↳"
-    } else {
-        "->"
-    }
+    if caps().unicode { "↳" } else { "->" }
 }
 
 /// The `Error:` label in front of a failure, in the failure color.
@@ -585,16 +509,8 @@ mod base64_mini {
             let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
             out.push(T[(n >> 18) as usize & 63] as char);
             out.push(T[(n >> 12) as usize & 63] as char);
-            out.push(if ch.len() > 1 {
-                T[(n >> 6) as usize & 63] as char
-            } else {
-                '='
-            });
-            out.push(if ch.len() > 2 {
-                T[n as usize & 63] as char
-            } else {
-                '='
-            });
+            out.push(if ch.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if ch.len() > 2 { T[n as usize & 63] as char } else { '=' });
         }
         out
     }
@@ -682,16 +598,7 @@ pub const CLOSED_PIPE_UNFINISHED: i32 = 141;
 /// as `head` asked. Every other verb is an action (send, sync, exec, receive,
 /// add, ...): its work is not finished when its output stops being read.
 const READ_ONLY_VERBS: &[&str] = &[
-    "status",
-    "devices",
-    "logs",
-    "reach",
-    "doctor",
-    "id",
-    "addr",
-    "requests",
-    "completions",
-    "man",
+    "status", "devices", "logs", "reach", "doctor", "id", "addr", "requests", "completions", "man",
     "help",
 ];
 
@@ -730,9 +637,7 @@ pub fn exit_code_on_closed_pipe(code: i32) {
 /// as "The pipe is being closed. (os error 232)".
 pub fn is_broken_pipe_print(msg: &str) -> bool {
     msg.starts_with("failed printing to")
-        && (msg.contains("Broken pipe")
-            || msg.contains("os error 32)")
-            || msg.contains("os error 232)"))
+        && (msg.contains("Broken pipe") || msg.contains("os error 32)") || msg.contains("os error 232)"))
 }
 // Deliberately NOT also "any error whose cause is BrokenPipe": a peer socket
 // or a child's stdin closing mid-transfer is a real failure of the command,
@@ -805,11 +710,7 @@ pub fn critical(line: &str) {
 /// pipe). Steps are pre-formatted by the caller, so a step may embed a command in
 /// the brand accent, e.g. `paint(Tone::Brand, "tunlion pty box")`.
 pub fn problem(headline: &str, detail: &str, steps: &[String]) {
-    critical(&format!(
-        "{} {}",
-        paint(Tone::Err, glyph_err()),
-        paint(Tone::Bold, headline)
-    ));
+    critical(&format!("{} {}", paint(Tone::Err, glyph_err()), paint(Tone::Bold, headline)));
     if !detail.is_empty() {
         critical(&format!("  {detail}"));
     }
@@ -831,11 +732,7 @@ pub fn problem(headline: &str, detail: &str, steps: &[String]) {
 /// Reporting only the success is how an operator runs the security verb and
 /// loses nothing without being told.
 pub fn caution(headline: &str, detail: Option<&str>, steps: &[String]) {
-    critical(&format!(
-        "{} {}",
-        paint(Tone::Warn, glyph_warn()),
-        paint(Tone::Bold, headline)
-    ));
+    critical(&format!("{} {}", paint(Tone::Warn, glyph_warn()), paint(Tone::Bold, headline)));
     if let Some(d) = detail.filter(|d| !d.is_empty()) {
         critical(&format!("  {d}"));
     }
@@ -884,11 +781,7 @@ pub fn status(line: &str) {
 /// bare eprint would land inside whatever transient line is on screen).
 pub fn answer_echo(c: char) {
     clear_live();
-    err_write(&format!(
-        "  {} {}\n",
-        paint(Tone::Dim, glyph_echo()),
-        paint(Tone::Bold, &c.to_string())
-    ));
+    err_write(&format!("  {} {}\n", paint(Tone::Dim, glyph_echo()), paint(Tone::Bold, &c.to_string())));
 }
 
 /// A status line that survives interleaved say()s until cleared, for open
@@ -929,10 +822,7 @@ pub fn erase_one() {
 }
 
 pub fn clear_sticky() {
-    let had = STICKY
-        .lock()
-        .map(|mut s| s.take().is_some())
-        .unwrap_or(false);
+    let had = STICKY.lock().map(|mut s| s.take().is_some()).unwrap_or(false);
     if had && caps().live {
         clear_live();
     }
@@ -961,10 +851,7 @@ pub fn pulse() -> String {
 /// get the resting frame; a redrawn line animates.
 pub fn knock() -> String {
     let c = caps();
-    paint(
-        Tone::Accent,
-        &crate::style::knock_frame(motion_ms(), c.unicode, c.reduced_motion).to_string(),
-    )
+    paint(Tone::Accent, &crate::style::knock_frame(motion_ms(), c.unicode, c.reduced_motion).to_string())
 }
 
 // ------------------------------------------------------------- progress bar --
@@ -999,11 +886,7 @@ impl Progress {
         let dt = now.duration_since(self.last_draw).as_secs_f64();
         let inst = (bytes.saturating_sub(self.last_bytes)) as f64 / dt.max(0.001);
         // EMA so the rate reads steady instead of jittering every frame
-        self.rate_ema = if self.rate_ema == 0.0 {
-            inst
-        } else {
-            0.85 * self.rate_ema + 0.15 * inst
-        };
+        self.rate_ema = if self.rate_ema == 0.0 { inst } else { 0.85 * self.rate_ema + 0.15 * inst };
         self.last_draw = now;
         self.last_bytes = bytes;
         if !caps().live {
@@ -1016,12 +899,7 @@ impl Progress {
             let done = "━".repeat(filled.min(width));
             let edge = if filled < width { "╸" } else { "" };
             let rest = "─".repeat(width - filled - if filled < width { 1 } else { 0 });
-            format!(
-                "{}{}{}",
-                paint(Tone::Accent, &done),
-                paint(Tone::Accent, edge),
-                paint(Tone::Dim, &rest)
-            )
+            format!("{}{}{}", paint(Tone::Accent, &done), paint(Tone::Accent, edge), paint(Tone::Dim, &rest))
         } else {
             let done = "=".repeat(filled.min(width));
             let rest = "-".repeat(width - filled);
@@ -1038,10 +916,7 @@ impl Progress {
             self.label,
             bar,
             paint(Tone::Bold, &format!("{:>3.0}%", frac * 100.0)),
-            paint(
-                Tone::Dim,
-                &format!("{}/s", crate::human(self.rate_ema as u64))
-            ),
+            paint(Tone::Dim, &format!("{}/s", crate::human(self.rate_ema as u64))),
             paint(Tone::Dim, &eta),
         ));
     }
@@ -1060,10 +935,7 @@ impl Progress {
             "  {} {}  {}",
             paint(Tone::Ok, glyph_ok()),
             self.label,
-            paint(
-                Tone::Dim,
-                &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))
-            ),
+            paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
         ));
         if caps().tty && secs > 30.0 {
             err_write("\x07");
@@ -1091,10 +963,7 @@ pub fn transfer_summary(label: &str, bytes: u64, secs: f64) {
         "  {} {}  {}",
         paint(Tone::Ok, glyph_ok()),
         label,
-        paint(
-            Tone::Dim,
-            &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))
-        ),
+        paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
     ));
     if caps().tty && secs > 30.0 {
         err_write("\x07");
@@ -1184,8 +1053,10 @@ pub fn qr(url: &str) -> String {
     // someone photographs off a glossy screen at an angle than L did. (L was
     // only introduced to buy columns for the 780-char v1 token; the reason is
     // gone, so L must not persist by inheritance.)
-    let Ok(code) = qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::M)
-    else {
+    let Ok(code) = qrcode::QrCode::with_error_correction_level(
+        url.as_bytes(),
+        qrcode::EcLevel::M,
+    ) else {
         return String::new();
     };
     let w = code.width();
@@ -1221,8 +1092,7 @@ pub fn qr_rows(url: &str) -> Option<usize> {
     if !caps().unicode {
         return None;
     }
-    let Ok(code) = qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::M)
-    else {
+    let Ok(code) = qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::M) else {
         return None;
     };
     Some((code.width() as usize + 4) / 2)
@@ -1232,9 +1102,7 @@ pub fn qr_rows(url: &str) -> Option<usize> {
 pub fn qr_fits(url: &str, rows_used: usize) -> bool {
     match qr_rows(url) {
         Some(rows) => {
-            let term_h = crossterm::terminal::size()
-                .map(|(_, h)| h as usize)
-                .unwrap_or(usize::MAX);
+            let term_h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(usize::MAX);
             rows_used + rows <= term_h
         }
         None => false,
@@ -1288,10 +1156,7 @@ mod verbosity_tests {
     fn receive_yes_help_says_what_it_controls() {
         let cmd = <crate::Cli as clap::CommandFactory>::command();
         let recv = cmd.find_subcommand("receive").expect("receive");
-        let yes = recv
-            .get_arguments()
-            .find(|a| a.get_id() == "yes")
-            .expect("-y");
+        let yes = recv.get_arguments().find(|a| a.get_id() == "yes").expect("-y");
         let help = yes.get_help().map(|h| h.to_string()).unwrap_or_default();
         assert!(help.contains("room") && help.contains("code"), "{help}");
         assert!(!help.contains("every offer"), "{help}");
@@ -1339,21 +1204,13 @@ mod verbosity_tests {
     /// other panic, including one that merely mentions a pipe, still reports.
     #[test]
     fn only_a_print_into_a_closed_pipe_is_a_quiet_exit() {
-        assert!(is_broken_pipe_print(
-            "failed printing to stdout: Broken pipe (os error 32)"
-        ));
-        assert!(is_broken_pipe_print(
-            "failed printing to stderr: Broken pipe (os error 32)"
-        ));
+        assert!(is_broken_pipe_print("failed printing to stdout: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print("failed printing to stderr: Broken pipe (os error 32)"));
         assert!(is_broken_pipe_print(
             "failed printing to stdout: The pipe is being closed. (os error 232)"
         ));
-        assert!(!is_broken_pipe_print(
-            "failed printing to stdout: No space left on device (os error 28)"
-        ));
-        assert!(!is_broken_pipe_print(
-            "called `Result::unwrap()` on an `Err` value: Broken pipe"
-        ));
+        assert!(!is_broken_pipe_print("failed printing to stdout: No space left on device (os error 28)"));
+        assert!(!is_broken_pipe_print("called `Result::unwrap()` on an `Err` value: Broken pipe"));
         assert!(!is_broken_pipe_print("index out of bounds"));
     }
 
@@ -1362,11 +1219,7 @@ mod verbosity_tests {
     #[test]
     fn a_closed_pipe_keeps_the_decided_exit_code() {
         use std::sync::atomic::Ordering;
-        assert_eq!(
-            super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed),
-            0,
-            "default: a reader that stopped is not a failure"
-        );
+        assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 0, "default: a reader that stopped is not a failure");
         super::exit_code_on_closed_pipe(11);
         assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 11);
         super::exit_code_on_closed_pipe(0);
@@ -1381,18 +1234,7 @@ mod verbosity_tests {
             assert_eq!(super::closed_pipe_default(Some(v)), 0, "{v} only looks");
         }
         assert_eq!(super::closed_pipe_default(None), 0, "bare tunlion, --help");
-        for v in [
-            "send",
-            "sync",
-            "exec",
-            "receive",
-            "backup",
-            "add",
-            "join",
-            "up",
-            "mount",
-            "something-new",
-        ] {
+        for v in ["send", "sync", "exec", "receive", "backup", "add", "join", "up", "mount", "something-new"] {
             assert_eq!(super::closed_pipe_default(Some(v)), 141, "{v} is an action");
         }
         assert_ne!(super::CLOSED_PIPE_UNFINISHED, 0);
@@ -1410,13 +1252,7 @@ mod verbosity_tests {
             let end = src[start..].find("\n}\n").map(|e| start + e).unwrap();
             src[start..end].to_string()
         };
-        for f in [
-            "emit",
-            "paint_live",
-            "clear_live",
-            "answer_echo",
-            "clipboard",
-        ] {
+        for f in ["emit", "paint_live", "clear_live", "answer_echo", "clipboard"] {
             let b = body(f);
             assert!(!b.contains("eprint"), "{f} uses a panicking print macro");
         }
@@ -1448,29 +1284,13 @@ mod scripting_output_tests {
     fn ascii_terminals_get_ascii_glyphs() {
         let s = |v: &str| Some(v.to_string());
         assert!(!unicode_from(None, None, s("C"), "xterm"), "LANG=C");
-        assert!(
-            !unicode_from(None, None, s("en_US.UTF-8"), "dumb"),
-            "TERM=dumb"
-        );
+        assert!(!unicode_from(None, None, s("en_US.UTF-8"), "dumb"), "TERM=dumb");
         assert!(unicode_from(None, None, s("en_US.UTF-8"), "xterm-256color"));
-        assert!(
-            !unicode_from(s("C"), None, s("en_US.UTF-8"), "xterm"),
-            "LC_ALL wins"
-        );
-        assert!(
-            unicode_from(s(""), None, s("en_US.UTF-8"), "xterm"),
-            "an empty LC_ALL is unset"
-        );
+        assert!(!unicode_from(s("C"), None, s("en_US.UTF-8"), "xterm"), "LC_ALL wins");
+        assert!(unicode_from(s(""), None, s("en_US.UTF-8"), "xterm"), "an empty LC_ALL is unset");
         assert_eq!(ascii_glyphs("  ✓ up (pid 7)"), "  ok up (pid 7)");
-        assert_eq!(
-            ascii_glyphs("  ⚡ warm  ○ cold → ●"),
-            "  * warm  o cold -> *"
-        );
-        assert_eq!(
-            ascii_glyphs("café.txt delivered"),
-            "café.txt delivered",
-            "user data passes through"
-        );
+        assert_eq!(ascii_glyphs("  ⚡ warm  ○ cold → ●"), "  * warm  o cold -> *");
+        assert_eq!(ascii_glyphs("café.txt delivered"), "café.txt delivered", "user data passes through");
         for (g, a) in ASCII_GLYPHS {
             assert!(a.is_ascii(), "{g} maps to non-ASCII");
         }
@@ -1484,42 +1304,17 @@ mod scripting_output_tests {
         let mut seen = std::collections::HashMap::new();
         let t0 = Instant::now();
         let l = "known device 'beta' appeared, connecting";
-        assert_eq!(
-            fold_decision(&mut seen, l, t0),
-            Some(0),
-            "first time prints"
-        );
+        assert_eq!(fold_decision(&mut seen, l, t0), Some(0), "first time prints");
         for i in 1..14 {
-            assert_eq!(
-                fold_decision(&mut seen, l, t0 + std::time::Duration::from_secs(i)),
-                None
-            );
+            assert_eq!(fold_decision(&mut seen, l, t0 + std::time::Duration::from_secs(i)), None);
         }
-        assert_eq!(
-            fold_decision(&mut seen, "other", t0),
-            Some(0),
-            "a different line is not folded"
-        );
+        assert_eq!(fold_decision(&mut seen, "other", t0), Some(0), "a different line is not folded");
         let later = t0 + DEDUP_WINDOW + std::time::Duration::from_secs(1);
-        assert_eq!(
-            fold_decision(&mut seen, l, later),
-            Some(13),
-            "the next printing carries the count"
-        );
-        assert_eq!(
-            fold_decision(&mut seen, l, later),
-            None,
-            "and the window restarts"
-        );
+        assert_eq!(fold_decision(&mut seen, l, later), Some(13), "the next printing carries the count");
+        assert_eq!(fold_decision(&mut seen, l, later), None, "and the window restarts");
         let line = stamped_line("2026-10-11T01:02:03Z", &folded_line(l, 13));
-        assert!(
-            line.starts_with("2026-10-11T01:02:03Z known device"),
-            "{line}"
-        );
-        assert!(
-            line.ends_with("(and 13 more like it in the last 60s)"),
-            "{line}"
-        );
+        assert!(line.starts_with("2026-10-11T01:02:03Z known device"), "{line}");
+        assert!(line.ends_with("(and 13 more like it in the last 60s)"), "{line}");
         assert_eq!(folded_line("x", 0), "x");
         // Bounded: a flood of distinct lines cannot grow the map without limit.
         for i in 0..(DEDUP_MAX * 2) {
@@ -1531,31 +1326,17 @@ mod scripting_output_tests {
     #[test]
     fn strip_ansi_removes_color_and_links_keeps_text() {
         assert_eq!(strip_ansi("plain"), "plain");
-        assert_eq!(
-            strip_ansi("\x1b[1;38;5;166mFLEET\x1b[0m  /  x"),
-            "FLEET  /  x"
-        );
+        assert_eq!(strip_ansi("\x1b[1;38;5;166mFLEET\x1b[0m  /  x"), "FLEET  /  x");
         assert_eq!(strip_ansi("\x1b[38;2;216;102;42mcode\x1b[0m"), "code");
-        assert_eq!(
-            strip_ansi("\x1b]8;;https://a.b\x1b\\site\x1b]8;;\x1b\\ ok"),
-            "site ok"
-        );
+        assert_eq!(strip_ansi("\x1b]8;;https://a.b\x1b\\site\x1b]8;;\x1b\\ ok"), "site ok");
         assert_eq!(strip_ansi("a\x1b]52;c;Zm9v\x07b"), "ab");
-        assert_eq!(
-            strip_ansi("caf\u{e9} \u{2713}"),
-            "caf\u{e9} \u{2713}",
-            "non-ASCII text survives"
-        );
+        assert_eq!(strip_ansi("caf\u{e9} \u{2713}"), "caf\u{e9} \u{2713}", "non-ASCII text survives");
     }
 
     #[test]
     fn header_keeps_its_text() {
         // Whatever the color decision, the words of a heading never change.
-        let h = header(
-            Tone::Brand,
-            Tone::Dim,
-            "TUNLION  /  3 DEVICES  /  AVAILABLE",
-        );
+        let h = header(Tone::Brand, Tone::Dim, "TUNLION  /  3 DEVICES  /  AVAILABLE");
         assert_eq!(strip_ansi(&h), "TUNLION  /  3 DEVICES  /  AVAILABLE");
     }
 }
