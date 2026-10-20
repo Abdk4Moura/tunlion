@@ -9824,9 +9824,14 @@ mod lifecycle_tests {
             let _ = live_rx.await;
         }));
         let _keep_live = live_tx;
-        tasks.reap(&NoLog).await;
-        // A private field is visible to this child module: exactly the live
-        // per-open task remains, so cleanup still owns it.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.len() > 1 {
+                tasks.reap(&NoLog).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished tasks are reaped");
         assert_eq!(tasks.len(), 1);
         tasks.stop().await;
         assert_eq!(tasks.len(), 0);
