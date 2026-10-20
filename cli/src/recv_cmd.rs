@@ -147,7 +147,7 @@ mod tests {
         let source = include_str!("recv_cmd.rs");
         assert!(source.lines().count() < 500, "the adapter is thin");
         assert!(source.contains("recv::dispatch"));
-        assert!(!source.contains("Ev::Chunk("));
+        assert!(!source.contains(concat!("Ev::", "Chunk(")));
     }
 
     #[test]
