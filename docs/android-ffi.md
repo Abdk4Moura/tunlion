@@ -1,14 +1,17 @@
 # tunlion-core: a library any process can call
 
-Status: the receive engine is linked. `CoreSession.start` and `stop` exist and
-run the real shared `recv::dispatch::drive` in `filament-peerloop`; the CLI is
-one process adapter, not the owner of the dispatch body. The reduced host
-serves the receive/transfer path and refuses absent desktop endpoints by name.
+Status: the receive engine is linked. `CoreSession.start`, `stop` and
+`receive_code` exist and run the real shared `recv::dispatch::drive` in
+`filament-peerloop`; the CLI is one process adapter, not the owner of the
+dispatch body. The reduced host serves the receive/transfer path and refuses
+absent desktop endpoints by name. `receive_code` is the first real transfer
+verb: an embedding caller can receive one code-addressed transfer and gets a
+per-file summary.
 
 This is **not** yet a complete FFI product. Creating or joining a code, sending
-by code, sending to a device, and the app-facing receive/incoming-transfer API
-still do not exist, so a fresh app cannot pair through FFI alone. `start` can
-serve an already-paired config directory; it cannot make one.
+by code, sending to a device, and the app-facing receive/incoming-transfer
+stream still do not exist, so a fresh app cannot pair through FFI alone.
+`start` can serve an already-paired config directory; it cannot make one.
 
 Android is why this crate exists now. It is not the owner of the API. Kotlin
 is one binding. A Rust caller, a desktop embedding, or a later language
@@ -51,8 +54,9 @@ that package's metadata, not the virtual workspace root.
 not call it from the app.
 
 Threading: the engine owns its runtime. Kotlin calls in and gets a result or a
-callback. Tokio types do not cross the boundary. `start` and `stop` are
-synchronous; call them off the UI thread.
+callback. Tokio types do not cross the boundary. `start`, `stop` and
+`receive_code` are synchronous; `receive_code` blocks for the whole transfer,
+so call them off the UI thread.
 
 Core settings come only from the explicit config directory, not
 `TUNLION_CONFIG_DIR` or other `TUNLION_*` settings. The transport underneath
@@ -128,6 +132,46 @@ detached stdin to report. A dispatch that does not finish within the 5-second
 bound is retained and reported as `TimedOut` / `CoreError::Stop`, never
 `Stopped`.
 
+`receive_code(code, dir, yes, timeout) -> ReceiveSummary`
+
+Runs the real one-shot `recv::dispatch::drive` with `code: Some`,
+`daemon: false`, `keep_open: false`, `output: None`, the same reduced
+`CoreHost`/ports/identity/store as `start`, and the caller's `dir`. `yes`
+accepts matching offers without a prompt; `timeout` is the seconds to wait for
+a sender, matching the CLI's `--timeout`.
+
+**This call blocks** until the transfer finishes, the timeout expires with
+nothing received, the sender/refusal path ends, or `stop` cancels it. Call it
+off the UI thread. No Tokio runtime crosses the boundary; the library owns its
+runtime. A one-shot receive has transfer-completion semantics, so it does not
+wait for the daemon readiness edge that `start` publishes.
+
+The code must be a well-formed claim: words followed by a trailing 3-5 digit
+nameplate (`brave-otter-ruby-3141`). Malformed input returns `Usage` before any
+network work, and the code/words are never logged. `stop` / `stop_blocking`
+cancels an in-flight receive and it returns `Cancelled`, never a fake empty
+success. A deadline with nothing received returns `Unreachable`, the library
+equivalent of the CLI's exit 6.
+
+`ReceiveSummary` is small and stable:
+
+```text
+ReceiveSummary { stored: Vec<StoredFile>, refused: Vec<RefusedFile>, bytes: u64 }
+StoredFile { name, stored_name, bytes, sha256: Option<String> }
+RefusedFile { name, reason, message }
+```
+
+A file is in exactly one list. Files stored or refused before an error are
+returned in the summary rather than silently dropped. Refusal reasons are the
+existing transfer vocabulary (`no_space`, `declined`, `no_tty`, ...); the
+library does not re-implement admission, consent, verification or the reduced
+profile's refusals, and the CLI's process exit codes stay out of the FFI.
+
+`receive_code` takes the same-directory `up.lock` lease and releases it on
+completion, refusal or error. It refuses with `EngineAlreadyRunning` when this
+Core already owns an engine, and with `EngineLease` when another Core or CLI
+daemon owns the root.
+
 `status().engine` is the slot state a UI polls: `NotLinked` (nothing started),
 `Starting` (startup claimed the Core, or the dispatch is spawned and readiness
 is pending), `Running`, `Stopping` (a stop is joining), `FinishedUnjoined` (the task returned
@@ -157,9 +201,10 @@ These are the rest of issue #465. Do not stub them as success.
 
 - create a code, join a code, remember.
 - send to a device, send by code.
-- an app-facing receive/incoming-transfer stream. The engine writes accepted
-  files to the config directory's inbox, but there is no FFI event/callback
-  surface yet.
+- an app-facing receive/incoming-transfer **stream**. `receive_code` is one
+  blocking call with a final summary; there is no progress/event/callback
+  surface, and `start` writes accepted files to the config directory's inbox
+  rather than telling the app about them.
 - shell bytes and resize, only toward a device that granted shell. The phone
   does not serve a shell (`openpty` on Android already refuses).
 

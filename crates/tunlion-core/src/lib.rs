@@ -33,11 +33,11 @@ use filament_id::{user_key_path, KeyStore, PendingIdentity, UserKey};
 use filament_peerloop::driver::{
     Cancellation, DriverOutcome, Engine, Readiness, ReadyWatch, StopError,
 };
-use filament_peerloop::host::{LogSink, NoLog};
+use filament_peerloop::host::{HostServices, LogSink, NoLog};
 use filament_peerloop::present::NoScreen;
-use filament_peerloop::recv::dispatch::{drive, RecvCleanup};
+use filament_peerloop::recv::dispatch::{drive, DispatchFailure, DispatchFailureKind, RecvCleanup};
 use filament_peerloop::recv::ports::{RecvEnv, RecvPorts};
-use filament_peerloop::recv::report::RecvReport;
+use filament_peerloop::recv::report::{RecvReport, RefusedFailure};
 use filament_peerloop::recv::store::{CoreLease, DeviceStore, OverlayKey};
 use filament_peerloop::shell_gate::ShellPolicy;
 use filament_transport::TransportContext;
@@ -257,6 +257,110 @@ impl Drop for StartClaim<'_> {
     }
 }
 
+/// The host composition for one engine invocation. Both `start` and
+/// `receive_code` build it through `Core::prepare_engine`, so a one-shot receive
+/// cannot drift into a second host, identity or store implementation.
+struct EngineParts {
+    server: String,
+    transport_context: TransportContext,
+    log: Arc<dyn LogSink>,
+    host: Arc<dyn HostServices>,
+    ports: RecvPorts,
+}
+
+/// The fixed posture of a one-shot receive: the code is the only way in, the
+/// invocation ends after the transfer, and files go to the caller's directory.
+/// Kept as a value so the mapping is unit-tested without a network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneShotArgs {
+    code: String,
+    dir: PathBuf,
+    yes: bool,
+    timeout: Option<u64>,
+    daemon: bool,
+    keep_open: bool,
+    output: Option<String>,
+}
+
+impl OneShotArgs {
+    fn new(code: String, dir: PathBuf, yes: bool, timeout: Option<u64>) -> Self {
+        Self {
+            code,
+            dir,
+            yes,
+            timeout,
+            daemon: false,
+            keep_open: false,
+            output: None,
+        }
+    }
+}
+
+/// Validate and normalize a receive claim exactly like the CLI's code entry:
+/// a well-formed claim is words followed by a trailing 3-5 digit nameplate
+/// (`brave-otter-ruby-3141`). Malformed input never reaches the network.
+fn parse_claim_code(raw: &str) -> Result<String, CoreError> {
+    let normalized = filament_pair::norm_code(raw);
+    let trimmed = normalized.trim_matches('-');
+    let (nameplate, words) = filament_pair::split_code(trimmed);
+    let nameplate_ok =
+        (3..=5).contains(&nameplate.len()) && nameplate.bytes().all(|b| b.is_ascii_digit());
+    if words.is_empty() || !nameplate_ok {
+        return Err(CoreError::Usage(
+            "that code doesn't look right, expected something like brave-otter-ruby-3141".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Turn the invocation-owned [`RecvReport`] into the small, stable FFI record.
+/// Every recorded file lands in exactly one list; arrival order is preserved.
+fn summarize_receive(report: &RecvReport) -> ReceiveSummary {
+    let mut stored = Vec::new();
+    let mut refused = Vec::new();
+    for file in report.files() {
+        match (file.stored_name.as_deref(), file.refusal.as_ref()) {
+            (Some(stored_name), _) => stored.push(StoredFile {
+                name: file.file.clone(),
+                stored_name: stored_name.to_string(),
+                bytes: file.bytes,
+                sha256: file.sha256.clone(),
+            }),
+            (None, Some(refusal)) => refused.push(RefusedFile {
+                name: file.file.clone(),
+                reason: refusal.reason.clone(),
+                message: refusal.message.clone(),
+            }),
+            (None, None) => refused.push(RefusedFile {
+                name: file.file.clone(),
+                reason: "unrecorded".to_string(),
+                message: "the receiver recorded no disposition for this file".to_string(),
+            }),
+        }
+    }
+    let bytes = stored.iter().map(|file| file.bytes).sum();
+    ReceiveSummary {
+        stored,
+        refused,
+        bytes,
+    }
+}
+
+/// Map the dispatch's typed failures onto the library's stable vocabulary.
+/// The dispatch deliberately carries no process exit codes.
+fn map_receive_error(error: anyhow::Error) -> CoreError {
+    if let Some(failure) = error.downcast_ref::<DispatchFailure>() {
+        return match failure.kind {
+            DispatchFailureKind::Usage => CoreError::Usage(failure.message.clone()),
+            DispatchFailureKind::Unreachable => CoreError::Unreachable(failure.message.clone()),
+        };
+    }
+    if let Some(refused) = error.downcast_ref::<RefusedFailure>() {
+        return CoreError::Refused(refused.message.clone());
+    }
+    CoreError::Engine(error.to_string())
+}
+
 /// A core opened on one config directory. The directory is the app's private
 /// files dir on Android. This type does not read `TUNLION_CONFIG_DIR`.
 pub struct Core {
@@ -315,6 +419,40 @@ pub struct Status {
     pub engine: EngineState,
 }
 
+/// One file a one-shot receive stored, after whole-file verification and final
+/// placement.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StoredFile {
+    /// The name the sender offered.
+    pub name: String,
+    /// The name it was actually stored under (a collision gets a suffix).
+    pub stored_name: String,
+    pub bytes: u64,
+    /// The verified SHA-256, when the sender offered one.
+    pub sha256: Option<String>,
+}
+
+/// One offered file the receive refused or the person declined.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RefusedFile {
+    /// The name the sender offered.
+    pub name: String,
+    /// The stable typed reason token (for example `no_space`, `declined`).
+    pub reason: String,
+    /// The sentence both ends see.
+    pub message: String,
+}
+
+/// What one `receive_code` call did. Stored files are on disk; refused files
+/// are named with their reason, never silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReceiveSummary {
+    pub stored: Vec<StoredFile>,
+    pub refused: Vec<RefusedFile>,
+    /// Total bytes of the stored files.
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum CoreError {
     #[error("{0}")]
@@ -325,6 +463,25 @@ pub enum CoreError {
     /// explicitly empty signaling server.
     #[error("{0}")]
     Config(String),
+    /// The caller's input cannot be acted on, before any network work (a
+    /// malformed receive code, for example).
+    #[error("{0}")]
+    Usage(String),
+    /// The receive ran but nobody authenticated and offered a transfer within
+    /// the caller's timeout. This is the library equivalent of the CLI's
+    /// exit 6 ("unreachable"), and it is only returned when nothing was
+    /// received.
+    #[error("{0}")]
+    Unreachable(String),
+    /// The transfer was refused or declined. Files that were stored or refused
+    /// before the end are summarized by a successful call instead; this error
+    /// is for an invocation that recorded no per-file fact.
+    #[error("{0}")]
+    Refused(String),
+    /// A `stop` / `stop_blocking` cancelled the receive. Cancellation is never
+    /// reported as a successful (possibly empty) receive.
+    #[error("the receive was cancelled")]
+    Cancelled,
     /// The 12 words did not match the phrase this pending identity minted.
     #[error("the recovery phrase did not match")]
     PhraseMismatch,
@@ -447,6 +604,187 @@ impl Core {
         // return `Ok` and then watch an engine appear behind it.
         let mut claim = StartClaim::acquire(self)?;
 
+        let engine_dir = self.dir.join("inbox");
+        let (parts, lease) = self.prepare_engine(engine_dir.clone())?;
+        let EngineParts {
+            server,
+            transport_context,
+            log,
+            host,
+            ports,
+        } = parts;
+        let dispatch = move |stop: Cancellation, readiness: Readiness| async move {
+            let mut cleanup = RecvCleanup::default();
+            let outcome = drive(
+                &server,
+                None,
+                engine_dir,
+                false,
+                None,
+                None,
+                true,
+                None,
+                None,
+                false,
+                None,
+                true,
+                None,
+                ShellPolicy::Granted,
+                None,
+                true,
+                transport_context,
+                log,
+                host,
+                ports,
+                RecvReport::new(),
+                &stop,
+                &readiness,
+                &mut cleanup,
+            )
+            .await;
+            match outcome {
+                DriverOutcome::Cancelled => Ok::<(), String>(()),
+                DriverOutcome::Returned(Ok(())) => Ok(()),
+                DriverOutcome::Returned(Err(error)) => Err(error.to_string()),
+            }
+        };
+
+        let (handle, engine, watch) = self.spawn_engine(dispatch)?;
+        claim.install(engine)?;
+        self.finish_start(handle, watch, lease)
+    }
+
+    /// Receive one transfer by code, synchronously, with one-shot semantics.
+    ///
+    /// This runs the same `recv::dispatch::drive` the CLI `receive` adapter and
+    /// `Core::start` run: same reduced `CoreHost`, ports, identity and store.
+    /// The code is the only way in (`daemon: false`), the invocation ends when
+    /// the transfer is done instead of serving (`keep_open: false`), and files
+    /// go to the caller's `dir`. `yes` accepts matching offers without a
+    /// prompt; `timeout` bounds the wait for a sender, in seconds, exactly as
+    /// the CLI's `--timeout` does.
+    ///
+    /// The call blocks until the dispatch finishes, the sender/refusal path
+    /// ends, or `stop` / `stop_blocking` cancels it. There is no readiness
+    /// edge: one-shot receives have transfer-completion semantics, so this
+    /// never waits for the daemon's "engine is serving" publication.
+    ///
+    /// A malformed code is rejected with `CoreError::Usage` before any network
+    /// work. Cancellation returns `CoreError::Cancelled`, never `Ok`. A wait
+    /// that ends with nothing received returns `CoreError::Unreachable` (the
+    /// CLI's exit 6). Files recorded before an error are returned in the
+    /// summary rather than dropped.
+    ///
+    /// The same-directory `up.lock` lease is taken for the duration and
+    /// released on completion, refusal or error; a Core or CLI that already
+    /// owns the root refuses with `EngineLease`, and a running engine in this
+    /// Core refuses with `EngineAlreadyRunning`.
+    pub fn receive_code(
+        &self,
+        code: String,
+        dir: PathBuf,
+        yes: bool,
+        timeout: Option<u64>,
+    ) -> Result<ReceiveSummary, CoreError> {
+        // Parse first: a typo must cost nothing and must not touch the network,
+        // the lease or a running engine.
+        let code = parse_claim_code(&code)?;
+        let args = OneShotArgs::new(code, dir, yes, timeout);
+
+        let mut claim = StartClaim::acquire(self)?;
+        let (parts, lease) = self.prepare_engine(args.dir.clone())?;
+        let EngineParts {
+            server,
+            transport_context,
+            log,
+            host,
+            ports,
+        } = parts;
+
+        let report = RecvReport::new();
+        let engine_report = report.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<ReceiveSummary, CoreError>>();
+        let dispatch = move |stop: Cancellation, readiness: Readiness| async move {
+            let mut cleanup = RecvCleanup::default();
+            let outcome = drive(
+                &server,
+                Some(args.code),
+                args.dir,
+                args.yes,
+                None,
+                None,
+                args.keep_open,
+                args.timeout,
+                None,
+                false,
+                None,
+                args.daemon,
+                args.output,
+                ShellPolicy::Granted,
+                None,
+                true,
+                transport_context,
+                log,
+                host,
+                ports,
+                engine_report.clone(),
+                &stop,
+                &readiness,
+                &mut cleanup,
+            )
+            .await;
+            let result = match outcome {
+                // Cancellation is its own outcome, never an empty success.
+                DriverOutcome::Cancelled => Err(CoreError::Cancelled),
+                DriverOutcome::Returned(result) => {
+                    let summary = summarize_receive(&engine_report);
+                    if summary.stored.is_empty() && summary.refused.is_empty() {
+                        match result {
+                            Ok(()) => Ok(summary),
+                            Err(error) => Err(map_receive_error(error)),
+                        }
+                    } else {
+                        // The per-file facts are the truth even when the
+                        // dispatch also returned an error (a partial receive,
+                        // or every file refused): report them, do not drop
+                        // them behind one sentence.
+                        Ok(summary)
+                    }
+                }
+            };
+            let _ = done_tx.send(result);
+            Ok::<(), String>(())
+        };
+
+        let (_handle, engine, _watch) = self.spawn_engine(dispatch)?;
+        claim.install(engine)?;
+        // Publish Running and the lease in one critical section, like start.
+        // A stop that won the slot already owns the join and the lease.
+        let published = self.publish_one_shot(lease);
+        let result = done_rx.recv().unwrap_or_else(|_| {
+            Err(CoreError::Engine(
+                "the receive dispatch ended without a result".into(),
+            ))
+        });
+        let settled = self.settle_one_shot();
+
+        match result {
+            // A cancelled receive is cancelled even if a concurrent stop is
+            // still finishing its join; that stop owns the lease release.
+            Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
+            other => {
+                published?;
+                settled?;
+                other
+            }
+        }
+    }
+
+    /// The host/identity/port composition both `start` and `receive_code` use.
+    ///
+    /// `engine_dir` is where the invocation writes: the config directory's
+    /// inbox for a daemon, the caller's directory for a one-shot receive.
+    fn prepare_engine(&self, engine_dir: PathBuf) -> Result<(EngineParts, CoreLease), CoreError> {
         let store = DeviceStore::open(&self.dir);
         if !store.has_identity() {
             return Err(CoreError::Identity(
@@ -513,8 +851,7 @@ impl Core {
             Arc::new(NoScreen),
             env,
         );
-        let inbox = self.dir.join("inbox");
-        fs::create_dir_all(&inbox).map_err(io_err)?;
+        fs::create_dir_all(&engine_dir).map_err(io_err)?;
         let settings_for_peer = settings.clone();
         let settings_for_membership = settings.clone();
         let transport_context = TransportContext::new(
@@ -522,46 +859,81 @@ impl Core {
             move |key, peer| settings_for_peer.setting(key, peer),
             move |peer| settings_for_membership.membership(peer),
         );
-        let engine_dir = inbox;
-        let dispatch = move |stop: Cancellation, readiness: Readiness| async move {
-            let mut cleanup = RecvCleanup::default();
-            let outcome = drive(
-                &server,
-                None,
-                engine_dir,
-                false,
-                None,
-                None,
-                true,
-                None,
-                None,
-                false,
-                None,
-                true,
-                None,
-                ShellPolicy::Granted,
-                None,
-                true,
+        Ok((
+            EngineParts {
+                server,
                 transport_context,
                 log,
                 host,
                 ports,
-                RecvReport::new(),
-                &stop,
-                &readiness,
-                &mut cleanup,
-            )
-            .await;
-            match outcome {
-                DriverOutcome::Cancelled => Ok::<(), String>(()),
-                DriverOutcome::Returned(Ok(())) => Ok(()),
-                DriverOutcome::Returned(Err(error)) => Err(error.to_string()),
-            }
-        };
+            },
+            lease,
+        ))
+    }
 
-        let (handle, engine, watch) = self.spawn_engine(dispatch)?;
-        claim.install(engine)?;
-        self.finish_start(handle, watch, lease)
+    /// Publish `Running` and store the one-shot lease in one critical section.
+    ///
+    /// Unlike [`Core::publish_started`], a one-shot dispatch does not publish
+    /// readiness, so a task that already returned is still `Running` here: its
+    /// result is waiting on the completion channel and `settle_one_shot` joins
+    /// it. If a stop won the slot first, this never replaces its state; it
+    /// keeps the lease with the task owner so that join is the one release.
+    fn publish_one_shot(&self, lease: CoreLease) -> Result<(), CoreError> {
+        let mut slot = self
+            .engine
+            .lock()
+            .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+        match std::mem::replace(&mut *slot, EngineSlot::None) {
+            EngineSlot::Starting(engine) => {
+                let mut held = self
+                    .lease
+                    .lock()
+                    .map_err(|_| CoreError::Engine("the lease lock was poisoned".into()))?;
+                *held = Some(lease);
+                drop(held);
+                *slot = EngineSlot::Running(engine);
+                Ok(())
+            }
+            other => {
+                *slot = other;
+                if matches!(
+                    &*slot,
+                    EngineSlot::Starting(_)
+                        | EngineSlot::Running(_)
+                        | EngineSlot::Stopping
+                        | EngineSlot::Unstopped(_)
+                ) {
+                    if let Ok(mut held) = self.lease.lock() {
+                        *held = Some(lease);
+                    }
+                }
+                Err(CoreError::Stop(
+                    "the receive engine stopped while it was starting".into(),
+                ))
+            }
+        }
+    }
+
+    /// Join a one-shot dispatch that has already sent its result, releasing the
+    /// lease. A concurrent stop may own the join; wait (bounded) for it to
+    /// settle instead of stealing its slot.
+    fn settle_one_shot(&self) -> Result<(), CoreError> {
+        match self.stop_blocking_within(Duration::from_secs(5)) {
+            Ok(()) => Ok(()),
+            Err(CoreError::EngineStopping) => {
+                for _ in 0..5_000 {
+                    match self.engine_state()? {
+                        EngineState::Stopping => std::thread::sleep(Duration::from_millis(1)),
+                        EngineState::Stopped | EngineState::Failed | EngineState::NotLinked => {
+                            return Ok(())
+                        }
+                        _ => return Err(CoreError::EngineNotStopped),
+                    }
+                }
+                Err(CoreError::EngineStopping)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Wait for the real readiness edge, then publish Running atomically with
@@ -1213,9 +1585,12 @@ mod tests {
                 listener.set_nonblocking(true).unwrap();
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 let (socket, _) = listener.accept().await.unwrap();
-                let _ = accepted_tx.send(());
                 let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
                 let _ = ws.send(Message::Text("0{}".into())).await;
+                // Signal only after the WebSocket handshake succeeded: a test
+                // that stops the receive cannot tear down the handshake and
+                // turn the stub's own unwrap into the failure under test.
+                let _ = accepted_tx.send(());
                 while let Some(Ok(message)) = ws.next().await {
                     match message {
                         Message::Text(text) if text == "40" => {
@@ -1246,6 +1621,76 @@ mod tests {
             });
         });
         (handle, accepted_rx)
+    }
+
+    /// A signaling stub that accepts the receive, sends the socket.io welcome,
+    /// and reports every client event it sees. Used to prove a real dispatch ran
+    /// (the code claim) without inventing a sender.
+    fn claiming_signaling_stub(
+        listener: std::net::TcpListener,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let _ = ws.send(Message::Text("0{}".into())).await;
+                while let Some(Ok(message)) = ws.next().await {
+                    match message {
+                        Message::Text(text) if text == "40" => {
+                            let _ = ws.send(Message::Text("40{}".into())).await;
+                            let _ = ws
+                                .send(Message::Text(
+                                    r#"42["welcome",{"id":"stub","peers":[]}]"#.into(),
+                                ))
+                                .await;
+                        }
+                        Message::Text(text) if text.starts_with("42") => {
+                            let _ = events_tx.send(text.to_string());
+                        }
+                        Message::Text(text) if text.starts_with("41") => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        Message::Close(_) => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        });
+        (handle, events_rx)
+    }
+
+    /// A Core with a committed identity, ready for the engine/receive paths.
+    fn enrolled_core(dir: &std::path::Path) -> Core {
+        let core = Core::open(dir).unwrap();
+        let pending = core.begin_identity().unwrap();
+        let phrase = pending.phrase();
+        core.commit_identity(pending, &phrase).unwrap();
+        core
+    }
+
+    fn configured_for(core: &Core, listener: &std::net::TcpListener) {
+        let addr = listener.local_addr().unwrap();
+        std::fs::write(
+            core.config_dir().join("config"),
+            format!("server http://{addr}\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1465,6 +1910,201 @@ mod tests {
             "a joined stop must not leave a stale lease"
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn one_shot_arguments_are_the_receive_posture() {
+        let args = OneShotArgs::new(
+            "brave-otter-ruby-3141".to_string(),
+            PathBuf::from("/tmp/received"),
+            true,
+            Some(9),
+        );
+        assert_eq!(args.code, "brave-otter-ruby-3141");
+        assert_eq!(args.dir, PathBuf::from("/tmp/received"));
+        assert!(args.yes);
+        assert_eq!(args.timeout, Some(9));
+        assert!(!args.daemon, "a one-shot receive is never a daemon");
+        assert!(
+            !args.keep_open,
+            "a one-shot receive ends after the transfer"
+        );
+        assert_eq!(args.output, None, "no stdout sink is part of this API");
+    }
+
+    #[test]
+    fn a_claim_code_is_normalized_and_requires_words_and_a_numeric_nameplate() {
+        assert_eq!(
+            parse_claim_code("  Brave Otter Ruby 3141 ").unwrap(),
+            "brave-otter-ruby-3141"
+        );
+        assert_eq!(
+            parse_claim_code("brave-otter-3141").unwrap(),
+            "brave-otter-3141"
+        );
+        for malformed in [
+            "",
+            "brave-otter",
+            "3141",
+            "brave-otter-ruby-12",
+            "brave-otter-ruby-123456",
+            "brave-otter-ruby-1234x",
+            "-3141",
+        ] {
+            assert!(
+                matches!(parse_claim_code(malformed), Err(CoreError::Usage(_))),
+                "{malformed:?} must be refused as malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn receive_code_refuses_a_malformed_code_before_engine_or_lease_work() {
+        let core = core();
+        let dir = core.config_dir().join("received");
+        for malformed in ["brave-otter", "3141", "brave-otter-ruby-12"] {
+            assert!(matches!(
+                core.receive_code(malformed.to_string(), dir.clone(), true, Some(1)),
+                Err(CoreError::Usage(_))
+            ));
+        }
+        assert_eq!(
+            core.status().unwrap().engine,
+            EngineState::NotLinked,
+            "a malformed code must not install an engine"
+        );
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "a malformed code must not take the root lease"
+        );
+    }
+
+    #[test]
+    fn receive_code_refuses_while_an_engine_is_already_running() {
+        let core = core();
+        core.start_with_dispatch(|stop, _readiness| async move {
+            stop.run(std::future::pending::<()>()).await;
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        assert_eq!(
+            core.receive_code(
+                "brave-otter-ruby-3141".to_string(),
+                core.config_dir().join("received"),
+                true,
+                Some(1),
+            ),
+            Err(CoreError::EngineAlreadyRunning)
+        );
+        core.stop_blocking().unwrap();
+    }
+
+    #[test]
+    fn receive_code_runs_the_real_one_shot_and_releases_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = enrolled_core(dir.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        configured_for(&core, &listener);
+        let (server, events) = claiming_signaling_stub(listener);
+
+        let error = core
+            .receive_code(
+                "brave-otter-ruby-3141".to_string(),
+                dir.path().join("received"),
+                true,
+                Some(1),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Unreachable(ref message) if message.contains("nothing arrived within 1s")),
+            "a deadline with nothing received must be the typed unreachable error, got {error:?}"
+        );
+
+        // The dispatch really connected and claimed the numeric nameplate; the
+        // spoken words never crossed the signaling socket.
+        let claim = events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the receive claimed the code nameplate");
+        assert!(claim.contains("pair-claim"), "{claim}");
+        assert!(claim.contains("3141"), "{claim}");
+        assert!(!claim.contains("brave-otter-ruby"), "{claim}");
+
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "a completed one-shot receive must release the root lease"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stop_cancels_a_receive_and_returns_cancelled_not_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(enrolled_core(dir.path()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        configured_for(&core, &listener);
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (server, accepted) = gated_signaling_stub(listener, gate_rx);
+
+        let receive_core = Arc::clone(&core);
+        let received = std::thread::spawn(move || {
+            receive_core.receive_code(
+                "brave-otter-ruby-3141".to_string(),
+                dir.path().join("received"),
+                true,
+                None,
+            )
+        });
+        accepted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the receive reached the signaling stub");
+
+        core.stop_blocking().unwrap();
+        assert_eq!(received.join().unwrap(), Err(CoreError::Cancelled));
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "a cancelled receive must release the root lease"
+        );
+        let _ = gate_tx.send(());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn summary_construction_keeps_every_stored_and_refused_file() {
+        use filament_peerloop::recv::report::RefusalClass;
+
+        let report = RecvReport::new();
+        report.note_stored("a.txt", 5, Some("ab"), "a (1).txt");
+        report.note_refused(
+            "p.bin",
+            3_000_000,
+            "no_space",
+            "receiver is out of disk space",
+            RefusalClass::LocalResource,
+        );
+        let summary = summarize_receive(&report);
+        assert_eq!(
+            summary.stored,
+            vec![StoredFile {
+                name: "a.txt".into(),
+                stored_name: "a (1).txt".into(),
+                bytes: 5,
+                sha256: Some("ab".into()),
+            }]
+        );
+        assert_eq!(
+            summary.refused,
+            vec![RefusedFile {
+                name: "p.bin".into(),
+                reason: "no_space".into(),
+                message: "receiver is out of disk space".into(),
+            }]
+        );
+        assert_eq!(summary.bytes, 5);
     }
 
     #[test]

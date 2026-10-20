@@ -41,10 +41,14 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   same-root `up.lock` election (the CLI daemon uses the same lock), starts
   `recv::dispatch::drive` through the same `Engine` and waits the real
   readiness edge before publishing `Running`. `Core::stop` / `stop_within`
-  request stop and join its own epilogue. `start_with_dispatch` remains for a
+  request stop and join its own epilogue. `Core::receive_code` reuses that same
+  host/ports/identity/store and lease for one `code: Some, daemon: false,
+  keep_open: false` dispatch, waits for the dispatch result (not readiness) and
+  returns a per-file `ReceiveSummary`. `start_with_dispatch` remains for a
   Rust embedder that needs a different dispatch. UniFFI exposes synchronous
-  `CoreSession::start` / `stop`; a UI caller must invoke them off its main
-  thread, and no Tokio runtime crosses the boundary.
+  `CoreSession::start` / `stop` / `receive_code`; `receive_code` blocks for the
+  transfer, so a UI caller must invoke them off its main thread, and no Tokio
+  runtime crosses the boundary.
 
   `Core` owns exactly one engine per instance, behind one mutex, with an
   explicit slot state machine:
@@ -176,7 +180,14 @@ error recorded as `Failed`; the no-engine stop no-op; `Starting` until a gated
 signaling stub publishes readiness, then `Running`; a second Core on the same
 root refused by the `up.lock` lease and released after a joined stop; and a real
 `Core::start` -> dispatch -> `stop_blocking` integration over a local signaling
-stub. Android keeps the reduced `filament-peerloop` profile: no
+stub. `Core::receive_code` coverage adds: the one-shot posture (`daemon: false`,
+`keep_open: false`, no stdout sink), claim-code normalization and malformed-code
+refusal before any engine/lease work, refusal while an engine is running, a real
+one-shot dispatch against a local signaling stub that proves the numeric
+nameplate was claimed (and the words were not sent) plus the typed
+`Unreachable` deadline and lease release, `stop` cancelling a receive into
+`Cancelled`, and summary construction that keeps stored and refused files.
+Android keeps the reduced `filament-peerloop` profile: no
 `mount-server`, `forward-server`, `mesh` or `fleet` sectors compile into the
 core library, and the graph gate fails if they do. The shipped Android CLI is
 built with the explicit reduced profile (`--no-default-features --features

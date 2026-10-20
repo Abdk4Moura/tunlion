@@ -1,1 +1,1 @@
-cargo check --target x86_64-pc-windows-msvc -p filament-cli --bin tunlion --locked
+cargo test -p tunlion-core --lib --locked && cargo test -p tunlion-core --release --lib --locked && python3 scripts/check_core_tooling_graph.py
