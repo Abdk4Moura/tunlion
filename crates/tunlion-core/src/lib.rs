@@ -1011,9 +1011,9 @@ impl Core {
 
     /// Whether this Core may still own a task whose outcome is unreaped.
     ///
-    /// True for `Running`, `Stopping`, `FinishedUnjoined` and `TimedOut`: in
-    /// each, a `JoinHandle` exists and has not been joined. False only once it
-    /// is `Stopped`, `Failed` or `NotLinked`.
+    /// True for `Starting`, `Running`, `Stopping`, `FinishedUnjoined` and
+    /// `TimedOut`: startup is in progress or a `JoinHandle` exists and has not
+    /// been joined. False only once it is `Stopped`, `Failed` or `NotLinked`.
     pub fn is_engine_running(&self) -> Result<bool, CoreError> {
         Ok(matches!(
             self.engine_state()?,

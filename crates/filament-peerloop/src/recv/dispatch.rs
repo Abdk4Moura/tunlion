@@ -10265,6 +10265,8 @@ mod expiry_redrive_tests {
 
 #[cfg(test)]
 mod inventory {
+    use serde_json::json;
+
     /// The receive loop's regression suite moved with the loop. Names are part
     /// of the contract: a relocation that silently drops one (or a suite) must
     /// fail here, not be hidden by unrelated new tests elsewhere.
