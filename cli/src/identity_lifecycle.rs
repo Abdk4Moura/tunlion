@@ -34,7 +34,8 @@ pub(crate) use filament_peerloop::recv::identity::PROVEN_CHALLENGE_DEADLINE;
 pub(crate) use filament_peerloop::recv::identity::VOUCH_CERT_SCOPE;
 
 /// Build the identity service on this process's paths, with the caller's log
-/// sink. The receive loop passes its own; one-shot commands use [`service`].
+/// sink. The receive loop owns one; each one-shot send/exec/shell flow builds
+/// one and reuses it for that flow's challenges.
 pub(crate) fn service_with_log(log: Arc<dyn LogSink>) -> IdentityService {
     IdentityService::new(
         crate::devices_store::store(),
