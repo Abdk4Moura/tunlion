@@ -148,7 +148,7 @@ pub fn pty_backend(sessions: Arc<l2::PtySessions>) -> Box<dyn PtyBackend> {
     #[cfg(not(feature = "pty-server"))]
     {
         let _ = sessions;
-        Box::new(ReducedPty)
+        Box::new(filament_peerloop::recv::servers::shell::UnavailablePty)
     }
 }
 
@@ -218,44 +218,6 @@ impl PtyBackend for CliPty {
         shell_user.is_some()
             && shell_root_note().is_empty()
             && shell_argv(None, shell_user.as_deref()).1
-    }
-}
-
-/// A build without `pty-server` compiles no CLI PTY backend: the library
-/// answers `pty-open` with a named close, so this value is never called. The
-/// port still needs a value, not a second implementation.
-#[cfg(not(feature = "pty-server"))]
-struct ReducedPty;
-
-#[cfg(not(feature = "pty-server"))]
-#[async_trait::async_trait]
-impl PtyBackend for ReducedPty {
-    async fn get_live(&self, _: &str) -> Option<Arc<dyn PtySession>> {
-        None
-    }
-    fn reserve(&self) -> Option<Box<dyn std::any::Any + Send>> {
-        None
-    }
-    async fn spawn(
-        &self,
-        _: PtySpawnSpec,
-        _: Box<dyn std::any::Any + Send>,
-    ) -> Option<Arc<dyn PtySession>> {
-        None
-    }
-    async fn forget(&self, _: &str) {}
-    fn start_pumps(
-        &self,
-        _: Arc<dyn PtySession>,
-        _: tokio::sync::mpsc::Receiver<PipeItem>,
-        _: tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>,
-    ) {
-    }
-    fn shell_argv(&self, _: &Option<String>) -> Vec<String> {
-        Vec::new()
-    }
-    fn user_drop_available(&self, _: &Option<String>) -> bool {
-        false
     }
 }
 
@@ -518,10 +480,6 @@ impl RecvStore for CliRecv {
 
 #[async_trait::async_trait]
 impl RecvServers for CliRecv {
-    /// Accept one `pty-open` frame: validate, shell-gate, attach or spawn,
-    /// acknowledge. Extracted verbatim from the recv loop arm so unsettled opens
-    /// can be parked and re-driven through this same function.
-
     /// Accept one `l2-open` forward frame by delegating admission to the library.
     ///
     /// The endpoint owns the gate, expose bound, allowlist answer, raw-trusted mux

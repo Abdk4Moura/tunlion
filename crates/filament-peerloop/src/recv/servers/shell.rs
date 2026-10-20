@@ -143,6 +143,43 @@ pub trait PtyBackend: Send + Sync {
 
 pub type PipeItem = l2::PipeItem;
 
+/// A host that compiles no PTY backend (a reduced profile, or a Core host that
+/// does not serve terminals). Every lookup, reservation and spawn answers
+/// "none"; a build with `pty-server` on that installs this value refuses an
+/// open at the reservation instead of pretending it can serve one.
+pub struct UnavailablePty;
+
+#[async_trait]
+impl PtyBackend for UnavailablePty {
+    async fn get_live(&self, _session_id: &str) -> Option<Arc<dyn PtySession>> {
+        None
+    }
+    fn reserve(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
+    async fn spawn(
+        &self,
+        _spec: PtySpawnSpec,
+        _reservation: Box<dyn std::any::Any + Send>,
+    ) -> Option<Arc<dyn PtySession>> {
+        None
+    }
+    async fn forget(&self, _session_id: &str) {}
+    fn start_pumps(
+        &self,
+        _session: Arc<dyn PtySession>,
+        _input: mpsc::Receiver<PipeItem>,
+        _resize: mpsc::UnboundedReceiver<(u16, u16)>,
+    ) {
+    }
+    fn shell_argv(&self, _shell_user: &Option<String>) -> Vec<String> {
+        Vec::new()
+    }
+    fn user_drop_available(&self, _shell_user: &Option<String>) -> bool {
+        false
+    }
+}
+
 #[cfg(feature = "pty-server")]
 #[allow(clippy::too_many_arguments)]
 pub async fn open_pty(
@@ -169,14 +206,22 @@ pub async fn open_pty(
         || backend.user_drop_available(shell_user),
     )
     .await;
-    let (t, sid, dev, device_pub, plan) = match admission {
+    let (t, sid, dev, device_pub, admitted_via_ceiling, plan) = match admission {
         crate::shell::admit::ShellAdmission::Admitted {
             transport,
             sid,
             device,
             device_pub,
+            admitted_via_ceiling,
             plan,
-        } => (transport, sid, device, device_pub, plan),
+        } => (
+            transport,
+            sid,
+            device,
+            device_pub,
+            admitted_via_ceiling,
+            plan,
+        ),
         crate::shell::admit::ShellAdmission::Ignored => return,
         crate::shell::admit::ShellAdmission::Denied(d) => {
             let known = |p: &[u8; 32]| ports.store.devices_find_by_device_pub(p).is_some();
@@ -332,7 +377,7 @@ pub async fn open_pty(
         term,
         argv,
         device_pub,
-        admitted_via_ceiling: plan.admitted_via_ceiling,
+        admitted_via_ceiling,
     };
     match backend.spawn(spec, reservation).await {
         Some(sess) => {
