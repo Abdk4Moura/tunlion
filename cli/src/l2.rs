@@ -51,7 +51,10 @@ pub(crate) use filament_peerloop::l2::MuxMap;
 /// H-1 (DoS): process-wide cap on concurrently live PTYs across ALL links. Each
 /// PTY is a login shell + threads, so this bounds total resource use even if many
 /// links each stay under the per-link cap. Refused opens get an `l2-close`.
-pub const MAX_PTYS_GLOBAL: usize = 32;
+///
+/// Re-exported from the library, which also names the figure in its refusal
+/// log: one definition, so the check and the message cannot drift apart.
+pub use filament_peerloop::l2::MAX_PTYS_GLOBAL;
 
 /// Process-wide live-PTY counter (incremented just before a PTY session task is
 /// spawned, decremented when it ends, see `PtyGuard`). The acceptor checks it
@@ -165,8 +168,7 @@ struct OutBind {
 }
 
 /// Commands to a session's task: (re)bind output to a new link, detach, or end.
-/// `pub(crate)` only so a crate test can observe the explicit-close command.
-pub(crate) enum SessionCmd {
+enum SessionCmd {
     Attach {
         transport: Arc<dyn Transport>,
         sid: u32,
@@ -220,26 +222,6 @@ impl PtySessionHandle {
     /// `pty-close` / user-closed path, NOT a transient channel drop).
     pub fn end(&self) {
         let _ = self.cmd_tx.send(SessionCmd::End);
-    }
-}
-
-#[cfg(test)]
-impl PtySessionHandle {
-    /// A live-looking handle with no task behind it, plus the command receiver,
-    /// so a test can assert which command the close path sent.
-    pub(crate) fn test_probe() -> (Self, mpsc::UnboundedReceiver<SessionCmd>) {
-        let (input_tx, _) = std::sync::mpsc::channel();
-        let (resize_tx, _) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        (
-            Self {
-                input_tx,
-                resize_tx,
-                cmd_tx,
-                dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-            cmd_rx,
-        )
     }
 }
 
@@ -2544,7 +2526,10 @@ impl Drop for RawGuard {
 /// shell exited while we were away (or on the warm path, which cannot tell a
 /// clean exit from a drop, see `pty_cmd`). It is the normal end of a session,
 /// never a refusal. The wire string is fixed: older acceptors send exactly it.
-pub(crate) const NO_SUCH_SESSION: &str = "no such session";
+///
+/// Re-exported from the library, which sends it: the string we compare against
+/// is the string this build sends, not a second copy of it.
+pub(crate) use filament_peerloop::l2::NO_SUCH_SESSION;
 
 /// Why a single PTY attach ended.
 enum PtyOutcome {

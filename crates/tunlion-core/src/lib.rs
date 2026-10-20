@@ -507,6 +507,9 @@ impl Core {
             Box::new(CoreServers),
             Box::new(CoreDaemon::new(self.dir.clone(), store.clone(), overlay)),
             Arc::new(CorePrompt),
+            // The reduced Core profile serves receive/transfer only; a PTY open
+            // is refused by name by the library before this value is consulted.
+            Box::new(filament_peerloop::recv::servers::shell::UnavailablePty),
             Arc::new(NoScreen),
             env,
         );

@@ -28,3 +28,8 @@ pub use mux::{
     ExecCtl, L2_SID_BASE, MAX_STREAMS_PER_LINK, Mux, OpenOutcome, OpenVerdict, PipeItem,
     TreeSignal, is_l2_sid, serve_stream, wire_sid,
 };
+
+/// Process-wide live-PTY cap shared by acceptors and hosts.
+pub const MAX_PTYS_GLOBAL: usize = 32;
+/// Close reason for a resume with no live session.
+pub const NO_SUCH_SESSION: &str = "no such session";

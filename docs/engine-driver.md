@@ -178,4 +178,8 @@ root refused by the `up.lock` lease and released after a joined stop; and a real
 `Core::start` -> dispatch -> `stop_blocking` integration over a local signaling
 stub. Android keeps the reduced `filament-peerloop` profile: no
 `mount-server`, `forward-server`, `mesh` or `fleet` sectors compile into the
-core library, and the graph gate fails if they do.
+core library, and the graph gate fails if they do. The shipped Android CLI is
+built with the explicit reduced profile (`--no-default-features --features
+mesh,mount-server`); its job asserts the resolved feature graph excludes the
+opt-in server backends (`forward-server`, `pty-server`, `exec-server`), so a
+`pty-open` there is answered with a named "not available in this build" close.

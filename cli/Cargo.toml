@@ -16,7 +16,7 @@ name = "tunlion"
 path = "src/main.rs"
 
 [features]
-default = ["mesh", "mount-server", "forward-server", "exec-server", "dispatch", "fleet"]
+default = ["mesh", "mount-server", "forward-server", "exec-server", "pty-server", "dispatch", "fleet"]
 mesh = ["filament-peerloop/mesh", "filament-peerloop/fleet", "dispatch"]
 mount-server = ["filament-peerloop/mount-server", "dispatch"]
 # Inbound local forward serving: dial a peer-requested local socket. Default-on
@@ -26,6 +26,11 @@ forward-server = ["filament-peerloop/forward-server", "dispatch"]
 # compiles the CLI's process adapter. Reduced profiles leave both out and the
 # library answers a well-formed open with a named refusal.
 exec-server = ["filament-peerloop/exec-server", "dispatch"]
+# Inbound `pty-open` serving. The protocol is library code; this feature also
+# compiles the CLI's PTY backend (persistent session map + pumps). Reduced
+# profiles leave both out and the library answers a well-formed open with a
+# named refusal.
+pty-server = ["filament-peerloop/pty-server", "dispatch"]
 # The receive dispatch loop and its host capability traits.
 dispatch = ["filament-peerloop/dispatch"]
 fleet = ["filament-peerloop/fleet"]

@@ -630,6 +630,19 @@ impl RecvIdentity for CoreIdentity {
     fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<filament_peerloop::refusal::Reinvite> {
         self.identity.reinvite_for(device_pub)
     }
+    fn reinvite_refusal(
+        &self,
+        mut refusal: filament_peerloop::refusal::Refusal,
+        device_pub: Option<&[u8; 32]>,
+    ) -> filament_peerloop::refusal::Refusal {
+        // Same rule as the CLI adapter: only an expiry carries a re-invite, and
+        // only when the decision did not already name one.
+        if refusal.code == filament_peerloop::refusal::Code::Expired && refusal.reinvite.is_none()
+        {
+            refusal.reinvite = device_pub.and_then(|d| self.identity.reinvite_for(d));
+        }
+        refusal
+    }
     fn enroll_channel(&self, public_key: &[u8; 32]) -> String {
         self.identity.enroll_channel(public_key)
     }
@@ -742,27 +755,6 @@ pub struct CoreServers;
 
 #[async_trait]
 impl RecvServers for CoreServers {
-    async fn retire_link(
-        &mut self,
-        _pid: &str,
-        _muxes: &mut HashMap<String, Arc<Mux>>,
-        _bindings: &mut HashMap<String, HashMap<u32, String>>,
-    ) {
-    }
-    async fn open_pty(
-        &mut self,
-        conn: &mut Conn,
-        pid: String,
-        v: &Value,
-        _policy: &ShellPolicy,
-        _shell_user: &Option<String>,
-        _muxes: &mut HashMap<String, Arc<Mux>>,
-        _bindings: &mut HashMap<String, HashMap<u32, String>>,
-        _l2_enabled: bool,
-        _parked: &mut Vec<filament_peerloop::recv::dispatch::ParkedOpen>,
-    ) {
-        refuse_control(conn, &pid, v, "pty-open").await;
-    }
     async fn open_exec(
         &mut self,
         conn: &mut Conn,
@@ -792,27 +784,6 @@ impl RecvServers for CoreServers {
     }
     fn forward_target_allowed(&self, _name: &str, _host: &str, _port: u16) -> bool {
         false
-    }
-    async fn pty_resize(
-        &mut self,
-        _pid: &str,
-        _v: &Value,
-        _muxes: &mut HashMap<String, Arc<Mux>>,
-        _bindings: &mut HashMap<String, HashMap<u32, String>>,
-    ) {
-    }
-    async fn pty_close(
-        &mut self,
-        _pid: &str,
-        _v: &Value,
-        _bindings: &mut HashMap<String, HashMap<u32, String>>,
-    ) {
-    }
-    async fn detach_link_ptys(
-        &mut self,
-        _pid: &str,
-        _bindings: &mut HashMap<String, HashMap<u32, String>>,
-    ) {
     }
     async fn exec_control(
         &mut self,
