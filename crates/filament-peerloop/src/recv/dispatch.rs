@@ -214,30 +214,6 @@ pub fn fleet_presence_allowed(is_fleet_channel: bool) -> bool {
     cfg!(feature = "fleet") && is_fleet_channel
 }
 
-/// What an unsolicited fleet-channel presence may do. Without the verifier it
-/// is `None`: no dial, no adopt, no pending entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FleetPresenceEffect {
-    AdoptOnly,
-    DialAndAdopt,
-}
-
-pub fn fleet_presence_effect(
-    is_fleet_channel: bool,
-    my_id: &str,
-    peer_id: &str,
-    has_rendezvous: bool,
-) -> Option<FleetPresenceEffect> {
-    if !fleet_presence_allowed(is_fleet_channel) || peer_id.is_empty() {
-        return None;
-    }
-    if my_id < peer_id && has_rendezvous {
-        Some(FleetPresenceEffect::DialAndAdopt)
-    } else {
-        Some(FleetPresenceEffect::AdoptOnly)
-    }
-}
-
 /// The settle timeout reason, shared by the expiry deny and the client.
 pub fn settle_timeout_reason(ms: u64) -> String {
     format!("identity not proven within {ms} ms; retry")
@@ -4288,13 +4264,10 @@ async fn recv_run(
                             crate::recv::revocation::bind_brokered_link(l, &broker);
                         }
                     }
-                } else if let Some(effect) = fleet_presence_effect(
+                } else if fleet_presence_allowed(
                     ports
                         .identity
                         .is_fleet_channel(v["channel"].as_str().unwrap_or("")),
-                    &conn.my_id,
-                    v["id"].as_str().unwrap_or(""),
-                    ports.identity.fleet_rv().is_some(),
                 ) {
                     // Fleet auto-mesh: a device is present on our fleet meeting
                     // point. We hold NO pair secret for it, so this is the
@@ -4320,7 +4293,7 @@ async fn recv_run(
                     // a link is visibly present. Pick ONE dialer deterministically;
                     // both sides run the same comparison and get opposite answers,
                     // so exactly one dials and the other accepts.
-                    if effect == FleetPresenceEffect::DialAndAdopt {
+                    if conn.my_id < pid {
                         if let Some(rv) = ports.identity.fleet_rv() {
                             conn.start_direct_fleet(&pid, &rv).await;
                         }
@@ -10302,32 +10275,12 @@ mod inventory {
     ];
 
     #[test]
-    // Covers the production selector used by the fleet-channel presence branch
-    // plus that branch's `effect` value; it does not drive a full Conn event.
     fn fleet_presence_is_disabled_without_a_verifier() {
         #[cfg(not(feature = "fleet"))]
-        {
-            assert!(!super::fleet_presence_allowed(true));
-            assert_eq!(
-                super::fleet_presence_effect(true, "a", "b", true),
-                None,
-                "no dial/adopt path may be selected without the verifier"
-            );
-        }
+        assert!(!super::fleet_presence_allowed(true));
         #[cfg(feature = "fleet")]
-        {
-            assert!(super::fleet_presence_allowed(true));
-            assert_eq!(
-                super::fleet_presence_effect(true, "a", "b", true),
-                Some(super::FleetPresenceEffect::DialAndAdopt)
-            );
-            assert_eq!(
-                super::fleet_presence_effect(true, "b", "a", true),
-                Some(super::FleetPresenceEffect::AdoptOnly)
-            );
-        }
+        assert!(super::fleet_presence_allowed(true));
         assert!(!super::fleet_presence_allowed(false));
-        assert_eq!(super::fleet_presence_effect(false, "a", "b", true), None);
     }
 
     #[test]
