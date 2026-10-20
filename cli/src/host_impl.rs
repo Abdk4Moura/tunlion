@@ -274,9 +274,6 @@ impl HostServices for CliHost {
     fn device_known(&self, device_pub: &[u8; 32]) -> bool {
         crate::device_view::devices_find_by_device_pub(device_pub).is_some()
     }
-    fn gate_settle_ms(&self) -> u64 {
-        crate::identity_state::gate_settle_ms()
-    }
     fn ensure_self_genesis_header(&self, user_key: &crate::identity::UserKey) -> bool {
         crate::ensure_self_genesis_header(&self.config_dir(), user_key)
     }

@@ -511,10 +511,6 @@ pub trait HostServices: Send + Sync + 'static {
     fn device_known(&self, _device_pub: &[u8; 32]) -> bool {
         false
     }
-    /// How long an identity proof may take before a parked open is re-driven.
-    fn gate_settle_ms(&self) -> u64 {
-        1500
-    }
     /// Seed the owner's self genesis capability header and its ratchet when
     /// this machine has an owner key and the store lacks them. A store WRITE,
     /// so it belongs here; returns whether anything was written.
