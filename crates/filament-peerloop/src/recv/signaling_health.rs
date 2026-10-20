@@ -100,7 +100,7 @@ pub fn close_is_current(closed: u64, current: u64) -> bool {
 
 /// Collapses repeats of the same log line. See the module docs, defect 3.
 #[derive(Default)]
-pub(crate) struct LogCollapse {
+pub struct LogCollapse {
     runs: HashMap<&'static str, (Instant, u32)>,
 }
 
