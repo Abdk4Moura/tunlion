@@ -152,6 +152,7 @@ mod tests {
         let host = CutHost {
             cut: Some(LiveCut {
                 cause: LiveCutCause::Expired,
+                expires_at: Some(1_760_384_363),
                 reason: "access expired at 2025-10-13 19:39:23 UTC".into(),
             }),
             calls: Default::default(),
@@ -159,6 +160,7 @@ mod tests {
         let mut recheck = RevokeRecheck::new(Duration::ZERO);
         let cut = recheck.cut(&host, None).expect("an elapsed interval asks the host");
         assert_eq!(cut.cause, LiveCutCause::Expired);
+        assert_eq!(cut.expires_at, Some(1_760_384_363));
         assert_eq!(cut.reason, "access expired at 2025-10-13 19:39:23 UTC");
         assert_eq!(recheck.interval(), Duration::ZERO);
         assert_eq!(host.calls.load(std::sync::atomic::Ordering::Relaxed), 1);

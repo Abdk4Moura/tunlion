@@ -63,6 +63,8 @@ pub struct CliRecv {
     pub pending_bootstrap: crate::platform::PendingBootstraps,
     pub daemon_mounts: crate::DaemonMounts,
     pub last_mount_check: Instant,
+    #[cfg(feature = "exec-server")]
+    pub exec_process: Arc<dyn filament_peerloop::shell::exec::ExecProcess>,
     #[cfg(feature = "mesh")]
     pub exposer: Option<Arc<crate::expose::Exposer>>,
 }
@@ -107,6 +109,8 @@ impl Default for CliRecv {
                 children: HashMap::new(),
             },
             last_mount_check: Instant::now(),
+            #[cfg(feature = "exec-server")]
+            exec_process: Arc::new(crate::exec_recv::CliExecProcess),
             #[cfg(feature = "mesh")]
             exposer: None,
         }
@@ -411,6 +415,7 @@ impl RecvServers for CliRecv {
                 device,
                 device_pub,
                 plan,
+                ..
             } => (transport, sid, device, device_pub, plan),
             filament_peerloop::shell::admit::ShellAdmission::Ignored => return,
             filament_peerloop::shell::admit::ShellAdmission::Denied(d) => {
@@ -617,10 +622,26 @@ impl RecvServers for CliRecv {
         l2_enabled: bool,
         parked: &mut Vec<ParkedOpen>,
     ) {
-        crate::exec_recv::handle_exec_open(
-            conn, &pid, v, policy, shell_user, muxes, l2_enabled, parked,
-        )
-        .await
+        #[cfg(feature = "exec-server")]
+        {
+            filament_peerloop::recv::servers::exec::open_exec(
+                conn,
+                &pid,
+                v,
+                policy,
+                shell_user,
+                muxes,
+                l2_enabled,
+                parked,
+                self.exec_process.clone(),
+            )
+            .await
+        }
+        #[cfg(not(feature = "exec-server"))]
+        {
+            let _ = (policy, shell_user, muxes, l2_enabled, parked);
+            filament_peerloop::recv::servers::exec::open_exec_unavailable(conn, &pid, v).await
+        }
     }
 
     async fn ssh_sign(

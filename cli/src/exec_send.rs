@@ -209,7 +209,7 @@ pub(crate) fn revoked_mid_session(peer: &str, v: &Value) -> String {
 
 /// The shell exit code for a remote refusal that means "could not start the
 /// command", or None for any other refusal. Matched on the remote daemon's
-/// own reason text (exec_recv.rs). Pure.
+/// own reason text (filament_peerloop::shell::exec_server). Pure.
 pub(crate) fn spawn_refusal_code(reason: &str) -> Option<i32> {
     let r = reason.to_lowercase();
     if r.contains("not found on daemon path") {
@@ -347,7 +347,7 @@ async fn exec_once(
             "err_sid": err_sid,
             "argv": opts.argv.clone(),
             // Heartbeat promise: the acceptor ends the command if these stop.
-            "alive_ms": crate::exec_recv::EXEC_ALIVE_INTERVAL.as_millis() as u64,
+            "alive_ms": filament_peerloop::shell::exec::EXEC_ALIVE_INTERVAL.as_millis() as u64,
         });
         if let Some(cwd) = &opts.cwd {
             f["cwd"] = json!(cwd.to_string_lossy());
@@ -439,7 +439,7 @@ async fn exec_once(
     let beats = {
         let t = t.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(crate::exec_recv::EXEC_ALIVE_INTERVAL);
+            let mut tick = tokio::time::interval(filament_peerloop::shell::exec::EXEC_ALIVE_INTERVAL);
             tick.tick().await;
             loop {
                 tick.tick().await;

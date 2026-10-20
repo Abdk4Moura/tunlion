@@ -10,11 +10,15 @@
 //! The sibling modules own the other host-free half of a shell-class open:
 //! [`admit`] decides whether a `pty-open`/`exec-open` may exist and returns a
 //! sanitized plan or a typed denial; [`exec`] is the pure `exec-open` frame
-//! parser; [`off`] is the serving-off refusal (ceiling-aware, asks once).
-//! Spawning a PTY or a child, and every process effect, stays in the CLI.
+//! parser and process seam; [`off`] is the serving-off refusal (ceiling-aware,
+//! asks once); `exec_server` is the feature-gated `exec-open` protocol state
+//! machine. The host supplies only the process primitive; spawning a PTY and
+//! all machine-bound process effects stay in the CLI adapter.
 
 pub mod admit;
 pub mod exec;
+#[cfg(feature = "exec-server")]
+pub mod exec_server;
 pub mod off;
 
 use std::path::Path;

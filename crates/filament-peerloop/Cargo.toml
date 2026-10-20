@@ -23,7 +23,7 @@ categories = ["network-programming"]
 
 [features]
 # Compatibility: existing consumers, including the CLI, keep the mesh API.
-default = ["mesh", "mount-server", "forward-server", "dispatch", "fleet"]
+default = ["mesh", "mount-server", "forward-server", "dispatch", "fleet", "exec-server"]
 mesh = ["dep:filament-overlay"]
 # The receive dispatch loop and its host capability traits. Default-on for the
 # CLI; a reduced consumer that only wants the mechanics can omit it.
@@ -39,6 +39,14 @@ mount-server = []
 # implementation compiles; the wire vocabulary and the admission policy stay
 # common, and a forward open is refused honestly.
 forward-server = []
+# Inbound `exec-open` serving: argv-exact direct spawn, separate stdout/stderr
+# stream pumps, heartbeat/revocation cancellation. The protocol lives in the
+# library behind this feature; the host supplies a process primitive only.
+# It implies `dispatch` because the module imports `recv::dispatch`. A profile
+# that explicitly omits defaults compiles no process backend, and a well-formed
+# L2-half open gets a named refusal. Default builds (including the Android CLI
+# release unless it opts out of defaults) do compile the exec backend.
+exec-server = ["dispatch"]
 # Fault-injection hooks the peer-loop paths read. The CLI forwards its own
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []

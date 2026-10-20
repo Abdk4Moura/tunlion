@@ -453,6 +453,7 @@ impl HostServices for CoreHost {
         if self.store.device_cert_revoked(idev) {
             return Some(LiveCut {
                 cause: LiveCutCause::Revoked,
+                expires_at: None,
                 reason: "device revoked".to_string(),
             });
         }
@@ -460,6 +461,7 @@ impl HostServices for CoreHost {
             .filter(|access| access.expired(now_secs()))
             .map(|access| LiveCut {
                 cause: LiveCutCause::Expired,
+                expires_at: Some(access.deadline),
                 reason: filament_peerloop::refusal::expired_reason(access.deadline),
             })
     }

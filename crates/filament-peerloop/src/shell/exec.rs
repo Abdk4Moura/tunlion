@@ -1,13 +1,164 @@
-//! The pure `exec-open` frame parser.
+//! The pure `exec-open` frame parser and the process-effect seam.
 //!
-//! Moved verbatim out of `cli::exec_recv` so exec admission can validate the
-//! frame before the sid and the shell gate without the CLI. There is no
-//! process fact here: `argv` is kept exactly as the initiator sent it, and the
-//! caller resolves PATH, cwd, the environment and the spawn plan later.
+//! The parser moved verbatim out of `cli::exec_recv` so exec admission can
+//! validate the frame before the sid and the shell gate without the CLI. There
+//! is no process fact in [`parse_exec_open`]: `argv` is kept exactly as the
+//! initiator sent it, and the serve loop resolves PATH, cwd, the environment
+//! and the spawn plan later.
+//!
+//! [`ExecProcess`] is that later seam. It is deliberately a process primitive,
+//! not a handler callback: the CLI supplies how to resolve a program on the
+//! daemon's PATH, the daemon's environment facts, the account-drop argv, and
+//! how to spawn and then observe/kill an owned child. The protocol state
+//! machine in `super::exec_server` owns every frame, stream and cancellation
+//! decision around it.
 
 use crate::l2::is_l2_sid;
+use crate::l2::mux::TreeSignal;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// How often an initiator says it is still there (`exec-alive`), announced in
+/// its open as `alive_ms`.
+pub const EXEC_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a served exec waits without a heartbeat before it decides the
+/// initiator is gone: six missed beats, never under 10 s (a busy relay can
+/// delay a few), never over a minute (a hostile `alive_ms` cannot buy an
+/// orphan a long life).
+pub fn alive_deadline(alive_ms: u64) -> std::time::Duration {
+    let beat = std::time::Duration::from_millis(alive_ms.clamp(250, 10_000));
+    (beat * 6).clamp(
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(60),
+    )
+}
+
+/// A child's terminal state, carried without `std::process::ExitStatus` so a
+/// deterministic test child and the real adapter speak the same vocabulary.
+/// A clean exit keeps its raw code; signal death becomes 128+signal (the shell
+/// convention: 137 SIGKILL, 143 SIGTERM); no information is `None`, and the
+/// close then OMITS status rather than inventing success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+impl ExecExit {
+    /// Map a real waited child, keeping the host's signal fact on unix.
+    pub fn from_std(status: std::process::ExitStatus) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            Self {
+                code: status.code(),
+                signal: status.signal(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                code: status.code(),
+                signal: None,
+            }
+        }
+    }
+
+    /// The reportable status, exactly [`status_code`].
+    pub fn wire_code(self) -> Option<i32> {
+        status_code(self.code, self.signal)
+    }
+}
+
+/// Pure exit-status mapping, split out so it is unit-testable without spawning.
+pub fn status_code(code: Option<i32>, signal: Option<i32>) -> Option<i32> {
+    match (code, signal) {
+        (Some(c), _) => Some(c),
+        (None, Some(s)) => Some(128 + s),
+        (None, None) => None,
+    }
+}
+
+/// One fully-resolved spawn request. The library decided argv exactness, the
+/// working directory and the child environment; the host applies the platform
+/// effects (process group, parent-death containment, bookkeeping).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecSpawnSpec {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    /// Already filtered: `env_clear` plus the TERM/LANG/LC_* allowlist and
+    /// explicit `--env` pairs. The host must not add the daemon environment.
+    pub env: Vec<(String, String)>,
+}
+
+/// The host's process effects for served exec.
+///
+/// A host answers only machine facts and applies only process effects. Every
+/// protocol decision (ack/close ordering, stdout/stderr sids, collision and
+/// capacity rules, heartbeat and revocation cancellation) stays in
+/// `super::exec_server`. Implementations must not run a second serve loop.
+pub trait ExecProcess: Send + Sync {
+    /// Resolve `argv[0]` the way the daemon's own PATH would. Absolute or
+    /// relative paths containing a separator are returned as-is; a bare name
+    /// is looked up. `None` refuses before any fork.
+    fn resolve_program(&self, program: &str) -> Option<PathBuf>;
+
+    /// The daemon's own environment as string pairs. The library applies the
+    /// allowlist; this method supplies the ambient fact.
+    fn daemon_environment(&self) -> Vec<(String, String)>;
+
+    /// The daemon user's home, or the platform default.
+    fn home_dir(&self) -> PathBuf;
+
+    /// The named account's home, when it has a usable one.
+    fn home_of_user(&self, user: &str) -> Option<PathBuf>;
+
+    /// The platform's account-drop argv (`runuser -l <user> -- ...` on unix),
+    /// or a reason that names the missing capability. The library checks that
+    /// the wrapper resolves on the daemon PATH and refuses rather than running
+    /// as the daemon user.
+    fn user_drop_argv(
+        &self,
+        program: &Path,
+        args: &[String],
+        user: &str,
+    ) -> Result<Vec<String>, String>;
+
+    /// Spawn exactly this command with piped stdio, in its own process group,
+    /// contained/best-effort tied to the daemon, with the host's own leftover
+    /// bookkeeping attached to the returned child's lifetime.
+    fn spawn(&self, spec: ExecSpawnSpec) -> Result<Box<dyn ExecChild>, String>;
+
+    /// Test-hook seam for the expiry close-order gate. Production hosts return
+    /// false; the CLI reads its compiled-in `test-hooks` environment here so no
+    /// ambient variable enters this crate.
+    fn test_expiry_close_first(&self) -> bool {
+        false
+    }
+}
+
+/// An owned child plus the host's cleanup bookkeeping.
+///
+/// `wait` must be cancel-safe (it is polled inside `tokio::select!`); dropping
+/// the child must end it or leave it to the host's recorded sweep, exactly as
+/// the CLI adapter promises. `signal_group`/`group_alive` name the process-tree
+/// effects the ladder uses; `start_kill` is the leader-only fallback.
+#[async_trait::async_trait]
+pub trait ExecChild: Send {
+    fn take_stdin(&mut self) -> Option<Box<dyn AsyncWrite + Unpin + Send>>;
+    fn take_stdout(&mut self) -> Option<Box<dyn AsyncRead + Unpin + Send>>;
+    fn take_stderr(&mut self) -> Option<Box<dyn AsyncRead + Unpin + Send>>;
+    async fn wait(&mut self) -> std::io::Result<ExecExit>;
+    fn try_wait(&mut self) -> std::io::Result<Option<ExecExit>>;
+    fn start_kill(&mut self);
+    /// Signal the whole process tree; true when the host delivered it.
+    fn signal_group(&self, sig: TreeSignal) -> bool;
+    /// Is any member of the child's process group still alive?
+    fn group_alive(&self) -> bool;
+}
 
 /// Bounds that keep a hostile or buggy initiator from turning an open frame
 /// into unbounded allocation. Generous on purpose: real commands (long rsync
@@ -183,13 +334,19 @@ mod tests {
         let req = parse_exec_open(&frame).expect("MAX_ARGV arguments are accepted");
         assert_eq!(req.argv.len(), MAX_ARGV);
         frame["argv"] = json!(vec!["arg"; MAX_ARGV + 1]);
-        assert!(parse_exec_open(&frame).is_none(), "MAX_ARGV + 1 must refuse");
+        assert!(
+            parse_exec_open(&frame).is_none(),
+            "MAX_ARGV + 1 must refuse"
+        );
 
         frame["argv"] = json!(["ok", "x".repeat(MAX_ARG_LEN)]);
         let req = parse_exec_open(&frame).expect("MAX_ARG_LEN bytes are accepted");
         assert_eq!(req.argv[1].len(), MAX_ARG_LEN);
         frame["argv"] = json!(["ok", "x".repeat(MAX_ARG_LEN + 1)]);
-        assert!(parse_exec_open(&frame).is_none(), "MAX_ARG_LEN + 1 must refuse");
+        assert!(
+            parse_exec_open(&frame).is_none(),
+            "MAX_ARG_LEN + 1 must refuse"
+        );
     }
 
     /// An open that promises heartbeats carries `alive_ms`; one that does not
@@ -205,5 +362,64 @@ mod tests {
         let mut zero = base.clone();
         zero["alive_ms"] = json!(0u64);
         assert_eq!(parse_exec_open(&zero).unwrap().alive_ms, None);
+    }
+
+    /// The silence an acceptor tolerates is bounded on both sides: a beat it
+    /// can miss a few of, and never long enough for a hostile `alive_ms` to
+    /// buy an orphan a long life.
+    #[test]
+    fn heartbeat_deadline_is_bounded() {
+        use std::time::Duration;
+        let ours = EXEC_ALIVE_INTERVAL.as_millis() as u64;
+        let d = alive_deadline(ours);
+        assert!(
+            d >= Duration::from_secs(10) && d <= Duration::from_secs(15),
+            "{d:?}"
+        );
+        assert_eq!(alive_deadline(1), Duration::from_secs(10));
+        assert_eq!(alive_deadline(u64::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn status_mapping_is_shell_convention() {
+        assert_eq!(status_code(Some(0), None), Some(0));
+        assert_eq!(status_code(Some(1), None), Some(1));
+        assert_eq!(status_code(None, Some(9)), Some(137));
+        assert_eq!(status_code(None, Some(15)), Some(143));
+        assert_eq!(status_code(None, None), None);
+        assert_eq!(
+            ExecExit {
+                code: None,
+                signal: Some(6)
+            }
+            .wire_code(),
+            Some(134)
+        );
+    }
+
+    #[test]
+    fn exec_control_frames_parse_and_unknowns_are_ignored() {
+        use crate::l2::mux::ExecCtl;
+        use crate::l2::mux::TreeSignal;
+        assert_eq!(
+            ExecCtl::from_frame(&json!({"type": "exec-alive", "sid": 1})),
+            Some(ExecCtl::Alive)
+        );
+        assert_eq!(
+            ExecCtl::from_frame(&json!({"type": "exec-signal", "sid": 1, "signal": "INT"})),
+            Some(ExecCtl::Signal(TreeSignal::Interrupt))
+        );
+        assert_eq!(
+            ExecCtl::from_frame(&json!({"type": "exec-signal", "sid": 1, "signal": "STOP"})),
+            None
+        );
+        assert_eq!(
+            ExecCtl::from_frame(&json!({"type": "exec-signal", "sid": 1})),
+            None
+        );
+        assert_eq!(
+            ExecCtl::from_frame(&json!({"type": "exec-open", "sid": 1})),
+            None
+        );
     }
 }

@@ -65,6 +65,10 @@ pub enum ShellAdmission<A> {
         /// rather than in the verb plan.
         device: Option<String>,
         device_pub: Option<[u8; 32]>,
+        /// True when the gate admitted this open through the enrolment ceiling
+        /// with no explicit grant. A live session re-checks a narrowed ceiling
+        /// only for this population; a grant-admitted one ignores it.
+        admitted_via_ceiling: bool,
         plan: A,
     },
     /// Refused by the shared shell gate. The caller's existing
@@ -225,6 +229,7 @@ pub async fn admit_pty_open(
         sid,
         device,
         device_pub: gate_inputs.idev,
+        admitted_via_ceiling: gate_inputs.ceiling_covers && !gate_inputs.has_grant,
         plan,
     }
 }
@@ -288,6 +293,7 @@ pub async fn admit_exec_open(
         sid,
         device,
         device_pub: gate_inputs.idev,
+        admitted_via_ceiling: gate_inputs.ceiling_covers && !gate_inputs.has_grant,
         plan,
     }
 }
@@ -550,6 +556,7 @@ mod tests {
             device,
             device_pub,
             plan,
+            ..
         } = out
         else {
             panic!("a granted device is admitted");
