@@ -1864,7 +1864,7 @@ mod store_guards {
     fn owner_pub_falls_back_to_the_local_certificate_issuer() {
         let root = unique("owner-fallback");
         let store = DeviceStore::open(&root);
-        let user = UserKey::generate().unwrap();
+        let user = UserKey::from_seed(&[7u8; 32]).unwrap();
         let cert = DeviceCert::certify(&user, [7u8; 32], now_secs(), 60).unwrap();
         store
             .write_local_device_cert_record(&json!({"name": "joined", "cert": cert.to_json()}))
