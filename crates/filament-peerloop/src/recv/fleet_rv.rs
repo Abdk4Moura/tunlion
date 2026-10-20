@@ -192,7 +192,8 @@ mod tests {
         let overlay = OverlayKey::new(root.join("overlay.ed25519"));
         let overlay_pub = overlay.public_key_bytes().unwrap();
         let user = UserKey::from_seed(&[11u8; 32]).unwrap();
-        let cert = filament_id::DeviceCert::certify(&user, overlay_pub, 100, 900).unwrap();
+        let now = filament_id::now_secs();
+        let cert = filament_id::DeviceCert::certify(&user, overlay_pub, now, 900).unwrap();
         let store = DeviceStore::open(&root);
         store
             .write_local_device_cert_record(&serde_json::json!({
@@ -217,7 +218,8 @@ mod tests {
         let overlay = OverlayKey::new(root.join("overlay.ed25519"));
         let overlay_pub = overlay.public_key_bytes().unwrap();
         let user = UserKey::from_seed(&[12u8; 32]).unwrap();
-        let cert = filament_id::DeviceCert::certify(&user, overlay_pub, 100, 900).unwrap();
+        let now = filament_id::now_secs();
+        let cert = filament_id::DeviceCert::certify(&user, overlay_pub, now, 900).unwrap();
         let store = DeviceStore::open(&root);
         store
             .write_local_device_cert_record(&serde_json::json!({
