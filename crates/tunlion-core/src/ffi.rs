@@ -153,13 +153,13 @@ mod tests {
         assert_eq!(status.engine, crate::EngineState::NotLinked);
         assert!(matches!(core.start(), Err(CoreError::Identity(_))));
     }
-}
 
-#[test]
-fn stop_without_a_started_engine_is_a_synchronous_no_op() {
-    let core = session();
-    core.stop().unwrap();
-    assert_eq!(core.status().unwrap().engine, crate::EngineState::NotLinked);
+    #[test]
+    fn stop_without_a_started_engine_is_a_synchronous_no_op() {
+        let core = session();
+        core.stop().unwrap();
+        assert_eq!(core.status().unwrap().engine, crate::EngineState::NotLinked);
+    }
 }
 
 fn already_taken() -> CoreError {

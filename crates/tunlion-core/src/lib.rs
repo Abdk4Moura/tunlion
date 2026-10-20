@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use filament_id::{now_secs, user_key_path, KeyStore, PendingIdentity, UserKey};
+use filament_id::{user_key_path, KeyStore, PendingIdentity, UserKey};
 use filament_peerloop::driver::{Cancellation, DriverOutcome, Engine, Readiness, StopError};
 use filament_peerloop::host::{LogSink, NoLog};
 use filament_peerloop::present::NoScreen;
