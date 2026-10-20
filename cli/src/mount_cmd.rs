@@ -199,6 +199,7 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ("permissions-migration", "permissions migration stamp"),
     ("identity.lock", "identity lock file"),
     ("devices.json.lock", "device store lock file"),
+    ("used-invitations.json.lock", "invitation use lock file"),
 ];
 
 /// What a reset removed, and what it could not.
@@ -560,6 +561,7 @@ mod reset_tests {
             "ssh",
             "revoked-keys.json",
             "used-invitations.json",
+            "used-invitations.json.lock",
         ] {
             assert!(names.contains(&must), "reset does not remove {must}");
         }

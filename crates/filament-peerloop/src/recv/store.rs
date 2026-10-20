@@ -48,6 +48,7 @@ use filament_cap::capability::{
 use filament_cap::ephemeral::Reuse;
 use filament_id::{now_secs, DeviceCert, KeyStore, UserKey};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,6 +65,10 @@ pub const LOCAL_DEVICE_CERT_FILE: &str = "identity/device-cert.json";
 pub const PROVISIONAL_TTL_SECS: u64 = 3600;
 /// Durable invitation-use file, kept apart from device records.
 pub const USED_INVITATIONS_FILE: &str = "used-invitations.json";
+/// The cross-process lock sidecar used for the invitation-use read/modify/write.
+/// It is derived from the data file's own path (append `.lock`), so every
+/// caller of [`record_invitation_use_at`] for one file locks the same sidecar.
+pub const USED_INVITATIONS_LOCK_FILE: &str = "used-invitations.json.lock";
 
 /// Why an invitation use was refused. The wire reason is what the joiner sees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1036,7 +1041,9 @@ impl DeviceStore {
 
     /// Durable invitation-use count, keyed by the enrolment public key. This is
     /// the cross-restart replay guard; the in-memory burn is only the live
-    /// engine's fast path.
+    /// engine's fast path. The whole read/modify/write is serialized across
+    /// processes by the per-root sidecar lock, so two stores over the same root
+    /// cannot both admit the same one-use invitation.
     pub fn record_invitation_use(
         &self,
         key_id: &str,
@@ -1193,9 +1200,66 @@ pub fn admit_invitation_use(
     }
 }
 
+/// The lock sidecar for a use file: the data file's name with `.lock` appended.
+/// It lives beside the data file, so the lock is per root and every caller that
+/// names the same data file names the same lock.
+fn invitation_use_lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// Parse the durable use list, refusing anything that is not the exact shape
+/// this store writes. A malformed entry must not be read as `uses: 0` (which
+/// would reset a consumed invitation), so the whole file is `Unverifiable`
+/// rather than silently rewritten. Extra fields are kept: the legacy format is
+/// the object keys `keyId`, `uses` and `expires`, and unknown keys do not make
+/// an otherwise valid count ambiguous.
+fn parse_invitation_uses(raw: &str) -> std::result::Result<Vec<Value>, InvitationRefusal> {
+    let entries: Vec<Value> =
+        serde_json::from_str(raw).map_err(|_| InvitationRefusal::Unverifiable)?;
+    {
+        let mut key_ids = HashSet::with_capacity(entries.len());
+        for entry in &entries {
+            let object = entry.as_object().ok_or(InvitationRefusal::Unverifiable)?;
+            let key_id = object
+                .get("keyId")
+                .and_then(Value::as_str)
+                .ok_or(InvitationRefusal::Unverifiable)?;
+            object
+                .get("uses")
+                .and_then(Value::as_u64)
+                .ok_or(InvitationRefusal::Unverifiable)?;
+            object
+                .get("expires")
+                .and_then(Value::as_u64)
+                .ok_or(InvitationRefusal::Unverifiable)?;
+            if !key_ids.insert(key_id) {
+                // Two counts for one invitation are ambiguous. Refusing is safer
+                // than picking one and overwriting the other (which could reset a
+                // consumed count).
+                return Err(InvitationRefusal::Unverifiable);
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// Count one use of `key_id` at an explicit path. The use is written BEFORE the
 /// caller admits anything, so a crash can lose a use but never grant an extra
-/// one. A file that exists but cannot be parsed is `Unverifiable` (fail closed).
+/// one. A file that exists but cannot be parsed (or contains an entry whose
+/// `uses`/`keyId`/`expires` is missing or is the wrong type) is `Unverifiable`
+/// (fail closed), and such a file is never overwritten.
+///
+/// The ENTIRE read/admit/write runs under an exclusive sidecar lock beside
+/// `path`. The in-memory burn is per process, so without this lock two
+/// `DeviceStore` instances over one root could both read `uses: 0` and both
+/// write `uses: 1`, admitting a one-use invitation twice. A lock that cannot be
+/// taken is `Unverifiable`: "I could not check whether this was used" is not
+/// "it was not used".
 pub fn record_invitation_use_at(
     path: &Path,
     key_id: &str,
@@ -1203,10 +1267,15 @@ pub fn record_invitation_use_at(
     expires: u64,
     now: u64,
 ) -> std::result::Result<(), InvitationRefusal> {
+    if let Some(dir) = path.parent() {
+        create_private_dir_all(dir).map_err(|_| InvitationRefusal::Unverifiable)?;
+    }
+    // Bind the guard before the read: it is released only after the atomic
+    // write below, so the whole read-modify-write is one critical section.
+    let _lock = StoreLock::acquire(&invitation_use_lock_path(path))
+        .map_err(|_| InvitationRefusal::Unverifiable)?;
     let mut entries = match std::fs::read_to_string(path) {
-        Ok(raw) => {
-            serde_json::from_str::<Vec<Value>>(&raw).map_err(|_| InvitationRefusal::Unverifiable)?
-        }
+        Ok(raw) => parse_invitation_uses(&raw)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(_) => return Err(InvitationRefusal::Unverifiable),
     };
@@ -1217,10 +1286,11 @@ pub fn record_invitation_use_at(
         .and_then(|e| e["uses"].as_u64())
         .unwrap_or(0);
     admit_invitation_use(uses, reuse)?;
+    let next = uses.checked_add(1).ok_or(InvitationRefusal::Unverifiable)?;
     entries.retain(|e| e["keyId"].as_str() != Some(key_id));
     entries.push(json!({
         "keyId": key_id,
-        "uses": uses + 1,
+        "uses": next,
         "expires": expires,
         "lastUsed": now,
     }));
@@ -1900,7 +1970,7 @@ mod tests {
 #[cfg(test)]
 mod store_guards {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::{Arc, Barrier};
 
     fn unique(name: &str) -> PathBuf {
@@ -2118,6 +2188,440 @@ mod store_guards {
             std::fs::metadata(&child).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const CHILD_ROOT_ENV: &str = "TUNLION_INVITATION_LOCK_CHILD_ROOT";
+    const CHILD_GATE_ENV: &str = "TUNLION_INVITATION_LOCK_CHILD_GATE";
+    const CHILD_READY_ENV: &str = "TUNLION_INVITATION_LOCK_CHILD_READY";
+    const CHILD_RESULT_ENV: &str = "TUNLION_INVITATION_LOCK_CHILD_RESULT";
+    const CHILD_KEY_ENV: &str = "TUNLION_INVITATION_LOCK_CHILD_KEY";
+
+    fn durable_uses(root: &Path, key: &str) -> Option<u64> {
+        let raw = std::fs::read_to_string(root.join(USED_INVITATIONS_FILE)).ok()?;
+        let entries: Vec<Value> = serde_json::from_str(&raw).ok()?;
+        entries
+            .iter()
+            .find(|entry| entry["keyId"].as_str() == Some(key))
+            .and_then(|entry| entry["uses"].as_u64())
+    }
+
+    fn durable_entry_count(root: &Path) -> usize {
+        std::fs::read_to_string(root.join(USED_INVITATIONS_FILE))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+            .map_or(0, |entries| entries.len())
+    }
+
+    #[test]
+    fn concurrent_stores_admit_a_once_invitation_exactly_once() {
+        let root = unique("invitation-once-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let writers = 16;
+        let barrier = Arc::new(Barrier::new(writers));
+        let mut threads = Vec::new();
+        for _ in 0..writers {
+            let store = DeviceStore::open(&root);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.record_invitation_use("shared-key", &Reuse::Once, 10_000, 100)
+            }));
+        }
+        let mut admitted = 0usize;
+        let mut refused = 0usize;
+        for thread in threads {
+            match thread.join().unwrap() {
+                Ok(()) => admitted += 1,
+                Err(InvitationRefusal::AlreadyUsed) => refused += 1,
+                Err(other) => panic!("unexpected refusal: {other:?}"),
+            }
+        }
+        assert_eq!(admitted, 1, "exactly one concurrent writer may admit");
+        assert_eq!(refused, writers - 1);
+        assert_eq!(durable_uses(&root, "shared-key"), Some(1));
+        // A fresh instance proves the refusal is the durable count, not memory.
+        let reopened = DeviceStore::open(&root);
+        assert_eq!(
+            reopened.record_invitation_use("shared-key", &Reuse::Once, 10_000, 101),
+            Err(InvitationRefusal::AlreadyUsed)
+        );
+        assert_eq!(durable_uses(&root, "shared-key"), Some(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_stores_never_exceed_a_bounded_budget() {
+        let root = unique("invitation-bounded-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let writers = 16;
+        let budget = 4;
+        let barrier = Arc::new(Barrier::new(writers));
+        let mut threads = Vec::new();
+        for _ in 0..writers {
+            let store = DeviceStore::open(&root);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.record_invitation_use("bounded-key", &Reuse::N(4), 10_000, 100)
+            }));
+        }
+        let mut admitted = 0usize;
+        let mut refused = 0usize;
+        for thread in threads {
+            match thread.join().unwrap() {
+                Ok(()) => admitted += 1,
+                Err(InvitationRefusal::UseLimitReached) => refused += 1,
+                Err(other) => panic!("unexpected refusal: {other:?}"),
+            }
+        }
+        assert_eq!(admitted, budget, "the durable budget must not be exceeded");
+        assert_eq!(refused, writers - budget);
+        assert_eq!(durable_uses(&root, "bounded-key"), Some(budget as u64));
+        let reopened = DeviceStore::open(&root);
+        assert_eq!(
+            reopened.record_invitation_use("bounded-key", &Reuse::N(4), 10_000, 101),
+            Err(InvitationRefusal::UseLimitReached)
+        );
+        assert_eq!(durable_uses(&root, "bounded-key"), Some(budget as u64));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_distinct_keys_do_not_lose_updates() {
+        let root = unique("invitation-distinct-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let writers = 12;
+        let barrier = Arc::new(Barrier::new(writers));
+        let mut threads = Vec::new();
+        for i in 0..writers {
+            let store = DeviceStore::open(&root);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let key = format!("key-{i}");
+                barrier.wait();
+                let outcome = store.record_invitation_use(&key, &Reuse::Once, 10_000, 100);
+                (key, outcome)
+            }));
+        }
+        let mut keys = Vec::new();
+        for thread in threads {
+            let (key, outcome) = thread.join().unwrap();
+            assert_eq!(outcome, Ok(()), "distinct key {key} must be admitted");
+            keys.push(key);
+        }
+        assert_eq!(
+            durable_entry_count(&root),
+            writers,
+            "no distinct-key update may be lost"
+        );
+        for key in keys {
+            assert_eq!(durable_uses(&root, &key), Some(1));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn independent_roots_do_not_share_the_use_lock() {
+        let first = unique("invitation-root-first");
+        let second = unique("invitation-root-second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let mut threads = Vec::new();
+        for root in [first.clone(), second.clone()] {
+            let store = DeviceStore::open(&root);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.record_invitation_use("same-key", &Reuse::Once, 10_000, 100)
+            }));
+        }
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), Ok(()));
+        }
+        assert_eq!(durable_uses(&first, "same-key"), Some(1));
+        assert_eq!(durable_uses(&second, "same-key"), Some(1));
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    fn wait_for_file(path: &Path, deadline: std::time::Instant) -> bool {
+        while !path.exists() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    fn wait_for_child(
+        child: &mut std::process::Child,
+        deadline: std::time::Instant,
+    ) -> Option<std::process::ExitStatus> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return child.wait().ok();
+                    }
+                    std::thread::yield_now();
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    return child.wait().ok();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn used_invitation_lock_child() {
+        let Some(root) = std::env::var_os(CHILD_ROOT_ENV) else {
+            // Ordinary test runs only collect this helper; the parent test
+            // below spawns this same binary with the environment set.
+            return;
+        };
+        let gate = PathBuf::from(std::env::var_os(CHILD_GATE_ENV).expect("child gate env"));
+        let ready = PathBuf::from(std::env::var_os(CHILD_READY_ENV).expect("child ready env"));
+        let result = PathBuf::from(std::env::var_os(CHILD_RESULT_ENV).expect("child result env"));
+        let key = std::env::var(CHILD_KEY_ENV).expect("child key env");
+        // Announce that this independent process is alive and waiting BEFORE
+        // the parent releases the gate, so the callers race and do not merely
+        // run one after another.
+        std::fs::write(&ready, b"ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !gate.exists() {
+            if std::time::Instant::now() > deadline {
+                panic!("parent did not release the process gate");
+            }
+            std::thread::yield_now();
+        }
+        let outcome = DeviceStore::open(PathBuf::from(root)).record_invitation_use(
+            &key,
+            &Reuse::Once,
+            10_000,
+            100,
+        );
+        let text = match outcome {
+            Ok(()) => "ok".to_string(),
+            Err(InvitationRefusal::AlreadyUsed) => "err:AlreadyUsed".to_string(),
+            Err(other) => format!("err:unexpected:{other:?}"),
+        };
+        std::fs::write(result, text).unwrap();
+    }
+
+    #[test]
+    fn the_use_lock_is_shared_by_independent_processes() {
+        let root = unique("invitation-process-lock");
+        std::fs::create_dir_all(&root).unwrap();
+        let gate = root.join("start.gate");
+        let exe = std::env::current_exe().unwrap();
+        let key = "process-shared-key";
+        let writers = 8usize;
+        let mut children: Vec<(usize, std::process::Child, PathBuf, PathBuf)> = Vec::new();
+        for i in 0..writers {
+            let ready = root.join(format!("child-{i}.ready"));
+            let result = root.join(format!("child-{i}.result"));
+            let mut command = std::process::Command::new(&exe);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            command
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .arg("used_invitation_lock_child")
+                .env(CHILD_ROOT_ENV, &root)
+                .env(CHILD_GATE_ENV, &gate)
+                .env(CHILD_READY_ENV, &ready)
+                .env(CHILD_RESULT_ENV, &result)
+                .env(CHILD_KEY_ENV, key);
+            match command.spawn() {
+                Ok(child) => children.push((i, child, ready, result)),
+                Err(e) => {
+                    // Never leave already-spawned helpers spinning.
+                    let _ = std::fs::write(&gate, b"go");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    for (_, mut child, _, _) in children {
+                        let _ = wait_for_child(&mut child, deadline);
+                    }
+                    panic!("spawn lock helper {i}: {e}");
+                }
+            }
+        }
+        let pids: HashSet<u32> = children.iter().map(|(_, child, _, _)| child.id()).collect();
+        assert_eq!(
+            pids.len(),
+            writers,
+            "the helpers must be independent processes"
+        );
+
+        // Wait until every independent process has announced readiness, then
+        // release them together. The deadline keeps a broken helper from
+        // hanging the suite forever.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut not_ready = Vec::new();
+        for (i, _, ready, _) in &children {
+            if !wait_for_file(ready, ready_deadline) {
+                not_ready.push(*i);
+            }
+        }
+        // Always release the gate: even a child that never announced still
+        // has its own deadline, and the parent must reap every one.
+        let gate_released = std::fs::write(&gate, b"go").is_ok();
+
+        let run_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut admitted = 0usize;
+        let mut already_used = 0usize;
+        let mut failures = Vec::new();
+        if !gate_released {
+            failures.push("could not release the process gate".to_string());
+        }
+        for (i, mut child, _, result_path) in children {
+            let status = wait_for_child(&mut child, run_deadline);
+            let result = std::fs::read_to_string(&result_path).unwrap_or_default();
+            let clean = status.as_ref().is_some_and(|status| status.success());
+            if !clean {
+                failures.push(format!(
+                    "child {i} did not exit cleanly (status {status:?}, result {result:?})"
+                ));
+            }
+            match result.as_str() {
+                "ok" => admitted += 1,
+                "err:AlreadyUsed" => already_used += 1,
+                other => failures.push(format!("child {i} returned {other:?}")),
+            }
+        }
+        if !not_ready.is_empty() || !failures.is_empty() {
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("not ready: {not_ready:?}; failures: {failures:?}");
+        }
+        assert_eq!(
+            admitted, 1,
+            "exactly one process may admit a once-only invitation"
+        );
+        assert_eq!(
+            already_used,
+            writers - 1,
+            "every loser must report the exact AlreadyUsed refusal"
+        );
+        assert_eq!(durable_uses(&root, key), Some(1));
+        let reopened = DeviceStore::open(&root);
+        assert_eq!(
+            reopened.record_invitation_use(key, &Reuse::Once, 10_000, 101),
+            Err(InvitationRefusal::AlreadyUsed)
+        );
+        assert_eq!(durable_uses(&root, key), Some(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_use_lock_that_cannot_be_taken_refuses_and_never_writes() {
+        let root = unique("invitation-lock-fail");
+        std::fs::create_dir_all(&root).unwrap();
+        let data = root.join(USED_INVITATIONS_FILE);
+        assert_eq!(
+            invitation_use_lock_path(&data),
+            root.join(USED_INVITATIONS_LOCK_FILE),
+            "the sidecar name must match the published lock path"
+        );
+        let original = br#"[{"keyId":"key","uses":0,"expires":10000,"lastUsed":1}]"#;
+        std::fs::write(&data, original).unwrap();
+        // A directory at the sidecar path makes the exclusive open fail.
+        std::fs::create_dir(root.join(USED_INVITATIONS_LOCK_FILE)).unwrap();
+        let store = DeviceStore::open(&root);
+        assert_eq!(
+            store.record_invitation_use("key", &Reuse::Once, 10_000, 100),
+            Err(InvitationRefusal::Unverifiable),
+            "a lock that cannot be taken must fail closed"
+        );
+        assert_eq!(std::fs::read(&data).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn semantically_corrupt_use_entries_fail_closed_and_are_not_overwritten() {
+        let root = unique("invitation-semantic-corrupt");
+        std::fs::create_dir_all(&root).unwrap();
+        let data = root.join(USED_INVITATIONS_FILE);
+        let corrupt = [
+            // No key id.
+            r#"[{}]"#,
+            // Missing or wrongly-typed uses (the old code read these as 0).
+            r#"[{"keyId":"k","expires":10000}]"#,
+            r#"[{"keyId":"k","uses":"1","expires":10000}]"#,
+            r#"[{"keyId":"k","uses":-1,"expires":10000}]"#,
+            r#"[{"keyId":"k","uses":1.5,"expires":10000}]"#,
+            // Wrongly-typed key id / expiry.
+            r#"[{"keyId":7,"uses":1,"expires":10000}]"#,
+            r#"[{"keyId":"k","uses":1}]"#,
+            r#"[{"keyId":"k","uses":1,"expires":"later"}]"#,
+            // Not an object.
+            r#"[1]"#,
+            // Two counts for one invitation are ambiguous.
+            r#"[{"keyId":"k","uses":0,"expires":10000},{"keyId":"k","uses":0,"expires":10000}]"#,
+        ];
+        let store = DeviceStore::open(&root);
+        for body in corrupt {
+            std::fs::write(&data, body).unwrap();
+            assert_eq!(
+                store.record_invitation_use("k", &Reuse::Once, 20_000, 100),
+                Err(InvitationRefusal::Unverifiable),
+                "semantically corrupt body {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&data).unwrap(),
+                body,
+                "semantically corrupt body {body} must not be rewritten"
+            );
+        }
+        // A valid u64 that would overflow the increment is also refused.
+        let overflow = r#"[{"keyId":"k","uses":18446744073709551615,"expires":10000}]"#;
+        std::fs::write(&data, overflow).unwrap();
+        assert_eq!(
+            store.record_invitation_use("k", &Reuse::Reusable, 20_000, 100),
+            Err(InvitationRefusal::Unverifiable)
+        );
+        assert_eq!(std::fs::read_to_string(&data).unwrap(), overflow);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_normal_legacy_use_file_is_read_and_kept_in_the_same_format() {
+        let root = unique("invitation-legacy");
+        std::fs::create_dir_all(&root).unwrap();
+        let data = root.join(USED_INVITATIONS_FILE);
+        let legacy = r#"[
+            {"keyId":"old","uses":2,"expires":10000,"lastUsed":5,"extra":"keep"},
+            {"uses":0,"expires":20000,"keyId":"other"}
+        ]"#;
+        std::fs::write(&data, legacy).unwrap();
+        let store = DeviceStore::open(&root);
+        assert_eq!(
+            store.record_invitation_use("other", &Reuse::N(2), 20_000, 100),
+            Ok(())
+        );
+        let raw = std::fs::read_to_string(&data).unwrap();
+        let entries: Vec<Value> = serde_json::from_str(&raw).unwrap();
+        let old = entries
+            .iter()
+            .find(|entry| entry["keyId"].as_str() == Some("old"))
+            .expect("the untouched entry stays");
+        assert_eq!(old["uses"].as_u64(), Some(2));
+        assert_eq!(old["expires"].as_u64(), Some(10_000));
+        assert_eq!(old["extra"].as_str(), Some("keep"));
+        let other = entries
+            .iter()
+            .find(|entry| entry["keyId"].as_str() == Some("other"))
+            .expect("the used entry stays");
+        assert_eq!(other["uses"].as_u64(), Some(1));
+        assert_eq!(other["expires"].as_u64(), Some(20_000));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
