@@ -3081,6 +3081,7 @@ async fn recv_run(
                 // as the command liked (observed: five minutes of `sleep`
                 // after the initiator was gone). End them, and detach the
                 // shells this link carried so their idle reaper runs.
+                #[cfg(feature = "pty-server")]
                 crate::recv::servers::shell::retire_link(
                     &ports,
                     &pid,
@@ -3821,6 +3822,7 @@ async fn recv_run(
                     ));
                     sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                     conn.drop_link(&pid);
+                    #[cfg(feature = "pty-server")]
                     crate::recv::servers::shell::retire_link(
                         &ports,
                         &pid,
@@ -6632,6 +6634,7 @@ async fn recv_run(
                     // #4: resize the persistent session bound to this sid (not a
                     // link-local serve_pty). Falls back to the mux resizer if the
                     // sid isn't a known session binding (defensive).
+                    #[cfg(feature = "pty-server")]
                     crate::recv::servers::shell::pty_resize(
                         &ports,
                         &pid,
@@ -6645,6 +6648,7 @@ async fn recv_run(
                 // Distinct from a bare channel drop, which only DETACHES. Kills the
                 // shell and removes the session so a later open spawns fresh.
                 Some("pty-close") if l2_enabled => {
+                    #[cfg(feature = "pty-server")]
                     crate::recv::servers::shell::pty_close(&ports, &pid, &v, &mut pty_bindings)
                         .await;
                 }
@@ -8890,6 +8894,7 @@ async fn recv_run(
                         && (s == "failed" || s == "closed")
                         && !pty_bindings.is_empty()
                     {
+                        #[cfg(feature = "pty-server")]
                         crate::recv::servers::shell::detach_link_ptys(
                             &ports,
                             &pid,

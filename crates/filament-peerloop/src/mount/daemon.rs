@@ -429,6 +429,7 @@ pub async fn handle_list_mounts(
     req: control::Req,
     daemon_mounts: &DaemonMounts,
     host: &dyn HostServices,
+    _log: &dyn LogSink,
 ) {
     let mounts: Vec<Value> = daemon_mounts
         .entries
@@ -455,6 +456,7 @@ pub async fn handle_mount_health(
     req: control::Req,
     daemon_mounts: &DaemonMounts,
     host: &dyn HostServices,
+    _log: &dyn LogSink,
 ) {
     let control::ReqKind::MountHealth { target } = &req.kind else {
         return;

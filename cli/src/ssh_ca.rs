@@ -344,58 +344,65 @@ pub(crate) fn spawn_cleanup_on_signal(dir: std::path::PathBuf) -> tokio::task::J
     })
 }
 
-/// Sign: write the pubkey to the workdir, run ssh-keygen, read back the
-/// `<pubkey>-cert.pub` it writes. Nonzero exit, missing output, or any IO
-/// failure refuses with a clear error -- never a cert, never a fallback.
-/// `keygen_bin` is injectable so tests pass a stub instead of the real tool.
-pub(crate) async fn sign(
+/// Mint the CA key idempotently (0700 dir, 0600 key, 0644 pub): exists →
+/// return as-is (perm problems fail closed later at sign time); missing →
+/// ssh-keygen, deleting a half-created key on failure. ssh-keygen itself
+/// missing refuses (the caller warns and continues: init must not fail for an
+/// SSH-CA nicety, and signing fails closed with a clear error).
+pub(crate) async fn ensure_ca_key_with(
+    config_dir: &std::path::Path,
     keygen_bin: &std::path::Path,
-    ca_path: &std::path::Path,
-    pubkey_text: &str,
-    key_id: &str,
-    principal: &str,
-    validity: &str,
-    serial: u64,
-    workdir: &std::path::Path,
-) -> Result<String> {
-    check_ephemeral_pubkey(pubkey_text)?;
-    if !is_single_name(principal) {
-        bail!("principal must be a single name");
+) -> Result<std::path::PathBuf> {
+    let key = ca_key_path(config_dir);
+    if key.exists() {
+        return Ok(key);
     }
-    let pub_file = workdir.join("key.pub");
-    std::fs::write(&pub_file, pubkey_text)?;
-    let argv = build_sign_argv(ca_path, &pub_file, key_id, principal, validity, serial);
+    if let Some(dir) = key.parent() {
+        crate::platform::create_private_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let created = !key.exists();
     let status = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         crate::platform::tokio_command(keygen_bin)
             .kill_on_drop(true)
-            .args(&argv)
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "tunlion-ca", "-f"])
+            .arg(&key)
             .stdin(std::process::Stdio::null())
-            .output(),
+            .status(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("ssh-keygen timed out; refusing"))?
-    .map_err(|e| anyhow::anyhow!("ssh-keygen failed to run: {e}"))?;
-    if !status.status.success() {
-        bail!(
-            "ssh-keygen refused to sign (exit {}): {}",
-            status.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&status.stderr).trim()
-        );
+    .map_err(|_| anyhow::anyhow!("CA mint timed out running ssh-keygen"))?
+    .map_err(|e| anyhow::anyhow!("CA mint failed to run ssh-keygen: {e}"))?;
+    if !status.success() {
+        if created {
+            let _ = std::fs::remove_file(&key);
+            let _ = std::fs::remove_file(key.with_extension("pub"));
+        }
+        bail!("ssh-keygen refused to mint the CA key");
     }
-    let cert_file = workdir.join("key-cert.pub");
-    let cert = std::fs::read_to_string(&cert_file)
-        .map(|s| s.trim().to_string())
-        .map_err(|_| anyhow::anyhow!("ssh-keygen exited 0 but wrote no cert; refusing"))?;
-    // Certs are public material, but a multi-user box should not offer them
-    // for harvesting: lock the file down, fail closed if that fails.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cert_file, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow::anyhow!("cannot lock down cert file: {e}"))?;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+        // ssh-keygen creates the .pub under the umask, which made it 0666 under
+        // `umask 0000`: anyone could swap the CA public key sshd is told to
+        // trust. Only this user and root (sshd) need to read it.
+        let _ = std::fs::set_permissions(
+            key.with_extension("pub"),
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
-    Ok(cert)
+    Ok(key)
+}
+
+/// Mint with the real ssh-keygen.
+pub(crate) async fn ensure_ca_key(config_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    ensure_ca_key_with(config_dir, std::path::Path::new("ssh-keygen")).await
 }
 
 #[cfg(test)]

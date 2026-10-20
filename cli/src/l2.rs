@@ -1720,19 +1720,6 @@ fn forward_probe_verdict(peer: &str, rport: u16, probe: ForwardProbe) -> Result<
     }
 }
 
-/// Bridge a verified warm stream to the client `sock`, replaying the already-read
-/// `first` frame so no peer bytes are lost.
-#[cfg(unix)]
-pub(crate) async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    mux: Arc<Mux>,
-    sid: u32,
-    sock: S,
-    first: PipeItem,
-    rx: mpsc::Receiver<PipeItem>,
-) {
-    serve_stream(mux, sid, sock, rx, true, Some(first), None).await;
-}
-
 /// Open a mesh-native mount stream to the peer, sending `mount-open` with the
 /// encoded root path. Waits for the `mount-open-ack` control message carrying
 /// server capabilities, then sends `mount-cap-ack` to confirm the negotiated
