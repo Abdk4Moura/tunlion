@@ -61,7 +61,7 @@ pub trait PtyBackend: Send + Sync {
         &self,
         session: Arc<dyn PtySession>,
         input: mpsc::Receiver<PipeItem>,
-        resize: mpsc::Receiver<(u16, u16)>,
+        resize: mpsc::UnboundedReceiver<(u16, u16)>,
     );
     /// Resolve the shell argv/user-drop policy. `can_use_user` drives admission.
     fn shell_argv(&self, shell_user: &Option<String>) -> (Vec<String>, bool);
@@ -191,7 +191,9 @@ pub async fn open_pty(
     }
     if resume {
         let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": l2::NO_SUCH_SESSION }))
+            .send_control(
+                &json!({ "type": "l2-close", "sid": sid, "err": crate::l2::NO_SUCH_SESSION }),
+            )
             .await;
         return;
     }
@@ -206,7 +208,7 @@ pub async fn open_pty(
     let Some(reservation) = backend.reserve() else {
         conn.log.say(&format!(
             "l2: pty refused: too many PTYs (global cap {})",
-            l2::MAX_PTYS_GLOBAL
+            crate::l2::MAX_PTYS_GLOBAL
         ));
         let _ = t
             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))

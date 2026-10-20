@@ -66,7 +66,7 @@ pub fn l2_target_allowed_in(allow: &Value, device: &str, host: &str, port: u16) 
 #[cfg(test)]
 mod tests {
     use super::{l2_open_allowed, l2_target_allowed_in};
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     #[test]
     fn l2_open_gate_scopes_grant_mode() {

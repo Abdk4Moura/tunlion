@@ -22,13 +22,13 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::AbortHandle;
 
 use crate::host::{HostServices, LiveCutCause};
@@ -1019,7 +1019,10 @@ mod tests {
             _host: &str,
             _port: u16,
         ) -> std::io::Result<tokio::net::TcpStream> {
-            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, self.0))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                self.0,
+            ))
         }
         fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<crate::host::LiveCut> {
             idev.map(|_| crate::host::LiveCut {
@@ -1047,9 +1050,13 @@ mod tests {
         let rb = b.register(sid).await.unwrap();
         let ri = inert.register(sid).await.unwrap();
         tokio::join!(
-            a.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, ra, None),
-            b.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, rb, None),
-            inert.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, ri, None),
+            a.clone()
+                .dial_and_serve(sid, "127.0.0.1".into(), 9, ra, None),
+            b.clone()
+                .dial_and_serve(sid, "127.0.0.1".into(), 9, rb, None),
+            inert
+                .clone()
+                .dial_and_serve(sid, "127.0.0.1".into(), 9, ri, None),
         );
         for (mux, transport, reason) in [
             (a, ta, "host-a"),
@@ -1086,7 +1093,9 @@ mod tests {
         for (mux, transport, reason) in [(a, ta, "cut-a"), (b, tb, "cut-b")] {
             assert_eq!(mux.live_streams().await, 0);
             let controls = transport.controls.lock().unwrap();
-            assert!(controls.iter().any(|v| v["type"] == "l2-close" && v["err"] == reason));
+            assert!(controls
+                .iter()
+                .any(|v| v["type"] == "l2-close" && v["err"] == reason));
         }
     }
     #[tokio::test]

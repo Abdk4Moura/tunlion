@@ -18,13 +18,13 @@
 //! and supplies `ShellPolicy`; these closures keep that host/config ownership
 //! while the ordering stays here.
 
-use crate::conn::{Conn, dropped_no_transport};
+use crate::conn::{dropped_no_transport, Conn};
 use crate::l2::{self, Mux, MuxMap, OpenVerdict, PipeItem};
-use crate::refusal::{Code, Reinvite, Refusal, TUNNEL_OFF_REASON};
-use crate::shell_gate::{ShellPolicy, forward_gate_decision, gather_shell_gate_inputs};
+use crate::refusal::{Code, Refusal, Reinvite, TUNNEL_OFF_REASON};
+use crate::shell_gate::{forward_gate_decision, gather_shell_gate_inputs, ShellPolicy};
 use filament_cap::capability as cap;
 use filament_transport::net::Transport;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -295,8 +295,8 @@ mod tests {
     use crate::conn::{Link, Presence};
     use crate::host::{CapGate, HostServices, NoHost, NoLog};
     use std::collections::HashMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     const PID: &str = "forward-peer";
@@ -575,12 +575,20 @@ mod tests {
         let park = d.park.as_ref().expect("a checked open may be parked");
         assert_eq!(park.sid, SID);
         assert_eq!(park.reason, d.reason);
-        assert!(allow_calls.lock().unwrap().is_empty(), "deny must not read the allowlist");
+        assert!(
+            allow_calls.lock().unwrap().is_empty(),
+            "deny must not read the allowlist"
+        );
         assert_eq!(host.gates(), vec![(false, false)]);
-        assert!(t.controls.lock().unwrap().is_empty(), "the caller sends the close");
+        assert!(
+            t.controls.lock().unwrap().is_empty(),
+            "the caller sends the close"
+        );
 
         assert_eq!(
-            d.close_frame(Some("phone".into()), || panic!("no reinvite for a plain deny")),
+            d.close_frame(Some("phone".into()), || panic!(
+                "no reinvite for a plain deny"
+            )),
             json!({
                 "type": "l2-close",
                 "sid": SID,
@@ -593,14 +601,8 @@ mod tests {
 
         // A low-half sid is not L2's, so a denial for it is never parked. The
         // close still names the sid the frame carried (never a wrapped cast).
-        let out = admit_forward_open(
-            &mut conn,
-            PID,
-            &open("127.0.0.1", 22, 1),
-            &mut muxes,
-            &cfg,
-        )
-        .await;
+        let out =
+            admit_forward_open(&mut conn, PID, &open("127.0.0.1", 22, 1), &mut muxes, &cfg).await;
         let ForwardAdmission::Denied(d) = out else {
             panic!("expected a policy denial for the low sid");
         };
@@ -697,7 +699,11 @@ mod tests {
         assert_eq!(d.cap_reason.as_deref(), Some("port out of range"));
         assert!(d.park.is_none(), "a bad port is not an identity question");
         assert!(allow_calls.lock().unwrap().is_empty());
-        assert_eq!(host.gates().len(), 1, "the gate still runs before the port veto");
+        assert_eq!(
+            host.gates().len(),
+            1,
+            "the gate still runs before the port veto"
+        );
         assert_eq!(
             d.close_frame(None, || panic!("no reinvite")),
             json!({
@@ -762,7 +768,14 @@ mod tests {
             &cfg,
         )
         .await;
-        let ForwardAdmission::Accepted { sid, host, port, mux, .. } = out else {
+        let ForwardAdmission::Accepted {
+            sid,
+            host,
+            port,
+            mux,
+            ..
+        } = out
+        else {
             panic!("loopback must be admitted");
         };
         assert_eq!((sid, host.as_str(), port), (SID + 1, "127.0.0.1", 22));
@@ -882,12 +895,7 @@ mod tests {
         assert!(matches!(out, ForwardAdmission::Denied(_)));
         assert_eq!(
             host.gates(),
-            vec![
-                (true, true),
-                (true, false),
-                (true, false),
-                (false, false),
-            ]
+            vec![(true, true), (true, false), (true, false), (false, false),]
         );
     }
 

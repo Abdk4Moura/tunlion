@@ -177,7 +177,7 @@ impl filament_peerloop::recv::servers::shell::PtyBackend for CliPty {
         &self,
         session: Arc<dyn filament_peerloop::recv::servers::shell::PtySession>,
         input: tokio::sync::mpsc::Receiver<filament_peerloop::recv::servers::shell::PipeItem>,
-        resize: tokio::sync::mpsc::Receiver<(u16, u16)>,
+        resize: tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>,
     ) {
         let Some(handle) = session.as_any().downcast_ref::<l2::PtySessionHandle>() else {
             return;
@@ -306,6 +306,13 @@ impl RecvIdentity for CliRecv {
     }
     fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<refusal::Reinvite> {
         self.identity().reinvite_for(device_pub)
+    }
+    fn reinvite_refusal(
+        &self,
+        refusal: refusal::Refusal,
+        device_pub: Option<&[u8; 32]>,
+    ) -> refusal::Refusal {
+        crate::refusal::with_reinvite_for(refusal, device_pub)
     }
     fn enroll_channel(&self, public_key: &[u8; 32]) -> String {
         self.identity().enroll_channel(public_key)

@@ -153,6 +153,11 @@ pub trait RecvIdentity: Send + Sync {
     }
     fn owner_pub_for_resources(&self) -> Option<[u8; 32]>;
     fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<crate::refusal::Reinvite>;
+    fn reinvite_refusal(
+        &self,
+        refusal: crate::refusal::Refusal,
+        device_pub: Option<&[u8; 32]>,
+    ) -> crate::refusal::Refusal;
     fn enroll_channel(&self, public_key: &[u8; 32]) -> String;
     fn is_armed(&self) -> bool;
     fn verify_and_store_roster(
@@ -845,7 +850,7 @@ pub(crate) mod test_support {
             &self,
             _: Arc<dyn crate::recv::servers::shell::PtySession>,
             _: mpsc::Receiver<crate::recv::servers::shell::PipeItem>,
-            _: mpsc::Receiver<(u16, u16)>,
+            _: mpsc::UnboundedReceiver<(u16, u16)>,
         ) {
         }
         fn shell_argv(&self, _: &Option<String>) -> (Vec<String>, bool) {
