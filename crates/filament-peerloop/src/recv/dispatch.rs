@@ -658,7 +658,10 @@ impl SyncTask {
 
     #[cfg(feature = "mount-server")]
     async fn join(self) -> Result<(), String> {
-        self.0.join().await
+        match self.0.join().await {
+            Ok(result) => result,
+            Err(error) => Err(error.to_string()),
+        }
     }
     #[cfg(not(feature = "mount-server"))]
     async fn join(self) -> Result<(), String> {
