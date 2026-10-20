@@ -66,6 +66,7 @@ jobs:
       - name: Compile dispatch only (no overlay, TUN or server backends)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          echo "dispatch-only target=${{ matrix.target }} abi=${{ matrix.abi }} flags=--no-default-features --features dispatch"
           cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop \
             --no-default-features --features dispatch
       - name: Compile CLI without forward-server (mesh + mount-server on)

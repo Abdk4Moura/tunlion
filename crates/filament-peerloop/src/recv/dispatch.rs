@@ -503,6 +503,25 @@ pub fn receive_timed_out(elapsed: Duration, timeout: Option<Duration>, completed
     completed == 0 && timeout.is_some_and(|d| !d.is_zero() && elapsed >= d)
 }
 
+/// The real producer of an invalid `--expect-sha256` failure.
+pub fn validate_expect_sha256(value: Option<&str>) -> Result<()> {
+    match value {
+        Some(expected) if !valid_sha256(expected) => Err(anyhow::Error::new(DispatchFailure {
+            kind: DispatchFailureKind::Usage,
+            message: "--expect-sha256 must be exactly 64 hexadecimal characters".into(),
+        })),
+        _ => Ok(()),
+    }
+}
+
+/// The real producer of the one-shot "nothing arrived" failure.
+pub fn receive_timeout_failure(secs: u64) -> DispatchFailure {
+    DispatchFailure {
+        kind: DispatchFailureKind::Unreachable,
+        message: format!("nothing arrived within {secs}s: no sender offered a transfer"),
+    }
+}
+
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && hex::decode(value).is_ok_and(|digest| digest.len() == 32)
 }
@@ -612,6 +631,7 @@ pub struct RecvCleanup {
     tasks: crate::recv::lifecycle::Tasks,
     writers: WriterTasks,
     watchdog: crate::recv::lifecycle::LoopWatchdog,
+    stdin: Option<Box<dyn crate::recv::ports::StdinOwner>>,
     sync_tasks: SyncTasks,
     /// Test-only observation of the cleanup order (`finish` also records the
     /// static phases used by the older tests). A gated writer pushes into the
@@ -787,13 +807,7 @@ fn note_cleanup_phase(phase: &'static str) {
 fn note_cleanup_phase(_phase: &'static str) {}
 
 impl SyncTasks {
-    async fn track_sync_task(
-        &self,
-        pid: String,
-        sid: u32,
-        task: crate::sync::serving::SyncServeTask,
-        log: &dyn LogSink,
-    ) {
+    async fn track_sync_task(&self, pid: String, sid: u32, task: SyncTask, log: &dyn LogSink) {
         let key = (pid, sid);
         // A live SID collision is rejected during admission. A finished entry
         // can remain until the next reap tick; join it before replacing it.
@@ -873,6 +887,16 @@ impl RecvCleanup {
     }
 
     async fn finish(&mut self, log: &dyn LogSink) {
+        // The stdin reader is an owned CLI resource when the adapter could
+        // join it. A platform that cannot do so returns false and says so.
+        if let Some(mut stdin) = self.stdin.take() {
+            stdin.stop();
+            if !stdin.join() {
+                log.debug(
+                    "recv: stdin reader could not be joined; CLI lifetime policy detaches it",
+                );
+            }
+        }
         // The loop is intentionally no longer turning. Ask its stall observer
         // to stop before the (possibly slow) flush, so cleanup cannot be
         // reported as a live-loop stall. This is a best-effort one-second
@@ -966,14 +990,7 @@ async fn recv_run(
     cleanup: &mut RecvCleanup,
 ) -> Result<()> {
     cleanup.watchdog = crate::recv::lifecycle::LoopWatchdog::with_stall(ports.env.loop_stall_secs);
-    if let Some(expected) = expect_sha256.as_deref() {
-        if !valid_sha256(expected) {
-            return Err(anyhow::Error::new(DispatchFailure {
-                kind: DispatchFailureKind::Usage,
-                message: "--expect-sha256 must be exactly 64 hexadecimal characters".into(),
-            }));
-        }
-    }
+    validate_expect_sha256(expect_sha256.as_deref())?;
     let opened_flow = !daemon
         && ports.env.interactive_allowed
         && (code.is_none() || ports.env.interactive_requested);
@@ -9697,6 +9714,7 @@ mod lifecycle_tests {
         }
     }
 
+    #[cfg(feature = "mount-server")]
     fn sync_server(
         stream: tokio::sync::mpsc::Receiver<Option<bytes::Bytes>>,
     ) -> crate::sync::serving::SyncServeTask {
@@ -9716,6 +9734,7 @@ mod lifecycle_tests {
         })
     }
 
+    #[cfg(feature = "mount-server")]
     #[tokio::test]
     async fn sync_task_reaping_and_cleanup_join_owned_servers() {
         let (finished_tx, finished_rx) = tokio::sync::mpsc::channel(1);

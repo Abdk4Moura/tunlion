@@ -112,7 +112,9 @@ impl Default for LoopWatchdog {
 
 impl LoopWatchdog {
     pub fn new() -> Self {
-        Self::with_stall(threshold_secs())
+        // Pure default; the dispatch replaces it with the invocation's
+        // `RecvEnv::loop_stall_secs` before the loop starts.
+        Self::with_stall(20)
     }
 
     /// Production constructor with the invocation's configured threshold.
@@ -274,14 +276,9 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Seconds without a tick before the watchdog speaks.
-/// `TUNLION_LOOP_STALL_SECS` overrides (gates).
+#[cfg(test)]
 fn threshold_secs() -> u64 {
-    std::env::var("TUNLION_LOOP_STALL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(20)
+    20
 }
 
 #[cfg(test)]

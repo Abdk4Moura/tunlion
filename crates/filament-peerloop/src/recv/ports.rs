@@ -25,7 +25,6 @@ use crate::l2::Mux;
 use crate::recv::MeshTunnel;
 use crate::recv::{IncomingFile, RecvReport};
 use crate::shell_gate::ShellPolicy;
-use crate::sync::serving::SyncServeTask;
 use async_trait::async_trait;
 use filament_id::{DeviceCert, IntroScope};
 use filament_signal::Client as SignalClient;
@@ -87,7 +86,7 @@ impl Default for RecvEnv {
             quiet_window: Duration::from_secs(10),
             l2_forced: false,
             daemon_ready: false,
-            pid: std::process::id(),
+            pid: 0,
             interactive_terminal: false,
             pair_grace: Duration::from_secs(60),
             fleet_offer_grace: Duration::from_secs(8),
@@ -420,6 +419,13 @@ pub trait RecvDaemon: Send + Sync {
 /// Terminal interaction: the code prompt and the confirmation line.
 pub trait RawMode: Send {}
 
+/// An owned stdin reader. `join` reports whether the reader actually stopped;
+/// an adapter that cannot join safely must return false (CLI-only policy).
+pub trait StdinOwner: Send {
+    fn stop(&mut self);
+    fn join(&mut self) -> bool;
+}
+
 pub trait RecvPrompt: Send + Sync {
     /// Ask for a code; `Ok(None)` means an empty submission, `Err` cancellation
     /// or interrupt.
@@ -435,7 +441,7 @@ pub trait RecvPrompt: Send + Sync {
         tx: mpsc::UnboundedSender<Ev>,
         question_open: Arc<std::sync::atomic::AtomicBool>,
         present: Arc<dyn crate::present::Presentation>,
-    );
+    ) -> Option<Box<dyn StdinOwner>>;
 }
 
 /// What the receive dispatch is handed once, at its entry.

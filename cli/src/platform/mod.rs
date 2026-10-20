@@ -103,7 +103,10 @@ impl Paths {
         }
         #[cfg(windows)]
         {
-            std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()).map(PathBuf::from)
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|h| !h.is_empty())
+                .map(PathBuf::from)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -125,10 +128,18 @@ impl Paths {
     /// because running a process as another user requires either elevated
     /// privileges (CreateProcessAsUser) or the target user's credentials
     /// (CreateProcessWithLogonW), both of which have security implications.
-    pub fn shell_argv(shell_program: Option<&str>, shell_config: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
+    pub fn shell_argv(
+        shell_program: Option<&str>,
+        shell_config: Option<&str>,
+        shell_user: Option<&str>,
+    ) -> (Vec<String>, bool) {
         let shell = shell_program
             .map(|s| s.to_string())
-            .or_else(|| std::env::var("TUNLION_SHELL").ok().filter(|s| !s.is_empty()))
+            .or_else(|| {
+                std::env::var("TUNLION_SHELL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
             .or_else(|| shell_config.map(|s| s.to_string()))
             .unwrap_or_else(|| Self::default_shell());
 
@@ -174,7 +185,8 @@ impl Paths {
         };
         #[cfg(unix)]
         {
-            let mut argv: Vec<String> = vec!["runuser".into(), "-u".into(), user.into(), "--".into()];
+            let mut argv: Vec<String> =
+                vec!["runuser".into(), "-u".into(), user.into(), "--".into()];
             argv.extend(direct);
             Ok(argv)
         }
@@ -201,7 +213,13 @@ impl Paths {
             let mut buf = vec![0 as libc::c_char; 16 * 1024];
             let mut result: *mut libc::passwd = std::ptr::null_mut();
             let rc = unsafe {
-                libc::getpwnam_r(name.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+                libc::getpwnam_r(
+                    name.as_ptr(),
+                    &mut pwd,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                )
             };
             if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
                 return None;
@@ -223,13 +241,21 @@ impl Paths {
     fn default_shell() -> String {
         #[cfg(unix)]
         {
-            std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
-                if Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
-            })
+            std::env::var("SHELL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    if Path::new("/bin/bash").exists() {
+                        "/bin/bash".into()
+                    } else {
+                        "/bin/sh".into()
+                    }
+                })
         }
         #[cfg(windows)]
         {
-            if Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
+            if Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists()
+            {
                 "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into()
             } else if Path::new("C:\\Windows\\System32\\cmd.exe").exists() {
                 "C:\\Windows\\System32\\cmd.exe".into()
@@ -321,7 +347,9 @@ pub fn tighten_config_dir(dir: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let Ok(md) = std::fs::symlink_metadata(dir) else { return };
+        let Ok(md) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
         let mode = md.permissions().mode();
         let mine = md.uid() == unsafe { libc::getuid() };
         if md.is_dir() && mine && mode & 0o1000 == 0 && mode & 0o077 != 0 {
@@ -355,7 +383,11 @@ pub fn open_private_log(path: &Path, truncate: bool) -> std::io::Result<std::fs:
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if file.metadata().map(|m| m.permissions().mode() & 0o077 != 0).unwrap_or(false) {
+        if file
+            .metadata()
+            .map(|m| m.permissions().mode() & 0o077 != 0)
+            .unwrap_or(false)
+        {
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
     }
@@ -404,7 +436,10 @@ pub fn publish_received_path(path: &Path, executable: bool) -> std::io::Result<(
             return Ok(());
         }
         let base = if executable { 0o755 } else { 0o644 };
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(base & !process_umask()))
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(base & !process_umask()),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -451,7 +486,9 @@ pub fn file_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::symlink_metadata(path).ok().map(|m| m.permissions().mode() & 0o7777)
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
     }
     #[cfg(not(unix))]
     {
@@ -516,7 +553,7 @@ fn repair_sensitive_file(path: &Path) -> std::io::Result<bool> {
 pub async fn termination_signal() -> i32 {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         let (Ok(mut term), Ok(mut hup), Ok(mut quit)) = (
             signal(SignalKind::terminate()),
             signal(SignalKind::hangup()),
@@ -604,7 +641,9 @@ pub fn signal_process_group(pgid: u32, sig: TreeSignal) -> std::io::Result<bool>
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (pgid, sig);
-        Err(std::io::Error::other("cannot signal processes on this platform"))
+        Err(std::io::Error::other(
+            "cannot signal processes on this platform",
+        ))
     }
 }
 
@@ -656,7 +695,14 @@ pub fn die_with_daemon(cmd: &mut tokio::process::Command) {
         unsafe {
             cmd.pre_exec(move || {
                 let zero: libc::c_ulong = 0;
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, zero, zero, zero) != 0 {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    zero,
+                    zero,
+                    zero,
+                ) != 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::getppid() != daemon {
@@ -683,9 +729,9 @@ pub fn contain_with_daemon(child: &tokio::process::Child) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
         static JOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let job = *JOB.get_or_init(|| unsafe {
@@ -1087,7 +1133,13 @@ pub(crate) fn process_is_elevated() -> bool {
             unsafe extern "system" {
                 fn GetCurrentProcess() -> isize;
                 fn OpenProcessToken(h: isize, access: u32, tok: *mut isize) -> i32;
-                fn GetTokenInformation(tok: isize, cls: u32, buf: *mut u8, len: u32, ret: *mut u32) -> i32;
+                fn GetTokenInformation(
+                    tok: isize,
+                    cls: u32,
+                    buf: *mut u8,
+                    len: u32,
+                    ret: *mut u32,
+                ) -> i32;
                 fn CloseHandle(h: isize) -> i32;
             }
             const TOKEN_QUERY: u32 = 0x0008;
@@ -1111,7 +1163,9 @@ pub(crate) fn process_is_elevated() -> bool {
         }
     }
     #[cfg(not(any(unix, windows)))]
-    { false }
+    {
+        false
+    }
 }
 
 /// The detected service manager on this platform.
@@ -1155,15 +1209,23 @@ impl ServiceHost {
     pub fn detect() -> Self {
         #[cfg(target_os = "linux")]
         {
-            if Self::has_systemd() { return ServiceHost::Systemd; }
+            if Self::has_systemd() {
+                return ServiceHost::Systemd;
+            }
             ServiceHost::None
         }
         #[cfg(target_os = "macos")]
-        { ServiceHost::Launchd }
+        {
+            ServiceHost::Launchd
+        }
         #[cfg(target_os = "windows")]
-        { ServiceHost::WindowsService }
+        {
+            ServiceHost::WindowsService
+        }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        { ServiceHost::None }
+        {
+            ServiceHost::None
+        }
     }
 
     pub fn supports_install(&self) -> bool {
@@ -1245,9 +1307,7 @@ impl ServiceHost {
     pub fn install_user(&self, exe: &Path, argv: &[String]) -> Result<()> {
         match self {
             #[cfg(target_os = "linux")]
-            ServiceHost::Systemd => {
-                install_systemd_user(exe, argv)
-            }
+            ServiceHost::Systemd => install_systemd_user(exe, argv),
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
                 // #173: per-user autostart via HKCU Run. No elevation needed:
@@ -1258,9 +1318,7 @@ impl ServiceHost {
                 install_run_key(exe, argv)
             }
             #[cfg(target_os = "macos")]
-            ServiceHost::Launchd => {
-                install_launch_agent(exe, argv)
-            }
+            ServiceHost::Launchd => install_launch_agent(exe, argv),
             _ if cfg!(target_os = "android") => Err(anyhow::anyhow!(ANDROID_NO_INSTALL)),
             _ => Err(anyhow::anyhow!("no service manager detected")),
         }
@@ -1294,7 +1352,8 @@ impl ServiceHost {
                     .args([
                         "delete",
                         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                        "/v", WINDOWS_AUTOSTART_NAME,
+                        "/v",
+                        WINDOWS_AUTOSTART_NAME,
                         "/f",
                     ])
                     .stdout(std::process::Stdio::null())
@@ -1362,7 +1421,11 @@ impl ServiceHost {
             const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
             const SW_HIDE: i32 = 0;
 
-            let exe_win: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let exe_win: Vec<u16> = exe
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
             let args = windows_args_line(&elevated_argv);
             let args_win: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
             let verb: Vec<u16> = "runas\0".encode_utf16().collect();
@@ -1435,7 +1498,9 @@ impl ServiceHost {
             return Ok(ok);
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        { Ok(false) }
+        {
+            Ok(false)
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1468,11 +1533,31 @@ mod frozen_service_names {
     fn frozen_service_names() {
         use sha2::{Digest, Sha256};
         for (name, value, digest) in [
-            ("SYSTEMD_UNIT", super::SYSTEMD_UNIT, "931e7d3a2f5b8af576a8b7401605527f62ef670364021e8b7ea8bbcd76a5b828"),
-            ("LAUNCHD_LABEL", super::LAUNCHD_LABEL, "1682586d67d66cdd3064800d94e8e5450f72a33a6410484969822f45977f8276"),
-            ("WINDOWS_AUTOSTART_NAME", super::WINDOWS_AUTOSTART_NAME, "5a48d0f29c16f94f2c7d9ec0ee1a94a814a225d4385e4ab8961ae3506bda6d21"),
-            ("WINDOWS_SERVICE_NAME", super::WINDOWS_SERVICE_NAME, "931e7d3a2f5b8af576a8b7401605527f62ef670364021e8b7ea8bbcd76a5b828"),
-            ("WINDOWS_FIREWALL_RULE", super::WINDOWS_FIREWALL_RULE, "bcc6d3bc87bccdca4e38f824d518b8509a592fd4635ad9322d6d9b7e22ec5bfa"),
+            (
+                "SYSTEMD_UNIT",
+                super::SYSTEMD_UNIT,
+                "931e7d3a2f5b8af576a8b7401605527f62ef670364021e8b7ea8bbcd76a5b828",
+            ),
+            (
+                "LAUNCHD_LABEL",
+                super::LAUNCHD_LABEL,
+                "1682586d67d66cdd3064800d94e8e5450f72a33a6410484969822f45977f8276",
+            ),
+            (
+                "WINDOWS_AUTOSTART_NAME",
+                super::WINDOWS_AUTOSTART_NAME,
+                "5a48d0f29c16f94f2c7d9ec0ee1a94a814a225d4385e4ab8961ae3506bda6d21",
+            ),
+            (
+                "WINDOWS_SERVICE_NAME",
+                super::WINDOWS_SERVICE_NAME,
+                "931e7d3a2f5b8af576a8b7401605527f62ef670364021e8b7ea8bbcd76a5b828",
+            ),
+            (
+                "WINDOWS_FIREWALL_RULE",
+                super::WINDOWS_FIREWALL_RULE,
+                "bcc6d3bc87bccdca4e38f824d518b8509a592fd4635ad9322d6d9b7e22ec5bfa",
+            ),
         ] {
             let got: String = Sha256::digest(value.as_bytes())
                 .as_slice()
@@ -1511,7 +1596,10 @@ pub(crate) fn xml_escape(s: &str) -> String {
 /// A launchd plist that runs `exe` with `argv`, one `<string>` per element.
 #[allow(dead_code)] // macOS only
 pub(crate) fn launchd_plist(label: &str, exe: &Path, argv: &[String]) -> String {
-    let mut args = format!("    <string>{}</string>\n", xml_escape(&exe.display().to_string()));
+    let mut args = format!(
+        "    <string>{}</string>\n",
+        xml_escape(&exe.display().to_string())
+    );
     for a in argv {
         args.push_str(&format!("    <string>{}</string>\n", xml_escape(a)));
     }
@@ -1612,7 +1700,10 @@ fn windows_arg(s: &str) -> String {
 /// The arguments part of a Windows command line (no program name).
 #[allow(dead_code)] // Windows only
 pub(crate) fn windows_args_line(argv: &[String]) -> String {
-    argv.iter().map(|a| windows_arg(a)).collect::<Vec<_>>().join(" ")
+    argv.iter()
+        .map(|a| windows_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A full Windows command line: quoted program, then the arguments.
@@ -1636,7 +1727,11 @@ fn sh_quote(s: &str) -> String {
 /// `--install-system` added to `up`, so the child installs and exits.
 fn elevated_install_argv(argv: &[String]) -> Vec<String> {
     let mut out: Vec<String> = argv.to_vec();
-    let at = out.iter().position(|a| a == "up").map(|i| i + 1).unwrap_or(0);
+    let at = out
+        .iter()
+        .position(|a| a == "up")
+        .map(|i| i + 1)
+        .unwrap_or(0);
     if at == 0 {
         out.insert(0, "up".into());
         out.insert(1, "--install-system".into());
@@ -1693,9 +1788,12 @@ fn install_run_key(exe: &Path, argv: &[String]) -> Result<()> {
         .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v", WINDOWS_AUTOSTART_NAME,
-            "/t", "REG_SZ",
-            "/d", &cmd,
+            "/v",
+            WINDOWS_AUTOSTART_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &cmd,
             "/f",
         ])
         .output()?;
@@ -1722,7 +1820,14 @@ fn install_scheduled_task(exe: &Path, argv: &[String]) -> Result<()> {
     let tmp = std::env::temp_dir().join("tunlion-task.xml");
     std::fs::write(&tmp, &task_xml)?;
     let out = crate::platform::command("schtasks")
-        .args(["/create", "/tn", WINDOWS_AUTOSTART_NAME, "/xml", &tmp.to_string_lossy(), "/f"])
+        .args([
+            "/create",
+            "/tn",
+            WINDOWS_AUTOSTART_NAME,
+            "/xml",
+            &tmp.to_string_lossy(),
+            "/f",
+        ])
         .output()?;
     let _ = std::fs::remove_file(&tmp);
     if !out.status.success() {
@@ -1745,7 +1850,9 @@ fn launchctl_bootstrap(domain: &str, plist: &Path) -> Result<()> {
         .status();
     let path = plist.display().to_string();
     run_checked("launchctl", &["bootstrap", domain, &path]).map_err(|e| {
-        anyhow::anyhow!("wrote {path} but {e}. Load it by hand: launchctl bootstrap {domain} {path}")
+        anyhow::anyhow!(
+            "wrote {path} but {e}. Load it by hand: launchctl bootstrap {domain} {path}"
+        )
     })
 }
 
@@ -1772,7 +1879,12 @@ mod service_argv_encoding {
     /// launchd does not pass to the program at all.
     #[test]
     fn plist_has_one_string_element_per_argument() {
-        let a = argv(&["up", "--shell-only=a,b", "--dir=/Users/k/A&B <x>", "--i-know"]);
+        let a = argv(&[
+            "up",
+            "--shell-only=a,b",
+            "--dir=/Users/k/A&B <x>",
+            "--i-know",
+        ]);
         let p = launchd_plist("autumated.tunlion", Path::new("/opt/tun lion/tunlion"), &a);
         let start = p.find("<array>").expect("array");
         let end = p.find("</array>").expect("array end");
@@ -1797,13 +1909,19 @@ mod service_argv_encoding {
             .split("<string>")
             .map(|s| s.split("</string>").nth(1).unwrap_or(""))
             .collect::<String>();
-        assert!(stripped.trim().is_empty(), "raw text inside <array>: {stripped:?}");
+        assert!(
+            stripped.trim().is_empty(),
+            "raw text inside <array>: {stripped:?}"
+        );
         assert!(p.contains("<key>Label</key><string>autumated.tunlion</string>"));
     }
 
     #[test]
     fn xml_escape_covers_the_five_entities() {
-        assert_eq!(xml_escape(r#"a&b<c>d"e'f"#), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape(r#"a&b<c>d"e'f"#),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
     }
 
     #[test]
@@ -1824,8 +1942,14 @@ mod service_argv_encoding {
              \"--shell-program=bash -l\" --name-as=100%% \
              --server=https://x.example/$$HOME \"--shell-user=say \\\"hi\\\"\""
         );
-        let unit = systemd_user_unit(Path::new("/usr/local/bin/tunlion"), &argv(&["up", "--shell"]));
-        assert!(unit.contains("\nExecStart=/usr/local/bin/tunlion up --shell\n"), "{unit}");
+        let unit = systemd_user_unit(
+            Path::new("/usr/local/bin/tunlion"),
+            &argv(&["up", "--shell"]),
+        );
+        assert!(
+            unit.contains("\nExecStart=/usr/local/bin/tunlion up --shell\n"),
+            "{unit}"
+        );
     }
 
     #[test]
@@ -1836,7 +1960,10 @@ mod service_argv_encoding {
         assert_eq!(windows_arg("C:\\x y\\"), "\"C:\\x y\\\\\"");
         assert_eq!(windows_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
         assert_eq!(
-            windows_command_line(Path::new("C:\\T\\tunlion.exe"), &argv(&["up", "--dir=C:\\My Files"])),
+            windows_command_line(
+                Path::new("C:\\T\\tunlion.exe"),
+                &argv(&["up", "--dir=C:\\My Files"])
+            ),
             "\"C:\\T\\tunlion.exe\" up \"--dir=C:\\My Files\""
         );
     }
@@ -1847,7 +1974,10 @@ mod service_argv_encoding {
             elevated_install_argv(&argv(&["up", "--shell", "--dir=/x"])),
             argv(&["up", "--install-system", "--shell", "--dir=/x"])
         );
-        assert_eq!(elevated_install_argv(&[]), argv(&["up", "--install-system"]));
+        assert_eq!(
+            elevated_install_argv(&[]),
+            argv(&["up", "--install-system"])
+        );
     }
 
     #[test]
@@ -1859,11 +1989,19 @@ mod service_argv_encoding {
 #[cfg(target_os = "windows")]
 pub fn add_firewall_rule(exe: &Path) {
     let _ = crate::platform::command("netsh")
-        .args(["advfirewall", "firewall", "add", "rule",
-            WINDOWS_FIREWALL_RULE, "dir=in", "action=allow",
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            WINDOWS_FIREWALL_RULE,
+            "dir=in",
+            "action=allow",
             "protocol=udp",
-            "program=", &exe.display().to_string(),
-            "enable=yes"])
+            "program=",
+            &exe.display().to_string(),
+            "enable=yes",
+        ])
         .output();
 }
 
@@ -1880,7 +2018,9 @@ pub fn open_in_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     let r = crate::platform::command("open").arg(url).status();
     #[cfg(target_os = "windows")]
-    let r = crate::platform::command("rundll32").args(["url.dll,FileProtocolHandler", url]).status();
+    let r = crate::platform::command("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .status();
     #[cfg(all(unix, not(target_os = "macos")))]
     let r = {
         if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
@@ -1901,7 +2041,11 @@ pub fn loopback_peer_uid(peer: std::net::SocketAddr, local: std::net::SocketAddr
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let hexaddr = |a: std::net::SocketAddr| match a.ip() {
-            std::net::IpAddr::V4(v) => Some(format!("{:08X}:{:04X}", u32::from_le_bytes(v.octets()), a.port())),
+            std::net::IpAddr::V4(v) => Some(format!(
+                "{:08X}:{:04X}",
+                u32::from_le_bytes(v.octets()),
+                a.port()
+            )),
             _ => None,
         };
         let (want_local, want_rem) = (hexaddr(peer)?, hexaddr(local)?);
@@ -1924,7 +2068,7 @@ pub fn loopback_peer_uid(peer: std::net::SocketAddr, local: std::net::SocketAddr
 pub async fn terminate_requested() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         if let Ok(mut term) = signal(SignalKind::terminate()) {
             term.recv().await;
             return;
@@ -2072,7 +2216,10 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
     // only "No such file or directory (os error 2)", which names nothing.
     if let Some(parent) = log.parent() {
         create_private_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!("cannot create the config directory {}: {e}", parent.display())
+            anyhow::anyhow!(
+                "cannot create the config directory {}: {e}",
+                parent.display()
+            )
         })?;
     }
     let log_file = open_private_log(log, false)
@@ -2145,7 +2292,9 @@ pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
     if end > 0 && buf[end - 1] == 0 {
         end -= 1;
     }
-    String::from_utf8(buf[..end].to_vec()).ok().map(PathBuf::from)
+    String::from_utf8(buf[..end].to_vec())
+        .ok()
+        .map(PathBuf::from)
 }
 
 #[cfg(target_os = "windows")]
@@ -2153,7 +2302,12 @@ pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
     unsafe {
         unsafe extern "system" {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
-            fn QueryFullProcessImageNameW(h: isize, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+            fn QueryFullProcessImageNameW(
+                h: isize,
+                flags: u32,
+                buf: *mut u16,
+                size: *mut u32,
+            ) -> i32;
             fn CloseHandle(h: isize) -> i32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -2173,7 +2327,12 @@ pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "windows"
+)))]
 pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
     None
 }
@@ -2197,7 +2356,9 @@ pub fn os_hostname() -> Option<String> {
 
 #[cfg(windows)]
 pub fn os_hostname() -> Option<String> {
-    std::env::var("COMPUTERNAME").ok().filter(|s| !s.trim().is_empty())
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 // ------------------------------------------------------- InstallSource --
@@ -2278,7 +2439,10 @@ mod tests {
         for i in 0..20 {
             let marker = dir.join(format!("rec-{i}"));
             let mut cmd = crate::platform::tokio_command("/bin/sh");
-            cmd.arg("-c").arg(r#"test "$(cat "$1")" = "$$""#).arg("sh").arg(&marker);
+            cmd.arg("-c")
+                .arg(r#"test "$(cat "$1")" = "$$""#)
+                .arg("sh")
+                .arg(&marker);
             own_process_group(&mut cmd);
             die_with_daemon(&mut cmd);
             let m = marker.clone();
@@ -2291,7 +2455,10 @@ mod tests {
             .expect("spawn");
             assert_eq!(recorded, child.id(), "recorded pid is the child's");
             let st = rt.block_on(child.wait()).unwrap();
-            assert!(st.success(), "run {i}: the program ran before its record existed");
+            assert!(
+                st.success(),
+                "run {i}: the program ran before its record existed"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2333,7 +2500,12 @@ mod tests {
         }
         for p in [inbox.join("synced"), sub.clone()] {
             if let Some(m) = file_mode(&p) {
-                assert_eq!(m & 0o022, 0, "{} must not be group/world-writable, got {m:o}", p.display());
+                assert_eq!(
+                    m & 0o022,
+                    0,
+                    "{} must not be group/world-writable, got {m:o}",
+                    p.display()
+                );
             }
         }
         // An existing inbox is left alone, and creating it again is not an error.
@@ -2349,7 +2521,11 @@ mod tests {
         let p = d.join("x.part.meta");
         drop(create_new_private(&p).unwrap());
         if let Some(m) = file_mode(&p) {
-            assert_eq!(m & 0o777, 0o600, "a new private file must be 0600, got {m:o}");
+            assert_eq!(
+                m & 0o777,
+                0o600,
+                "a new private file must be 0600, got {m:o}"
+            );
         }
         // create_new: it never reuses (or writes through) what is already there.
         assert!(create_new_private(&p).is_err());
@@ -2365,7 +2541,11 @@ mod tests {
         restrict_open_file(&f).unwrap();
         drop(f);
         if let Some(m) = file_mode(&p) {
-            assert_eq!(m & 0o777, 0o600, "a resumed partial must end up 0600, got {m:o}");
+            assert_eq!(
+                m & 0o777,
+                0o600,
+                "a resumed partial must end up 0600, got {m:o}"
+            );
         }
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -2381,7 +2561,11 @@ mod tests {
         drop(f);
         if let Some(m) = file_mode(&p) {
             assert_eq!(m & 0o777, 0o644 & !process_umask(), "got {m:o}");
-            assert_eq!(m & 0o133, 0, "never group/other writable nor executable, got {m:o}");
+            assert_eq!(
+                m & 0o133,
+                0,
+                "never group/other writable nor executable, got {m:o}"
+            );
         }
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -2408,9 +2592,18 @@ mod tests {
                     1: -> FLOCK  ADVISORY  WRITE 5151 fd:01:131087 0 EOF\n\
                     2: POSIX  ADVISORY  WRITE 777 08:02:99 0 EOF\n\
                     3: OFDLCK ADVISORY  READ  -1 08:02:1234 0 EOF\n";
-        assert_eq!(lock_holder_in(text, 0xfd, 0x01, 131087), LockHolder::Held(Some(4242)));
-        assert_eq!(lock_holder_in(text, 0x08, 0x02, 99), LockHolder::Held(Some(777)));
-        assert_eq!(lock_holder_in(text, 0x08, 0x02, 1234), LockHolder::Held(None));
+        assert_eq!(
+            lock_holder_in(text, 0xfd, 0x01, 131087),
+            LockHolder::Held(Some(4242))
+        );
+        assert_eq!(
+            lock_holder_in(text, 0x08, 0x02, 99),
+            LockHolder::Held(Some(777))
+        );
+        assert_eq!(
+            lock_holder_in(text, 0x08, 0x02, 1234),
+            LockHolder::Held(None)
+        );
         // Same inode number on another device, and a free inode.
         assert_eq!(lock_holder_in(text, 0x08, 0x03, 99), LockHolder::Free);
         assert_eq!(lock_holder_in(text, 0xfd, 0x01, 5), LockHolder::Free);
@@ -2461,11 +2654,18 @@ mod tests {
             assert_eq!(n, 1, "the child never took the lock");
             if unsafe { libc::geteuid() } != 0 {
                 // The precondition the bug needs (root may read it anyway).
-                assert_eq!(process_exe_path(child), None, "the child should be non-dumpable");
+                assert_eq!(
+                    process_exe_path(child),
+                    None,
+                    "the child should be non-dumpable"
+                );
             }
             assert_eq!(instance_lock_holder(&lock), LockHolder::Held(Some(child)));
             std::fs::write(&pidfile, format!("{child}\n")).unwrap();
-            assert_eq!(crate::shell_support::daemon_alive_in(&pidfile, &lock), Some(child));
+            assert_eq!(
+                crate::shell_support::daemon_alive_in(&pidfile, &lock),
+                Some(child)
+            );
             // A pidfile naming any other live process is not this config's daemon.
             std::fs::write(&pidfile, format!("{}\n", std::process::id())).unwrap();
             assert_eq!(crate::shell_support::daemon_alive_in(&pidfile, &lock), None);
@@ -2497,12 +2697,17 @@ mod tests {
         let (a, b) = (base.join("a"), base.join("b"));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        let held = InstanceLock::try_acquire(&a.join("up.lock")).unwrap().expect("lock");
+        let held = InstanceLock::try_acquire(&a.join("up.lock"))
+            .unwrap()
+            .expect("lock");
         let me = std::process::id();
         std::fs::write(a.join("up.pid"), format!("{me}\n")).unwrap();
         std::fs::copy(a.join("up.lock"), b.join("up.lock")).unwrap();
         std::fs::copy(a.join("up.pid"), b.join("up.pid")).unwrap();
-        assert_eq!(instance_lock_holder(&a.join("up.lock")), LockHolder::Held(Some(me)));
+        assert_eq!(
+            instance_lock_holder(&a.join("up.lock")),
+            LockHolder::Held(Some(me))
+        );
         assert_eq!(instance_lock_holder(&b.join("up.lock")), LockHolder::Free);
         assert_eq!(
             crate::shell_support::daemon_alive_in(&a.join("up.pid"), &a.join("up.lock")),
@@ -2586,7 +2791,10 @@ mod tests {
                 die_with_daemon(&mut cmd);
                 let child = cmd.spawn().expect("spawn sleep");
                 let pid = child.id().expect("pid");
-                assert!(process_start_token(pid).is_some(), "the leader's start is readable");
+                assert!(
+                    process_start_token(pid).is_some(),
+                    "the leader's start is readable"
+                );
                 std::mem::forget(child);
                 pid
             })
@@ -2597,7 +2805,11 @@ mod tests {
         let running = |pid: u32| {
             std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
-                .and_then(|s| s.rfind(')').map(|i| s[i + 1..].trim_start().starts_with('Z')).map(|z| !z))
+                .and_then(|s| {
+                    s.rfind(')')
+                        .map(|i| s[i + 1..].trim_start().starts_with('Z'))
+                        .map(|z| !z)
+                })
                 .unwrap_or(false)
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2641,7 +2853,9 @@ mod tests {
     #[test]
     fn install_instructions_non_empty_when_no_backend() {
         assert!(!ServiceHost::Launchd.install_instructions().is_empty());
-        assert!(!ServiceHost::WindowsService.install_instructions().is_empty());
+        assert!(!ServiceHost::WindowsService
+            .install_instructions()
+            .is_empty());
         assert!(!ServiceHost::None.install_instructions().is_empty());
         // Systemd has a backend, so instructions should be empty.
         assert!(ServiceHost::Systemd.install_instructions().is_empty());
@@ -2683,9 +2897,18 @@ mod tests {
 
     #[test]
     fn install_source_upgrade_hints() {
-        assert_eq!(InstallSource::Homebrew.upgrade_hint(), "brew upgrade tunlion");
-        assert_eq!(InstallSource::Winget.upgrade_hint(), "winget upgrade Abdk4Moura.Tunlion");
-        assert_eq!(InstallSource::Cargo.upgrade_hint(), "cargo install filament-cli");
+        assert_eq!(
+            InstallSource::Homebrew.upgrade_hint(),
+            "brew upgrade tunlion"
+        );
+        assert_eq!(
+            InstallSource::Winget.upgrade_hint(),
+            "winget upgrade Abdk4Moura.Tunlion"
+        );
+        assert_eq!(
+            InstallSource::Cargo.upgrade_hint(),
+            "cargo install filament-cli"
+        );
         assert_eq!(InstallSource::SelfInstalled.upgrade_hint(), "");
     }
 
@@ -2698,8 +2921,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exec_as_user_argv_drops_through_runuser_on_unix() {
-        let argv = Paths::exec_as_user_argv("/usr/bin/id", &["-un".into()], Some("nobody")).unwrap();
-        assert_eq!(argv, vec!["runuser", "-u", "nobody", "--", "/usr/bin/id", "-un"]);
+        let argv =
+            Paths::exec_as_user_argv("/usr/bin/id", &["-un".into()], Some("nobody")).unwrap();
+        assert_eq!(
+            argv,
+            vec!["runuser", "-u", "nobody", "--", "/usr/bin/id", "-un"]
+        );
         // Same tool as the PTY drop: one mechanism, not two.
         let (pty, _) = Paths::shell_argv(Some("bash"), None, Some("nobody"));
         assert_eq!(pty[0], argv[0]);
@@ -2732,12 +2959,18 @@ mod tests {
         let caps = dir.join("caps.json");
         std::fs::write(&caps, "[]").unwrap();
         std::fs::set_permissions(&caps, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(std::fs::metadata(&caps).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            std::fs::metadata(&caps).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
 
         let repaired = repair_sensitive_permissions_in(&dir).unwrap();
 
         assert_eq!(repaired, 1);
-        assert_eq!(std::fs::metadata(&caps).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&caps).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2751,7 +2984,10 @@ mod tests {
         let uid = format!(
             "{}-cfgname-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         );
         let work = std::env::temp_dir().join(format!("tl-cfg-{uid}"));
         let home = work.join("home");
@@ -2777,10 +3013,18 @@ mod tests {
         restore("TUNLION_CONFIG_DIR", old_override);
         restore("XDG_CONFIG_HOME", old_xdg);
 
-        let names: Vec<String> =
-            dir.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-        assert!(names.iter().any(|n| n == "tunlion"), "config dir is not tunlion's: {dir:?}");
-        assert!(!names.iter().any(|n| n == "filament"), "config dir is filament's: {dir:?}");
+        let names: Vec<String> = dir
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "tunlion"),
+            "config dir is not tunlion's: {dir:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "filament"),
+            "config dir is filament's: {dir:?}"
+        );
         assert_ne!(dir, other);
         assert_eq!(
             std::fs::read(other.join("identity.ed25519")).unwrap(),
@@ -2871,7 +3115,11 @@ pub mod policy_route {
                     Err(e) => failures.push(format!("ip {}: {e}", step.join(" "))),
                 }
             }
-            return if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) };
+            return if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("; "))
+            };
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -2896,7 +3144,9 @@ pub mod policy_route {
 pub fn terminfo_exists(name: &str) -> bool {
     #[cfg(unix)]
     {
-        let Some(first) = name.chars().next() else { return false };
+        let Some(first) = name.chars().next() else {
+            return false;
+        };
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(d) = std::env::var_os("TERMINFO") {
             dirs.push(d.into());
@@ -3057,7 +3307,10 @@ pub fn pty_mode_test_argv(before: &str, after: &str) -> Option<Vec<String>> {
 #[test]
 fn terminfo_lookup_distinguishes_known_from_invented_names() {
     assert!(!terminfo_exists("definitely-not-a-real-terminal-x9"));
-    assert!(terminfo_exists("xterm-256color"), "every Linux/macOS image ships xterm-256color");
+    assert!(
+        terminfo_exists("xterm-256color"),
+        "every Linux/macOS image ships xterm-256color"
+    );
 }
 
 #[cfg(test)]
@@ -3080,7 +3333,10 @@ pub fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (target, link);
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no symlink support on this platform"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no symlink support on this platform",
+        ))
     }
 }
 
@@ -3205,7 +3461,11 @@ pub fn lock_holder_in(locks: &str, major: u64, minor: u64, ino: u64) -> LockHold
             && u64::from_str_radix(mi, 16).ok() == Some(minor)
             && ino_s.parse::<u64>().ok() == Some(ino);
         if same {
-            let pid = fields[4].parse::<i64>().ok().filter(|p| *p > 0).map(|p| p as u32);
+            let pid = fields[4]
+                .parse::<i64>()
+                .ok()
+                .filter(|p| *p > 0)
+                .map(|p| p as u32);
             return LockHolder::Held(pid);
         }
     }
@@ -3359,7 +3619,9 @@ pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
 
 #[cfg(not(any(unix, windows)))]
 pub fn escalate(_pid: u32, _how: Escalate) -> std::io::Result<()> {
-    Err(std::io::Error::other("cannot signal processes on this platform"))
+    Err(std::io::Error::other(
+        "cannot signal processes on this platform",
+    ))
 }
 
 /// Is `pid` stopped (SIGSTOP, a debugger, a terminal stop)? Some(true/false)
@@ -3388,7 +3650,8 @@ pub fn process_stopped(_pid: u32) -> Option<bool> {
 pub fn process_exists(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => !matches!(
-            stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next()),
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next()),
             Some("Z" | "X") | None
         ),
         Err(_) => false,
@@ -3461,7 +3724,11 @@ pub fn stdio_is_file(path: &Path) -> bool {
 pub fn stdout_reader_gone() -> bool {
     #[cfg(unix)]
     {
-        let mut p = libc::pollfd { fd: 1, events: 0, revents: 0 };
+        let mut p = libc::pollfd {
+            fd: 1,
+            events: 0,
+            revents: 0,
+        };
         let n = unsafe { libc::poll(&mut p, 1, 0) };
         n > 0 && (p.revents & (libc::POLLERR | libc::POLLHUP)) != 0
     }
@@ -3486,13 +3753,21 @@ pub fn free_space(dir: &Path) -> Option<u64> {
         if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
             return None;
         }
-        let unit = if st.f_frsize as u64 > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
+        let unit = if st.f_frsize as u64 > 0 {
+            st.f_frsize as u64
+        } else {
+            st.f_bsize as u64
+        };
         Some((st.f_bavail as u64).saturating_mul(unit))
     }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let mut avail: u64 = 0;
         let ok = unsafe {
             windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
@@ -3502,7 +3777,11 @@ pub fn free_space(dir: &Path) -> Option<u64> {
                 std::ptr::null_mut(),
             )
         };
-        if ok == 0 { None } else { Some(avail) }
+        if ok == 0 {
+            None
+        } else {
+            Some(avail)
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -3572,7 +3851,10 @@ pub fn control_socket_path(preferred: &Path, config_dir: &Path) -> PathBuf {
         bases.push(PathBuf::from("/tmp"));
         let candidates: Vec<PathBuf> = bases
             .into_iter()
-            .map(|base| base.join(format!("tunlion-{uid}")).join(format!("{key}.sock")))
+            .map(|base| {
+                base.join(format!("tunlion-{uid}"))
+                    .join(format!("{key}.sock"))
+            })
             .filter(|sock| sock.as_os_str().len() < SOCKET_PATH_MAX)
             .filter(|sock| {
                 let dir = sock.parent().unwrap_or(Path::new("/"));
@@ -3591,7 +3873,9 @@ pub fn control_socket_path(preferred: &Path, config_dir: &Path) -> PathBuf {
             .iter()
             .filter_map(|sock| {
                 let md = std::fs::symlink_metadata(sock).ok()?;
-                md.file_type().is_socket().then(|| (md.modified().ok(), sock))
+                md.file_type()
+                    .is_socket()
+                    .then(|| (md.modified().ok(), sock))
             })
             .max_by_key(|(mtime, _)| *mtime)
             .map(|(_, sock)| sock.clone());
@@ -3721,9 +4005,8 @@ pub fn current_username() -> Option<String> {
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut result: *mut libc::passwd = std::ptr::null_mut();
         let mut buf = vec![0 as libc::c_char; 4096];
-        let rc = unsafe {
-            libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
-        };
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
         if rc == 0 && !result.is_null() && !pwd.pw_name.is_null() {
             let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
                 .to_string_lossy()
@@ -3797,7 +4080,10 @@ mod hostile_env_tests {
         assert!(first.is_some(), "the first taker wins");
         // A second open file description conflicts even inside one process,
         // which is exactly the concurrent-`up` race.
-        assert!(InstanceLock::try_acquire(&path).unwrap().is_none(), "a second taker loses");
+        assert!(
+            InstanceLock::try_acquire(&path).unwrap().is_none(),
+            "a second taker loses"
+        );
         drop(first);
         assert!(
             InstanceLock::try_acquire(&path).unwrap().is_some(),
@@ -3834,7 +4120,11 @@ mod hostile_env_tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let fm = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
-            let dm = std::fs::metadata(f.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+            let dm = std::fs::metadata(f.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!((fm, dm), (0o600, 0o700));
         }
         // No temp left behind by a successful write.
@@ -3874,21 +4164,45 @@ mod hostile_env_tests {
     #[test]
     fn storage_failures_are_classified_for_the_typed_refusal() {
         use std::io::{Error, ErrorKind};
-        assert_eq!(storage_failure(&Error::from(ErrorKind::StorageFull)), Some(StorageFailure::NoSpace));
-        assert_eq!(storage_failure(&Error::from(ErrorKind::QuotaExceeded)), Some(StorageFailure::NoSpace));
-        assert_eq!(storage_failure(&Error::from(ErrorKind::InvalidFilename)), Some(StorageFailure::NameTooLong));
-        assert_eq!(storage_failure(&Error::from(ErrorKind::ReadOnlyFilesystem)), Some(StorageFailure::ReadOnly));
-        assert_eq!(storage_failure(&Error::from(ErrorKind::PermissionDenied)), Some(StorageFailure::Permission));
-        assert_eq!(storage_failure(&Error::from(ErrorKind::ConnectionReset)), None);
+        assert_eq!(
+            storage_failure(&Error::from(ErrorKind::StorageFull)),
+            Some(StorageFailure::NoSpace)
+        );
+        assert_eq!(
+            storage_failure(&Error::from(ErrorKind::QuotaExceeded)),
+            Some(StorageFailure::NoSpace)
+        );
+        assert_eq!(
+            storage_failure(&Error::from(ErrorKind::InvalidFilename)),
+            Some(StorageFailure::NameTooLong)
+        );
+        assert_eq!(
+            storage_failure(&Error::from(ErrorKind::ReadOnlyFilesystem)),
+            Some(StorageFailure::ReadOnly)
+        );
+        assert_eq!(
+            storage_failure(&Error::from(ErrorKind::PermissionDenied)),
+            Some(StorageFailure::Permission)
+        );
+        assert_eq!(
+            storage_failure(&Error::from(ErrorKind::ConnectionReset)),
+            None
+        );
         #[cfg(unix)]
         {
-            assert_eq!(storage_failure(&Error::from_raw_os_error(libc::ENOSPC)), Some(StorageFailure::NoSpace));
+            assert_eq!(
+                storage_failure(&Error::from_raw_os_error(libc::ENOSPC)),
+                Some(StorageFailure::NoSpace)
+            );
             assert_eq!(
                 storage_failure(&Error::from_raw_os_error(libc::ENAMETOOLONG)),
                 Some(StorageFailure::NameTooLong)
             );
             // Re-wrapped with context the OS code is gone, but the kind survives.
-            let wrapped = Error::new(Error::from_raw_os_error(libc::ENOSPC).kind(), "safe create .part: x");
+            let wrapped = Error::new(
+                Error::from_raw_os_error(libc::ENOSPC).kind(),
+                "safe create .part: x",
+            );
             assert_eq!(storage_failure(&wrapped), Some(StorageFailure::NoSpace));
         }
     }
@@ -3896,7 +4210,11 @@ mod hostile_env_tests {
     #[test]
     fn free_space_is_known_for_a_real_directory() {
         let d = std::env::temp_dir();
-        assert!(free_space(&d).is_some(), "no free-space answer for {}", d.display());
+        assert!(
+            free_space(&d).is_some(),
+            "no free-space answer for {}",
+            d.display()
+        );
     }
 
     #[test]
@@ -3935,3 +4253,6 @@ mod hostile_env_tests {
 
 mod recv_daemon;
 pub(crate) use recv_daemon::*;
+
+mod stdin;
+pub(crate) use stdin::spawn_stdin;

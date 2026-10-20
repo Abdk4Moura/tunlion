@@ -141,15 +141,7 @@ pub(crate) async fn recv_cmd(
         crate::shared_defs::REMEMBER_STORED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     match outcome {
-        DriverOutcome::Returned(result) => result.map_err(|e| {
-            match e.downcast::<filament_peerloop::recv::report::RefusedFailure>() {
-                Ok(refused) => crate::recv_report::as_error(crate::recv_report::RefusedOutcome {
-                    kind: refused.kind,
-                    message: refused.message,
-                }),
-                Err(e) => e,
-            }
-        }),
+        DriverOutcome::Returned(result) => result.map_err(map_dispatch_error),
         DriverOutcome::Cancelled => {
             if daemon {
                 log.say(&format!(
@@ -168,6 +160,34 @@ pub(crate) async fn recv_cmd(
     }
 }
 
+/// Coerce the library's typed failures onto the CLI exit taxonomy. The chain
+/// is preserved when the error is not one of the library types.
+pub(crate) fn map_dispatch_error(error: anyhow::Error) -> anyhow::Error {
+    let error = match error.downcast::<filament_peerloop::recv::report::RefusedFailure>() {
+        Ok(refused) => {
+            return crate::recv_report::as_error(crate::recv_report::RefusedOutcome {
+                kind: refused.kind,
+                message: refused.message,
+            });
+        }
+        Err(error) => error,
+    };
+    match error.downcast::<filament_peerloop::recv::dispatch::DispatchFailure>() {
+        Ok(failure) => {
+            let kind = match failure.kind {
+                filament_peerloop::recv::dispatch::DispatchFailureKind::Usage => {
+                    exit_codes::ExitKind::Usage
+                }
+                filament_peerloop::recv::dispatch::DispatchFailureKind::Unreachable => {
+                    exit_codes::ExitKind::Unreachable
+                }
+            };
+            exit_codes::err(kind, &failure.message)
+        }
+        Err(error) => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +200,33 @@ mod tests {
         assert!(source.lines().count() < 500, "the adapter is thin");
         assert!(source.contains("recv::dispatch"));
         assert!(!source.contains(concat!("Ev::", "Chunk(")));
+    }
+
+    #[test]
+    fn invalid_expect_pin_maps_to_usage_exit_and_json() {
+        let error =
+            filament_peerloop::recv::dispatch::validate_expect_sha256(Some("bad")).unwrap_err();
+        let mapped = map_dispatch_error(error);
+        assert_eq!(
+            crate::exit_codes::classify(&mapped),
+            crate::exit_codes::ExitKind::Usage
+        );
+        assert_eq!(crate::exit_codes::classify(&mapped).code(), 2);
+        assert_eq!(crate::exit_codes::json_code(&mapped), "usage");
+    }
+
+    #[test]
+    fn empty_timeout_maps_to_unreachable_exit_and_json() {
+        let error = anyhow::Error::new(filament_peerloop::recv::dispatch::receive_timeout_failure(
+            0,
+        ));
+        let mapped = map_dispatch_error(error);
+        assert_eq!(
+            crate::exit_codes::classify(&mapped),
+            crate::exit_codes::ExitKind::Unreachable
+        );
+        assert_eq!(crate::exit_codes::classify(&mapped).code(), 6);
+        assert_eq!(crate::exit_codes::json_code(&mapped), "unreachable");
     }
 
     #[test]
