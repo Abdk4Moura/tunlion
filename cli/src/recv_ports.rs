@@ -547,7 +547,7 @@ impl RecvServers for CliRecv {
             // reduced profile. Refuse a well-formed L2 sid by name so the
             // initiator reports a build limitation instead of timing out.
             if let Some(sid) = filament_peerloop::l2::wire_sid(v)
-                .filter(filament_peerloop::l2::is_l2_sid)
+                .filter(|sid| filament_peerloop::l2::is_l2_sid(*sid))
             {
                 let _ = t
                     .send_control(&json!({
