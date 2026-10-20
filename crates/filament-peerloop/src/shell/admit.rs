@@ -186,11 +186,13 @@ pub async fn admit_pty_open(
     // persistent PTY. DEVICE-SCOPED: prefixed with the verified device so a
     // client id from device A can never address device B's session (no
     // cross-device collision or hijack) - the random per-invocation client id
-    // then only needs to be unique per device. Absent (older client) -> a
-    // per-sid id that never reattaches (old behavior).
+    // then only needs to be unique per device. The client id must not contain
+    // the scope separator, or the scoped string would be ambiguous to the
+    // resolver at close. Absent/invalid (older client) -> a per-sid id that
+    // never reattaches (old behavior).
     let session = match v["session"]
         .as_str()
-        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .filter(|s| !s.is_empty() && s.len() <= 128 && !s.contains('\u{1}'))
     {
         Some(s) => format!("{}\u{1}{}", device.as_deref().unwrap_or(pid), s),
         None => format!("{pid}:{sid:#x}"),
@@ -568,8 +570,15 @@ mod tests {
         assert_eq!(plan.resume_from, Some(12));
         assert!(plan.admitted_via_ceiling, "covered and grantless");
 
-        // Absent, empty and over-long session ids fall back to the per-sid id.
-        for bad in [Value::Null, json!(""), json!("x".repeat(129))] {
+        // Absent, empty, over-long and separator-bearing session ids fall back
+        // to the per-sid id: a client id containing `\u{1}` would make the
+        // device scope ambiguous when a close resolves it.
+        for bad in [
+            Value::Null,
+            json!(""),
+            json!("x".repeat(129)),
+            json!("dev\u{1}client"),
+        ] {
             let v = pty_frame(json!({"session": bad.clone()}));
             let out = admit_pty_open(&mut conn, PID, &v, &cfg(&policy, true), || false).await;
             let ShellAdmission::Admitted { plan, .. } = out else {

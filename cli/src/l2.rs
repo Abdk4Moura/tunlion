@@ -165,7 +165,8 @@ struct OutBind {
 }
 
 /// Commands to a session's task: (re)bind output to a new link, detach, or end.
-enum SessionCmd {
+/// `pub(crate)` only so a crate test can observe the explicit-close command.
+pub(crate) enum SessionCmd {
     Attach {
         transport: Arc<dyn Transport>,
         sid: u32,
@@ -219,6 +220,26 @@ impl PtySessionHandle {
     /// `pty-close` / user-closed path, NOT a transient channel drop).
     pub fn end(&self) {
         let _ = self.cmd_tx.send(SessionCmd::End);
+    }
+}
+
+#[cfg(test)]
+impl PtySessionHandle {
+    /// A live-looking handle with no task behind it, plus the command receiver,
+    /// so a test can assert which command the close path sent.
+    pub(crate) fn test_probe() -> (Self, mpsc::UnboundedReceiver<SessionCmd>) {
+        let (input_tx, _) = std::sync::mpsc::channel();
+        let (resize_tx, _) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                input_tx,
+                resize_tx,
+                cmd_tx,
+                dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            cmd_rx,
+        )
     }
 }
 

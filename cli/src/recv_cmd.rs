@@ -148,6 +148,123 @@ mod caps_reannounce_tests {
     }
 }
 
+#[cfg(test)]
+mod pty_close_tests {
+    use super::*;
+
+    fn scoped(device: &str, client: &str) -> String {
+        format!("{device}\u{1}{client}")
+    }
+
+    fn two_links() -> HashMap<String, HashMap<u32, String>> {
+        HashMap::from([
+            (
+                "pid-a".to_string(),
+                HashMap::from([(1, scoped("dev-a", "client-a"))]),
+            ),
+            (
+                "pid-b".to_string(),
+                HashMap::from([(2, scoped("dev-b", "client-b"))]),
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn another_devices_scoped_value_cannot_end_its_session() {
+        let sessions = l2::PtySessions::new();
+        let (a_handle, mut a_cmds) = l2::PtySessionHandle::test_probe();
+        sessions.insert(scoped("dev-a", "client-a"), a_handle).await;
+        let mut bindings = two_links();
+
+        // B presents A's EXACT scoped value. Only B's own bindings are searched,
+        // so this must not resolve, must not touch the global session, and must
+        // not change either link's bindings.
+        let closed =
+            close_bound_pty("pid-b", &scoped("dev-a", "client-a"), &sessions, &mut bindings).await;
+
+        assert!(!closed);
+        assert!(
+            sessions.get_live(&scoped("dev-a", "client-a")).await.is_some(),
+            "A's shell is still alive"
+        );
+        assert!(
+            a_cmds.try_recv().is_err(),
+            "A's session was never sent End"
+        );
+        assert_eq!(
+            bindings["pid-a"].get(&1),
+            Some(&scoped("dev-a", "client-a"))
+        );
+        assert_eq!(
+            bindings["pid-b"].get(&2),
+            Some(&scoped("dev-b", "client-b"))
+        );
+    }
+
+    #[tokio::test]
+    async fn b_raw_client_id_ends_b_and_removes_only_b_binding() {
+        let sessions = l2::PtySessions::new();
+        let (a_handle, _a_cmds) = l2::PtySessionHandle::test_probe();
+        let (b_handle, mut b_cmds) = l2::PtySessionHandle::test_probe();
+        sessions.insert(scoped("dev-a", "client-a"), a_handle).await;
+        sessions.insert(scoped("dev-b", "client-b"), b_handle).await;
+        let mut bindings = two_links();
+
+        assert!(close_bound_pty("pid-b", "client-b", &sessions, &mut bindings).await);
+
+        assert!(
+            matches!(b_cmds.try_recv(), Ok(l2::SessionCmd::End)),
+            "the explicit close ends B's shell"
+        );
+        assert!(sessions.get_live(&scoped("dev-b", "client-b")).await.is_none());
+        assert!(
+            sessions.get_live(&scoped("dev-a", "client-a")).await.is_some(),
+            "A is untouched"
+        );
+        assert!(bindings["pid-b"].is_empty(), "B's sid binding is gone");
+        assert_eq!(
+            bindings["pid-a"].get(&1),
+            Some(&scoped("dev-a", "client-a")),
+            "A's binding is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_then_reopen_spawns_fresh_instead_of_reattaching() {
+        let sessions = l2::PtySessions::new();
+        let (b_handle, _b_cmds) = l2::PtySessionHandle::test_probe();
+        sessions.insert(scoped("dev-b", "client-b"), b_handle).await;
+        let mut bindings = two_links();
+
+        assert!(close_bound_pty("pid-b", "client-b", &sessions, &mut bindings).await);
+
+        // `handle_pty_open` reattaches only when `get_live` finds this scoped
+        // id. The close removed both the session and its binding, so the same
+        // client id now takes the spawn path.
+        assert!(sessions.get_live(&scoped("dev-b", "client-b")).await.is_none());
+        assert!(bindings["pid-b"].is_empty());
+        assert!(
+            !close_bound_pty("pid-b", "client-b", &sessions, &mut bindings).await,
+            "a second close has nothing to end"
+        );
+    }
+
+    #[test]
+    fn an_own_scoped_value_still_resolves_exactly() {
+        let bindings = two_links();
+        assert_eq!(
+            pty_close_target(&bindings["pid-a"], &scoped("dev-a", "client-a")).as_deref(),
+            Some(scoped("dev-a", "client-a").as_str())
+        );
+        assert_eq!(
+            pty_close_target(&bindings["pid-a"], "client-a").as_deref(),
+            Some(scoped("dev-a", "client-a").as_str())
+        );
+        assert!(pty_close_target(&bindings["pid-a"], "").is_none());
+        assert!(pty_close_target(&bindings["pid-a"], "client-b").is_none());
+    }
+}
+
 /// A shell-class open parked while its link's possession proof is in flight
 /// (settle-then-evaluate). The link is identified by pid AND the device key
 /// known at park time: only a proof for the same identity on the same link
@@ -571,6 +688,54 @@ async fn handle_forward_open(
 /// a second rule.
 fn serving_off_refusal(conn: &Conn, pid: &str, off: crate::refusal::Code) -> crate::refusal::Refusal {
     filament_peerloop::shell::off::serving_off_refusal(conn, pid, off)
+}
+
+/// Resolve the client id in a `pty-close` frame against the caller's OWN
+/// `sid -> device-scoped session` bindings.
+///
+/// The browser presents the raw id it chose, while `pty_sessions` is keyed by
+/// the device-scoped value built at `pty-open` (`<device>\u{1}<client id>`).
+/// Match only within this map: the stored value exactly, or its client-id
+/// suffix after the single scope separator. There is deliberately no fallback
+/// to a global `pty_sessions` lookup, so presenting another device's scoped
+/// value cannot end that device's shell.
+fn pty_close_target(bindings: &HashMap<u32, String>, presented: &str) -> Option<String> {
+    if presented.is_empty() {
+        return None;
+    }
+    bindings.values().find_map(|stored| {
+        let matches = stored == presented
+            || stored
+                .split_once('\u{1}')
+                .is_some_and(|(_, client_id)| client_id == presented);
+        matches.then(|| stored.clone())
+    })
+}
+
+/// End the session a `pty-close` frame addresses, but only when that session is
+/// bound to the calling link (`pid`). Returns whether anything was closed.
+async fn close_bound_pty(
+    pid: &str,
+    presented: &str,
+    pty_sessions: &l2::PtySessions,
+    pty_bindings: &mut HashMap<String, HashMap<u32, String>>,
+) -> bool {
+    let Some(scoped) = pty_bindings
+        .get(pid)
+        .and_then(|bindings| pty_close_target(bindings, presented))
+    else {
+        return false;
+    };
+    if let Some(sess) = pty_sessions.get_live(&scoped).await {
+        sess.end(); // kill the shell now
+    }
+    pty_sessions.remove(&scoped).await;
+    if let Some(bindings) = pty_bindings.get_mut(pid) {
+        // Drop every sid alias for this one scoped session; other links and
+        // other sessions keep their bindings.
+        bindings.retain(|_, stored| stored != &scoped);
+    }
+    true
 }
 
 /// Accept one `pty-open` frame: validate, shell-gate, attach or spawn,
@@ -6969,14 +7134,12 @@ async fn recv_run(
                 // Distinct from a bare channel drop, which only DETACHES. Kills the
                 // shell and removes the session so a later open spawns fresh.
                 Some("pty-close") if l2_enabled => {
-                    if let Some(session_id) = v["session"].as_str() {
-                        if let Some(sess) = pty_sessions.get_live(session_id).await {
-                            sess.end(); // kill the shell now
-                        }
-                        pty_sessions.remove(session_id).await;
-                        if let Some(sid_map) = pty_bindings.get_mut(&pid) {
-                            sid_map.retain(|_, v| v != session_id);
-                        }
+                    // Resolve only against this caller's own bindings: a raw
+                    // client id (the browser's) must not be looked up in the
+                    // global session map, where another device's scope would
+                    // match and its shell could be killed.
+                    if let Some(presented) = v["session"].as_str().filter(|s| !s.is_empty()) {
+                        close_bound_pty(&pid, presented, &pty_sessions, &mut pty_bindings).await;
                     }
                 }
                 // Client confirmed the protocol version advertised in mount-open-ack.
