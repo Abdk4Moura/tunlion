@@ -10310,19 +10310,19 @@ mod inventory {
 
     #[test]
     fn unserved_forward_and_sync_opens_are_named_closes() {
-        let forward = json!({ "type": "l2-open", "sid": 42u32 });
+        let forward = json!({ "type": "l2-open", "sid": 0x8000_0042u32 });
         let close = super::unserved_open_close(&forward, crate::refusal::TUNNEL_OFF_REASON)
             .expect("a valid forward sid must get a close");
         assert_eq!(close["type"], "l2-close");
-        assert_eq!(close["sid"], 42);
+        assert_eq!(close["sid"], 0x8000_0042u32);
         assert!(close["err"]
             .as_str()
             .is_some_and(|reason| reason.contains("tunnelling is off")));
 
-        let sync = json!({ "type": "sync-open", "sid": 43u32 });
+        let sync = json!({ "type": "sync-open", "sid": 0x8000_0043u32 });
         let (sid, close) = crate::recv::servers::sync_unavailable_close(&sync)
             .expect("a valid sync sid must get a close");
-        assert_eq!(sid, 43);
+        assert_eq!(sid, 0x8000_0043u32);
         assert_eq!(close["type"], "l2-close");
         assert!(close["err"]
             .as_str()
@@ -10333,11 +10333,11 @@ mod inventory {
     fn unserved_mount_open_is_a_named_close_without_l2() {
         // A Core-like reduced host has l2_enabled=false. The mount-open arm
         // must still answer with a valid sid and a named reason.
-        let open = json!({ "type": "mount-open", "sid": 41u32 });
+        let open = json!({ "type": "mount-open", "sid": 0x8000_0041u32 });
         let close = super::unserved_open_close(&open, "mount serving is off in this core profile")
             .expect("a valid sid must get a close");
         assert_eq!(close["type"], "l2-close");
-        assert_eq!(close["sid"], 41);
+        assert_eq!(close["sid"], 0x8000_0041u32);
         assert!(close["err"]
             .as_str()
             .is_some_and(|reason| reason.contains("mount serving is off")));
