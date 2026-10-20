@@ -1014,13 +1014,14 @@ impl RecvDaemon for CliRecv {
         let tok = l2::proxy_token().map_err(|e| format!("cannot create its token: {e}"))?;
         self.record_proxy("127.0.0.1", port);
         let server = server.to_string();
+        let log = self.log.clone();
         tokio::spawn(async move {
             if let Err(e) =
                 l2::proxy_serve(&server, listener, "127.0.0.1", port, 0, relay, tok.into()).await
             {
                 // A proxy that stops is reported on the daemon log; the loop
                 // does not own its lifetime.
-                eprintln!("auto-proxy on 127.0.0.1:{port} stopped: {e}");
+                log.critical(&format!("auto-proxy on 127.0.0.1:{port} stopped: {e}"));
             }
         });
         Ok((port, l2::proxy_usage_lines("127.0.0.1", port)))
