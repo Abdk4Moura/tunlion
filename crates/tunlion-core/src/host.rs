@@ -10,9 +10,8 @@
 //! deny by default because the capability policy site is not composed in this
 //! profile; that is a refusal, never an allow.
 
-use crate::CoreError;
 use async_trait::async_trait;
-use filament_cap::capability::{expired_reason, GateDecision};
+use filament_cap::capability::GateDecision;
 use filament_id::{now_secs, DeviceCert, UserKey};
 use filament_peerloop::conn::Conn;
 use filament_peerloop::host::{
@@ -396,7 +395,7 @@ impl HostServices for CoreHost {
             .filter(|access| access.expired(now_secs()))
             .map(|access| LiveCut {
                 cause: LiveCutCause::Expired,
-                reason: expired_reason(access.deadline),
+                reason: filament_peerloop::refusal::expired_reason(access.deadline),
             })
     }
 
@@ -847,6 +846,27 @@ impl RecvDaemon for CoreDaemon {
     fn mark_daemon_ready(&mut self) {}
     fn record_proxy(&self, _bind: &str, _port: u16) {}
     fn maybe_hint_local_wedge(&mut self, _shown: &mut bool) {}
+    fn wg_usable(&self) -> bool {
+        false
+    }
+    fn wg_claim_attempt(&self, _addr: &str) -> bool {
+        false
+    }
+    fn wg_release_attempt(&mut self, _addr: &str) {}
+    fn wg_local_offer(&mut self) -> anyhow::Result<(String, u16)> {
+        anyhow::bail!("wireguard is not served by this core profile")
+    }
+    async fn wg_adopt_peer(
+        &mut self,
+        _peer_pub: &str,
+        _peer_overlay: &str,
+        _our_overlay: &str,
+        _mtu: u32,
+        _peer_underlay: std::net::IpAddr,
+        _peer_wg_port: u16,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("wireguard is not served by this core profile")
+    }
     fn subnet_enable(
         &mut self,
         _ifname: &str,
