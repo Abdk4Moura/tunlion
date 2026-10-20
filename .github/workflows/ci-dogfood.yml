@@ -1,4 +1,4 @@
-# Dogfood: run one CI job whose payload and artifacts travel over tunlion.
+# Dogfood: run a payload job, or reuse one bounded CI worker over tunlion.
 #
 # Dispatch only, from scripts/ci-dogfood.sh, which mints a single-use invitation,
 # sets it as TUNLION_INVITE, and sends the payload once the device shows up.
@@ -7,7 +7,9 @@
 # the binary from the last green `publish-edge` run and verifies its sha256, so
 # the only things this job needs are a key and a payload. Nothing here accepts
 # an arbitrary command string: the payload carries job.json and the steps run
-# exactly its declared `cmd`.
+# exactly its declared `cmd`. The explicit worker_minutes mode instead keeps
+# this single machine/cache alive for multiple trusted owner-driven jobs. Shell
+# access is enabled only for host_name, never through an Internet-facing sshd.
 name: ci-dogfood
 
 on:
@@ -47,6 +49,7 @@ jobs:
       - name: Fetch the tunlion binary (no repo, no build)
         env:
           GH_TOKEN: ${{ github.token }}
+          WORKER_MODE: ${{ inputs.worker_minutes }}
         run: |
           set -euo pipefail
           echo "WORK=$RUNNER_TEMP/tunlion-work" >> "$GITHUB_ENV"
@@ -68,6 +71,25 @@ jobs:
           chmod +x "$RUNNER_TEMP/bin/tunlion"
           "$RUNNER_TEMP/bin/tunlion" --version
           echo "TUNLION_BIN=$RUNNER_TEMP/bin/tunlion" >> "$GITHUB_ENV"
+          # No source checkout is needed for the worker bootstrap. This key is
+          # public metadata only; dependency/target bytes persist across leases.
+          if [ "$WORKER_MODE" != 0 ]; then
+            lock=$(gh api "repos/${GITHUB_REPOSITORY}/contents/Cargo.lock?ref=main" --jq '.sha')
+            echo "CARGO_CACHE_KEY=$lock" >> "$GITHUB_ENV"
+          fi
+
+      - name: Restore the reusable worker's Cargo cache
+        if: inputs.worker_minutes != '0'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/tunlion-work/cargo-target
+          key: ci-worker-linux-${{ env.CARGO_CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ci-worker-linux-${{ env.CARGO_CACHE_KEY }}-
+            ci-worker-linux-
 
       - name: Join and serve with one command
         env:
