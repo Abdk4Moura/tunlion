@@ -275,7 +275,7 @@ mod reduced_tests {
         let transport = Arc::new(RecordingTransport::default());
         let t: Arc<dyn filament_transport::net::Transport> = transport.clone();
         let result = open_sync(
-            |_| Some(t),
+            |_| Some(t.clone()),
             "peer",
             &json!({
                 "type": "sync-open",
