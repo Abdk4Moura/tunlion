@@ -67,7 +67,28 @@ pub(crate) async fn recv_cmd(
             .map(|x| x == "1")
             .unwrap_or(false),
         daemon_ready: false,
+        pid: std::process::id(),
+        interactive_terminal: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        pair_grace: std::env::var("TUNLION_PAIR_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::from_secs(60)),
+        fleet_offer_grace: std::env::var("TUNLION_FLEET_OFFER_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::from_secs(8)),
+        trace_throughput: std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok(),
+        supervised: std::env::var("INVOCATION_ID").is_ok(),
+        loop_stall_secs: std::env::var("TUNLION_LOOP_STALL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20),
+        remember_stored: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        delivery: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
+    let remember_stored = env.remember_stored.clone();
     let engine = Engine::start(stop.clone(), move |stop, readiness| async move {
         let cli = Arc::new(crate::recv_ports::CliRecv::new(engine_log.clone()));
         let ports = RecvPorts::new(
