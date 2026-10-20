@@ -24,7 +24,6 @@ use filament_peerloop::host::{LogSink, Tone};
 use filament_peerloop::l2 as lib_l2;
 use filament_peerloop::l2::forward;
 use filament_peerloop::l2::Mux;
-use filament_peerloop::mesh::MeshTunnel;
 use filament_peerloop::recv::dispatch::{self, settle_timeout_reason};
 use filament_peerloop::recv::dispatch::{ParkKind, ParkedOpen};
 use filament_peerloop::recv::ports::{
@@ -32,6 +31,7 @@ use filament_peerloop::recv::ports::{
 };
 use filament_peerloop::recv::report::RecvReport;
 use filament_peerloop::recv::IncomingFile;
+use filament_peerloop::recv::MeshTunnel;
 use filament_peerloop::session::Session;
 use filament_peerloop::shell::ShellHost;
 use filament_peerloop::shell_gate::PeerAuthz;
@@ -53,6 +53,7 @@ pub struct CliRecv {
     pub pending_bootstrap: crate::platform::PendingBootstraps,
     pub daemon_mounts: crate::DaemonMounts,
     pub last_mount_check: Instant,
+    #[cfg(feature = "mesh")]
     pub exposer: Option<Arc<crate::expose::Exposer>>,
 }
 
@@ -69,6 +70,7 @@ impl Default for CliRecv {
                 children: HashMap::new(),
             },
             last_mount_check: Instant::now(),
+            #[cfg(feature = "mesh")]
             exposer: None,
         }
     }
@@ -564,29 +566,6 @@ impl RecvServers for CliRecv {
         .await
     }
 
-    async fn open_sync(
-        &mut self,
-        conn: &mut Conn,
-        pid: &str,
-        v: &Value,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        dir: &Path,
-        parked: &mut Vec<ParkedOpen>,
-    ) -> Option<(u32, filament_peerloop::sync::serving::SyncServeTask)> {
-        crate::sync_cmd::handle_sync_open(conn, pid, v, muxes, dir, parked).await
-    }
-
-    async fn open_mount(
-        &mut self,
-        conn: &mut Conn,
-        pid: &str,
-        v: &Value,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        share_root: &Path,
-    ) {
-        crate::platform::open_mount(conn, pid, v, muxes, share_root).await;
-    }
-
     async fn ssh_sign(
         &mut self,
         conn: &mut Conn,
@@ -702,10 +681,18 @@ impl RecvServers for CliRecv {
     }
 
     async fn start_expose(&mut self, tunnel: Arc<dyn MeshTunnel>) -> usize {
-        let ex = crate::expose::Exposer::new(tunnel);
-        let n = ex.reconcile().await;
-        self.exposer = Some(ex);
-        n
+        #[cfg(feature = "mesh")]
+        {
+            let ex = crate::expose::Exposer::new(tunnel);
+            let n = ex.reconcile().await;
+            self.exposer = Some(ex);
+            n
+        }
+        #[cfg(not(feature = "mesh"))]
+        {
+            let _ = tunnel;
+            0
+        }
     }
 
     async fn reconcile_expose(&mut self, tunnel: &Arc<dyn MeshTunnel>) -> usize {
@@ -713,9 +700,16 @@ impl RecvServers for CliRecv {
     }
 
     async fn reload_expose(&mut self) -> usize {
-        match self.exposer.as_ref() {
-            Some(ex) => ex.reconcile().await,
-            None => 0,
+        #[cfg(feature = "mesh")]
+        {
+            match self.exposer.as_ref() {
+                Some(ex) => ex.reconcile().await,
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "mesh"))]
+        {
+            0
         }
     }
 }

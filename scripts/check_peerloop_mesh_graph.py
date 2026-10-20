@@ -65,10 +65,10 @@ def main():
             if args.output_dir:
                 (args.output_dir / f"{label}.txt").write_text(graph)
             try:
-                count = check_graph(graph, mesh=profile != "minimal")
+                count = check_graph(graph, mesh=profile in ("mesh", "default"))
             except RuntimeError as error:
                 raise RuntimeError(f"{label}: {error}\n{graph}") from error
-            print(f"PASS: {label}: {count} packages; mesh={profile != 'minimal'}")
+            print(f"PASS: {label}: {count} packages; mesh={profile in ('mesh', 'default')}")
 
 
 if __name__ == "__main__":

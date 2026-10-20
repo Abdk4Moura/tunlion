@@ -22,7 +22,7 @@
 use crate::conn::Conn;
 use crate::host::HostServices;
 use crate::l2::Mux;
-use crate::mesh::MeshTunnel;
+use crate::recv::MeshTunnel;
 use crate::recv::{IncomingFile, RecvReport};
 use crate::shell_gate::ShellPolicy;
 use crate::sync::serving::SyncServeTask;
@@ -267,24 +267,6 @@ pub trait RecvServers: Send + Sync {
         parked: &mut Vec<crate::recv::dispatch::ParkedOpen>,
     );
     #[allow(clippy::too_many_arguments)]
-    async fn open_sync(
-        &mut self,
-        conn: &mut Conn,
-        pid: &str,
-        v: &Value,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        dir: &Path,
-        parked: &mut Vec<crate::recv::dispatch::ParkedOpen>,
-    ) -> Option<(u32, SyncServeTask)>;
-    #[allow(clippy::too_many_arguments)]
-    async fn open_mount(
-        &mut self,
-        conn: &mut Conn,
-        pid: &str,
-        v: &Value,
-        muxes: &mut HashMap<String, Arc<Mux>>,
-        share_root: &Path,
-    );
     #[allow(clippy::too_many_arguments)]
     async fn ssh_sign(
         &mut self,
@@ -709,26 +691,6 @@ pub(crate) mod test_support {
             _: &mut HashMap<String, Arc<Mux>>,
             _: bool,
             _: &mut Vec<ParkedOpen>,
-        ) {
-        }
-        async fn open_sync(
-            &mut self,
-            _: &mut Conn,
-            _: &str,
-            _: &Value,
-            _: &mut HashMap<String, Arc<Mux>>,
-            _: &Path,
-            _: &mut Vec<ParkedOpen>,
-        ) -> Option<(u32, SyncServeTask)> {
-            None
-        }
-        async fn open_mount(
-            &mut self,
-            _: &mut Conn,
-            _: &str,
-            _: &Value,
-            _: &mut HashMap<String, Arc<Mux>>,
-            _: &Path,
         ) {
         }
         async fn ssh_sign(

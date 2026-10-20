@@ -21,7 +21,6 @@ use crate::driver::DriverOutcome;
 use crate::host::{CapGate, HostServices, Level, LogSink, StorageFailure, Tone};
 use crate::l2::{self, Mux};
 use crate::limits::MAX_ATTEMPTS;
-use crate::mesh::MeshTunnel;
 #[cfg(feature = "mesh")]
 use crate::mesh::{
     accept_advertised, advertised_prefixes, sanitize_host, L3Mode, RouteAcceptance, RoutePolicy,
@@ -32,6 +31,7 @@ use crate::recv::ceremony::{Ceremony, Inbound as PakeInbound};
 use crate::recv::ports::{RecvDaemon, RecvPorts, RecvServers};
 use crate::recv::report::{RecvReport, RefusalClass};
 use crate::recv::signaling_health;
+use crate::recv::MeshTunnel;
 use crate::recv::{IncomingFile, PartMeta, StdoutSink, WriteFailure};
 use crate::refusal::Code as RefusalCode;
 use crate::secret::fresh_secret;
@@ -42,10 +42,12 @@ use crate::shell_gate::ShellPolicy;
 use crate::{refusal, test_hooks};
 use anyhow::{anyhow, bail, Context, Result};
 use filament_cap::capability as cap;
+#[cfg(feature = "fleet")]
 use filament_fleet as fleet;
 use filament_id as identity;
 #[cfg(feature = "mesh")]
 use filament_overlay::Announce;
+#[cfg(feature = "mesh")]
 use filament_overlay::{b64, unb64};
 use filament_pair as pake;
 use filament_proto as protocol;
@@ -1457,6 +1459,8 @@ async fn recv_run(
     // (review fix #3).
     #[cfg(feature = "mesh")]
     let mut l3_seen: HashMap<String, Announce> = HashMap::new();
+    #[cfg(not(feature = "mesh"))]
+    let l3: Option<std::sync::Arc<dyn MeshTunnel>> = None;
     #[cfg(feature = "mesh")]
     let l3: Option<std::sync::Arc<dyn MeshTunnel>> = if daemon {
         match host.settings_get_str("tun-addr") {
@@ -2611,17 +2615,17 @@ async fn recv_run(
                             );
                             continue;
                         }
-                        if let Some((sid, task)) = ports
-                            .servers
-                            .open_sync(
-                                &mut conn,
-                                &p.pid,
-                                &p.v,
-                                &mut l2_muxes,
-                                &dir,
-                                &mut parked_opens,
-                            )
-                            .await
+                        if let Some((sid, task)) = crate::recv::servers::open_sync(
+                            &ports,
+                            host.as_ref(),
+                            &mut conn,
+                            &p.pid,
+                            &p.v,
+                            &mut l2_muxes,
+                            &dir,
+                            &mut parked_opens,
+                        )
+                        .await
                         {
                             sync_tasks
                                 .track_sync_task(p.pid.clone(), sid, task, log.as_ref())
@@ -4987,6 +4991,7 @@ async fn recv_run(
                         }
                     }
                 }
+                #[cfg(feature = "mesh")]
                 Some("l3-nonce") => {
                     match v["nonce"].as_str().map(unb64) {
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
@@ -5034,6 +5039,7 @@ async fn recv_run(
                 // possession bound to THIS link, a certificate chaining to OUR
                 // owner key, and both naming the same device key. Anything less
                 // and the link stays unverified, so it never gains a route.
+                #[cfg(feature = "fleet")]
                 Some(fleet::HELLO) => {
                     let link_fps = link_fingerprints(&conn, &pid).await;
                     let cb = conn
@@ -5283,6 +5289,7 @@ async fn recv_run(
                 // would let mere presence on the fleet channel manufacture a
                 // trusted-looking peering, which is the one thing this design says
                 // presence must never buy.
+                #[cfg(feature = "fleet")]
                 Some("fleet-rendezvous") if fleet_verified.contains(&pid) => {
                     match v["secret"].as_str() {
                         Some(sec) if hex::decode(sec).map(|b| b.len()).ok() == Some(32) => {
@@ -6401,10 +6408,17 @@ async fn recv_run(
                         crate::conn::dropped_no_transport(log.as_ref(), &pid, "sync-open");
                         continue;
                     }
-                    if let Some((sid, task)) = ports
-                        .servers
-                        .open_sync(&mut conn, &pid, &v, &mut l2_muxes, &dir, &mut parked_opens)
-                        .await
+                    if let Some((sid, task)) = crate::recv::servers::open_sync(
+                        &ports,
+                        host.as_ref(),
+                        &mut conn,
+                        &pid,
+                        &v,
+                        &mut l2_muxes,
+                        &dir,
+                        &mut parked_opens,
+                    )
+                    .await
                     {
                         sync_tasks
                             .track_sync_task(pid.clone(), sid, task, log.as_ref())
@@ -6443,16 +6457,14 @@ async fn recv_run(
                     // The endpoint returns the serving task so a future driver
                     // can join it; binding and dropping it here is today's
                     // detached behaviour, unchanged.
-                    let _mount_server = ports
-                        .servers
-                        .open_mount(
-                            &mut conn,
-                            &pid,
-                            &v,
-                            &mut l2_muxes,
-                            &ports.daemon.fleet_share_root(),
-                        )
-                        .await;
+                    let _mount_server = crate::mount::handle_mount_open(
+                        &mut conn,
+                        &pid,
+                        &v,
+                        &mut l2_muxes,
+                        &ports.daemon.fleet_share_root(),
+                    )
+                    .await;
                 }
                 #[cfg(not(feature = "mount-server"))]
                 Some("mount-open") if l2_enabled => {

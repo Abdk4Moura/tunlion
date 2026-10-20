@@ -99,3 +99,92 @@ pub async fn open_forward(
 
 #[allow(dead_code)]
 fn _transport(_: &Arc<dyn Transport>) {}
+
+/// Directory-sync admission and serving. The protocol and task ownership are
+/// library code; the host supplies only the drop directory and request queue.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_sync(
+    ports: &RecvPorts,
+    host: &dyn HostServices,
+    conn: &mut crate::conn::Conn,
+    pid: &str,
+    v: &Value,
+    muxes: &mut HashMap<String, Arc<Mux>>,
+    drop_dir: &std::path::Path,
+    parked: &mut Vec<ParkedOpen>,
+) -> Option<(u32, crate::sync::serving::SyncServeTask)> {
+    use crate::sync::{SyncAccepted, SyncAdmission};
+    match crate::sync::admit_sync_open(conn, pid, v, muxes, drop_dir).await {
+        SyncAdmission::Accepted(a) => {
+            let SyncAccepted {
+                sid,
+                who,
+                root,
+                dry_run,
+                delete,
+                rx,
+                mux,
+                transport: t,
+            } = a;
+            conn.log.say(&format!(
+                "sync: '{who}' -> {}{}",
+                root.display(),
+                if dry_run { " (dry run)" } else { "" }
+            ));
+            let task =
+                crate::sync::serving::spawn_sync_server(crate::sync::serving::SyncServeConfig {
+                    transport: t,
+                    mux,
+                    sid,
+                    root,
+                    delete,
+                    dry_run,
+                    stream: rx,
+                    max_record_bytes: crate::sync::MAX_SYNC_RECORD_BYTES,
+                });
+            return Some((sid, task));
+        }
+        SyncAdmission::Denied(d) => {
+            let known = |p: &[u8; 32]| ports.store.devices_find_by_device_pub(p).is_some();
+            let revoked = |p: &[u8; 32]| ports.identity.device_cert_revoked(p);
+            let delegated = |p: &[u8; 32]| {
+                host.delegated_access_for(p)
+                    .is_some_and(|a| a.expired(filament_id::now_secs()))
+            };
+            let denied = |n: &str, c: &str| host.device_capability_denied(n, c);
+            if park_on_deny(
+                &known,
+                &revoked,
+                &delegated,
+                &denied,
+                ports.identity.gate_settle_ms(),
+                parked,
+                conn,
+                pid,
+                ParkKind::Sync,
+                &d.transport,
+                d.park.sid,
+                v,
+                &d.park.reason,
+            )
+            .await
+            {
+                return None;
+            }
+            let name = conn.link(pid).and_then(|l| l.verified_name.clone());
+            host.enqueue_request_if_requestable(
+                name.as_deref().unwrap_or("<unverified>"),
+                "transfer",
+            );
+            let err = d.err();
+            conn.log.say(&format!("sync: refused: {err}"));
+            let _ = d.transport.send_control(&d.close_frame()).await;
+        }
+        SyncAdmission::Refused(r) => {
+            conn.log.say(&format!("sync: refused: {}", r.reason));
+            let _ = r.transport.send_control(&r.close).await;
+        }
+        SyncAdmission::Ignored => {}
+    }
+    None
+}

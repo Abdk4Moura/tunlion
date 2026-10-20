@@ -68,8 +68,14 @@ pub mod files;
 pub mod fleet;
 #[cfg(feature = "dispatch")]
 pub mod lifecycle;
+#[cfg(not(feature = "mesh"))]
+pub mod mesh_stub;
 #[cfg(feature = "dispatch")]
 pub mod ports;
+#[cfg(feature = "mesh")]
+pub use crate::mesh::MeshTunnel;
+#[cfg(not(feature = "mesh"))]
+pub use mesh_stub::MeshTunnel;
 pub mod report;
 #[cfg(feature = "dispatch")]
 pub mod revocation;
