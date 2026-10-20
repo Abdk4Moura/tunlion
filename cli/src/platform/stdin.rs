@@ -426,10 +426,11 @@ mod windows_tests {
     use super::win::spawn_on_handle;
     use filament_peerloop::present::NoScreen;
     use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
     use windows_sys::Win32::System::Pipes::CreatePipe;
 
     #[test]
-    fn stop_joins_a_pending_overlapped_pipe_read() {
+    fn stop_joins_a_pipe_reader_with_no_writer_data() {
         let mut read = std::ptr::null_mut();
         let mut write = std::ptr::null_mut();
         // SAFETY: default security, anonymous pipe; handles checked below.
@@ -439,7 +440,7 @@ mod windows_tests {
         let q = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut owner = spawn_on_handle(read, tx, q, std::sync::Arc::new(NoScreen))
             .expect("reader for the pipe");
-        // No writer data: the ReadFile is pending on the pipe.
+        // No writer data: PeekNamedPipe reports 0 and the reader waits.
         std::thread::sleep(std::time::Duration::from_millis(150));
         let started = std::time::Instant::now();
         owner.stop();
@@ -447,11 +448,48 @@ mod windows_tests {
         assert_eq!(
             outcome,
             filament_peerloop::recv::ports::StdinOutcome::Joined,
-            "the overlapped read must cancel and join"
+            "the polling reader must stop and join"
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
             "join must be prompt"
+        );
+        unsafe {
+            let _ = CloseHandle(read);
+            let _ = CloseHandle(write);
+        }
+    }
+
+    #[test]
+    fn available_pipe_data_is_delivered_before_stop() {
+        let mut read = std::ptr::null_mut();
+        let mut write = std::ptr::null_mut();
+        // SAFETY: default security, anonymous pipe; handles checked below.
+        let ok = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null_mut(), 0) };
+        assert_ne!(ok, 0, "CreatePipe");
+        let mut wrote = 0u32;
+        // SAFETY: three bytes from a static slice into the open write handle.
+        let ok = unsafe { WriteFile(write, b"hi\n".as_ptr(), 3, &mut wrote, std::ptr::null_mut()) };
+        assert_ne!(ok, 0, "WriteFile");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let q = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut owner = spawn_on_handle(read, tx, q, std::sync::Arc::new(NoScreen))
+            .expect("reader for the pipe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let line = loop {
+            if let Ok(filament_transport::net::Ev::StdinLine(line)) = rx.try_recv() {
+                break line;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "line was not delivered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(line, "hi");
+        assert_eq!(
+            owner.join(),
+            filament_peerloop::recv::ports::StdinOutcome::Joined
         );
         unsafe {
             let _ = CloseHandle(read);
