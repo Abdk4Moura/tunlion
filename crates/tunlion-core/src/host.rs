@@ -852,8 +852,8 @@ impl RecvDaemon for CoreDaemon {
     fn wg_claim_attempt(&self, _addr: &str) -> bool {
         false
     }
-    fn wg_release_attempt(&mut self, _addr: &str) {}
-    fn wg_local_offer(&mut self) -> anyhow::Result<(String, u16)> {
+    fn wg_release_attempt(&self, _addr: &str) {}
+    fn wg_local_offer(&self) -> anyhow::Result<(String, u16)> {
         anyhow::bail!("wireguard is not served by this core profile")
     }
     async fn wg_adopt_peer(
