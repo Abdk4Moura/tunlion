@@ -596,7 +596,7 @@ pub(crate) mod test_support {
             _: &str,
             _: &[u8; 64],
         ) -> std::result::Result<(), &'static str> {
-            Ok(())
+            Err("this capability was not expected to be called")
         }
         fn fleet_channel(&self) -> Option<String> {
             None
@@ -842,7 +842,7 @@ pub(crate) mod test_support {
             _: &str,
             _: &[u8; 64],
         ) -> std::result::Result<(), &'static str> {
-            Ok(())
+            Err("this capability was not expected to be called")
         }
         fn fleet_share_root(&self) -> PathBuf {
             PathBuf::new()

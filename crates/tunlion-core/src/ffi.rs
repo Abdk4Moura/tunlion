@@ -65,13 +65,17 @@ impl CoreSession {
         self.inner.status()
     }
 
-    /// Refuses until a library receive dispatch is linked. Does not spawn a
-    /// process. A Rust embedder with the real dispatch uses
-    /// `Core::start_with_dispatch`; a language binding cannot supply one, and
-    /// this must not pretend it can. Engine `stop` is therefore not exported
-    /// here yet either: there is nothing a binding can have started.
+    /// Start the real receive engine for this config directory. Synchronous
+    /// across the FFI boundary: the library owns the runtime, and readiness is
+    /// observed before this returns.
     pub fn start(&self) -> Result<(), CoreError> {
         self.inner.start()
+    }
+
+    /// Stop and join the engine synchronously. No Tokio runtime crosses the
+    /// FFI boundary.
+    pub fn stop(&self) -> Result<(), CoreError> {
+        self.inner.stop_blocking()
     }
 }
 
@@ -147,8 +151,15 @@ mod tests {
         let status = core.status().unwrap();
         assert_eq!(status.fingerprint, None);
         assert_eq!(status.engine, crate::EngineState::NotLinked);
-        assert_eq!(core.start(), Err(CoreError::EngineNotLinked));
+        assert!(matches!(core.start(), Err(CoreError::Identity(_))));
     }
+}
+
+#[test]
+fn stop_without_a_started_engine_is_a_synchronous_no_op() {
+    let core = session();
+    core.stop().unwrap();
+    assert_eq!(core.status().unwrap().engine, crate::EngineState::NotLinked);
 }
 
 fn already_taken() -> CoreError {

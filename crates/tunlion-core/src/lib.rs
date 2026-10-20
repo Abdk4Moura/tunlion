@@ -25,17 +25,28 @@
 //! Rust embedder with that composition calls `start_with_dispatch` today. See
 //! `docs/engine-driver.md` and `docs/android-ffi.md`.
 
+mod host;
+
 uniffi::setup_scaffolding!();
 
 use std::fs;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use filament_id::{user_key_path, KeyStore, PendingIdentity, UserKey};
-use filament_peerloop::driver::{Cancellation, Engine, Readiness, StopError};
+use filament_id::{now_secs, user_key_path, KeyStore, PendingIdentity, UserKey};
+use filament_peerloop::driver::{Cancellation, DriverOutcome, Engine, Readiness, StopError};
+use filament_peerloop::host::{LogSink, NoLog};
+use filament_peerloop::present::NoScreen;
+use filament_peerloop::recv::dispatch::{drive, RecvCleanup};
+use filament_peerloop::recv::ports::{RecvEnv, RecvPorts};
+use filament_peerloop::recv::report::RecvReport;
+use filament_peerloop::recv::store::{CoreLease, DeviceStore, OverlayKey};
+use filament_peerloop::shell_gate::ShellPolicy;
+use filament_transport::TransportContext;
+use host::{CoreDaemon, CoreHost, CoreIdentity, CorePrompt, CoreServers, CoreSettings};
 use secret_write::SecretFile;
 
 /// Build proof for the Android cdylib job. Not the app API.
@@ -47,6 +58,9 @@ pub extern "C" fn tunlion_core_abi_version() -> u32 {
 /// One dispatch task owned by this Core. The dispatch body is supplied by the
 /// embedder; the library owns the runtime, the latch, readiness and the join.
 type EngineTask = Engine<Result<(), String>>;
+
+/// Default signaling endpoint when the config does not name one.
+const DEFAULT_SERVER: &str = "https://api.tunlion.autumated.com";
 
 /// The one engine slot a Core owns.
 ///
@@ -64,6 +78,10 @@ type EngineTask = Engine<Result<(), String>>;
 enum EngineSlot {
     /// Nothing was ever started.
     None,
+    /// `Core::start` spawned the engine and is waiting for its readiness edge.
+    /// The task is owned here; a concurrent start is refused and a stop may
+    /// still join it.
+    Starting(EngineTask),
     /// The one engine, owned by this slot. It may already have finished while
     /// still unjoined; `stop` is what joins it and records `Ended`.
     Running(EngineTask),
@@ -114,6 +132,9 @@ impl Drop for StopClaim<'_> {
 /// files dir on Android. This type does not read `TUNLION_CONFIG_DIR`.
 pub struct Core {
     dir: PathBuf,
+    /// The same-root `up.lock` election this Core holds while an engine is
+    /// running. `None` before the first start and after a joined stop.
+    lease: Mutex<Option<CoreLease>>,
     /// At most one engine per Core. No process-global engine state.
     engine: Mutex<EngineSlot>,
     /// Created only when the caller is not already inside a Tokio runtime, so
@@ -129,10 +150,13 @@ pub struct UncommittedIdentity {
 /// Whether the peer loop is running inside this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum EngineState {
-    /// No engine is owned by this Core. `Core::start` has no library receive
-    /// dispatch to run yet, so it returns `EngineNotLinked`. A Rust embedder
-    /// that does have the dispatch uses `start_with_dispatch`.
+    /// No engine is owned by this Core. `Core::start` has not started one (or
+    /// refused before installing it). A Rust embedder that supplies its own
+    /// dispatch may use `start_with_dispatch`.
     NotLinked,
+    /// `Core::start` has spawned the real dispatch and is waiting for its
+    /// publish-once readiness edge.
+    Starting,
     /// An engine dispatch started through `start_with_dispatch` is running.
     Running,
     /// A stop is in flight; the task may still be running. A start and a second
@@ -174,9 +198,13 @@ pub enum CoreError {
     /// `identity.ed25519` is already in this config directory.
     #[error("an identity already exists in this config directory")]
     AlreadyExists,
-    /// `start` was called and no library receive dispatch is linked yet.
+    /// Retained for API compatibility; `start` now returns a concrete
+    /// identity/config/lease/readiness error instead.
     #[error("the engine is not linked")]
     EngineNotLinked,
+    /// Another Core or CLI daemon holds this config directory's engine lease.
+    #[error("another engine holds this config directory")]
+    EngineLease,
     /// An engine dispatch is already running in this Core.
     #[error("an engine is already running in this core")]
     EngineAlreadyRunning,
@@ -228,6 +256,7 @@ impl Core {
         set_private_dir(&dir)?;
         Ok(Core {
             dir,
+            lease: Mutex::new(None),
             engine: Mutex::new(EngineSlot::None),
             runtime: Mutex::new(None),
         })
@@ -276,10 +305,232 @@ impl Core {
         })
     }
 
-    /// No library receive dispatch is linked yet, so there is nothing the
-    /// credential-side Core can start. This never spawns a child process.
+    /// Start the real receive engine for this config directory.
+    ///
+    /// Validates that an identity and config exist, takes the same-root
+    /// `up.lock` election (shared with the CLI daemon), starts `recv::dispatch`
+    /// on this Core's runtime and waits for its publish-once readiness edge.
+    /// A failure releases the lease and joins the task unless it timed out, in
+    /// which case the task is retained and a retry is refused.
     pub fn start(&self) -> Result<(), CoreError> {
-        Err(CoreError::EngineNotLinked)
+        let store = DeviceStore::open(&self.dir);
+        if !store.has_identity() {
+            return Err(CoreError::Identity(
+                "no identity in this config directory; run init or join first".into(),
+            ));
+        }
+        let settings = CoreSettings::load(&self.dir);
+        let server = settings
+            .get("server")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+        if server.trim().is_empty() {
+            return Err(CoreError::Engine(
+                "the config has no signaling server".into(),
+            ));
+        }
+        let lease = store
+            .try_acquire_engine_lease()
+            .map_err(|e| CoreError::Engine(format!("engine lease: {e}")))?
+            .ok_or(CoreError::EngineLease)?;
+
+        {
+            let slot = self
+                .engine
+                .lock()
+                .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+            match &*slot {
+                EngineSlot::Stopping => return Err(CoreError::EngineStopping),
+                EngineSlot::Starting(engine) => {
+                    return Err(if engine.is_finished() {
+                        CoreError::EngineNotJoined
+                    } else {
+                        CoreError::EngineAlreadyRunning
+                    })
+                }
+                EngineSlot::Running(engine) => {
+                    return Err(if engine.is_finished() {
+                        CoreError::EngineNotJoined
+                    } else {
+                        CoreError::EngineAlreadyRunning
+                    })
+                }
+                EngineSlot::Unstopped(engine) => {
+                    return Err(if engine.is_finished() {
+                        CoreError::EngineNotJoined
+                    } else {
+                        CoreError::EngineNotStopped
+                    })
+                }
+                EngineSlot::None | EngineSlot::Ended(_) => {}
+            }
+        }
+
+        let display_name = settings
+            .get("name")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "device".to_string());
+        let uid = format!(
+            "core-r-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        );
+        let overlay = OverlayKey::new(self.dir.join("overlay.ed25519"));
+        let log: Arc<dyn LogSink> = Arc::new(NoLog);
+        let settle_ms = settings
+            .u64("gate.settle_ms")
+            .filter(|n| *n > 0)
+            .map(|n| n.clamp(250, 5_000))
+            .unwrap_or(2_000);
+        let identity = Arc::new(CoreIdentity::new(
+            store.clone(),
+            overlay.clone(),
+            display_name.clone(),
+            settle_ms,
+            log.clone(),
+        ));
+        let host = Arc::new(CoreHost::new(
+            self.dir.clone(),
+            store.clone(),
+            settings.clone(),
+            overlay.clone(),
+            display_name.clone(),
+            uid.clone(),
+        ));
+        let ports = RecvPorts::new(
+            identity,
+            Arc::new(store.clone()),
+            Box::new(CoreServers),
+            Box::new(CoreDaemon::new(
+                self.dir.clone(),
+                store.clone(),
+                overlay,
+                display_name.clone(),
+            )),
+            Arc::new(CorePrompt),
+            Arc::new(NoScreen),
+            RecvEnv {
+                display_name: display_name.clone(),
+                uid: uid.clone(),
+                config_name: settings.get("name"),
+                consent_token: "core".to_string(),
+                pid: std::process::id(),
+                ..RecvEnv::default()
+            },
+        );
+        let inbox = self.dir.join("inbox");
+        fs::create_dir_all(&inbox).map_err(io_err)?;
+        let settings_for_transport = settings.clone();
+        let transport_context = TransportContext::new(
+            Some(self.dir.join("signaling-dns.json")),
+            move |key, peer| settings_for_transport.setting(key, peer),
+            move |peer| settings_for_transport.membership(peer),
+        );
+        let engine_dir = inbox;
+        let dispatch = move |stop: Cancellation, readiness: Readiness| async move {
+            let mut cleanup = RecvCleanup::default();
+            let outcome = drive(
+                &server,
+                None,
+                engine_dir,
+                false,
+                None,
+                None,
+                true,
+                None,
+                None,
+                false,
+                None,
+                true,
+                None,
+                ShellPolicy::Granted,
+                None,
+                true,
+                transport_context,
+                log,
+                host,
+                ports,
+                RecvReport::new(),
+                &stop,
+                &readiness,
+                &mut cleanup,
+            )
+            .await;
+            match outcome {
+                DriverOutcome::Cancelled => Ok::<(), String>(()),
+                DriverOutcome::Returned(Ok(())) => Ok(()),
+                DriverOutcome::Returned(Err(error)) => Err(error.to_string()),
+            }
+        };
+
+        let (handle, engine, watch) = self.spawn_engine(dispatch)?;
+        {
+            let mut slot = self
+                .engine
+                .lock()
+                .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+            *slot = EngineSlot::Starting(engine);
+        }
+        let readiness = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    handle.block_on(async move {
+                        let mut watch = watch;
+                        watch.wait(Some(Duration::from_secs(30))).await
+                    })
+                })
+                .join()
+                .unwrap_or_else(|_| Err(filament_peerloop::driver::ReadyError::NotPublished))
+        });
+        match readiness {
+            Ok(()) => {
+                let mut slot = self
+                    .engine
+                    .lock()
+                    .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+                match std::mem::replace(&mut *slot, EngineSlot::None) {
+                    EngineSlot::Starting(engine) => {
+                        *slot = EngineSlot::Running(engine);
+                        drop(slot);
+                        let mut held = self
+                            .lease
+                            .lock()
+                            .map_err(|_| CoreError::Engine("the lease lock was poisoned".into()))?;
+                        *held = Some(lease);
+                        Ok(())
+                    }
+                    other => {
+                        // A concurrent stop claimed/joined the task while the
+                        // readiness edge was being observed. Put its state back
+                        // and do not claim a running engine.
+                        *slot = other;
+                        Err(CoreError::Stop(
+                            "the engine stopped while it was starting".into(),
+                        ))
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = self.stop_blocking();
+                // A timed-out stop retained the task; keep the root lease so a
+                // retry cannot start a second engine over it. A joined stop
+                // released it already.
+                if self
+                    .engine_state()
+                    .is_ok_and(|state| state == EngineState::TimedOut)
+                {
+                    if let Ok(mut held) = self.lease.lock() {
+                        *held = Some(lease);
+                    }
+                }
+                Err(CoreError::Engine(format!(
+                    "the receive engine did not become ready: {error}"
+                )))
+            }
+        }
     }
 
     /// Start the library engine over a caller-supplied dispatch.
@@ -309,6 +560,11 @@ impl Core {
         // make the caller join through `stop`.
         let blocked = match &*slot {
             EngineSlot::Stopping => Some(CoreError::EngineStopping),
+            EngineSlot::Starting(engine) => Some(if engine.is_finished() {
+                CoreError::EngineNotJoined
+            } else {
+                CoreError::EngineAlreadyRunning
+            }),
             EngineSlot::Running(engine) => Some(if engine.is_finished() {
                 CoreError::EngineNotJoined
             } else {
@@ -354,6 +610,84 @@ impl Core {
         Ok(())
     }
 
+    /// Start one engine on this Core's own runtime and return its handle,
+    /// task and readiness watch. The caller records the slot.
+    fn spawn_engine<F, Fut>(
+        &self,
+        dispatch: F,
+    ) -> Result<
+        (
+            tokio::runtime::Handle,
+            EngineTask,
+            filament_peerloop::driver::ReadyWatch,
+        ),
+        CoreError,
+    >
+    where
+        F: FnOnce(Cancellation, Readiness) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| CoreError::Engine("the runtime lock was poisoned".into()))?;
+        if runtime.is_none() {
+            *runtime = Some(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("tunlion-core-engine")
+                    .build()
+                    .map_err(|error| CoreError::Engine(error.to_string()))?,
+            );
+        }
+        let runtime = runtime.as_ref().expect("runtime inserted above");
+        let handle = runtime.handle().clone();
+        let _entered = runtime.enter();
+        let cancel = Cancellation::default();
+        let engine = Engine::start(cancel, dispatch);
+        let watch = engine.ready_watch();
+        Ok((handle, engine, watch))
+    }
+
+    fn release_lease(&self) {
+        if let Ok(mut lease) = self.lease.lock() {
+            *lease = None;
+        }
+    }
+
+    /// The synchronous form FFI uses. It runs `stop_within` on a fresh OS
+    /// thread so no Tokio runtime is created or entered across the boundary.
+    pub fn stop_blocking(&self) -> Result<(), CoreError> {
+        let handle = self
+            .runtime
+            .lock()
+            .ok()
+            .and_then(|runtime| runtime.as_ref().map(|runtime| runtime.handle().clone()));
+        let result = match handle {
+            Some(handle) => std::thread::scope(|scope| {
+                scope
+                    .spawn(move || handle.block_on(self.stop_within(Duration::from_secs(5))))
+                    .join()
+                    .unwrap_or_else(|_| Err(CoreError::Engine("the stop thread panicked".into())))
+            }),
+            None => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| CoreError::Engine(error.to_string()))?;
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(move || runtime.block_on(self.stop_within(Duration::from_secs(5))))
+                        .join()
+                        .unwrap_or_else(|_| {
+                            Err(CoreError::Engine("the stop thread panicked".into()))
+                        })
+                })
+            }
+        };
+        result
+    }
+
     /// Request stop and wait, in this instance, for the dispatch to return.
     ///
     /// The dispatch's own epilogue is what is joined; work it detached is not
@@ -389,7 +723,9 @@ impl Core {
             let decision = match &*slot {
                 EngineSlot::None | EngineSlot::Ended(_) => Decision::Settled,
                 EngineSlot::Stopping => Decision::Refuse,
-                EngineSlot::Running(_) | EngineSlot::Unstopped(_) => Decision::Take,
+                EngineSlot::Starting(_) | EngineSlot::Running(_) | EngineSlot::Unstopped(_) => {
+                    Decision::Take
+                }
             };
             match decision {
                 Decision::Refuse => return Err(CoreError::EngineStopping),
@@ -397,7 +733,9 @@ impl Core {
                 Decision::Settled => return Ok(()),
                 Decision::Take => {
                     let engine = match std::mem::replace(&mut *slot, EngineSlot::Stopping) {
-                        EngineSlot::Running(engine) | EngineSlot::Unstopped(engine) => engine,
+                        EngineSlot::Starting(engine)
+                        | EngineSlot::Running(engine)
+                        | EngineSlot::Unstopped(engine) => engine,
                         _ => unreachable!("a live engine was inspected above"),
                     };
                     StopClaim {
@@ -429,17 +767,20 @@ impl Core {
             Ok(Ok(())) => {
                 let _ = claim.take();
                 *slot = EngineSlot::Ended(Ok(()));
+                self.release_lease();
                 Ok(())
             }
             Ok(Err(message)) => {
                 let _ = claim.take();
                 *slot = EngineSlot::Ended(Err(message.clone()));
+                self.release_lease();
                 Err(CoreError::Engine(message))
             }
             Err(StopError::Panicked(error)) => {
                 let _ = claim.take();
                 let message = format!("the engine dispatch failed: {error}");
                 *slot = EngineSlot::Ended(Err(message.clone()));
+                self.release_lease();
                 Err(CoreError::Engine(message))
             }
             Err(StopError::TimedOut) => {
@@ -460,7 +801,8 @@ impl Core {
     pub fn is_engine_running(&self) -> Result<bool, CoreError> {
         Ok(matches!(
             self.engine_state()?,
-            EngineState::Running
+            EngineState::Starting
+                | EngineState::Running
                 | EngineState::Stopping
                 | EngineState::FinishedUnjoined
                 | EngineState::TimedOut
@@ -477,6 +819,8 @@ impl Core {
             // A finished task is still unjoined: its result (including a
             // natural error or panic) is owned by the handle in the slot.
             // `Stopped`/`Failed` require the join `stop` performs.
+            EngineSlot::Starting(engine) if engine.is_finished() => EngineState::FinishedUnjoined,
+            EngineSlot::Starting(_) => EngineState::Starting,
             EngineSlot::Running(engine) if engine.is_finished() => EngineState::FinishedUnjoined,
             EngineSlot::Running(_) => EngineState::Running,
             EngineSlot::Stopping => EngineState::Stopping,
@@ -517,6 +861,9 @@ impl Drop for Core {
             Err(poisoned) => poisoned.into_inner(),
         };
         drop(std::mem::replace(slot, EngineSlot::None));
+        if let Ok(lease) = self.lease.get_mut() {
+            drop(lease.take());
+        }
 
         let runtime = match self.runtime.get_mut() {
             Ok(runtime) => runtime.take(),
@@ -589,6 +936,67 @@ mod tests {
         Core::open(tempfile::tempdir().unwrap().keep()).unwrap()
     }
 
+    fn signaling_stub(listener: std::net::TcpListener) -> std::thread::JoinHandle<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                ws.send(Message::Text("0{}".into())).await.unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    match message {
+                        Message::Text(text) if text == "40" => {
+                            ws.send(Message::Text("40{}".into())).await.unwrap();
+                            ws.send(Message::Text(
+                                r#"42["welcome",{"id":"stub","peers":[]}]"#.into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        Message::Text(text) if text.starts_with("41") => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        Message::Close(_) => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        })
+    }
+
+    #[test]
+    fn core_start_runs_the_real_dispatch_and_stop_joins_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        let pending = core.begin_identity().unwrap();
+        let phrase = pending.phrase();
+        core.commit_identity(pending, &phrase).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::fs::write(
+            dir.path().join("config"),
+            format!("server http://{addr}\n"),
+        )
+        .unwrap();
+        let server = signaling_stub(listener);
+        core.start().unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+        core.stop_blocking().unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        server.join().unwrap();
+    }
+
     #[test]
     fn begin_writes_nothing_until_the_phrase_is_confirmed() {
         let core = core();
@@ -622,7 +1030,7 @@ mod tests {
         let status = core.status().unwrap();
         assert_eq!(status.fingerprint, None);
         assert_eq!(status.engine, EngineState::NotLinked);
-        assert_eq!(core.start().unwrap_err(), CoreError::EngineNotLinked);
+        assert!(matches!(core.start().unwrap_err(), CoreError::Identity(_)));
     }
 
     /// A dispatch that observes cancellation cooperatively and then parks until
@@ -942,10 +1350,10 @@ mod tests {
     }
 
     #[test]
-    fn start_without_a_dispatch_stays_engine_not_linked() {
+    fn start_without_identity_is_refused_and_installs_no_engine() {
         let core = core();
-        assert_eq!(core.start().unwrap_err(), CoreError::EngineNotLinked);
-        // The credential-side start must not install an engine slot.
+        assert!(matches!(core.start().unwrap_err(), CoreError::Identity(_)));
+        // A refused start must not install an engine slot or a lease.
         assert_eq!(core.status().unwrap().engine, EngineState::NotLinked);
     }
 

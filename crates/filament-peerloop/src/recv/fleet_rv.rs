@@ -106,7 +106,7 @@ impl FleetService {
 
     /// Build our `fleet-hello` for a link whose channel binding is `cb`.
     pub fn make_hello(&self, cb: &[u8], name: &str) -> Result<Value> {
-        let id = self.overlay.load()?;
+        let id = self.overlay.identity()?;
         let seq = filament_overlay::next_announce_seq_at(&self.announce_seq_path);
         let announce = if self.routes.is_empty() {
             id.announce(seq, cb)
@@ -183,6 +183,66 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(service.owner_pub(), Some(user.public_key_bytes()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_pub_falls_back_to_the_local_certificate_issuer() {
+        let root = temp("owner-cert");
+        let overlay = OverlayKey::new(root.join("overlay.ed25519"));
+        let overlay_pub = overlay.public_key_bytes().unwrap();
+        let user = UserKey::from_seed(&[11u8; 32]).unwrap();
+        let cert = filament_id::DeviceCert::certify(&user, overlay_pub, 100, 900).unwrap();
+        let store = DeviceStore::open(&root);
+        store
+            .write_local_device_cert_record(&serde_json::json!({
+                "name": "test-device",
+                "cert": cert.to_json(),
+            }))
+            .unwrap();
+        let service = FleetService::new(
+            store,
+            overlay,
+            root.join("overlay.announce-seq"),
+            "test-device",
+            Vec::new(),
+        );
+        assert_eq!(service.owner_pub(), Some(user.public_key_bytes()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn make_hello_binds_the_route_set_to_the_link_channel() {
+        let root = temp("hello");
+        let overlay = OverlayKey::new(root.join("overlay.ed25519"));
+        let overlay_pub = overlay.public_key_bytes().unwrap();
+        let user = UserKey::from_seed(&[12u8; 32]).unwrap();
+        let cert = filament_id::DeviceCert::certify(&user, overlay_pub, 100, 900).unwrap();
+        let store = DeviceStore::open(&root);
+        store
+            .write_local_device_cert_record(&serde_json::json!({
+                "name": "test-device",
+                "cert": cert.to_json(),
+            }))
+            .unwrap();
+        let routes = vec!["10.0.0.0/8".to_string(), "fd00::/64".to_string()];
+        let service = FleetService::new(
+            store,
+            overlay,
+            root.join("overlay.announce-seq"),
+            "test-device",
+            routes.clone(),
+        );
+        let cb = b"this-link";
+        let hello = service.make_hello(cb, "test-device").unwrap();
+        assert_eq!(hello["cert"]["devicePub"], hex::encode(overlay_pub));
+        let announce = filament_overlay::Announce::from_json(&hello["announce"]).unwrap();
+        assert_eq!(announce.pubkey, overlay_pub);
+        assert!(announce.verify(cb).is_ok());
+        assert_eq!(announce.verify_routes(cb), routes);
+        // A capture from this link cannot be replayed onto another.
+        assert!(announce.verify(b"another-link").is_err());
+        assert!(announce.verify_routes(b"another-link").is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -4078,12 +4078,21 @@ dependencies = [
 name = "tunlion-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "filament-cap",
  "filament-id",
  "filament-peerloop",
+ "filament-signal",
+ "filament-transport",
+ "futures-util",
+ "hex",
  "secret-write",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
  "uniffi",
 ]
 

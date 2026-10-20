@@ -30,7 +30,7 @@ pub fn next_announce_seq() -> u64 {
 /// use. The generation and the file format are the library's explicit-path
 /// `OverlayKey`; this module only names the process path.
 pub fn load_identity() -> Result<Identity> {
-    filament_peerloop::recv::store::OverlayKey::new(key_path()).load()
+    filament_peerloop::recv::store::OverlayKey::new(key_path()).identity()
 }
 
 /// Convenience: load the overlay key and return just the 32-byte public key.

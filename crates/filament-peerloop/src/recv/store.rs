@@ -139,18 +139,16 @@ impl KeyStore for RootKeyStore {
 
 /// The overlay signing key for one instance, at an explicit path.
 ///
-/// The CLI's `overlay` module used to own this and resolved the path from the
-/// process config directory. The cryptography and the on-disk format are
-/// unchanged (PKCS8, owner-only, generated on first use); only the path is now
-/// a constructor argument, so a Core instance never reads another instance's
-/// key or an environment variable.
-#[cfg(feature = "mesh")]
+/// The key is an Ed25519 PKCS8 file used for possession proofs. Loading,
+/// generating and signing need only `ring`, not the overlay/announce feature:
+/// an Android transfer/shell-client engine needs the key and certificate
+/// primitives without pulling in mesh, fleet, mounts or forward serving. The
+/// announce wrapper is available under `mesh` via [`OverlayKey::identity`].
 #[derive(Clone, Debug)]
 pub struct OverlayKey {
     path: PathBuf,
 }
 
-#[cfg(feature = "mesh")]
 impl OverlayKey {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -160,28 +158,46 @@ impl OverlayKey {
         &self.path
     }
 
-    /// Load the overlay key, generating and persisting it on first use.
-    pub fn load(&self) -> Result<filament_overlay::Identity> {
-        let pkcs8 = match std::fs::read(&self.path) {
-            Ok(bytes) => bytes,
+    /// Load the PKCS8 bytes, generating and persisting the key on first use.
+    pub fn load_pkcs8(&self) -> Result<Vec<u8>> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(bytes),
             Err(_) => {
                 let rng = ring::rand::SystemRandom::new();
                 let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
                     .map_err(|_| anyhow::anyhow!("overlay key generation failed"))?;
                 secret_write::SecretFile::write(&self.path, doc.as_ref())
                     .context("write overlay key")?;
-                doc.as_ref().to_vec()
+                Ok(doc.as_ref().to_vec())
             }
-        };
-        filament_overlay::Identity::from_pkcs8(&pkcs8)
+        }
+    }
+
+    pub fn keypair(&self) -> Result<ring::signature::Ed25519KeyPair> {
+        let pkcs8 = self.load_pkcs8()?;
+        ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .map_err(|_| anyhow::anyhow!("overlay key is corrupt"))
     }
 
     pub fn public_key_bytes(&self) -> Result<[u8; 32]> {
-        Ok(self.load()?.public_key_bytes())
+        use ring::signature::KeyPair;
+        let keypair = self.keypair()?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(keypair.public_key().as_ref());
+        Ok(out)
     }
 
     pub fn sign(&self, msg: &[u8]) -> Result<[u8; 64]> {
-        Ok(self.load()?.sign(msg))
+        let keypair = self.keypair()?;
+        let mut out = [0u8; 64];
+        out.copy_from_slice(keypair.sign(msg).as_ref());
+        Ok(out)
+    }
+
+    /// The overlay announce identity, for the mesh/fleet features.
+    #[cfg(feature = "mesh")]
+    pub fn identity(&self) -> Result<filament_overlay::Identity> {
+        filament_overlay::Identity::from_pkcs8(&self.load_pkcs8()?)
     }
 }
 
@@ -237,6 +253,16 @@ impl std::fmt::Display for CorruptStore {
 }
 
 impl std::error::Error for CorruptStore {}
+
+/// The frozen rendezvous channel derivation (`filament-pair:` domain). Shared
+/// by pairing and fleet; one implementation.
+pub fn channel_of(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"filament-pair:");
+    h.update(secret.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
 
 fn create_private_dir_all(dir: &Path) -> io::Result<()> {
     if dir.as_os_str().is_empty() || dir.is_dir() {
@@ -348,6 +374,63 @@ struct StoreLock {
 }
 
 impl StoreLock {
+    /// Try to take the lock without waiting. `Ok(None)` means another process
+    /// holds it; every other failure is an I/O error.
+    fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        #[allow(unused_mut)]
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::{
+                LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+            };
+            use windows_sys::Win32::System::IO::OVERLAPPED;
+            let handle = file.as_raw_handle() as HANDLE;
+            let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
+            let ok = unsafe {
+                LockFileEx(
+                    handle,
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                // ERROR_LOCK_VIOLATION (33): another process holds the lease.
+                if error.raw_os_error() == Some(33) {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        }
+        Ok(Some(Self { _file: file }))
+    }
+
     fn acquire(path: &Path) -> io::Result<Self> {
         #[allow(unused_mut)]
         let mut opts = std::fs::OpenOptions::new();
@@ -393,6 +476,11 @@ impl StoreLock {
     }
 }
 
+/// A held engine lease on one config root. Dropping it releases the lock.
+pub struct CoreLease {
+    _lock: StoreLock,
+}
+
 /// The device and identity store for one config directory.
 ///
 /// `owner_pub` is the key owner-signed capability operations are verified
@@ -429,6 +517,15 @@ impl DeviceStore {
 
     pub fn keystore(&self) -> RootKeyStore {
         RootKeyStore::new(&self.root)
+    }
+
+    /// Take the same-root engine election (`up.lock`) without waiting. A
+    /// competing Core or CLI daemon on this config makes this return `None`, so
+    /// only one engine serves a root.
+    pub fn try_acquire_engine_lease(&self) -> io::Result<Option<CoreLease>> {
+        create_private_dir_all(&self.root)?;
+        Ok(StoreLock::try_acquire(&self.root.join("up.lock"))?
+            .map(|lock| CoreLease { _lock: lock }))
     }
 
     pub fn devices_path(&self) -> PathBuf {
@@ -476,6 +573,17 @@ impl DeviceStore {
         secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
             .context("atomic write devices.json")?;
         Ok(out)
+    }
+
+    /// The capability store array, already parsed (empty when missing or
+    /// unreadable). The peer loop hands this to `filament-cap`'s pure evaluators.
+    pub fn cap_store(&self) -> Vec<Value> {
+        self.load_cap_store()
+    }
+
+    /// The protocol rendezvous derivation shared by pairing and fleet. Pure.
+    pub fn channel_of(secret: &str) -> String {
+        channel_of(secret)
     }
 
     /// The raw records, tolerating a missing or malformed store (the read-side
@@ -2118,6 +2226,18 @@ mod store_guards {
             Some(user.public_key_bytes()),
             "a broken/unreadable overlay key must not hide the certificate issuer"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_engine_lease_per_root_and_a_dropped_lease_can_be_retaken() {
+        let root = unique("lease");
+        let a = DeviceStore::open(&root);
+        let b = DeviceStore::open(&root);
+        let held = a.try_acquire_engine_lease().unwrap().expect("first lease");
+        assert!(b.try_acquire_engine_lease().unwrap().is_none());
+        drop(held);
+        assert!(b.try_acquire_engine_lease().unwrap().is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 
