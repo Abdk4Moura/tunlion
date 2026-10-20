@@ -84,21 +84,24 @@ commit first and delete on failure.
 
 `status() -> Status`
 
-`fingerprint` as above. `engine` is `NotLinked` until the peer loop is in this
-crate. A missing identity is not an error. It is `fingerprint: None`.
+`fingerprint` as above. `engine` is `NotLinked` until `start` installs an
+engine. A missing identity is not an error. It is `fingerprint: None`.
 
 `start() -> Result<(), CoreError>`
 
-Returns `EngineNotLinked`. It must not report the engine as up. The engine
-*runtime* now lives in `filament_peerloop::driver::Engine` (see
-`docs/engine-driver.md`); what is still missing is a library-callable receive
-*dispatch*. `Core` owns that runtime per instance, and a Rust embedder that has
-the dispatch uses `Core::start_with_dispatch` (not exposed over UniFFI). A
-language binding cannot supply a dispatch, so `start` refuses honestly, and
-`Core::stop` is a Rust API for now rather than an exported one.
+Validates identity/config, takes the same-root `up.lock` lease, starts the real
+receive dispatch on the Core runtime and waits its readiness edge before
+returning. It never spawns the `tunlion` binary. The reduced Core host refuses
+absent server/daemon endpoints explicitly.
+
+`stop() -> Result<(), CoreError>`
+
+Synchronous; cancels and joins the engine without carrying a Tokio runtime
+across the FFI boundary. It reports a retained task honestly rather than
+claiming success when the bound expires.
 
 `status().engine` is the slot state a UI polls: `NotLinked` (nothing started),
-`Running`, `Stopping` (a stop is joining), `FinishedUnjoined` (the task returned
+`Starting` (dispatch spawned, readiness pending), `Running`, `Stopping` (a stop is joining), `FinishedUnjoined` (the task returned
 but its handle has not been joined, so its `Ok` / `Err` / panic is still owned
 by `Core`), `Stopped` (confirmed join), `Failed` (the joined dispatch returned
 an error or panicked), and `TimedOut` (a stop bound expired and the task is
@@ -132,11 +135,11 @@ of `send_cmd`. `send_cmd` stays in the CLI. The library will call
 `filament-transfer` and `filament-proto` for the byte mechanics.
 
 `Conn` now lives in `filament-peerloop::conn`; `cli/src/conn.rs` is only a
-re-export shim. The library will own link state and adoption. The CLI still owns
+re-export shim. The library owns link state and adoption. The CLI still owns
 argument parsing, terminal copy, the pidfile, service install, the control
-socket, and `/etc` writes, and the receive **dispatch body** is still in
-`cli/src/recv_cmd.rs`, which is why `Core::start` remains `EngineNotLinked`.
-The remaining sectors are listed in `docs/engine-driver.md`.
+socket, and `/etc` writes. `Core::start` now runs the library dispatch with the
+reduced host; the remaining server/daemon handlers and the optional fleet
+profile are listed in `docs/engine-driver.md`.
 Lookups use the petname (`verified_name`), never the broadcast display name. A
 signaling close is current only when it carries the live client id and the same
 link generation.

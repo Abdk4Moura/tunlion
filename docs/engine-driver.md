@@ -1,9 +1,9 @@
 # The engine driver, and what is still linked out
 
-> Status: the receive **dispatch body** is library-owned now. It lives in
-> `filament-peerloop::recv::dispatch`; the CLI is the process adapter.
-> `Core::start` still refuses by name because it has no host composition for
-> the dispatch's capability ports yet.
+> Status: the receive **dispatch body** is library-owned and `Core::start`
+> composes a real reduced host around it. Identity/store/enrollment/roster/
+> depart are library implementations; absent server/daemon endpoints are
+> explicit refusals, not successes.
 
 ## What moved
 
@@ -48,6 +48,7 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   | slot | start allowed | `status().engine` | what it means |
   |---|---|---|---|
   | `None` | yes | `NotLinked` | nothing was ever started |
+  | `Starting(engine)` | no | `Starting` | `Core::start` spawned the dispatch and is waiting for readiness |
   | `Running(engine)` | no | `Running`, or `FinishedUnjoined` once finished | the one engine; a finished task is still unjoined |
   | `Stopping` | no | `Stopping` | a stop claimed the slot and is joining |
   | `Unstopped(engine)` | no | `TimedOut` while live, `FinishedUnjoined` once finished | a stop bound expired; the task is retained and not joined |
@@ -73,7 +74,7 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   observed cancellation is abandoned with the runtime. Callers that need the
   dispatch epilogue use `stop` first.
 
-## What is still linked out, and why `Core::start` refuses
+## What is still linked out
 
 `recv_run` moved to `crates/filament-peerloop/src/recv/dispatch.rs` with the
 transfer/consent/file arms, the reconnect loop, cleanup and the file/event
@@ -113,33 +114,23 @@ the host-effect surface, not a split target):
 `RecvEnv` is the process snapshot the CLI resolves (name, uid, terminal
 interactivity, quiet window, L2/direct posture, consent token).
 
-For Core, the blocker is now **composition**. `RecvStore` has a non-CLI
-implementation (`recv::store::DeviceStore`, opened on the Core's config
-directory with that instance's owner key), and the identity proof/expose/renew
-handlers have a non-CLI implementation (`recv::identity::IdentityService`,
-built from that store plus an explicit `OverlayKey` path). Auth-key enrolment
-has an instance-owned runtime and a non-CLI handler in `recv::enrollment`;
-roster/depart live in `recv::roster`/`recv::membership`; fleet facts live in
-`recv::fleet_rv`. The remaining non-CLI sectors are `RecvServers`,
-`RecvDaemon` and `RecvPrompt`.
-`Core::start` therefore keeps returning `EngineNotLinked`; an embedder that
-supplies those and the existing `HostServices` uses `start_with_dispatch` with
-`recv::dispatch::drive` today.
+`Core::start` now validates identity/config, takes the same-root `up.lock`
+lease, starts the real `recv::dispatch::drive` on the Core runtime and waits
+its publish-once readiness edge. The reduced `tunlion-core` host composes
+`DeviceStore`, `IdentityService`, `EnrollmentService`, roster/depart and a
+logical `CoreHost`; it refuses PTY/exec/ssh/sync/mount/warm/proxy/wireguard/
+sshd endpoints explicitly. Fleet is optional and not composed in this profile.
+The remaining work is the real server/daemon handlers and the capability policy
+site, not identity composition.
 
 Next linkage work, in order:
 
-1. Add a `CoreHost` composition that implements `HostServices` and `RecvEnv`,
-   and supplies the remaining ports for an embedder with no CLI modules (the
-   server sectors can be omitted behind the `dispatch` feature's server
-   capability; reduced profiles already omit them). Its `RecvStore` is a
-   `recv::store::DeviceStore` opened on the Core's config directory.
-2. Add the `RecvServers`/`RecvDaemon`/`RecvPrompt` compositions (or an explicit
-   reduced profile that refuses them honestly). The identity/store/roster/depart
-   and fleet facts are already library-owned; there is no remaining identity
-   handler in the CLI adapter.
-3. Have `Core::start` construct `HostServices + RecvPorts` and call
-   `Engine::start(..., recv::dispatch::drive(...))`; only then remove the
-   `EngineNotLinked` arm.
+1. Implement the real PTY/exec/ssh/sync/mount/warm/proxy/wireguard/sshd
+   handlers behind the reduced profile's explicit refusals.
+2. Compose the capability policy site for Core (today gated shell/forward
+   actions deny by default in the reduced profile).
+3. Optionally compose `recv::fleet_rv::FleetService` when the mesh/fleet profile
+   is enabled.
 
 ## Verification
 
@@ -159,7 +150,8 @@ the task and refusing restart (`TimedOut` / `EngineNotStopped`) until it is
 joined; a dropped stop future retaining the task via `StopClaim::drop`; a
 natural `Err` and a natural panic remaining `FinishedUnjoined` and refusing
 restart (`EngineNotJoined`) until `stop` joins and reports `Failed`; a dispatch
-error recorded as `Failed`; the no-engine stop no-op; and that `Core::start`
-stays `EngineNotLinked` without installing a slot. Android keeps the reduced
-`filament-peerloop` profile: no `mount-server`, `forward-server` or `mesh`
-sectors compile into the library.
+error recorded as `Failed`; the no-engine stop no-op; and a real
+`Core::start` -> dispatch -> `stop_blocking` integration over a local signaling
+stub. Android keeps the reduced `filament-peerloop` profile: no
+`mount-server`, `forward-server` or `mesh` sectors compile into the core
+library.

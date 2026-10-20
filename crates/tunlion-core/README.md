@@ -7,11 +7,12 @@ binding uses the same types.
 Contract: `docs/android-ffi.md`.
 
 Slice 1 opens an explicit config directory and mints a recoverable identity.
-The engine *runtime* is linked: `Core` owns one `filament_peerloop::driver::
-Engine` per instance (`start_with_dispatch` / `stop`). The receive *dispatch
-body* is still in the CLI, so the credential-side `start` refuses by name with
-`EngineNotLinked` until it is library-callable. It never spawns the `tunlion`
-binary. Remaining sectors: `docs/engine-driver.md`.
+`Core::start` now composes the reduced library host, takes the same-root engine
+lease and runs the real `recv::dispatch::drive`, waiting for readiness.
+`Core::stop` / `stop_blocking` join it; `start_with_dispatch` remains for Rust
+embedders that supply their own dispatch. It never spawns the `tunlion` binary.
+The remaining real server/daemon handlers are listed in
+`docs/engine-driver.md`.
 
 `stop` / `stop_within` join the dispatch and reap its outcome. `Drop` is only a
 fallback: it requests cancellation and shuts the instance runtime down
