@@ -60,6 +60,8 @@ use crate::present::{human, Progress as ProgressBar};
 pub mod ceremony;
 #[cfg(feature = "dispatch")]
 pub mod dispatch;
+#[cfg(all(feature = "dispatch", feature = "mesh"))]
+pub mod enrollment;
 #[cfg(feature = "dispatch")]
 pub mod events;
 #[cfg(feature = "dispatch")]

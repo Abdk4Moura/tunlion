@@ -14,12 +14,12 @@
 //! does not yet have a host composition for the dispatch's capability ports
 //! (`RecvIdentity`, `RecvStore`, `RecvServers`, `RecvDaemon`, `RecvPrompt`).
 //! Those interfaces exist and the loop calls them. `RecvStore` and the
-//! proof/expose/renew half of `RecvIdentity` now have host-neutral
-//! implementations (`recv::store::DeviceStore` and
-//! `recv::identity::IdentityService`, built from an explicit config directory
-//! and overlay-key path). The remaining non-CLI gap is auth-key enrolment plus
-//! the fleet/roster host facts and the optional server/daemon sectors (today
-//! they forward to `cli/src/renewal_lifecycle.rs`, `roster.rs`, `membership.rs`,
+//! proof/expose/renew and auth-key enrolment parts of `RecvIdentity` now have
+//! host-neutral implementations (`recv::store::DeviceStore`,
+//! `recv::identity::IdentityService` and `recv::enrollment::EnrollmentService`,
+//! built from an explicit config directory and overlay-key path). The remaining
+//! non-CLI gap is the fleet/roster host facts and the optional server/daemon
+//! sectors (today they forward to `cli/src/roster.rs`, `membership.rs`,
 //! `fleet.rs`, `daemon_ctl.rs` and the optional PTY/exec/ssh servers). A Rust
 //! embedder with that composition calls `start_with_dispatch` today. See
 //! `docs/engine-driver.md` and `docs/android-ffi.md`.

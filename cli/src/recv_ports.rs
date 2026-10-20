@@ -25,6 +25,7 @@ use filament_peerloop::l2::forward;
 use filament_peerloop::l2::Mux;
 use filament_peerloop::recv::dispatch::{self, settle_timeout_reason};
 use filament_peerloop::recv::dispatch::{ParkKind, ParkedOpen};
+use filament_peerloop::recv::enrollment::EnrollmentService;
 use filament_peerloop::recv::identity::IdentityService;
 use filament_peerloop::recv::ports::{
     RawMode, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvPrompt, RecvServers, RecvStore,
@@ -50,6 +51,9 @@ pub struct CliRecv {
     /// One identity service for this receive loop. Its drop-once state is
     /// per-instance and must outlive individual dispatch calls.
     pub identity: IdentityService,
+    /// One enrollment runtime for this receive loop: nonces, live burns and
+    /// rate-limit windows are per instance, never process globals.
+    pub enrollment: EnrollmentService,
     pub pty_sessions: std::sync::Arc<l2::PtySessions>,
     pub warm_ptys: crate::WarmPtys,
     pub liveness: crate::LivenessProbes,
@@ -60,11 +64,23 @@ pub struct CliRecv {
     pub exposer: Option<Arc<crate::expose::Exposer>>,
 }
 
+fn enrollment_service(log: Arc<dyn LogSink>) -> EnrollmentService {
+    EnrollmentService::new(
+        crate::devices_store::store(),
+        filament_peerloop::recv::store::OverlayKey::new(
+            crate::platform::Paths::config_path("overlay.ed25519"),
+        ),
+        crate::display_name(),
+        log,
+    )
+}
+
 impl Default for CliRecv {
     fn default() -> Self {
         let log: Arc<dyn LogSink> = Arc::new(filament_peerloop::host::NoLog);
         Self {
             identity: crate::identity_lifecycle::service_with_log(log.clone()),
+            enrollment: enrollment_service(log.clone()),
             log,
             pty_sessions: l2::PtySessions::new(),
             warm_ptys: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -86,6 +102,7 @@ impl CliRecv {
         let mut recv = Self::default();
         recv.log = log;
         recv.identity = crate::identity_lifecycle::service_with_log(recv.log.clone());
+        recv.enrollment = enrollment_service(recv.log.clone());
         recv
     }
 
@@ -148,10 +165,14 @@ impl RecvIdentity for CliRecv {
         self.identity().handle_cert_renew_ack(v).await
     }
     async fn respond_to_auth_key_enroll_request(&self, conn: &mut Conn, pid: String, v: Value) {
-        crate::renewal_lifecycle::respond_to_auth_key_enroll_request(conn, pid, v).await
+        self.enrollment
+            .respond_to_auth_key_enroll_request(conn, pid, v)
+            .await
     }
     async fn handle_auth_key_enroll_response(&self, conn: &mut Conn, pid: String, v: Value) {
-        crate::renewal_lifecycle::handle_auth_key_enroll_response(conn, pid, v).await
+        self.enrollment
+            .handle_auth_key_enroll_response(conn, pid, v)
+            .await
     }
     fn gate_settle_ms(&self) -> u64 {
         self.identity().gate_settle_ms()

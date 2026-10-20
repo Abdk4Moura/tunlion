@@ -100,11 +100,7 @@ pub fn arm(key_id: String, expires_at: u64, name: Option<String>, kind: Option<S
 /// certificate like a device's, so without this the owner's `devices` filed
 /// a guest under FLEET, "your devices".
 pub fn invitee_kind(key_id: &str) -> Option<String> {
-    let now = crate::capability::now_secs();
-    load()
-        .into_iter()
-        .find(|e| e.key_id == key_id && e.expires > now)
-        .and_then(|e| e.kind)
+    crate::devices_store::store().invitee_kind(key_id)
 }
 
 /// The name the owner chose for whoever enrols with this key, while the key
@@ -112,12 +108,7 @@ pub fn invitee_kind(key_id: &str) -> Option<String> {
 /// under the JOINER's hostname, not "beta": the owner's choice was dropped at
 /// the mint.
 pub fn invitee_name(key_id: &str) -> Option<String> {
-    let now = crate::capability::now_secs();
-    load()
-        .into_iter()
-        .find(|e| e.key_id == key_id && e.expires > now)
-        .and_then(|e| e.name)
-        .filter(|n| !n.trim().is_empty())
+    crate::devices_store::store().invitee_name(key_id)
 }
 
 /// Drop a key from the armed set (called when it burns, or on explicit disarm).

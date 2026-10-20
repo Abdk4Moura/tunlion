@@ -45,6 +45,7 @@ use anyhow::{Context, Result};
 use filament_cap::capability::{
     now_secs as cap_now_secs, superseded_by_tombstone, CapOp, PrincipalKind, CAP_TOMBSTONE_TYPE,
 };
+use filament_cap::ephemeral::Reuse;
 use filament_id::{now_secs, DeviceCert, KeyStore, UserKey};
 use serde_json::{json, Value};
 use std::io;
@@ -61,6 +62,26 @@ pub const LOCAL_DEVICE_CERT_FILE: &str = "identity/device-cert.json";
 /// session's identity proof to that session's overlay announcement, which
 /// follows within seconds; an hour is generous.
 pub const PROVISIONAL_TTL_SECS: u64 = 3600;
+/// Durable invitation-use file, kept apart from device records.
+pub const USED_INVITATIONS_FILE: &str = "used-invitations.json";
+
+/// Why an invitation use was refused. The wire reason is what the joiner sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationRefusal {
+    AlreadyUsed,
+    UseLimitReached,
+    Unverifiable,
+}
+
+impl InvitationRefusal {
+    pub fn wire_reason(self) -> &'static str {
+        match self {
+            InvitationRefusal::AlreadyUsed => "already used",
+            InvitationRefusal::UseLimitReached => "use limit reached",
+            InvitationRefusal::Unverifiable => "enrollment denied",
+        }
+    }
+}
 
 /// Terminal principal states written to `principalState` on a device record.
 pub const PRINCIPAL_STATE_LAPSED: &str = "lapsed";
@@ -930,6 +951,108 @@ impl DeviceStore {
         !entries.is_empty()
     }
 
+    /// The `invitee_name` field recorded for an outstanding invitation, while
+    /// it is unexpired. Explicit-root port of `cli/src/armed.rs`.
+    pub fn invitee_name(&self, key_id: &str) -> Option<String> {
+        let now = cap_now_secs();
+        self.armed_entries()
+            .into_iter()
+            .find(|e| {
+                e["key_id"].as_str() == Some(key_id)
+                    && e["expires"].as_u64().is_some_and(|x| x > now)
+            })
+            .and_then(|e| e["name"].as_str().map(str::to_string))
+            .filter(|n| !n.trim().is_empty())
+    }
+
+    /// The `invitee_kind` (`person`/`device`) recorded for an outstanding
+    /// invitation, while it is unexpired.
+    pub fn invitee_kind(&self, key_id: &str) -> Option<String> {
+        let now = cap_now_secs();
+        self.armed_entries()
+            .into_iter()
+            .find(|e| {
+                e["key_id"].as_str() == Some(key_id)
+                    && e["expires"].as_u64().is_some_and(|x| x > now)
+            })
+            .and_then(|e| e["kind"].as_str().map(str::to_string))
+    }
+
+    fn armed_entries(&self) -> Vec<Value> {
+        let Ok(raw) = std::fs::read_to_string(self.root.join("armed.json")) else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+    }
+
+    /// The owner-signed `cap_header` for resource "self", if this store has one.
+    pub fn owner_cap_header(&self) -> Option<Value> {
+        self.load_cap_store().into_iter().find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        })
+    }
+
+    /// The fleet rendezvous secret at this instance's `fleet.rv`, if any.
+    pub fn fleet_rv(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.root.join("fleet.rv")).ok()?;
+        let s = raw.trim().to_string();
+        (hex::decode(&s).map(|b| b.len()).ok() == Some(32)).then_some(s)
+    }
+
+    /// The owner's copy, minted on first use. Only a device holding the owner
+    /// key calls this; every other device receives it at enrollment.
+    pub fn fleet_rv_load_or_create(&self) -> anyhow::Result<String> {
+        if let Some(s) = self.fleet_rv() {
+            return Ok(s);
+        }
+        let s = crate::secret::fresh_secret();
+        self.store_fleet_rv(&s)?;
+        Ok(s)
+    }
+
+    /// Persist a fleet rendezvous secret received at enrollment.
+    pub fn store_fleet_rv(&self, hex_secret: &str) -> anyhow::Result<()> {
+        if hex::decode(hex_secret).map(|b| b.len()).ok() != Some(32) {
+            anyhow::bail!("fleet rendezvous secret must be 32 bytes of hex");
+        }
+        secret_write::SecretFile::write_str(&self.root.join("fleet.rv"), hex_secret)?;
+        Ok(())
+    }
+
+    /// Whether `name` is pinned to a DIFFERENT device identity than
+    /// `device_pub_hex`.
+    pub fn name_pinned_by_other(&self, name: &str, device_pub_hex: &str) -> bool {
+        self.devices_records().iter().any(|d| {
+            d["name"].as_str() == Some(name)
+                && d["deviceCert"]["devicePub"]
+                    .as_str()
+                    .is_some_and(|p| p != device_pub_hex)
+        })
+    }
+
+    /// Durable invitation-use count, keyed by the enrolment public key. This is
+    /// the cross-restart replay guard; the in-memory burn is only the live
+    /// engine's fast path.
+    pub fn record_invitation_use(
+        &self,
+        key_id: &str,
+        reuse: &Reuse,
+        expires: u64,
+        now: u64,
+    ) -> std::result::Result<(), InvitationRefusal> {
+        record_invitation_use_at(
+            &self.root.join(USED_INVITATIONS_FILE),
+            key_id,
+            reuse,
+            expires,
+            now,
+        )
+    }
+
     /// What to re-invite an expired delegated device with: the ceiling it was
     /// admitted with and the lifetime its invitation granted. Pure over the
     /// record, so the refusal text and the re-invitation cannot drift.
@@ -1056,6 +1179,57 @@ impl DeviceStore {
         }
         Ok(added)
     }
+}
+
+/// May this use be admitted, given `uses` already recorded? Pure.
+pub fn admit_invitation_use(
+    uses: u64,
+    reuse: &Reuse,
+) -> std::result::Result<(), InvitationRefusal> {
+    match reuse {
+        Reuse::Once if uses >= 1 => Err(InvitationRefusal::AlreadyUsed),
+        Reuse::N(max) if uses >= u64::from(*max) => Err(InvitationRefusal::UseLimitReached),
+        _ => Ok(()),
+    }
+}
+
+/// Count one use of `key_id` at an explicit path. The use is written BEFORE the
+/// caller admits anything, so a crash can lose a use but never grant an extra
+/// one. A file that exists but cannot be parsed is `Unverifiable` (fail closed).
+pub fn record_invitation_use_at(
+    path: &Path,
+    key_id: &str,
+    reuse: &Reuse,
+    expires: u64,
+    now: u64,
+) -> std::result::Result<(), InvitationRefusal> {
+    let mut entries = match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            serde_json::from_str::<Vec<Value>>(&raw).map_err(|_| InvitationRefusal::Unverifiable)?
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return Err(InvitationRefusal::Unverifiable),
+    };
+    entries.retain(|e| e["expires"].as_u64().map_or(true, |x| x > now));
+    let uses = entries
+        .iter()
+        .find(|e| e["keyId"].as_str() == Some(key_id))
+        .and_then(|e| e["uses"].as_u64())
+        .unwrap_or(0);
+    admit_invitation_use(uses, reuse)?;
+    entries.retain(|e| e["keyId"].as_str() != Some(key_id));
+    entries.push(json!({
+        "keyId": key_id,
+        "uses": uses + 1,
+        "expires": expires,
+        "lastUsed": now,
+    }));
+    let body =
+        serde_json::to_string_pretty(&entries).map_err(|_| InvitationRefusal::Unverifiable)?;
+    keep_backup(path);
+    secret_write::SecretFile::write_str(path, &body)
+        .map_err(|_| InvitationRefusal::Unverifiable)?;
+    Ok(())
 }
 
 /// Strip terminal escape sequences and control characters from a device
@@ -1873,6 +2047,39 @@ mod store_guards {
             store.owner_pub_for_resources(None),
             Some(user.public_key_bytes()),
             "a broken/unreadable overlay key must not hide the certificate issuer"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_durable_invitation_use_survives_a_fresh_store() {
+        let root = unique("invitation-use");
+        let first = DeviceStore::open(&root);
+        first
+            .record_invitation_use("key", &Reuse::Once, 1_000, 10)
+            .unwrap();
+        // A restart is a fresh store over the same root: nothing in memory.
+        let second = DeviceStore::open(&root);
+        assert_eq!(
+            second.record_invitation_use("key", &Reuse::Once, 1_000, 11),
+            Err(InvitationRefusal::AlreadyUsed)
+        );
+        assert_eq!(
+            second.record_invitation_use("other", &Reuse::Once, 1_000, 11),
+            Ok(())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_corrupt_used_invitation_file_fails_closed() {
+        let root = unique("invitation-corrupt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(USED_INVITATIONS_FILE), b"{garbage").unwrap();
+        let store = DeviceStore::open(&root);
+        assert_eq!(
+            store.record_invitation_use("key", &Reuse::Once, 1_000, 10),
+            Err(InvitationRefusal::Unverifiable)
         );
         let _ = std::fs::remove_dir_all(&root);
     }

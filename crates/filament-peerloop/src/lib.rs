@@ -47,10 +47,11 @@
 //!   the process environment. `host` defines the `LogSink` and `HostServices`
 //!   traits the peer loop asks through, and the CLI implements them. `present`
 //!   does the same for terminal state. One deliberate exception is
-//!   `recv::store` and `recv::identity`: they read and write `devices.json`, the
-//!   capability store, the identity sidecars and the overlay key, but every
-//!   entry point is built from an explicit root/key path and nothing in them
-//!   consults the environment.
+//!   `recv::store`, `recv::identity` and `recv::enrollment`: they read and write
+//!   `devices.json`, the capability store, the identity sidecars, the overlay
+//!   key and the enrollment nonce/burn runtime, but every entry point is built
+//!   from an explicit root/key path and nothing in them consults the
+//!   environment.
 //! Nothing here calls back into the CLI; the CLI depends on this crate.
 
 #![cfg_attr(not(feature = "mesh"), doc = include_str!("mesh_disabled.md"))]
