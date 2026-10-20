@@ -17,14 +17,11 @@ use crate::daemon_alive;
 use crate::devices_store::devices_load;
 use crate::effective_principal_deadline;
 use crate::expose;
-use crate::fleet;
 use crate::fleet_ui;
 use crate::format_approval_expiry;
 use crate::identity;
 use crate::identity_flow::local_device_cert;
 use crate::local_request;
-use crate::owner_cap_header;
-use crate::owner_signed_cap_ops;
 use crate::parse_duration_secs;
 use crate::pidfile;
 use crate::request_entries;
@@ -705,29 +702,18 @@ pub(crate) fn mesh_enrolment(
     expires: u64,
     persistent: bool,
 ) -> Result<(identity::DeviceCert, Value)> {
-    let now = identity::now_secs();
-    let cert =
-        identity::DeviceCert::certify(owner_key, device_pub, now, expires.saturating_sub(now))
-            .map_err(|e| anyhow!("could not certify the device: {e}"))?;
-    let payload = json!({
-        "device_cert": cert.to_json(),
-        "owner_cert": local_device_cert().map(|c| c.to_json()),
-        // Only a persistent member joins the fleet meeting point.
-        "fleet_rv": persistent.then(|| fleet::rv_load_or_create().ok()).flatten(),
-        // A joined device cannot make its own header: ensure_self_genesis_header
-        // SIGNS it with the owner's UserKey, which the joiner does not hold. So
-        // the owner hands it over. It carries no secret, being signed and
-        // self-certifying, and naming owner_pub and a nonce.
-        "cap_header": persistent.then(owner_cap_header).flatten(),
-        // Owner-authored policy, relayed. The joiner verifies every op against
-        // the owner key in the header above, so this is not a trust decision
-        // handed to whoever transmits it.
-        "cap_ops": persistent.then(|| json!(owner_signed_cap_ops())).unwrap_or(Value::Null),
-        "ceiling": caps,
-        "expires": expires,
-        "persistent": persistent,
-    });
-    Ok((cert, payload))
+    filament_peerloop::recv::enrollment::build_enrolment(
+        &crate::devices_store::store(),
+        &filament_peerloop::recv::store::OverlayKey::new(
+            crate::platform::Paths::config_path("overlay.ed25519"),
+        ),
+        &crate::display_name(),
+        owner_key,
+        device_pub,
+        caps,
+        expires,
+        persistent,
+    )
 }
 
 /// How long `up --detach` re-watches a daemon it has just called detached.

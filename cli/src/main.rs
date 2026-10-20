@@ -93,7 +93,6 @@ mod session;
 /// Daemon control-socket + warm-reuse handlers, lifted out of this file.
 mod daemon_ctl;
 /// Certificate-renewal + auth-key enrolment lifecycle handlers.
-mod renewal_lifecycle;
 /// Peer-identity proof/expose lifecycle handlers.
 mod identity_lifecycle;
 /// `tunlion enroll` and its shared helpers.

@@ -1025,12 +1025,6 @@ struct BurnState {
     map: HashMap<[u8; 32], BurnEntry>,
 }
 
-static BURN: OnceLock<Mutex<BurnState>> = OnceLock::new();
-
-fn burn_state() -> &'static Mutex<BurnState> {
-    BURN.get_or_init(|| Mutex::new(BurnState { map: HashMap::new() }))
-}
-
 // ---- Flood store (pid-keyed, TTL-sweepable — SEPARATE from burn so entries can be evicted) ----
 
 struct FloodEntry {
@@ -1042,86 +1036,142 @@ struct FloodState {
     map: HashMap<String, FloodEntry>,
 }
 
-static FLOOD: OnceLock<Mutex<FloodState>> = OnceLock::new();
-
-fn flood_state() -> &'static Mutex<FloodState> {
-    FLOOD.get_or_init(|| Mutex::new(FloodState { map: HashMap::new() }))
+/// Owned auth-key enrollment runtime state: the nonce, burn and rate-limit
+/// state one engine/config identity needs. It is deliberately a value, not a
+/// process static: two instances in one process must not consume each other's
+/// nonces or share a rate-limit window. The CLI keeps one in its receive loop;
+/// the legacy free functions below delegate to a process-wide instance for the
+/// older callers.
+pub struct EnrollmentState {
+    burn: Mutex<BurnState>,
+    flood: Mutex<FloodState>,
+    nonces: Mutex<NonceStore>,
 }
 
-/// Rate-limit check: pre-flight anti-flood KEYED BY TRANSPORT PID.
-/// Separate map from burn store so expired entries can be swept without
-/// destroying permanent single-use burn state.
+impl Default for EnrollmentState {
+    fn default() -> Self {
+        Self {
+            burn: Mutex::new(BurnState {
+                map: HashMap::new(),
+            }),
+            flood: Mutex::new(FloodState {
+                map: HashMap::new(),
+            }),
+            nonces: Mutex::new(NonceStore {
+                pending: HashMap::new(),
+            }),
+        }
+    }
+}
+
+static ENROLLMENT_STATE: OnceLock<EnrollmentState> = OnceLock::new();
+
+fn enrollment_state() -> &'static EnrollmentState {
+    ENROLLMENT_STATE.get_or_init(EnrollmentState::default)
+}
+
+impl EnrollmentState {
+    /// Rate-limit check: pre-flight anti-flood KEYED BY TRANSPORT PID.
+    /// Separate map from burn store so expired entries can be swept without
+    /// destroying permanent single-use burn state.
+    pub fn check_rate_limit_at(&self, pid: &str, now_secs: u64) -> Result<()> {
+        let mut state = self.flood.lock().unwrap();
+        // Sweep expired flood entries
+        state
+            .map
+            .retain(|_, e| now_secs.saturating_sub(e.window_start_secs) < 120);
+        let entry = state.map.entry(pid.to_string()).or_insert(FloodEntry {
+            attempt_count: 0,
+            window_start_secs: now_secs,
+        });
+        let elapsed = now_secs.saturating_sub(entry.window_start_secs);
+        if elapsed >= 60 {
+            entry.attempt_count = 0;
+            entry.window_start_secs = now_secs;
+        }
+        if entry.attempt_count >= ENROLL_RATE_LIMIT {
+            bail!("too many enrollment attempts (max {}/min)", ENROLL_RATE_LIMIT);
+        }
+        entry.attempt_count += 1;
+        Ok(())
+    }
+
+    pub fn check_rate_limit(&self, pid: &str) -> Result<()> {
+        self.check_rate_limit_at(pid, now_secs())
+    }
+
+    /// Consume one use of an auth key identified by `enroll_pub`.
+    /// Rate-limited: max 5 enrollments/min per enroll_pub per peer.
+    /// NEVER reset burn_count (reuse guard) — the rate-limit window is
+    /// independent. The durable cross-restart count is `used-invitations.json`
+    /// in the host store; this value only carries the engine's live state.
+    pub fn burn_auth_key_at(
+        &self,
+        enroll_pub: &[u8; 32],
+        reuse: &Reuse,
+        now_secs: u64,
+    ) -> Result<()> {
+        let mut state = self.burn.lock().unwrap();
+        let entry = state.map.entry(*enroll_pub).or_insert(BurnEntry {
+            burn_count: 0,
+            window_count: 0,
+            window_start_secs: now_secs,
+        });
+
+        let elapsed = now_secs.saturating_sub(entry.window_start_secs);
+        if elapsed >= 60 {
+            entry.window_count = 0;
+            entry.window_start_secs = now_secs;
+        }
+        if entry.window_count >= ENROLL_RATE_LIMIT {
+            bail!(
+                "auth key rate-limited (max {} enrollments/min)",
+                ENROLL_RATE_LIMIT
+            );
+        }
+
+        match reuse {
+            Reuse::Once => {
+                if entry.burn_count > 0 {
+                    bail!("auth key already used (single-use)");
+                }
+            }
+            Reuse::N(max) => {
+                if entry.burn_count >= *max {
+                    bail!("auth key exhausted ({} uses)", max);
+                }
+            }
+            Reuse::Reusable => {}
+        }
+
+        entry.burn_count += 1;
+        entry.window_count += 1;
+        Ok(())
+    }
+
+    pub fn burn_auth_key(&self, enroll_pub: &[u8; 32], reuse: &Reuse) -> Result<()> {
+        self.burn_auth_key_at(enroll_pub, reuse, now_secs())
+    }
+}
+
+/// Rate-limit check for the process-wide legacy state.
 pub fn check_rate_limit(pid: &str) -> Result<()> {
-    let now_secs = now_secs();
-    let mut state = flood_state().lock().unwrap();
-    // Sweep expired flood entries
-    state.map.retain(|_, e| now_secs.saturating_sub(e.window_start_secs) < 120);
-    let entry = state.map.entry(pid.to_string()).or_insert(FloodEntry {
-        attempt_count: 0,
-        window_start_secs: now_secs,
-    });
-    let elapsed = now_secs.saturating_sub(entry.window_start_secs);
-    if elapsed >= 60 {
-        entry.attempt_count = 0;
-        entry.window_start_secs = now_secs;
-    }
-    if entry.attempt_count >= ENROLL_RATE_LIMIT {
-        bail!("too many enrollment attempts (max {}/min)", ENROLL_RATE_LIMIT);
-    }
-    entry.attempt_count += 1;
-    Ok(())
+    enrollment_state().check_rate_limit(pid)
 }
 
-/// Consume one use of an auth key identified by `enroll_pub`.
-/// Rate-limited: max 5 enrollments/min per enroll_pub per peer.
-/// Burn is process-local: a daemon restart clears all burn state.
-/// NEVER reset burn_count (reuse guard) — rate-limit window is independent.
+/// Consume one use of an auth key in the process-wide legacy state.
 pub fn burn_auth_key(enroll_pub: &[u8; 32], reuse: &Reuse) -> Result<()> {
-    burn_auth_key_at(enroll_pub, reuse, now_secs())
+    enrollment_state().burn_auth_key(enroll_pub, reuse)
 }
 
-/// Like burn_auth_key but takes an explicit now so tests can advance time
+/// Like [`burn_auth_key`] but takes an explicit now so tests can advance time
 /// without sleeping.
-pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u64) -> Result<()> {
-    let mut state = burn_state().lock().unwrap();
-    let entry = state.map.entry(*enroll_pub).or_insert(BurnEntry {
-        burn_count: 0,
-        window_count: 0,
-        window_start_secs: now_secs,
-    });
-
-    let elapsed = now_secs.saturating_sub(entry.window_start_secs);
-    if elapsed >= 60 {
-        entry.window_count = 0;
-        entry.window_start_secs = now_secs;
-    }
-    if entry.window_count >= ENROLL_RATE_LIMIT {
-        bail!("auth key rate-limited (max {} enrollments/min)", ENROLL_RATE_LIMIT);
-    }
-
-    match reuse {
-        Reuse::Once => {
-            if entry.burn_count > 0 {
-                bail!("auth key already used (single-use)");
-            }
-        }
-        Reuse::N(max) => {
-            if entry.burn_count >= *max {
-                bail!("auth key exhausted ({} uses)", max);
-            }
-        }
-        Reuse::Reusable => {}
-    }
-
-    entry.burn_count += 1;
-    entry.window_count += 1;
-
-    // Burn: a consumed key is left in the armed file until its expiry, when the
-    // file-backed store's is_armed() prunes it. Enrollment still requires the
-    // signed invitation, so a burned key lingering in the set is harmless and a
-    // per-key immediate disarm (which needs this crate to know the store path,
-    // which it must not) is a refinement the CLI may add later.
-    Ok(())
+pub(crate) fn burn_auth_key_at(
+    enroll_pub: &[u8; 32],
+    reuse: &Reuse,
+    now_secs: u64,
+) -> Result<()> {
+    enrollment_state().burn_auth_key_at(enroll_pub, reuse, now_secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,7 +1207,8 @@ pub fn delegated_effective_caps(
 
 use std::time::Instant as StdInstant;
 
-const ENROLL_NONCE_TTL_SECS: u64 = 60;
+/// How long an enrollment challenge nonce stays valid.
+pub const ENROLL_NONCE_TTL_SECS: u64 = 60;
 
 struct NonceEntry {
     nonce: [u8; 32],
@@ -1169,62 +1220,73 @@ struct NonceStore {
     pending: HashMap<String, Vec<NonceEntry>>,
 }
 
-static NONCE_STORE: OnceLock<Mutex<NonceStore>> = OnceLock::new();
+impl EnrollmentState {
+    /// Generate a fresh CSPRNG nonce for the given peer, store it, return the nonce.
+    /// Single outstanding nonce per peer (replaced on each new request). Sweeps
+    /// expired entries on insert. Propagates CSPRNG fill error — never issues a
+    /// zero-filled nonce.
+    pub fn generate_nonce_at(&self, peer_id: &str, now: StdInstant) -> Result<[u8; 32]> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        let mut nonce = [0u8; 32];
+        rng.fill(&mut nonce)
+            .map_err(|e| anyhow!("CSPRNG failure: {}", e))?;
+        if nonce == [0u8; 32] {
+            bail!("CSPRNG returned zero nonce");
+        }
+        let mut store = self.nonces.lock().unwrap();
+        store
+            .pending
+            .retain(|_, entries| entries.iter().any(|e| e.deadline > now));
+        store.pending.insert(
+            peer_id.to_string(),
+            vec![NonceEntry {
+                nonce,
+                deadline: now + std::time::Duration::from_secs(ENROLL_NONCE_TTL_SECS),
+            }],
+        );
+        Ok(nonce)
+    }
 
-fn nonce_store() -> &'static Mutex<NonceStore> {
-    NONCE_STORE.get_or_init(|| Mutex::new(NonceStore { pending: HashMap::new() }))
+    pub fn generate_nonce(&self, peer_id: &str) -> Result<[u8; 32]> {
+        self.generate_nonce_at(peer_id, StdInstant::now())
+    }
+
+    /// Consume the outstanding nonce for a peer and return it.
+    /// Since there is one outstanding nonce per peer (replaced on each new
+    /// request), this simply takes it. Errors if none found or expired.
+    pub fn consume_latest_nonce_at(&self, peer_id: &str, now: StdInstant) -> Result<[u8; 32]> {
+        let mut store = self.nonces.lock().unwrap();
+        let entries = match store.pending.get_mut(peer_id) {
+            Some(v) => v,
+            None => bail!("no enrollment nonce for peer"),
+        };
+        entries.retain(|e| e.deadline > now);
+        if entries.is_empty() {
+            store.pending.remove(peer_id);
+            bail!("enrollment nonce expired or already consumed");
+        }
+        let nonce = entries.remove(0).nonce;
+        if entries.is_empty() {
+            store.pending.remove(peer_id);
+        }
+        Ok(nonce)
+    }
+
+    pub fn consume_latest_nonce(&self, peer_id: &str) -> Result<[u8; 32]> {
+        self.consume_latest_nonce_at(peer_id, StdInstant::now())
+    }
 }
 
-/// Generate a fresh CSPRNG nonce for the given peer, store it, return the nonce.
-/// Rate-limited: called once per attempt (by check_rate_limit), single outstanding
-/// nonce per peer (replaced on each new request). Sweeps expired entries on insert.
-/// Propagates CSPRNG fill error — never issues a zero-filled nonce.
+/// Generate a nonce in the process-wide legacy state.
 pub fn generate_nonce(peer_id: &str) -> Result<[u8; 32]> {
-    use ring::rand::{SecureRandom, SystemRandom};
-    let rng = SystemRandom::new();
-    let mut nonce = [0u8; 32];
-    rng.fill(&mut nonce).map_err(|e| anyhow!("CSPRNG failure: {}", e))?;
-    // Nonce must be non-zero after fill
-    if nonce == [0u8; 32] {
-        bail!("CSPRNG returned zero nonce");
-    }
-    let mut store = nonce_store().lock().unwrap();
-    // Sweep expired entries across ALL peers
-    let now = StdInstant::now();
-    store.pending.retain(|_, entries| {
-        entries.iter().any(|e| e.deadline > now)
-    });
-    // Single outstanding nonce per peer — replace
-    store.pending.insert(peer_id.to_string(), vec![NonceEntry {
-        nonce,
-        deadline: now + std::time::Duration::from_secs(ENROLL_NONCE_TTL_SECS),
-    }]);
-    Ok(nonce)
+    enrollment_state().generate_nonce(peer_id)
 }
 
-/// Consume the outstanding nonce for a peer and return it.
-/// Since we maintain a single outstanding nonce per peer (replaced on each
-/// new request), this simply takes it. Errors if none found or expired.
+/// Consume the outstanding nonce from the process-wide legacy state.
 pub fn consume_latest_nonce(peer_id: &str) -> Result<[u8; 32]> {
-    let mut store = nonce_store().lock().unwrap();
-    let entries = match store.pending.get_mut(peer_id) {
-        Some(v) => v,
-        None => bail!("no enrollment nonce for peer"),
-    };
-    let now = StdInstant::now();
-    entries.retain(|e| e.deadline > now);
-    if entries.is_empty() {
-        store.pending.remove(peer_id);
-        bail!("enrollment nonce expired or already consumed");
-    }
-    let nonce = entries.remove(0).nonce;
-    if entries.is_empty() {
-        store.pending.remove(peer_id);
-    }
-    Ok(nonce)
+    enrollment_state().consume_latest_nonce(peer_id)
 }
-
-// Remove consume_nonce (peer_id, nonce) — no longer needed since single-outstanding.
 
 // ---------------------------------------------------------------------------
 // Arm-gate: armed set for enrollment room membership
@@ -1503,7 +1565,7 @@ mod tests {
 
         // Manually reset window to simulate rate-window expiry at t=120
         {
-            let mut state = burn_state().lock().unwrap();
+            let mut state = enrollment_state().burn.lock().unwrap();
             if let Some(entry) = state.map.get_mut(&enroll_pub) {
                 entry.window_count = 0;
                 entry.window_start_secs = 120;
@@ -2208,5 +2270,61 @@ mod frozen_protocol_literals {
             let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(got, digest, "frozen protocol literal {name} changed");
         }
+    }
+}
+
+#[cfg(test)]
+mod owned_enrollment_state_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn key(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn two_instances_do_not_share_nonces_burn_or_rate_limits() {
+        let a = EnrollmentState::default();
+        let b = EnrollmentState::default();
+        let now = Instant::now();
+
+        // Rate limit: A can be exhausted without touching B.
+        for _ in 0..ENROLL_RATE_LIMIT {
+            a.check_rate_limit_at("peer", 0).unwrap();
+        }
+        assert!(a.check_rate_limit_at("peer", 0).is_err());
+        assert!(b.check_rate_limit_at("peer", 0).is_ok());
+
+        // Nonces: a nonce minted by A cannot be consumed from B.
+        let nonce = a.generate_nonce_at("peer", now).unwrap();
+        assert!(b.consume_latest_nonce_at("peer", now).is_err());
+        assert_eq!(a.consume_latest_nonce_at("peer", now).unwrap(), nonce);
+        assert!(a.consume_latest_nonce_at("peer", now).is_err());
+
+        // Burn: A's single-use key stays usable in B.
+        let k = key(7);
+        a.burn_auth_key_at(&k, &Reuse::Once, 0).unwrap();
+        assert!(a.burn_auth_key_at(&k, &Reuse::Once, 0).is_err());
+        assert!(b.burn_auth_key_at(&k, &Reuse::Once, 0).is_ok());
+    }
+
+    #[test]
+    fn an_owned_nonce_expires_without_sleeping() {
+        let state = EnrollmentState::default();
+        let now = Instant::now();
+        state.generate_nonce_at("peer", now).unwrap();
+        assert!(state
+            .consume_latest_nonce_at("peer", now + Duration::from_secs(ENROLL_NONCE_TTL_SECS + 1))
+            .is_err());
+    }
+
+    #[test]
+    fn a_bounded_burn_counts_to_its_limit_per_instance() {
+        let state = EnrollmentState::default();
+        let k = key(9);
+        for _ in 0..3 {
+            state.burn_auth_key_at(&k, &Reuse::N(3), 0).unwrap();
+        }
+        assert!(state.burn_auth_key_at(&k, &Reuse::N(3), 0).is_err());
     }
 }
