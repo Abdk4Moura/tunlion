@@ -96,7 +96,7 @@ jobs:
       # pake-ux drives the real backend, so it needs the Python side present.
       # Versions match capability-ci.yml so the two jobs cannot drift apart.
       - name: Install backend deps
-        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0 redis==8.1.0
 
       # pake-ux asserts the built app talks to its own origin, so the dist must
       # be built WITHOUT a production API base. The gate checks this and says so.
