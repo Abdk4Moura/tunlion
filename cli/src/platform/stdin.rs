@@ -176,7 +176,6 @@ mod win {
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
         reason: Arc<std::sync::Mutex<Option<&'static str>>>,
-        detached: bool,
     }
 
     impl StdinOwner for WindowsStdin {
@@ -191,7 +190,6 @@ mod win {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while !handle.is_finished() {
                 if std::time::Instant::now() >= deadline {
-                    self.detached = true;
                     self.handle = Some(handle);
                     return StdinOutcome::Detached("windows stdin reader did not stop within 2s");
                 }
@@ -252,7 +250,6 @@ mod win {
             stop,
             handle: Some(handle),
             reason,
-            detached: false,
         }))
     }
 
@@ -567,7 +564,6 @@ mod win {
             stop,
             handle: Some(handle),
             reason,
-            detached: false,
         })
     }
 
@@ -580,7 +576,6 @@ mod win {
             stop,
             handle: Some(handle),
             reason,
-            detached: false,
         })
     }
 }
@@ -807,6 +802,26 @@ mod windows_tests {
         }
         assert!(started.elapsed() >= std::time::Duration::from_secs(2));
         assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        // The timed-out handle must still be retained: a second join times out
+        // again rather than reporting NotStarted or Joined.
+        match owner.join() {
+            StdinOutcome::Detached(reason) => assert!(reason.contains("did not stop")),
+            other => panic!("expected retained detached handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn socket_reported_as_pipe_is_named_not_joined() {
+        use std::os::windows::io::AsRawSocket;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut owner, _rx) = owner(listener.as_raw_socket() as usize);
+        match owner.join() {
+            StdinOutcome::Detached(reason) => assert!(
+                reason.contains("pipe query failed") || reason.contains("neither console"),
+                "expected a named failure, got {reason}"
+            ),
+            other => panic!("expected detached, got {other:?}"),
+        }
     }
 
     #[test]
