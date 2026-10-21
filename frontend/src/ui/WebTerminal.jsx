@@ -110,7 +110,17 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       ta.readOnly = !enabled
       ta.setAttribute('inputmode', enabled ? 'text' : 'none')
       ta.setAttribute('virtualkeyboardpolicy', enabled ? 'auto' : 'manual')
-      if (!enabled) ta.blur()
+      if (!enabled) {
+        // Hidden means the SOFT keyboard is hidden: physical keyboards and
+        // their IME must keep working. blur() normally delivers the final
+        // compositionend (which commits exactly once); clear the shared flag
+        // after it so a browser that does not deliver that event cannot leave
+        // the next composition marked as still in progress. Do not clear the
+        // textarea here: the compositionend handler owns that, and clearing it
+        // early would lose an in-flight commit.
+        ta.blur()
+        composingRef.current = false
+      }
     }
     // Must stay in the button's click stack: iOS rejects delayed IME focus.
     if (enabled) termRef.current?.focus()
@@ -542,7 +552,10 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
           composing = false; composingRef.current = false
           // Commit the resolved/autocompleted word ONCE.
           const data = e && e.data ? e.data : ''
-          if (data && keyboardOpenRef.current) {
+          // Soft-keyboard visibility must not gate input: hardware keyboards
+          // (including their IME composition) stay live while the software
+          // keyboard is hidden. Commit once, whatever opened the keyboard.
+          if (data) {
             write(applyMods(data))
             // Predict the committed text now (NOT during composition, so we never
             // double-insert): mirrors typing the resolved chars.
@@ -812,7 +825,12 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
 
     const ro = new ResizeObserver(() => safeFit())
     ro.observe(hostRef.current)
-    focusTerminal()
+    // Focus the helper textarea on mount even in touch/browse mode so a
+    // hardware keyboard has a target immediately. On touch it is readOnly with
+    // inputmode=none, which is what keeps the SOFTWARE keyboard closed; do not
+    // replace this with focusTerminal() (that intentionally skips hidden mode
+    // for accessory/scroll/reconnect paths).
+    try { term.focus() } catch (e) {}
 
     // Final-unmount cleanup ONLY. This effect has deps [] so it runs exactly
     // once on mount and its cleanup runs exactly once on unmount: the ONLY place
@@ -1142,7 +1160,6 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
               {isTouch && <button type="button" data-testid="term-keyboard"
                 aria-label={keyboardOpen ? 'hide terminal keyboard' : 'show terminal keyboard'}
                 aria-pressed={keyboardOpen} title={keyboardOpen ? 'hide keyboard; keep viewing' : 'show keyboard to type'}
-                onPointerDown={(e) => e.preventDefault()}
                 onClick={() => { setKeyboard(!keyboardOpenRef.current); haptic() }}
                 style={{ ...hb, color: keyboardOpen ? T.onAccent : T.text, background: keyboardOpen ? accent : 'transparent' }}
               >Keyboard</button>}
