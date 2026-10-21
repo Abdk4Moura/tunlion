@@ -706,6 +706,37 @@ async fn verify_fleet_identity(
 /// before saying it is offline. A live daemon answers the moment it sees us.
 const EXEC_SILENT_PEER: Duration = Duration::from_secs(15);
 
+/// The one transient "waiting" line an `exec` may show. Created only after
+/// [`crate::ui::wait_status_enabled`] said a live, non-quiet, non-JSON TTY is
+/// watching, so a pipe never receives it. The delay is owned by the caller's
+/// timer; this guard only erases the line on EVERY exit (success, refusal,
+/// timeout) so the command's real output never lands on top of it.
+struct ExecWaitLine {
+    enabled: bool,
+    shown: bool,
+}
+
+impl ExecWaitLine {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, shown: false }
+    }
+
+    fn show(&mut self, line: &str) {
+        if self.enabled {
+            crate::ui::status(line);
+            self.shown = true;
+        }
+    }
+}
+
+impl Drop for ExecWaitLine {
+    fn drop(&mut self) {
+        if self.shown {
+            crate::ui::clear_status();
+        }
+    }
+}
+
 pub(crate) async fn bring_up_to_known(
     server: &str,
     peer_name: &str,
@@ -870,7 +901,16 @@ pub(crate) async fn bring_up_to_known(
     // wording; "reconnect" is silent (post-warm resume check — the link was
     // already up; re-reporting it after a clean logout is noise).
     let silent = role.starts_with("reconnect");
-    if !silent {
+    // `exec` is the one role whose wait line is a DEFERRED transient: a warm or
+    // fast cold path must print nothing, a pipe/quiet/JSON run must print
+    // nothing, and a slow path gets one line that is erased the instant we are
+    // ready. Every other role keeps its established wording.
+    let exec_wait = role == "exec" && crate::ui::wait_status_enabled();
+    let mut wait_line = ExecWaitLine::new(exec_wait);
+    let wait_timer =
+        tokio::time::sleep_until(tokio::time::Instant::now() + crate::ui::WAIT_STATUS_DELAY);
+    tokio::pin!(wait_timer);
+    if !silent && role != "exec" {
         crate::ui::say(&match role {
             "bootstrap" => format!("tunlion: authenticating with '{peer_name}'..."),
             _ => format!("\rtunlion: waiting for known device '{peer_name}'..."),
@@ -1012,12 +1052,23 @@ pub(crate) async fn bring_up_to_known(
             }
         }
         let ev = tokio::select! {
+            _ = &mut wait_timer, if exec_wait && !wait_line.shown => {
+                wait_line.show(&format!("tunlion: waiting for known device '{peer_name}'..."));
+                continue;
+            }
             ev = rx.recv() => match ev {
                 Some(ev) => ev,
                 None => break,
             },
             _ = heartbeat.tick() => {
-                if role != "doctor" {
+                if role == "exec" {
+                    // A slow establish: refresh the transient line; it is erased
+                    // by the guard when this function returns.
+                    wait_line.show(&format!(
+                        "tunlion: still reaching '{peer_name}'... ({}s)",
+                        connect_started.elapsed().as_secs()
+                    ));
+                } else if role != "doctor" {
                     crate::ui::say(&format!(
                         "tunlion: still reaching '{peer_name}'... ({}s)",
                         connect_started.elapsed().as_secs()
@@ -1028,7 +1079,9 @@ pub(crate) async fn bring_up_to_known(
             _ = offline_check.tick(), if !heard_from_peer => {
                 if !offline_hinted && connect_started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER {
                     offline_hinted = true;
-                    if role != "doctor" && !silent {
+                    if role == "exec" {
+                        wait_line.show(&crate::conn::offline_hint(peer_name));
+                    } else if role != "doctor" && !silent {
                         crate::ui::say(&crate::conn::offline_hint(peer_name));
                     }
                 }

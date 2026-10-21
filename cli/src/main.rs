@@ -40,6 +40,7 @@ mod fleet_renewal;
 mod exit_route;
 mod exec_recv;
 mod exec_send;
+mod exec_warm;
 mod sync_cmd;
 mod ssh_ca;
 /// `tunlion expose`: publish a local port on the L3 overlay. The CLI/config side

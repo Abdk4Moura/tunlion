@@ -2,12 +2,17 @@
 //!
 //! Deliberately one-shot where `pty_cmd` is resumable: an exec invocation has
 //! no session worth reattaching (the receiver holds no persistent state for
-//! it), so there is NO warm-daemon fast path and NO reconnect loop. A dropped
-//! link fails loudly instead of re-running the command -- re-running would
-//! execute side effects twice, which is exactly the wrong default for a
-//! non-idempotent remote command. That asymmetry with shells is intentional
-//! and documented here so a future "make exec resilient" change has to reckon
-//! with double-execution first.
+//! it), so there is NO reconnect loop. A dropped link fails loudly instead of
+//! re-running the command -- re-running would execute side effects twice, which
+//! is exactly the wrong default for a non-idempotent remote command. That
+//! asymmetry with shells is intentional and documented here so a future "make
+//! exec resilient" change has to reckon with double-execution first.
+//!
+//! WARM REUSE is different from reconnecting and lives in `exec_warm`: a local
+//! `up` daemon that ALREADY holds an identity-proven link may carry the exec
+//! over it, once. Only an explicit `no warm path` falls back to the cold
+//! establish below; after the daemon has sent `exec-open`, a link death is
+//! final and is never replayed on a fresh link.
 //!
 //! Wire contract (CONTRACT.md, "Exec streams"): allocator registers both pipes
 //! BEFORE the open goes out (a racing ack/close must not find no pipe, same
@@ -40,7 +45,7 @@ pub(crate) struct ExecOpts {
 /// link stalls, `blocking_send` parks this thread instead of buffering
 /// forever: file reads pause, pipe writers block -- backpressure end to
 /// end instead of OOM. An empty Vec is the EOF sentinel, same convention.
-fn spawn_bounded_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+pub(crate) fn spawn_bounded_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || {
         use std::io::Read;
@@ -227,7 +232,7 @@ pub(crate) fn spawn_refusal_code(reason: &str) -> Option<i32> {
 }
 
 /// Say why the remote command could not start, and return its shell code.
-fn spawn_refused(peer: &str, argv0: &str, reason: &str, code: i32) -> i32 {
+pub(crate) fn spawn_refused(peer: &str, argv0: &str, reason: &str, code: i32) -> i32 {
     let what = if code == EXEC_NOT_FOUND {
         format!("'{argv0}' is not on {peer}'s PATH")
     } else {
@@ -239,7 +244,7 @@ fn spawn_refused(peer: &str, argv0: &str, reason: &str, code: i32) -> i32 {
 
 /// A write to this side's stdout/stderr failed: a closed reader is 141
 /// (quietly, as SIGPIPE would end a local command), anything else is an error.
-fn local_output_failed(e: std::io::Error) -> Result<i32> {
+pub(crate) fn local_output_failed(e: std::io::Error) -> Result<i32> {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
         Ok(EXEC_OUTPUT_CLOSED)
     } else {
@@ -262,6 +267,22 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
     // keeps a signal's handler installed once registered, so a listener per
     // attempt would leave the gaps between attempts swallowing Ctrl-C.
     let mut interrupted: Interrupted = Box::pin(interruption());
+    // Warm reuse FIRST, and once: a local `up` daemon already holding a live,
+    // identity-proven link to this peer can carry the exec without a second
+    // establish. Only a daemon that says "no warm path" falls through to the
+    // one-shot loop below. A warm attempt that got as far as sending
+    // `exec-open` NEVER falls back: the remote command may already have run,
+    // and re-running a non-idempotent command is exactly what this file's
+    // header forbids. The daemon owns the identity challenge and the
+    // heartbeats for the warm session, so no `IdentityService` is needed here.
+    // `--relay` asks for a relayed link explicitly; a warm link may be direct,
+    // so it is not the path the user asked for. Take the cold establish instead.
+    if !relay {
+        match crate::exec_warm::try_exec(peer, &opts, &mut interrupted).await {
+            crate::exec_warm::WarmExec::NoPath => {}
+            crate::exec_warm::WarmExec::Done(result) => return result,
+        }
+    }
     // One identity service for the whole invocation, retries included: the
     // drop-once bookkeeping belongs to the flow, not to one attempt.
     let identity = crate::identity_lifecycle::service_with_log(std::sync::Arc::new(
@@ -294,7 +315,7 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
 }
 
 /// The invocation's signal listener (see `exec_cmd`).
-type Interrupted = std::pin::Pin<Box<dyn std::future::Future<Output = (TreeSignal, i32)> + Send>>;
+pub(crate) type Interrupted = std::pin::Pin<Box<dyn std::future::Future<Output = (TreeSignal, i32)> + Send>>;
 
 async fn exec_once(
     server: &str,
