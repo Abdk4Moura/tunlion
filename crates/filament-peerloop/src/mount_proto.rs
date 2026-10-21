@@ -1374,7 +1374,7 @@ mod win_at {
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-    use std::path::{Component, Path};
+    use std::path::{Component, Path, PathBuf};
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
@@ -1648,7 +1648,61 @@ mod win_at {
         _id: (u32, u32, u32),
     }
 
+    /// All directory HANDLEs from the pinned root down to the staging parent.
+    /// Retaining the ancestors (no FILE_SHARE_DELETE) blocks renames of any
+    /// component, not just the final parent.
+    #[derive(Debug)]
+    pub(crate) struct PinnedParent {
+        chain: Vec<OwnedHandle>,
+    }
+
+    impl PinnedParent {
+        pub fn handle(&self) -> &OwnedHandle {
+            self.chain.last().expect("a pinned parent chain is non-empty")
+        }
+    }
+
     impl WinRoot {
+        /// Production admission: open the drop directory, then walk/create the
+        /// requested root relative to it. Every component is opened with
+        /// FILE_OPEN_REPARSE_POINT and refused if it is a reparse point, so an
+        /// ancestor junction cannot redirect the pin; missing directories are
+        /// created relative to the HANDLE, never by path.
+        pub fn open_relative(drop_dir: &Path, rel: &Path, create: bool) -> io::Result<(Self, PathBuf)> {
+            let mut current = open_root_handle(drop_dir, false)?;
+            for component in rel.components() {
+                match component {
+                    Component::Normal(name) => {
+                        let name = units(name)?;
+                        current = if create {
+                            open_or_create_dir(&current, &name)?
+                        } else {
+                            check_dir(nt_open(
+                                &current,
+                                &name,
+                                FILE_OPEN,
+                                DIR_ACCESS,
+                                FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                                0,
+                            )?)?
+                        };
+                    }
+                    Component::CurDir => {}
+                    _ => {
+                        return Err(denied(
+                            "Windows sync path component escapes the pinned root",
+                        ))
+                    }
+                }
+            }
+            let id = stable_id(current.as_raw_handle() as HANDLE)?;
+            let win = Self { handle: current, _id: id };
+            let path = win.final_path()?;
+            Ok((win, path))
+        }
+
+        /// Test/absolute-path pin. Production admission uses `open_relative`
+        /// from the pinned drop directory.
         pub fn open(root: &Path) -> io::Result<Self> {
             let handle = open_root_handle(root, true)?;
             let id = stable_id(handle.as_raw_handle() as HANDLE)?;
@@ -1662,18 +1716,45 @@ mod win_at {
             Ok(Self { handle, _id: id })
         }
 
+        fn final_path(&self) -> io::Result<PathBuf> {
+            use std::os::windows::ffi::OsStringExt;
+            let mut buf = vec![0u16; 512];
+            loop {
+                let n = unsafe {
+                    WinFs::GetFinalPathNameByHandleW(
+                        self.handle.as_raw_handle() as HANDLE,
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                        0,
+                    )
+                };
+                if n == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if (n as usize) < buf.len() {
+                    return Ok(PathBuf::from(std::ffi::OsString::from_wide(
+                        &buf[..n as usize],
+                    )));
+                }
+                buf.resize(n as usize + 1, 0);
+            }
+        }
+
         /// Walk/recreate `parent_rel` relative to the pinned root. A missing
         /// component is created with FILE_CREATE in the directory HANDLE we
         /// already hold, never by path; a junction/symlink component is
-        /// refused. The returned HANDLE is the staging parent, retained
-        /// through finalization.
-        pub fn ensure_parent(&self, parent_rel: &Path) -> io::Result<OwnedHandle> {
-            let mut current = self.handle.try_clone()?;
+        /// refused. Every ancestor HANDLE is retained so none can be renamed.
+        pub fn ensure_parent(&self, parent_rel: &Path) -> io::Result<PinnedParent> {
+            let mut chain = vec![self.handle.try_clone()?];
             for component in parent_rel.components() {
                 match component {
                     Component::Normal(name) => {
                         let name = units(name)?;
-                        current = open_or_create_dir(&current, &name)?;
+                        let next = open_or_create_dir(
+                            chain.last().expect("chain is non-empty"),
+                            &name,
+                        )?;
+                        chain.push(next);
                     }
                     Component::CurDir => {}
                     _ => {
@@ -1683,13 +1764,13 @@ mod win_at {
                     }
                 }
             }
-            Ok(current)
+            Ok(PinnedParent { chain })
         }
 
-        pub fn create_staging(&self, parent: &OwnedHandle, name: &OsStr) -> io::Result<File> {
+        pub fn create_staging(&self, parent: &PinnedParent, name: &OsStr) -> io::Result<File> {
             let name = units(name)?;
             let file = nt_open(
-                parent,
+                parent.handle(),
                 &name,
                 FILE_CREATE,
                 ACCESS_READ_WRITE,
@@ -1699,10 +1780,10 @@ mod win_at {
             Ok(File::from(file))
         }
 
-        pub fn open_existing(&self, parent: &OwnedHandle, name: &OsStr) -> io::Result<File> {
+        pub fn open_existing(&self, parent: &PinnedParent, name: &OsStr) -> io::Result<File> {
             let name = units(name)?;
             let file = nt_open(
-                parent,
+                parent.handle(),
                 &name,
                 FILE_OPEN,
                 ACCESS_READ,
@@ -1725,7 +1806,7 @@ mod win_at {
         /// deliberately no path parameter: the parent cannot be re-resolved.
         pub fn rename_staged(
             &self,
-            parent: &OwnedHandle,
+            parent: &PinnedParent,
             from_name: &OsStr,
             to_name: &OsStr,
             source: &File,
@@ -1733,7 +1814,7 @@ mod win_at {
             let from = units(from_name)?;
             let to = units(to_name)?;
             let named = nt_open(
-                parent,
+                parent.handle(),
                 &from,
                 FILE_OPEN,
                 WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
@@ -1748,7 +1829,7 @@ mod win_at {
                 ));
             }
             drop(named);
-            rename_handle(parent, &to, source)
+            rename_handle(parent.handle(), &to, source)
         }
     }
 
@@ -1877,7 +1958,7 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
 }
 
 #[cfg(windows)]
-pub(crate) use win_at::WinRoot;
+pub(crate) use win_at::{PinnedParent, WinRoot};
 
 #[cfg(windows)]
 pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool, create_mode: u32) -> std::io::Result<std::fs::File> {
@@ -3113,6 +3194,49 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pinned_root_blocks_replacing_the_root_path() {
+        let root = win_tmp();
+        let moved = root.with_extension("moved");
+        let _win = win_root(&root);
+        let error = std::fs::rename(&root, &moved)
+            .expect_err("the pinned root HANDLE must block replacing its path");
+        assert!(
+            error.raw_os_error().is_some(),
+            "the OS refused the root rename: {error}"
+        );
+        assert!(root.is_dir());
+        assert!(!moved.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rename_cannot_name_a_cross_directory_target() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let root = win_tmp();
+        let win = win_root(&root);
+        let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+        let mut part = win
+            .create_staging(&parent, OsStr::new("a.part"))
+            .expect("create staging");
+        part.write_all(b"x").unwrap();
+        let error = win
+            .rename_staged(&parent, OsStr::new("a.part"), OsStr::new("sub/a"), &part)
+            .expect_err("the target is a single component under the pinned parent");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("separator, stream colon or control character"),
+            "{error}"
+        );
+        assert!(!root.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(windows)]

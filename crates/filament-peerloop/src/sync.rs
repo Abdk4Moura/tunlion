@@ -215,6 +215,15 @@ impl RootPin {
         }
     }
 
+    /// Wrap a root already pinned by the Windows relative walk.
+    #[cfg(windows)]
+    pub fn from_win(win: crate::mount_proto::WinRoot, root: PathBuf) -> Self {
+        Self {
+            root,
+            win: Some(win),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.root
     }
@@ -343,26 +352,56 @@ pub async fn admit_sync_open(
     // grant-only decision it would have failed anyway, and the gate sees the
     // real scope. A dry run must not create the destination.
     let dry_run = v["dry_run"].as_bool() == Some(true);
-    let root = match resolve_root(drop_dir, v["root"].as_str().unwrap_or(""), !dry_run) {
-        Ok(root) => root,
-        Err(reason) => return SyncAdmission::Refused(SyncRefusal::new(sid, reason, t)),
-    };
-    // Pin the admitted directory object NOW. A later path swap cannot redirect
-    // staging or finalization on Windows; a dry run writes nothing, so it only
-    // carries the path.
-    let pin = if dry_run {
-        RootPin::path_only(&root)
-    } else {
-        match RootPin::open(&root) {
-            Ok(pin) => pin,
-            Err(error) => {
-                return SyncAdmission::Refused(SyncRefusal::new(
-                    sid,
-                    format!("cannot pin the receive root: {error}"),
-                    t,
-                ))
+    let request = v["root"].as_str().unwrap_or("");
+    #[cfg(windows)]
+    let (root, pin) = {
+        let outside = || "remote dir is outside this device's drop directory".to_string();
+        let rel = match windows_root_rel(drop_dir, request) {
+            Some(rel) => rel,
+            None => return SyncAdmission::Refused(SyncRefusal::new(sid, outside(), t)),
+        };
+        if dry_run {
+            // Nothing is written; the ack names the requested path.
+            let root = drop_dir.join(&rel);
+            (root, RootPin::path_only(&root))
+        } else {
+            // Walk/create the root relative to the drop directory HANDLE. No
+            // path-based resolve_root/create_content_dirs runs on Windows, so
+            // an ancestor junction cannot redirect the pin or create dirs
+            // outside. Every component is refused if it is a reparse point.
+            match crate::mount_proto::WinRoot::open_relative(drop_dir, &rel, true) {
+                Ok((win, root)) => (root.clone(), RootPin::from_win(win, root)),
+                Err(error) => {
+                    return SyncAdmission::Refused(SyncRefusal::new(
+                        sid,
+                        format!("cannot pin the receive root: {error}"),
+                        t,
+                    ))
+                }
             }
         }
+    };
+    #[cfg(not(windows))]
+    let (root, pin) = {
+        let root = match resolve_root(drop_dir, request, !dry_run) {
+            Ok(root) => root,
+            Err(reason) => return SyncAdmission::Refused(SyncRefusal::new(sid, reason, t)),
+        };
+        let pin = if dry_run {
+            RootPin::path_only(&root)
+        } else {
+            match RootPin::open(&root) {
+                Ok(pin) => pin,
+                Err(error) => {
+                    return SyncAdmission::Refused(SyncRefusal::new(
+                        sid,
+                        format!("cannot pin the receive root: {error}"),
+                        t,
+                    ))
+                }
+            }
+        };
+        (root, pin)
     };
 
     // Snapshot trust and the peer's name BEFORE `peer_authz` lazily resolves
@@ -467,6 +506,26 @@ pub async fn admit_sync_open(
         mux,
         transport: t,
     })
+}
+
+/// Resolve a sync root request to a relative path for the Windows HANDLE walk.
+/// Only lexical work happens here; the walk itself is relative to the pinned
+/// drop directory and refuses reparse points on every component.
+#[cfg(windows)]
+fn windows_root_rel(drop_dir: &Path, request: &str) -> Option<PathBuf> {
+    let rel = match request.trim() {
+        "" | "." => PathBuf::new(),
+        r if Path::new(r).is_absolute() => {
+            let inside = Path::new(r).strip_prefix(drop_dir).ok()?;
+            if inside.as_os_str().is_empty() {
+                PathBuf::new()
+            } else {
+                safe_relpath(&inside.to_string_lossy())?
+            }
+        }
+        r => safe_relpath(r)?,
+    };
+    path_within(drop_dir, &drop_dir.join(&rel)).then_some(rel)
 }
 
 /// Stateful receiver for an admitted sync stream. This module owns record
@@ -583,7 +642,7 @@ pub mod serving {
     /// reopened, and cleanup is by handle.
     #[cfg(windows)]
     struct StagedPart {
-        parent: std::os::windows::io::OwnedHandle,
+        parent: crate::mount_proto::PinnedParent,
         part_name: std::ffi::OsString,
         target_name: std::ffi::OsString,
         file: Option<std::fs::File>,
@@ -593,7 +652,7 @@ pub mod serving {
     #[cfg(windows)]
     impl StagedPart {
         fn new(
-            parent: std::os::windows::io::OwnedHandle,
+            parent: crate::mount_proto::PinnedParent,
             part_name: std::ffi::OsString,
             target_name: std::ffi::OsString,
             file: std::fs::File,
@@ -1537,6 +1596,42 @@ pub mod serving {
 
         #[cfg(windows)]
         #[tokio::test]
+        async fn windows_two_level_ancestor_rename_is_blocked_by_the_retained_chain() {
+            let root = TempRoot::new();
+            std::fs::create_dir_all(root.0.join("nested/deep")).unwrap();
+            let bytes = b"ancestors pinned";
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_finalization_gate(
+                &root.0,
+                receive_wire("nested/deep/file.txt", bytes),
+                Some((entered.clone(), release.clone())),
+            )
+            .await;
+            entered.notified().await;
+            // `nested` is two levels above the staging file; the retained chain
+            // (root + nested + deep) must block renaming it.
+            let error = std::fs::rename(root.0.join("nested"), root.0.join("nested-moved"))
+                .expect_err("the retained ancestor HANDLE must block the rename");
+            assert!(
+                error.raw_os_error().is_some(),
+                "the OS refused the ancestor rename: {error}"
+            );
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(
+                std::fs::read(root.0.join("nested/deep/file.txt")).unwrap(),
+                bytes
+            );
+            assert!(!root.0.join("nested-moved").exists());
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
         async fn windows_staging_name_replacement_is_blocked_until_commit() {
             let root = TempRoot::new();
             let bytes = b"stage pinned";
@@ -2140,6 +2235,68 @@ mod tests {
                 "no symlink support on this platform",
             ))
         }
+    }
+
+    #[cfg(windows)]
+    fn win_junction(target: &Path, link: &Path) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let ok = std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            ok,
+            "required Windows coverage: mklink /J (junction creation) is unavailable"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_admission_refuses_an_ancestor_junction_root() {
+        let share = Share::new();
+        let outside = Share::new();
+        win_junction(&outside.0, &share.0.join("anc"));
+        let t = Arc::new(CaptureTransport::default());
+        let host = TestHost::new(false, Verdict::Allow);
+        let (mut conn, _far) = connection(host, t.clone(), true, true, Some("phone")).await;
+        let mut muxes = MuxMap::new();
+        let out = admit_sync_open(&mut conn, PID, &open("anc/sub", SID), &mut muxes, &share.0).await;
+        let SyncAdmission::Refused(r) = out else {
+            panic!("an ancestor junction must be refused, not admitted");
+        };
+        assert!(
+            r.reason.contains("a parent is a junction/symlink (reparse point)"),
+            "the PINNED walk names the junction: {}",
+            r.reason
+        );
+        assert!(
+            std::fs::read_dir(&outside.0).unwrap().next().is_none(),
+            "nothing was created through the ancestor junction"
+        );
+        assert!(!share.0.join("anc/sub").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_admission_creates_a_missing_root_relative_to_the_drop_dir() {
+        let share = Share::new();
+        let t = Arc::new(CaptureTransport::default());
+        let host = TestHost::new(false, Verdict::Allow);
+        let (mut conn, _far) = connection(host, t.clone(), true, true, Some("phone")).await;
+        let mut muxes = MuxMap::new();
+        let out = admit_sync_open(&mut conn, PID, &open("new/deep", SID), &mut muxes, &share.0).await;
+        let SyncAdmission::Accepted(a) = out else {
+            panic!("a valid trusted open must be admitted");
+        };
+        assert!(share.0.join("new/deep").is_dir());
+        assert_eq!(a.root, share.0.join("new/deep").canonicalize().unwrap());
     }
 
     #[tokio::test]
