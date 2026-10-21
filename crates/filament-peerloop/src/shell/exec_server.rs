@@ -2078,6 +2078,7 @@ process.stdout.write('ok\n');
         });
         let mut req = request();
         req.cwd = None;
+        let process = Arc::new(process);
 
         let t = Arc::new(FakeTransport::default());
         serve_with_user(process.clone(), t.clone(), req, Some("guest"))
@@ -2115,6 +2116,7 @@ process.stdout.write('ok\n');
         process.program = Some(PathBuf::from("/usr/sbin/runuser"));
         process.target_context =
             Err("exec refused: --shell-user ghost is not a resolvable local account".into());
+        let process = Arc::new(process);
         let t = Arc::new(FakeTransport::default());
         serve_with_user(process.clone(), t.clone(), request(), Some("ghost"))
             .await
