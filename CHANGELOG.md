@@ -8,16 +8,6 @@ the GitHub release notes.
 
 ### Breaking
 
-- **Windows sync file receiving is temporarily disabled.** A received file is
-  drained and negatively acknowledged without creating a `.part` file or
-  changing the target. The sender reports the per-file failure, including in
-  `sync --json`/`--json-lines`, as: `Windows sync receive disabled: race-safe
-  parent-relative rename unavailable; no target or .part file was changed`.
-  This affects the Windows device acting as sync receiver (including desktop
-  Windows); Unix receive behavior is unchanged. Sync deletion and dry-run
-  behavior are not disabled. Windows sync file delivery is not feature-complete
-  until race-safe handle-relative staging is implemented.
-
 - `filament-transport` removes the process-global correctness hooks
   `hooks::set_settings_get_str`, `hooks::set_raw_membership` and
   `hooks::set_config_path` together with their getters. Pass an explicit
@@ -35,6 +25,17 @@ the GitHub release notes.
   before any SDP; the CLI cancels/skips the direct ladder for that peer and
   answers WebRTC immediately. CLI peers carry no hint, so direct-first is
   unchanged for them.
+- **Windows sync file receiving is enabled with handle-relative confinement.**
+  The previous fail-closed path is gone. A received file is staged in a
+  `.part` created relative to a chain of pinned directory HANDLEs (every
+  component opened with `FILE_OPEN_REPARSE_POINT` and refused if it is a
+  junction/symlink), then committed by renaming that open staging HANDLE with
+  `SetFileInformationByHandle(FileRenameInfo, RootDirectory=pinned parent)`.
+  Parent junction/reparse swaps and root movement fail closed with a named
+  error; a destination symlink/junction is replaced as a name and never
+  followed. Filesystems that cannot express the replace return the named
+  "Windows sync finalization is not supported on this filesystem" error. Unix
+  receive behavior is unchanged.
 
 - The first command typed into `tunlion shell` before the remote prompt appears
   now runs when Enter is pressed. Input typed ahead is captured while the local
