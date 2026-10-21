@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Only this test APK talks cleartext to the isolated host fixture. -->
+    <application android:label="Core acceptance" android:usesCleartextTraffic="true" />
+</manifest>
