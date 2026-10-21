@@ -260,7 +260,24 @@ impl Mux {
         sid: u32,
         owner: Option<String>,
     ) -> Option<mpsc::Receiver<PipeItem>> {
+        self.register_owned_generation(sid, owner, false).await.map(|(rx, _)| rx)
+    }
+
+    /// Agreement-owned streams capture their cleanup generation atomically with
+    /// registration, including the shared cap, so cancellation cannot orphan a
+    /// pipe while awaiting a second table lookup or remove a reused SID.
+    pub async fn register_access_stream(&self, sid: u32) -> Option<(mpsc::Receiver<PipeItem>, u64)> {
+        self.register_owned_generation(sid, None, true).await
+    }
+
+    async fn register_owned_generation(
+        &self,
+        sid: u32,
+        owner: Option<String>,
+        enforce_cap: bool,
+    ) -> Option<(mpsc::Receiver<PipeItem>, u64)> {
         let mut streams = self.streams.lock().await;
+        if enforce_cap && streams.len() >= MAX_STREAMS_PER_LINK { return None; }
         if streams.contains_key(&sid) {
             return None; // sid already live: refuse, do NOT overwrite/drop
         }
@@ -288,7 +305,7 @@ impl Mux {
         if is_pty {
             self.pty_high_water.fetch_max(sid, Ordering::Relaxed);
         }
-        Some(rx)
+        Some((rx, generation))
     }
 
     async fn set_read_pump(&self, sid: u32, h: AbortHandle) {
