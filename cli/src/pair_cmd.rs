@@ -26,6 +26,35 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// `mint_pair_nameplate` is always four digits. A custom phrase must leave room
+/// for that separator and suffix in the full code the user will read out.
+const PAIR_NAMEPLATE_LEN: usize = 4;
+const CODE_LIMIT: usize = 48;
+
+/// An explicit code surface: refuse reserved material before cleanup, then
+/// lowercase/separate/collapse with the shared canonicalizer and reject (never
+/// truncate) anything over the 48-character limit.
+fn checked_code(raw: &str) -> Result<String> {
+    crate::join_input::PairingCode::checked_text(raw)
+        .map_err(|error| anyhow!("{}", error.message()))
+}
+
+fn checked_code_option(value: Option<String>) -> Result<Option<String>> {
+    value.map(|raw| checked_code(&raw)).transpose()
+}
+
+/// Split a checked custom phrase and require room for the machine-assigned
+/// number. The phrase itself has already been canonicalized; `norm_code` is
+/// idempotent here and keeps the PAKE password byte-identical to the old path.
+fn chosen_pair_words(raw: &str) -> Result<String> {
+    let normalized = crate::pake::norm_code(raw);
+    let (words, _nameplate) = crate::pake::split_chosen_code(&normalized);
+    if words.len() + 1 + PAIR_NAMEPLATE_LEN > CODE_LIMIT {
+        bail!("{}", crate::join_input::CodeError::TooLong.message());
+    }
+    Ok(words)
+}
+
 /// Store an owner-signed enrolment received over the pairing ceremony.
 ///
 /// VERIFIES BEFORE IT STORES. The grant arrives sealed under the PAKE key, so
@@ -307,6 +336,12 @@ pub(crate) async fn pair_cmd(
     // alternative on the code screen instead, where it is relevant.
     quick: bool,
 ) -> Result<()> {
+    // Explicit code/word entry crosses the same typed boundary as `join`, before
+    // any prompt, banner, echo or network: reservation first, cleanup second.
+    // This also keeps a raw invitation out of the repair banner and weak-word
+    // error below.
+    code = checked_code_option(code)?;
+    word = checked_code_option(word)?;
     if code.is_none() && word.is_none() && !interactive_allowed() {
         let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
         eprintln!("{message}");
@@ -386,6 +421,10 @@ pub(crate) async fn pair_cmd(
             (Some(_), None) => {}
         }
     }
+    // Guided entry can replace either value. Apply the same boundary again
+    // before the contradiction check, any echo, or the signaling connection.
+    code = checked_code_option(code)?;
+    word = checked_code_option(word)?;
     // STEERING: --word lets the creator choose the SPAKE2 password. The positional
     // `code` arg still means "claim", so --word + a code is contradictory.
     if word.is_some() && code.is_some() {
@@ -393,15 +432,17 @@ pub(crate) async fn pair_cmd(
             "--word chooses your OWN pairing words (creator); it can't be combined with a code to claim. Drop one."
         );
     }
-    // A custom phrase must clear the password gate (Decision #3) BEFORE we touch
-    // the network. Normalize with the SHARED norm_code so the echoed/created code
-    // is exactly what SPAKE2 will hash, then validate against the blocklist.
+    // A custom phrase must clear the password gate (Decision #3) and fit with
+    // its machine-assigned number BEFORE we touch the network. Normalize with
+    // the SHARED norm_code so the echoed/created code is exactly what SPAKE2
+    // will hash, then validate against the blocklist. The error names the
+    // checked phrase, never the raw input (reserved material was refused above).
     let custom_words: Option<String> = match &word {
         Some(w) => {
-            let (words, _np) = crate::pake::split_chosen_code(&crate::pake::norm_code(w));
+            let words = chosen_pair_words(w)?;
             if let Err(why) = crate::pake::words::validate_chosen_password(&words, &display_name())
             {
-                bail!("'{w}' is too weak: {why}");
+                bail!("'{words}' is too weak: {why}");
             }
             Some(words)
         }
@@ -482,14 +523,7 @@ pub(crate) async fn pair_cmd(
             my_nameplate = preview_nameplate
                 .clone()
                 .unwrap_or_else(crate::pake::words::mint_pair_nameplate);
-            // STEERING: echo the normalized code we're about to create so the
-            // creator sees EXACTLY what their peer must type (== what SPAKE2 hashes).
-            if custom_words.is_some() {
-                ui::say(&format!(
-                    "  using your words: {}",
-                    ui::paint(ui::Tone::Brand, &format!("{my_words}-{my_nameplate}"))
-                ));
-            }
+            // Display the full code once, only after PairOk confirms allocation.
             sio.emit("pair-create", json!({ "nameplate": my_nameplate, "v": 2 }))
                 .await
                 .ok();
@@ -1080,26 +1114,29 @@ pub(crate) async fn pair_cmd(
                 // from OUR OWN local mint (the server never echoed any words).
                 let full = format!("{my_words}-{my_nameplate}");
                 ui::clipboard(&full);
-                ui::say("");
-                ui::say(&format!(
-                    "      {}",
-                    ui::paint(ui::Tone::Brand, &full.to_uppercase())
-                ));
-                ui::say("");
-                if interactive_allowed() {
+                ui::say(&ui::paint(ui::Tone::Dim, "  tunlion / Waiting"));
+                ui::say(&format!("  {}", ui::paint(ui::Tone::Accent, &full)));
+                ui::say("  Enter this code on the other device.");
+                // QR is secondary. Never let it push the code and waiting hint
+                // off a small terminal. The same supported payload is retained.
+                let qr = ui::qr_or_text(&full, 2);
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+                let qr_width = qr.lines().map(|line| line.chars().count()).max().unwrap_or(0);
+                if interactive_allowed() && usize::from(cols) > qr_width + 1
+                    && usize::from(rows) >= qr.lines().count() + 10 {
                     ui::say(&ui::paint(
                         ui::Tone::Dim,
-                        "  scan this in Tunlion, or enter the code below it",
+                        "  Or scan this in Tunlion:",
                     ));
-                    ui::say(&ui::qr_or_text(&full, 6));
+                    ui::say(&qr);
                 }
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  on the other device: type it into the web app, or `tunlion join <code>`",
+                    "  Web app or: tunlion join <code>",
                 ));
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  keep this window open until the other device claims it",
+                    "  Keep open until claimed. Ctrl-C cancels.",
                 ));
                 if quick {
                     // The HOW question was skipped to get here in one step, so
@@ -1112,7 +1149,7 @@ pub(crate) async fn pair_cmd(
                 }
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)",
+                    "  One claim · expires in 10 min.",
                 ));
             }
             Ev::PairCode(v) => {
@@ -1132,8 +1169,8 @@ pub(crate) async fn pair_cmd(
                 let room = v["room"].as_str().unwrap_or_default().to_string();
                 ceremony_deadline.get_or_insert_with(|| Instant::now() + ceremony_budget);
                 ui::say(&format!(
-                    "  {} code accepted, connecting",
-                    ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                    "  {} Code claimed · connecting",
+                    ui::cursor_accent("|")
                 ));
                 sess.room = Some(room.clone()); // C30: desire moves with us
                 sess.touch();
@@ -1800,5 +1837,29 @@ mod external_notice_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod explicit_code_surface_tests {
+    use super::{chosen_pair_words, checked_code};
+
+    #[test]
+    fn a_dot_is_a_word_separator_and_reserved_material_is_refused() {
+        assert_eq!(
+            checked_code("Brave.Otter..3141").unwrap(),
+            "brave-otter-3141"
+        );
+        assert!(checked_code("filament-invite:v2:hidden").is_err());
+        assert!(checked_code("{\"code\":\"brave-otter-3141\"}").is_err());
+    }
+
+    #[test]
+    fn a_custom_phrase_leaves_room_for_the_four_digit_nameplate() {
+        assert_eq!(chosen_pair_words(&"a".repeat(43)).unwrap().len(), 43);
+        assert!(chosen_pair_words(&"a".repeat(44)).is_err());
+        // A trailing chosen number is not the minted one: the split removes it
+        // before the room check, exactly as the creator will append four new digits.
+        assert_eq!(chosen_pair_words(&format!("{}-9999", "a".repeat(43))).unwrap().len(), 43);
     }
 }

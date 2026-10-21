@@ -1413,31 +1413,24 @@ pub(crate) async fn async_main() -> Result<()> {
             // and still is not accepted here, because argv lands in `ps` output
             // and shell history. So the test is "does this name a file that
             // exists", not "does this look like a token".
-            let (code, invite_file) = match code {
-                Some(arg)
-                    if invite_file.is_none()
-                        && invite_fd.is_none()
-                        && std::path::Path::new(&arg).is_file() =>
-                {
-                    (None, Some(std::path::PathBuf::from(arg)))
-                }
-                other => (other, invite_file),
-            };
-            // A path that does not exist used to fall through to the code
-            // ceremony and come back as "that code doesn't look right", which
-            // sends the person hunting for a typo in a code they never typed.
-            if let Some(arg) = code.as_deref() {
-                if let Some(msg) = crate::identity_flow::join_missing_file_msg(arg, invite_file.is_some() || invite_fd.is_some()) {
-                    crate::bail_usage!("{msg}");
-                }
-            }
-            if let Some(code) = code {
+            if let Some(raw) = code {
                 if invite_file.is_some() || invite_fd.is_some() {
                     crate::bail_usage!("give a code or an invitation file, not both");
                 }
-                // Same ceremony `add <code>` runs: accepting a code confers no
-                // membership by itself, the offering side decides that.
-                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), None, false).await
+                // Guided and positional join share the same typed boundary.
+                // Material is forbidden in argv and never retried as a code.
+                use crate::join_input::{classify_join_input, JoinInput};
+                match classify_join_input(&raw, &|p| std::path::Path::new(p).is_file()) {
+                    JoinInput::Code(code) => pair_cmd(&server, Some(code.into_string()), name, None, relay, false, Vec::new(), None, false).await,
+                    JoinInput::File(path) => join_cmd(&ui_caps, &server, relay, Some(path.into_path()), None, name, to, None).await,
+                    JoinInput::Invitation(_) => Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage,
+                        "Invitation material must not be passed in argv. Run tunlion join and paste it, or use --invite-file/--invite-fd.")),
+                    JoinInput::TransferCode(_) => Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage,
+                        crate::identity_flow::join_transfer_code_msg(""))),
+                    JoinInput::InvalidCode(error) => Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, error.message())),
+                    JoinInput::Unknown => Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage,
+                        crate::identity_flow::join_input_not_recognized())),
+                }
             } else if invite_file.is_none() && invite_fd.is_none() && ui_caps.interactive {
                 // Nothing given at a terminal: ONE prompt that takes a code, an
                 // invitation, or a file path, and runs whichever it is. The

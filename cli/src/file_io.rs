@@ -210,7 +210,7 @@ pub(crate) const INVITE_PREFIX_V2: &str = "filament-invite:v2:";
 
 pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation> {
     use base64::Engine;
-    let token = raw.trim();
+    let token = raw.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}').trim_end();
     // Three forms exist in the wild, and they are the same v2 payload except v1:
     //
     //   filament-invite:v1:...    0.8.0-0.8.3, a JSON token replaced in 0.8.4.
@@ -231,20 +231,10 @@ pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation
         .strip_prefix(INVITE_PREFIX_V2)
         .or_else(|| token.strip_prefix(INVITE_PREFIX))
         .ok_or_else(|| {
-            // A pairing code handed to an invitation reader is the common
-            // case (the guided menu used to do exactly that): name the verb
-            // that takes it instead of only refusing.
-            let code = crate::pake::norm_code(token);
-            if crate::token_is_pairing_code(code.trim_matches('-')) {
-                anyhow!(
-                    "invitation has an unknown format: that is a pairing code, not an invitation. Accept it with:  tunlion join {}",
-                    code.trim_matches('-')
-                )
-            } else {
-                anyhow!(
-                    "invitation has an unknown format: an invitation starts with `{INVITE_PREFIX}`. A pairing code (like brave-otter-3141) is accepted with:  tunlion join <code>"
-                )
-            }
+            // Explicit invitation input never enters spoken-code cleanup.
+            anyhow!(
+                "invitation has an unknown format: an invitation starts with `{INVITE_PREFIX}`. A pairing code (like brave-otter-3141) is accepted with:  tunlion join <code>"
+            )
         })?;
     let bytes = Zeroizing::new(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -264,10 +254,22 @@ mod invitation_reader_tests {
     fn a_code_given_to_the_invitation_reader_names_join() {
         let e = super::parse_invitation("comic-otter-1950").err().expect("a code is not an invitation").to_string();
         assert!(e.contains("pairing code"), "{e}");
-        assert!(e.contains("tunlion join comic-otter-1950"), "{e}");
+        assert!(e.contains("tunlion join"), "{e}");
+        assert!(!e.contains("comic-otter-1950"), "{e}");
         let e = super::parse_invitation("hello there").err().expect("not an invitation").to_string();
         assert!(e.contains("filament-invite:"), "{e}");
         assert!(e.contains("tunlion join"), "{e}");
+    }
+
+    #[test]
+    fn bom_prefixed_invitation_uses_the_same_parser_without_echoing_material() {
+        let token = "filament-invite:v1:hidden-material";
+        let plain = super::parse_invitation(token).err().expect("legacy format refused").to_string();
+        let bom = super::parse_invitation(&format!(" \u{feff}{token}\n")).err().expect("legacy format refused").to_string();
+        assert_eq!(plain, bom);
+        assert!(bom.contains("pre-0.8.4"));
+        let masked = super::parse_invitation("[\"comic-otter-1950\"]").err().expect("not an invitation").to_string();
+        assert!(!masked.contains("comic-otter-1950"));
     }
 }
 

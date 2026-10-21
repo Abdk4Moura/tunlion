@@ -23,6 +23,18 @@ pub(crate) use crate::recv_ports::cli_park_on_deny as park_on_deny;
 /// `exec_recv`/`sync_cmd`/`ssh_ca` modules) share the one parked-open type.
 pub(crate) use filament_peerloop::recv::dispatch::{settle_timeout_reason, ParkKind, ParkedOpen};
 
+/// Explicit received-code surface: reserve non-code material before cleanup,
+/// then lowercase/separate/collapse and reject (never truncate) over 48. Runs
+/// before the engine starts, so a pasted invitation cannot reach the network.
+fn checked_recv_code(raw: &str) -> Result<String> {
+    crate::join_input::PairingCode::checked_text(raw)
+        .map_err(|error| anyhow::anyhow!("{}", error.message()))
+}
+
+fn checked_recv_code_option(value: Option<String>) -> Result<Option<String>> {
+    value.map(|raw| checked_recv_code(&raw)).transpose()
+}
+
 /// CLI process adapter. Returns only after the library dispatch and its owned
 /// cleanup have completed; cancellation is translated into the CLI exit policy.
 #[allow(clippy::too_many_arguments)]
@@ -48,6 +60,9 @@ pub(crate) async fn recv_cmd(
     host: Arc<dyn HostServices>,
     report: &RecvReport,
 ) -> Result<()> {
+    // Explicit argv/env code crosses the typed boundary before signals, engine
+    // start or any network setup. Guided entry stays on the shared code entry.
+    let code = checked_recv_code_option(code)?;
     let stop = Cancellation::default();
     let mut signals = Signals::install(stop.clone())?;
     let server = server.to_string();
@@ -236,5 +251,17 @@ mod tests {
         let _ = ParkKind::Exec;
         let _ = host_impl::cli_screen;
         let _ = exit_codes::ExitKind::Usage;
+    }
+
+    #[test]
+    fn explicit_code_surface_cleans_separators_and_refuses_material() {
+        assert_eq!(
+            super::checked_recv_code("Brave.Otter..3141").unwrap(),
+            "brave-otter-3141"
+        );
+        assert!(super::checked_recv_code("filament-invite:v2:hidden").is_err());
+        assert!(super::checked_recv_code("\"brave-otter-3141\"").is_err());
+        assert_eq!(super::checked_recv_code(&"a".repeat(48)).unwrap().len(), 48);
+        assert!(super::checked_recv_code(&"a".repeat(49)).is_err());
     }
 }
