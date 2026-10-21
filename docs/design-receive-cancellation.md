@@ -84,9 +84,12 @@ it). Only then should a readiness input/result be exposed for the driver.
 
 ## Remaining process ownership / limits
 
-- stdin remains a CLI-only OS thread, reaped by process exit, not joined here.
-  Interactive prompts and TTY restoration perform synchronous process I/O; the
-  outer async race cannot preempt a synchronous blocking call.
+- stdin is a CLI-owned OS thread: `RecvCleanup::finish` stops and joins it.
+  Windows reports `Joined` or a named `Detached`; a join timeout retains the
+  reader thread and handle, and console-mode restoration happens when that
+  retained reader exits. Interactive prompts and TTY restoration perform
+  synchronous process I/O; the outer async race cannot preempt a synchronous
+  blocking call.
 - The CLI force-exit watchdog remains a detached Tokio task and can bypass a
   stuck cleanup after its grace. It does not prove an OS-thread deadline during
   scheduler starvation. The receive adapter no longer uses LAST_SIGNAL; other
