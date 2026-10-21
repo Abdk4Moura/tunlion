@@ -1287,6 +1287,10 @@ export function useTunlion() {
     // single handoff often fires online + connection-change + visibility within
     // a few hundred ms) does not thrash the reconnect/rebuild work.
     let recoverTimer = null
+    // Set by pagehide; used by pageshow even when a browser restores the same
+    // document without `persisted:true`. The generation was possibly retired
+    // by our close beacon, so a same-document return must rotate too.
+    let pageHideSeen = false
     const runRecovery = () => {
       // A superseded tab stays quiet: rejoining would steal the session back
       // and start a supersede tug-of-war. Only a fresh generation (reload or a
@@ -1343,6 +1347,7 @@ export function useTunlion() {
     // and do NOT tear down on visibilitychange alone (backgrounding an iPad is a
     // normal thing, not a departure).
     const onPageHide = () => {
+      pageHideSeen = true
       if (recoverTimer) { clearTimeout(recoverTimer); recoverTimer = null }
       for (const link of linksRef.current.values()) {
         try { link.close() } catch {}
@@ -1359,7 +1364,9 @@ export function useTunlion() {
     // cannot match, and the restored page legitimately takes over again.
     const onPageShow = (e) => {
       const persisted = !!(e && e.persisted)
-      if (persisted) {
+      const restoring = persisted || pageHideSeen
+      pageHideSeen = false
+      if (restoring) {
         genRef.current = rotateGeneration()
         try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
         supersededRef.current = false
