@@ -1227,7 +1227,7 @@ mod tests {
 
         let ack = json!({ "type": "exec-open-ack", "sid": sid });
         assert!(mux.on_exec_initiator_frame(sid, ack.clone()).await);
-        assert_eq!(ctl.recv().await, Some(ack));
+        assert_eq!(ctl.recv().await, Some(ack.clone()));
         assert!(
             !mux.on_exec_initiator_frame(other, ack).await,
             "wrong sid has no waiter"
