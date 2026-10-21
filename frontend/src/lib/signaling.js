@@ -48,7 +48,7 @@ class SocketIOSignaling extends Emitter {
     this.name = null
     this.uid = null
     this.gen = null
-    // Private device-ownership token, minted by the relay on first claim and
+    // Opaque SESSION token, minted by the relay on a tokenless join and
     // returned only to this socket (welcome/sync ack). Never in a roster.
     this.token = loadOwnerToken() || null
     // A page whose session was superseded stops talking. Auto-reconnect must
@@ -76,13 +76,14 @@ class SocketIOSignaling extends Emitter {
       reconnectionDelay: 400,
       reconnectionDelayMax: 2000,
     })
-    // welcome is handled separately: it can carry the private ownership token,
+    // welcome is handled separately: it can carry the opaque session token,
     // which we persist but never surface to the UI/roster.
     this.socket.on('welcome', (payload) => {
       if (payload && payload.token) {
         this.token = payload.token
         saveOwnerToken(payload.token)
       }
+      if (payload && payload.gen) this.gen = payload.gen
       this._emit('welcome', payload)
     })
     for (const ev of ['peer-joined', 'peer-left', 'peer-updated', 'session-superseded', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
@@ -100,7 +101,7 @@ class SocketIOSignaling extends Emitter {
         return
       }
       this._emit('status', { connected: true })
-      if (this.room) this.socket.emit('join', { room: this.room, name: this.name, uid: this.uid, gen: this.gen, token: this.token })
+      this._emitJoin()
     })
     this.socket.on('disconnect', () => {
       this._openedAt = Date.now()
@@ -126,13 +127,19 @@ class SocketIOSignaling extends Emitter {
     if (leadChanged && this.socket.io.engine) this.socket.io.engine.close()
     if (nudge && !this.socket.connected) this.socket.connect()
   }
+  _emitJoin() {
+    if (this.suspended || !this.room) return
+    this.socket.emit('join', { room: this.room, name: this.name, uid: this.uid, gen: this.gen, token: this.token })
+  }
   join(room, name, uid, gen) {
     this.room = room
     this.name = name
     this.uid = uid
     this.gen = gen
     if (!this.token) this.token = loadOwnerToken() || null
-    this.socket.emit('join', { room, name, uid, gen, token: this.token })
+    // If the socket is still connecting, the `connect` handler emits this once;
+    // emitting here too made two tokenless joins mint two sessions on one sid.
+    if (this.socket.connected) this._emitJoin()
   }
   setToken(token) {
     if (!token) return
@@ -193,11 +200,15 @@ class SocketIOSignaling extends Emitter {
   // decides WHEN to call this; here we only carry the wire.
   sync(state, onAck) {
     if (!this.token) this.token = loadOwnerToken() || null
+    // Initial join owns token minting. Do not race it with a tokenless sync
+    // (which would create a second, independent session).
+    if (!this.token) return // join mints the token; retry on the session tick
     this.socket.emit('sync', { ...state, token: this.token }, (resp) => {
       if (resp && resp.token) {
         this.token = resp.token
         saveOwnerToken(resp.token)
       }
+      if (resp && resp.gen) this.gen = resp.gen
       onAck?.(resp)
     })
   }

@@ -92,9 +92,9 @@ socketio = SocketIO(
 REGISTRY = signaling.make_registry(config.REDIS_URL)
 signaling.register(socketio, REGISTRY)
 
-# Pagehide beacons are bearer-token authenticated (uid+gen+token). They are NOT
-# a way to evict a peer from a uid alone. Keep a per-IP budget and honor the
-# configured origin allowlist when it is not the wildcard dev default.
+# Pagehide beacons are bearer-token authenticated by (token, gen). They are
+# never keyed by uid. Keep a per-IP budget and honor the configured origin
+# allowlist when it is not the wildcard dev default.
 _CLOSE_LIMIT = int(os.environ.get("FIL_CLOSE_LIMIT", "120"))
 _close_limiter = ratelimit.make_limiter("session-close", _CLOSE_LIMIT, 60.0,
                                         getattr(REGISTRY, "r", None))
@@ -204,10 +204,9 @@ def _origin_allowed(origin):
 
 @app.post("/api/session/close")
 def session_close():
-    """Synchronous pagehide beacon: drop this session only if the caller holds
-    the device's private ownership token AND (uid, gen) still own it. A late,
+    """Synchronous pagehide beacon for a token+generation session. A late,
     forged or cross-origin beacon cannot drop a live link; it always returns
-    the same 204 so it cannot be used as a uid/token oracle."""
+    the same 204 so it cannot be used as a token oracle."""
     origin = request.headers.get("Origin")
     if not _origin_allowed(origin):
         return "", 204
@@ -221,9 +220,9 @@ def session_close():
         body = {}
     if not isinstance(body, dict):
         body = {}
-    uid, gen, token = body.get("uid"), body.get("gen"), body.get("token")
-    if isinstance(uid, str) and isinstance(gen, str) and isinstance(token, str):
-        signaling.close_session(socketio, REGISTRY, uid[:128], gen[:128], token[:256])
+    gen, token = body.get("gen"), body.get("token")
+    if isinstance(gen, str) and isinstance(token, str) and gen and token:
+        signaling.close_session(socketio, REGISTRY, token[:512], gen[:128])
     return "", 204
 
 

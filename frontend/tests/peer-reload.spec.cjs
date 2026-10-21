@@ -167,8 +167,8 @@ async function ownerToken(page) {
   return page.evaluate(() => localStorage.getItem('tunlion.ownerToken') || '');
 }
 
-function closeCount(uid, gen) {
-  return telEvents().filter((e) => e.ev === 'session-close' && e.uid === uid && e.gen === gen.slice(0, 8)).length;
+function closeCount(gen) {
+  return telEvents().filter((e) => e.ev === 'session-close' && e.gen === gen.slice(0, 8)).length;
 }
 
 async function postClose(ctx, body, headers = {}) {
@@ -300,7 +300,7 @@ async function runEngine(engine, browser, contextOptions) {
   // The normal reload's own pagehide can legitimately close generation 1; this
   // assertion is specifically that OUR late beacon for the superseded
   // generation 2 was refused.
-  const closeEvents = telEvents().filter((e) => e.ev === 'session-close' && e.uid === g2.uid && e.gen === g2.gen.slice(0, 8));
+  const closeEvents = telEvents().filter((e) => e.ev === 'session-close' && e.gen === g2.gen.slice(0, 8));
   if (closeEvents.length) fail(`${tag} stale close was accepted by the relay: ${JSON.stringify(closeEvents)}`);
   ok(`${tag} a late close from the old generation is ignored; the new link stays up`);
 
@@ -310,7 +310,7 @@ async function runEngine(engine, browser, contextOptions) {
   const owner = await ownerToken(second);
   if (!owner) fail(`${tag} the relay did not mint an ownership token for the browser`);
   const live = await identity(second);
-  const closesBefore = closeCount(live.uid, live.gen);
+  const closesBefore = closeCount(live.gen);
   const attempts = [
     { data: { uid: live.uid, gen: live.gen } },
     { data: { uid: live.uid, gen: live.gen, token: 'attacker-token' } },
@@ -321,7 +321,7 @@ async function runEngine(engine, browser, contextOptions) {
     if (r.status() !== 204) fail(`${tag} close endpoint did not hide the refusal as 204: ${r.status()}`);
   }
   await sleep(1200);
-  if (closeCount(live.uid, live.gen) !== closesBefore) fail(`${tag} an unauthenticated/wrong/cross-origin close was accepted`);
+  if (closeCount(live.gen) !== closesBefore) fail(`${tag} an unauthenticated/wrong/cross-origin close was accepted`);
   if (full) await waitOnlineAndPeer(second, peerName, 10000); else await waitOnline(second, 10000);
   ok(`${tag} close endpoint refuses no-token, wrong-token and cross-origin calls; the live session stays up`);
 
@@ -441,12 +441,18 @@ async function runEngine(engine, browser, contextOptions) {
   // 7. The authenticated close path still works for the live generation.
   const finalId = await identity(second);
   const finalToken = await ownerToken(second);
-  const beforeAuthClose = closeCount(finalId.uid, finalId.gen);
+  const beforeAuthClose = closeCount(finalId.gen);
   const okClose = await postClose(second.context(), { uid: finalId.uid, gen: finalId.gen, token: finalToken },
     { Origin: BASE });
   if (okClose.status() !== 204) fail(`${tag} authenticated close returned ${okClose.status()}`);
-  await waitFor(() => closeCount(finalId.uid, finalId.gen) === beforeAuthClose + 1, 10000,
-    'the authenticated close to be applied');
+  try {
+    await waitFor(() => closeCount(finalId.gen) === beforeAuthClose + 1, 10000,
+      'the authenticated close to be applied');
+  } catch (e) {
+    console.log(`${tag} close debug gen=${finalId.gen.slice(0, 8)} tok=${String(finalToken).slice(0, 8)} before=${beforeAuthClose}`);
+    console.log(telEvents().filter((ev) => ev.ev === 'session-close').slice(-5));
+    throw e;
+  }
   ok(`${tag} the owner's authenticated close is applied`);
 
   // 8. pagehide clears page-owned timers (config refresh + pairing/waitUp/

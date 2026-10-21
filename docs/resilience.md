@@ -268,33 +268,26 @@ and never shown, so a device could be `silken-chickadee` on the wire while the
 UI hid it.
 
 **Solution.**
-- **Generation ownership, with a private token.** Every page load mints a
-  fresh `gen` (never persisted). On the first claim for a uid the relay mints a
-  private ownership `token` UNCONDITIONALLY (a client-supplied value is
-  ignored) and returns it only to that socket (`welcome` / sync ack); it is
-  never in a roster. `join`/`sync` carry `{uid, gen, token}`. A token-bearing,
-  non-retired `gen` supersedes the old sid immediately; the relay tells the old
-  page `session-superseded`, removes its room/channel presence, and retires the
-  old generation. A late `sync` from a retired generation is refused. A uid
-  alone is NOT authority: an unrelated room client that learned the victim's
-  uid cannot evict or close it without the token. A same-generation socket
-  reconnect still reclaims its own session. The token is a sliding 24h bearer
-  credential; expired non-live ownership mints a fresh token. Claim rate,
-  uid/gen/token length, ownership-record count and per-uid tombstones are all
-  bounded (Redis stores gen/sid/token in ONE hash with one 24h TTL and uses
-  atomic Lua; Mem and Redis both use a global retired-generation ZSET/map with
-  a 24h TTL plus a hard total cap, and a bounded LRU ownership map/ZSET).
-  The token is a bearer credential kept in localStorage: it is not rotated per
-  session and has no revocation endpoint, but expires 24h after the last
-  successful claim (a live tab refreshes it on each sync). A leaked token is
-  therefore usable only while the device keeps it alive; clearing the browser
-  token/uid is the escape hatch.
+- **TOKEN-keyed sessions, not uid ownership.** Every page load mints a fresh
+  `gen`. On `join`/`sync` the relay keys the session by a server-minted opaque
+  `token`; uid/name are display attributes only. A join without a token creates
+  a NEW session and returns its token (welcome/sync ack, never a roster). A join
+  with a token reattaches that token's session and may replace its previous sid.
+  A retired generation for that token is refused. A uid alone is NEVER an
+  ownership key: an unrelated client that knows the victim's uid but lacks its
+  token gets an independent session and cannot evict, close, or join as the
+  victim. A legacy no-token client also gets a new independent session.
+  Capacity is on token records only; evicting one loses resume ability, not
+  access. gen/sid/token live in one record with one sliding 24h TTL (one Redis
+  hash updated by atomic Lua), and retired generations are bounded per token
+  with a global 24h TTL/cap. The token is a bearer in localStorage: not rotated,
+  no revocation endpoint, expires 24h after the last successful claim.
 - **Synchronous pagehide, not unload-dependent.** `pagehide` closes local
   `RTCPeerConnection`s, stops link/session/pairing/config timers, and beacons
-  `POST /api/session/close` with `{uid, gen, token}`. The endpoint requires the
+  `POST /api/session/close` with `{token, gen}`. The endpoint requires the
   token, honors the configured origin allowlist, and is rate-limited; it only
-  acts when that generation still owns the uid, so the reload's late close
-  cannot drop the new link. `pageshow` always revalidates/reconnects; a BFCache
+  acts for that token's current generation, so a late close cannot drop a newer
+  session. `pageshow` always revalidates/reconnects; a BFCache
   restore (or any pagehide/pageshow return) rotates generation first.
   `visibilitychange` alone does NOT tear down (backgrounding an iPad is
   normal), and ICE/presence timeouts remain the fallback if `pagehide` never
@@ -359,12 +352,11 @@ a platform boundary (no filesystem access), not a design choice.
   revokes file handles on navigation.
 - **Multi-instance API scaling** needs the Redis registry (already wired); the
   glare fix (#1) is what makes that safe.
-- **Ownership token state is relay state.** If the relay loses its state
-  (restart without Redis), a uid with no surviving record can be first-claimed
-  by another client during that window; there is no old live session to evict,
-  and the first claim wins. With Redis the 24h ownership/TTL state and atomic
-  Lua survive restarts. During normal operation a live victim cannot be evicted
-  by a uid alone.
+- **Session ownership state is relay state.** If the relay loses its state
+  (restart without Redis), existing tokens are unknown: each client starts a
+  new independent session. A uid alone never grants access to another session
+  in any window. With Redis the 24h token/session TTL state and atomic Lua
+  survive restarts.
 - **Optional Firebase signaling** remains add/remove presence: it does not
   implement generation/token supersede, in-place rename, or relay-side close.
   Those paths are Socket.IO-only.

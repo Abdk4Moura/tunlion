@@ -185,39 +185,32 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   already received).
 
 ### Generation-safe reload (web)
-- Every page load mints a new `gen`; `join`/`sync` carry `{uid, gen, token}`.
-  On the FIRST claim for a uid the relay mints a private `token`
-  UNCONDITIONALLY (a client-supplied value is ignored) and returns it only to
-  that socket (`welcome`/sync ack, never in a roster). Every later
-  claim/reclaim/close must present it. A uid visible in `welcome`/`peer-joined`
-  is NOT authority and alone can never evict a peer. The token is a bearer
-  credential with a sliding 24h policy: valid claims refresh it; an expired
-  token whose session is not live is stale ownership and a fresh token is
-  minted. Claim rate and uid/gen/token length are bounded. Mem and Redis store
-  the token/gen/sid under one ownership lifecycle (one TTL in Redis) so no
-  field can outlive another. Retired generations are one global 24h TTL set
-  with a hard total cap, oldest evicted first; a valid current owner is never
-  refused because of it. The token is a bearer credential in localStorage, not
-  rotated per session and with no revocation endpoint: it expires 24h after the
-  last successful claim, and a live tab refreshes it on each sync.
-- A token-bearing `gen` different from the relay's current owner supersedes
-  that session and retires the old generation. A retired generation's late
-  `sync` is refused (`{ok:false, superseded:true}`) and cannot take the session
-  back. Tombstones expire after 24h; each uid has a hard retired-generation cap
-  and ownership records are LRU/TTL bounded.
+- Every page load mints a new `gen`. Sessions are keyed by a server-minted
+  opaque `token`; uid/name are display attributes only. `join`/`sync` carry
+  `{uid, gen, token}`. A tokenless join creates a NEW session and returns its
+  token (`welcome`/sync ack, never a roster). A valid token reattaches that
+  session and may replace its previous sid; an unknown/expired token becomes a
+  new independent session. A uid alone is never authority and can neither
+  evict nor close another session.
+- A token-bearing `gen` different from that token's current generation
+  supersedes its old sid and retires the old generation. A late `sync` from a
+  retired generation is refused (`{ok:false, superseded:true}`). Retired
+  generations are one global 24h TTL set with a hard total cap; oldest are
+  evicted first, never refusing a valid current owner. Token records have a
+  cardinality cap (LRU eviction loses resume ability only) and one sliding 24h
+  TTL covering sid/gen/token together (one Redis hash/Lua).
 - `pagehide` closes local PeerConnections synchronously, stops link/session/
-  pairing/config timers, and `sendBeacon`s `{uid, gen, token}` to
+  pairing/config timers, and `sendBeacon`s `{token, gen}` to
   `POST /api/session/close`. The endpoint requires the token, honors the
-  configured origin allowlist, is rate-limited, and only drops the session when
-  `gen` is still current. A late/forged/cross-origin beacon cannot kill the
-  replacement link. `pageshow` revalidates/reconnects; a BFCache restore (or any
-  pagehide/pageshow return) rotates to a fresh generation first.
-- A rename is an in-place `sync` on the same `{uid, gen}`. The relay updates
-  that sid and emits `peer-updated {id,name,uid}` to the room; it never creates
-  a second peer or a second pairing record. Open tabs receive a `storage` event
-  and relabel in place. A superseded tab receives `session-superseded`, stops
-  auto-reconnect, and STAYS suspended across `pageshow`/BFCache/storage events;
-  only an explicit full reload may take over again.
+  configured origin allowlist, is rate-limited, and only drops that token's
+  current generation. `pageshow` revalidates/reconnects; a BFCache restore (or
+  any pagehide/pageshow return) rotates to a fresh generation first.
+- A rename is an in-place `sync` on the same token. The relay updates that sid
+  and emits `peer-updated {id,name,uid}`; open tabs relabel via `storage`. A
+  superseded tab stays suspended across `pageshow`/BFCache/storage events; only
+  an explicit full reload may take over.
+- The token is a bearer in localStorage: no per-session rotation/revocation,
+  expires 24h after the last successful claim; a live tab refreshes it on sync.
 - Names are human labels, not identities: duplicates are allowed; ownership
   and pairing are keyed by the token/uid (and pairing secrets), not the name.
 

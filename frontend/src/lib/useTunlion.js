@@ -44,9 +44,9 @@ function roomFromUrl() {
 // sendBeacon is synchronous from the page's point of view and survives unload;
 // never await it. The relay ignores it when a newer generation already owns the
 // device, so a late beacon cannot drop the replacement link.
-function beaconSessionClose(uid, gen, token) {
-  if (!uid || !gen || !token) return
-  const body = JSON.stringify({ uid, gen, token })
+function beaconSessionClose(gen, token) {
+  if (!gen || !token) return
+  const body = JSON.stringify({ gen, token })
   try {
     if (navigator.sendBeacon && navigator.sendBeacon(api('/api/session/close'), body)) return
   } catch {}
@@ -231,7 +231,7 @@ export function useTunlion() {
     return next
   }, [])
 
-  // Another tab renamed this browser or received the ownership token from the
+  // Another tab renamed this browser or received the session token from the
   // relay. Keep every open tab's label/identity cache in step (the storage
   // event fires in the OTHER tabs, never the writer).
   useEffect(() => {
@@ -1439,7 +1439,7 @@ export function useTunlion() {
         try { resolveWait?.(false) } catch {}
       }
       if (helperTimerRef.current) { clearInterval(helperTimerRef.current); helperTimerRef.current = null }
-      beaconSessionClose(uidRef.current, genRef.current, loadOwnerToken())
+      beaconSessionClose(genRef.current, loadOwnerToken())
     }
     // pageshow fires on a normal load AND on a BFCache restore. Always
     // revalidate/reconnect; a restored page also rotates to a fresh generation,

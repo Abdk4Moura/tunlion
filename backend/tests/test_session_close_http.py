@@ -44,7 +44,7 @@ class CloseEndpointHTTP(unittest.TestCase):
         uid = "http-" + uuid.uuid4().hex
         gen = "g-" + uuid.uuid4().hex
         sid = "s-" + uuid.uuid4().hex
-        ack = api.REGISTRY.claim_session(uid, gen, sid)
+        ack = api.REGISTRY.claim_session(None, gen, sid, uid, "ipad")
         api.REGISTRY.add(sid, "r-http", "ipad", uid, gen)
         return uid, gen, sid, ack["token"]
 
@@ -52,40 +52,40 @@ class CloseEndpointHTTP(unittest.TestCase):
         headers = {"Origin": origin} if origin else {}
         return self.client.post("/api/session/close", json=body, headers=headers)
 
-    def _owned(self, uid, gen):
-        cur = api.REGISTRY.owned_uid(uid)
-        return bool(cur and cur.get("gen") == gen)
+    def _owned(self, uid, gen, token):
+        rec = api.REGISTRY._sessions.get(token)
+        return bool(rec and rec.get("gen") == gen)
 
     def test_missing_and_wrong_token_do_nothing(self):
         uid, gen, _sid, token = self._seed()
-        self.assertEqual(self._post({"uid": uid, "gen": gen}).status_code, 204)
-        self.assertEqual(self._post({"uid": uid, "gen": gen, "token": "wrong"}).status_code, 204)
-        self.assertTrue(self._owned(uid, gen))
-        self.assertEqual(self._post({"uid": uid, "gen": gen, "token": token}).status_code, 204)
-        self.assertFalse(self._owned(uid, gen))
+        self.assertEqual(self._post({"gen": gen}).status_code, 204)
+        self.assertEqual(self._post({"gen": gen, "token": "wrong"}).status_code, 204)
+        self.assertTrue(self._owned(uid, gen, token))
+        self.assertEqual(self._post({"gen": gen, "token": token}).status_code, 204)
+        self.assertFalse(self._owned(uid, gen, token))
 
     def test_explicit_allowlist_refuses_evil_origin_but_allows_configured(self):
         api._ALLOWED_ORIGINS = ["https://app.example"]
         uid, gen, _sid, token = self._seed()
-        self.assertEqual(self._post({"uid": uid, "gen": gen, "token": token},
+        self.assertEqual(self._post({"gen": gen, "token": token},
                                     origin="https://evil.example").status_code, 204)
-        self.assertTrue(self._owned(uid, gen))
-        self.assertEqual(self._post({"uid": uid, "gen": gen, "token": token},
+        self.assertTrue(self._owned(uid, gen, token))
+        self.assertEqual(self._post({"gen": gen, "token": token},
                                     origin="https://app.example").status_code, 204)
-        self.assertFalse(self._owned(uid, gen))
+        self.assertFalse(self._owned(uid, gen, token))
 
     def test_default_wildcard_and_missing_origin(self):
         api._ALLOWED_ORIGINS = "*"
         uid, gen, _sid, token = self._seed()
-        r = self._post({"uid": uid, "gen": gen, "token": token}, origin="https://evil.example")
+        r = self._post({"gen": gen, "token": token}, origin="https://evil.example")
         self.assertEqual(r.status_code, 204)
         self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), "https://evil.example")
-        self.assertFalse(self._owned(uid, gen))
+        self.assertFalse(self._owned(uid, gen, token))
         # No Origin at all (some sendBeacon paths) is accepted when the token
         # is valid; the bearer token, not the Origin, is the authority.
         uid2, gen2, _s2, token2 = self._seed()
-        self.assertEqual(self._post({"uid": uid2, "gen": gen2, "token": token2}).status_code, 204)
-        self.assertFalse(self._owned(uid2, gen2))
+        self.assertEqual(self._post({"gen": gen2, "token": token2}).status_code, 204)
+        self.assertFalse(self._owned(uid2, gen2, token2))
 
     def test_rate_limiter_gate_blocks_noop(self):
         class Closed:
@@ -94,8 +94,8 @@ class CloseEndpointHTTP(unittest.TestCase):
 
         api._close_limiter = Closed()
         uid, gen, _sid, token = self._seed()
-        self.assertEqual(self._post({"uid": uid, "gen": gen, "token": token}).status_code, 204)
-        self.assertTrue(self._owned(uid, gen))
+        self.assertEqual(self._post({"gen": gen, "token": token}).status_code, 204)
+        self.assertTrue(self._owned(uid, gen, token))
 
 
 if __name__ == "__main__":
