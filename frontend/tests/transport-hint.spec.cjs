@@ -71,6 +71,9 @@ function startServer(bundlePath) {
   if (first.type !== 'transport-hint') fail(`first signal was ${JSON.stringify(first.type)}, expected transport-hint`);
   if (first.direct !== false) fail(`transport hint did not say direct:false (got ${JSON.stringify(first.direct)})`);
   if (first.uid !== 'browser-uid') fail(`transport hint uid was ${JSON.stringify(first.uid)}`);
+  // PeerLink.name is the REMOTE peer; it must never travel as our name, and an
+  // unauthenticated hint must not be able to set a display name.
+  if ('name' in first) fail(`transport hint carried a name (${JSON.stringify(first.name)})`);
   if (out.firstDescription !== -1 && out.sent.findIndex((x) => x.data && x.data.type === 'transport-hint') > out.firstDescription)
     fail('a description was emitted before the transport hint');
   if (!(out.sent[0].at < 50)) fail(`transport hint took ${out.sent[0].at}ms; it must be synchronous`);

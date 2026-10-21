@@ -342,8 +342,13 @@ export function legacyPoliteRole({ myUid, peerUid, myId, peerId }) {
 // that ladder for this peer while keeping direct-first for CLI peers. Old CLIs
 // ignore an unknown signal type, so this is a pure latency hint, not a protocol
 // dependency (identity/PAKE still gate trust).
-export function transportHint(uid, name) {
-  return { type: 'transport-hint', v: 1, direct: false, uid: uid || null, name: name || null }
+export function transportHint(uid) {
+  // `name` is deliberately absent: PeerLink.name is the REMOTE peer's name, and
+  // an unauthenticated hint must not be able to write a display name (or uid)
+  // into the receiver's roster before pair-proof/PAKE resolves identity. The
+  // uid is used only for the symmetric politeness election; `direct:false` is
+  // the only durable fact.
+  return { type: 'transport-hint', v: 1, direct: false, uid: uid || null }
 }
 
 
@@ -455,7 +460,7 @@ export class PeerLink {
     // budget for a peer that cannot speak QUIC. Sent synchronously so it is
     // ordered ahead of every SDP on the same signaling socket.
     try {
-      this.sendSignal(transportHint(this.myUid, this.name))
+      this.sendSignal(transportHint(this.myUid))
     } catch (err) {
       rlog.debug('transport hint failed', this.id.slice(-6), err)
     }

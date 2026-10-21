@@ -27,7 +27,7 @@ function captureHint() {
   const elapsed = performance.now() - t0
   try { link.close() } catch {}
   return {
-    hint: transportHint('browser-uid', 'web-shell'),
+    hint: transportHint('browser-uid'),
     sent,
     elapsed,
     first: sent[0] ? sent[0].data : null,
