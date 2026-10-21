@@ -566,6 +566,18 @@ else
     echo "-- L.err --"; cat "$WORK/L.err"; echo "-- upL.log --"; tail -20 "$WORK/upL.log"
     bad "gateL: exec did NOT run as the --shell-user account (rc=$rcL out='$OUTL')"
   fi
+  OUTLENV=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- \
+    /bin/sh -c 'printf "%s|%s|%s|%s" "$HOME" "$USER" "$SHELL" "$XDG_CONFIG_HOME"' \
+    2>"$WORK/L-env.err" </dev/null)
+  rcLENV=$?
+  echo "## (--shell-user nobody env) rc=$rcLENV out='$OUTLENV'"
+  if [ "$rcLENV" = "0" ] && [[ "$OUTLENV" == *"|nobody|"* ]] \
+     && [[ "$OUTLENV" != "$RHOME"* && "$OUTLENV" != *"|$RHOME/"* ]]; then
+    ok "gateL: --shell-user env named nobody and did not use the daemon HOME/XDG"
+  else
+    echo "-- L-env.err --"; cat "$WORK/L-env.err"; echo "-- upL.log --"; tail -20 "$WORK/upL.log"
+    bad "gateL: --shell-user env leaked the daemon profile (rc=$rcLENV out='$OUTLENV')"
+  fi
   # The daemon is root's: stop it as root. Matched by its unique drop dir.
   for p in $(pgrep -f -- "--dir $RDROP" 2>/dev/null); do "${AS_ROOT[@]}" kill "$p" 2>/dev/null; done
   sleep 1
