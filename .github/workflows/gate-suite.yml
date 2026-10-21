@@ -90,6 +90,11 @@
 #                              (and an unclaimed third keeps waiting, then
 #                              works); status records every send outcome;
 #                              join names the inviting device
+#   core-receive-e2e-gates.sh  a real CLI `send --code` delivers bytes to a
+#                              receiver running the library engine through
+#                              `Core::receive_code`; the inbox file matches,
+#                              the summary carries stored/bytes/sha256, the
+#                              sender exits 0, and the code is not logged
 #
 # mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
 # 6 PASS / 2 FAIL -- every mutation through the mount (create/write, mkdir,
@@ -143,6 +148,7 @@ on:
       - 'cli/tests/state-ux-gates.sh'
       - 'cli/tests/rc-polish-gates.sh'
       - 'cli/tests/concurrent-code-gates.sh'
+      - 'cli/tests/core-receive-e2e-gates.sh'
       - 'cli/tests/dashboard-gates.sh'
       - 'cli/tests/demo-gates.sh'
       - 'cli/tests/pair-bystander-gates.sh'
@@ -238,9 +244,16 @@ jobs:
         working-directory: cli
         run: cargo build --release
 
+      # The library receiver arm of the core E2E gate. It is the real
+      # `Core::receive_code`, not `tunlion receive`, and lands next to the CLI
+      # binary in the workspace target directory.
+      - name: Build Core receive helper
+        run: cargo build --release -p tunlion-core --bin receive-code
+
       - name: Run gates
         env:
           TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+          TUNLION_CORE_BIN: ${{ github.workspace }}/target/release/receive-code
         run: |
           set -uo pipefail
           declare -A EXPECT=(
@@ -267,6 +280,9 @@ jobs:
             [cli/tests/rc-polish-gates.sh]=6
             # 7: C1 C2 C3 C4 C5 H J (fix/concurrent-code-sends, the RC lab pass).
             [cli/tests/concurrent-code-gates.sh]=7
+            # 5: P1 sender delivery, P2 inbox bytes, P3 summary, P4 code not
+            # logged, P5 receiver exit 0.
+            [cli/tests/core-receive-e2e-gates.sh]=5
             # 9: H O S A W I G C X (feat/dashboard).
             [cli/tests/dashboard-gates.sh]=9
             # 6: A T I C N Z (feat/demo-command: the offline guided tour).
@@ -310,6 +326,7 @@ jobs:
                    cli/tests/state-ux-gates.sh \
                    cli/tests/rc-polish-gates.sh \
                    cli/tests/concurrent-code-gates.sh \
+                   cli/tests/core-receive-e2e-gates.sh \
                    cli/tests/dashboard-gates.sh \
                    cli/tests/demo-gates.sh \
                    cli/tests/pair-bystander-gates.sh; do

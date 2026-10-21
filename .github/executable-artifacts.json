@@ -53,6 +53,17 @@
       ]
     },
     {
+      "path": "cli/tests/core-receive-e2e-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion TUNLION_CORE_BIN=target/release/receive-code bash cli/tests/core-receive-e2e-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/demo-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/demo-gates.sh",
