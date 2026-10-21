@@ -488,9 +488,11 @@ mod win {
         }
     }
 
-    struct ConsoleModeGuard {
+    pub(super) struct ConsoleModeGuard {
         input: HANDLE,
         saved: u32,
+        #[cfg(test)]
+        restore: Option<Box<dyn FnMut(u32)>>,
     }
 
     impl ConsoleModeGuard {
@@ -500,12 +502,31 @@ mod win {
             unsafe {
                 let _ = SetConsoleMode(input, raw);
             }
-            Self { input, saved }
+            Self {
+                input,
+                saved,
+                #[cfg(test)]
+                restore: None,
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn with_restore(saved: u32, restore: impl FnMut(u32) + 'static) -> Self {
+            Self {
+                input: std::ptr::null_mut(),
+                saved,
+                restore: Some(Box::new(restore)),
+            }
         }
     }
 
     impl Drop for ConsoleModeGuard {
         fn drop(&mut self) {
+            #[cfg(test)]
+            if let Some(restore) = self.restore.as_mut() {
+                restore(self.saved);
+                return;
+            }
             // SAFETY: restore the exact saved console mode, including unwind.
             unsafe {
                 let _ = SetConsoleMode(self.input, self.saved);
@@ -660,6 +681,7 @@ mod unix_pipe_tests {
 mod windows_tests {
     use super::win::{
         spawn_on_handle, spawn_on_handle_raw, spawn_panicking_for_test, spawn_stuck_for_test,
+        ConsoleModeGuard,
     };
     use filament_peerloop::present::NoScreen;
     use filament_peerloop::recv::ports::StdinOutcome;
@@ -672,6 +694,13 @@ mod windows_tests {
     use windows_sys::Win32::System::Pipes::CreatePipe;
 
     static CONSOLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn console_marker(state: &str, test: &str) {
+        use std::io::Write;
+        // Raw stderr bypasses libtest's per-test capture, so CI logs show
+        // whether a console test executed or skipped.
+        let _ = writeln!(std::io::stderr(), "{state}: {test}");
+    }
 
     fn pipe() -> (usize, usize) {
         let mut read = std::ptr::null_mut();
@@ -962,9 +991,10 @@ mod windows_tests {
                 std::ptr::null_mut(),
             )
         };
-        if handle as isize == -1 {
-            return; // no NUL device in this environment
-        }
+        assert_ne!(
+            handle as isize, -1,
+            "CreateFileW(NUL) must succeed: NUL exists on every Windows system"
+        );
         let (mut owner, _rx) = owner(handle as usize);
         assert_eq!(
             owner.join(),
@@ -973,6 +1003,28 @@ mod windows_tests {
         unsafe {
             CloseHandle(handle);
         }
+    }
+
+    #[test]
+    fn console_mode_guard_restores_once_on_unwind() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::atomic::AtomicUsize;
+        let restored = Arc::new(AtomicUsize::new(0));
+        let count = restored.clone();
+        let saved = 0x1234_5678u32;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = ConsoleModeGuard::with_restore(saved, move |mode| {
+                assert_eq!(mode, saved);
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+            panic!("panic inside console mode guard");
+        }));
+        assert!(result.is_err(), "the test must unwind");
+        assert_eq!(
+            restored.load(Ordering::SeqCst),
+            1,
+            "the fake restore must run exactly once"
+        );
     }
 
     #[test]
@@ -996,13 +1048,25 @@ mod windows_tests {
             )
         };
         if handle as isize == -1 {
-            return; // headless runner: no console to restore
+            console_marker(
+                "SKIP(console unavailable)",
+                "console_mode_is_restored_when_a_console_is_available",
+            );
+            return;
         }
         let mut before = 0u32;
         if unsafe { GetConsoleMode(handle, &mut before) } == 0 {
             unsafe { CloseHandle(handle) };
+            console_marker(
+                "SKIP(console unavailable)",
+                "console_mode_is_restored_when_a_console_is_available",
+            );
             return;
         }
+        console_marker(
+            "CONSOLE(executed)",
+            "console_mode_is_restored_when_a_console_is_available",
+        );
         let (mut owner, _rx) = owner(handle as usize);
         assert_eq!(owner.join(), StdinOutcome::Joined);
         let mut after = 0u32;
@@ -1034,7 +1098,11 @@ mod windows_tests {
             )
         };
         if handle as isize == -1 {
-            return; // headless runner: no console input
+            console_marker(
+                "SKIP(console unavailable)",
+                "console_surrogate_pair_is_one_line (console injection unavailable)",
+            );
+            return;
         }
         // SAFETY: console handle; flush and inject three key-down records.
         let (mut events, written) = unsafe {
@@ -1052,8 +1120,13 @@ mod windows_tests {
         };
         if events == 0 || written != 3 {
             unsafe { CloseHandle(handle) };
-            return; // console input injection unavailable
+            console_marker(
+                "SKIP(console unavailable)",
+                "console_surrogate_pair_is_one_line (console injection unavailable)",
+            );
+            return;
         }
+        console_marker("CONSOLE(executed)", "console_surrogate_pair_is_one_line");
         let (mut owner, mut rx) = owner(handle as usize);
         assert_eq!(next_line(&mut rx), "😀");
         assert_eq!(owner.join(), StdinOutcome::Joined);
