@@ -2176,7 +2176,13 @@ mod tests {
                 let socket = accept_stub_websocket(&listener).await;
                 let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
                 let _ = ws.send(Message::Text("0{}".into())).await;
-                while let Some(Ok(message)) = ws.next().await {
+                while let Some(Ok(message)) = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    ws.next(),
+                )
+                .await
+                .expect("code allocation fixture: client did not send a frame or close within 10s")
+                {
                     match message {
                         Message::Text(text) if text == "40" => {
                             let _ = ws.send(Message::Text("40{}".into())).await;
