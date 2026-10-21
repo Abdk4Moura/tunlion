@@ -25,6 +25,9 @@ Approved 2026-10-20. Reference prototype and detailed decisions:
   golden cases, production browser build, all join PTYs at 40×12/96×24, two
   real PAKE ceremonies with replay refusal and authenticated reach, resize and
   light/dark fragmented-paint checks.
+- Integration branch pushed as `work/pairing-boundary-rebased`; PR
+  [#566](https://github.com/Abdk4Moura/tunlion/pull/566) is open against `main`.
+  Not merged or deployed.
 - Evidence archive `/root/Tunlion/tunlion-pairing-ux-rebased.tar.gz`, SHA-256
   `f20b6c31bd48904add18f5373375b6ec07b6aa7e401a1e79dafaeb1a497f4867`;
   extracted under `/root/pairing-ux/evidence/rebased-final`; 27 source hashes
