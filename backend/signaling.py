@@ -122,6 +122,9 @@ class _MemRegistry:
         """
         if not uid or not gen:
             return {"status": "legacy", "prev": None}
+        if gen in self._retired.get(uid, set()):
+            cur = self._uids.get(uid)
+            return {"status": "retired", "prev": cur.get("sid") if cur else None}
         cur = self._uids.get(uid)
         if cur is None:
             self._uids[uid] = {"gen": gen, "sid": sid}
@@ -132,8 +135,6 @@ class _MemRegistry:
                 cur["sid"] = sid
                 return {"status": "replace", "prev": prev}
             return {"status": "current", "prev": None}
-        if gen in self._retired.get(uid, set()):
-            return {"status": "retired", "prev": cur.get("sid")}
         old = cur.get("gen")
         retired = self._retired.setdefault(uid, set())
         retired.add(old)
@@ -301,6 +302,9 @@ class _RedisRegistry:
             """
             local cur = redis.call('GET', KEYS[1])
             local cursid = redis.call('GET', KEYS[2])
+            if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then
+              return {'retired', cursid or ''}
+            end
             if not cur then
               redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
               redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
@@ -310,9 +314,6 @@ class _RedisRegistry:
               if cursid == ARGV[2] then return {'current', ''} end
               redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
               return {'replace', cursid}
-            end
-            if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then
-              return {'retired', cursid}
             end
             redis.call('SADD', KEYS[3], cur)
             redis.call('EXPIRE', KEYS[3], ARGV[3])
