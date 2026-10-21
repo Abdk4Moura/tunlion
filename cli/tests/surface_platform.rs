@@ -53,7 +53,8 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("exec_send.rs", 3),
         // Warm exec's platform split is the honest one: a Unix control socket
         // and a NAMED absence on Windows (NamedPipe support is a follow-up).
-        ("exec_warm.rs", 2),
+        // 3: producer, Windows stub, and the Unix-only fake-daemon test.
+        ("exec_warm.rs", 3),
         ("shell_support.rs", 3),
         ("up_logs.rs", 2),
         ("conn.rs", 1),
