@@ -943,19 +943,11 @@ impl Core {
             match events.recv_timeout(left) {
                 Ok(SendEvent::Code(code)) => {
                     // The job belongs to the generation claimed by THIS
-                    // invocation, not whichever engine owns the slot now. If
-                    // a stop already ended it, do not hand out a code for a
-                    // send that is no longer running and do not publish a
-                    // job a successor could later reap.
-                    if self.engine_generation() != generation {
-                        return Err(CoreError::Cancelled);
-                    }
-                    *self.send_job.lock().map_err(|_| {
-                        CoreError::Engine("the send job lock was poisoned".into())
-                    })? = Some(SendJob {
-                        rx: events,
-                        engine_seq: generation,
-                    });
+                    // invocation, not whichever engine owns the slot now.
+                    // Publishing is one critical section with that check, so
+                    // a stop or successor start cannot leave a stale job
+                    // behind that shadows the successor's.
+                    self.publish_send_job(generation, events)?;
                     return Ok(CreatedCode {
                         code: code.code,
                         expires_in_secs: code.expires_in_secs,
@@ -1702,6 +1694,42 @@ impl Core {
         if let Ok(mut job) = self.send_job.lock() {
             *job = None;
         }
+    }
+
+    /// Publish the completion half of a code send, atomically with the engine
+    /// generation that owns it.
+    ///
+    /// The engine lock is held across the generation check and the store, so a
+    /// stop or a successor start cannot interleave between them and leave a
+    /// stale job that shadows the successor's job. The slot must still own a
+    /// live task; an `Ended`/`None` slot means the invocation this generation
+    /// named has already been settled.
+    fn publish_send_job(
+        &self,
+        generation: u64,
+        rx: std::sync::mpsc::Receiver<SendEvent>,
+    ) -> Result<(), CoreError> {
+        let slot = self
+            .engine
+            .lock()
+            .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+        if self.engine_generation() != generation
+            || !matches!(
+                &*slot,
+                EngineSlot::Starting(_) | EngineSlot::Running(_) | EngineSlot::Unstopped(_)
+            )
+        {
+            return Err(CoreError::Cancelled);
+        }
+        let mut job = self
+            .send_job
+            .lock()
+            .map_err(|_| CoreError::Engine("the send job lock was poisoned".into()))?;
+        *job = Some(SendJob {
+            rx,
+            engine_seq: generation,
+        });
+        Ok(())
     }
 
     /// Clear the send job only when it belongs to `generation`. A settle for a
@@ -2939,6 +2967,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!(core.status().unwrap().engine, EngineState::Running);
+
+        // A late Code event from A must not publish a stale job over B: the
+        // publish checks the generation under the same engine lock a start
+        // uses. A job left here would shadow B's job for wait_send.
+        let (_old_tx, old_rx) = std::sync::mpsc::channel();
+        assert!(matches!(
+            core.publish_send_job(generation, old_rx),
+            Err(CoreError::Cancelled)
+        ));
+        assert!(
+            core.send_job.lock().unwrap().is_none(),
+            "a superseded generation published a send job"
+        );
 
         // A's result arrives only now. The settle names A's generation, so it
         // must not join B (the exact check-then-stop race in wait_send).
