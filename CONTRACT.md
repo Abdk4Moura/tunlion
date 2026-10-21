@@ -193,7 +193,13 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   is NOT authority and alone can never evict a peer. The token is a bearer
   credential with a sliding 24h policy: valid claims refresh it; an expired
   token whose session is not live is stale ownership and a fresh token is
-  minted. Claim rate and uid/gen/token length are bounded.
+  minted. Claim rate and uid/gen/token length are bounded. Mem and Redis store
+  the token/gen/sid under one ownership lifecycle (one TTL in Redis) so no
+  field can outlive another. Retired generations are one global 24h TTL set
+  with a hard total cap, oldest evicted first; a valid current owner is never
+  refused because of it. The token is a bearer credential in localStorage, not
+  rotated per session and with no revocation endpoint: it expires 24h after the
+  last successful claim, and a live tab refreshes it on each sync.
 - A token-bearing `gen` different from the relay's current owner supersedes
   that session and retires the old generation. A retired generation's late
   `sync` is refused (`{ok:false, superseded:true}`) and cannot take the session

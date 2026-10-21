@@ -153,6 +153,14 @@ jobs:
           FIL_TEST_REDIS_URL: redis://127.0.0.1:6379/0
         run: python -m unittest backend.tests.test_session_generation_redis
 
+      - name: backend session close HTTP
+        run: python -m unittest backend.tests.test_session_close_http
+
+      - name: backend rate limiter (Mem + Redis)
+        env:
+          FIL_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+        run: python -m unittest backend.tests.test_ratelimit
+
       # The shell outlives its link: a reattach sends resume_from (exactly the
       # bytes the terminal showed), the bar says reconnecting while the link is
       # down, and no line arrives twice or goes missing. Fake device session that

@@ -30,6 +30,7 @@ import re
 import secrets
 import threading
 import time as _time
+from collections import deque
 
 from flask import request
 from flask_socketio import emit, join_room, leave_room
@@ -72,6 +73,15 @@ def _norm_code(raw):
     return re.sub(r"[^a-z0-9-]", "", re.sub(r"\s+", "-", raw.strip().lower()))[:48]
 
 
+_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def _valid_id(value):
+    """Session ids cross a JSON boundary. Require a short, separator-safe str
+    before they become Redis key/hash/zset members or Python dict keys."""
+    return isinstance(value, str) and bool(_ID_RE.match(value))
+
+
 def origin_allowed(origin, allowed):
     """Whether a pagehide beacon Origin may reach the close endpoint.
 
@@ -99,21 +109,21 @@ class _MemRegistry:
 
     LIVE_TTL = 60  # liveness lease; refreshed by the lease loop + on activity
     OWNER_TTL = 24 * 3600  # ownership token/record lifetime (sliding on use)
-    RETIRED_TTL = 24 * 3600  # tombstone lifetime; also bounds _retired memory
+    RETIRED_TTL = 24 * 3600  # tombstone lifetime (one global set)
     MAX_OWNED_UIDS = 50_000
-    MAX_RETIRED_PER_UID = 1024
+    MAX_RETIRED_TOTAL = 200_000
 
     def __init__(self):
         self._m = {}  # sid -> {"room", "name", "uid", "gen"}
         self._live = {}  # sid -> lease expiry (monotonic)
         # uid -> {"gen", "sid", "token", "token_exp", "last_seen"}.
         # A reload has the same uid but a new generation; it takes ownership
-        # immediately when it presents the server-minted token. `_retired`
-        # remembers generations that were replaced so a late sync/close from
-        # the frozen old page cannot steal the session back.
+        # immediately when it presents the server-minted token. Retired
+        # generations are one GLOBAL (uid, gen) -> expiry map so memory is
+        # bounded by MAX_RETIRED_TOTAL, not by uid count.
         self._uids = {}
-        self._retired = {}  # uid -> set(old generations)
-        self._retired_exp = {}  # uid -> wall-clock expiry for its tombstone set
+        self._retired = {}
+        self._retired_order = deque()
         # async_mode=threading really is concurrent: claim/take must not
         # interleave or two generations can both believe they own a uid.
         self._lock = threading.RLock()
@@ -160,16 +170,15 @@ class _MemRegistry:
         """
         if not uid or not gen:
             return {"status": "legacy", "prev": None}
-        if len(uid) > 128 or len(gen) > 128 or (token and len(str(token)) > 256):
+        if not _valid_id(uid) or not _valid_id(gen) or (token is not None and not isinstance(token, str)):
+            return {"status": "denied", "prev": None}
+        if token and len(token) > 256:
             return {"status": "denied", "prev": None}
         with self._lock:
             now = _time.time()
             has_room = self._sweep_owners(now)
-            ret_exp = self._retired_exp.get(uid)
-            if ret_exp is not None and ret_exp <= now:
-                self._retired.pop(uid, None)
-                self._retired_exp.pop(uid, None)
-            if gen in self._retired.get(uid, set()):
+            self._prune_retired(now)
+            if self._is_retired(uid, gen):
                 cur = self._uids.get(uid)
                 return {"status": "retired", "prev": cur.get("sid") if cur else None}
             cur = self._uids.get(uid)
@@ -211,16 +220,43 @@ class _MemRegistry:
                 return {"status": "current", "prev": None, "token": cur_token}
             old = cur.get("gen")
             prev = cur.get("sid")
-            retired = self._retired.setdefault(uid, set())
             if old:
-                if len(retired) >= self.MAX_RETIRED_PER_UID:
-                    # Bounded memory without dropping an old tombstone and
-                    # making a retired page valid again.
-                    return {"status": "capacity", "prev": prev}
-                retired.add(old)
-                self._retired_exp[uid] = now + self.RETIRED_TTL
+                self._add_retired(uid, old, now)
             cur.update({"gen": gen, "sid": sid})
             return {"status": "new", "prev": prev, "token": cur_token}
+
+    def _prune_retired(self, now):
+        """Drop expired tombstones and enforce the global count cap (oldest
+        first). A valid owner is never refused because of this bound."""
+        while self._retired_order:
+            uid, gen, exp = self._retired_order[0]
+            if exp > now and len(self._retired) < self.MAX_RETIRED_TOTAL:
+                break
+            self._retired_order.popleft()
+            if self._retired.get((uid, gen)) == exp:
+                self._retired.pop((uid, gen), None)
+        while len(self._retired) >= self.MAX_RETIRED_TOTAL and self._retired_order:
+            uid, gen, exp = self._retired_order.popleft()
+            if self._retired.get((uid, gen)) == exp:
+                self._retired.pop((uid, gen), None)
+
+    def _is_retired(self, uid, gen):
+        exp = self._retired.get((uid, gen))
+        if exp is None:
+            return False
+        if exp <= _time.time():
+            self._retired.pop((uid, gen), None)
+            return False
+        return True
+
+    def _add_retired(self, uid, gen, now):
+        self._prune_retired(now)
+        exp = now + self.RETIRED_TTL
+        key = (uid, gen)
+        if key in self._retired:
+            return
+        self._retired[key] = exp
+        self._retired_order.append((uid, gen, exp))
 
     def _sweep_owners(self, now):
         """Bound ownership memory: drop stale, non-live records oldest-first."""
@@ -235,8 +271,6 @@ class _MemRegistry:
         drop = len(self._uids) - self.MAX_OWNED_UIDS + 1
         for uid, _ in stale[: max(0, drop)]:
             self._uids.pop(uid, None)
-            self._retired.pop(uid, None)
-            self._retired_exp.pop(uid, None)
         return len(self._uids) < self.MAX_OWNED_UIDS
 
     def rename(self, sid, name):
@@ -252,6 +286,13 @@ class _MemRegistry:
         clients: they may not re-use a uid that a token-owning session owns)."""
         with self._lock:
             return self._uids.get(uid)
+
+    def claim_legacy(self, uid):
+        """Atomic decision for a generation-less client: a fresh uid may join
+        as non-owning; an already-owned uid is refused. No later token claim can
+        be raced by a stale read between check and return."""
+        with self._lock:
+            return uid not in self._uids
 
     def take_session(self, uid, gen, token=None):
         """Close the active sid for (uid, gen) IF the caller holds its ownership
@@ -275,10 +316,7 @@ class _MemRegistry:
             cur["gen"] = None
             cur["last_seen"] = now
             cur["token_exp"] = now + self.OWNER_TTL
-            retired = self._retired.setdefault(uid, set())
-            if len(retired) < self.MAX_RETIRED_PER_UID:
-                retired.add(gen)
-                self._retired_exp[uid] = now + self.RETIRED_TTL
+            self._add_retired(uid, gen, now)
             self._live.pop(sid, None)
             m = self._m.pop(sid, None)
             return {"sid": sid, "room": m.get("room") if m else None}
@@ -377,6 +415,10 @@ class _RedisRegistry:
     """
 
     TTL = 86400  # room/sid bookkeeping
+    OWNER_TTL = _MemRegistry.OWNER_TTL
+    RETIRED_TTL = _MemRegistry.RETIRED_TTL
+    MAX_OWNED_UIDS = _MemRegistry.MAX_OWNED_UIDS
+    MAX_RETIRED_TOTAL = _MemRegistry.MAX_RETIRED_TOTAL
     LIVE_TTL = 120  # liveness lease; refreshed every ~15s while connected
 
     def __init__(self, url):
@@ -393,17 +435,16 @@ class _RedisRegistry:
     def _lk(self, sid):
         return f"filament:live:{sid}"
 
-    def _gk(self, uid):
-        return f"filament:uid:{uid}:gen"
+    # One hash per uid holds gen/sid/token, so they share one TTL and cannot
+    # expire independently (a surviving token with an expired gen was the bug).
+    def _ok(self, uid):
+        return f"filament:owner:{uid}"
 
-    def _usk(self, uid):
-        return f"filament:uid:{uid}:sid"
+    def _owners(self):
+        return "filament:owners"
 
-    def _urk(self, uid):
-        return f"filament:uid:{uid}:retired"
-
-    def _utk(self, uid):
-        return f"filament:uid:{uid}:token"
+    def _retired_key(self):
+        return "filament:retired:gens"
 
     def add(self, sid, room, name, uid=None, gen=None):
         import json
@@ -419,58 +460,92 @@ class _RedisRegistry:
         """Atomic generation ownership (same contract as _MemRegistry)."""
         if not uid or not gen:
             return {"status": "legacy", "prev": None}
-        if len(uid) > 128 or len(gen) > 128 or (token and len(str(token)) > 256):
+        if not _valid_id(uid) or not _valid_id(gen) or (token is not None and not isinstance(token, str)):
+            return {"status": "denied", "prev": None}
+        if token and len(token) > 256:
             return {"status": "denied", "prev": None}
         # Mint unconditionally on a first claim; the client's value never
         # becomes the first owner of a uid.
         candidate = secrets.token_urlsafe(24)
+        now = _time.time()
+        member = f"{uid}|{gen}"
         status, prev, issued = self.r.eval(
             """
-            local cur = redis.call('GET', KEYS[1])
-            local cursid = redis.call('GET', KEYS[2])
-            local curtok = redis.call('GET', KEYS[4])
-            if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then
+            local cur = redis.call('HMGET', KEYS[1], 'gen', 'sid', 'token')
+            local curgen, cursid, curtok = cur[1], cur[2], cur[3]
+            redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[6])
+            -- owners idle past the shared TTL are gone with their hash
+            local stale = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', tonumber(ARGV[6]) - tonumber(ARGV[5]))
+            for _, ou in ipairs(stale) do
+              if not redis.call('EXISTS', 'filament:owner:' .. ou) then
+                redis.call('ZREM', KEYS[3], ou)
+              end
+            end
+            if redis.call('ZSCORE', KEYS[2], ARGV[11]) then
               return {'retired', cursid or '', curtok or ''}
             end
-            if not cur then
-              redis.call('SET', KEYS[4], ARGV[4], 'EX', ARGV[5])
-              redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[5])
-              redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
+            if (not curgen) or curgen == '' then
+              -- A closed slot may still hold the real token (hash TTL keeps
+              -- all fields together). Only that token may reclaim it.
+              if curtok then
+                if ARGV[3] == '' or ARGV[3] ~= curtok then
+                  return {'denied', '', curtok}
+                end
+                redis.call('HSET', KEYS[1], 'gen', ARGV[1], 'sid', ARGV[2])
+                redis.call('EXPIRE', KEYS[1], ARGV[5])
+                redis.call('ZADD', KEYS[3], ARGV[6], ARGV[7])
+                return {'new', '', curtok}
+              end
+              -- Brand-new uid: a tokenless caller gets the server-minted
+              -- token; no existing live token can be taken this way.
+              local cards = redis.call('ZCARD', KEYS[3])
+              if cards >= tonumber(ARGV[8]) then
+                local olds = redis.call('ZRANGE', KEYS[3], 0, cards - tonumber(ARGV[8]) + 1)
+                local freed = false
+                for _, ou in ipairs(olds) do
+                  local osid = redis.call('HGET', 'filament:owner:' .. ou, 'sid')
+                  if not osid or osid == '' or redis.call('EXISTS', 'filament:live:' .. osid) == 0 then
+                    redis.call('DEL', 'filament:owner:' .. ou)
+                    redis.call('ZREM', KEYS[3], ou)
+                    freed = true
+                    break
+                  end
+                end
+                if not freed then return {'capacity', '', ''} end
+              end
+              redis.call('ZREM', KEYS[3], ARGV[7])
+              redis.call('HSET', KEYS[1], 'gen', ARGV[1], 'sid', ARGV[2], 'token', ARGV[4])
+              redis.call('EXPIRE', KEYS[1], ARGV[5])
+              redis.call('ZADD', KEYS[3], ARGV[6], ARGV[7])
               return {'new', '', ARGV[4]}
             end
-            if not curtok then
-              -- expired bearer: stale only if its session is not live
-              if redis.call('EXISTS', 'filament:live:' .. cursid) == 0 then
-                redis.call('SET', KEYS[4], ARGV[4], 'EX', ARGV[5])
-                redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[5])
-                redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
-                return {'new', cursid or '', ARGV[4]}
-              end
-              return {'denied', cursid or '', ''}
-            end
-            local authorized = (ARGV[3] ~= '' and ARGV[3] == curtok)
-            if not authorized and cur == ARGV[1] and cursid == ARGV[2] then
+            local authorized = (ARGV[3] ~= '' and curtok and ARGV[3] == curtok)
+            if not authorized and curgen == ARGV[1] and cursid == ARGV[2] then
               authorized = true
             end
-            if not authorized then return {'denied', cursid or '', curtok} end
-            redis.call('EXPIRE', KEYS[4], ARGV[5])
-            if cur == ARGV[1] then
+            if not authorized then return {'denied', cursid or '', curtok or ''} end
+            redis.call('EXPIRE', KEYS[1], ARGV[5])
+            redis.call('ZADD', KEYS[3], ARGV[6], ARGV[7])
+            if curgen == ARGV[1] then
               if cursid == ARGV[2] then return {'current', '', curtok} end
-              redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
+              redis.call('HSET', KEYS[1], 'sid', ARGV[2])
               return {'replace', cursid, curtok}
             end
-            if redis.call('SCARD', KEYS[3]) >= tonumber(ARGV[6]) then
-              return {'capacity', cursid or '', curtok}
+            -- retire the old generation in one global ZSET; evict oldest
+            -- tombstones rather than refusing the valid current owner.
+            while redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[9]) do
+              redis.call('ZREMRANGEBYRANK', KEYS[2], 0, 0)
             end
-            redis.call('SADD', KEYS[3], cur)
-            redis.call('EXPIRE', KEYS[3], ARGV[5])
-            redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[5])
-            redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
-            return {'new', cursid, curtok}
+            redis.call('ZADD', KEYS[2], tonumber(ARGV[6]) + tonumber(ARGV[10]),
+                       ARGV[7] .. '|' .. curgen)
+            redis.call('EXPIRE', KEYS[2], tonumber(ARGV[10]) * 2)
+            redis.call('HSET', KEYS[1], 'gen', ARGV[1], 'sid', ARGV[2])
+            return {'new', cursid or '', curtok}
             """,
-            4, self._gk(uid), self._usk(uid), self._urk(uid), self._utk(uid),
-            gen, sid, str(token) if token else "", candidate, self.TTL,
-            _MemRegistry.MAX_RETIRED_PER_UID,
+            3, self._ok(uid), self._retired_key(), self._owners(),
+            gen, sid, str(token) if token else "", candidate, self.OWNER_TTL,
+            now, uid, self.MAX_OWNED_UIDS, self.MAX_RETIRED_TOTAL,
+            self.RETIRED_TTL, member,
         )
         return {"status": status, "prev": prev or None, "token": issued or None}
 
@@ -490,29 +565,39 @@ class _RedisRegistry:
         return {"id": sid, "name": name, "uid": v.get("uid")}
 
     def owned_uid(self, uid):
-        if self.r.exists(self._gk(uid), self._usk(uid), self._utk(uid)):
-            return {"gen": self.r.get(self._gk(uid)), "sid": self.r.get(self._usk(uid))}
-        return None
+        h = self.r.hmget(self._ok(uid), "gen", "sid", "token")
+        if not any(h):
+            return None
+        return {"gen": h[0] or None, "sid": h[1] or None}
+
+    def claim_legacy(self, uid):
+        # EXISTS is atomic against a concurrent token claim.
+        return not self.r.exists(self._ok(uid))
 
     def take_session(self, uid, gen, token=None):
         if not uid or not gen or not token:
             return None
         sid, room = self.r.eval(
             """
-            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {'', ''} end
-            local curtok = redis.call('GET', KEYS[4])
-            if not curtok or curtok ~= ARGV[3] then return {'', ''} end
-            local sid = redis.call('GET', KEYS[2])
+            local cur = redis.call('HMGET', KEYS[1], 'gen', 'sid', 'token')
+            if cur[1] ~= ARGV[1] or not cur[3] or cur[3] ~= ARGV[3] then
+              return {'', ''}
+            end
+            local sid = cur[2]
             if not sid then return {'', ''} end
             local room = redis.call('GET', 'filament:sid:' .. sid)
-            redis.call('SADD', KEYS[3], ARGV[1])
-            redis.call('EXPIRE', KEYS[3], ARGV[2])
-            redis.call('EXPIRE', KEYS[4], ARGV[2])
-            redis.call('DEL', KEYS[2])
+            while redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[5]) do
+              redis.call('ZREMRANGEBYRANK', KEYS[2], 0, 0)
+            end
+            redis.call('ZADD', KEYS[2], tonumber(ARGV[4]) + tonumber(ARGV[6]), ARGV[7])
+            redis.call('EXPIRE', KEYS[2], tonumber(ARGV[6]) * 2)
+            redis.call('HSET', KEYS[1], 'gen', '', 'sid', '')
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
             return {sid, room or ''}
             """,
-            4, self._gk(uid), self._usk(uid), self._urk(uid), self._utk(uid),
-            gen, self.TTL, str(token),
+            2, self._ok(uid), self._retired_key(),
+            gen, self.OWNER_TTL, str(token), _time.time(),
+            self.MAX_RETIRED_TOTAL, self.RETIRED_TTL, f"{uid}|{gen}",
         )
         if not sid:
             return None
@@ -775,16 +860,23 @@ def register(socketio, registry):
         to this socket alone."""
         if not uid:
             return True, None
+        if not _valid_id(uid) or (token is not None and not isinstance(token, str)):
+            _tel("session-invalid", sid=sid)
+            emit("session-superseded", {"reason": "invalid"})
+            return False, None
         if not gen:
-            # Legacy/CLI clients do not carry a generation. They may still join
-            # fresh uids, but a uid that a token-owning session already owns is
-            # never theirs to re-use (no uid-alone eviction/impersonation).
-            cur = registry.owned_uid(uid)
-            if cur is not None:
+            # Legacy/CLI clients do not carry a generation. The check-and-join
+            # is one atomic registry operation, so a concurrent token claim
+            # cannot slip between "no owner" and "join".
+            if not registry.claim_legacy(uid):
                 _tel("session-denied", sid=sid, uid=uid, gen=None)
                 emit("session-superseded", {"reason": "not-owner"})
                 return False, None
             return True, None
+        if not _valid_id(gen) or (token and len(token) > 256):
+            _tel("session-invalid", sid=sid)
+            emit("session-superseded", {"reason": "invalid"})
+            return False, None
         if not _session_claim_allowed(sid):
             _tel("session-claim-rate-limited", sid=sid, uid=uid)
             emit("session-superseded", {"reason": "rate-limited"})
@@ -840,8 +932,10 @@ def register(socketio, registry):
     @socketio.on("join")
     def on_join(data):
         sid = request.sid
-        room = (data or {}).get("room")
-        name = (data or {}).get("name") or "anonymous"
+        data = data if isinstance(data, dict) else {}
+        room = data.get("room")
+        name = data.get("name") if isinstance(data.get("name"), str) else "anonymous"
+        name = name[:128] or "anonymous"
         # uid: a stable per-tab identity that survives reconnects (sids don't).
         # It lets peers recognize "same device, new connection" — the basis for
         # transfer resume.
@@ -1037,9 +1131,10 @@ def register(socketio, registry):
     @socketio.on("sync")
     def on_sync(data=None):
         sid = request.sid
-        data = data or {}
+        data = data if isinstance(data, dict) else {}
         room = data.get("room")
-        name = data.get("name") or "anonymous"
+        name = data.get("name") if isinstance(data.get("name"), str) else "anonymous"
+        name = name[:128] or "anonymous"
         uid = data.get("uid")
         gen = data.get("gen")
         token = data.get("token")

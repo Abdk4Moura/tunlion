@@ -210,6 +210,13 @@ class SocketIOSignaling extends Emitter {
   reconnect() {
     if (this.socket && !this.suspended && !this.socket.connected) this.socket.connect()
   }
+  // Test-only: drop and re-open the signaling socket without touching the
+  // WebRTC links, so a gate can prove the reconnect cache (gen/name) without
+  // conflating it with network emulation.
+  dropForTest() {
+    try { this.socket.disconnect() } catch {}
+    setTimeout(() => { if (!this.suspended) this.socket.connect() }, 100)
+  }
   // A newer session for this device owns it: stop auto-reconnect and do not
   // re-emit join (that would replay a retired generation).
   suspend() {

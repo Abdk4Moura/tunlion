@@ -23,19 +23,19 @@ URL = os.environ.get("FIL_TEST_REDIS_URL", "")
 
 @unittest.skipUnless(URL, "FIL_TEST_REDIS_URL not set (real Redis required for Lua)")
 class RedisGenerationParity(unittest.TestCase):
+    def _cleanup(self):
+        self.reg.r.delete(f"filament:owner:{self.uid}")
+        self.reg.r.zrem("filament:owners", self.uid)
+        for member, _score in list(self.reg.r.zscan_iter("filament:retired:gens", match=f"{self.uid}|*")):
+            self.reg.r.zrem("filament:retired:gens", member)
+
     def setUp(self):
         self.uid = "test-" + uuid.uuid4().hex
         self.reg = signaling._RedisRegistry(URL)
-        self.reg.r.delete(
-            f"filament:uid:{self.uid}:gen",
-            f"filament:uid:{self.uid}:sid",
-            f"filament:uid:{self.uid}:retired",
-            f"filament:uid:{self.uid}:token",
-        )
+        self._cleanup()
 
     def tearDown(self):
-        for suffix in ("gen", "sid", "retired", "token"):
-            self.reg.r.delete(f"filament:uid:{self.uid}:{suffix}")
+        self._cleanup()
 
     def test_mint_ignore_client_token_reclaim_and_close(self):
         first = self.reg.claim_session(self.uid, "g1", "s1", "attacker-chosen")
@@ -51,6 +51,26 @@ class RedisGenerationParity(unittest.TestCase):
         self.assertIsNone(self.reg.take_session(self.uid, "g2", "wrong"))
         self.assertEqual(self.reg.take_session(self.uid, "g2", tok)["sid"], "s3")
 
+    def test_shared_ttl_live_tokenless_and_expired_paths(self):
+        first = self.reg.claim_session(self.uid, "g1", "s1")
+        tok = first["token"]
+        # Tokenless new generation cannot take a live owner.
+        self.assertEqual(self.reg.claim_session(self.uid, "g2", "s2", None)["status"], "denied")
+        # A live sync refreshes the ONE hash key carrying gen/sid/token.
+        self.reg.r.pexpire(f"filament:owner:{self.uid}", 100)
+        self.assertEqual(self.reg.claim_session(self.uid, "g1", "s1", tok)["status"], "current")
+        self.assertGreater(self.reg.r.pttl(f"filament:owner:{self.uid}"), 1000)
+        # Close keeps the token (gen/sid empty) but a tokenless client cannot reuse it.
+        self.assertEqual(self.reg.take_session(self.uid, "g1", tok)["sid"], "s1")
+        self.assertEqual(self.reg.claim_session(self.uid, "g2", "s2", None)["status"], "denied")
+        reclaim = self.reg.claim_session(self.uid, "g2", "s2", tok)
+        self.assertEqual((reclaim["status"], reclaim["token"]), ("new", tok))
+        # Expired ownership hash is stale; a fresh relay token is minted.
+        self.reg.r.delete(f"filament:owner:{self.uid}")
+        expired = self.reg.claim_session(self.uid, "g3", "s3", None)
+        self.assertEqual(expired["status"], "new")
+        self.assertNotEqual(expired["token"], tok)
+
     def test_concurrent_claims_leave_one_owner(self):
         from concurrent.futures import ThreadPoolExecutor
 
@@ -58,8 +78,7 @@ class RedisGenerationParity(unittest.TestCase):
         gens = [f"r{i}" for i in range(24)]
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(lambda i: self.reg.claim_session(self.uid, gens[i], f"rs{i}", tok), range(len(gens))))
-        cur_gen = self.reg.r.get(f"filament:uid:{self.uid}:gen")
-        cur_sid = self.reg.r.get(f"filament:uid:{self.uid}:sid")
+        cur_gen, cur_sid = self.reg.r.hmget(f"filament:owner:{self.uid}", "gen", "sid")
         self.assertIn(cur_gen, gens)
         # every other generation is a tombstone; one remains current
         for i, g in enumerate(gens):

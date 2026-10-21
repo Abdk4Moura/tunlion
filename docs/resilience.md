@@ -281,7 +281,14 @@ UI hid it.
   reconnect still reclaims its own session. The token is a sliding 24h bearer
   credential; expired non-live ownership mints a fresh token. Claim rate,
   uid/gen/token length, ownership-record count and per-uid tombstones are all
-  bounded (Redis uses the same 24h TTLs and atomic Lua).
+  bounded (Redis stores gen/sid/token in ONE hash with one 24h TTL and uses
+  atomic Lua; Mem and Redis both use a global retired-generation ZSET/map with
+  a 24h TTL plus a hard total cap, and a bounded LRU ownership map/ZSET).
+  The token is a bearer credential kept in localStorage: it is not rotated per
+  session and has no revocation endpoint, but expires 24h after the last
+  successful claim (a live tab refreshes it on each sync). A leaked token is
+  therefore usable only while the device keeps it alive; clearing the browser
+  token/uid is the escape hatch.
 - **Synchronous pagehide, not unload-dependent.** `pagehide` closes local
   `RTCPeerConnection`s, stops link/session/pairing/config timers, and beacons
   `POST /api/session/close` with `{uid, gen, token}`. The endpoint requires the

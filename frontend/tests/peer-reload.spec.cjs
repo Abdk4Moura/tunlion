@@ -152,14 +152,14 @@ async function waitPeerReady(page, name, timeout = 30000) {
     if (!/\bready\b/i.test(await row.innerText().catch(() => ''))) return false;
     // `ready` is set from pc.connectionState too; prove a real DataChannel is
     // open. The ?test=1 hook exposes the live PeerLink map, not a mock.
-    return page.evaluate(() => {
+    return page.evaluate((wanted) => {
       const links = window.__tunlionTestLinks;
       if (!links) return false;
       for (const link of links.values()) {
-        if (link?.channel?.readyState === 'open') return true;
+        if (link?.name === wanted && link?.channel?.readyState === 'open') return true;
       }
       return false;
-    });
+    }, name);
   }, timeout, `peer ${name} ready with an OPEN data channel`);
 }
 
@@ -358,20 +358,19 @@ async function runEngine(engine, browser, contextOptions) {
   const gen8 = beforeReconnect.gen.slice(0, 8);
   const retiredBefore = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === g3.uid && e.gen === gen8).length;
   const joinsBefore = telEvents().filter((e) => e.ev === 'join' && e.uid === g3.uid && e.gen === gen8).length;
-  await second.context().setOffline(true);
-  await sleep(700);
-  await second.context().setOffline(false);
-  // WebKit's offline emulation can also stall the peer context's ICE; refresh
-  // that fixture so this test measures the DEVICE's reconnect cache, not
-  // WebKit's network-process offline recovery.
-  if (engine === 'webkit-ipad') { await nav(peer, BASE); await waitOnline(peer); }
+  // Drop only the signaling socket; the WebRTC links stay up, so a `ready`
+  // assertion here measures the reconnect cache, not ICE/network emulation.
+  await second.evaluate(() => window.__tunlionTestReconnect && window.__tunlionTestReconnect());
+  await sleep(400);
   if (full) {
     await waitOnlineAndPeer(second, peerName, 45000);
+    await waitPeerReady(second, peerName, 60000);
     await waitFor(async () => {
       const now = await peerRows(peer, chosen).count();
       const old = await peerRows(peer, devName).count();
       return now === 1 && old === 0;
     }, 15000, 'the peer to relabel the reconnected device');
+    await waitPeerReady(peer, chosen, 60000);
   } else {
     await waitOnline(second, 30000);
   }
@@ -401,7 +400,7 @@ async function runEngine(engine, browser, contextOptions) {
   const beforeBf = await identity(second);
   await second.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
   await waitFor(async () => (await identity(second)).gen !== beforeBf.gen, 15000, 'pageshow(persisted) to rotate generation');
-  if (full) await waitOnlineAndPeer(second, peerName, 45000); else await waitOnline(second);
+  if (full) { await waitOnlineAndPeer(second, peerName, 45000); await waitPeerReady(second, peerName, 60000); } else await waitOnline(second);
   ok(`${tag} persisted pageshow rotates the session generation and revalidates`);
 
   // 6a-b. Force a real socket disconnect/reconnect AFTER that rotation. The
@@ -411,11 +410,9 @@ async function runEngine(engine, browser, contextOptions) {
   const bfGen = bf.gen.slice(0, 8);
   const bfRetiredBefore = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === bf.uid && e.gen === bfGen).length;
   const bfJoinsBefore = telEvents().filter((e) => e.ev === 'join' && e.uid === bf.uid && e.gen === bfGen).length;
-  await second.context().setOffline(true);
-  await sleep(700);
-  await second.context().setOffline(false);
-  if (engine === 'webkit-ipad') { await nav(peer, BASE); await waitOnline(peer); }
-  if (full) await waitOnlineAndPeer(second, peerName, 45000); else await waitOnline(second, 45000);
+  await second.evaluate(() => window.__tunlionTestReconnect && window.__tunlionTestReconnect());
+  await sleep(400);
+  if (full) { await waitOnlineAndPeer(second, peerName, 45000); await waitPeerReady(second, peerName, 60000); } else await waitOnline(second, 45000);
   const bfRetiredAfter = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === bf.uid && e.gen === bfGen).length;
   const bfJoinsAfter = telEvents().filter((e) => e.ev === 'join' && e.uid === bf.uid && e.gen === bfGen).length;
   if (bfRetiredAfter !== bfRetiredBefore) fail(`${tag} post-pageshow reconnect retired the current generation`);
@@ -452,15 +449,27 @@ async function runEngine(engine, browser, contextOptions) {
 
   // 8. pagehide clears page-owned timers (config refresh + pairing/waitUp/
   //    second-wind/helper slots), not only PeerLink timers.
-  const timersBefore = await second.evaluate(() => window.__tunlionTimerStats && window.__tunlionTimerStats());
-  if (!timersBefore || timersBefore.cfg !== true) fail(`${tag} timer inventory missing or config refresh not running before pagehide`);
+  const timersBefore = await second.evaluate(() => {
+    window.__tunlionArmTimers?.();
+    return window.__tunlionTimerStats && window.__tunlionTimerStats();
+  });
+  if (!timersBefore) fail(`${tag} timer inventory missing`);
+  for (const [name, on] of Object.entries(timersBefore)) {
+    if (!on) fail(`${tag} timer ${name} was not running before pagehide`);
+  }
   await second.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
   await sleep(250);
-  const timersAfter = await second.evaluate(() => window.__tunlionTimerStats && window.__tunlionTimerStats());
-  for (const [name, on] of Object.entries(timersAfter || {})) {
+  const timersAfter = await second.evaluate(() => ({
+    stats: window.__tunlionTimerStats && window.__tunlionTimerStats(),
+    released: window.__tunlionTimersReleased,
+  }));
+  for (const [name, on] of Object.entries(timersAfter.stats || {})) {
     if (on) fail(`${tag} pagehide left a page timer running: ${name}`);
   }
-  ok(`${tag} pagehide clears the page-owned timers`);
+  if (!timersAfter.released?.waitUp || !timersAfter.released?.pairCreate) {
+    fail(`${tag} pagehide did not resolve the waitUp/pair-create promises`);
+  }
+  ok(`${tag} pagehide clears and resolves all page-owned timers`);
 
   await second.close();
   await dev.close();

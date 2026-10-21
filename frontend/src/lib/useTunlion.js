@@ -85,6 +85,8 @@ export function useTunlion() {
   const cfgTimerRef = useRef(null)
   const waitUpTimerRef = useRef(null)
   const waitUpResolveRef = useRef(null)
+  const pairCreateTimerRef = useRef(null)
+  const pairCreateResolveRef = useRef(null)
   const secondWindTimerRef = useRef(null)
   const helperTimerRef = useRef(null)
   const myNameRef = useRef(deviceName)
@@ -595,6 +597,7 @@ export function useTunlion() {
     try {
       if (new URLSearchParams(window.location.search).has('test')) {
         window.__tunlionTestLinks = linksRef.current
+        window.__tunlionTestReconnect = () => sigRef.current?.dropForTest?.()
       }
     } catch {}
     ;(async () => {
@@ -1207,6 +1210,7 @@ export function useTunlion() {
       let retried = false
       let settled = false
       let watchdog
+      pairCreateResolveRef.current = resolve
       const mintAndCreate = () => {
         // Words: the user's chosen password, else a fresh mint. Nameplate: the
         // user's chosen one (first try) else a fresh mint; subsequent retries
@@ -1225,6 +1229,7 @@ export function useTunlion() {
       // handler. off() + the `settled` guard keep each create attempt isolated.
       const cleanup = () => {
         clearTimeout(watchdog)
+        pairCreateTimerRef.current = null
         sig.off?.('pair-error', onError)
         sig.off?.('pair-ok', onOk)
         sig.off?.('pair-code', onDowngrade)
@@ -1233,10 +1238,11 @@ export function useTunlion() {
         if (settled) return
         settled = true
         cleanup()
+        pairCreateResolveRef.current = null
         resolve(val)
       }
-      const arm = () =>
-        setTimeout(() => {
+      const arm = () => {
+        watchdog = setTimeout(() => {
           if (!retried) {
             retried = true
             tel('pair-create-retry', { afterMs: Date.now() - t0 })
@@ -1253,6 +1259,9 @@ export function useTunlion() {
             finish(null)
           }
         }, 5000)
+        pairCreateTimerRef.current = watchdog
+        return watchdog
+      }
       // Collision: the server says our nameplate is taken, re-mint and retry.
       // If the user had CHOSEN that number, tell them which fresh one we used.
       function onError({ error }) {
@@ -1415,6 +1424,12 @@ export function useTunlion() {
       sessionRef.current?.stop()
       if (cfgTimerRef.current) { clearInterval(cfgTimerRef.current); cfgTimerRef.current = null }
       if (pairTimerRef.current) { clearTimeout(pairTimerRef.current); pairTimerRef.current = null }
+      if (pairCreateTimerRef.current) { clearTimeout(pairCreateTimerRef.current); pairCreateTimerRef.current = null }
+      if (pairCreateResolveRef.current) {
+        const resolveCreate = pairCreateResolveRef.current
+        pairCreateResolveRef.current = null
+        try { resolveCreate?.(null) } catch {}
+      }
       if (secondWindTimerRef.current) { clearTimeout(secondWindTimerRef.current); secondWindTimerRef.current = null }
       if (waitUpTimerRef.current) {
         clearInterval(waitUpTimerRef.current)
@@ -1542,11 +1557,32 @@ export function useTunlion() {
       window.__tunlionTimerStats = () => ({
         cfg: !!cfgTimerRef.current,
         pair: !!pairTimerRef.current,
+        pairCreate: !!pairCreateTimerRef.current,
         secondWind: !!secondWindTimerRef.current,
         waitUp: !!waitUpTimerRef.current,
         helper: !!helperTimerRef.current,
       })
-      return () => { try { delete window.__tunlionTimerStats } catch {} }
+      // Arm every page-owned timer with a harmless callback so the gate can
+      // prove each one actually transitions true -> false on pagehide.
+      window.__tunlionTimersReleased = { waitUp: false, pairCreate: false }
+      window.__tunlionArmTimers = () => {
+        const noop = () => {}
+        if (!pairTimerRef.current) pairTimerRef.current = setTimeout(noop, 60000)
+        if (!pairCreateTimerRef.current) pairCreateTimerRef.current = setTimeout(noop, 60000)
+        if (!secondWindTimerRef.current) secondWindTimerRef.current = setTimeout(noop, 60000)
+        if (!waitUpTimerRef.current) waitUpTimerRef.current = setInterval(noop, 60000)
+        if (!helperTimerRef.current) helperTimerRef.current = setInterval(noop, 60000)
+        waitUpResolveRef.current = () => { window.__tunlionTimersReleased.waitUp = true }
+        pairCreateResolveRef.current = () => { window.__tunlionTimersReleased.pairCreate = true }
+        return window.__tunlionTimerStats()
+      }
+      return () => {
+        try {
+          delete window.__tunlionTimerStats
+          delete window.__tunlionArmTimers
+          delete window.__tunlionTimersReleased
+        } catch {}
+      }
     } catch { return undefined }
   }, [])
 

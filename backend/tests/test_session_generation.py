@@ -207,7 +207,7 @@ class OwnershipToken(unittest.TestCase):
         cur = reg._uids[U1]
         self.assertIn(cur["gen"], claims)
         self.assertEqual(cur["sid"], f"s{claims.index(cur['gen'])}")
-        retired = reg._retired[U1]
+        retired = {g for (u, g) in reg._retired if u == U1}
         self.assertEqual(set(claims) - {cur["gen"]}, retired)
         self.assertEqual(reg.claim_session(U1, cur["gen"], cur["sid"], tok)["status"], "current")
         for i, g in enumerate(claims):
@@ -311,6 +311,37 @@ class ClaimPrimitives(unittest.TestCase):
             for f in futs:
                 f.result()
 
+    def test_legacy_join_is_atomic_and_bad_json_is_refused(self):
+        reg = signaling._MemRegistry()
+        self.assertTrue(reg.claim_legacy(U1))
+        reg.claim_session(U1, "g1", "s1")
+        self.assertFalse(reg.claim_legacy(U1))
+        app, sio, _ = _make()
+        c = sio.test_client(app)
+        c.get_received()
+        for bad_uid in (123, ["u"], {"u": 1}):
+            ack = _join(c, "r1", "n", bad_uid, "g1")
+            self.assertFalse(ack["ok"])
+        ack = _join(c, "r1", "n", U1, 123)
+        self.assertFalse(ack["ok"])
+        # A non-dict payload must be refused, not throw.
+        ack = c.emit("sync", ["not", "a", "dict"], callback=True)
+        self.assertFalse(ack["ok"])
+
+    def test_live_tokenless_close_reclaim_and_expiry(self):
+        reg = signaling._MemRegistry()
+        first = reg.claim_session(U1, "g1", "s1")
+        tok = first["token"]
+        self.assertEqual(reg.claim_session(U1, "g2", "s2", None)["status"], "denied")
+        self.assertEqual(reg.take_session(U1, "g1", tok)["sid"], "s1")
+        self.assertEqual(reg.claim_session(U1, "g2", "s2", None)["status"], "denied")
+        reclaim = reg.claim_session(U1, "g2", "s2", tok)
+        self.assertEqual((reclaim["status"], reclaim["token"]), ("new", tok))
+        reg._uids[U1]["token_exp"] = 0
+        expired = reg.claim_session(U1, "g3", "s3", None)
+        self.assertEqual(expired["status"], "new")
+        self.assertNotEqual(expired["token"], tok)
+
     def test_owned_state_is_bounded(self):
         reg = signaling._MemRegistry()
         reg.MAX_OWNED_UIDS = 8
@@ -318,12 +349,30 @@ class ClaimPrimitives(unittest.TestCase):
             reg.claim_session(f"u{i}", "g", f"s{i}")
         self.assertLessEqual(len(reg._uids), 8)
         reg2 = signaling._MemRegistry()
-        reg2.MAX_RETIRED_PER_UID = 8
+        reg2.MAX_RETIRED_TOTAL = 8
         first = reg2.claim_session(U1, "g0", "s0")
         tok = first["token"]
+        statuses = []
         for i in range(20):
-            reg2.claim_session(U1, f"g{i + 1}", f"s{i + 1}", tok)
-        self.assertLessEqual(len(reg2._retired[U1]), 8)
+            statuses.append(reg2.claim_session(U1, f"g{i + 1}", f"s{i + 1}", tok)["status"])
+        self.assertNotIn("capacity", statuses, "a valid current owner must never be refused by the retired bound")
+        self.assertLessEqual(len(reg2._retired), 8)
+        self.assertIn((U1, "g19"), reg2._retired, "the just-closed generation stays retired")
+        # A live owner set at capacity refuses a NEW uid, but non-live records
+        # are evicted first.
+        reg3 = signaling._MemRegistry()
+        reg3.MAX_OWNED_UIDS = 2
+        a = reg3.claim_session("u-a", "g", "s-a")
+        reg3.refresh(["s-a"])
+        reg3.claim_session("u-b", "g", "s-b")
+        reg3.refresh(["s-b"])
+        self.assertEqual(reg3.claim_session("u-c", "g", "s-c")["status"], "capacity")
+        reg4 = signaling._MemRegistry()
+        reg4.MAX_OWNED_UIDS = 2
+        reg4.claim_session("u-a", "g", "s-a")
+        reg4.claim_session("u-b", "g", "s-b")
+        self.assertEqual(reg4.claim_session("u-c", "g", "s-c")["status"], "new")
+        self.assertLessEqual(len(reg4._uids), 2)
 
 
 if __name__ == "__main__":
