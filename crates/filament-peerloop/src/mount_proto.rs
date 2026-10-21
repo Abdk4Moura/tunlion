@@ -2963,6 +2963,44 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_rename_refuses_a_junction_parent() {
+        use std::io::Write;
+        let root = win_tmp();
+        let outside = win_tmp();
+        if !win_junction(&outside, &root.join("j")) {
+            eprintln!("skipping junction test: mklink /J unavailable");
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+        // A staging file that would resolve through the junction if the
+        // rename honoured paths instead of pinned HANDLEs.
+        let mut part = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(outside.join("x.part"))
+            .unwrap();
+        part.write_all(b"x").unwrap();
+        let error = safe_rename_beneath(
+            &root,
+            std::path::Path::new("j/x.part"),
+            std::path::Path::new("j/x"),
+            &part,
+        )
+        .expect_err("a junction parent must never be traversed");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "refusing Windows sync path: a parent is a junction/symlink (reparse point)"
+        );
+        assert!(!outside.join("x").exists(), "nothing was renamed through it");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_rename_refuses_a_cross_directory_target() {
         use std::io::Write;
         let root = win_tmp();
