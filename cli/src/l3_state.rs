@@ -74,8 +74,7 @@ pub fn read_file_for(daemon: Option<u32>) -> Value {
 /// The live state: ask the daemon on a platform with a control socket, else
 /// read the PID-checked record. Never blocks on a missing daemon for long.
 pub async fn current() -> Value {
-    #[cfg(unix)]
-    if let Some(l3) = crate::ctl::try_l3_state().await {
+    if let Some(l3) = crate::platform::l3_state_over_control().await {
         if l3.is_object() {
             return l3;
         }
