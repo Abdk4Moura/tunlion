@@ -1642,6 +1642,7 @@ mod win_at {
     /// while the receive holds it). A second, following open at pin time must
     /// report the same volume serial + file index: a root swapped between
     /// canonicalisation and pinning is refused.
+    #[derive(Debug)]
     pub(crate) struct WinRoot {
         handle: OwnedHandle,
         _id: (u32, u32, u32),
