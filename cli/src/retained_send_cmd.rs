@@ -281,18 +281,15 @@ pub(crate) async fn command(
         }
         let closed = inbox.terminal(&id, record.rev, SendState::Cancelled, now())?;
         if json_out {
-            println!(
-                "{}",
-                json!({
-                    "ok": true,
-                    "verb": "send",
-                    "queued": false,
-                    "delivered": false,
-                    "state": "cancelled",
-                    "files": [],
-                    "offers": [{"id": closed.id.clone(), "state": closed.state}],
-                })
-            );
+            crate::ui::json_out(&json!({
+                "ok": true,
+                "verb": "send",
+                "queued": false,
+                "delivered": false,
+                "state": "cancelled",
+                "files": [],
+                "offers": [{"id": closed.id.clone(), "state": closed.state}],
+            }));
         } else {
             crate::ui::say(&format!(
                 "cancelled outgoing offer {id} locally; retries stopped and the private snapshot was removed. \
@@ -366,7 +363,7 @@ pub(crate) async fn command(
     }
     let result = outcome(&records);
     if json_out {
-        println!("{result}");
+        crate::ui::json_out(&result);
     } else {
         for record in &records {
             let state = if record.state == SendState::Waiting {
