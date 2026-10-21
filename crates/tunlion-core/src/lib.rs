@@ -2011,6 +2011,49 @@ mod tests {
         })
     }
 
+    /// The sender obtains an auto-room over HTTP before opening Socket.IO.
+    /// Accept that preflight as well as a direct WebSocket from receive/start.
+    /// Otherwise the fixture mistakes GET /api/room for an upgrade request and
+    /// fails before the lifecycle path under test has even started.
+    async fn accept_stub_websocket(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 128];
+            let count = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let count = socket.peek(&mut prefix).await.unwrap();
+                    assert!(count != 0, "fixture request closed before its headers");
+                    if count >= b"GET /api/room ".len() {
+                        break count;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+                .await
+                .expect("fixture HTTP request deadline");
+            if !prefix[..count].starts_with(b"GET /api/room ") {
+                return socket;
+            }
+            let mut header = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !header.ends_with(b"\r\n\r\n") {
+                    assert!(header.len() < 8192, "fixture request headers too large");
+                    header.push(socket.read_u8().await.unwrap());
+                }
+                let body = r#"{"room":"core-send-fixture"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            })
+            .await
+            .expect("fixture room preflight deadline");
+        }
+    }
+
     fn gated_signaling_stub(
         listener: std::net::TcpListener,
         gate: std::sync::mpsc::Receiver<()>,
@@ -2026,7 +2069,7 @@ mod tests {
             runtime.block_on(async move {
                 listener.set_nonblocking(true).unwrap();
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let (socket, _) = listener.accept().await.unwrap();
+                let socket = accept_stub_websocket(&listener).await;
                 let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
                 let _ = ws.send(Message::Text("0{}".into())).await;
                 // Signal only after the WebSocket handshake succeeded: a test
@@ -2130,7 +2173,7 @@ mod tests {
             runtime.block_on(async move {
                 listener.set_nonblocking(true).unwrap();
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let (socket, _) = listener.accept().await.unwrap();
+                let socket = accept_stub_websocket(&listener).await;
                 let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
                 let _ = ws.send(Message::Text("0{}".into())).await;
                 while let Some(Ok(message)) = ws.next().await {
