@@ -602,7 +602,7 @@ echo "## (-q) rc=$rcQ out='$OUTQ' stderr_bytes=$(wc -c <"$WORK/Wq.err")"
 # The command's own stderr ("err") is expected; the assertion is that no
 # TUNLION status/debug line joined it under -q.
 if [ "$rcQ" = "7" ] && [ "$OUTQ" = "out" ] \
-   && [ "$(wc -l <"$WORK/Wq.err")" = "1" ] && grep -qx "err" "$WORK/Wq.err" \
+   && [ "$(cat "$WORK/Wq.err")" = "err" ] \
    && ! grep -q "waiting for known device\|riding the local daemon\|still reaching" "$WORK/Wq.err"; then
   ok "gateW3: -q printed no status on a successful warm exec, stdout/rc exact"
 else
