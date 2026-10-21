@@ -105,6 +105,8 @@ pub struct Limits {
     pub max_name_bytes: usize,
     pub max_metadata_bytes: usize,
     pub max_total_bytes: u64,
+    /// Aggregate serialized manifest bytes retained in the queue.
+    pub max_queue_bytes: usize,
     pub max_pending: usize,
     pub max_terminal: usize,
     pub max_tombstones: usize,
@@ -118,6 +120,7 @@ impl Default for Limits {
             max_name_bytes: 255,
             max_metadata_bytes: 256 * 1024,
             max_total_bytes: 10 * 1024 * 1024 * 1024,
+            max_queue_bytes: 8 * 1024 * 1024,
             max_pending: 1000,
             max_terminal: 100,
             max_tombstones: 1000,
@@ -171,13 +174,20 @@ fn validate_relative_path(path: &str, limits: &Limits) -> Result<(), RequestErro
     if path.contains('\\') || path.contains(':') {
         return Err(RequestError::UnsafePath(path.to_string()));
     }
-    if path.chars().any(|c| c.is_control()) {
+    if path
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | '"' | '|' | '?' | '*'))
+    {
         return Err(RequestError::UnsafePath(path.to_string()));
     }
-    if path
-        .split('/')
-        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
+    if path.split('/').any(|segment| {
+        segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.ends_with('.')
+            || segment.ends_with(' ')
+            || windows_reserved(segment)
+    }) {
         return Err(RequestError::UnsafePath(path.to_string()));
     }
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -185,6 +195,25 @@ fn validate_relative_path(path: &str, limits: &Limits) -> Result<(), RequestErro
         return Err(RequestError::LimitExceeded("manifest file name is too long"));
     }
     Ok(())
+}
+
+/// Windows device names stay reserved even with an extension
+/// (`CON.txt` is still `CON`). Refusing them here keeps a later placement from
+/// creating an unreadable or device-bound path.
+fn windows_reserved(segment: &str) -> bool {
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .trim_end_matches([' ', '.'])
+        .to_ascii_lowercase();
+    matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+        || stem
+            .strip_prefix("com")
+            .or_else(|| stem.strip_prefix("lpt"))
+            .is_some_and(|digits| {
+                digits.len() == 1 && matches!(digits.as_bytes()[0], b'1'..=b'9')
+            })
 }
 
 /// Validate, sort and digest a manifest. The digest covers `path`, `size` and
@@ -438,13 +467,19 @@ impl RequestStore {
         if owner_user_id.is_empty() {
             return Err(RequestError::InvalidSender("owner_user_id"));
         }
+        if limits.max_terminal == 0 || limits.max_tombstones == 0 {
+            return Err(RequestError::LimitExceeded(
+                "terminal and tombstone retention must be positive",
+            ));
+        }
         let directory = directory.into();
         std::fs::create_dir_all(&directory)
             .map_err(|error| RequestError::Storage(error.to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| RequestError::Storage(error.to_string()))?;
         }
         Ok(Self {
             directory,
@@ -484,9 +519,28 @@ impl RequestStore {
             if !ids.insert(record.id) || !offers.insert(record.offer_id.clone()) {
                 return Err(RequestError::Corrupt("duplicate request id or offer id".into()));
             }
+            if record.rev > state.rev || record.expires_at < record.created_at {
+                return Err(RequestError::Corrupt("request revision/lifetime is inconsistent".into()));
+            }
+            if matches!(record.state, RequestState::Approved | RequestState::Delivering)
+                && record.destination.is_none()
+            {
+                return Err(RequestError::Corrupt(
+                    "accepted request has no destination".into(),
+                ));
+            }
+            let checked = canonical_manifest(&record.manifest.entries, &self.limits)?;
+            if checked != record.manifest {
+                return Err(RequestError::Corrupt(
+                    "stored manifest does not match its digest".into(),
+                ));
+            }
         }
         if state.next_id <= ids.iter().copied().max().unwrap_or(0) {
             return Err(RequestError::Corrupt("next_id is behind a stored request".into()));
+        }
+        if state.terminal_floor > state.rev {
+            return Err(RequestError::Corrupt("terminal floor is ahead of the store".into()));
         }
         Ok(state)
     }
@@ -514,6 +568,11 @@ impl RequestStore {
     /// response is always authoritative, and a cursor below the retained
     /// terminal floor asks the caller to resync.
     pub fn snapshot(&self, since: Option<u64>) -> Result<Snapshot, RequestError> {
+        // A read holds the same lock as writes. Atomic rename already prevents
+        // torn reads; the lock also stops a Windows reader from making the
+        // writer exhaust its bounded replace retries.
+        let _lock = StoreLock::acquire(&self.lock_path())
+            .map_err(|error| RequestError::Storage(error.to_string()))?;
         let state = self.load()?;
         let resync_required = since.is_some_and(|cursor| {
             cursor > state.rev || cursor < state.terminal_floor
@@ -565,14 +624,20 @@ impl RequestStore {
         }
 
         self.locked(|state| {
+            // Drop expired tombstones before deciding whether this id is new;
+            // otherwise an idle inbox blocks that id past its retention.
+            prune_state(state, &self.limits, now);
             if let Some(existing) = state
                 .requests
                 .iter()
                 .find(|record| record.offer_id == offer_id)
             {
                 if existing.sender.device_id == sender.device_id
+                    && existing.sender.user_id == sender.user_id
+                    && existing.sender.relation == sender.relation
                     && existing.manifest.digest == manifest.digest
                 {
+                    require_same_sender(existing, sender, now, &self.owner_user_id)?;
                     return Ok((existing.clone(), None));
                 }
                 return Err(RequestError::OfferIdReused(offer_id.to_string()));
@@ -591,6 +656,16 @@ impl RequestStore {
                 .count();
             if active >= self.limits.max_pending {
                 return Err(RequestError::LimitExceeded("request queue is full"));
+            }
+            let queued_bytes: usize = state
+                .requests
+                .iter()
+                .map(|record| record.manifest.serialized_bytes)
+                .sum();
+            if queued_bytes.saturating_add(manifest.serialized_bytes)
+                > self.limits.max_queue_bytes
+            {
+                return Err(RequestError::LimitExceeded("request queue bytes are full"));
             }
 
             let expires_at = now
@@ -653,6 +728,10 @@ impl RequestStore {
             if state.requests[index].state == RequestState::Approved
                 && state.requests[index].destination.as_deref() == Some(destination)
             {
+                if now >= state.requests[index].expires_at {
+                    return Err(RequestError::OfferExpired(id));
+                }
+                require_same_sender(&state.requests[index], sender, now, &self.owner_user_id)?;
                 return Ok((state.requests[index].clone(), None));
             }
             let state_name = state.requests[index].state;
@@ -718,6 +797,35 @@ impl RequestStore {
         })
     }
 
+    /// Mark a delivery that failed locally. The request stays in the snapshot
+    /// as a terminal record until retention prunes it.
+    pub fn fail(
+        &self,
+        id: u64,
+        expected_rev: u64,
+        now: u64,
+    ) -> Result<(RequestRecord, Option<RequestEvent>), RequestError> {
+        terminal_transition(self, id, expected_rev, RequestState::Failed, &[RequestState::Delivering], now)
+    }
+
+    /// Withdraw a request before delivery starts. This is local owner action,
+    /// not a declining sender message.
+    pub fn withdraw(
+        &self,
+        id: u64,
+        expected_rev: u64,
+        now: u64,
+    ) -> Result<(RequestRecord, Option<RequestEvent>), RequestError> {
+        terminal_transition(
+            self,
+            id,
+            expected_rev,
+            RequestState::Withdrawn,
+            &[RequestState::Pending, RequestState::Approved],
+            now,
+        )
+    }
+
     /// The sender re-offered and the receiver is starting to write bytes. A
     /// fresh authority observation is required here, not the one stored at
     /// acceptance.
@@ -739,6 +847,7 @@ impl RequestStore {
                 });
             }
             if state.requests[index].state == RequestState::Delivering {
+                require_same_sender(&state.requests[index], sender, now, &self.owner_user_id)?;
                 return Ok((state.requests[index].clone(), None));
             }
             let state_name = state.requests[index].state;
@@ -783,6 +892,7 @@ impl RequestStore {
                 });
             }
             if state.requests[index].state == RequestState::Fulfilled {
+                require_same_sender(&state.requests[index], sender, now, &self.owner_user_id)?;
                 return Ok((state.requests[index].clone(), None));
             }
             let state_name = state.requests[index].state;
@@ -792,9 +902,8 @@ impl RequestStore {
                     state: state_name.as_str(),
                 });
             }
-            if now >= state.requests[index].expires_at {
-                return Err(RequestError::OfferExpired(id));
-            }
+            // Already-delivering transfers may finish after the acceptance
+            // deadline; only starting a delivery is gated by expiry.
             require_same_sender(&state.requests[index], sender, now, &self.owner_user_id)?;
             let event = touch(
                 &mut state.rev,
@@ -814,8 +923,10 @@ impl RequestStore {
         self.locked(|state| {
             let mut events = Vec::new();
             for index in 0..state.requests.len() {
-                if state.requests[index].state.is_active()
-                    && now >= state.requests[index].expires_at
+                if matches!(
+                    state.requests[index].state,
+                    RequestState::Pending | RequestState::Approved
+                ) && now >= state.requests[index].expires_at
                 {
                     let event = touch(
                         &mut state.rev,
@@ -839,6 +950,40 @@ impl RequestStore {
             Ok(())
         })
     }
+}
+
+fn terminal_transition(
+    store: &RequestStore,
+    id: u64,
+    expected_rev: u64,
+    next: RequestState,
+    allowed: &[RequestState],
+    now: u64,
+) -> Result<(RequestRecord, Option<RequestEvent>), RequestError> {
+    store.locked(|state| {
+        let index = find_index(state, id)?;
+        let current = state.requests[index].rev;
+        if current != expected_rev {
+            return Err(RequestError::RevisionConflict {
+                expected: expected_rev,
+                current,
+            });
+        }
+        if state.requests[index].state == next {
+            return Ok((state.requests[index].clone(), None));
+        }
+        let state_name = state.requests[index].state;
+        if !allowed.contains(&state_name) {
+            return Err(RequestError::InvalidState {
+                id,
+                state: state_name.as_str(),
+            });
+        }
+        let event = touch(&mut state.rev, &mut state.requests[index], next, now);
+        let record = state.requests[index].clone();
+        prune_state(state, &store.limits, now);
+        Ok((record, Some(event)))
+    })
 }
 
 fn validate_destination(destination: &str) -> Result<(), RequestError> {
@@ -912,7 +1057,9 @@ fn prune_state(state: &mut DiskState, limits: &Limits, now: u64) {
         .filter(|record| record.state.is_terminal())
         .map(|record| (record.updated_at, record.rev))
         .collect();
-    terminal.sort_unstable();
+    // Revision is the monotonic terminal sequence. A wall clock can step back,
+    // which would otherwise prune the record just written and lose its receipt.
+    terminal.sort_unstable_by_key(|(_, rev)| *rev);
     if terminal.len() <= limits.max_terminal {
         return;
     }
@@ -1211,21 +1358,25 @@ mod tests {
         assert_eq!(again.state, RequestState::Denied);
         assert!(event.is_none());
 
-        // With no terminal retention the record is pruned, so the same offer id
-        // must still not resurrect.
+        // A pruned terminal record leaves a tombstone: the same offer id must
+        // still not resurrect.
         let dir = temp_dir();
         let limits = Limits {
-            max_terminal: 0,
+            max_terminal: 1,
             ..Limits::default()
         };
         let store = RequestStore::open(dir.0.as_path(), "user-owner", limits).unwrap();
-        let (pending, _) = store
-            .propose("ext-offer", &external(), &manifest, 60, None, 10)
+        let (first, _) = store
+            .propose("offer-a", &external(), &manifest, 60, None, 10)
             .unwrap();
-        store.decline(pending.id, pending.rev, 11).unwrap();
-        assert!(store.snapshot(None).unwrap().requests.is_empty());
+        store.decline(first.id, first.rev, 11).unwrap();
+        let (second, _) = store
+            .propose("offer-b", &external(), &manifest, 60, None, 12)
+            .unwrap();
+        store.decline(second.id, second.rev, 13).unwrap();
+        assert_eq!(store.snapshot(None).unwrap().requests.len(), 1);
         assert!(matches!(
-            store.propose("ext-offer", &external(), &manifest, 60, None, 13),
+            store.propose("offer-a", &external(), &manifest, 60, None, 14),
             Err(RequestError::OfferIdReused(_))
         ));
     }
@@ -1264,23 +1415,158 @@ mod tests {
     fn expiry_is_durable_and_snapshot_cursors_report_resync_after_prune() {
         let dir = temp_dir();
         let limits = Limits {
-            max_terminal: 0,
+            max_terminal: 1,
             ..Limits::default()
         };
         let store = RequestStore::open(dir.0.as_path(), "user-owner", limits).unwrap();
         let manifest = manifest("a.txt", 1);
-        let (pending, _) = store
-            .propose("ext-offer", &external(), &manifest, 5, None, 10)
+        store
+            .propose("offer-a", &external(), &manifest, 5, None, 10)
+            .unwrap();
+        store
+            .propose("offer-b", &external(), &manifest, 5, None, 10)
             .unwrap();
         let events = store.expire(16).unwrap();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].status, "expired");
         let snapshot = store.snapshot(Some(0)).unwrap();
-        assert!(snapshot.requests.is_empty());
+        assert_eq!(snapshot.requests.len(), 1);
         assert!(snapshot.resync_required);
         assert!(!store.snapshot(Some(snapshot.rev)).unwrap().resync_required);
         let reopened = RequestStore::open(dir.0.as_path(), "user-owner", Limits::default()).unwrap();
         assert_eq!(reopened.snapshot(None).unwrap().rev, snapshot.rev);
-        let _ = pending;
+    }
+
+    #[test]
+    fn zero_retention_caps_are_rejected_at_open() {
+        let dir = temp_dir();
+        for limits in [
+            Limits {
+                max_terminal: 0,
+                ..Limits::default()
+            },
+            Limits {
+                max_tombstones: 0,
+                ..Limits::default()
+            },
+        ] {
+            assert!(RequestStore::open(dir.0.as_path(), "user-owner", limits).is_err());
+        }
+    }
+
+    #[test]
+    fn idempotent_fast_paths_still_require_fresh_authority() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let manifest = manifest("a.txt", 1);
+        let (approved, _) = store
+            .propose("owner-offer", &owner(), &manifest, 60, Some("/inbox"), 10)
+            .unwrap();
+        let revoked = SenderIdentity {
+            revoked: true,
+            ..owner()
+        };
+        assert!(matches!(
+            store.accept(approved.id, approved.rev, "/inbox", &revoked, 11),
+            Err(RequestError::SenderRefused(_))
+        ));
+
+        let (pending, _) = store
+            .propose("ext-offer", &external(), &manifest, 60, None, 10)
+            .unwrap();
+        let (accepted, _) = store
+            .accept(pending.id, pending.rev, "/inbox", &external(), 11)
+            .unwrap();
+        let (delivering, _) = store
+            .begin_delivery(accepted.id, accepted.rev, &external(), 12)
+            .unwrap();
+        let revoked_ext = SenderIdentity {
+            revoked: true,
+            ..external()
+        };
+        assert!(matches!(
+            store.begin_delivery(delivering.id, delivering.rev, &revoked_ext, 13),
+            Err(RequestError::SenderRefused(_))
+        ));
+        let (done, _) = store
+            .complete(delivering.id, delivering.rev, &external(), 14)
+            .unwrap();
+        assert!(matches!(
+            store.complete(done.id, done.rev, &revoked_ext, 15),
+            Err(RequestError::SenderRefused(_))
+        ));
+    }
+
+    #[test]
+    fn a_rebound_or_changed_identity_cannot_reuse_the_offer_id() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let manifest = manifest("a.txt", 1);
+        store
+            .propose("ext-offer", &external(), &manifest, 60, None, 10)
+            .unwrap();
+        let rebound = sender("dev-ext", "user-other", SenderRelation::PairedExternal);
+        assert!(matches!(
+            store.propose("ext-offer", &rebound, &manifest, 60, None, 11),
+            Err(RequestError::OfferIdReused(_))
+        ));
+        let same_owner = sender("dev-ext", "user-owner", SenderRelation::SameOwner);
+        assert!(matches!(
+            store.propose("ext-offer", &same_owner, &manifest, 60, None, 12),
+            Err(RequestError::OfferIdReused(_))
+        ));
+    }
+
+    #[test]
+    fn windows_reserved_names_and_forbidden_characters_are_refused_paths() {
+        let limits = Limits::default();
+        for bad in ["CON", "con.txt", "a/NUL", "a.", "a ", "a<b", "a?b", "a|b"] {
+            assert!(
+                canonical_manifest(&[entry(bad, 1, 'a')], &limits).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(canonical_manifest(&[entry("normal/name.txt", 1, 'a')], &limits).is_ok());
+    }
+
+    #[test]
+    fn fail_and_withdraw_are_terminal_and_bounded() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let manifest = manifest("a.txt", 1);
+        let (pending, _) = store
+            .propose("withdraw-me", &external(), &manifest, 60, None, 10)
+            .unwrap();
+        let (withdrawn, event) = store.withdraw(pending.id, pending.rev, 11).unwrap();
+        assert_eq!(withdrawn.state, RequestState::Withdrawn);
+        assert_eq!(event.unwrap().status, "withdrawn");
+
+        let (pending, _) = store
+            .propose("fail-me", &external(), &manifest, 60, None, 12)
+            .unwrap();
+        let (accepted, _) = store
+            .accept(pending.id, pending.rev, "/inbox", &external(), 13)
+            .unwrap();
+        let (delivering, _) = store
+            .begin_delivery(accepted.id, accepted.rev, &external(), 14)
+            .unwrap();
+        let (failed, event) = store.fail(delivering.id, delivering.rev, 15).unwrap();
+        assert_eq!(failed.state, RequestState::Failed);
+        assert_eq!(event.unwrap().status, "failed");
+    }
+
+    #[test]
+    fn aggregate_queue_bytes_are_bounded() {
+        let dir = temp_dir();
+        let limits = Limits {
+            max_queue_bytes: 1,
+            ..Limits::default()
+        };
+        let store = RequestStore::open(dir.0.as_path(), "user-owner", limits).unwrap();
+        let manifest = manifest("a.txt", 1);
+        assert!(matches!(
+            store.propose("too-big", &external(), &manifest, 60, None, 10),
+            Err(RequestError::LimitExceeded(_))
+        ));
     }
 }

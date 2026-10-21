@@ -35,7 +35,8 @@ offline sender will return.
   destination. External offers stay pending for review.
 - Acceptance binds the exact manifest digest and a destination string.
   Destination confinement to receive roots remains the caller's policy.
-- Every write requires a fresh `SenderIdentity` observation. A revoked,
+- Every write requires a fresh `SenderIdentity` observation, including
+  idempotent retries of accept, begin-delivery and complete. A revoked,
   unverified, unknown or expired sender is refused even if acceptance succeeded
   earlier. Stored sender fields are a snapshot, not a capability.
 - Mutations are revision-checked. The store is written atomically under a
@@ -43,8 +44,17 @@ offline sender will return.
   commit; there is no notification inside the store.
 - Snapshots are full authoritative snapshots. A cursor below the retained
   terminal floor reports `resync_required`. There is no event log or mailbox.
-- Terminal records and tombstones are bounded. No record contains grants or
-  capability lists, so accepting an offer creates no standing access.
+- Terminal records and tombstones are bounded by monotonic revision, not wall
+  clock, so a clock step cannot lose a just-written receipt. Zero retention is
+  refused at open. Aggregate serialized manifest bytes are capped as well as
+  entry count/pending count. No record contains grants or capability lists, so
+  accepting an offer creates no standing access.
+- The acceptance deadline gates review and starting delivery; an already
+  `delivering` transfer may finish and be receipted after it. `failed` and
+  `withdrawn` are terminal transitions for local failure and owner cancellation.
+- Path validation also refuses Windows device names, trailing dot/space
+  segments and Windows-forbidden characters. NFC/NFD collisions remain for the
+  later placement slice.
 
 ## Deliberately not in this slice
 
@@ -60,6 +70,8 @@ offline sender will return.
 ## Verification
 
 Remote unit suite: `cargo test -p filament-peerloop --lib requests::tests`.
+Latest cached-worker run: 17 focused tests and 455 full peerloop library tests
+passed. This verifies the library slice, not dispatch wiring or network retries.
 The tests cover canonicalization and unsafe paths, sender refusal, same-owner
 versus external decisions, exact digest/revision binding, restart persistence,
 idempotent decline, tombstone replay refusal, fresh-authority delivery, expiry,
