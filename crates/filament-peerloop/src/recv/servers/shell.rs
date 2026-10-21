@@ -245,7 +245,12 @@ async fn prune_session_attachments(
     bindings.retain(|_, sid_map| !sid_map.is_empty());
     for (binding_pid, old_sid) in stale {
         if let Some(old_mux) = muxes.get(&binding_pid) {
-            old_mux.drop_stream(old_sid).await;
+            // Only the stream this exact key still owns. A stale binding must
+            // not become a handle for dropping a forward/mount/other PTY that
+            // has since reused the sid.
+            if old_mux.stream_owner(old_sid).await.as_deref() == Some(session_id) {
+                old_mux.drop_stream(old_sid).await;
+            }
         }
     }
 }
@@ -396,7 +401,9 @@ pub async fn open_pty(
     let mut own_live = 0usize;
     if let Some(sid_map) = bindings.get(&pid) {
         for (old_sid, key) in sid_map {
-            if key == &session_id && mux.has_stream(*old_sid).await {
+            if key == &session_id
+                && mux.stream_owner(*old_sid).await.as_deref() == Some(session_id.as_str())
+            {
                 own_live += 1;
             }
         }
@@ -1546,6 +1553,20 @@ mod tests {
         );
         assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(h.c.attaches.load(Ordering::SeqCst), 0);
+
+        // Superseding the stale binding on ANOTHER sid also leaves the foreign
+        // stream alone (the old sid is not this session's stream any more).
+        open(
+            &mut h,
+            &open_frame_sid("client-1", false, SID + 1),
+        )
+        .await;
+        let mut live = h.muxes[PID].live_sids().await;
+        live.sort_unstable();
+        assert_eq!(live, vec![SID, SID + 1]);
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 1);
+        assert_eq!(h.bindings[PID].len(), 1);
+        assert_eq!(h.bindings[PID][&(SID + 1)], SESSION);
     }
 
     #[tokio::test]
