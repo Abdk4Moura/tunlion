@@ -378,7 +378,7 @@ pub async fn admit_sync_open(
             // path-based resolve_root/create_content_dirs runs on Windows, so
             // an ancestor junction cannot redirect the pin or create dirs
             // outside. Every component is refused if it is a reparse point.
-            match crate::mount_proto::WinRoot::open_relative(drop_dir, &rel, true) {
+            match crate::mount_proto::WinRoot::open_relative(drop_dir, &rel) {
                 Ok((win, root)) => (root.clone(), RootPin::from_win(win, root)),
                 Err(error) => {
                     // A junction/symlink anywhere on the requested root is an
@@ -1474,6 +1474,35 @@ pub mod serving {
                 std::fs::read(root.0.join("file.txt")).unwrap(),
                 replacement
             );
+            assert!(!root.0.join("file.txt.part").exists());
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_receive_without_a_pinned_root_fails_closed() {
+            let root = TempRoot::new();
+            let bytes = b"must not be written";
+            let pin = RootPin::path_only(&root.0);
+            let (task, mux, transport) = setup_with_pin(
+                &root.0,
+                pin,
+                receive_wire("file.txt", bytes),
+                None,
+                None,
+            )
+            .await;
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], false);
+            assert!(
+                replies[1]["err"]
+                    .as_str()
+                    .unwrap()
+                    .contains("requires a root pinned at admission"),
+                "replies: {replies:?}"
+            );
+            assert!(!root.0.join("file.txt").exists());
             assert!(!root.0.join("file.txt.part").exists());
             assert_eq!(mux.live_streams().await, 0);
         }

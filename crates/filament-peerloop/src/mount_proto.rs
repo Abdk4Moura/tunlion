@@ -1688,24 +1688,13 @@ mod win_at {
         /// FILE_OPEN_REPARSE_POINT and refused if it is a reparse point, so an
         /// ancestor junction cannot redirect the pin; missing directories are
         /// created relative to the HANDLE, never by path.
-        pub fn open_relative(drop_dir: &Path, rel: &Path, create: bool) -> io::Result<(Self, PathBuf)> {
+        pub fn open_relative(drop_dir: &Path, rel: &Path) -> io::Result<(Self, PathBuf)> {
             let mut current = open_root_handle(drop_dir, false)?;
             for component in rel.components() {
                 match component {
                     Component::Normal(name) => {
                         let name = units(name)?;
-                        current = if create {
-                            open_or_create_dir(&current, &name)?
-                        } else {
-                            check_dir(nt_open(
-                                &current,
-                                &name,
-                                FILE_OPEN,
-                                DIR_ACCESS,
-                                FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
-                                0,
-                            )?)?
-                        };
+                        current = open_or_create_dir(&current, &name)?;
                     }
                     Component::CurDir => {}
                     _ => {
