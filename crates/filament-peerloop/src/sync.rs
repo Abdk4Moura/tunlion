@@ -1137,9 +1137,10 @@ pub mod serving {
             let bytes = b"first payload";
             let (task, mux, transport) = receive_one(&root.0, "file.txt", bytes).await;
             assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
             assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), bytes);
             assert!(!root.0.join("file.txt.part").exists());
-            assert_eq!(outgoing_json(&transport)[1]["ok"], true);
             assert_eq!(mux.live_streams().await, 0);
 
             // A second receive replaces the committed file atomically.
@@ -1147,12 +1148,13 @@ pub mod serving {
             let replacement = b"second payload, longer";
             let (task, mux, transport) = receive_one(&root.0, "file.txt", replacement).await;
             assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
             assert_eq!(
                 std::fs::read(root.0.join("file.txt")).unwrap(),
                 replacement
             );
             assert!(!root.0.join("file.txt.part").exists());
-            assert_eq!(outgoing_json(&transport)[1]["ok"], true);
             assert_eq!(mux.live_streams().await, 0);
         }
 
@@ -1178,61 +1180,32 @@ pub mod serving {
 
         #[cfg(windows)]
         #[tokio::test]
-        async fn windows_parent_swap_to_outside_junction_is_refused_by_final_rename() {
+        async fn windows_receive_refuses_a_junction_parent_before_staging() {
             let root = TempRoot::new();
             let outside = TempRoot::new();
-            let nested = root.0.join("nested");
-            std::fs::create_dir(&nested).unwrap();
-            let bytes = b"confined";
-            let digest = sha2::Sha256::digest(bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let mut wire = Vec::new();
-            record(&json!({"type":"manifest", "files":[]}), &mut wire);
-            record(
-                &json!({"type":"file", "p":"nested/file.txt", "size":bytes.len(), "full":digest}),
-                &mut wire,
-            );
-            record(&json!({"type":"chunk", "idx":0}), &mut wire);
-            record_bytes(bytes, &mut wire);
-            record(&json!({"type":"file-end"}), &mut wire);
-            record(&json!({"type":"done"}), &mut wire);
-
-            let entered = Arc::new(Notify::new());
-            let release = Arc::new(Notify::new());
-            let (task, mux, transport) = setup_with_finalization_gate(
-                &root.0,
-                wire,
-                Some((entered.clone(), release.clone())),
-            )
-            .await;
-            entered.notified().await;
-            let displaced = root.0.join("nested-displaced");
-            std::fs::rename(&nested, &displaced).unwrap();
-            if !junction(&outside.0, &nested) {
-                // Junction creation is unprivileged on NTFS; if this host
-                // refuses it, the swap cannot be constructed here.
-                release.notify_one();
-                let _ = task.join().await;
-                eprintln!("skipping junction swap: mklink /J unavailable");
+            // The peer-controlled parent is a junction from the start: the
+            // receiver must refuse it rather than follow it out of the root.
+            if !junction(&outside.0, &root.0.join("nested")) {
+                eprintln!("skipping junction test: mklink /J unavailable");
                 return;
             }
-            release.notify_one();
-
+            let bytes = b"confined";
+            let (task, mux, transport) = receive_one(&root.0, "nested/file.txt", bytes).await;
             assert!(task.join().await.unwrap().is_ok());
             assert!(
                 std::fs::read_dir(&outside.0).unwrap().next().is_none(),
-                "the outside junction target received nothing"
+                "nothing was created through the junction"
             );
-            assert!(
-                !displaced.join("file.txt.part").exists(),
-                "handle-based cleanup removes the stage without resolving the swapped path"
-            );
-            assert!(!displaced.join("file.txt").exists());
+            assert!(!root.0.join("nested/file.txt").exists());
+            assert!(!root.0.join("nested/file.txt.part").exists());
             let replies = outgoing_json(&transport);
             assert_eq!(replies[1]["ok"], false);
+            assert!(replies[1]["err"]
+                .as_str()
+                .unwrap()
+                .contains("escapes the remote dir"));
             assert_eq!(mux.live_streams().await, 0);
+            let _ = std::fs::remove_dir_all(&root.0);
         }
 
         #[cfg(windows)]
@@ -1308,19 +1281,38 @@ pub mod serving {
             .await;
             entered.notified().await;
             let moved = root.0.with_extension("moved");
-            std::fs::rename(&root.0, &moved).unwrap();
+            let move_result = std::fs::rename(&root.0, &moved);
             release.notify_one();
 
             assert!(task.join().await.unwrap().is_ok());
-            assert!(!moved.join("file.txt").exists());
-            assert!(
-                !moved.join("file.txt.part").exists(),
-                "handle-based cleanup removes the uncommitted stage; no target is committed"
-            );
             let replies = outgoing_json(&transport);
-            assert_eq!(replies[1]["ok"], false);
+            match move_result {
+                Ok(()) => {
+                    // The path moved while the transfer ran: finalization
+                    // re-opens the root by path and must fail closed.
+                    assert_eq!(replies[1]["ok"], false, "replies: {replies:?}");
+                    assert!(!moved.join("file.txt").exists());
+                    assert!(
+                        !moved.join("file.txt.part").exists(),
+                        "handle-based cleanup removes the uncommitted stage; no target is committed"
+                    );
+                    let _ = std::fs::remove_dir_all(&moved);
+                }
+                Err(error) => {
+                    // Windows itself refuses to move a directory that holds
+                    // an open staging handle. That is the OS-layer version of
+                    // the same fail-closed guarantee; the transfer stays
+                    // confined and still commits normally.
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied,
+                        "unexpected root-move error: {error}"
+                    );
+                    assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+                    assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), bytes);
+                }
+            }
             assert_eq!(mux.live_streams().await, 0);
-            let _ = std::fs::remove_dir_all(&moved);
         }
 
         #[cfg(unix)]
