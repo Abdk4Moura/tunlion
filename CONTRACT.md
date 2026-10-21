@@ -117,6 +117,8 @@ touch the socket, Firestore, or RTCPeerConnection directly.
 ```ts
 {
   me: { id: string, name: string, color: string } | null,
+  deviceName: string,                // this browser's name, available before welcome
+  superseded: string | null,         // a newer tab/load owns this device; show + offer reload
   connected: boolean,
   signalingKind: "socketio" | "firebase" | null,
 
@@ -161,6 +163,7 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   pairWithCode(code: string): void,           // claim a ONE-TIME code (burned on use)
   generateCode(keyword?: string): Promise<string>, // mint a speakable one-time code
   useAutoRoom(): Promise<void>,               // back to the "people near you" room
+  renameSelf(name: string): string,           // relabel THIS device; same uid/pairing
 }
 ```
 
@@ -176,9 +179,25 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   reconnect"; allow **clear** to abandon it.
 
 ### Signaling additions for resume
-- `join` carries a `uid` (stable per-tab id); `welcome` peers and `peer-joined`
-  include it. Transfer control messages: `file-offer` may carry `resume: true`;
-  `file-accept` carries `offset` (bytes already received).
+- `join` carries a `uid` (stable per-tab id) and a `gen` (fresh per page load);
+  `welcome` peers and `peer-joined` include the uid. Transfer control messages:
+  `file-offer` may carry `resume: true`; `file-accept` carries `offset` (bytes
+  already received).
+
+### Generation-safe reload (web)
+- Every page load mints a new `gen`; `sync` carries `{uid, gen}`. A `gen`
+  different from the relay's current owner supersedes that session at once and
+  retires the old generation. A retired generation's late `sync` is refused
+  (`{ok:false, superseded:true}`) and cannot take the session back.
+- `pagehide` closes local PeerConnections synchronously, stops timers, and
+  `sendBeacon`s `{uid, gen}` to `POST /api/session/close`. The endpoint only
+  drops the session when `gen` is still current, so a reload's late beacon
+  cannot kill the replacement link. `pageshow` revalidates/reconnects; a
+  BFCache restore rotates to a fresh generation first.
+- A rename is an in-place `sync` on the same `{uid, gen}`. The relay updates
+  that sid and emits `peer-updated {id,name,uid}` to the room; it never creates
+  a second peer or a second pairing record. A superseded tab receives
+  `session-superseded` and must not auto-rejoin (it offers a reload instead).
 
 ### Part A — `peer.route` (the privacy/trust signal)
 Once a peer connects, `route` tells you the **physical path** ICE chose:

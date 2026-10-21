@@ -89,7 +89,8 @@ socketio = SocketIO(
     ping_timeout=int(os.environ.get("FIL_PING_TIMEOUT", "10")),
     ping_interval=int(os.environ.get("FIL_PING_INTERVAL", "5")),
 )
-signaling.register(socketio, signaling.make_registry(config.REDIS_URL))
+REGISTRY = signaling.make_registry(config.REDIS_URL)
+signaling.register(socketio, REGISTRY)
 
 
 # ---------------------------------------------------------------- REST API ---
@@ -184,6 +185,26 @@ def telemetry():
     except (ValueError, TypeError):
         pass
     return {"ok": True}
+
+
+# ------------------------------------------------------- Session close -------
+@app.post("/api/session/close")
+def session_close():
+    """Synchronous pagehide beacon: drop this session only if (uid, gen) still
+    owns the device. A late beacon from the previous page load is ignored, so a
+    normal reload cannot drop the replacement link."""
+    raw = request.get_data(cache=False, as_text=True)[:2048]
+    try:
+        body = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    uid = body.get("uid")
+    gen = body.get("gen")
+    if isinstance(uid, str) and isinstance(gen, str):
+        signaling.close_session(socketio, REGISTRY, uid[:128], gen[:128])
+    return "", 204
 
 
 # --------------------------------------------------------- Static / SPA -------

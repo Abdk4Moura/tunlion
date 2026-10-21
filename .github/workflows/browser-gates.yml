@@ -116,6 +116,25 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/browser-ui.spec.cjs
 
+      # The local device name and connected peer name are visible, a chosen
+      # name replaces the generated default, and a superseded tab explains
+      # itself without a reset/clear-data instruction. Chromium + WebKit iPad.
+      - name: peer-identity
+        run: node frontend/tests/peer-identity.spec.cjs
+
+      # Generation-safe reload: a normal reload supersedes the old signaling
+      # session, a late close from that generation is ignored, two tabs for one
+      # device resolve to one live session, and rename relabels the same sid.
+      # Real Flask relay + Chromium and WebKit iPad (each in its own process).
+      - name: peer-reload
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/peer-reload.spec.cjs
+
+      # The relay's generation/rename/close semantics, independent of a browser.
+      - name: backend session generation
+        run: python -m unittest backend.tests.test_session_generation
+
       # The shell outlives its link: a reattach sends resume_from (exactly the
       # bytes the terminal showed), the bar says reconnecting while the link is
       # down, and no line arrives twice or goes missing. Fake device session that

@@ -10,9 +10,16 @@ that lets you run many api replicas and scale them up/down on demand, because
 every instance shares the same room state and can deliver to any peer.
 
 Event contract (kept in sync with CONTRACT.md):
-  client -> server   join {room,name} · signal {to,data} · leave {}
-  server -> client   welcome {id,peers:[{id,name}]} · peer-joined {id,name}
-                     peer-left {id} · signal {from,data}
+  client -> server   join {room,name,uid,gen} · sync {room,name,uid,gen,channels}
+                     signal {to,data} · leave {}
+  server -> client   welcome {id,peers:[{id,name,uid}]} · peer-joined {id,name,uid}
+                     peer-left {id} · peer-updated {id,name,uid}
+                     session-superseded {reason} · signal {from,data}
+  HTTP               POST /api/session/close {uid,gen} (pagehide beacon)
+
+`gen` is a fresh per-page-load generation: a new generation for the same `uid`
+supersedes the old sid immediately, while a late sync/close from a retired
+generation is ignored.
 """
 import os
 import re
@@ -70,8 +77,14 @@ class _MemRegistry:
     LIVE_TTL = 60  # liveness lease; refreshed by the lease loop + on activity
 
     def __init__(self):
-        self._m = {}  # sid -> {"room", "name", "uid"}
+        self._m = {}  # sid -> {"room", "name", "uid", "gen"}
         self._live = {}  # sid -> lease expiry (monotonic)
+        # uid -> {"gen": current page-load generation, "sid": owning sid}.
+        # A reload has the same uid but a new generation; it takes ownership
+        # immediately. `_retired` remembers generations that were replaced so a
+        # late sync/close from the frozen old page cannot steal the session back.
+        self._uids = {}
+        self._retired = {}  # uid -> set(old generations)
 
     def refresh(self, sids):
         """Extend the liveness lease for connected sids."""
@@ -82,8 +95,8 @@ class _MemRegistry:
     def _alive(self, sid):
         return self._live.get(sid, 0) > _time.monotonic()
 
-    def add(self, sid, room, name, uid=None):
-        self._m[sid] = {"room": room, "name": name, "uid": uid}
+    def add(self, sid, room, name, uid=None, gen=None):
+        self._m[sid] = {"room": room, "name": name, "uid": uid, "gen": gen}
         self.refresh([sid])
 
     def room_of(self, sid):
@@ -93,7 +106,68 @@ class _MemRegistry:
     def remove(self, sid):
         self._live.pop(sid, None)
         m = self._m.pop(sid, None)
+        # Keep the uid->generation ownership record: a socket reconnect under
+        # the SAME generation must be able to reclaim it, while a newer
+        # generation still supersedes this sid. Only take_session (a real
+        # close) drops ownership. Stale records are bounded by _retired.
         return m["room"] if m else None
+
+    def claim_session(self, uid, gen, sid):
+        """Claim this device identity for a page-load generation.
+
+        Returns {"status": "current"|"new"|"replace"|"retired", "prev": sid}.
+        A retired generation is an old bfcache/frozen page: it must NOT rejoin
+        and steal the session back. Any different, non-retired generation is a
+        newer page load and takes over immediately (the reload fix).
+        """
+        if not uid or not gen:
+            return {"status": "legacy", "prev": None}
+        cur = self._uids.get(uid)
+        if cur is None:
+            self._uids[uid] = {"gen": gen, "sid": sid}
+            return {"status": "new", "prev": None}
+        if cur.get("gen") == gen:
+            prev = cur.get("sid")
+            if prev != sid:
+                cur["sid"] = sid
+                return {"status": "replace", "prev": prev}
+            return {"status": "current", "prev": None}
+        if gen in self._retired.get(uid, set()):
+            return {"status": "retired", "prev": cur.get("sid")}
+        old = cur.get("gen")
+        retired = self._retired.setdefault(uid, set())
+        retired.add(old)
+        # Bound the tombstone set; a page this old has long since unloaded.
+        if len(retired) > 32:
+            for g in list(retired)[: len(retired) - 32]:
+                retired.discard(g)
+        self._uids[uid] = {"gen": gen, "sid": sid}
+        return {"status": "new", "prev": cur.get("sid")}
+
+    def rename(self, sid, name):
+        m = self._m.get(sid)
+        if not m:
+            return None
+        m["name"] = name
+        return {"id": sid, "name": name, "uid": m.get("uid")}
+
+    def take_session(self, uid, gen):
+        """Remove the active sid for (uid, gen). A close for an OLD generation
+        returns None, which is exactly what makes a late pagehide harmless."""
+        if not uid or not gen:
+            return None
+        cur = self._uids.get(uid)
+        if not cur or cur.get("gen") != gen:
+            return None
+        sid = cur.get("sid")
+        self._uids.pop(uid, None)
+        # A closed generation cannot come back and reclaim the device. A
+        # bfcache restore is safe because the client rotates first; a stale
+        # sync/beacon from the closed page stays retired.
+        self._retired.setdefault(uid, set()).add(gen)
+        self._live.pop(sid, None)
+        m = self._m.pop(sid, None)
+        return {"sid": sid, "room": m.get("room") if m else None}
 
     def peers_in(self, room, exclude=None):
         return [
@@ -200,15 +274,96 @@ class _RedisRegistry:
     def _lk(self, sid):
         return f"filament:live:{sid}"
 
-    def add(self, sid, room, name, uid=None):
+    def _gk(self, uid):
+        return f"filament:uid:{uid}:gen"
+
+    def _usk(self, uid):
+        return f"filament:uid:{uid}:sid"
+
+    def _urk(self, uid):
+        return f"filament:uid:{uid}:retired"
+
+    def add(self, sid, room, name, uid=None, gen=None):
         import json
 
         p = self.r.pipeline()
-        p.hset(self._rk(room), sid, json.dumps({"name": name, "uid": uid}))
+        p.hset(self._rk(room), sid, json.dumps({"name": name, "uid": uid, "gen": gen}))
         p.expire(self._rk(room), self.TTL)
         p.set(self._sk(sid), room, ex=self.TTL)
         p.set(self._lk(sid), 1, ex=self.LIVE_TTL)  # liveness lease (#10)
         p.execute()
+
+    def claim_session(self, uid, gen, sid):
+        """Atomic generation ownership (same contract as _MemRegistry)."""
+        if not uid or not gen:
+            return {"status": "legacy", "prev": None}
+        status, prev = self.r.eval(
+            """
+            local cur = redis.call('GET', KEYS[1])
+            local cursid = redis.call('GET', KEYS[2])
+            if not cur then
+              redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+              redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+              return {'new', ''}
+            end
+            if cur == ARGV[1] then
+              if cursid == ARGV[2] then return {'current', ''} end
+              redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+              return {'replace', cursid}
+            end
+            if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then
+              return {'retired', cursid}
+            end
+            redis.call('SADD', KEYS[3], cur)
+            redis.call('EXPIRE', KEYS[3], ARGV[3])
+            redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+            redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+            return {'new', cursid}
+            """,
+            3, self._gk(uid), self._usk(uid), self._urk(uid), gen, sid, self.TTL,
+        )
+        return {"status": status, "prev": prev or None}
+
+    def rename(self, sid, name):
+        import json
+
+        room = self.r.get(self._sk(sid))
+        if not room:
+            return None
+        raw = self.r.hget(self._rk(room), sid)
+        try:
+            v = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            v = {"uid": None}
+        v["name"] = name
+        self.r.hset(self._rk(room), sid, json.dumps(v))
+        return {"id": sid, "name": name, "uid": v.get("uid")}
+
+    def take_session(self, uid, gen):
+        if not uid or not gen:
+            return None
+        sid, room = self.r.eval(
+            """
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {'', ''} end
+            local sid = redis.call('GET', KEYS[2])
+            if not sid then return {'', ''} end
+            local room = redis.call('GET', 'filament:sid:' .. sid)
+            redis.call('SADD', KEYS[3], ARGV[1])
+            redis.call('EXPIRE', KEYS[3], ARGV[2])
+            redis.call('DEL', KEYS[1], KEYS[2])
+            return {sid, room or ''}
+            """,
+            3, self._gk(uid), self._usk(uid), self._urk(uid), gen, self.TTL,
+        )
+        if not sid:
+            return None
+        if room:
+            p = self.r.pipeline()
+            p.hdel(self._rk(room), sid)
+            p.delete(self._sk(sid))
+            p.delete(self._lk(sid))
+            p.execute()
+        return {"sid": sid, "room": room or None}
 
     def refresh(self, sids):
         """Extend the liveness lease for locally-connected sids."""
@@ -230,6 +385,10 @@ class _RedisRegistry:
             p.delete(self._sk(sid))
             p.delete(self._lk(sid))
             p.execute()
+            # The uid->generation ownership record deliberately survives:
+            # a same-generation socket reconnect reclaims it, a newer
+            # generation still supersedes this sid, and a stale old generation
+            # can never clear the new owner. take_session() drops it on close.
         return room
 
     def meta(self, sid):
@@ -350,6 +509,34 @@ def make_registry(redis_url):
     return _RedisRegistry(redis_url) if redis_url else _MemRegistry()
 
 
+def close_session(socketio, registry, uid, gen):
+    """Best-effort pagehide close, tagged with the page-load generation.
+
+    Only the generation that currently owns `uid` can close it. A late beacon
+    from the page that has just been reloaded (same uid, older generation) is
+    ignored, so it can never drop the replacement link. Returns bool.
+    """
+    info = registry.take_session(uid, gen)
+    if not info:
+        return False
+    sid = info.get("sid")
+    room = info.get("room")
+    if not sid:
+        return False
+    # This runs OUTSIDE a Socket.IO event (an HTTP beacon), where the
+    # Flask-SocketIO wrapper's include_self/skip_sid path reads flask.request.sid
+    # and raises. The underlying server emit addresses sids/rooms directly and
+    # works from any context (including cross-replica with the Redis queue).
+    for ch, others in registry.unsubscribe_all(sid).items():
+        for other in others:
+            socketio.server.emit("known-peer-left", {"id": sid, "channel": ch}, to=other)
+    if room:
+        socketio.server.emit("peer-left", {"id": sid}, to=room)
+    socketio.server.emit("session-superseded", {"reason": "page-closed"}, to=sid)
+    _tel("session-close", sid=sid, uid=uid, gen=str(gen)[:8])
+    return True
+
+
 def _tel(event, **kv):
     """Debugger-grade telemetry (C24): one JSON line per lifecycle event,
     prefixed TEL, to stdout -> docker logs. No file contents, no file names."""
@@ -407,7 +594,31 @@ def register(socketio, registry):
 
     socketio.start_background_task(_lease_loop)
 
-    def _do_join(sid, room, name, uid):
+    def _claim_session(sid, uid, gen):
+        """Let a new page-load generation own `uid` immediately, evicting the
+        old sid (if any). A retired generation (an old bfcache/frozen page)
+        is refused instead of superseding the newer session back."""
+        if not uid or not gen:
+            return True
+        verdict = registry.claim_session(uid, gen, sid)
+        status = verdict.get("status")
+        if status == "retired":
+            _tel("session-retired", sid=sid, uid=uid, gen=str(gen)[:8])
+            emit("session-superseded", {"reason": "stale-generation"})
+            return False
+        prev = verdict.get("prev")
+        if prev and prev != sid:
+            _tel("session-supersede", old=prev, new=sid, uid=uid, gen=str(gen)[:8])
+            # Tell the old page first, then make the room/known-device views
+            # forget it. Its own late disconnect/beacon is ignored by the uid
+            # generation check.
+            socketio.emit("session-superseded", {"reason": "newer-generation"}, to=prev)
+            _channel_goodbye(prev)
+            local_sids.discard(prev)
+            _leave_room(prev)
+        return True
+
+    def _do_join(sid, room, name, uid, gen=None):
         """The room-join effect: leave any prior room, join the new one, and
         announce in both directions. Factored so `sync` can reuse the EXACT
         same flow when (and only when) a sid's room actually changes."""
@@ -419,9 +630,9 @@ def register(socketio, registry):
         _leave_room(sid)
 
         join_room(room)
-        registry.add(sid, room, name, uid)
+        registry.add(sid, room, name, uid, gen)
         peers = [p for p in registry.peers_in(room, exclude=sid) if _sid_alive(p["id"])]
-        _tel("join", sid=sid, uid=uid, room=room, peers=len(peers))
+        _tel("join", sid=sid, uid=uid, gen=str(gen)[:8] if gen else None, room=room, peers=len(peers))
 
         # Tell the joiner who's already here (they initiate offers); tell the
         # room someone arrived. With the Redis message queue these reach peers
@@ -438,9 +649,12 @@ def register(socketio, registry):
         # It lets peers recognize "same device, new connection" — the basis for
         # transfer resume.
         uid = (data or {}).get("uid")
+        gen = (data or {}).get("gen")
         if not room:
             return
-        _do_join(sid, room, name, uid)
+        if not _claim_session(sid, uid, gen):
+            return
+        _do_join(sid, room, name, uid, gen)
 
     # -- one-time pairing (#11): say the code aloud; it works exactly once. --
     PAIR_TTL = 600  # unclaimed codes evaporate after 10 minutes
@@ -628,18 +842,33 @@ def register(socketio, registry):
         room = data.get("room")
         name = data.get("name") or "anonymous"
         uid = data.get("uid")
+        gen = data.get("gen")
         if not room:
             return {"v": 1, "ok": False, "room": None, "channels": 0, "lease": False}
 
+        # Generation ownership first: a reload's new generation takes over even
+        # if the old sid is still in the room, and a retired old page cannot
+        # take the session back with a late sync.
+        if not _claim_session(sid, uid, gen):
+            return {"v": 1, "ok": False, "superseded": True, "room": None,
+                    "channels": 0, "lease": False}
+
         # Membership: re-announce ONLY when the room actually changes for this
-        # sid (idempotent — a repeated sync to the same room is silent). When
-        # the room is unchanged we deliberately do NOT re-add (a name/uid edit
-        # without a room change is not re-broadcast); we only refresh the lease.
+        # sid (idempotent — a repeated sync to the same room is silent).
         room_changed = registry.room_of(sid) != room
         if room_changed:
-            _do_join(sid, room, name, uid)
-        elif hasattr(registry, "refresh"):
-            registry.refresh([sid])  # lease refresh only (Redis); no emits
+            _do_join(sid, room, name, uid, gen)
+        else:
+            if hasattr(registry, "refresh"):
+                registry.refresh([sid])  # lease refresh only (Redis); no emits
+            # A rename is a relabel of the SAME device: update this sid's
+            # metadata and tell the room, never create a second peer/pairing.
+            me = registry.meta(sid)
+            if me and me.get("name") != name:
+                updated = registry.rename(sid, name)
+                if updated:
+                    emit("peer-updated", updated, room=room, include_self=False)
+                    _tel("rename", sid=sid, uid=uid)
 
         # Subscriptions: union, idempotent, emits known-peer pairs as today AND
         # returns the live channel roster (deterministic discovery).

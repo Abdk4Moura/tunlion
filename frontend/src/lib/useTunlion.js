@@ -15,7 +15,8 @@ import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import * as linkdiag from './linkdiag.js'
 import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
-import { mintWords, mintCreatedNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
+import { mintWords, mintCreatedNameplate } from './words.js'
+import { loadDeviceName, saveDeviceName, tabUid, currentGeneration, rotateGeneration } from './identity.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink, linkIsLive, reconcileDigest } from '../net/app/recovery.js'
@@ -26,36 +27,6 @@ import { pakePartnerFor } from '../net/app/pakePartner.js'
 // APPLICATION/state-reducer — pure peer/transfer list transforms (Phase 2).
 import { addPeerToList, patchPeerInList, removePeerFromList, upsertTransferInList } from '../net/app/state.js'
 
-// Peer display names draw from the same 64x64 vocabulary as the pairing
-// wordlists, imported from words.js (ADJ/ANIMAL) so there is a single source
-// of truth (was duplicated here). 4,096 combinations picked via
-// crypto.getRandomValues, persisted per tab: a device KEEPS its name on purpose
-// (stable identity, like the uid below): recurrence across visits is
-// sessionStorage, not a small or biased RNG. See the variance analysis repo for
-// the entropy/birthday math.
-
-function cryptoPick(a) {
-  const buf = new Uint32Array(1)
-  // rejection sampling: no modulo bias even for non-power-of-two lists
-  const limit = Math.floor(0xffffffff / a.length) * a.length
-  do {
-    crypto.getRandomValues(buf)
-  } while (buf[0] >= limit)
-  return a[buf[0] % a.length]
-}
-
-function randomName() {
-  try {
-    const saved = sessionStorage.getItem('tunlion.name')
-    if (saved) return saved
-    const name = `${cryptoPick(ADJ)}-${cryptoPick(ANIMALS)}`
-    sessionStorage.setItem('tunlion.name', name)
-    return name
-  } catch {
-    return `${cryptoPick(ADJ)}-${cryptoPick(ANIMALS)}`
-  }
-}
-
 // Deterministic hue so a peer keeps the same color everywhere it appears.
 function hueFor(seed) {
   let h = 0
@@ -64,24 +35,24 @@ function hueFor(seed) {
 }
 const colorFor = (seed) => `hsl(${hueFor(seed)} 70% 55%)`
 
-// Stable per-tab identity (survives reconnects; sids don't). Basis for resume.
-function tabUid() {
-  try {
-    let u = sessionStorage.getItem('tunlion.uid')
-    if (!u) {
-      u = (crypto.randomUUID && crypto.randomUUID()) || Math.random().toString(36).slice(2) + Date.now().toString(36)
-      sessionStorage.setItem('tunlion.uid', u)
-    }
-    if (!/^[\x00-\x7F]*$/.test(u)) throw new Error('Tunlion UID must be ASCII')
-    return u
-  } catch {
-    return Math.random().toString(36).slice(2) + Date.now().toString(36)
-  }
-}
-
 function roomFromUrl() {
   const m = window.location.pathname.match(/^\/rooms\/([^/]+)/)
   return m ? decodeURIComponent(m[1]) : null
+}
+
+// Best-effort pagehide note to the relay, tied to THIS page-load generation.
+// sendBeacon is synchronous from the page's point of view and survives unload;
+// never await it. The relay ignores it when a newer generation already owns the
+// device, so a late beacon cannot drop the replacement link.
+function beaconSessionClose(uid, gen) {
+  if (!uid || !gen) return
+  const body = JSON.stringify({ uid, gen })
+  try {
+    if (navigator.sendBeacon && navigator.sendBeacon(api('/api/session/close'), body)) return
+  } catch {}
+  try {
+    fetch(api('/api/session/close'), { method: 'POST', body, keepalive: true }).catch(() => {})
+  } catch {}
 }
 
 export function useTunlion() {
@@ -96,6 +67,12 @@ export function useTunlion() {
   const [signalingKind, setSignalingKind] = useState(null)
   const [connected, setConnected] = useState(false)
   const [localHelper, setLocalHelper] = useState({ available: false, peers: [] }) // Part C
+  // The local device's human name, shown even before the socket/welcome lands.
+  const [deviceName, setDeviceName] = useState(() => loadDeviceName())
+  // Set when the relay says a newer session for this device has taken over
+  // (a reload, bfcache restore, or a duplicated tab). No auto-reconnect: that
+  // would ping-pong two tabs forever; a reload mints a fresh generation.
+  const [superseded, setSuperseded] = useState(null)
 
   const sigRef = useRef(null)
   const sessionRef = useRef(null) // C30 convergent session, owns the repair loop
@@ -105,9 +82,13 @@ export function useTunlion() {
   const linksRef = useRef(new Map()) // peerId -> PeerLink
   const transferOwner = useRef(new Map()) // transferId -> peerId
   const cfgRef = useRef(null)
-  const myNameRef = useRef(null)
+  const myNameRef = useRef(deviceName)
   const myIdRef = useRef(null) // our current socket id, for the politeness tiebreaker (#1)
   const uidRef = useRef(tabUid()) // stable per-tab identity (resume)
+  // New per page load; lets the relay supersede this device's previous session
+  // without a late close from that session tearing down the new link.
+  const genRef = useRef(currentGeneration())
+  const supersededRef = useRef(false)
   // Resume stores, deliberately OUTLIVE individual PeerLinks (see docs/resilience.md):
   const partialsRef = useRef(new Map()) // transferId -> { received, buffers, size, mime, name }
   const outgoingRef = useRef(new Map()) // transferId -> { file, name, size, mime, peerUid }
@@ -219,6 +200,27 @@ export function useTunlion() {
     )
   }, [subscribeKnown])
 
+  // Rename THIS browser. The uid and session generation are untouched, so
+  // peers update the name on the same signaling session: this is a relabel of
+  // one device identity, never a second device/pairing. A blank or unchanged
+  // value is a no-op and keeps the current (always valid) name.
+  const renameSelf = useCallback((raw) => {
+    const next = saveDeviceName(raw)
+    if (!next) return myNameRef.current
+    const changed = next !== myNameRef.current
+    myNameRef.current = next
+    setDeviceName(next)
+    setMe((prev) => (prev ? { ...prev, name: next, color: colorFor(prev.id) } : prev))
+    if (changed) {
+      // Level-triggered: the next sync carries the same uid+gen with the new
+      // name; the relay updates the existing session and tells the room.
+      sessionRef.current?.setRoom(roomIdRef.current, next, uidRef.current, genRef.current)
+      sessionRef.current?.kick()
+      tel('self-renamed', {})
+    }
+    return next
+  }, [])
+
   // C27: remembering is a TRUST GRANT (the holder can find and auto-connect
   // to this browser forever), so the human decides, never the protocol.
   // pair-keep offers queue here until answered; the answer goes back as
@@ -304,6 +306,11 @@ export function useTunlion() {
   const makeLink = useCallback(
     ({ id, name, uid, relayOnly }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
+      // Our own uid under an older sid is the previous page-load generation
+      // (or a restored bfcache page), never a peer. A reload used to try to
+      // negotiate with its own stale session and could sit at "connecting";
+      // the relay now retires that session, and we never dial it either.
+      if (uid && uid === uidRef.current) return null
       if (uid != null && !/^[\x00-\x7F]*$/.test(uid)) {
         console.warn('peer UID is not ASCII; refusing role election', { id })
         addPeer({ id, name, uid, color: colorFor(id), status: 'peer identity is invalid; reload this page', route: null, lastSeen: 'now' })
@@ -574,8 +581,12 @@ export function useTunlion() {
       sigRef.current = sig
       installTel(tabUid())
       linkdiag.installEnv() // link-diagnostics: env/network taps (vis, online, conn, pagehide)
-      const myName = randomName()
+      const myName = myNameRef.current || loadDeviceName()
       myNameRef.current = myName
+      // Diagnostic marker: which page-load generation this document is. It is
+      // not a secret and is never used for trust; it makes reload/bfcache
+      // behavior observable in a browser without reading internal state.
+      try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
 
       // C30: the convergent session. Its level-triggered loop owns session-state
       // repair (room membership + channel subscriptions + lease), replacing the
@@ -636,13 +647,22 @@ export function useTunlion() {
           linksRef.current.delete(pid)
           removePeer(pid)
         }
-        setMe({ id, name: myName, color: colorFor(id) })
+        setMe({ id, name: myNameRef.current || myName, color: colorFor(id) })
         setConnected(true)
         connectedRef.current = true
         existing.forEach((p) => makeLink({ id: p.id, name: p.name, uid: p.uid }))
         subscribeKnown() // re-introduce any known device the wipe-era logic lost
       })
       sig.on('peer-joined', ({ id, name, uid }) => {
+        if (uid && uid === uidRef.current) return
+        const existing = linksRef.current.get(id)
+        if (existing) {
+          // A re-announce (e.g. a name change on rejoin) must relabel the row,
+          // not be swallowed because the link already exists.
+          existing.name = name
+          updatePeer(id, { name })
+          return
+        }
         makeLink({ id, name, uid })
       })
       sig.on('peer-left', ({ id }) => {
@@ -655,6 +675,33 @@ export function useTunlion() {
         linksRef.current.delete(id)
         removePeer(id)
         setPendingKeeps((prev) => prev.filter((k) => k.peerId !== id)) // moot now (C27)
+      })
+      // The relay says a newer page load/tab for THIS device has taken over.
+      // Stop talking instead of fighting it: an automatic rejoin would make
+      // two tabs supersede each other forever. A reload (new generation) is
+      // the intentional way back, and loses no pairing (localStorage stays).
+      sig.on('session-superseded', () => {
+        if (supersededRef.current) return
+        supersededRef.current = true
+        tel('session-superseded', {})
+        for (const link of linksRef.current.values()) link.close()
+        linksRef.current.clear()
+        setPeers([])
+        setPendingKeeps([])
+        setPendingPakeKeep([])
+        sessionRef.current?.stop()
+        setConnected(false)
+        connectedRef.current = false
+        setSuperseded('A newer tab or reload for this device took over the session.')
+      })
+      // A live device was renamed. Keep the SAME peer/link row and just relabel
+      // it (a new peer-joined would be ignored for an existing sid anyway).
+      sig.on('peer-updated', ({ id, name, uid }) => {
+        if (!id || !name) return
+        if (uid && uid === uidRef.current) return
+        const link = linksRef.current.get(id)
+        if (link) link.name = name
+        updatePeer(id, { name })
       })
       // C12: a known device came online (matched one of our secret-derived
       // channels): link to it regardless of rooms. Both sides receive this;
@@ -782,8 +829,8 @@ export function useTunlion() {
 
       // Seed the convergent session with our room, then fire the initial join
       // for instant welcome UX. From here the session loop owns the repair.
-      session.setRoom(room, myName, uidRef.current)
-      sig.join(room, myName, uidRef.current)
+      session.setRoom(room, myName, uidRef.current, genRef.current)
+      sig.join(room, myName, uidRef.current, genRef.current)
       session.kick() // independent of subscribeKnown (which no-ops with 0 devices)
       subscribeKnown()
     })()
@@ -851,8 +898,8 @@ export function useTunlion() {
     // C30: update the convergent session's desired room BEFORE the join, else
     // the next 5s sync re-asserts the OLD room and the server moves us back.
     // setRoom + kick = the deliberate switch; the loop then keeps it.
-    sessionRef.current?.setRoom(newRoomId, myNameRef.current, uidRef.current)
-    sig.join(newRoomId, myNameRef.current, uidRef.current)
+    sessionRef.current?.setRoom(newRoomId, myNameRef.current, uidRef.current, genRef.current)
+    sig.join(newRoomId, myNameRef.current, uidRef.current, genRef.current)
     sessionRef.current?.kick()
   }, [])
 
@@ -1241,6 +1288,10 @@ export function useTunlion() {
     // a few hundred ms) does not thrash the reconnect/rebuild work.
     let recoverTimer = null
     const runRecovery = () => {
+      // A superseded tab stays quiet: rejoining would steal the session back
+      // and start a supersede tug-of-war. Only a fresh generation (reload or a
+      // persisted-page restore, handled in onPageShow) may take over again.
+      if (supersededRef.current) return
       sigRef.current?.reconnect?.()
       sessionRef.current?.kick() // C30: re-ensure room + channels the freeze may have eaten
       subscribeKnown() // re-derive channels in case a secret was stored while hidden
@@ -1285,16 +1336,40 @@ export function useTunlion() {
     // (recover() already calls nudgeUpgradeProbes, so the P5 relay probe still
     // runs too.) These also fire `online` immediately on a handoff.
     const onNetworkChange = () => recover()
-    // M4: BFCache / iOS Safari. iOS can freeze a tab into BFCache firing ONLY
-    // pagehide (not visibilitychange); restore via pageshow with persisted:true.
-    // pagehide -> tell peers brb (mirrors the hidden branch). pageshow (persisted)
-    // -> run the shared recovery. Both share the debounce with visibility so a
-    // pageshow that also fires visibilitychange does not double-repair.
+    // M4: BFCache / iOS Safari. A page can be frozen into BFCache firing ONLY
+    // pagehide (not visibilitychange). pagehide is the last reliable synchronous
+    // moment, so: close every local RTCPeerConnection, stop the link + session
+    // timers, and beacon a generation-tagged close note. Do NOT await anything
+    // and do NOT tear down on visibilitychange alone (backgrounding an iPad is a
+    // normal thing, not a departure).
     const onPageHide = () => {
-      for (const link of linksRef.current.values()) link.sendBrb?.(120)
+      if (recoverTimer) { clearTimeout(recoverTimer); recoverTimer = null }
+      for (const link of linksRef.current.values()) {
+        try { link.close() } catch {}
+      }
+      linksRef.current.clear()
+      setPeers([]) // those links are gone; a bfcache restore repopulates from the roster
+      sessionRef.current?.stop()
+      beaconSessionClose(uidRef.current, genRef.current)
     }
+    // pageshow fires on a normal load AND on a BFCache restore. Always
+    // revalidate/reconnect; a restored page also rotates to a fresh generation,
+    // because the relay may have retired the generation it was frozen under
+    // (another load/tab owned the device meanwhile). The old close note then
+    // cannot match, and the restored page legitimately takes over again.
     const onPageShow = (e) => {
-      if (e && e.persisted) recover()
+      const persisted = !!(e && e.persisted)
+      if (persisted) {
+        genRef.current = rotateGeneration()
+        try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
+        supersededRef.current = false
+        setSuperseded(null)
+        sessionRef.current?.setRoom(roomIdRef.current, myNameRef.current, uidRef.current, genRef.current)
+        sessionRef.current?.invalidate()
+        tel('bfcache-restore', { gen: genRef.current.slice(0, 8) })
+      }
+      sessionRef.current?.start()
+      recover()
     }
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onVisibility)
@@ -1365,6 +1440,9 @@ export function useTunlion() {
 
   return {
     me,
+    deviceName, // this browser's human name (available before/without a socket)
+    superseded, // a newer tab/load took over this device (null when healthy)
+    renameSelf, // change this device's name; same uid+generation, no new pairing
     peers,
     transfers,
     roomId,

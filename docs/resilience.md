@@ -254,6 +254,47 @@ that peer, including status 'offered'.
 
 ---
 
+## 13. A normal reload left a stale session → no reconnect
+
+**Symptom.** Reloading the tab did not connect, but closing it and opening a
+new one worked. The old page's session was still present and the replacement
+could not claim the device cleanly.
+
+**Problem.** A reload keeps the per-tab `uid` (sessionStorage), so both the
+old and new page briefly present the same device. Nothing on the relay let the
+new page load take ownership; a late `pagehide`/`disconnect` from the old page
+could race the new link. The local name was also generated in sessionStorage
+and never shown, so a device could be `silken-chickadee` on the wire while the
+UI hid it.
+
+**Solution.**
+- **Generation ownership.** Every page load mints a fresh `gen` (never
+  persisted). `join`/`sync` carry `{uid, gen}`. A different, non-retired `gen`
+  for the same uid supersedes the old sid immediately; the relay tells the old
+  page `session-superseded`, removes its room/channel presence, and retires the
+  old generation. A late `sync` from a retired generation is refused. A same-
+  generation socket reconnect still reclaims its own session.
+- **Synchronous pagehide, not unload-dependent.** `pagehide` closes local
+  `RTCPeerConnection`s, stops link/session timers, and beacons
+  `POST /api/session/close` with `{uid, gen}`. The endpoint only acts when that
+  generation still owns the uid, so the reload's late close cannot drop the new
+  link. `pageshow` always revalidates/reconnects; a BFCache restore rotates
+  generation first. `visibilitychange` alone does NOT tear down (backgrounding
+  an iPad is normal), and ICE/presence timeouts remain the fallback if
+  `pagehide` never fires.
+- **Visible, editable identity.** The device name lives in localStorage (with
+  migration from the old per-tab name), is shown on Home/header and in a name
+  field with a generated default. Renaming sends the SAME `{uid, gen}` and the
+  relay emits `peer-updated`, so peers relabel one row; no duplicate pairing or
+  peer tile. Clearing site data is never part of the recovery path.
+
+*Files:* `frontend/src/lib/identity.js`, `frontend/src/lib/useTunlion.js`,
+`frontend/src/lib/session.js`, `frontend/src/lib/signaling.js`,
+`frontend/src/ui/Tunlion.jsx`, `backend/signaling.py`, `backend/app.py`.
+*Gates:* `frontend/tests/peer-identity.spec.cjs`,
+`frontend/tests/peer-reload.spec.cjs`,
+`backend/tests/test_session_generation.py`.
+
 ## Testing
 
 `PeerLink`'s logic is exercised against a mock `RTCPeerConnection` (see the test

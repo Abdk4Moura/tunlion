@@ -8,8 +8,10 @@
 //   sig.on('welcome',     ({ id, peers }) => {})
 //   sig.on('peer-joined', ({ id, name })  => {})
 //   sig.on('peer-left',   ({ id })        => {})
+//   sig.on('peer-updated',({ id, name })  => {})  // in-place rename, same sid
+//   sig.on('session-superseded', ()       => {})  // a newer page load/tab took over
 //   sig.on('signal',      ({ from, data })=> {})
-//   sig.join(room, name)
+//   sig.join(room, name, uid, gen)
 //   sig.signal(toPeerId, data)
 //   sig.leave()
 //
@@ -65,7 +67,7 @@ class SocketIOSignaling extends Emitter {
       reconnectionDelay: 400,
       reconnectionDelayMax: 2000,
     })
-    for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
+    for (const ev of ['welcome', 'peer-joined', 'peer-left', 'peer-updated', 'session-superseded', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }
     // Resilience: on every (re)connect, rejoin the current room. A reconnect
@@ -76,7 +78,7 @@ class SocketIOSignaling extends Emitter {
       this._connectErrors = 0
       this._openedAt = Date.now()
       this._emit('status', { connected: true })
-      if (this.room) this.socket.emit('join', { room: this.room, name: this.name, uid: this.uid })
+      if (this.room) this.socket.emit('join', { room: this.room, name: this.name, uid: this.uid, gen: this.gen })
     })
     this.socket.on('disconnect', () => {
       this._openedAt = Date.now()
@@ -102,11 +104,12 @@ class SocketIOSignaling extends Emitter {
     if (leadChanged && this.socket.io.engine) this.socket.io.engine.close()
     if (nudge && !this.socket.connected) this.socket.connect()
   }
-  join(room, name, uid) {
+  join(room, name, uid, gen) {
     this.room = room
     this.name = name
     this.uid = uid
-    this.socket.emit('join', { room, name, uid })
+    this.gen = gen
+    this.socket.emit('join', { room, name, uid, gen })
   }
   signal(to, data) {
     this.socket.emit('signal', { to, data })
