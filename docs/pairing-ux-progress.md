@@ -6,7 +6,33 @@ Approved 2026-10-20. Reference prototype and detailed decisions:
 
 ## Current slice
 
-### Raw categories and separator cleanup (2026-10-21, verified remotely)
+### Rebased integration (2026-10-21)
+
+- Rebased onto main `74896a82` (includes `#542` through `#562`). Upstream work is
+  preserved; overlaps were resolved by starting from their tree and reapplying
+  this slice:
+  - `6d33ac50` CLI categories, inline join, code-only surfaces, receive dispatch
+  - `eba9846b` shared browser entry boundary
+  - `adec0fdf` boundary harnesses, worker reuse, documentation
+  - `c9e6b0a9` source digest includes the library receive dispatch
+- Receive code parsing moved into `filament-peerloop` upstream. The CLI adapter
+  now validates an explicit code before engine start, and the library dispatch
+  applies the same canonical cleanup and 48-character refusal before `norm_code`.
+- Verified on a fresh cached lease (`run39546859138`, validation
+  `20261021T050617-2436`): **153 Rust tests** (34 entry, 24 join, 6 category,
+  5 explicit creator/claimer/receive, 2 classifier, 3 invitation, 56 UI,
+  23 pairing library), 17 zero-connection category cases, 12 browser/Rust
+  golden cases, production browser build, all join PTYs at 40×12/96×24, two
+  real PAKE ceremonies with replay refusal and authenticated reach, resize and
+  light/dark fragmented-paint checks.
+- Evidence archive `/root/Tunlion/tunlion-pairing-ux-rebased.tar.gz`, SHA-256
+  `f20b6c31bd48904add18f5373375b6ec07b6aa7e401a1e79dafaeb1a497f4867`;
+  extracted under `/root/pairing-ux/evidence/rebased-final`; 27 source hashes
+  matched. Isolated preview SHA-256
+  `e9d522e434d9b8ca02efffa4eab1a6d45359b50cdc91a7ef891c7b66a0f53110`;
+  earlier previews retained. Production binary and daemon PID 8921 unchanged.
+
+### Raw categories and separator cleanup (2026-10-21, pre-rebase verification)
 
 - New private payload types distinguish pairing codes, transfer codes,
   invitation material and invitation paths. Raw prefixes/JSON/path syntax are
