@@ -136,8 +136,10 @@ class SocketIOSignaling extends Emitter {
   }
   setToken(token) {
     if (!token) return
+    // The storage event already means localStorage has this value; do not
+    // write it back (that would let a synthetic/foreign event change the
+    // browser's owner token).
     this.token = token
-    saveOwnerToken(token)
   }
   // Keep the reconnect cache in step with a rename / BFCache generation
   // rotation. Without this, the auto-rejoin would replay a retired generation
@@ -226,10 +228,11 @@ class SocketIOSignaling extends Emitter {
 // Serverless signaling over Firestore. Loaded lazily so the Firebase SDK is
 // only pulled in when SIGNALING=firebase. Presence + per-peer signal mailboxes
 // mirror the Socket.IO event contract, EXCEPT generation ownership/reload
-// takeover: Firestore presence is added/removed documents and has no relay to
-// mint or verify an ownership token. The generation-safe supersede/close path
-// below is therefore Socket.IO-only; a Firebase deployment keeps its existing
-// presence semantics (documented as a known limit).
+// takeover AND in-place rename/cleanup: Firestore presence is added/removed
+// documents and has no relay to mint or verify an ownership token, and
+// setIdentity()/peer-updated/renamed presence has no Firestore equivalent.
+// Those paths are Socket.IO-only; a Firebase deployment keeps its existing
+// add/remove presence semantics (documented as a known limit).
 class FirebaseSignaling extends Emitter {
   constructor(firebaseConfig) {
     super()

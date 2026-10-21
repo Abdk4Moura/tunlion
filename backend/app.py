@@ -199,11 +199,7 @@ def telemetry():
 
 # ------------------------------------------------------- Session close -------
 def _origin_allowed(origin):
-    if not origin:
-        return True  # some same-origin beacons omit Origin; the token still gates it
-    if _ALLOWED_ORIGINS == "*":
-        return True
-    return origin in _ALLOWED_ORIGINS
+    return signaling.origin_allowed(origin, _ALLOWED_ORIGINS)
 
 
 @app.post("/api/session/close")

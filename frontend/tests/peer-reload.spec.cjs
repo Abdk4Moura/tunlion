@@ -105,7 +105,9 @@ async function waitFor(fn, timeoutMs, label) {
 // WebKit counts the signaling websocket as an open request, so networkidle
 // never fires for the real app; wait for the rendered identity field instead.
 async function nav(page, url) {
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const target = new URL(url);
+  target.searchParams.set('test', '1'); // expose real link/timer diagnostics
+  await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
   try {
     // waitForFunction is deliberate: a continuously-updating React root can
     // make Playwright's selector wait chase a replaced node, while "does the
@@ -147,8 +149,18 @@ async function waitPeerReady(page, name, timeout = 30000) {
   await waitFor(async () => {
     const row = peerRows(page, name).first();
     if ((await row.count()) !== 1) return false;
-    return /\bready\b/i.test(await row.innerText().catch(() => ''));
-  }, timeout, `peer ${name} ready (WebRTC data channel)`);
+    if (!/\bready\b/i.test(await row.innerText().catch(() => ''))) return false;
+    // `ready` is set from pc.connectionState too; prove a real DataChannel is
+    // open. The ?test=1 hook exposes the live PeerLink map, not a mock.
+    return page.evaluate(() => {
+      const links = window.__tunlionTestLinks;
+      if (!links) return false;
+      for (const link of links.values()) {
+        if (link?.channel?.readyState === 'open') return true;
+      }
+      return false;
+    });
+  }, timeout, `peer ${name} ready with an OPEN data channel`);
 }
 
 async function ownerToken(page) {
@@ -264,6 +276,21 @@ async function runEngine(engine, browser, contextOptions) {
   if (!supersede.length) fail(`${tag} relay did not log the generation supersede`);
   ok(`${tag} second tab took over (gen ${g3.gen.slice(0, 8)}); old tab explained${full ? ', peer still has one row' : ''}`);
 
+  // 2b. A BFCache restore / token storage event must NOT resume the superseded
+  //     tab. Only an explicit full reload may take over again.
+  const oldGen8 = g2.gen.slice(0, 8);
+  const oldJoinsBefore = telEvents().filter((e) => e.ev === 'join' && e.uid === g2.uid && e.gen === oldGen8).length;
+  await dev.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
+  await dev.evaluate(() => window.dispatchEvent(new StorageEvent('storage', { key: 'tunlion.ownerToken', newValue: 'attacker-token' })));
+  await sleep(1200);
+  if ((await dev.locator('[data-testid="superseded-banner"]').count()) !== 1) fail(`${tag} a pageshow/storage event cleared the superseded banner`);
+  const oldIdentity = await identity(dev);
+  if (oldIdentity.online) fail(`${tag} a superseded tab came back online on pageshow/storage`);
+  const oldJoinsAfter = telEvents().filter((e) => e.ev === 'join' && e.uid === g2.uid && e.gen === oldGen8).length;
+  if (oldJoinsAfter !== oldJoinsBefore) fail(`${tag} a superseded tab replayed its retired generation (${oldJoinsBefore} -> ${oldJoinsAfter})`);
+  if (full) { await waitOnlineAndPeer(second, peerName); await waitPeerReady(second, peerName); }
+  ok(`${tag} pageshow/storage events leave the superseded tab suspended; the active tab stays owner`);
+
   // 3. A LATE close from the superseded generation must not drop the new link.
   const staleClose = await devCtx.request.post(`${BASE}/api/session/close`, { data: { uid: g2.uid, gen: g2.gen } });
   if (staleClose.status() !== 204) fail(`${tag} stale close endpoint returned ${staleClose.status()}`);
@@ -340,13 +367,11 @@ async function runEngine(engine, browser, contextOptions) {
   if (engine === 'webkit-ipad') { await nav(peer, BASE); await waitOnline(peer); }
   if (full) {
     await waitOnlineAndPeer(second, peerName, 45000);
-    await waitPeerReady(second, peerName, 60000);
     await waitFor(async () => {
       const now = await peerRows(peer, chosen).count();
       const old = await peerRows(peer, devName).count();
       return now === 1 && old === 0;
     }, 15000, 'the peer to relabel the reconnected device');
-    await waitPeerReady(peer, chosen, 60000);
   } else {
     await waitOnline(second, 30000);
   }
@@ -376,7 +401,7 @@ async function runEngine(engine, browser, contextOptions) {
   const beforeBf = await identity(second);
   await second.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
   await waitFor(async () => (await identity(second)).gen !== beforeBf.gen, 15000, 'pageshow(persisted) to rotate generation');
-  if (full) { await waitOnlineAndPeer(second, peerName, 45000); await waitPeerReady(second, peerName, 60000); } else await waitOnline(second);
+  if (full) await waitOnlineAndPeer(second, peerName, 45000); else await waitOnline(second);
   ok(`${tag} persisted pageshow rotates the session generation and revalidates`);
 
   // 6a-b. Force a real socket disconnect/reconnect AFTER that rotation. The
@@ -390,7 +415,7 @@ async function runEngine(engine, browser, contextOptions) {
   await sleep(700);
   await second.context().setOffline(false);
   if (engine === 'webkit-ipad') { await nav(peer, BASE); await waitOnline(peer); }
-  if (full) { await waitOnlineAndPeer(second, peerName, 45000); await waitPeerReady(second, peerName, 60000); } else await waitOnline(second, 45000);
+  if (full) await waitOnlineAndPeer(second, peerName, 45000); else await waitOnline(second, 45000);
   const bfRetiredAfter = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === bf.uid && e.gen === bfGen).length;
   const bfJoinsAfter = telEvents().filter((e) => e.ev === 'join' && e.uid === bf.uid && e.gen === bfGen).length;
   if (bfRetiredAfter !== bfRetiredBefore) fail(`${tag} post-pageshow reconnect retired the current generation`);
@@ -424,6 +449,18 @@ async function runEngine(engine, browser, contextOptions) {
   await waitFor(() => closeCount(finalId.uid, finalId.gen) === beforeAuthClose + 1, 10000,
     'the authenticated close to be applied');
   ok(`${tag} the owner's authenticated close is applied`);
+
+  // 8. pagehide clears page-owned timers (config refresh + pairing/waitUp/
+  //    second-wind/helper slots), not only PeerLink timers.
+  const timersBefore = await second.evaluate(() => window.__tunlionTimerStats && window.__tunlionTimerStats());
+  if (!timersBefore || timersBefore.cfg !== true) fail(`${tag} timer inventory missing or config refresh not running before pagehide`);
+  await second.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+  await sleep(250);
+  const timersAfter = await second.evaluate(() => window.__tunlionTimerStats && window.__tunlionTimerStats());
+  for (const [name, on] of Object.entries(timersAfter || {})) {
+    if (on) fail(`${tag} pagehide left a page timer running: ${name}`);
+  }
+  ok(`${tag} pagehide clears the page-owned timers`);
 
   await second.close();
   await dev.close();

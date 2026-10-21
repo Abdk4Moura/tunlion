@@ -270,14 +270,18 @@ UI hid it.
 **Solution.**
 - **Generation ownership, with a private token.** Every page load mints a
   fresh `gen` (never persisted). On the first claim for a uid the relay mints a
-  private ownership `token` and returns it only to that socket (`welcome` /
-  sync ack); it is never in a roster. `join`/`sync` carry `{uid, gen, token}`.
-  A token-bearing, non-retired `gen` supersedes the old sid immediately; the
-  relay tells the old page `session-superseded`, removes its room/channel
-  presence, and retires the old generation (uncapped). A late `sync` from a
-  retired generation is refused. A uid alone is NOT authority: an unrelated
-  room client that learned the victim's uid cannot evict or close it without
-  the token. A same-generation socket reconnect still reclaims its own session.
+  private ownership `token` UNCONDITIONALLY (a client-supplied value is
+  ignored) and returns it only to that socket (`welcome` / sync ack); it is
+  never in a roster. `join`/`sync` carry `{uid, gen, token}`. A token-bearing,
+  non-retired `gen` supersedes the old sid immediately; the relay tells the old
+  page `session-superseded`, removes its room/channel presence, and retires the
+  old generation. A late `sync` from a retired generation is refused. A uid
+  alone is NOT authority: an unrelated room client that learned the victim's
+  uid cannot evict or close it without the token. A same-generation socket
+  reconnect still reclaims its own session. The token is a sliding 24h bearer
+  credential; expired non-live ownership mints a fresh token. Claim rate,
+  uid/gen/token length, ownership-record count and per-uid tombstones are all
+  bounded (Redis uses the same 24h TTLs and atomic Lua).
 - **Synchronous pagehide, not unload-dependent.** `pagehide` closes local
   `RTCPeerConnection`s, stops link/session/pairing/config timers, and beacons
   `POST /api/session/close` with `{uid, gen, token}`. The endpoint requires the
@@ -287,7 +291,8 @@ UI hid it.
   restore (or any pagehide/pageshow return) rotates generation first.
   `visibilitychange` alone does NOT tear down (backgrounding an iPad is
   normal), and ICE/presence timeouts remain the fallback if `pagehide` never
-  fires.
+  fires. A superseded tab stays suspended across `pageshow`/BFCache/storage
+  events; only an explicit full reload may take over again.
 - **Visible, editable identity.** The device name lives in localStorage (with
   migration from the old per-tab name), is shown on Home/header and in a name
   field with a generated default. Renaming sends the SAME `{uid, gen}` and the
@@ -295,6 +300,8 @@ UI hid it.
   from the `storage` event. Names are labels, not identities -- duplicates are
   allowed, and ownership/pairing never depends on the name. No duplicate
   pairing or peer tile. Clearing site data is never part of the recovery path.
+  Optional Firebase signaling has no relay-side token/rename/supersede path;
+  its Firestore presence remains add/remove only.
 
 *Files:* `frontend/src/lib/identity.js`, `frontend/src/lib/useTunlion.js`,
 `frontend/src/lib/session.js`, `frontend/src/lib/signaling.js`,
@@ -345,3 +352,12 @@ a platform boundary (no filesystem access), not a design choice.
   revokes file handles on navigation.
 - **Multi-instance API scaling** needs the Redis registry (already wired); the
   glare fix (#1) is what makes that safe.
+- **Ownership token state is relay state.** If the relay loses its state
+  (restart without Redis), a uid with no surviving record can be first-claimed
+  by another client during that window; there is no old live session to evict,
+  and the first claim wins. With Redis the 24h ownership/TTL state and atomic
+  Lua survive restarts. During normal operation a live victim cannot be evicted
+  by a uid alone.
+- **Optional Firebase signaling** remains add/remove presence: it does not
+  implement generation/token supersede, in-place rename, or relay-side close.
+  Those paths are Socket.IO-only.

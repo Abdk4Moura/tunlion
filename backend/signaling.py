@@ -72,6 +72,23 @@ def _norm_code(raw):
     return re.sub(r"[^a-z0-9-]", "", re.sub(r"\s+", "-", raw.strip().lower()))[:48]
 
 
+def origin_allowed(origin, allowed):
+    """Whether a pagehide beacon Origin may reach the close endpoint.
+
+    No Origin is allowed (some same-origin beacons omit it) because the bearer
+    token still gates the operation. "*" is the dev/simple default; otherwise
+    the configured list is enforced exactly.
+    """
+    if not origin:
+        return True
+    if allowed == "*":
+        return True
+    try:
+        return origin in allowed
+    except TypeError:
+        return False
+
+
 class _MemRegistry:
     """Process-local membership (single instance).
 
@@ -81,16 +98,22 @@ class _MemRegistry:
     """
 
     LIVE_TTL = 60  # liveness lease; refreshed by the lease loop + on activity
+    OWNER_TTL = 24 * 3600  # ownership token/record lifetime (sliding on use)
+    RETIRED_TTL = 24 * 3600  # tombstone lifetime; also bounds _retired memory
+    MAX_OWNED_UIDS = 50_000
+    MAX_RETIRED_PER_UID = 1024
 
     def __init__(self):
         self._m = {}  # sid -> {"room", "name", "uid", "gen"}
         self._live = {}  # sid -> lease expiry (monotonic)
-        # uid -> {"gen": current page-load generation, "sid": owning sid}.
+        # uid -> {"gen", "sid", "token", "token_exp", "last_seen"}.
         # A reload has the same uid but a new generation; it takes ownership
-        # immediately. `_retired` remembers generations that were replaced so a
-        # late sync/close from the frozen old page cannot steal the session back.
+        # immediately when it presents the server-minted token. `_retired`
+        # remembers generations that were replaced so a late sync/close from
+        # the frozen old page cannot steal the session back.
         self._uids = {}
         self._retired = {}  # uid -> set(old generations)
+        self._retired_exp = {}  # uid -> wall-clock expiry for its tombstone set
         # async_mode=threading really is concurrent: claim/take must not
         # interleave or two generations can both believe they own a uid.
         self._lock = threading.RLock()
@@ -98,8 +121,9 @@ class _MemRegistry:
     def refresh(self, sids):
         """Extend the liveness lease for connected sids."""
         exp = _time.monotonic() + self.LIVE_TTL
-        for sid in sids:
-            self._live[sid] = exp
+        with self._lock:
+            for sid in sids:
+                self._live[sid] = exp
 
     def _alive(self, sid):
         return self._live.get(sid, 0) > _time.monotonic()
@@ -110,8 +134,9 @@ class _MemRegistry:
             self.refresh([sid])
 
     def room_of(self, sid):
-        m = self._m.get(sid)
-        return m["room"] if m else None
+        with self._lock:
+            m = self._m.get(sid)
+            return m["room"] if m else None
 
     def remove(self, sid):
         with self._lock:
@@ -135,24 +160,49 @@ class _MemRegistry:
         """
         if not uid or not gen:
             return {"status": "legacy", "prev": None}
+        if len(uid) > 128 or len(gen) > 128 or (token and len(str(token)) > 256):
+            return {"status": "denied", "prev": None}
         with self._lock:
+            now = _time.time()
+            has_room = self._sweep_owners(now)
+            ret_exp = self._retired_exp.get(uid)
+            if ret_exp is not None and ret_exp <= now:
+                self._retired.pop(uid, None)
+                self._retired_exp.pop(uid, None)
             if gen in self._retired.get(uid, set()):
                 cur = self._uids.get(uid)
                 return {"status": "retired", "prev": cur.get("sid") if cur else None}
             cur = self._uids.get(uid)
             if cur is None:
-                issued = str(token) if token else secrets.token_urlsafe(24)
-                self._uids[uid] = {"gen": gen, "sid": sid, "token": issued}
+                if not has_room:
+                    return {"status": "capacity", "prev": None}
+                # The relay mints unconditionally; a client-supplied token is
+                # never allowed to become the first owner of a uid.
+                issued = secrets.token_urlsafe(24)
+                self._uids[uid] = {"gen": gen, "sid": sid, "token": issued,
+                                   "token_exp": now + self.OWNER_TTL, "last_seen": now}
+                return {"status": "new", "prev": None, "token": issued}
+            # An expired token whose session is not live is stale ownership:
+            # mint a new token. A live session keeps its token until it expires
+            # only if it stops refreshing (sync normally refreshes every 5s).
+            if cur.get("token_exp", 0) <= now:
+                if self._alive(cur.get("sid")):
+                    return {"status": "denied", "prev": cur.get("sid")}
+                issued = secrets.token_urlsafe(24)
+                self._uids[uid] = {"gen": gen, "sid": sid, "token": issued,
+                                   "token_exp": now + self.OWNER_TTL, "last_seen": now}
                 return {"status": "new", "prev": None, "token": issued}
             authorized = bool(token) and secrets.compare_digest(str(token), str(cur.get("token") or ""))
             # One page load emits `join` and `sync` concurrently on the SAME
             # socket. The first mints the token; the second cannot know it yet.
             # Same sid + same generation is that race, not a takeover.
-            if not authorized and not token and cur.get("sid") == sid and cur.get("gen") == gen:
+            if not authorized and cur.get("sid") == sid and cur.get("gen") == gen:
                 authorized = True
             if not authorized:
                 return {"status": "denied", "prev": cur.get("sid")}
             cur_token = cur.get("token")
+            cur["last_seen"] = now
+            cur["token_exp"] = now + self.OWNER_TTL
             if cur.get("gen") == gen:
                 prev = cur.get("sid")
                 if prev != sid:
@@ -161,12 +211,33 @@ class _MemRegistry:
                 return {"status": "current", "prev": None, "token": cur_token}
             old = cur.get("gen")
             prev = cur.get("sid")
+            retired = self._retired.setdefault(uid, set())
             if old:
-                # Not capped: "a retired generation cannot sync back" must be
-                # true for every old page, not just the most recent 32.
-                self._retired.setdefault(uid, set()).add(old)
+                if len(retired) >= self.MAX_RETIRED_PER_UID:
+                    # Bounded memory without dropping an old tombstone and
+                    # making a retired page valid again.
+                    return {"status": "capacity", "prev": prev}
+                retired.add(old)
+                self._retired_exp[uid] = now + self.RETIRED_TTL
             cur.update({"gen": gen, "sid": sid})
             return {"status": "new", "prev": prev, "token": cur_token}
+
+    def _sweep_owners(self, now):
+        """Bound ownership memory: drop stale, non-live records oldest-first."""
+        if len(self._uids) < self.MAX_OWNED_UIDS:
+            return True
+        stale = [
+            (uid, rec.get("last_seen", 0))
+            for uid, rec in self._uids.items()
+            if not self._alive(rec.get("sid"))
+        ]
+        stale.sort(key=lambda x: x[1])
+        drop = len(self._uids) - self.MAX_OWNED_UIDS + 1
+        for uid, _ in stale[: max(0, drop)]:
+            self._uids.pop(uid, None)
+            self._retired.pop(uid, None)
+            self._retired_exp.pop(uid, None)
+        return len(self._uids) < self.MAX_OWNED_UIDS
 
     def rename(self, sid, name):
         with self._lock:
@@ -179,7 +250,8 @@ class _MemRegistry:
     def owned_uid(self, uid):
         """Whether this uid has ever been claimed (used by legacy no-gen
         clients: they may not re-use a uid that a token-owning session owns)."""
-        return self._uids.get(uid)
+        with self._lock:
+            return self._uids.get(uid)
 
     def take_session(self, uid, gen, token=None):
         """Close the active sid for (uid, gen) IF the caller holds its ownership
@@ -188,8 +260,11 @@ class _MemRegistry:
         if not uid or not gen:
             return None
         with self._lock:
+            now = _time.time()
             cur = self._uids.get(uid)
             if not cur or cur.get("gen") != gen:
+                return None
+            if cur.get("token_exp", 0) <= now:
                 return None
             if not token or not secrets.compare_digest(str(token), str(cur.get("token") or "")):
                 return None
@@ -198,21 +273,31 @@ class _MemRegistry:
             # new generation. Only the live sid/gen is cleared.
             cur["sid"] = None
             cur["gen"] = None
-            self._retired.setdefault(uid, set()).add(gen)
+            cur["last_seen"] = now
+            cur["token_exp"] = now + self.OWNER_TTL
+            retired = self._retired.setdefault(uid, set())
+            if len(retired) < self.MAX_RETIRED_PER_UID:
+                retired.add(gen)
+                self._retired_exp[uid] = now + self.RETIRED_TTL
             self._live.pop(sid, None)
             m = self._m.pop(sid, None)
             return {"sid": sid, "room": m.get("room") if m else None}
 
     def peers_in(self, room, exclude=None):
-        return [
-            {"id": s, "name": v["name"], "uid": v.get("uid")}
-            for s, v in self._m.items()
-            if v["room"] == room and s != exclude and self._alive(s)
-        ]
+        # Snapshot under the same lock that add/remove/take use: iterating a
+        # live dict while another thread mutates it raises RuntimeError.
+        with self._lock:
+            items = list(self._m.items())
+            return [
+                {"id": s, "name": v["name"], "uid": v.get("uid")}
+                for s, v in items
+                if v["room"] == room and s != exclude and self._alive(s)
+            ]
 
     def meta(self, sid):
-        m = self._m.get(sid)
-        return {"id": sid, "name": m["name"], "uid": m.get("uid")} if m else None
+        with self._lock:
+            m = self._m.get(sid)
+            return {"id": sid, "name": m["name"], "uid": m.get("uid")} if m else None
 
     # -- persistent-pair presence channels (C12): a channel id is a hash of an
     # E2E-shared secret; two sids in the same channel are mutually-trusted
@@ -334,7 +419,11 @@ class _RedisRegistry:
         """Atomic generation ownership (same contract as _MemRegistry)."""
         if not uid or not gen:
             return {"status": "legacy", "prev": None}
-        candidate = str(token) if token else secrets.token_urlsafe(24)
+        if len(uid) > 128 or len(gen) > 128 or (token and len(str(token)) > 256):
+            return {"status": "denied", "prev": None}
+        # Mint unconditionally on a first claim; the client's value never
+        # becomes the first owner of a uid.
+        candidate = secrets.token_urlsafe(24)
         status, prev, issued = self.r.eval(
             """
             local cur = redis.call('GET', KEYS[1])
@@ -349,15 +438,29 @@ class _RedisRegistry:
               redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
               return {'new', '', ARGV[4]}
             end
-            local authorized = (ARGV[3] ~= '' and curtok and ARGV[3] == curtok)
-            if not authorized and ARGV[3] == '' and cur == ARGV[1] and cursid == ARGV[2] then
+            if not curtok then
+              -- expired bearer: stale only if its session is not live
+              if redis.call('EXISTS', 'filament:live:' .. cursid) == 0 then
+                redis.call('SET', KEYS[4], ARGV[4], 'EX', ARGV[5])
+                redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[5])
+                redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
+                return {'new', cursid or '', ARGV[4]}
+              end
+              return {'denied', cursid or '', ''}
+            end
+            local authorized = (ARGV[3] ~= '' and ARGV[3] == curtok)
+            if not authorized and cur == ARGV[1] and cursid == ARGV[2] then
               authorized = true
             end
-            if not authorized then return {'denied', cursid or '', curtok or ''} end
+            if not authorized then return {'denied', cursid or '', curtok} end
+            redis.call('EXPIRE', KEYS[4], ARGV[5])
             if cur == ARGV[1] then
               if cursid == ARGV[2] then return {'current', '', curtok} end
               redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
               return {'replace', cursid, curtok}
+            end
+            if redis.call('SCARD', KEYS[3]) >= tonumber(ARGV[6]) then
+              return {'capacity', cursid or '', curtok}
             end
             redis.call('SADD', KEYS[3], cur)
             redis.call('EXPIRE', KEYS[3], ARGV[5])
@@ -367,6 +470,7 @@ class _RedisRegistry:
             """,
             4, self._gk(uid), self._usk(uid), self._urk(uid), self._utk(uid),
             gen, sid, str(token) if token else "", candidate, self.TTL,
+            _MemRegistry.MAX_RETIRED_PER_UID,
         )
         return {"status": status, "prev": prev or None, "token": issued or None}
 
@@ -403,6 +507,7 @@ class _RedisRegistry:
             local room = redis.call('GET', 'filament:sid:' .. sid)
             redis.call('SADD', KEYS[3], ARGV[1])
             redis.call('EXPIRE', KEYS[3], ARGV[2])
+            redis.call('EXPIRE', KEYS[4], ARGV[2])
             redis.call('DEL', KEYS[2])
             return {sid, room or ''}
             """,
@@ -649,6 +754,19 @@ def register(socketio, registry):
 
     socketio.start_background_task(_lease_loop)
 
+    _session_claim_limiter = ratelimit.make_limiter(
+        "session-claim",
+        int(os.environ.get("FIL_SESSION_CLAIM_LIMIT", "600")),
+        60.0,
+        getattr(registry, "r", None),
+    )
+
+    def _session_claim_allowed(sid):
+        return _session_claim_limiter.allow([
+            f"sid:{sid}",
+            "ip:" + ratelimit.ip_bucket(ratelimit.client_ip(request)),
+        ])
+
     def _claim_session(sid, uid, gen, token=None):
         """Let a new page-load generation own `uid` immediately, evicting the
         old sid (if any), but ONLY when the caller holds the device's private
@@ -667,13 +785,19 @@ def register(socketio, registry):
                 emit("session-superseded", {"reason": "not-owner"})
                 return False, None
             return True, None
+        if not _session_claim_allowed(sid):
+            _tel("session-claim-rate-limited", sid=sid, uid=uid)
+            emit("session-superseded", {"reason": "rate-limited"})
+            return False, None
         verdict = registry.claim_session(uid, gen, sid, token)
         status = verdict.get("status")
         owner_token = verdict.get("token")
-        if status in ("retired", "denied"):
+        if status in ("retired", "denied", "capacity"):
+            reason = {"retired": "stale-generation", "denied": "not-owner",
+                      "capacity": "capacity"}[status]
             _tel("session-retired" if status == "retired" else "session-denied",
-                 sid=sid, uid=uid, gen=str(gen)[:8])
-            emit("session-superseded", {"reason": "stale-generation" if status == "retired" else "not-owner"})
+                 sid=sid, uid=uid, gen=str(gen)[:8], status=status)
+            emit("session-superseded", {"reason": reason})
             return False, None
         prev = verdict.get("prev")
         if prev and prev != sid:

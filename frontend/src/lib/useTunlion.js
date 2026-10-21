@@ -83,6 +83,10 @@ export function useTunlion() {
   const transferOwner = useRef(new Map()) // transferId -> peerId
   const cfgRef = useRef(null)
   const cfgTimerRef = useRef(null)
+  const waitUpTimerRef = useRef(null)
+  const waitUpResolveRef = useRef(null)
+  const secondWindTimerRef = useRef(null)
+  const helperTimerRef = useRef(null)
   const myNameRef = useRef(deviceName)
   const myIdRef = useRef(null) // our current socket id, for the politeness tiebreaker (#1)
   const uidRef = useRef(tabUid()) // stable per-tab identity (resume)
@@ -231,23 +235,10 @@ export function useTunlion() {
   useEffect(() => {
     const onStorage = (e) => {
       if (e.key === 'tunlion.ownerToken' && e.newValue) {
+        // Store it for a future full reload, but NEVER lift a supersede here:
+        // a superseded tab stays suspended until the user explicitly reloads.
         sigRef.current?.setToken?.(e.newValue)
-        if (supersededRef.current) {
-          // A near-simultaneous tab won the first-claim race and just stored
-          // the minted token. We can now rejoin legitimately with a fresh gen.
-          supersededRef.current = false
-          setSuperseded(null)
-          genRef.current = rotateGeneration()
-          try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
-          sigRef.current?.setIdentity?.({ name: myNameRef.current, uid: uidRef.current, gen: genRef.current })
-          sigRef.current?.resume?.()
-          sessionRef.current?.start()
-          sessionRef.current?.setRoom(roomIdRef.current, myNameRef.current, uidRef.current, genRef.current)
-          sessionRef.current?.invalidate()
-          sessionRef.current?.kick()
-          return
-        }
-        sessionRef.current?.kick()
+        if (!supersededRef.current) sessionRef.current?.kick()
         return
       }
       if (e.key !== 'tunlion.deviceName' || !e.newValue) return
@@ -574,7 +565,9 @@ export function useTunlion() {
           if (d.action === 'second-wind') {
             attemptsRef.current.set(id + ':sw', 1)
             tel('second-wind', { peer: id.slice(-6) })
-            setTimeout(() => {
+            if (secondWindTimerRef.current) clearTimeout(secondWindTimerRef.current)
+            secondWindTimerRef.current = setTimeout(() => {
+              secondWindTimerRef.current = null
               attemptsRef.current.delete(id)
               if (!linksRef.current.has(id) && document.visibilityState === 'visible') {
                 makeLinkRef.current?.({ id, name, uid })
@@ -597,6 +590,13 @@ export function useTunlion() {
   // ---- bootstrap -----------------------------------------------------------
   useEffect(() => {
     let cancelled = false
+    // Browser gates use ?test=1 to inspect the REAL live links (a `ready`
+    // label alone is not proof that the data channel opened).
+    try {
+      if (new URLSearchParams(window.location.search).has('test')) {
+        window.__tunlionTestLinks = linksRef.current
+      }
+    } catch {}
     ;(async () => {
       const cfg = await fetch(api('/api/config')).then((r) => r.json())
       if (cancelled) return
@@ -1154,12 +1154,18 @@ export function useTunlion() {
     const waitUp = (ms) =>
       new Promise((res) => {
         const start = Date.now()
+        waitUpResolveRef.current = res
         const iv = setInterval(() => {
           if (connectedRef.current || Date.now() - start > ms) {
             clearInterval(iv)
+            if (waitUpTimerRef.current === iv) {
+              waitUpTimerRef.current = null
+              waitUpResolveRef.current = null
+            }
             res(connectedRef.current)
           }
         }, 150)
+        waitUpTimerRef.current = iv
       })
     if (!connectedRef.current) {
       tel('pair-create-wait-reconnect', {})
@@ -1409,6 +1415,15 @@ export function useTunlion() {
       sessionRef.current?.stop()
       if (cfgTimerRef.current) { clearInterval(cfgTimerRef.current); cfgTimerRef.current = null }
       if (pairTimerRef.current) { clearTimeout(pairTimerRef.current); pairTimerRef.current = null }
+      if (secondWindTimerRef.current) { clearTimeout(secondWindTimerRef.current); secondWindTimerRef.current = null }
+      if (waitUpTimerRef.current) {
+        clearInterval(waitUpTimerRef.current)
+        waitUpTimerRef.current = null
+        const resolveWait = waitUpResolveRef.current
+        waitUpResolveRef.current = null
+        try { resolveWait?.(false) } catch {}
+      }
+      if (helperTimerRef.current) { clearInterval(helperTimerRef.current); helperTimerRef.current = null }
       beaconSessionClose(uidRef.current, genRef.current, loadOwnerToken())
     }
     // pageshow fires on a normal load AND on a BFCache restore. Always
@@ -1420,6 +1435,9 @@ export function useTunlion() {
       const persisted = !!(e && e.persisted)
       const restoring = persisted || pageHideSeen
       pageHideSeen = false
+      // A superseded tab stays suspended until an explicit full reload. A
+      // BFCache restore is not a reload and must not steal the session back.
+      if (supersededRef.current) return
       if (restoring) {
         genRef.current = rotateGeneration()
         try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
@@ -1489,14 +1507,47 @@ export function useTunlion() {
         return false
       }
     }
+    const stopPoll = () => {
+      if (t) clearInterval(t)
+      t = null
+      helperTimerRef.current = null
+    }
+    const startPoll = () => {
+      if (t) clearInterval(t)
+      t = setInterval(poll, 3000)
+      helperTimerRef.current = t
+    }
     // First (and possibly only) probe. Light up the steady poll iff it's there.
     poll().then((present) => {
-      if (alive && present && !t) t = setInterval(poll, 3000)
+      if (alive && present && !t) startPoll()
     })
+    // pagehide clears the interval; a BFCache restore re-probes and restarts it.
+    const onShow = () => {
+      if (!alive) return
+      poll().then((present) => { if (alive && present) startPoll() })
+    }
+    window.addEventListener('pageshow', onShow)
     return () => {
       alive = false
-      if (t) clearInterval(t)
+      stopPoll()
+      window.removeEventListener('pageshow', onShow)
     }
+  }, [])
+
+  // Test-only timer inventory (?test=1). The browser gate triggers pagehide and
+  // asserts the page-owned timers are actually gone, not just "the link closed".
+  useEffect(() => {
+    try {
+      if (!new URLSearchParams(window.location.search).has('test')) return undefined
+      window.__tunlionTimerStats = () => ({
+        cfg: !!cfgTimerRef.current,
+        pair: !!pairTimerRef.current,
+        secondWind: !!secondWindTimerRef.current,
+        waitUp: !!waitUpTimerRef.current,
+        helper: !!helperTimerRef.current,
+      })
+      return () => { try { delete window.__tunlionTimerStats } catch {} }
+    } catch { return undefined }
   }, [])
 
   const roomUrl = useMemo(

@@ -186,14 +186,19 @@ touch the socket, Firestore, or RTCPeerConnection directly.
 
 ### Generation-safe reload (web)
 - Every page load mints a new `gen`; `join`/`sync` carry `{uid, gen, token}`.
-  On the FIRST claim for a uid the relay mints a private `token` and returns it
-  only to that socket (`welcome`/sync ack, never in a roster). Every later
+  On the FIRST claim for a uid the relay mints a private `token`
+  UNCONDITIONALLY (a client-supplied value is ignored) and returns it only to
+  that socket (`welcome`/sync ack, never in a roster). Every later
   claim/reclaim/close must present it. A uid visible in `welcome`/`peer-joined`
-  is NOT authority and alone can never evict a peer.
+  is NOT authority and alone can never evict a peer. The token is a bearer
+  credential with a sliding 24h policy: valid claims refresh it; an expired
+  token whose session is not live is stale ownership and a fresh token is
+  minted. Claim rate and uid/gen/token length are bounded.
 - A token-bearing `gen` different from the relay's current owner supersedes
   that session and retires the old generation. A retired generation's late
   `sync` is refused (`{ok:false, superseded:true}`) and cannot take the session
-  back; the retired set is not age-capped.
+  back. Tombstones expire after 24h; each uid has a hard retired-generation cap
+  and ownership records are LRU/TTL bounded.
 - `pagehide` closes local PeerConnections synchronously, stops link/session/
   pairing/config timers, and `sendBeacon`s `{uid, gen, token}` to
   `POST /api/session/close`. The endpoint requires the token, honors the
@@ -205,7 +210,8 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   that sid and emits `peer-updated {id,name,uid}` to the room; it never creates
   a second peer or a second pairing record. Open tabs receive a `storage` event
   and relabel in place. A superseded tab receives `session-superseded`, stops
-  auto-reconnect, and offers a reload instead.
+  auto-reconnect, and STAYS suspended across `pageshow`/BFCache/storage events;
+  only an explicit full reload may take over again.
 - Names are human labels, not identities: duplicates are allowed; ownership
   and pairing are keyed by the token/uid (and pairing secrets), not the name.
 

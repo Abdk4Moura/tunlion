@@ -15,6 +15,7 @@ Redis when the deployment has one, so every replica shares one budget;
 otherwise in a bounded in-process map whose idle keys are evicted.
 """
 import ipaddress
+import threading
 import time
 from collections import OrderedDict, deque
 
@@ -79,6 +80,9 @@ class MemLimiter:
         self.max_keys = max_keys
         self._log = OrderedDict()  # key -> deque of timestamps
         self._ops = 0
+        # async_mode=threading calls allow() from many request threads; without
+        # this, two check-then-charge sequences can both pass the limit.
+        self._lock = threading.Lock()
 
     def _prune(self, key, now):
         q = self._log.get(key)
@@ -96,26 +100,28 @@ class MemLimiter:
 
     def allow(self, keys, now=None):
         now = time.monotonic() if now is None else now
-        self._ops += 1
-        if self._ops % 1024 == 0 or len(self._log) > self.max_keys:
-            self._sweep(now)
-        for key in keys:
-            q = self._prune(key, now)
-            if q is not None and len(q) >= self.limit:
-                return False
-        for key in keys:
-            q = self._log.get(key)
-            if q is None:
-                q = self._log[key] = deque()
-            else:
-                self._log.move_to_end(key)
-            q.append(now)
-        while len(self._log) > self.max_keys:
-            self._log.popitem(last=False)
-        return True
+        with self._lock:
+            self._ops += 1
+            if self._ops % 1024 == 0 or len(self._log) > self.max_keys:
+                self._sweep(now)
+            for key in keys:
+                q = self._prune(key, now)
+                if q is not None and len(q) >= self.limit:
+                    return False
+            for key in keys:
+                q = self._log.get(key)
+                if q is None:
+                    q = self._log[key] = deque()
+                else:
+                    self._log.move_to_end(key)
+                q.append(now)
+            while len(self._log) > self.max_keys:
+                self._log.popitem(last=False)
+            return True
 
     def __len__(self):
-        return len(self._log)
+        with self._lock:
+            return len(self._log)
 
 
 class RedisLimiter:

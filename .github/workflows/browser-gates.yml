@@ -32,6 +32,19 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The Redis registry is the multi-replica path; exercise its atomic Lua
+    # alongside the in-memory registry so the two ownership implementations
+    # cannot silently drift apart.
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -134,6 +147,11 @@ jobs:
       # The relay's generation/rename/close semantics, independent of a browser.
       - name: backend session generation
         run: python -m unittest backend.tests.test_session_generation
+
+      - name: backend session generation (Redis parity)
+        env:
+          FIL_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+        run: python -m unittest backend.tests.test_session_generation_redis
 
       # The shell outlives its link: a reattach sends resume_from (exactly the
       # bytes the terminal showed), the bar says reconnecting while the link is
