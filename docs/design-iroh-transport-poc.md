@@ -299,9 +299,12 @@ second and that an empty relay plan is an error, not `RelayMode::Default`.
 `examples/relay_echo.rs` produced the transcript quoted in the crate README.
 
 **CI wiring:** `.github/workflows/iroh-transport.yml` runs `scripts/iroh-poc.sh
-test` and `demo` on PRs touching this crate or the lock. It has **not** been
-observed green in GitHub Actions in this environment; the evidence above is the
-lease-worker run. Do not read the workflow file as a passing CI check.
+test` and `demo` on pushes to the lane branch and on PRs touching this crate or
+the lock, gated by the repo's shared `changes.yml` classifier. The crate is also
+named in `test.yml`'s explicit crate loop (two default-feature gate tests) so the
+source-test ratchet sees it; the iroh-specific tests stay in the dedicated
+workflow because they need `test-relay`. Exact-head GitHub Actions status is
+reported on the draft PR; the worker evidence above is the independent run.
 
 **Lock impact:** the workspace `Cargo.lock` grows by ~154 packages (iroh, noq,
 iroh-relay, ed25519-dalek 3 rc, etc.). Existing pins: rustls 0.23.45 → 0.23.46,
