@@ -632,9 +632,15 @@ say "AUTH-B: exec outside the enrolment ceiling is refused under authoritative"
 OUTAB=$(timeout 60 env TUNLION_CONFIG_DIR="$DS2" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AB.err" </dev/null)
 rcAB=$?
 echo "## (authoritative uncovered exec) rc=$rcAB out='$OUTAB'"
+# Both are the same ceiling verdict: a COLD exec may first arrive on an
+# Inferred binding and log the proof-attributable "needs an explicit grant"
+# reason before the re-drive; a WARM exec rides an already-Proven link and goes
+# straight to the ceiling reason. The gate is about the verdict being a
+# ceiling/grant refusal with nothing run, not which intermediate sentence the
+# gate logged first.
 if [ "$rcAB" != "0" ] \
    && ! echo "$OUTAB" | grep -q "SHOULD-NOT-RUN" \
-   && grep -qi "explicit grant" "$WORK/up-auth.log"; then
+   && grep -qiE "explicit grant|invitation ceiling" "$WORK/up-auth.log"; then
   ok "gateAUTH-B: uncovered exec refused under authoritative (grant reason, no output)"
 else
   echo "-- AB.err --"; cat "$WORK/AB.err"
