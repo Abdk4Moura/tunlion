@@ -34,6 +34,61 @@
 use filament_pair::PakeState;
 use serde_json::{json, Value};
 
+/// Versioned purpose binding carried by the EXISTING PAKE relay frames. A
+/// digest observed before confirmation is untrusted; only successful mutual
+/// confirmation authenticates it. Ordinary pairing cannot accept this purpose.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TemporaryBinding {
+    pub offer_id: String,
+    pub revision: u64,
+    pub offer_digest: [u8; 32],
+    pub host_peer: [u8; 32],
+}
+
+impl TemporaryBinding {
+    pub fn new(host_peer: [u8; 32], spec: &crate::access::AccessSpec,
+        lifetime: crate::access::Lifetime, claim_expires_at: u64) -> Result<Self, crate::access::AccessError> {
+        let mut random = [0;32];
+        getrandom::getrandom(&mut random).map_err(|_| crate::access::AccessError::Unavailable)?;
+        let mut binding = Self { offer_id: hex::encode(random), revision: 1, offer_digest: [0;32], host_peer };
+        binding.offer_digest = binding.digest_for(spec, lifetime, claim_expires_at)?;
+        Ok(binding)
+    }
+
+    pub(crate) fn digest_for(&self, spec: &crate::access::AccessSpec,
+        lifetime: crate::access::Lifetime, claim_expires_at: u64) -> Result<[u8;32], crate::access::AccessError> {
+        spec.validate()?;
+        let bytes = serde_json::to_vec(&("tunlion/temporary-offer/v1", &self.offer_id,
+            self.revision, self.host_peer, spec, lifetime, claim_expires_at))
+            .map_err(|_| crate::access::AccessError::InvalidSpec)?;
+        Ok(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref().try_into().expect("SHA256 length"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporaryRole { Host, Recipient }
+impl TemporaryRole {
+    fn wire(self) -> &'static str { match self { Self::Host => "host", Self::Recipient => "recipient" } }
+    fn opposite(self) -> Self { match self { Self::Host => Self::Recipient, Self::Recipient => Self::Host } }
+}
+
+/// Inspect only to choose the PAKE state machine before sending the recipient's
+/// first element. This is UNAUTHENTICATED negotiation, never actionable review.
+/// A recognizable temporary marker with malformed binding fails closed.
+pub fn inspect_temporary_binding(data: &Value) -> Result<Option<TemporaryBinding>, crate::access::AccessError> {
+    match data.get("purpose") {
+        None if data.get("access_binding").is_none() => Ok(None),
+        Some(value) if value.as_str() == Some("temporary-access-v1") && data["access_role"].as_str() == Some("host") => {
+            let binding: TemporaryBinding = serde_json::from_value(data["access_binding"].clone()).map_err(|_| crate::access::AccessError::InvalidSpec)?;
+            if binding.offer_id.len() != 64 || !binding.offer_id.bytes().all(|b| b.is_ascii_hexdigit()) || binding.revision == 0 {
+                return Err(crate::access::AccessError::InvalidSpec);
+            }
+            Ok(Some(binding))
+        }
+        _ => Err(crate::access::AccessError::Unsupported),
+    }
+}
+
 /// The capability set v2 first-pairing / ephemeral transfer-auth agrees on.
 /// "transfer" is the L0 baseline (always allowed); deny-by-default future caps
 /// are NOT granted here. BOTH sides MAC the identical canonical string or
@@ -107,6 +162,7 @@ pub enum Inbound {
 /// previously inlined (the live session, our element, derived K, the sent-flags)
 /// so both `pair` and the transfer path drive it identically.
 pub struct Ceremony {
+    temporary: Option<(TemporaryBinding, TemporaryRole)>,
     /// The agreed capability set (relayed in the confirm payload) and its
     /// canonical form (fed to the MAC).
     caps: Vec<String>,
@@ -204,6 +260,7 @@ impl Ceremony {
         let caps_canon = filament_pair::canonical_caps(&caps);
         let (state, msg) = filament_pair::start(password.as_bytes(), nameplate.as_bytes());
         Ceremony {
+            temporary: None,
             caps,
             caps_canon,
             scope,
@@ -217,6 +274,101 @@ impl Ceremony {
             nameplate: nameplate.to_string(),
             peer_direct: false,
         }
+    }
+
+    /// Explicit opt-in. No temporary-to-standing fallback is possible: purpose
+    /// metadata is checked and the purpose/digest are also inside the PAKE MAC.
+    pub fn new_temporary(password: &str, nameplate: &str, binding: TemporaryBinding, role: TemporaryRole) -> Self {
+        let bytes = serde_json::to_vec(&binding).expect("binding serialization");
+        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        let caps = vec![format!("temporary-access-v1:{}", hex::encode(digest.as_ref()))];
+        let mut ceremony = Self::new(password, nameplate, caps, 0x01);
+        ceremony.temporary = Some((binding, role));
+        ceremony
+    }
+
+    pub fn temporary_binding(&self) -> Option<&TemporaryBinding> {
+        self.temporary.as_ref().map(|(binding, _)| binding)
+    }
+
+    fn decorate(&self, mut payload: Value) -> Value {
+        if let Some((binding, role)) = &self.temporary {
+            payload["purpose"] = json!("temporary-access-v1");
+            payload["access_binding"] = json!(binding);
+            payload["access_role"] = json!(role.wire());
+        }
+        payload
+    }
+
+    fn confirm_canon(&self, my_fp: &str, their_fp: &str) -> String {
+        match &self.temporary {
+            None => self.caps_canon.clone(),
+            Some((_, role)) => {
+                let (host, recipient) = match role { TemporaryRole::Host => (my_fp, their_fp), TemporaryRole::Recipient => (their_fp, my_fp) };
+                // Role mapping is authenticated, not merely an unsigned relay field.
+                format!("{}|roles:{}", self.caps_canon, serde_json::to_string(&(host,recipient)).expect("fingerprints"))
+            }
+        }
+    }
+
+    /// Sign only after mutual PAKE confirmation. This challenge binds possession
+    /// to this PAKE session, purpose, role and both device keys; it reveals no K.
+    pub fn temporary_possession_message(&self, sender: [u8;32], receiver: [u8;32]) -> Result<Vec<u8>, crate::access::AccessError> {
+        let Some((binding, role)) = &self.temporary else { return Err(crate::access::AccessError::Unsupported); };
+        if self.secret.is_none() || self.aborted.is_some() { return Err(crate::access::AccessError::NotAccepted); }
+        if sender == receiver { return Err(crate::access::AccessError::InvalidProof); }
+        let k = self.k.as_ref().ok_or(crate::access::AccessError::NotAccepted)?;
+        let session = ring::digest::digest(&ring::digest::SHA256, k);
+        let host = match role { TemporaryRole::Host => sender, TemporaryRole::Recipient => receiver };
+        if binding.host_peer != host { return Err(crate::access::AccessError::WrongPeer); }
+        serde_json::to_vec(&("tunlion/temporary-possession/v1", binding, session.as_ref(), role.wire(), sender, receiver))
+            .map_err(|_| crate::access::AccessError::InvalidSpec)
+    }
+
+    pub fn authenticate_temporary_peer(&self, local: [u8;32], peer: [u8;32], signature: [u8;64])
+        -> Result<crate::access::ProvenPeer, crate::access::AccessError> {
+        let Some((binding, role)) = &self.temporary else { return Err(crate::access::AccessError::Unsupported); };
+        if self.secret.is_none() || self.aborted.is_some() { return Err(crate::access::AccessError::NotAccepted); }
+        if local == peer { return Err(crate::access::AccessError::InvalidProof); }
+        let host = match role { TemporaryRole::Host => local, TemporaryRole::Recipient => peer };
+        if binding.host_peer != host { return Err(crate::access::AccessError::WrongPeer); }
+        let session = ring::digest::digest(&ring::digest::SHA256, self.k.as_ref().ok_or(crate::access::AccessError::NotAccepted)?);
+        let bytes = serde_json::to_vec(&("tunlion/temporary-possession/v1", binding, session.as_ref(), role.opposite().wire(), peer, local))
+            .map_err(|_| crate::access::AccessError::InvalidSpec)?;
+        filament_id::verify_possession_sig(&peer, &bytes, &signature).map_err(|_| crate::access::AccessError::InvalidProof)?;
+        Ok(crate::access::ProvenPeer::from_temporary_proof(peer, binding.offer_digest))
+    }
+
+    /// A control payload on the existing proven transport, not a new channel.
+    /// Its signature must be over `temporary_possession_message(sender,receiver)`.
+    pub fn temporary_proof_payload(&self, sender: [u8;32], receiver: [u8;32], signature: [u8;64])
+        -> Result<Value, crate::access::AccessError> {
+        let message = self.temporary_possession_message(sender, receiver)?;
+        filament_id::verify_possession_sig(&sender, &message, &signature).map_err(|_| crate::access::AccessError::InvalidProof)?;
+        Ok(json!({"type":"access-possession", "v":1, "peer":hex::encode(sender), "signature":hex::encode(signature)}))
+    }
+
+    pub fn authenticate_temporary_payload(&self, local: [u8;32], payload: &Value)
+        -> Result<crate::access::ProvenPeer, crate::access::AccessError> {
+        if payload["type"].as_str() != Some("access-possession") || payload["v"].as_u64() != Some(1) {
+            return Err(crate::access::AccessError::Unsupported);
+        }
+        let decode = |field: &str, size: usize| -> Result<Vec<u8>, crate::access::AccessError> {
+            let value = payload[field].as_str().ok_or(crate::access::AccessError::InvalidProof)?;
+            if value.len() != size * 2 { return Err(crate::access::AccessError::InvalidProof); }
+            hex::decode(value).map_err(|_| crate::access::AccessError::InvalidProof)
+        };
+        let key = decode("peer", 32)?.try_into().map_err(|_| crate::access::AccessError::InvalidProof)?;
+        let signature = decode("signature", 64)?.try_into().map_err(|_| crate::access::AccessError::InvalidProof)?;
+        self.authenticate_temporary_peer(local, key, signature)
+    }
+
+    /// Recipient-side gate before showing an actionable full scope review.
+    pub fn review_temporary_offer(&self, snapshot: crate::access::AgreementSnapshot, host_signature: [u8;64],
+        local_peer: [u8;32], now: u64) -> Result<crate::access::AuthenticatedReview, crate::access::AccessError> {
+        let Some((binding, TemporaryRole::Recipient)) = &self.temporary else { return Err(crate::access::AccessError::Unsupported); };
+        if self.secret.is_none() || self.aborted.is_some() { return Err(crate::access::AccessError::NotAccepted); }
+        crate::access::AuthenticatedReview::verify(binding, snapshot, host_signature, local_peer, now)
     }
 
     /// Re-mint with a FRESH nameplate (and optionally fresh words) after a
@@ -259,12 +411,12 @@ impl Ceremony {
     /// claimer offering it to every peer that comes up in the room before the
     /// creator has spoken (only the creator, who holds the code, can use it).
     pub fn msg_payload(&self) -> Value {
-        json!({
+        self.decorate(json!({
             "type": "pake-msg", "v": 2,
             "msg": b64_encode(&self.msg),
             "np": self.nameplate,
             "direct": true,
-        })
+        }))
     }
 
     /// Send our element again, to a new partner: the peer it went to was a
@@ -294,12 +446,12 @@ impl Ceremony {
             return None;
         }
         self.sent_msg = true;
-        Some(json!({
+        Some(self.decorate(json!({
             "type": "pake-msg", "v": 2,
             "msg": b64_encode(&self.msg),
             "np": self.nameplate,
             "direct": true,
-        }))
+        })))
     }
 
     /// The opaque `signal` payload carrying our key-confirmation MAC, IF K is
@@ -313,15 +465,16 @@ impl Ceremony {
         let k = self.k.as_ref()?;
         // Scope byte is MANDATORY and is derived from the authenticated
         // introduction token (or the fixed convention for plain pair).
-        let mac = filament_pair::our_confirm(k, my_fp, their_fp, &self.caps_canon, self.scope);
+        let canon = self.confirm_canon(my_fp, their_fp);
+        let mac = filament_pair::our_confirm(k, my_fp, their_fp, &canon, self.scope);
         self.sent_confirm = true;
-        Some(json!({
+        Some(self.decorate(json!({
             "type": "pake-confirm", "v": 2,
             "mac": b64_encode(&mac),
             "caps": self.caps.clone(),
             "scope": self.scope,
             "np": self.nameplate,
-        }))
+        })))
     }
 
     /// Whether K has been derived (the peer's element was consumed).
@@ -355,6 +508,20 @@ impl Ceremony {
     /// fingerprints to verify against (the caller supplies the link's current
     /// fingerprints). On a verified confirm the secret is derived.
     pub fn on_signal(&mut self, data: &Value, fps: Option<(&str, &str)>) -> Inbound {
+        if matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm")) {
+            let matches = match &self.temporary {
+                None => data.get("purpose").is_none() && data.get("access_binding").is_none(),
+                Some((binding, role)) => data["purpose"].as_str() == Some("temporary-access-v1")
+                    && data["access_role"].as_str() == Some(role.opposite().wire())
+                    && serde_json::from_value::<TemporaryBinding>(data["access_binding"].clone()).ok().as_ref() == Some(binding),
+            };
+            if !matches {
+                self.aborted = Some("pairing purpose/binding mismatch".into());
+                self.secret = None;
+                return Inbound::Abort("pairing purpose/binding mismatch; temporary access cannot fall back to standing pairing".into());
+            }
+        }
+        if self.aborted.is_some() { return Inbound::Abort("ceremony already aborted".into()); }
         if matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm"))
             && data["direct"].as_bool() == Some(true)
         {
@@ -396,7 +563,7 @@ impl Ceremony {
                     &k,
                     my_fp,
                     their_fp,
-                    &self.caps_canon,
+                    &self.confirm_canon(my_fp, their_fp),
                     self.scope,
                     &recv_mac,
                 ) {
@@ -417,6 +584,82 @@ impl Ceremony {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_pair(binding: TemporaryBinding) -> (Ceremony, Ceremony) {
+        let mut a = Ceremony::new_temporary("correct horse", "1234", binding.clone(), TemporaryRole::Host);
+        let mut b = Ceremony::new_temporary("correct horse", "1234", binding, TemporaryRole::Recipient);
+        let am = a.take_msg_payload().unwrap(); let bm = b.take_msg_payload().unwrap();
+        assert!(matches!(a.on_signal(&bm, None), Inbound::Consumed));
+        assert!(matches!(b.on_signal(&am, None), Inbound::Consumed));
+        let ac = a.take_confirm_payload("host-fp", "recipient-fp").unwrap();
+        let bc = b.take_confirm_payload("recipient-fp", "host-fp").unwrap();
+        assert!(matches!(a.on_signal(&bc, Some(("host-fp", "recipient-fp"))), Inbound::Consumed));
+        assert!(matches!(b.on_signal(&ac, Some(("recipient-fp", "host-fp"))), Inbound::Consumed));
+        assert!(a.secret().is_some()); assert_eq!(a.secret(), b.secret());
+        (a,b)
+    }
+
+    #[test]
+    fn temporary_purpose_cannot_downgrade_or_swap_binding_or_roles() {
+        let binding = TemporaryBinding::new([1;32], &crate::access::AccessSpec::default(), crate::access::Lifetime::UntilEnded, 100).unwrap();
+        let mut temp = Ceremony::new_temporary("pw", "1234", binding.clone(), TemporaryRole::Host);
+        let mut legacy = Ceremony::new("pw", "1234", pair_v2_caps(), 1);
+        assert!(matches!(legacy.on_signal(&temp.msg_payload(), None), Inbound::Abort(_)));
+        assert!(matches!(temp.on_signal(&legacy.msg_payload(), None), Inbound::Abort(_)));
+        let mut other = binding.clone(); other.revision += 1;
+        let mut host = Ceremony::new_temporary("pw", "1234", binding.clone(), TemporaryRole::Host);
+        let recipient = Ceremony::new_temporary("pw", "1234", other, TemporaryRole::Recipient);
+        assert!(matches!(host.on_signal(&recipient.msg_payload(), None), Inbound::Abort(_)));
+        let mut host = Ceremony::new_temporary("pw", "1234", binding.clone(), TemporaryRole::Host);
+        let same_role = Ceremony::new_temporary("pw", "1234", binding.clone(), TemporaryRole::Host);
+        assert!(matches!(host.on_signal(&same_role.msg_payload(), None), Inbound::Abort(_)));
+        // Rewriting the unsigned role marker cannot bypass authenticated role mapping.
+        let mut a = Ceremony::new_temporary("pw", "1234", binding.clone(), TemporaryRole::Host);
+        let mut b = Ceremony::new_temporary("pw", "1234", binding, TemporaryRole::Host);
+        let mut am = a.msg_payload(); let mut bm = b.msg_payload();
+        am["access_role"] = json!("recipient"); bm["access_role"] = json!("recipient");
+        a.on_signal(&bm, None); b.on_signal(&am, None);
+        let mut confirm = b.take_confirm_payload("b", "a").unwrap(); confirm["access_role"] = json!("recipient");
+        assert!(matches!(a.on_signal(&confirm, Some(("a", "b"))), Inbound::Abort(_)));
+        assert!(a.secret().is_none());
+    }
+
+    #[test]
+    fn real_two_party_temporary_pake_possession_full_review_acceptance_and_end() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        use crate::access::{AccessSpec, AgreementEngine, AccessError, Lifetime, ServiceAccess, ServiceProtocol};
+        let make_key = || {
+            let bytes = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+            Ed25519KeyPair::from_pkcs8(bytes.as_ref()).unwrap()
+        };
+        let host = make_key(); let recipient = make_key();
+        let hp: [u8;32] = host.public_key().as_ref().try_into().unwrap();
+        let rp: [u8;32] = recipient.public_key().as_ref().try_into().unwrap();
+        let spec = AccessSpec { services: vec![ServiceAccess { id: "web".into(), target: "127.0.0.1:8080".parse().unwrap(), protocol: ServiceProtocol::Tcp }], ..AccessSpec::default() };
+        let binding = TemporaryBinding::new(hp, &spec, Lifetime::UntilEnded, 100).unwrap();
+        let (a,b) = temporary_pair(binding.clone());
+        let (_, different_session) = temporary_pair(binding.clone());
+        let recipient_msg = b.temporary_possession_message(rp, hp).unwrap();
+        let recipient_sig: [u8;64] = recipient.sign(&recipient_msg).as_ref().try_into().unwrap();
+        let proven_recipient = a.authenticate_temporary_peer(hp, rp, recipient_sig).unwrap();
+        assert_eq!(different_session.authenticate_temporary_peer(rp, hp, recipient_sig).err(), Some(AccessError::InvalidProof));
+        assert_eq!(a.authenticate_temporary_peer(hp, hp, recipient_sig).err(), Some(AccessError::InvalidProof));
+        let host_msg = a.temporary_possession_message(hp, rp).unwrap();
+        let host_sig = host.sign(&host_msg).as_ref().try_into().unwrap();
+        assert_eq!(b.authenticate_temporary_peer(rp, hp, host_sig).unwrap().public_key(), hp);
+        let engine = AgreementEngine::new(hp, Vec::new());
+        let s = engine.offer_bound(proven_recipient, &binding, "existing-hostname", spec.clone(), Lifetime::UntilEnded, 100, 10).unwrap();
+        assert_eq!(engine.offer_bound(proven_recipient, &binding, "existing-hostname", spec, Lifetime::UntilEnded, 100, 10).err(), Some(AccessError::InvalidProof));
+        let review_sig = host.sign(&engine.review_message(&s.id, 1, 10).unwrap()).as_ref().try_into().unwrap();
+        let review = b.review_temporary_offer(s.clone(), review_sig, rp, 10).unwrap();
+        assert_eq!(review.snapshot(), &s);
+        let mut altered = s.clone(); altered.spec.shell = true;
+        assert!(b.review_temporary_offer(altered, review_sig, rp, 10).is_err());
+        let signature = recipient.sign(&review.acceptance_message().unwrap()).as_ref().try_into().unwrap();
+        engine.accept(&s.id, 1, proven_recipient, signature, 10).unwrap();
+        engine.end(&s.id, 11).unwrap();
+        assert_eq!(engine.accept(&s.id, 1, proven_recipient, signature, 12).err(), Some(AccessError::Ended));
+    }
 
     fn fps_for(a_is_lo: bool) -> ((&'static str, &'static str), (&'static str, &'static str)) {
         // Distinct fingerprints; each side passes (mine, theirs).
