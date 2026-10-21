@@ -1,12 +1,11 @@
-//! The send command (`tunlion send`) and its single-stream helper.
+//! The send command (`tunlion send`) and its process adapter.
 //!
-//! Moved as one unit: `send_cmd` drives the send-side ceremony and the
-//! transfer loop, and `stream_one` streams one file for it -- `send_cmd` is its
-//! only caller, which is why it lives here and why it stays private rather than
-//! being promoted. Neither body contains a cfg attribute, so nothing about the
-//! move is conditional. The four spawns in `send_cmd` and the two in
-//! `stream_one` keep their captures, and `stream_one` keeps its own
-//! function-local `use anyhow::{ Result, anyhow, bail };
+//! The interactive/preflight half stays here: argument policy, path resolution,
+//! fleet brokering and terminal choices are CLI concerns. The byte engine it
+//! used to own (`stream_one`) now lives in `filament_peerloop::send::stream`, so
+//! the CLI and the library Core sender run the same chunk loop, the same
+//! `file-end` and the same source-failure mapping. `send_source`,
+//! `pake_ceremony` and `send_liveness` are shims over the same library modules.
 use crate::DEFAULT_SERVER;
 use crate::MAX_ATTEMPTS;
 use crate::PakeInbound;
@@ -58,7 +57,6 @@ use filament_transport::net;
 use net::{Ev, Transport};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -396,6 +394,11 @@ pub(crate) async fn send_cmd(
     // code can be opened in a browser; a device name is another tunlion.
     let peer_hint = no_peer_hint(to.as_deref(), use_code, room.as_deref());
     let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
+    // One log/presentation pair for this send, shared by the link loop and the
+    // library streamer. The CLI's CliLog/CliScreen delegate to `ui`, so output
+    // is unchanged.
+    let send_log = crate::host_impl::cli_log();
+    let send_present = crate::host_impl::cli_screen();
     let room = match room {
         Some(r) => r,
         None => net::fetch_auto_room(&transport_context, server).await?,
@@ -644,7 +647,7 @@ pub(crate) async fn send_cmd(
         to,                       // to_filter
         false,                    // warm_standby default (one-shot send)
         direct::direct_enabled(), // direct_ok: env gate only (file transfer keeps WebRTC default)
-        crate::host_impl::cli_log(),
+        send_log.clone(),
         crate::host_impl::cli_host(),
     );
     if known_target.is_some() {
@@ -2172,8 +2175,10 @@ pub(crate) async fn send_cmd(
                     // synthesize a peer-left for it mid-flight (see stream_one).
                     let active_sid = conn.active.clone();
                     let source_failed = source_failed.clone();
+                    let stream_log = send_log.clone();
+                    let stream_present = send_present.clone();
                     tokio::spawn(async move {
-                        match stream_one(
+                        match filament_peerloop::send::stream::stream_one(
                             out,
                             transports,
                             id.clone(),
@@ -2181,6 +2186,8 @@ pub(crate) async fn send_cmd(
                             chunk,
                             active_sid,
                             tx2.clone(),
+                            stream_log,
+                            stream_present,
                         )
                         .await
                         {
@@ -2854,273 +2861,6 @@ impl Drop for SpoolDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-async fn stream_one(
-    outgoing: Arc<tokio::sync::Mutex<Vec<Outgoing>>>,
-    transports: Vec<Arc<dyn Transport>>,
-    id: String,
-    offset: u64,
-    chunk: usize,
-    active_sid: Option<String>,
-    tx: mpsc::UnboundedSender<Ev>,
-) -> Result<()> {
-    let (sid, name, size, path) = {
-        let out = outgoing.lock().await;
-        let o = out
-            .iter()
-            .find(|o| o.id == id)
-            .ok_or_else(|| anyhow!("unknown transfer {id}"))?;
-        (o.sid, o.name.clone(), o.size, o.path.clone())
-    };
-    if offset > 0 {
-        // Said at the default level: a re-run that picks up a kept partial
-        // used to look exactly like a fresh send, so nobody could tell that
-        // the resume they were told to run had actually resumed.
-        ui::say(&crate::transfer_truth::resume_line(&name, offset, size));
-    }
-    // #28 deterministic test hook: once we cross this byte offset, synthesize a
-    // peer-left for the ACTIVE peer WITHOUT touching the data channel, exactly
-    // the "signaling reconnect mid-transfer, channel stays alive" case. The
-    // deferred-drop path must keep the link and let the transfer finish on it.
-    // Injecting the active sid is critical: a wrong id makes on_peer_left
-    // return early (link-not-found) and the test would falsely pass.
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let inject_at: Option<u64> = test_hooks::inject_peer_left_at();
-    let num = transports.len().max(1);
-    // Split the remaining bytes [offset, size) into `num` contiguous ranges and
-    // stream each over its OWN transport in a CONCURRENT task. The previous
-    // round-robin ran on one task and awaited each send_frame, so it stalled on
-    // whichever connection's flow-control window filled first and never used the
-    // links in parallel. One task per connection lets every link drain at once,
-    // which is the actual multi-stream win. The receiver reassembles by absolute
-    // offset (positional writes), so range order does not matter.
-    let bar = std::sync::Arc::new(tokio::sync::Mutex::new(ui::Progress::new(&name, size)));
-    // #262: stamp the real start of the byte stream, so the completion rate can
-    // be measured against the `delivery-ack` rather than against `flush()`.
-    {
-        let mut out = outgoing.lock().await;
-        if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-            o.stream_started = Some(Instant::now());
-            o.stream_bytes = size.saturating_sub(offset);
-        }
-    }
-    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(offset));
-    let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let remaining = size.saturating_sub(offset);
-    let per = remaining / num as u64;
-    let mut handles = Vec::with_capacity(num);
-    for i in 0..num {
-        let start = offset + i as u64 * per;
-        let end = if i == num - 1 { size } else { start + per };
-        if start >= end {
-            continue;
-        }
-        let t = transports[i].clone();
-        let path = path.clone();
-        let bar = bar.clone();
-        let progress = progress.clone();
-        let injected = injected.clone();
-        let tx = tx.clone();
-        let active_sid = active_sid.clone();
-        handles.push(tokio::spawn(async move {
-            let trace =
-                cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
-            // Every local file operation below maps its failure to a SourceRead:
-            // the source stopped being readable (a permission changed, a disk
-            // failed, the file was truncated), which no reconnect can repair.
-            use crate::send_source::source_read;
-            let mut f = tokio::fs::File::open(&path)
-                .await
-                .map_err(|e| source_read(&path, e))?;
-            f.seek(SeekFrom::Start(start))
-                .await
-                .map_err(|e| source_read(&path, e))?;
-            let mut pos = start;
-            // Double-buffer with tracing + batching
-            let mut buf_a = vec![0u8; chunk];
-            let mut buf_b = vec![0u8; chunk];
-            let mut using_buf_a = true;
-            let mut chunk_idx: u64 = 0;
-
-            // Prime the first read into buf_a.
-            let first_want = std::cmp::min(chunk as u64, end - pos) as usize;
-            if first_want == 0 {
-                return Ok(());
-            }
-            let t_first_read = if trace {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let mut cur_n = f
-                .read(&mut buf_a[..first_want])
-                .await
-                .map_err(|e| source_read(&path, e))?;
-            let _first_read_us = t_first_read.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-            if cur_n == 0 {
-                // End of file where the offer promised more bytes.
-                return Err(source_read(&path, format!("it ended at {pos} bytes, shorter than offered")));
-            }
-
-            while pos < end {
-                // Gate 11b only: slow the send so the transfer is still in flight
-                // when the reconnect lands. Zero in every build without test
-                // hooks, and the no-hook twin returns 0, so the shipped loop is
-                // unchanged.
-                //
-                // Per 64 KiB of the chunk, not per chunk: a direct-QUIC chunk is
-                // up to 1 MiB against WebRTC's ~60 KiB, so a per-chunk stall
-                // slowed QUIC sixteen times less, and 80 MB still crossed in
-                // under a second (gate 2 killed its receiver at 0 bytes). The
-                // same setting now means the same rate on either transport.
-                let stall = test_hooks::transfer_stall_ms();
-                if stall > 0 {
-                    let units = (cur_n as u64).div_ceil(64 * 1024).max(1);
-                    tokio::time::sleep(Duration::from_millis(stall.saturating_mul(units))).await;
-                }
-                // Fire the NEXT read (into the alternate buffer) BEFORE sending.
-                let next_want = std::cmp::min(chunk as u64, end - (pos + cur_n as u64)) as usize;
-                let next_read = if next_want > 0 {
-                    let mut f2 = tokio::fs::File::open(&path)
-                        .await
-                        .map_err(|e| source_read(&path, e))?;
-                    f2.seek(SeekFrom::Start(pos + cur_n as u64))
-                        .await
-                        .map_err(|e| source_read(&path, e))?;
-                    let alt_buf = if using_buf_a {
-                        std::mem::replace(&mut buf_b, vec![0u8; chunk])
-                    } else {
-                        std::mem::replace(&mut buf_a, vec![0u8; chunk])
-                    };
-                    let read_path = path.clone();
-                    Some(tokio::spawn(async move {
-                        let mut buf = alt_buf;
-                        let n = f2
-                            .read(&mut buf[..next_want])
-                            .await
-                            .map_err(|e| source_read(&read_path, e))?;
-                        Ok::<(Vec<u8>, usize), anyhow::Error>((buf, n))
-                    }))
-                } else {
-                    None
-                };
-
-                // Send the current buffer.
-                let cur_buf = if using_buf_a {
-                    &buf_a[..cur_n]
-                } else {
-                    &buf_b[..cur_n]
-                };
-                let t_send_start = if trace {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                t.send_frame(sid, pos, cur_buf).await?;
-                let send_us = t_send_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-                pos += cur_n as u64;
-
-                let total = progress.fetch_add(cur_n as u64, std::sync::atomic::Ordering::Relaxed)
-                    + cur_n as u64;
-                // Batch progress ticks
-                chunk_idx += 1;
-                let should_tick = chunk_idx % 8 == 0 || pos >= end;
-                let t_tick_start = if trace && should_tick {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                if should_tick {
-                    bar.lock().await.tick(total);
-                }
-                let tick_us = t_tick_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-                if trace && (chunk_idx % 10 == 0 || send_us + tick_us > 5000) {
-                    dlog!(
-                        "[TRACE stream_one] chunk={} offset={} len={} send_frame={}us tick={}us",
-                        chunk_idx,
-                        pos - cur_n as u64,
-                        cur_n,
-                        send_us,
-                        tick_us
-                    );
-                }
-                if let (Some(at), Some(asid)) = (inject_at, active_sid.as_ref()) {
-                    if total >= at && !injected.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        eprintln!(
-                            "[test] injecting synthetic peer-left for active sid at {total} bytes"
-                        );
-                        let _ = tx.send(Ev::PeerLeft(json!({ "id": asid })));
-                    }
-                }
-
-                // Collect the next read (it was running while we sent).
-                match next_read {
-                    Some(handle) => match handle.await {
-                        Ok(Ok((buf, n))) => {
-                            if using_buf_a {
-                                buf_b = buf;
-                            } else {
-                                buf_a = buf;
-                            }
-                            using_buf_a = !using_buf_a;
-                            cur_n = n;
-                            if cur_n == 0 {
-                                // A read-ahead is only fired while bytes remain
-                                // in this range, so EOF here is a source that
-                                // got shorter than the size it was offered at.
-                                return Err(source_read(
-                                    &path,
-                                    format!("it ended at {pos} bytes, shorter than offered"),
-                                ));
-                            }
-                        }
-                        Ok(Err(e)) => return Err(e.into()),
-                        Err(e) => return Err(anyhow!("read-ahead task panicked: {e}")),
-                    },
-                    None => break,
-                }
-            }
-            t.flush().await?;
-            Ok::<(), anyhow::Error>(())
-        }));
-    }
-    for h in handles {
-        h.await.map_err(|e| anyhow!("stream task join: {e}"))??;
-    }
-    // End frame on primary transport; flush all transports.
-    transports[0]
-        .send_control(&protocol::end_msg(&id, sid))
-        .await?;
-    for t in &transports {
-        t.flush().await?;
-    }
-    let mut out = outgoing.lock().await;
-    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-        // P4: the bytes + file-end left this side, but the transfer is NOT
-        // `done` yet. It is `done` only once the receiver returns a whole-file-
-        // verified `delivery-ack` (or the bounded no-ack fallback fires). A peer
-        // that has nothing more to send for THIS file is `sent`; the all-done
-        // exit waits on `acked`. If this file carries no `full` digest (we
-        // couldn't hash it), there's nothing for the receiver to verify-and-ack,
-        // so it's done on send, the legacy fire-and-forget behaviour, scoped to
-        // exactly the un-hashable case.
-        o.sent = true;
-        if o.full.is_none() {
-            o.acked = true;
-            o.done = true;
-            // #262: no digest means no `delivery-ack` is coming, so this is the
-            // last instant we will ever have. The rate is honest about what it
-            // can know here (bytes handed to the transport) and is the only case
-            // that still ends its interval at `flush()`.
-            let secs = o
-                .stream_started
-                .map(|t| t.elapsed().as_secs_f64())
-                .unwrap_or(0.0);
-            ui::transfer_summary(&o.name, o.stream_bytes, secs);
-        }
-    }
-    Ok(())
 }
 
 /// The establishment window: `--timeout` first, then TUNLION_SEND_TIMEOUT,

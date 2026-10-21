@@ -19,6 +19,21 @@ mod on {
     pub fn no_defer() -> bool {
         std::env::var("TUNLION_TEST_NO_DEFER").is_ok()
     }
+    /// gate 11b: hold each chunk briefly so a transfer is still flowing when
+    /// the gate's second receiver rejoins.
+    pub fn transfer_stall_ms() -> u64 {
+        std::env::var("TUNLION_TEST_TRANSFER_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+    /// #28: synthesize a peer-left for the active sid once N file-data bytes
+    /// have been sent.
+    pub fn inject_peer_left_at() -> Option<u64> {
+        std::env::var("TUNLION_TEST_INJECT_PEER_LEFT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+    }
     /// Daemon-survival gate (14c): make the first `n` peer adoptions fail the
     /// way an ICE-config timeout does. The count is a process-global latch,
     /// exactly as it was in `cli/src/main.rs`.
@@ -114,6 +129,14 @@ mod off {
     #[inline]
     pub fn no_defer() -> bool {
         false
+    }
+    #[inline]
+    pub fn transfer_stall_ms() -> u64 {
+        0
+    }
+    #[inline]
+    pub fn inject_peer_left_at() -> Option<u64> {
+        None
     }
     #[inline]
     pub fn fail_adopt() -> bool {

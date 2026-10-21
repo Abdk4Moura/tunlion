@@ -36,9 +36,13 @@ use filament_peerloop::driver::{
 use filament_peerloop::host::{HostServices, LogSink, NoLog};
 use filament_peerloop::present::NoScreen;
 use filament_peerloop::recv::dispatch::{drive, DispatchFailure, DispatchFailureKind, RecvCleanup};
+use filament_peerloop::recv::identity::IdentityService;
 use filament_peerloop::recv::ports::{RecvEnv, RecvPorts};
 use filament_peerloop::recv::report::{RecvReport, RefusedFailure};
 use filament_peerloop::recv::store::{CoreLease, DeviceStore, OverlayKey};
+use filament_peerloop::send::engine::{
+    CodeInfo, SendFailure, SendFailureKind, SendMode, SendPorts, SendRequest, SendSummary,
+};
 use filament_peerloop::shell_gate::ShellPolicy;
 use filament_transport::TransportContext;
 use host::{CoreDaemon, CoreHost, CoreIdentity, CorePrompt, CoreServers, CoreSettings};
@@ -272,6 +276,35 @@ struct EngineParts {
     relay: bool,
 }
 
+/// The explicit-root composition for one library send.
+struct SendParts {
+    ports: SendPorts,
+    server: String,
+    display_name: String,
+    uid: String,
+}
+
+impl From<SendSummary> for SendResult {
+    fn from(summary: SendSummary) -> Self {
+        Self {
+            code: summary.code,
+            expires_in_secs: summary.expires_in_secs,
+            files: summary
+                .files
+                .into_iter()
+                .map(|file| SentFile {
+                    name: file.name,
+                    stored_name: file.stored_name,
+                    bytes: file.bytes,
+                    sha256: file.sha256,
+                    delivered: file.delivered,
+                })
+                .collect(),
+            bytes: summary.bytes,
+        }
+    }
+}
+
 /// The fixed posture of a one-shot receive: the code is the only way in, the
 /// invocation ends after the transfer, and files go to the caller's directory.
 /// Kept as a value so the mapping is unit-tested without a network.
@@ -365,6 +398,17 @@ fn map_receive_error(error: anyhow::Error) -> CoreError {
     CoreError::Engine(error.to_string())
 }
 
+fn map_send_failure(failure: SendFailure) -> CoreError {
+    match failure.kind {
+        SendFailureKind::Usage => CoreError::Usage(failure.message),
+        SendFailureKind::Unreachable => CoreError::Unreachable(failure.message),
+        SendFailureKind::Denied | SendFailureKind::Refused => CoreError::Refused(failure.message),
+        SendFailureKind::Partial => CoreError::Partial(failure.message),
+        SendFailureKind::Interrupted => CoreError::Cancelled,
+        SendFailureKind::Engine => CoreError::Engine(failure.message),
+    }
+}
+
 /// A core opened on one config directory. The directory is the app's private
 /// files dir on Android. This type does not read `TUNLION_CONFIG_DIR`.
 pub struct Core {
@@ -377,6 +421,10 @@ pub struct Core {
     /// Created only when the caller is not already inside a Tokio runtime, so
     /// the engine never borrows another instance's runtime.
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
+    /// The completion half of a `create_code` send that is still running. The
+    /// engine task itself is in `engine`; this only lets `wait_send` join and
+    /// collect the summary without replacing the one-engine state machine.
+    send_job: Mutex<Option<std::sync::mpsc::Receiver<Result<SendSummary, CoreError>>>>,
 }
 
 /// An identity that exists only in memory until `Core::commit_identity`.
@@ -457,6 +505,40 @@ pub struct ReceiveSummary {
     pub bytes: u64,
 }
 
+/// A real, claimable transfer code allocated by the signaling server. The
+/// Core keeps the sender engine alive after this returns, so the code stays
+/// claimable until a receiver uses it or it expires; `wait_send` collects the
+/// transfer result and `stop` cancels both.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CreatedCode {
+    pub code: String,
+    /// Seconds until the code stops being claimable, bounded by the caller's
+    /// timeout and the server's TTL.
+    pub expires_in_secs: u64,
+}
+
+/// One file's send result.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SentFile {
+    pub name: String,
+    /// The name the receiver stored it under, when it reported one.
+    pub stored_name: Option<String>,
+    pub bytes: u64,
+    pub sha256: Option<String>,
+    /// True only when the receiver's whole-file `delivery-ack` landed (or the
+    /// file had no digest to verify, the legacy case).
+    pub delivered: bool,
+}
+
+/// What a send did. `code` is present for code sends.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SendResult {
+    pub code: Option<String>,
+    pub expires_in_secs: Option<u64>,
+    pub files: Vec<SentFile>,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum CoreError {
     #[error("{0}")]
@@ -482,9 +564,13 @@ pub enum CoreError {
     /// is for an invocation that recorded no per-file fact.
     #[error("{0}")]
     Refused(String),
-    /// A `stop` / `stop_blocking` cancelled the receive. Cancellation is never
-    /// reported as a successful (possibly empty) receive.
-    #[error("the receive was cancelled")]
+    /// Some send files were confirmed and some were not. Never reported as a
+    /// full success.
+    #[error("{0}")]
+    Partial(String),
+    /// A `stop` / `stop_blocking` cancelled the receive or send. Cancellation is
+    /// never reported as a successful (possibly empty) operation.
+    #[error("the operation was cancelled")]
     Cancelled,
     /// The 12 words did not match the phrase this pending identity minted.
     #[error("the recovery phrase did not match")]
@@ -549,6 +635,7 @@ impl Core {
             lease: Mutex::new(None),
             engine: Mutex::new(EngineSlot::None),
             runtime: Mutex::new(None),
+            send_job: Mutex::new(None),
         })
     }
 
@@ -784,6 +871,256 @@ impl Core {
                 other
             }
         }
+    }
+
+    /// Allocate a real, claimable transfer code and start the one-shot sender
+    /// engine behind it.
+    ///
+    /// This is not a random words generator. The engine connects to the
+    /// configured signaling server, asks it to register a v2 nameplate, keeps
+    /// the socket and room alive, and returns only after the server has
+    /// allocated the code. The registration stays alive in this Core's engine
+    /// slot until a receiver claims it, the code expires, or `stop` cancels it.
+    ///
+    /// The files are resolved and hashed before the code is allocated, so a
+    /// missing/unreadable local path fails without spending a code. Call
+    /// `wait_send` to reap the transfer result and release the root lease.
+    pub fn create_code(
+        &self,
+        paths: Vec<String>,
+        timeout: Option<u64>,
+    ) -> Result<CreatedCode, CoreError> {
+        let (done, code_rx) = self.begin_send(
+            paths,
+            SendMode::Code { word: None },
+            true,
+            timeout,
+        )?;
+        let code_rx = code_rx.expect("a code send asks for its code");
+        let code = match code_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(code) => code,
+            Err(_) => {
+                let _ = self.settle_one_shot();
+                return Err(CoreError::Engine(
+                    "the server did not allocate a transfer code in time".into(),
+                ));
+            }
+        };
+        *self
+            .send_job
+            .lock()
+            .map_err(|_| CoreError::Engine("the send job lock was poisoned".into()))? = Some(done);
+        Ok(CreatedCode {
+            code: code.code,
+            expires_in_secs: code.expires_in_secs,
+        })
+    }
+
+    /// Wait for the send started by `create_code` and return its per-file
+    /// result. Joins the engine and releases the same-root lease, exactly like
+    /// `receive_code` does for a receive.
+    pub fn wait_send(&self) -> Result<SendResult, CoreError> {
+        let done = self
+            .send_job
+            .lock()
+            .map_err(|_| CoreError::Engine("the send job lock was poisoned".into()))?
+            .take()
+            .ok_or_else(|| CoreError::Engine("no code send is in progress".into()))?;
+        let result = done.recv().unwrap_or_else(|_| {
+            Err(CoreError::Engine(
+                "the send dispatch ended without a result".into(),
+            ))
+        });
+        let settled = self.settle_one_shot();
+        match result {
+            Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
+            other => {
+                settled?;
+                other.map(Into::into)
+            }
+        }
+    }
+
+    /// Send files by a code in one blocking call. The code is allocated for
+    /// real and is returned in the result; callers that need the code before the
+    /// transfer finishes should use `create_code` and `wait_send`.
+    pub fn send_by_code(
+        &self,
+        paths: Vec<String>,
+        timeout: Option<u64>,
+    ) -> Result<SendResult, CoreError> {
+        let _ = self.create_code(paths, timeout)?;
+        self.wait_send()
+    }
+
+    /// Send files to an already paired device by petname. Blocking, one-shot,
+    /// with the same explicit root/identity/store and lease as `start`.
+    pub fn send_to_device(
+        &self,
+        paths: Vec<String>,
+        device: String,
+        timeout: Option<u64>,
+    ) -> Result<SendResult, CoreError> {
+        let (done, _) = self.begin_send(
+            paths,
+            SendMode::Device { name: device.clone() },
+            false,
+            timeout,
+        )?;
+        let result = done.recv().unwrap_or_else(|_| {
+            Err(CoreError::Engine(
+                "the send dispatch ended without a result".into(),
+            ))
+        });
+        let settled = self.settle_one_shot();
+        match result {
+            Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
+            other => {
+                settled?;
+                other.map(Into::into)
+            }
+        }
+    }
+
+    /// Claim the engine slot, build the shared sender ports and spawn the
+    /// one-shot engine. `want_code` adds the code-allocation channel.
+    fn begin_send(
+        &self,
+        paths: Vec<String>,
+        mode: SendMode,
+        want_code: bool,
+        timeout: Option<u64>,
+    ) -> Result<
+        (
+            std::sync::mpsc::Receiver<Result<SendSummary, CoreError>>,
+            Option<std::sync::mpsc::Receiver<CodeInfo>>,
+        ),
+        CoreError,
+    > {
+        if paths.is_empty() {
+            return Err(CoreError::Usage(
+                "nothing to send; pass at least one regular file".into(),
+            ));
+        }
+        let mut claim = StartClaim::acquire(self)?;
+        let (parts, lease) = self.prepare_send()?;
+        let SendParts {
+            ports,
+            server,
+            display_name,
+            uid,
+        } = parts;
+        let request = SendRequest {
+            server,
+            paths: paths.into_iter().map(PathBuf::from).collect(),
+            name: None,
+            mode,
+            relay: false,
+            timeout,
+            display_name,
+            uid,
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (code_tx, code_rx) = if want_code {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let dispatch = move |stop: Cancellation, _readiness: Readiness| async move {
+            let outcome = stop
+                .run(filament_peerloop::send::engine::drive(
+                    request, ports, code_tx, &stop,
+                ))
+                .await;
+            let result = match outcome {
+                DriverOutcome::Cancelled => Err(CoreError::Cancelled),
+                DriverOutcome::Returned(Ok(summary)) => Ok(summary),
+                DriverOutcome::Returned(Err(failure)) => Err(map_send_failure(failure)),
+            };
+            let _ = done_tx.send(result);
+            Ok::<(), String>(())
+        };
+        let (_handle, engine, _watch) = self.spawn_engine(dispatch)?;
+        claim.install(engine)?;
+        let published = self.publish_one_shot(lease);
+        if let Err(error) = published {
+            let _ = self.settle_one_shot();
+            return Err(error);
+        }
+        Ok((done_rx, code_rx))
+    }
+
+    /// The explicit-root host/identity/store/transport composition for one
+    /// send. The sender never reads `TUNLION_CONFIG_DIR` or spawns the CLI.
+    fn prepare_send(&self) -> Result<(SendParts, CoreLease), CoreError> {
+        let store = DeviceStore::open(&self.dir);
+        if !store.has_identity() {
+            return Err(CoreError::Identity(
+                "no identity in this config directory; run init or join first".into(),
+            ));
+        }
+        let settings =
+            CoreSettings::load(&self.dir).map_err(|e| CoreError::Config(e.to_string()))?;
+        let server = resolve_server(&settings)?;
+        let lease = store
+            .try_acquire_engine_lease()
+            .map_err(|e| CoreError::Engine(format!("engine lease: {e}")))?
+            .ok_or(CoreError::EngineLease)?;
+        let display_name = settings
+            .get("name")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "device".to_string());
+        let uid = format!(
+            "core-s-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        );
+        let overlay = OverlayKey::new(self.dir.join("overlay.ed25519"));
+        let log: Arc<dyn LogSink> = Arc::new(NoLog);
+        let settle_ms = settings
+            .u64("gate.settle_ms")
+            .filter(|n| *n > 0)
+            .map(|n| n.clamp(250, 5_000))
+            .unwrap_or(2_000);
+        let host = Arc::new(CoreHost::new(
+            self.dir.clone(),
+            store.clone(),
+            settings.clone(),
+            overlay.clone(),
+        ));
+        let identity = Arc::new(IdentityService::new(
+            store.clone(),
+            overlay,
+            display_name.clone(),
+            settle_ms,
+            log.clone(),
+        ));
+        let settings_for_peer = settings.clone();
+        let settings_for_membership = settings.clone();
+        let transport_context = TransportContext::new(
+            Some(self.dir.join("signaling-dns.json")),
+            move |key, peer| settings_for_peer.setting(key, peer),
+            move |peer| settings_for_membership.membership(peer),
+        );
+        Ok((
+            SendParts {
+                ports: SendPorts {
+                    host,
+                    identity,
+                    log,
+                    present: Arc::new(NoScreen),
+                    transport_context,
+                },
+                server,
+                display_name,
+                uid,
+            },
+            lease,
+        ))
     }
 
     /// The host/identity/port composition both `start` and `receive_code` use.

@@ -1,17 +1,18 @@
 # tunlion-core: a library any process can call
 
-Status: the receive engine is linked. `CoreSession.start`, `stop` and
-`receive_code` exist and run the real shared `recv::dispatch::drive` in
-`filament-peerloop`; the CLI is one process adapter, not the owner of the
-dispatch body. The reduced host serves the receive/transfer path and refuses
-absent desktop endpoints by name. `receive_code` is the first real transfer
-verb: an embedding caller can receive one code-addressed transfer and gets a
-per-file summary.
+Status: the receive engine is linked. `CoreSession.start`, `stop`,
+`receive_code`, `create_code`, `wait_send`, `send_by_code` and
+`send_to_device` exist. Receive runs the real shared `recv::dispatch::drive`;
+send runs the library sender engine over the same `Conn`, `Session`, SPAKE2
+ceremony, `filament-proto` controls and shared `stream_one` byte loop. The CLI
+is one process adapter, not the owner of the dispatch body. The reduced host
+serves the transfer path and refuses absent desktop endpoints by name.
 
-This is **not** yet a complete FFI product. Creating or joining a code, sending
-by code, sending to a device, and the app-facing receive/incoming-transfer
-stream still do not exist, so a fresh app cannot pair through FFI alone.
-`start` can serve an already-paired config directory; it cannot make one.
+This is **not** yet a complete FFI product. Pairing create/join, remember, a
+directory/stdin send, fleet rendezvous, resume-after-link-loss, and the
+app-facing receive/incoming-transfer stream still do not exist. `create_code`
+allocates a real transfer code for a one-shot file send; it is not a pairing
+code. `start` can serve an already-paired config directory; it cannot make one.
 
 Android is why this crate exists now. It is not the owner of the API. Kotlin
 is one binding. A Rust caller, a desktop embedding, or a later language
@@ -177,6 +178,48 @@ completion, refusal or error. It refuses with `EngineAlreadyRunning` when this
 Core already owns an engine, and with `EngineLease` when another Core or CLI
 daemon owns the root.
 
+`create_code(paths, timeout) -> CreatedCode`
+
+Starts a one-shot library sender for regular-file `paths` and returns a real,
+claimable transfer code plus its remaining lifetime. It is not a random-words
+helper: the engine connects to the configured signaling server, registers a v2
+nameplate (`pair-create`), keeps the socket and room alive in this Core's engine
+slot, and returns only after the server acknowledges the allocation. The files
+are resolved and hashed first, so a bad local path fails without spending a
+code. The code stays claimable until a receiver uses it, its TTL expires, or
+`stop` cancels the engine. Call `wait_send` to collect the transfer and release
+the same-root lease. This call is synchronous; it does network work but is
+bounded (30s for the allocation), so call it off the UI thread.
+
+`wait_send() -> SendResult`
+
+Blocks until the code send started by `create_code` completes, fails, or `stop`
+cancels it; joins the engine and releases the root lease. It returns the code,
+its expiry, one `SentFile` per input with `name`, `stored_name`, `bytes`,
+`sha256`, `delivered`, and the total stored bytes. `delivered` is true only for
+the receiver's whole-file `delivery-ack` (or a file with no digest to verify).
+A failure is typed (`Usage`, `Unreachable`, `Refused`, `Partial`, `Cancelled`,
+`Engine`), never a fake success.
+
+`send_by_code(paths, timeout) -> SendResult`
+
+The blocking convenience form: allocate the code, wait for the transfer, return
+the summary. Because the code is only returned at the end, an app that must show
+it before the receiver claims should use `create_code` then `wait_send`.
+
+`send_to_device(paths, device, timeout) -> SendResult`
+
+The same one-shot engine for an already paired device petname. It subscribes to
+that device's presence channel, proves the pair secret and the device identity,
+then sends. Unknown names fail with `Usage` before any transfer; a device that
+never appears fails with `Unreachable`. Fleet siblings, brokered rendezvous and
+the CLI's interactive/`--remember` paths are not part of this API.
+
+The shared send engine currently accepts **regular files** only. Directories,
+stdin, and the CLI's tar spool are not exposed; they remain CLI concerns. The
+timeout bounds the whole send call. There is no resume after a link loss in this
+slice, and the engine uses the same direct-QUIC/WebRTC transports as the CLI.
+
 `status().engine` is the slot state a UI polls: `NotLinked` (nothing started),
 `Starting` (startup claimed the Core, or the dispatch is spawned and readiness
 is pending), `Running`, `Stopping` (a stop is joining), `FinishedUnjoined` (the task returned
@@ -204,8 +247,8 @@ no recovery phrase. The phone uses `PendingIdentity`.
 
 These are the rest of issue #465. Do not stub them as success.
 
-- create a code, join a code, remember.
-- send to a device, send by code.
+- pairing: create a pairing code, join a code, remember.
+- directories, stdin, and send resume.
 - an app-facing receive/incoming-transfer **stream**. `receive_code` is one
   blocking call with a final summary; there is no progress/event/callback
   surface, and `start` writes accepted files to the config directory's inbox
@@ -214,9 +257,12 @@ These are the rest of issue #465. Do not stub them as success.
   does not serve a shell (`openpty` on Android already refuses).
 
 `up` on the CLI is `recv_cmd(..., daemon: true)`. There is no separate daemon
-loop. The library `Engine` driver now runs that function's dispatch, not a copy
-of `send_cmd`. `send_cmd` stays in the CLI. The library will call
-`filament-transfer` and `filament-proto` for the byte mechanics.
+loop. The library `Engine` driver runs that function's dispatch, not a copy of
+`send_cmd`. The send-side mechanics shared with the CLI (`send::stream`,
+`send::ceremony`, `send::source`, `send::liveness`) live in
+`filament-peerloop`; Core's one-shot sender composes them with `Conn`, `Session`
+and the `filament-proto` controls. The CLI keeps argument parsing, interactive
+choices and fleet brokering; it does not provide the library sender.
 
 `Conn` now lives in `filament-peerloop::conn`; `cli/src/conn.rs` is only a
 re-export shim. The library owns link state and adoption. The CLI still owns
