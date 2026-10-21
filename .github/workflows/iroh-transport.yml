@@ -35,7 +35,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Shared change detection (changes.yml). Required by the repo's CI path
+  # policy: a push with no Rust-relevant files must not start a cargo job.
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   test:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: relay echo + binding tests (linux)
     runs-on: ubuntu-latest
     timeout-minutes: 30
