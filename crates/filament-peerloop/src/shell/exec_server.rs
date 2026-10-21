@@ -1930,6 +1930,60 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
     }
 
+    /// Values are not shell-expanded or normalized on the way to the child:
+    /// an empty value stays present, `%VAR%` stays literal, CRLF survives, and
+    /// non-ASCII Windows UTF-16 text survives the wide-character environment.
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_env_preserves_literal_values() {
+        let daemon: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let explicit = vec![
+            ("TUNLION_TEST_EMPTY".into(), String::new()),
+            ("TUNLION_TEST_PERCENT".into(), r"%SystemRoot%;%PATH%".into()),
+            ("TUNLION_TEST_CRLF".into(), "line1\r\nline2".into()),
+            ("TUNLION_TEST_UNICODE".into(), "Grüße-世界-🚀".into()),
+        ];
+        let env = build_env_for(daemon, &explicit, true, &windows_current_user(), false)
+            .expect("windows env");
+        assert_eq!(env_value_exact(&env, "TUNLION_TEST_EMPTY"), Some(""));
+        assert_eq!(
+            env_value_exact(&env, "TUNLION_TEST_PERCENT"),
+            Some(r"%SystemRoot%;%PATH%")
+        );
+        assert_eq!(
+            env_value_exact(&env, "TUNLION_TEST_CRLF"),
+            Some("line1\r\nline2")
+        );
+
+        let Some(node) = program_on_path(&env, "node.exe") else {
+            panic!("node.exe is not on the daemon PATH; literal-value acceptance cannot run");
+        };
+        let mut command = std::process::Command::new(&node);
+        command
+            .args(["-e", LITERAL_ENV_ACCEPTANCE])
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .output()
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", node.display()));
+        assert!(
+            output.status.success(),
+            "node literal-value probe failed ({}): stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let got: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("node emitted JSON");
+        assert_eq!(got["empty"], "");
+        assert_eq!(got["percent"], r"%SystemRoot%;%PATH%");
+        assert_eq!(got["crlf"], "line1\r\nline2");
+        assert_eq!(got["unicode"], "Grüße-世界-🚀");
+    }
+
     /// A WSL-style launch: `wsl.exe` is a Windows child that needs the same
     /// baseline. `--help` does not require an installed distribution, so this
     /// proves the executable starts without turning a missing distro into a
@@ -1970,6 +2024,16 @@ mod tests {
             windows_text(&output.stderr)
         );
     }
+
+    #[cfg(windows)]
+    const LITERAL_ENV_ACCEPTANCE: &str = r#"
+process.stdout.write(JSON.stringify({
+  empty: process.env.TUNLION_TEST_EMPTY,
+  percent: process.env.TUNLION_TEST_PERCENT,
+  crlf: process.env.TUNLION_TEST_CRLF,
+  unicode: process.env.TUNLION_TEST_UNICODE
+}));
+"#;
 
     #[cfg(windows)]
     const NODE_ACCEPTANCE: &str = r#"

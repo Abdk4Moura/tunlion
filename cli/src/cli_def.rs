@@ -485,6 +485,8 @@ pub(crate) enum Cmd {
         /// account (via `runuser`). STRONGLY recommended when `up` runs as root:
         /// without it, a granted device gets a shell as the up-process user
         /// (often root). Requires `up` to run as root (runuser is setuid).
+        /// Exec uses this account's own HOME/USER/SHELL/XDG defaults; PATH
+        /// remains the daemon's search path unless overridden per exec.
         #[arg(long, value_name = "USER")]
         shell_user: Option<String>,
         /// Serve the shell as yourself, knowingly: any device let in can do
@@ -852,7 +854,8 @@ pub(crate) enum Cmd {
         #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,
         /// Extra environment as KEY=VALUE (repeatable; account/platform
-        /// essentials already pass, but secret/session variables do not)
+        /// essentials already pass, but secret/session variables do not).
+        /// PATH stays the daemon's search path unless overridden here.
         #[arg(long, value_name = "KEY=VALUE")]
         env: Vec<String>,
         /// The command and its arguments, passed exactly (trailing)

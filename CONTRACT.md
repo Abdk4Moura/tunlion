@@ -576,8 +576,13 @@ stream kinds are refused, never misinterpreted.
     `COMSPEC`, `TEMP`/`TMP`, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`, `APPDATA`,
     `LOCALAPPDATA`, `PROGRAMDATA`, `PROGRAMFILES`, `PROGRAMFILES(X86)`,
     `COMMONPROGRAMFILES`, `COMMONPROGRAMFILES(X86)`, `PSModulePath`,
-    `USERNAME`, `USERDOMAIN`, `COMPUTERNAME`, and
-    `PROCESSOR_ARCHITECTURE`.
+    `USERNAME`, `USERDOMAIN`, `COMPUTERNAME`,
+    `PROCESSOR_ARCHITECTURE`, and the locale/terminal facts `TERM`, `LANG`,
+    `LC_*`.
+  On both platforms `PATH` is the DAEMON'S executable-search path, not a
+  login-shell-resolved PATH for the target account (a login shell would require
+  re-parsing the command and would lose argv exactness). Explicit
+  `--env PATH=...` overrides it.
   On Unix, `--shell-user` identity and home/shell values come from the password
   database, not the daemon's environment. On Windows, `--shell-user` is
   refused because deriving another account's profile requires its token
