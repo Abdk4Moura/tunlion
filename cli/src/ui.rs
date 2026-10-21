@@ -8,7 +8,7 @@
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ------------------------------------------------------------- verbosity --
 // One global output LEVEL, resolved once at startup. The default is `info`:
@@ -777,6 +777,50 @@ pub fn status(line: &str) {
     paint_live(line);
 }
 
+/// How long a wait is allowed to stay silent before a transient line appears.
+/// A fast warm/extablish path finishes inside this window, so it prints
+/// nothing at all; only a genuinely slow one says it is waiting.
+pub const WAIT_STATUS_DELAY: Duration = Duration::from_millis(300);
+
+/// Whether a transient wait line may be shown at all: a live terminal (never a
+/// pipe, so a script's stderr gets no progress chatter), not `--quiet` (info is
+/// off), and not `--json` (stdout is the only machine surface; stderr stays
+/// clean too). Pure so every combination is testable without a terminal.
+pub fn wait_status_visible(
+    tty: bool,
+    live: bool,
+    quiet: bool,
+    json: bool,
+    elapsed: Duration,
+    delay: Duration,
+) -> bool {
+    tty && live && !quiet && !json && elapsed >= delay
+}
+
+/// The live decision behind [`wait_status_visible`], resolved against this
+/// process's terminal and verbosity. Callers still own the DELAY: they print
+/// with [`status`] only once `WAIT_STATUS_DELAY` has passed.
+pub fn wait_status_enabled() -> bool {
+    // BOTH streams must be terminals. `exec ... | head` and `exec > file` are
+    // pipelines/scripts even when stderr happens to be a terminal; a transient
+    // line there is exactly the complaint this delay exists to fix.
+    let tty = caps().tty && std::io::stdout().is_terminal();
+    wait_status_visible(
+        tty,
+        caps().live,
+        !enabled(Level::Info),
+        crate::exit_codes::json_mode(),
+        WAIT_STATUS_DELAY,
+        WAIT_STATUS_DELAY,
+    )
+}
+
+/// Erase the transient line, if one is up. Deliberately safe when nothing is:
+/// a fast path that finishes before the delay calls this unconditionally.
+pub fn clear_status() {
+    clear_live();
+}
+
 /// Echo a single-key answer cleanly (raw mode disables terminal echo, and a
 /// bare eprint would land inside whatever transient line is on screen).
 pub fn answer_echo(c: char) {
@@ -1171,6 +1215,25 @@ mod verbosity_tests {
         assert_eq!(resolve_from_flags(1, false), Level::Debug);
         assert_eq!(resolve_from_flags(2, false), Level::Trace);
         assert_eq!(resolve_from_flags(9, false), Level::Trace); // saturates
+    }
+
+    /// The exec wait line is a courtesy, never a contract: a fast path prints
+    /// nothing, and a pipe/quiet/JSON run never sees it even when slow.
+    #[test]
+    fn a_wait_line_is_delayed_and_only_for_a_live_tty() {
+        let d = WAIT_STATUS_DELAY;
+        // Fast path: finished before the delay, so no line.
+        assert!(!wait_status_visible(true, true, false, false, Duration::from_millis(50), d));
+        // Slow cold path: the line appears once the delay passed.
+        assert!(wait_status_visible(true, true, false, false, Duration::from_millis(350), d));
+        // Piped stderr: absent, however slow.
+        assert!(!wait_status_visible(false, false, false, false, Duration::from_secs(9), d));
+        // `--quiet`: absent.
+        assert!(!wait_status_visible(true, true, true, false, Duration::from_secs(9), d));
+        // `--json`: absent.
+        assert!(!wait_status_visible(true, true, false, true, Duration::from_secs(9), d));
+        // TERM=dumb: tty but not live, so absent (no control sequences).
+        assert!(!wait_status_visible(true, false, false, false, Duration::from_secs(9), d));
     }
 
     #[test]

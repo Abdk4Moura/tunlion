@@ -22,13 +22,13 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::AbortHandle;
 
 use crate::host::{HostServices, LiveCutCause};
@@ -161,6 +161,13 @@ pub struct Mux {
     /// session. Bounded: a peer that floods heartbeats loses the extras, never
     /// the daemon's memory. Dropped with the stream on every teardown path.
     exec_ctl: Mutex<HashMap<u32, mpsc::Sender<ExecCtl>>>,
+    /// INITIATOR side of a warm exec: per-sid control frames the peer sends
+    /// back to an exec this daemon opened over an already-warm link
+    /// (`exec-open-ack`, `exec-close`, `link-revoked`). The receive loop routes
+    /// them here by (link pid, sid), exactly as it routes data frames to the
+    /// stream pipes, so a warm exec needs no second listener on the shared
+    /// event channel. Bounded and dropped with the stream.
+    exec_init: Mutex<HashMap<u32, mpsc::Sender<Value>>>,
 }
 
 impl Mux {
@@ -195,6 +202,7 @@ impl Mux {
             open_ack_tx: Mutex::new(HashMap::new()),
             close_err: Mutex::new(HashMap::new()),
             exec_ctl: Mutex::new(HashMap::new()),
+            exec_init: Mutex::new(HashMap::new()),
         })
     }
 
@@ -356,6 +364,7 @@ impl Mux {
         self.resizers.lock().await.remove(&sid);
         self.open_ack_tx.lock().await.remove(&sid);
         self.exec_ctl.lock().await.remove(&sid);
+        self.exec_init.lock().await.remove(&sid);
         drop(streams);
         if let Some(s) = removed {
             if let Some(h) = s.read_pump {
@@ -420,6 +429,7 @@ impl Mux {
         self.resizers.lock().await.remove(&sid);
         self.open_ack_tx.lock().await.remove(&sid);
         self.exec_ctl.lock().await.remove(&sid);
+        self.exec_init.lock().await.remove(&sid);
         drop(streams);
         if let Some(h) = s.read_pump {
             h.abort();
@@ -577,6 +587,38 @@ impl Mux {
         }
     }
 
+    /// INITIATOR: open the control channel for an exec THIS end is sending over
+    /// a warm link. Registered BEFORE `exec-open` goes out, so an ack racing the
+    /// send still finds a receiver. Dropped with the stream.
+    pub async fn register_exec_initiator(&self, sid: u32) -> mpsc::Receiver<Value> {
+        let (tx, rx) = mpsc::channel(16);
+        self.exec_init.lock().await.insert(sid, tx);
+        rx
+    }
+
+    /// INITIATOR: deliver one `exec-open-ack`/`exec-close` frame for `sid` to
+    /// the warm exec waiting on it. Returns whether a waiter was listening; a
+    /// frame for no live warm exec is dropped, never guessed at.
+    pub async fn on_exec_initiator_frame(&self, sid: u32, v: Value) -> bool {
+        match self.exec_init.lock().await.get(&sid) {
+            Some(tx) if !tx.is_closed() => {
+                let _ = tx.try_send(v);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// INITIATOR: the link said `link-revoked` (which carries no sid). Every
+    /// in-flight warm exec on THIS link is told, so it fails loudly instead of
+    /// waiting for an exit status that will never come.
+    pub async fn on_link_revoked(&self, v: Value) {
+        let senders: Vec<_> = self.exec_init.lock().await.values().cloned().collect();
+        for tx in senders {
+            let _ = tx.try_send(v.clone());
+        }
+    }
+
     /// Take the mid-session close reason for a stream, if one was recorded, so the
     /// caller can distinguish "the peer revoked us" from "the shell exited".
     pub async fn take_close_err(&self, sid: u32) -> Option<String> {
@@ -589,6 +631,7 @@ impl Mux {
         self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
         self.open_ack_tx.lock().await.clear();
         self.exec_ctl.lock().await.clear();
+        self.exec_init.lock().await.clear();
         self.close_err.lock().await.clear();
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
@@ -1153,7 +1196,10 @@ mod tests {
             _host: &str,
             _port: u16,
         ) -> std::io::Result<tokio::net::TcpStream> {
-            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, self.0))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                self.0,
+            ))
         }
         fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<crate::host::LiveCut> {
             idev.map(|_| crate::host::LiveCut {
@@ -1165,6 +1211,39 @@ mod tests {
         fn revoke_recheck_interval(&self) -> Duration {
             Duration::from_millis(1)
         }
+    }
+
+    /// INITIATOR-side warm exec routing: an ack/close reaches only the sid it
+    /// names, a revocation reaches every in-flight exec on the link, and
+    /// dropping the stream retires the waiter so a late frame cannot wake it.
+    #[tokio::test]
+    async fn warm_exec_initiator_frames_route_by_sid_and_retire_with_the_stream() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let sid = L2_SID_BASE | 21;
+        let other = L2_SID_BASE | 22;
+        let _stream = mux.register_stream(sid).await.unwrap();
+        let mut ctl = mux.register_exec_initiator(sid).await;
+
+        let ack = json!({ "type": "exec-open-ack", "sid": sid });
+        assert!(mux.on_exec_initiator_frame(sid, ack.clone()).await);
+        assert_eq!(ctl.recv().await, Some(ack));
+        assert!(
+            !mux.on_exec_initiator_frame(other, ack).await,
+            "wrong sid has no waiter"
+        );
+
+        let revoked = json!({ "type": "link-revoked", "reason": "forgotten" });
+        mux.on_link_revoked(revoked.clone()).await;
+        assert_eq!(ctl.recv().await, Some(revoked));
+
+        mux.drop_stream(sid).await;
+        assert!(
+            !mux.on_exec_initiator_frame(sid, json!({ "type": "exec-close", "sid": sid }))
+                .await,
+            "a closed warm exec must not keep a live waiter"
+        );
+        assert!(ctl.recv().await.is_none(), "the waiter channel is dropped");
     }
 
     #[cfg(feature = "forward-server")]
@@ -1181,9 +1260,13 @@ mod tests {
         let rb = b.register(sid).await.unwrap();
         let ri = inert.register(sid).await.unwrap();
         tokio::join!(
-            a.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, ra, None),
-            b.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, rb, None),
-            inert.clone().dial_and_serve(sid, "127.0.0.1".into(), 9, ri, None),
+            a.clone()
+                .dial_and_serve(sid, "127.0.0.1".into(), 9, ra, None),
+            b.clone()
+                .dial_and_serve(sid, "127.0.0.1".into(), 9, rb, None),
+            inert
+                .clone()
+                .dial_and_serve(sid, "127.0.0.1".into(), 9, ri, None),
         );
         for (mux, transport, reason) in [
             (a, ta, "host-a"),
@@ -1220,7 +1303,9 @@ mod tests {
         for (mux, transport, reason) in [(a, ta, "cut-a"), (b, tb, "cut-b")] {
             assert_eq!(mux.live_streams().await, 0);
             let controls = transport.controls.lock().unwrap();
-            assert!(controls.iter().any(|v| v["type"] == "l2-close" && v["err"] == reason));
+            assert!(controls
+                .iter()
+                .any(|v| v["type"] == "l2-close" && v["err"] == reason));
         }
     }
     #[tokio::test]
@@ -1343,7 +1428,10 @@ mod tests {
         let mux = Mux::new(MockTransport::new(), Arc::new(NoHost));
         let sid = L2_SID_BASE | 55;
         let _old = mux.register_stream(sid).await.expect("first generation");
-        let old = mux.stream_generation(sid).await.expect("generation recorded");
+        let old = mux
+            .stream_generation(sid)
+            .await
+            .expect("generation recorded");
         mux.drop_stream(sid).await;
         let _new = mux.register_stream(sid).await.expect("sid reused");
         let new = mux.stream_generation(sid).await.expect("new generation");
@@ -1351,7 +1439,10 @@ mod tests {
 
         // The OLD generation's cleanup is a no-op against the new stream.
         mux.drop_stream_if(sid, old).await;
-        assert!(mux.has_stream(sid).await, "old cleanup must not free the new stream");
+        assert!(
+            mux.has_stream(sid).await,
+            "old cleanup must not free the new stream"
+        );
         // The CURRENT generation releases it.
         mux.drop_stream_if(sid, new).await;
         assert!(!mux.has_stream(sid).await);

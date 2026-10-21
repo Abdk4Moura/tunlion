@@ -492,6 +492,9 @@ pub async fn handle_warm_req(
         control::ReqKind::Dial { .. } => req.reject("dial not handled here").await,
         control::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
         control::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
+        control::ReqKind::Exec { .. } => {
+            crate::l2::warm_exec::handle_warm_exec(conn, l2_muxes, tx, req).await
+        }
         control::ReqKind::Ping { .. } => handle_warm_ping(conn, probes, req).await,
         // Bootstrap is dispatched before this (it defers its reply), so it never
         // reaches here; reject defensively so a future caller falls back to cold.

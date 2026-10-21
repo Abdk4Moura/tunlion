@@ -641,6 +641,27 @@ stream kinds are refused, never misinterpreted.
 a,b` scopes it to the listed peers/devices identically: a peer outside the
   scope gets the open refused, the same verdict an out-of-scope shell
   attempt receives. Exec adds no new trust -- it rides the shell grant.
+- WARM EXEC (initiator side, Unix): a CLI process MAY ask a local `up` daemon
+  to carry the exec over a link it already holds, via the control socket's
+  `exec` op. The daemon sends the SAME `exec-open` over that link, so every
+  receiving-side rule above (serving switch, shell gate, ceiling, revocation,
+  identity) runs unchanged at request time. The daemon MUST use the existing
+  link and its existing per-peer mux: opening a second link defeats the point
+  and is non-conformant. If no live, identity-proven link exists, the daemon
+  answers `no warm path`; that is the ONLY answer that lets the client
+  cold-establish. Once `exec-open` has been sent, any failure is final: the
+  command MUST NOT be replayed on a fresh link, because it may already have
+  run. The control socket bridges the session with the binary framing in
+  `filament_peerloop::exec_frame`: stdin/EOF/signal one way,
+  stdout/stderr/exit-status the other. Those three surfaces stay separate and
+  byte-exact, including a nonzero or signal-derived status. Windows has no
+  control socket yet, so it has no warm exec; the absence is explicit, not a
+  named-pipe claim.
+- WARM EXEC STANDBY: the daemon, not each CLI, owns warm-link lifetime. A warm
+  exec feeds the daemon's existing warm-hold LRU (`note_warm_use`); the
+  default `auto-warm` tier and `warm-max` cap remain the only pool, so exec
+  never creates an unbounded background fleet. A per-exec idle TTL/drop is a
+  follow-up, not part of this rule.
 
 ## Capability ledger (append-only signed ops)
 

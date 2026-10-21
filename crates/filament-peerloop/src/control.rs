@@ -38,6 +38,22 @@ pub enum ReqKind {
     Pty { peer: String, session: String, cols: u16, rows: u16, term: String, cmd: String },
     /// Relay a window-size change to an already-open warm PTY (by `session`).
     Resize { session: String, cols: u16, rows: u16 },
+    /// Run a ONE-SHOT command over the daemon's existing warm link to `peer`.
+    /// The daemon sends the same `exec-open` a cold initiator would (so the
+    /// peer's serving/capability/revocation checks run at request time), then
+    /// bridges stdin/stdout/stderr/exit over the control socket with the binary
+    /// framing in `exec_frame`. A daemon with no live, identity-proven link
+    /// answers `no warm path`, which is the client's signal to cold-establish;
+    /// once the open is sent there is NO retry (a non-idempotent command must
+    /// never run twice). `argv` is final (shell wrapping already applied) and
+    /// `env` is `KEY=VALUE`, exactly as the cold exec frame carries them.
+    Exec {
+        peer: String,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        env: Vec<String>,
+        tty: bool,
+    },
     /// Run the ssh `shell-bootstrap` over the daemon's warm link instead of a
     /// fresh cold establish: install our managed `pubkey` on `peer` and return
     /// the peer's host keys + login. The reply is deferred (it awaits the

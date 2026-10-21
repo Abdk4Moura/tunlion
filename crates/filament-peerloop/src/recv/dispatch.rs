@@ -2408,8 +2408,12 @@ async fn recv_run(
                                 req.reject(&format!("request {id} not found or not pending")).await;
                             }
                         } else {
-                            // Auto-warm: feed LRU for pty sessions (bounded, no leak).
-                            if let ReqKind::Pty { peer, .. } = &req.kind {
+                            // Auto-warm: feed LRU for pty and exec sessions
+                            // (bounded, no leak). An exec is exactly the kind of
+                            // short, repeated use that should keep one link warm
+                            // for the next one; the warm-hold machine owns the
+                            // per-peer cap and the dial policy, not each CLI.
+                            if let ReqKind::Pty { peer, .. } | ReqKind::Exec { peer, .. } = &req.kind {
                                 conn.note_warm_use(peer);
                             }
                             ports.daemon.warm_req(&conn, &mut l2_muxes, &tx, req).await;
@@ -6485,6 +6489,27 @@ async fn recv_run(
                         &mut parked_opens,
                     )
                     .await;
+                }
+                // Warm exec, INITIATOR side: the daemon opened an exec over an
+                // existing link from a sibling CLI process. Route the answers
+                // back by sid to the mux's per-stream waiter, exactly as data
+                // frames route to their pipes. A frame for no in-flight warm
+                // exec is dropped, never mistaken for a served session's.
+                Some("exec-open-ack") | Some("exec-close") => {
+                    if let (Some(mux), Some(sid)) = (l2_muxes.get(&pid), l2::wire_sid(&v)) {
+                        mux.on_exec_initiator_frame(sid, v.clone()).await;
+                    }
+                    continue;
+                }
+                // `link-revoked` names no sid. Tell every in-flight warm exec on
+                // THIS link, so each fails loudly instead of waiting for an exit
+                // status that will never arrive. Other consumers (send, a served
+                // session) keep their existing handling.
+                Some("link-revoked") => {
+                    if let Some(mux) = l2_muxes.get(&pid) {
+                        mux.on_link_revoked(v.clone()).await;
+                    }
+                    continue;
                 }
                 // Remote command execution: parse, shell-gate, direct-spawn
                 // and serve. The module sends its own ack/close/refusal

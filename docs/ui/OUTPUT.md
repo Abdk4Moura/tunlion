@@ -128,6 +128,11 @@ rule per class:
 - `exec` writes the remote command's output itself: a closed local stdout
   ends it with 141, never "Error: Broken pipe" and 1;
 - `logs` and `logs -f` stop quietly with 0 when their reader goes away.
+- `exec`'s connect wait is a TRANSIENT stderr line, not a permanent one: it
+  appears only on a live terminal, only after 300 ms (a warm or fast path
+  prints nothing), and never under `-q`, `--json`, or a pipe. It is erased
+  before the remote command's first byte, so a pipeline's stderr stays clean
+  and the command's stdout is never touched.
 
 Mixing them inside one screen is the specific bug to avoid. The invitation
 screen currently prints its body with `eprintln!` and its footer with

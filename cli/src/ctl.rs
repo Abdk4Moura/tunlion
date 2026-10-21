@@ -18,6 +18,13 @@
 //   daemon -> client:  {"ok":true}\n            (then both sides pipe raw bytes)
 //                  or:  {"ok":false,"err":"..."}\n  (daemon closes; client falls back)
 //
+// ONE op is different after that `ok`: `exec` carries a one-shot command and
+// speaks the binary stdin/stdout/stderr/exit framing in
+// `filament_peerloop::exec_frame` instead of raw bytes, so its streams and
+// status stay separate and exact. Its `no warm path` refusal is the only one
+// that makes the client cold-establish; a `refused:`/`failed:` answer after the
+// open was sent is final.
+//
 // SECURITY: the socket is created 0600 under the user's config dir, so only the
 // user who runs the daemon can talk to it. That is the same authority boundary as
 // the daemon itself (it already acts on behalf of the local user); a peer is only
@@ -675,7 +682,11 @@ mod imp {
             // Read the request off the loop so a slow/garbage client cannot stall
             // the daemon; only a well-formed request reaches the event loop.
             tokio::spawn(async move {
-                let line = match read_line(&mut sock, 4096).await {
+                // Exec requests carry the final argv/env as a JSON array, so a
+                // long `rsync` command can exceed the old 4 KiB probe bound.
+                // The socket is 0600 and local; 1 MiB caps one abusive client
+                // while leaving ordinary long command lines intact.
+                let line = match read_line(&mut sock, 1024 * 1024).await {
                     Ok(l) => l,
                     Err(_) => return,
                 };
@@ -684,6 +695,18 @@ mod imp {
                     Err(_) => return,
                 };
                 let kind = match v["op"].as_str() {
+                    // Capability probe for the warm `exec` op. Answered HERE,
+                    // without touching the daemon loop, so a newer CLI can tell
+                    // "this daemon understands exec" from an OLDER daemon that
+                    // merely closes on an unknown op. Without it, that close
+                    // would look like a lost reply AFTER an exec might have
+                    // started, and the only safe answer (do not replay) would
+                    // make exec fail against a stale daemon.
+                    Some("exec-cap") => {
+                        let _ = sock.write_all(b"{\"ok\":true}\n").await;
+                        let _ = sock.flush().await;
+                        return;
+                    }
                     Some("open") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
                         let Some(rport) = v["rport"].as_u64().and_then(|n| u16::try_from(n).ok()) else { return };
@@ -708,6 +731,43 @@ mod imp {
                         let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                         let rows = v["rows"].as_u64().unwrap_or(24) as u16;
                         ReqKind::Resize { session, cols, rows }
+                    }
+                    Some("exec") => {
+                        // Local 0600 socket, but still bounded: an argv/env list
+                        // that cannot fit the same limits the cold frame parses
+                        // is a malformed request, not something to buffer.
+                        let Some(peer) = v["peer"]
+                            .as_str()
+                            .filter(|s| !s.is_empty() && s.len() <= 256)
+                            .map(str::to_string)
+                        else { return };
+                        let Some(argv) = v["argv"].as_array().and_then(|a| {
+                            a.iter()
+                                .map(|x| x.as_str().map(str::to_string))
+                                .collect::<Option<Vec<String>>>()
+                        }) else { return };
+                        if argv.is_empty() || argv.len() > 4096 {
+                            return;
+                        }
+                        let cwd = v["cwd"]
+                            .as_str()
+                            .filter(|s| s.len() <= 4096)
+                            .map(str::to_string);
+                        let env = v["env"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str())
+                                    .filter(|s| s.len() <= 4096)
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        if env.len() > 4096 {
+                            return;
+                        }
+                        let tty = v["tty"].as_bool().unwrap_or(false);
+                        ReqKind::Exec { peer, argv, cwd, env, tty }
                     }
                     Some("bootstrap") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
@@ -872,6 +932,102 @@ mod imp {
             let path = PathBuf::from(format!("/tmp/filament-ctl-warm-missing-{}", std::process::id()));
             let _ = std::fs::remove_file(&path);
             assert!(try_list_warm_at(&path).await.is_none());
+        }
+
+        /// The capability probe is answered by the socket server itself, so a
+        /// newer CLI can tell THIS daemon from a stale one that closes unknown
+        /// ops. It never reaches the daemon loop and starts nothing.
+        #[tokio::test]
+        async fn exec_cap_probe_is_answered_without_starting_work() {
+            let dir = format!("/tmp/filament-ctl-exec-cap-{}", std::process::id());
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = PathBuf::from(&dir).join("control.sock");
+            let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let mut s = UnixStream::connect(&path).await.unwrap();
+            s.write_all(b"{\"op\":\"exec-cap\"}\n").await.unwrap();
+            s.flush().await.unwrap();
+            let reply = read_line(&mut s, 256).await.unwrap();
+            let v: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(v["ok"].as_bool(), Some(true));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                    .await
+                    .is_err(),
+                "the probe must not reach the daemon loop"
+            );
+            server.abort();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The warm-execop request keeps argv as an ARRAY (never joined or
+        /// re-parsed) and every field the cold exec frame carries. This is the
+        /// parse half; the byte framing is tested in `exec_frame`.
+        #[tokio::test]
+        async fn exec_request_parses_argv_verbatim() {
+            let dir = format!("/tmp/filament-ctl-exec-{}", std::process::id());
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = PathBuf::from(&dir).join("control.sock");
+            let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let mut s = UnixStream::connect(&path).await.unwrap();
+            let line = json!({
+                "op": "exec",
+                "peer": "box",
+                "argv": ["printf", "%s\\n", "a b", "*.log"],
+                "cwd": "/tmp",
+                "env": ["K=V"],
+                "tty": false,
+            })
+            .to_string()
+                + "\n";
+            s.write_all(line.as_bytes()).await.unwrap();
+            s.flush().await.unwrap();
+            let req = rx.recv().await.expect("exec request reached the daemon");
+            match &req.kind {
+                ReqKind::Exec { peer, argv, cwd, env, tty } => {
+                    assert_eq!(peer, "box");
+                    assert_eq!(
+                        argv.iter().map(String::as_str).collect::<Vec<_>>(),
+                        vec!["printf", "%s\n", "a b", "*.log"]
+                    );
+                    assert_eq!(cwd.as_deref(), Some("/tmp"));
+                    assert_eq!(env.len(), 1);
+                    assert_eq!(env[0], "K=V");
+                    assert!(!tty);
+                }
+                _ => panic!("expected an Exec request"),
+            }
+            req.reject("no warm path: no live link to that peer").await;
+            server.abort();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn a_malformed_exec_request_never_reaches_the_daemon() {
+            let dir = format!("/tmp/filament-ctl-exec-bad-{}", std::process::id());
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = PathBuf::from(&dir).join("control.sock");
+            let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let mut s = UnixStream::connect(&path).await.unwrap();
+            let line = json!({ "op": "exec", "peer": "box", "argv": [] }).to_string() + "\n";
+            s.write_all(line.as_bytes()).await.unwrap();
+            s.flush().await.unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                    .await
+                    .is_err(),
+                "an empty argv must be dropped, not handed to the daemon"
+            );
+            server.abort();
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[tokio::test]

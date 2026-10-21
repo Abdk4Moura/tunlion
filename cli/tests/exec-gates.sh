@@ -37,6 +37,11 @@
 #   R  FORGET -- granted exec works, then after `devices forget` the same exec
 #      is refused within seconds as an unrecognized device (exit 4), with no
 #      "tunnel up" claim and no "serving is off" / grant advice.
+#   W1 WARM -- a REAL second process (`up` on A) holds the link; a separate
+#      `exec` rides it over the Unix control socket. stdout/stderr/exit exact,
+#      and no "waiting" line on a pipe. W2 is the explicit cold fallback, W3
+#      proves `-q` stays silent, W4 kills the daemon mid-exec and proves the
+#      command is never replayed.
 #
 # PLATFORM NOTE, stated honestly: executed here on Linux. The wire property
 # under test (array preserved, never re-parsed) is platform-independent code --
@@ -527,6 +532,99 @@ else
 fi
 # Gate L below re-uses boxB's pairing with boxA.
 cp "$WORK/devices.before-forget.json" "$DB/devices.json"
+
+# ================================================================ GATE W1-W4 ==
+# WARM REUSE, as a REAL two-process path: an `up` daemon on A holds the link,
+# and a separate `exec` process rides it over the Unix control socket. These
+# gates assert the four promises that make the fast path safe:
+#   W1  warm: stdout/stderr/exit byte-exact, and no "waiting" line on a pipe.
+#   W2  explicit cold fallback (TUNLION_NO_WARM_REUSE=1) stays exact.
+#   W3  `-q`: no transient status leaks into a successful run's stderr.
+#   W4  killing the daemon mid-exec NEVER replays the command (no DONE line).
+say W1-W4
+A_DROP="$WORK/Adrop"; mkdir -p "$A_DROP"
+# The standby link is the daemon's job; make that default explicit instead of
+# relying on the runner's persisted settings.
+env TUNLION_CONFIG_DIR="$DA" "$BIN" set auto-warm on >"$WORK/W-set.log" 2>&1 || true
+env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA \
+  "$BIN" up --dir "$A_DROP" --server "$SERVER" >"$WORK/upA.log" 2>&1 &
+pids+=($!)
+# Wait for the control socket to answer, then for warm-hold to actually hold
+# the link (auto-warm is on by default; the debug line names the peer).
+warm_ready=0
+for _ in $(seq 1 40); do
+  if env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" status --json >/dev/null 2>&1 \
+     && grep -qE "warm-hold: (established connection to|skip) 'boxB'" "$WORK/upA.log"; then
+    warm_ready=1; break
+  fi
+  sleep 0.5
+done
+if [ "$warm_ready" != "1" ]; then
+  echo "-- upA.log --"; tail -20 "$WORK/upA.log"
+fi
+CMD_W=(/bin/sh -c 'printf out; printf err >&2; exit 7')
+# Portable milliseconds (BSD date has no %N).
+now_ms() { "$PYV" -c 'import time; print(int(time.time()*1000))'; }
+t0=$(now_ms)
+OUTW=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -v exec boxB -- "${CMD_W[@]}" 2>"$WORK/W.err" </dev/null)
+rcW=$?
+elW=$(( $(now_ms) - t0 ))
+echo "## (warm) rc=$rcW out='$OUTW' ${elW}ms"
+if [ "$rcW" = "7" ] && [ "$OUTW" = "out" ] \
+   && grep -qx "err" "$WORK/W.err" \
+   && grep -q "riding the local daemon's warm link" "$WORK/W.err" \
+   && ! grep -q "waiting for known device" "$WORK/W.err"; then
+  ok "gateW1: warm exec rode the daemon link (${elW}ms), stdout/stderr/rc exact, no wait line on a pipe"
+else
+  echo "-- W.err --"; cat "$WORK/W.err"; echo "-- upA.log --"; tail -20 "$WORK/upA.log"
+  bad "gateW1: warm exec did not ride the link byte-exactly (rc=$rcW out='$OUTW')"
+fi
+
+t0=$(now_ms)
+OUTC=$(TUNLION_NO_WARM_REUSE=1 timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -v exec boxB -- "${CMD_W[@]}" 2>"$WORK/Wcold.err" </dev/null)
+rcC=$?
+elC=$(( $(now_ms) - t0 ))
+echo "## (cold fallback) rc=$rcC out='$OUTC' ${elC}ms"
+if [ "$rcC" = "7" ] && [ "$OUTC" = "out" ] \
+   && grep -qx "err" "$WORK/Wcold.err" \
+   && ! grep -q "riding the local daemon's warm link" "$WORK/Wcold.err" \
+   && ! grep -q "waiting for known device" "$WORK/Wcold.err"; then
+  ok "gateW2: explicit cold path stayed byte-exact (${elC}ms), no warm claim, no wait line"
+else
+  echo "-- Wcold.err --"; cat "$WORK/Wcold.err"
+  bad "gateW2: cold fallback changed stdout/stderr/rc or leaked a status line (rc=$rcC out='$OUTC')"
+fi
+echo "## measured: warm=${elW}ms cold=${elC}ms"
+
+OUTQ=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -q exec boxB -- "${CMD_W[@]}" 2>"$WORK/Wq.err" </dev/null)
+rcQ=$?
+echo "## (-q) rc=$rcQ out='$OUTQ' stderr_bytes=$(wc -c <"$WORK/Wq.err")"
+if [ "$rcQ" = "7" ] && [ "$OUTQ" = "out" ] && [ ! -s "$WORK/Wq.err" ]; then
+  ok "gateW3: -q printed no status on a successful warm exec, stdout/rc exact"
+else
+  echo "-- Wq.err --"; cat "$WORK/Wq.err"
+  bad "gateW3: -q leaked status or changed the result (rc=$rcQ out='$OUTQ')"
+fi
+
+# No replay: a warm command's stdout starts, then the DAEMON dies. The remote
+# tree is ended by link death; a cold replay would run the whole command again
+# and eventually print DONE. It must never do that.
+( timeout 25 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- \
+    /bin/sh -c 'echo START; sleep 8; echo DONE' >"$WORK/WK.out" 2>"$WORK/WK.err" </dev/null
+  echo $? >"$WORK/WK.rc" ) &
+CPID=$!
+sleep 2
+APID=$(cat "$DA/up.pid" 2>/dev/null || true)
+kill -9 "$APID" 2>/dev/null
+wait "$CPID" 2>/dev/null
+rcK=$(cat "$WORK/WK.rc" 2>/dev/null || echo missing)
+echo "## (daemon killed mid-exec pid=$APID) rc=$rcK out='$(cat "$WORK/WK.out")'"
+if [ "$rcK" != "0" ] && grep -q START "$WORK/WK.out" && ! grep -q DONE "$WORK/WK.out"; then
+  ok "gateW4: daemon death mid-exec failed loudly and the command was never replayed (rc=$rcK)"
+else
+  echo "-- WK.err --"; cat "$WORK/WK.err"
+  bad "gateW4: a dead warm link replays or silently succeeds (rc=$rcK out='$(cat "$WORK/WK.out")')"
+fi
 
 # ===================================================================== GATE L ==
 # --shell-user REACHES EXEC: a ROOT acceptor started with `--shell-user nobody`
