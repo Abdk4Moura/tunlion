@@ -266,6 +266,10 @@ struct EngineParts {
     log: Arc<dyn LogSink>,
     host: Arc<dyn HostServices>,
     ports: RecvPorts,
+    /// The persistent `relay = always` policy. One-shot and daemon engines use
+    /// relay-only ICE when set, exactly as the CLI does; `auto` stays direct-
+    /// first with relay fallback.
+    relay: bool,
 }
 
 /// The fixed posture of a one-shot receive: the code is the only way in, the
@@ -612,6 +616,7 @@ impl Core {
             log,
             host,
             ports,
+            relay,
         } = parts;
         let dispatch = move |stop: Cancellation, readiness: Readiness| async move {
             let mut cleanup = RecvCleanup::default();
@@ -625,7 +630,7 @@ impl Core {
                 true,
                 None,
                 None,
-                false,
+                relay,
                 None,
                 true,
                 None,
@@ -699,6 +704,7 @@ impl Core {
             log,
             host,
             ports,
+            relay,
         } = parts;
 
         let report = RecvReport::new();
@@ -716,7 +722,7 @@ impl Core {
                 args.keep_open,
                 args.timeout,
                 None,
-                false,
+                relay,
                 None,
                 args.daemon,
                 args.output,
@@ -852,6 +858,7 @@ impl Core {
             env,
         );
         fs::create_dir_all(&engine_dir).map_err(io_err)?;
+        let relay = settings.relay_only();
         let settings_for_peer = settings.clone();
         let settings_for_membership = settings.clone();
         let transport_context = TransportContext::new(
@@ -866,6 +873,7 @@ impl Core {
                 log,
                 host,
                 ports,
+                relay,
             },
             lease,
         ))

@@ -81,6 +81,14 @@ impl CoreSettings {
         self.get(key).and_then(|v| v.parse().ok())
     }
 
+    /// The persistent relay policy. `always` forces relay-only ICE; the default
+    /// `auto` and `never` keep a direct-first policy (the reducer still decides
+    /// whether relay fallback is allowed).
+    pub fn relay_only(&self) -> bool {
+        self.get("relay")
+            .is_some_and(|value| value.eq_ignore_ascii_case("always"))
+    }
+
     /// The transport-facing setting read. `prefer` is stored as a JSON
     /// order/strategy object; the transport wants its `o` value.
     pub fn setting(&self, key: &str, _peer: Option<&str>) -> Option<String> {
@@ -1044,6 +1052,22 @@ mod tests {
             cert_revoked: false,
             denied: false,
             ceiling_authorizes: false,
+        }
+    }
+
+    #[test]
+    fn relay_setting_maps_only_always_to_relay_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        for (raw, want) in [
+            ("relay always\n", true),
+            ("relay auto\n", false),
+            ("relay never\n", false),
+            ("", false),
+        ] {
+            std::fs::write(&config, raw).unwrap();
+            let settings = CoreSettings::load(dir.path()).unwrap();
+            assert_eq!(settings.relay_only(), want, "{raw:?}");
         }
     }
 

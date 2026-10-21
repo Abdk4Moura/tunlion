@@ -167,6 +167,11 @@ existing transfer vocabulary (`no_space`, `declined`, `no_tty`, ...); the
 library does not re-implement admission, consent, verification or the reduced
 profile's refusals, and the CLI's process exit codes stay out of the FFI.
 
+`receive_code` and `start` honor the persistent `relay` setting: `relay always`
+uses relay-only ICE (both peers can be behind hard NAT), while the default
+`auto` stays direct-first with relay fallback. The real CLI sender + Core relay
+acceptance is `cli/tests/core-receive-relay-nat-gates.sh`.
+
 `receive_code` takes the same-directory `up.lock` lease and releases it on
 completion, refusal or error. It refuses with `EngineAlreadyRunning` when this
 Core already owns an engine, and with `EngineLease` when another Core or CLI

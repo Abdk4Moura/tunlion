@@ -149,6 +149,7 @@ on:
       - 'cli/tests/rc-polish-gates.sh'
       - 'cli/tests/concurrent-code-gates.sh'
       - 'cli/tests/core-receive-e2e-gates.sh'
+      - 'cli/tests/core-receive-relay-nat-gates.sh'
       - 'cli/tests/dashboard-gates.sh'
       - 'cli/tests/demo-gates.sh'
       - 'cli/tests/pair-bystander-gates.sh'
@@ -283,6 +284,10 @@ jobs:
             # 5: P1 sender delivery, P2 inbox bytes, P3 summary, P4 code not
             # logged, P5 receiver exit 0.
             [cli/tests/core-receive-e2e-gates.sh]=5
+            # 8: R1 sender delivery, R2 inbox bytes, R3 summary, R4 relay route,
+            # R5 ALLOCATE + relay packets, R6 cross-subnet blocked, R7 both NAT
+            # rules moved, R8 exit/no code.
+            [cli/tests/core-receive-relay-nat-gates.sh]=8
             # 9: H O S A W I G C X (feat/dashboard).
             [cli/tests/dashboard-gates.sh]=9
             # 6: A T I C N Z (feat/demo-command: the offline guided tour).
@@ -296,6 +301,7 @@ jobs:
           declare -A BOUND=(
             [cli/tests/warm-hold-idle-gates.sh]=420
             [cli/tests/daemon-path-gates.sh]=420
+            [cli/tests/core-receive-relay-nat-gates.sh]=420
           )
           # MODE MATTERS HERE, and it is not a formality: `[ -x "$g" ]` below
           # fails the gate when the file is not executable, which is how this
@@ -327,6 +333,7 @@ jobs:
                    cli/tests/rc-polish-gates.sh \
                    cli/tests/concurrent-code-gates.sh \
                    cli/tests/core-receive-e2e-gates.sh \
+                   cli/tests/core-receive-relay-nat-gates.sh \
                    cli/tests/dashboard-gates.sh \
                    cli/tests/demo-gates.sh \
                    cli/tests/pair-bystander-gates.sh; do
