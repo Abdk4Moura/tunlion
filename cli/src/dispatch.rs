@@ -925,7 +925,10 @@ pub(crate) async fn async_main() -> Result<()> {
                     // exit status or stderr imply it is routable.
                     crate::outln!("{}", id.addr_v4());
                     if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
-                        eprintln!("{}", crate::ui::paint(crate::ui::Tone::Warn, &note));
+                        // ui::say writes to stderr, so the bare address on stdout
+                        // stays machine-clean while a person still sees why it is
+                        // not routable.
+                        ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
                     }
                 } else {
                     crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
