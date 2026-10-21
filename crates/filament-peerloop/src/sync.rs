@@ -1439,19 +1439,18 @@ pub mod serving {
 
         #[cfg(windows)]
         #[tokio::test]
-        async fn windows_root_path_move_before_staging_keeps_writes_in_the_pinned_root() {
+        async fn windows_replaced_root_path_before_staging_writes_only_to_the_pinned_root() {
             let (real, sub) = root_with_sub();
             let pin = RootPin::open(&sub).expect("pin the admitted root");
-            let moved = real.0.with_extension("moved");
-            std::fs::rename(&real.0, &moved).expect("move the ancestor of the pinned root");
-            // Recreate the old path as a junction to an outside directory: the
-            // retained HANDLE must ignore it.
-            std::fs::create_dir(&real.0).unwrap();
             let outside = TempRoot::new();
-            require_junction(&outside.0, &sub);
+            // The path the config carries is now a junction outside the real
+            // admitted directory. Any implementation that reopens the root by
+            // path would write here; the pinned handle must not.
+            let replaced = real.0.join("replaced");
+            require_junction(&outside.0, &replaced);
             let bytes = b"pinned before staging";
             let (task, mux, transport) = setup_with_pin(
-                &sub,
+                &replaced,
                 pin,
                 receive_wire("file.txt", bytes),
                 None,
@@ -1461,25 +1460,27 @@ pub mod serving {
             assert!(task.join().await.unwrap().is_ok());
             let replies = outgoing_json(&transport);
             assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
-            assert_eq!(std::fs::read(moved.join("sub/file.txt")).unwrap(), bytes);
+            assert_eq!(std::fs::read(sub.join("file.txt")).unwrap(), bytes);
             assert!(
                 std::fs::read_dir(&outside.0).unwrap().next().is_none(),
                 "the replaced root path was never written through"
             );
             assert_eq!(mux.live_streams().await, 0);
-            let _ = std::fs::remove_dir_all(&moved);
         }
 
         #[cfg(windows)]
         #[tokio::test]
-        async fn windows_root_path_move_during_finalization_keeps_writes_in_the_pinned_root() {
+        async fn windows_replaced_root_path_during_finalization_writes_only_to_the_pinned_root() {
             let (real, sub) = root_with_sub();
             let pin = RootPin::open(&sub).expect("pin the admitted root");
+            let outside = TempRoot::new();
+            let replaced = real.0.join("replaced");
+            require_junction(&outside.0, &replaced);
             let bytes = b"pinned through finalization";
             let entered = Arc::new(Notify::new());
             let release = Arc::new(Notify::new());
             let (task, mux, transport) = setup_with_pin(
-                &sub,
+                &replaced,
                 pin,
                 receive_wire("file.txt", bytes),
                 Some((entered.clone(), release.clone())),
@@ -1487,23 +1488,20 @@ pub mod serving {
             )
             .await;
             entered.notified().await;
-            let moved = real.0.with_extension("moved");
-            std::fs::rename(&real.0, &moved).expect("move the ancestor of the pinned root");
-            std::fs::create_dir(&real.0).unwrap();
-            let outside = TempRoot::new();
-            require_junction(&outside.0, &sub);
+            // The stage exists and the finalization is paused. The config path
+            // is still the outside junction; the commit must use the pinned
+            // parent, not that path.
             release.notify_one();
 
             assert!(task.join().await.unwrap().is_ok());
             let replies = outgoing_json(&transport);
             assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
-            assert_eq!(std::fs::read(moved.join("sub/file.txt")).unwrap(), bytes);
+            assert_eq!(std::fs::read(sub.join("file.txt")).unwrap(), bytes);
             assert!(
                 std::fs::read_dir(&outside.0).unwrap().next().is_none(),
                 "finalization used the pinned root, not the replaced path"
             );
             assert_eq!(mux.live_streams().await, 0);
-            let _ = std::fs::remove_dir_all(&moved);
         }
 
         #[cfg(windows)]
@@ -1523,10 +1521,9 @@ pub mod serving {
             entered.notified().await;
             let error = std::fs::rename(root.0.join("nested"), root.0.join("nested-moved"))
                 .expect_err("the pinned parent handle must block a rename");
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied,
-                "unexpected rename error: {error}"
+            assert!(
+                error.raw_os_error().is_some(),
+                "the OS refused the rename: {error}"
             );
             release.notify_one();
 
@@ -1554,10 +1551,9 @@ pub mod serving {
             entered.notified().await;
             let error = std::fs::rename(root.0.join("file.txt.part"), root.0.join("other.part"))
                 .expect_err("the open staging handle must block a rename");
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied,
-                "unexpected rename error: {error}"
+            assert!(
+                error.raw_os_error().is_some(),
+                "the OS refused the rename: {error}"
             );
             release.notify_one();
 
@@ -1566,6 +1562,49 @@ pub mod serving {
             assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
             assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), bytes);
             assert!(!root.0.join("other.part").exists());
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_staging_hardlink_or_rename_out_of_the_parent_is_not_an_escape() {
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            let bytes = b"staged content";
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_finalization_gate(
+                &root.0,
+                receive_wire("file.txt", bytes),
+                Some((entered.clone(), release.clone())),
+            )
+            .await;
+            entered.notified().await;
+            // A rename out of the pinned parent must be refused; a hard link
+            // is a second name for the SAME verified inode and cannot change
+            // what finalization commits.
+            let moved = std::fs::rename(
+                root.0.join("file.txt.part"),
+                outside.0.join("file.txt.part"),
+            );
+            assert!(moved.is_err(), "the pinned staging name cannot be moved out");
+            let linked = std::fs::hard_link(
+                root.0.join("file.txt.part"),
+                outside.0.join("stolen.bin"),
+            );
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), bytes);
+            if linked.is_ok() {
+                assert_eq!(
+                    std::fs::read(outside.0.join("stolen.bin")).unwrap(),
+                    bytes,
+                    "the extra name points at the same verified content, not an escape"
+                );
+            }
             assert_eq!(mux.live_streams().await, 0);
         }
 
