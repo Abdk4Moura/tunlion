@@ -110,6 +110,7 @@ class _MemRegistry:
 
     LIVE_TTL = 60  # liveness lease; refreshed by the lease loop + on activity
     SESSION_TTL = 24 * 3600  # token/session lifetime (sliding on use)
+    SESSION_LIVE_WINDOW = 120  # last claim heartbeat; sync is every 5s
     RETIRED_TTL = 24 * 3600  # per-token generation tombstone lifetime
     MAX_SESSIONS = 50_000  # token records (LRU-evicted, never uid ownership)
     MAX_RETIRED_TOTAL = 200_000
@@ -235,20 +236,32 @@ class _MemRegistry:
                     out.append(sid)
         return out
 
+    def _session_live(self, rec, now):
+        """A session is live only if its sid is connected AND its last claim is
+        inside the configured heartbeat window. A stale score with a lingering
+        sid is not live and may be evicted under capacity pressure."""
+        sid = rec.get("sid")
+        if not sid or not self._alive(sid):
+            return False
+        return (now - rec.get("last_seen", 0)) <= self.SESSION_LIVE_WINDOW
+
     def _make_room(self, now):
         """Capacity is on TOKEN records only. Prefer expired/closed/non-live
         records; never evict a live session. Returns evicted sids, or None when
         every record is live (caller returns a capacity error)."""
+        if len(self._sessions) < self.MAX_SESSIONS:
+            return []
         out = []
-        while len(self._sessions) >= self.MAX_SESSIONS and self._sessions:
-            candidates = [
-                (token, rec)
-                for token, rec in self._sessions.items()
-                if not rec.get("sid") or not self._alive(rec.get("sid"))
-            ]
-            if not candidates:
-                return None
-            token, rec = min(candidates, key=lambda kv: kv[1].get("last_seen", 0))
+        candidates = [
+            (token, rec)
+            for token, rec in self._sessions.items()
+            if not self._session_live(rec, now)
+        ]
+        if not candidates:
+            return None
+        # Remove every non-live record on pressure, matching Redis. This frees
+        # multiple stale slots without touching a genuinely live session.
+        for token, rec in candidates:
             self._sessions.pop(token, None)
             sid = rec.get("sid")
             if sid:
@@ -413,6 +426,7 @@ class _RedisRegistry:
 
     TTL = 86400  # room/sid bookkeeping
     SESSION_TTL = _MemRegistry.SESSION_TTL
+    SESSION_LIVE_WINDOW = _MemRegistry.SESSION_LIVE_WINDOW
     RETIRED_TTL = _MemRegistry.RETIRED_TTL
     MAX_SESSIONS = _MemRegistry.MAX_SESSIONS
     MAX_RETIRED_TOTAL = _MemRegistry.MAX_RETIRED_TOTAL
@@ -518,8 +532,12 @@ class _RedisRegistry:
               for _, tok in ipairs(all) do
                 local skey = 'filament:session:' .. tok
                 local h = redis.call('HMGET', skey, 'sid', 'gen')
-                if (not h[2]) or h[2] == '' then
-                  if h[1] and h[1] ~= '' then evicted = evicted .. h[1] .. ',' end
+                local esid, egen = h[1], h[2]
+                local score = redis.call('ZSCORE', KEYS[3], tok)
+                local connected = esid and esid ~= '' and redis.call('EXISTS', 'filament:live:' .. esid) == 1
+                local stale = (not score) or tonumber(score) < (tonumber(ARGV[5]) - tonumber(ARGV[13]))
+                if (not egen) or egen == '' or (not connected) or stale then
+                  if esid and esid ~= '' then evicted = evicted .. esid .. ',' end
                   redis.call('DEL', skey)
                   redis.call('ZREM', KEYS[3], tok)
                 end
@@ -542,6 +560,7 @@ class _RedisRegistry:
             self.MAX_RETIRED_TOTAL, candidate,
             str(token) if token else "",  # ARGV[8] token for existing records
             uid, name, self.MAX_SESSIONS, self.RETIRED_TTL,
+            self.SESSION_LIVE_WINDOW,
         )
         return {"status": status, "token": out_token or None, "gen": out_gen or None,
                 "prev": prev or None,

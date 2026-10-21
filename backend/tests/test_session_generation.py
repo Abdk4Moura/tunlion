@@ -137,21 +137,20 @@ class TokenOwnership(unittest.TestCase):
         self.assertIn(victim_sid, reg._m)
         self.assertNotIn("session-superseded", _names(victim.get_received()))
 
-    def test_capacity_eviction_is_token_only(self):
+    def test_non_live_sessions_are_evicted(self):
         reg = signaling._MemRegistry()
         reg.MAX_SESSIONS = 2
         a = reg.claim_session(None, "g1", "s1", U1, "pad")
         b = reg.claim_session(None, "g1", "s2", U2, "laptop")
+        reg.refresh(["s1", "s2"])
+        reg.SESSION_LIVE_WINDOW = 0.05
+        time.sleep(0.1)  # live sids but stale heartbeat/score
         c = reg.claim_session(None, "g1", "s3", "u3", "nas")
+        self.assertEqual(c["status"], "new")
         self.assertIn("s1", c["evicted"])
+        self.assertIn("s2", c["evicted"])
         self.assertNotIn(a["token"], reg._sessions)
-        self.assertIn(b["token"], reg._sessions)
-        self.assertIn(c["token"], reg._sessions)
-        # Knowing the evicted session's uid grants nothing: this is a new one.
-        reg.MAX_SESSIONS = 3
-        d = reg.claim_session(None, "g1", "s4", U1, "pad")
-        self.assertNotEqual(d["token"], a["token"])
-        self.assertIn(b["token"], reg._sessions)
+        self.assertNotIn(b["token"], reg._sessions)
 
     def test_live_capacity_refuses_new_sessions(self):
         reg = signaling._MemRegistry()
@@ -163,7 +162,13 @@ class TokenOwnership(unittest.TestCase):
         self.assertEqual(c["status"], "capacity")
         self.assertIn(a["token"], reg._sessions)
         self.assertIn(b["token"], reg._sessions)
-        # Closing one makes room; the live b is still not evicted.
+
+    def test_closed_slot_reused_before_live(self):
+        reg = signaling._MemRegistry()
+        reg.MAX_SESSIONS = 2
+        a = reg.claim_session(None, "g1", "sa", U1, "pad")
+        b = reg.claim_session(None, "g1", "sb", U2, "laptop")
+        reg.refresh(["sb"])
         reg.take_session(a["token"], "g1")
         d = reg.claim_session(None, "g1", "sd", "u4", "phone")
         self.assertEqual(d["status"], "new")

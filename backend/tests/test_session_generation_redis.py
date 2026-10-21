@@ -46,6 +46,12 @@ class RedisTokenParity(unittest.TestCase):
             self.tokens.append(out["token"])
         return out
 
+    def test_invalid_ids_are_refused_before_lua(self):
+        self.assertEqual(self.reg.claim_session(None, "", "s1", self.uid, "pad")["status"], "denied")
+        self.assertEqual(self.reg.claim_session(None, "g1", "s1", "", "pad")["status"], "denied")
+        self.assertEqual(self.reg.claim_session(None, "g1", "s1", 123, "pad")["status"], "denied")
+        self.assertEqual(self.reg.claim_session(123, "g1", "s1", self.uid, "pad")["status"], "denied")
+
     def test_token_keyed_lifecycle(self):
         first = self.claim()
         token = first["token"]
@@ -129,19 +135,45 @@ class RedisTokenParity(unittest.TestCase):
         self.assertNotEqual(other["token"], token)
         self.assertTrue(self.reg.r.exists(self.reg._sess(other["token"])))
 
-    def test_capacity_eviction_is_token_only(self):
+    def _live(self, sid, uid=None):
+        self.reg.add(sid, "r-cap", "pad", uid or self.uid, "g1")
+        self.reg.refresh([sid])
+
+    def test_live_capacity_refuses_new_session(self):
         self.reg.MAX_SESSIONS = 2
         a = self.claim(sid="sa")
         b = self.claim(sid="sb")
+        self._live("sa")
+        self._live("sb")
         c = self.claim(sid="sc")
         self.assertEqual(c["status"], "capacity")
         self.assertIsNone(c["token"])
         self.assertTrue(self.reg.r.exists(self.reg._sess(a["token"])))
         self.assertTrue(self.reg.r.exists(self.reg._sess(b["token"])))
-        # Closing a record makes room; a live record is still never evicted.
+
+    def test_non_live_sessions_are_evicted(self):
+        self.reg.MAX_SESSIONS = 2
+        a = self.claim(sid="sa")
+        b = self.claim(sid="sb")
+        self._live("sa")
+        self._live("sb")
+        self.reg.SESSION_LIVE_WINDOW = 0.05
+        time.sleep(0.1)
+        c = self.claim(sid="sc")
+        self.assertEqual(c["status"], "new")
+        self.assertIn("sa", c["evicted"])
+        self.assertIn("sb", c["evicted"])
+        self.assertFalse(self.reg.r.exists(self.reg._sess(a["token"])))
+        self.assertFalse(self.reg.r.exists(self.reg._sess(b["token"])))
+
+    def test_closed_slot_reused_before_live(self):
+        self.reg.MAX_SESSIONS = 2
+        a = self.claim(sid="sa")
+        b = self.claim(sid="sb")
+        self._live("sb")
         self.reg.take_session(a["token"], "g1")
-        d = self.claim(sid="sd")
-        self.assertEqual(d["status"], "new")
+        c = self.claim(sid="sc")
+        self.assertEqual(c["status"], "new")
         self.assertFalse(self.reg.r.exists(self.reg._sess(a["token"])))
         self.assertTrue(self.reg.r.exists(self.reg._sess(b["token"])))
 
