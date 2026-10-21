@@ -1,5 +1,6 @@
 # The frontend browser gates. These exist because a clean build is not a correct
-# UI: every one of them drives a real Chromium against the real components.
+# UI: every one of them drives a real browser against the real components. The
+# webshell-scroll gate runs in both Chromium and WebKit (Safari's engine).
 #
 # They ran nowhere until now. All four were dead on hardcoded absolute paths
 # into worktrees that had been reaped (#250), and nothing in CI invoked them
@@ -68,9 +69,11 @@ jobs:
             echo "::error::cli/dashboard-dist is stale: run 'npx vite build --config vite.dashboard.config.js' in frontend/ and commit it"; exit 1; }
           test -z "$(git status --porcelain -- ../cli/dashboard-dist)"
 
-      - name: Install Chromium
+      - name: Install Chromium and WebKit
         working-directory: frontend
-        run: npx playwright install --with-deps chromium
+        # WebKit is Safari's engine. It is not a physical iPad; the webshell
+        # gate states that boundary and uses an iPad touch viewport/UA.
+        run: npx playwright install --with-deps chromium webkit
 
       # The dashboard's screens against a stand-in API (the real daemon is
       # covered by cli/tests/dashboard-gates.sh and the lab run).
@@ -119,7 +122,15 @@ jobs:
       # get xterm-encoded wheel reports at the touched cell, and the alternate
       # screen without mouse reporting uses xterm's cursor-key fallback. Also
       # gates taps/horizontal/multi-touch and the mobile IME path.
-      - name: webshell-scroll
+      - name: webshell-scroll (Chromium)
+        run: node frontend/tests/webshell-scroll.spec.cjs
+
+      # Same spec, Safari's engine, iPad touch viewport/user-agent. The spec
+      # fails honestly if WebKit offers no synthetic Touch/TouchEvent API; it
+      # never rewrites a touch gesture as a mouse/key gesture to go green.
+      - name: webshell-scroll (WebKit / iPad)
+        env:
+          WEBSHELL_BROWSER: webkit
         run: node frontend/tests/webshell-scroll.spec.cjs
 
       # Screenshots are the evidence a browser actually rendered, rather than the
