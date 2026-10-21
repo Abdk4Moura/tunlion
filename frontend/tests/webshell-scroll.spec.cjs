@@ -52,6 +52,44 @@ function eq(actual, expected, msg) {
     fail(`${msg}: got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)}`);
   }
 }
+// Touch taps are real input events; React state and xterm focus settle after
+// the event task. Poll instead of reading immediately (WebKit order differs).
+async function waitPolicy(page, want, msg) {
+  try {
+    await page.waitForFunction((want) => {
+      const ta = document.querySelector('.xterm-helper-textarea');
+      return !!ta
+        && ta.readOnly === want.readOnly
+        && (want.inputMode === undefined || ta.getAttribute('inputmode') === want.inputMode)
+        && (document.activeElement === ta) === want.focused;
+    }, want, { timeout: 5000 });
+  } catch (e) {
+    fail(`${msg}: ${e && e.message ? e.message : e}`);
+  }
+}
+async function waitPressed(page, want, msg) {
+  try {
+    await page.waitForFunction((want) => {
+      const b = document.querySelector('[data-testid="term-keyboard"]');
+      return !!b && b.getAttribute('aria-pressed') === want;
+    }, want, { timeout: 5000 });
+  } catch (e) {
+    fail(`${msg}: ${e && e.message ? e.message : e}`);
+  }
+}
+async function waitInputs(page, n, msg) {
+  try {
+    await page.waitForFunction((n) => window.__scroll.inputs().length >= n, n, { timeout: 5000 });
+  } catch (e) {
+    fail(`${msg}: ${e && e.message ? e.message : e}`);
+  }
+}
+async function tapHostAt(page, x, y) {
+  const host = page.locator('[data-testid="term-host"]');
+  const box = await host.boundingBox();
+  if (!box) fail('term-host has no bounding box');
+  await host.tap({ position: { x: Math.max(0, x - box.x), y: Math.max(0, y - box.y) } });
+}
 
 function build() {
   const out = path.join(__dirname, '.webshell-scroll-bundle.js');
@@ -66,17 +104,23 @@ function build() {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function openPage(browser, { width = BROWSER === 'webkit' ? 1024 : 900, height = BROWSER === 'webkit' ? 768 : 700 } = {}) {
+async function openPage(browser, { width = BROWSER === 'webkit' ? 1024 : 900, height = BROWSER === 'webkit' ? 768 : 700, touch = true } = {}) {
   const page = await browser.newPage({
     viewport: { width, height },
-    hasTouch: true,
-    ...(BROWSER === 'webkit' ? { isMobile: true, deviceScaleFactor: 2, userAgent: IPAD_UA } : {}),
+    hasTouch: touch,
+    ...(BROWSER === 'webkit' && touch ? { isMobile: true, deviceScaleFactor: 2, userAgent: IPAD_UA } : {}),
   });
   page.on('pageerror', (e) => { pageErrors.push(String(e)); console.log('[page-error]', String(e).slice(0, 400)); });
-  await page.goto(`http://127.0.0.1:${PORT}/?preview=webshell-scroll&touch=1`, { waitUntil: 'networkidle' });
+  await page.goto(`http://127.0.0.1:${PORT}/?preview=webshell-scroll&touch=${touch ? 1 : 0}`, { waitUntil: 'networkidle' });
   await page.waitForFunction(() => window.__webterm && window.__scroll, null, { timeout: 10000 })
     .catch(() => fail('WebTerminal / xterm never mounted'));
-  await page.evaluate(() => window.__webterm.focus());
+  // The component focuses the helper textarea on mount (readonly on touch).
+  // Wait for that real state instead of calling term.focus() from the harness,
+  // which would mask a missing mount-focus regression.
+  await page.waitForFunction(() => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    return !!ta && document.activeElement === ta;
+  }, null, { timeout: 5000 }).catch(() => fail('terminal helper textarea did not receive initial focus'));
   // TouchEvent construction is engine-specific. WebKit exposes `Touch` but its
   // constructor is an illegal constructor (Safari's real API is the legacy
   // `document.createTouch` + `createTouchList` pair). Do not paper over that:
@@ -203,6 +247,137 @@ function legacyWheel(code, col, row) {
   await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
   const engine = BROWSER === 'webkit' ? webkit : chromium;
   const browser = await engine.launch({ headless: true });
+
+  // Touch viewing does not ask the OS for a keyboard. Only the explicit button
+  // makes xterm editable/focuses it in the user's click stack. Browsers here do
+  // not display an iOS/Gboard IME; assert the DOM/focus contract, not fake pixels.
+  {
+    const page = await openPage(browser);
+    const keyboard = page.locator('[data-testid="term-keyboard"]');
+    const policy = () => page.evaluate(() => {
+      const ta = document.querySelector('.xterm-helper-textarea');
+      return { readOnly: ta.readOnly, inputMode: ta.getAttribute('inputmode'), focused: document.activeElement === ta };
+    });
+    await waitPressed(page, 'false', 'touch must start with keyboard off');
+    eq((await policy()).readOnly, true, 'touch viewing must not expose an editable field');
+    eq((await policy()).inputMode, 'none', 'touch viewing must suppress the IME hint');
+    await waitPolicy(page, { readOnly: true, inputMode: 'none', focused: true }, 'touch mount must focus the readonly helper for hardware keyboards');
+
+    // Physical keyboard input works from the initial readonly focus. Do this
+    // before any tap so the mount-focus contract is what is exercised.
+    await clearInputs(page);
+    await page.keyboard.type('hardware');
+    await waitInputs(page, 'hardware'.length, 'physical keys did not reach the PTY from initial focus');
+    eq((await inputs(page)).join(''), 'hardware', 'focused readonly terminal still accepts physical keys with the software keyboard off');
+    eq((await policy()).readOnly, true, 'physical typing must not make the field editable');
+
+    // A real touch tap on the terminal must neither enable editing nor hide the
+    // hardware focus/typing path.
+    await clearInputs(page);
+    const p = await cellPoint(page, 4, 4);
+    await tapHostAt(page, p.x, p.y);
+    await waitPolicy(page, { readOnly: true, inputMode: 'none', focused: true }, 'terminal touch tap must leave the readonly policy intact');
+    await page.keyboard.type('tap');
+    await waitInputs(page, 'tap'.length, 'physical keys did not reach the PTY after a terminal tap');
+    eq((await inputs(page)).join(''), 'tap', 'terminal touch tap must not block physical keys');
+
+    // A real touch tap (not a mouse click) on the button is the Safari path.
+    await keyboard.tap();
+    await waitPressed(page, 'true', 'Keyboard touch tap did not enable typing');
+    await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'show keyboard synchronously enables and focuses input');
+    await clearInputs(page);
+    await page.keyboard.type('hello');
+    await waitInputs(page, 'hello'.length, 'explicit keyboard typing did not reach the PTY');
+    eq((await inputs(page)).join(''), 'hello', 'explicit keyboard typing reaches PTY');
+    await keyboard.tap();
+    await waitPressed(page, 'false', 'Keyboard touch tap did not hide the keyboard');
+    await waitPolicy(page, { readOnly: true, inputMode: 'none', focused: false }, 'hide keyboard disables editing and blurs input');
+    await clearInputs(page);
+    await page.locator('[data-key="Esc"]').tap();
+    await waitInputs(page, 1, 'accessory Esc did not reach the PTY');
+    eq(await inputBytes(page), [[27]], 'accessory keys still work with keyboard hidden');
+    await page.locator('[data-key="Redraw"]').tap();
+    await waitPolicy(page, { readOnly: true, inputMode: 'none', focused: false }, 'redraw must not enable typing or steal focus');
+    await keyboard.tap();
+    await waitPressed(page, 'true', 'Keyboard did not reopen after accessory actions');
+    await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'keyboard can reopen after accessory actions');
+    ok('touch keyboard: real taps show/hide; taps, redraw and accessory keys keep readonly policy');
+    await page.close();
+  }
+
+  // Hidden means the SOFT keyboard is hidden. Hardware keyboards (including
+  // their IME) stay live: composition must commit once and reopening must not
+  // duplicate or lose it.
+  {
+    const page = await openPage(browser);
+    const keyboard = page.locator('[data-testid="term-keyboard"]');
+    await waitPolicy(page, { readOnly: true, inputMode: 'none', focused: true }, 'hidden hardware composition fixture is not focused/readonly');
+    await clearInputs(page);
+    await page.evaluate(() => {
+      const ta = document.querySelector('.xterm-helper-textarea');
+      ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: 'ni' }));
+      ta.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, data: '你' }));
+      ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '你' }));
+    });
+    await waitInputs(page, 1, 'hidden hardware composition did not commit');
+    eq(await inputs(page), ['你'], 'hidden hardware composition must commit exactly once');
+    eq((await page.evaluate(() => document.querySelector('.xterm-helper-textarea').readOnly)), true, 'composition must not reveal an editable field');
+
+    await keyboard.tap();
+    await waitPressed(page, 'true', 'Keyboard did not reopen after hidden composition');
+    await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'keyboard did not focus after hidden composition');
+    await clearInputs(page);
+    await page.keyboard.type('x');
+    await waitInputs(page, 1, 'typing after hidden composition did not reach the PTY');
+    eq(await inputs(page), ['x'], 'reopening after hidden composition must not duplicate the prior commit');
+    ok('hidden hardware composition/reopen: one commit, one later key, no duplicate');
+    await page.close();
+  }
+
+  // Hiding while a composition is in flight: the final compositionend must
+  // commit once after hide, and reopening must not duplicate it.
+  {
+    const page = await openPage(browser);
+    const keyboard = page.locator('[data-testid="term-keyboard"]');
+    await keyboard.tap();
+    await waitPressed(page, 'true', 'Keyboard did not enable for hide-mid-composition fixture');
+    await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'hide-mid-composition fixture did not focus');
+    await clearInputs(page);
+    await page.evaluate(() => {
+      const ta = document.querySelector('.xterm-helper-textarea');
+      ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: 'ni' }));
+      ta.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, data: '你' }));
+    });
+    await keyboard.tap();
+    await waitPressed(page, 'false', 'hide-mid-composition did not hide the keyboard');
+    await waitPolicy(page, { readOnly: true, inputMode: 'none', focused: false }, 'hide-mid-composition did not blur');
+    await page.evaluate(() => {
+      const ta = document.querySelector('.xterm-helper-textarea');
+      ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '你' }));
+    });
+    await waitInputs(page, 1, 'composition ending after hide was silently dropped');
+    eq(await inputs(page), ['你'], 'composition ending after hide must commit exactly once');
+    await clearInputs(page);
+    await keyboard.tap();
+    await waitPressed(page, 'true', 'Keyboard did not reopen after hide-mid-composition');
+    await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'keyboard did not focus after hide-mid-composition');
+    await page.keyboard.type('q');
+    await waitInputs(page, 1, 'typing after hide-mid-composition did not reach the PTY');
+    eq(await inputs(page), ['q'], 'reopen after hide-mid-composition must not duplicate the commit');
+    ok('hide mid-composition: final commit lands once; reopen commits later text only');
+    await page.close();
+  }
+  {
+    const page = await openPage(browser, { touch: false });
+    await waitPolicy(page, { readOnly: false, focused: true }, 'desktop helper is not editable/focused on mount');
+    eq(await page.locator('[data-testid="term-keyboard"]').count(), 0, 'desktop has no touch keyboard toggle');
+    await clearInputs(page);
+    await page.keyboard.type('desktop');
+    await waitInputs(page, 'desktop'.length, 'desktop typing did not reach the PTY');
+    eq((await inputs(page)).join(''), 'desktop', 'desktop auto-focused typing remains unchanged');
+    ok('desktop retains normal focus and typing without a keyboard toggle');
+    await page.close();
+  }
 
   // 1. Ordinary normal-buffer terminal: local history, never PTY data.
   {
@@ -385,6 +560,9 @@ function legacyWheel(code, col, row) {
   //    plain typing still reaches the PTY, and a composition commits once.
   {
     const page = await openPage(browser);
+    await page.locator('[data-testid="term-keyboard"]').tap();
+    await waitPressed(page, 'true', 'IME fixture did not enable the keyboard');
+    await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'IME fixture did not focus after tap');
     const s = await state(page);
     eq(s.textarea, {
       autocorrect: 'off', autocapitalize: 'off', autocomplete: 'off', spellcheck: 'false',
@@ -454,6 +632,9 @@ function legacyWheel(code, col, row) {
     eq(await inputs(page), [sgrWheel(64, 10, 5)], 'sticky Alt corrupted an SGR wheel report');
     eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'true', 'SGR wheel consumed sticky Alt');
     await clearInputs(page);
+    await page.locator('[data-testid="term-keyboard"]').tap();
+    await waitPressed(page, 'true', 'sticky Alt fixture did not enable the keyboard');
+    await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'sticky Alt fixture did not focus after tap');
     await page.keyboard.type('a');
     await wait(100);
     eq(await inputBytes(page), [[27, 97]], 'sticky Alt no longer prefixes real text');
@@ -471,6 +652,9 @@ function legacyWheel(code, col, row) {
     eq(await inputBytes(page), [legacyWheel(96, 150, 5)], 'sticky Alt corrupted a legacy wheel report');
     eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'true', 'legacy wheel consumed sticky Alt');
     await clearInputs(page);
+    await page.locator('[data-testid="term-keyboard"]').tap();
+    await waitPressed(page, 'true', 'sticky Alt fixture did not enable the keyboard');
+    await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'sticky Alt fixture did not focus after tap');
     await page.keyboard.type('a');
     await wait(100);
     eq(await inputBytes(page), [[27, 97]], 'sticky Alt no longer prefixes real text after a legacy report');
