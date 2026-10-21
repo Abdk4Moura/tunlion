@@ -978,6 +978,14 @@ mod tests {
     const SID: u32 = L2_SID_BASE + 1;
     const ERR_SID: u32 = L2_SID_BASE + 2;
 
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+
+    // The Windows acceptance test is a console process too; keep its child
+    // from flashing a window when a developer runs the suite interactively.
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
         env.iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -1438,10 +1446,13 @@ mod tests {
             return;
         };
 
-        let output = std::process::Command::new(&node)
+        let mut command = std::process::Command::new(&node);
+        command
             .args(["-e", NODE_ACCEPTANCE])
             .env_clear()
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .creation_flags(CREATE_NO_WINDOW);
+        let output = command
             .output()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", node.display()));
         assert!(
