@@ -42,7 +42,7 @@ const CREDENTIAL_CAP: usize = 64 * 1024;
 /// code word and must stay hidden. This is presentation only, never a limit.
 const WORD_DISPLAY_MAX: usize = 12;
 
-const PROMPT: &str = "  join: pairing code, invitation, or file path";
+const PROMPT: &str = "  code or invitation: pairing code, invitation, or file path";
 
 /// What the person chose at the join prompt. The raw material is held in a
 /// zeroizing buffer and is handed to the existing classifier untouched.
