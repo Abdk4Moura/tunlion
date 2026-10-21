@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::{Core, CoreError, ReceiveSummary, Status, UncommittedIdentity};
+use crate::{
+    Core, CoreError, CreatedCode, ReceiveSummary, SendResult, Status, UncommittedIdentity,
+};
 
 /// A core opened on a directory the caller owns.
 #[derive(uniffi::Object)]
@@ -101,6 +103,50 @@ impl CoreSession {
     ) -> Result<ReceiveSummary, CoreError> {
         self.inner
             .receive_code(code, PathBuf::from(dir), yes, timeout)
+    }
+
+    /// Allocate a real, claimable transfer code and start the sender engine.
+    ///
+    /// Synchronous; returns once the signaling server has registered the code.
+    /// The engine stays alive in this Core, so the code remains claimable until
+    /// a receiver uses it, it expires, or `stop` cancels it. Call `wait_send` to
+    /// collect the transfer and release the root lease. Call it off the UI
+    /// thread: the allocation itself is bounded but performs real network work.
+    pub fn create_code(
+        &self,
+        paths: Vec<String>,
+        timeout: Option<u64>,
+    ) -> Result<CreatedCode, CoreError> {
+        self.inner.create_code(paths, timeout)
+    }
+
+    /// Wait for the code send started by `create_code`. Synchronous and
+    /// blocking: it returns after the receiver acknowledges, the send fails, or
+    /// `stop` cancels it. Call it off the UI thread.
+    pub fn wait_send(&self) -> Result<SendResult, CoreError> {
+        self.inner.wait_send()
+    }
+
+    /// Send files by a freshly allocated code in one blocking call. The result
+    /// carries the code, so a caller that can show it only after the transfer
+    /// should use `create_code` and `wait_send` instead.
+    pub fn send_by_code(
+        &self,
+        paths: Vec<String>,
+        timeout: Option<u64>,
+    ) -> Result<SendResult, CoreError> {
+        self.inner.send_by_code(paths, timeout)
+    }
+
+    /// Send files to an already paired device by petname. Synchronous and
+    /// blocking; call it off the UI thread.
+    pub fn send_to_device(
+        &self,
+        paths: Vec<String>,
+        device: String,
+        timeout: Option<u64>,
+    ) -> Result<SendResult, CoreError> {
+        self.inner.send_to_device(paths, device, timeout)
     }
 }
 

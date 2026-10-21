@@ -44,11 +44,24 @@ caller: the CLI's process runtime, or the runtime `tunlion-core` creates per
   request stop and join its own epilogue. `Core::receive_code` reuses that same
   host/ports/identity/store and lease for one `code: Some, daemon: false,
   keep_open: false` dispatch, waits for the dispatch result (not readiness) and
-  returns a per-file `ReceiveSummary`. `start_with_dispatch` remains for a
-  Rust embedder that needs a different dispatch. UniFFI exposes synchronous
-  `CoreSession::start` / `stop` / `receive_code`; `receive_code` blocks for the
-  transfer, so a UI caller must invoke them off its main thread, and no Tokio
-  runtime crosses the boundary.
+  returns a per-file `ReceiveSummary`. `Core::create_code` starts the one-shot
+  sender engine, waits for a real signaling `pair-create` allocation, and returns
+  the claimable code while the engine keeps the socket/room and root lease
+  alive; `wait_send`, `send_by_code` and `send_to_device` collect the per-file
+  `SendResult`. A code registration expires on its TTL, and `stop` cancels it.
+  `start_with_dispatch` remains for a Rust embedder that needs a different
+  dispatch. UniFFI exposes synchronous `CoreSession::start` / `stop` /
+  `receive_code` / `create_code` / `wait_send` / `send_by_code` /
+  `send_to_device`; receive and send block for the transfer, so a UI caller must
+  invoke them off its main thread, and no Tokio runtime crosses the boundary.
+
+  The send side shares its actual byte engine with the CLI: `stream_one`,
+  the source digest/read-failure rules, the SPAKE2 ceremony and the liveness
+  sentences moved to `filament_peerloop::send`. The CLI keeps its interactive,
+  fleet and argument policy; Core runs a reduced one-shot loop over the same
+  `Conn`, `Session`, `Ceremony`, `filament-proto` controls and stream engine.
+  Core's sender accepts regular files only in this slice (no directories,
+  stdin, fleet rendezvous or resume after link loss).
 
   `Core` owns exactly one engine per instance, behind one mutex, with an
   explicit slot state machine:
@@ -187,6 +200,11 @@ one-shot dispatch against a local signaling stub that proves the numeric
 nameplate was claimed (and the words were not sent) plus the typed
 `Unreachable` deadline and lease release, `stop` cancelling a receive into
 `Cancelled`, and summary construction that keeps stored and refused files.
+The cross-engine gates add real bytes both ways: a CLI `send --code` into
+`Core::receive_code` (`core-receive-e2e-gates.sh`), and `Core::create_code` /
+`wait_send` into a normal CLI `receive <code>` (`core-send-e2e-gates.sh`), with
+the inbox compared byte for byte, the summary's stored/bytes/sha256 asserted,
+the sender exit checked, and the receiver/sender logs checked for the code.
 Android keeps the reduced `filament-peerloop` profile: no
 `mount-server`, `forward-server`, `mesh` or `fleet` sectors compile into the
 core library, and the graph gate fails if they do. The shipped Android CLI is

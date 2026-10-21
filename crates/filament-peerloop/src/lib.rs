@@ -87,6 +87,8 @@ pub mod refusal;
 pub mod resilience;
 mod retry;
 pub mod secret;
+#[cfg(feature = "dispatch")]
+pub mod send;
 pub mod session;
 pub mod shell;
 pub mod shell_gate;

@@ -1,1 +1,1 @@
-cargo test -p tunlion-core --lib --locked && cargo test -p tunlion-core --release --lib --locked && python3 scripts/check_core_tooling_graph.py
+cargo test -p tunlion-core --lib --locked && cargo test -p filament-peerloop --lib --locked && cargo check -p tunlion-core --all-targets --locked
