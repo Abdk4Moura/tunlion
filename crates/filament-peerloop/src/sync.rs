@@ -1191,19 +1191,18 @@ pub mod serving {
             }
             let bytes = b"confined";
             let (task, mux, transport) = receive_one(&root.0, "nested/file.txt", bytes).await;
-            assert!(task.join().await.unwrap().is_ok());
+            // The per-file bound fails before staging, so the stream aborts
+            // (the unread payload cannot be reinterpreted as records). It must
+            // still clean the mux sid and write nothing through the junction.
+            let result = task.join().await.unwrap();
+            assert!(result.is_err(), "a junction parent must abort the receive");
+            assert!(result.unwrap_err().contains("escapes the remote dir"));
             assert!(
                 std::fs::read_dir(&outside.0).unwrap().next().is_none(),
                 "nothing was created through the junction"
             );
             assert!(!root.0.join("nested/file.txt").exists());
             assert!(!root.0.join("nested/file.txt.part").exists());
-            let replies = outgoing_json(&transport);
-            assert_eq!(replies[1]["ok"], false);
-            assert!(replies[1]["err"]
-                .as_str()
-                .unwrap()
-                .contains("escapes the remote dir"));
             assert_eq!(mux.live_streams().await, 0);
             let _ = std::fs::remove_dir_all(&root.0);
         }

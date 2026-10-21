@@ -1429,6 +1429,13 @@ mod win_at {
             ea_buffer: *mut c_void,
             ea_length: u32,
         ) -> i32;
+        fn NtSetInformationFile(
+            file_handle: HANDLE,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> i32;
         fn RtlNtStatusToDosError(status: i32) -> u32;
     }
 
@@ -1439,6 +1446,11 @@ mod win_at {
     const FILE_OPEN: u32 = 1;
     const FILE_CREATE: u32 = 2;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    /// `FILE_RENAME_INFORMATION` (ntddk.h). Win32's
+    /// SetFileInformationByHandle(FileRenameInfo) rejects the RootDirectory
+    /// form with ERROR_INVALID_PARAMETER, so the handle-relative rename goes
+    /// straight to the NT information class the structure was designed for.
+    const FILE_RENAME_INFORMATION: u32 = 10;
     const SHARE_ALL: u32 =
         WinFs::FILE_SHARE_READ | WinFs::FILE_SHARE_WRITE | WinFs::FILE_SHARE_DELETE;
     /// `FILE_ADD_FILE`/`FILE_DELETE_CHILD` are what a handle-relative create
@@ -1754,16 +1766,22 @@ mod win_at {
                 to_name.len(),
             );
         }
-        let ok = unsafe {
-            WinFs::SetFileInformationByHandle(
+        let mut iosb = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtSetInformationFile(
                 source.as_raw_handle() as HANDLE,
-                WinFs::FileRenameInfo,
-                buffer.as_ptr() as *const c_void,
+                &mut iosb,
+                buffer.as_mut_ptr() as *mut c_void,
                 size as u32,
+                FILE_RENAME_INFORMATION,
             )
         };
-        if ok == 0 {
-            return Err(unsupported(io::Error::last_os_error()));
+        if status < 0 {
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(unsupported(io::Error::from_raw_os_error(code as i32)));
         }
         Ok(())
     }
@@ -2901,7 +2919,6 @@ mod tests {
     fn windows_staging_refuses_a_junction_parent() {
         let root = win_tmp();
         let outside = win_tmp();
-        std::fs::create_dir(root.join("nested")).unwrap();
         if !win_junction(&outside, &root.join("nested")) {
             eprintln!("skipping junction test: mklink /J unavailable");
             let _ = std::fs::remove_dir_all(&root);
