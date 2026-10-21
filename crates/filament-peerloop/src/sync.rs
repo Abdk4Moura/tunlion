@@ -513,6 +513,8 @@ pub async fn admit_sync_open(
 /// drop directory and refuses reparse points on every component.
 #[cfg(windows)]
 fn windows_root_rel(drop_dir: &Path, request: &str) -> Option<PathBuf> {
+    use filament_transfer::path_bounds::{path_within, safe_relpath};
+
     let rel = match request.trim() {
         "" | "." => PathBuf::new(),
         r if Path::new(r).is_absolute() => {
