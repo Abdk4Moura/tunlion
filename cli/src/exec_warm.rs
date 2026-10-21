@@ -63,6 +63,14 @@ mod imp {
         Ok(String::from_utf8(buf)?)
     }
 
+    /// A warm control connection that died mid-session is the same fact the
+    /// cold path classifies through `link_died_error`: if THIS device's own
+    /// access ended (an invitation expiring mid-exec), that is a refusal
+    /// (exit 4 naming the expiry), not an unreachable peer (exit 6).
+    fn warm_link_died(peer: &str) -> anyhow::Error {
+        crate::identity_flow::link_died_error(peer, "during exec (the warm link died)")
+    }
+
     /// Does the RUNNING daemon understand the `exec` op? A stale daemon from
     /// before this feature closes an unknown request without a reply; that must
     /// be a cold fallback, not the "reply lost after the open" failure. One
@@ -143,7 +151,7 @@ mod imp {
         .await
         {
             Ok(Ok(line)) => line,
-            Ok(Err(e)) => return WarmExec::Done(Err(e)),
+            Ok(Err(_)) => return WarmExec::Done(Err(warm_link_died(peer))),
             Err(_) => {
                 return WarmExec::Done(Err(anyhow::anyhow!(
                     "the local daemon did not answer the warm exec request in 15s"
@@ -179,6 +187,11 @@ mod imp {
             .strip_prefix("failed: ")
             .unwrap_or(err.as_str())
             .to_string();
+        if err.starts_with("failed: ") {
+            // Rejected after `exec-open` was sent: the link may have died with
+            // the local access expiring. Same classification as the cold path.
+            return WarmExec::Done(Err(warm_link_died(peer)));
+        }
         WarmExec::Done(Err(anyhow::anyhow!("{msg}")))
     }
 
@@ -244,9 +257,7 @@ mod imp {
                         }
                     }
                     Some(_) => {}
-                    None => break Err(anyhow::anyhow!(
-                        "the local daemon closed the warm exec channel without an exit status"
-                    )),
+                    None => break Err(warm_link_died(peer)),
                 },
                 chunk = stdin_rx.recv(), if !stdin_done => match chunk {
                     Some(c) if c.is_empty() => {
@@ -291,7 +302,11 @@ mod imp {
             bail!("{}", revoked_mid_session(peer, v));
         }
         if v["type"].as_str() == Some("warm-error") {
-            bail!("{}", v["err"].as_str().unwrap_or("warm exec failed"));
+            let msg = v["err"].as_str().unwrap_or("warm exec failed");
+            if msg.contains("warm link died") || msg.contains("control channel closed") {
+                return Err(warm_link_died(peer));
+            }
+            bail!("{msg}");
         }
         let err = v["err"].as_str().unwrap_or("closed");
         if let Some(code) = spawn_refusal_code(err) {

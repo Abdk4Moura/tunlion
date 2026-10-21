@@ -993,7 +993,7 @@ mod imp {
                     assert_eq!(peer, "box");
                     assert_eq!(
                         argv.iter().map(String::as_str).collect::<Vec<_>>(),
-                        vec!["printf", "%s\n", "a b", "*.log"]
+                        vec!["printf", "%s\\n", "a b", "*.log"]
                     );
                     assert_eq!(cwd.as_deref(), Some("/tmp"));
                     assert_eq!(env.len(), 1);
