@@ -128,9 +128,9 @@ Isolated worker, source snapshot archived with per-file SHA-256, debug
 Python venv from `backend/requirements.txt` when `--python` is omitted, so a
 bare worker can reproduce the gate without hand-installed Flask/Eventlet.
 
-- full `filament-peerloop` library: **524 passed**
+- full `filament-peerloop` library: **525 passed**
 - `filament-cli` bin tests: **804 passed**, 2 ignored
-- focused request store: **19 passed**
+- focused request store: **20 passed**
 - retained sender store: **10 passed**
 - real network/restart E2E: proven restricted sender created a pending offer with
   no bytes; daemon approval plus receiver restart delivered the exact retained
@@ -138,8 +138,11 @@ bare worker can reproduce the gate without hand-installed Flask/Eventlet.
   sender daemon retried a retained offer; an offline receiver did not lose the
   offer; an acknowledgement-loss retry reused the committed receipt with no
   duplicate placement; fresh certificate revocation defeated a prior approval.
-- evidence: worker `results/durable-e2e-bootstrap-20261021T121317`, sanitized
-  logs archived locally. The gate bootstraps its own backend venv.
+- the gate boots with the configured drop dir deliberately different from the
+  daemon's `up --dir`, proving approval uses the served inbox recorded in
+  `up.inbox`.
+- evidence: worker `results/durable-e2e-review-20261021T123107`, sanitized logs
+  archived locally. The gate bootstraps its own backend venv.
 - the E2E is wired into CI as its own job, not a manual-only script; it requires
   `--fault-hooks` and asserts the sender/receiver terminal states, not just the
   absence of a duplicate file.
