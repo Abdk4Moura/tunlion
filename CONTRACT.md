@@ -1380,6 +1380,35 @@ for a hold to bind to.
 - FUTURE WORK, not built: the cleaner shape is client-side (the client
   waits for a "proven" acknowledgement before sending the open), which
   would remove the server-side hold entirely.
+## L3 overlay state (`addr --json`, `devices --json`, `expose`)
+
+A derived overlay address is an identity, not a route. Every machine-readable
+command that mentions one now carries the LIVE endpoint state:
+
+```json
+"l3": {"state": "ready|down|starting", "mode": "kernel|userspace|none", "reason": "..."}
+```
+
+- `ready` is emitted only after the daemon's `MeshTunnel` endpoint exists, so
+  `dial` and `bind` can actually work. It is never inferred from a stored or
+  key-derived address.
+- `down` means no endpoint exists; `reason` is a short operator-facing cause.
+- `starting` is a transient startup state and must not be treated as `ready`.
+- `mode` distinguishes the kernel TUN/Wintun path from the userspace smoltcp
+  netstack, and `none` when there is no endpoint.
+- `addr --json` puts the object at the top level. `devices --json` puts it at
+  `data.l3` (it describes the LOCAL machine, shared by every row).
+- Text `addr` prints the address but explicitly says it is identity-only when
+  the state is not `ready`. `addr --v4` still prints the bare address, with the
+  same warning on stderr.
+- `expose <port>` exits zero only after the daemon records that exact port as
+  BOUND (the port accepts on the overlay). A saved-but-unbound request exits
+  nonzero with the bind failure or the missing-endpoint reason. `expose --list`
+  marks each port `[bound]` or `[NOT bound: ...]`.
+- The userspace path binds through the same `MeshTunnel::bind` and needs no TUN.
+- The daemon reconciles `expose.json` on a short tick even where there is no
+  unix control socket (Windows), so `expose` is verified on every platform.
+
 ## Certify (`tunlion certify <device>` -- NeedsReview exit)
 
 A NeedsReview device has a record but no stored certificate and is trusted

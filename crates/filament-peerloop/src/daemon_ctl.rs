@@ -507,6 +507,15 @@ pub async fn handle_warm_req(
             req.reply(&json!({ "ok": true, "live": false, "count": 0 }))
                 .await
         }
+        // L3State is handled inline in the daemon loop (it owns the endpoint);
+        // never claim `ready` from here.
+        control::ReqKind::L3State => {
+            req.reply(&json!({
+                "ok": true,
+                "l3": {"state": "down", "mode": "none", "reason": "L3 state is served by the daemon loop"}
+            }))
+            .await
+        }
         // Reload is handled inline in the daemon loop (it self-SIGTERMs); answer
         // defensively if it ever reaches here.
         control::ReqKind::Reload => req.reply(&json!({ "ok": true, "reloading": false })).await,

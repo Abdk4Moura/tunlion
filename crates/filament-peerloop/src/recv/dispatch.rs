@@ -23,8 +23,8 @@ use crate::l2::{self, Mux};
 use crate::limits::MAX_ATTEMPTS;
 #[cfg(feature = "mesh")]
 use crate::mesh::{
-    accept_advertised, advertised_prefixes, sanitize_host, L3Mode, RouteAcceptance, RoutePolicy,
-    IFNAME,
+    accept_advertised, advertised_prefixes, l3_mode_word, sanitize_host, L3Mode, L3Status,
+    RouteAcceptance, RoutePolicy, IFNAME,
 };
 use crate::present::{Ask, Presentation};
 use crate::recv::ceremony::{Ceremony, Inbound as PakeInbound};
@@ -1556,6 +1556,10 @@ async fn recv_run(
     // (review fix #3).
     #[cfg(feature = "mesh")]
     let mut l3_seen: HashMap<String, Announce> = HashMap::new();
+    // The live state published to siblings. `ready` is set only from the Ok arm
+    // of `l3_start`, i.e. only when there is a real endpoint to bind/dial.
+    #[cfg(feature = "mesh")]
+    let mut l3_status = L3Status::down("none", "L3 has not started");
     #[cfg(not(feature = "mesh"))]
     let l3: Option<std::sync::Arc<dyn MeshTunnel>> = None;
     #[cfg(feature = "mesh")]
@@ -1567,6 +1571,7 @@ async fn recv_run(
                         Ok(id) => (format!("{}/128", id.addr()), Some(id)),
                         Err(e) => {
                             log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
+                            l3_status = L3Status::down("none", e.to_string());
                             (String::new(), None)
                         }
                     }
@@ -1586,6 +1591,7 @@ async fn recv_run(
                     };
                     match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
+                            l3_status = L3Status::ready(l3_mode_word(m.is_userspace()));
                             let addr = m.my_addr().map(|a| a.to_string()).unwrap_or(cidr);
 
                             // Subnet router: if this machine offers prefixes, make
@@ -1729,16 +1735,33 @@ async fn recv_run(
                         }
                         Err(e) => {
                             log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
+                            l3_status = L3Status::down("none", e.to_string());
                             None
                         }
                     }
                 }
             }
-            None => None,
+            None => {
+                l3_status = L3Status::down(
+                    "none",
+                    "tun-addr is not set (run: tunlion set tun-addr auto, then tunlion up)",
+                );
+                None
+            }
         }
     } else {
+        l3_status = L3Status::down("none", "the daemon is not running");
         None
     };
+    #[cfg(feature = "mesh")]
+    let l3_status_json = serde_json::to_value(&l3_status)
+        .unwrap_or_else(|_| json!({"state": "down", "mode": "none", "reason": "L3 state unavailable"}));
+    #[cfg(feature = "mesh")]
+    if let Ok(text) = serde_json::to_string(&l3_status) {
+        host.l3_state_report(&text);
+    }
+    #[cfg(not(feature = "mesh"))]
+    let l3_status_json = json!({"state": "down", "mode": "none", "reason": "this build has no mesh feature"});
     // `tunlion expose`: once the overlay is up, bind the persisted ports on the
     // overlay address. The optional exposer lives in the host server; the loop
     // only asks it to reconcile.
@@ -1782,6 +1805,11 @@ async fn recv_run(
     let mut digest_alone = false;
     // C30 phase 3: link mini-sync, state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
+    // Cross-platform `expose` apply: the control socket is unix-only, so on
+    // Windows an `expose` in a sibling process could only write expose.json and
+    // believe it. Reconcile on a short tick wherever an L3 endpoint exists, and
+    // let expose-bound.json be the truth the CLI waits for.
+    let mut last_expose_tick = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
@@ -2179,6 +2207,10 @@ async fn recv_run(
                             // iteration, so a just-minted invitation's enrollment
                             // channel is subscribed before the joiner can arrive.
                             req.reply(&json!({ "ok": true })).await;
+                        } else if matches!(&req.kind, ReqKind::L3State) {
+                            // `addr`/`devices --json`/`expose`: report the LIVE
+                            // endpoint, never a derived address that cannot bind.
+                            req.reply(&json!({ "ok": true, "l3": l3_status_json.clone() })).await;
                         } else if matches!(&req.kind, ReqKind::ReloadExpose) {
                             // `tunlion expose`/`unexpose`: reconcile overlay
                             // listeners from expose.json. live:true only if L3 is up.
@@ -3504,6 +3536,11 @@ async fn recv_run(
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
+        }
+
+        if daemon && l3.is_some() && last_expose_tick.elapsed() >= Duration::from_secs(1) {
+            last_expose_tick = Instant::now();
+            ports.servers.reload_expose().await;
         }
 
         // C30 phase 3: state pings, each open link hears our transfer/away

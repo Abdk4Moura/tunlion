@@ -436,6 +436,16 @@ pub trait HostServices: Send + Sync + 'static {
     ) -> Result<Arc<dyn MeshTunnel>, String> {
         Err("this host has no mesh overlay endpoint".to_string())
     }
+    /// Publish the machine-readable L3 state (`state`/`mode`/`reason`) for
+    /// sibling processes (`addr --json`, `devices --json`, `expose`).
+    ///
+    /// The loop owns the live endpoint, so only it can say `ready`. The host
+    /// owns where the record lives (this crate has no config dir), and a host
+    /// that has nowhere to put it leaves the default no-op. Sibling commands
+    /// that cannot ask the daemon (Windows has no control socket) read it to
+    /// avoid trusting an address whose endpoint never bound.
+    #[cfg(feature = "mesh")]
+    fn l3_state_report(&self, _status_json: &str) {}
     /// The public host keys this machine's sshd offers a bootstrap peer.
     ///
     /// HOST-BOUND: they are this machine's own key files. The inert answer is

@@ -48,24 +48,47 @@ fn bound_path() -> PathBuf {
     crate::settings::config_dir().join("expose-bound.json")
 }
 
-/// The ports the daemon with pid `daemon` has recorded as bound. Empty when no
-/// daemon runs, or when the record was written by another process (a daemon
-/// that is gone serves nothing, whatever its last record says).
-pub fn bound_ports(daemon: Option<u32>) -> Vec<u16> {
-    let Some(pid) = daemon else { return Vec::new() };
+/// What the daemon with pid `daemon` has recorded: the ports it actually BOUND
+/// and, per port, why a bind failed. Empty/ignored when no daemon runs, or when
+/// the record was written by another process (a daemon that is gone serves
+/// nothing, whatever its last record says).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BoundState {
+    pub ports: Vec<u16>,
+    pub errors: std::collections::HashMap<u16, String>,
+}
+
+pub fn bound_state(daemon: Option<u32>) -> BoundState {
+    let Some(pid) = daemon else { return BoundState::default() };
     let Some(v) = std::fs::read_to_string(bound_path())
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
     else {
-        return Vec::new();
+        return BoundState::default();
     };
     if v["pid"].as_u64() != Some(u64::from(pid)) {
-        return Vec::new();
+        return BoundState::default();
     }
-    v["ports"]
+    let ports = v["ports"]
         .as_array()
         .map(|a| a.iter().filter_map(|p| p.as_u64().and_then(|n| u16::try_from(n).ok())).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let errors = v["errors"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, why)| {
+                    Some((k.parse::<u16>().ok()?, why.as_str()?.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    BoundState { ports, errors }
+}
+
+/// The ports the daemon has recorded as bound.
+pub fn bound_ports(daemon: Option<u32>) -> Vec<u16> {
+    bound_state(daemon).ports
 }
 
 fn save(bindings: &[Binding]) -> Result<()> {
@@ -120,20 +143,107 @@ pub async fn expose_cmd(
     cfg.sort_by_key(|b| b.port);
     save(&cfg)?;
 
-    ui::say(&format!(
-        "  {} expose :{port} {} {}  ({})",
-        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-        ui::glyph_arrow(),
-        target,
-        scope_str(&peers),
-    ));
-    // Without a TUN, peers reach this port as <this-device>.mesh through their
-    // SOCKS proxy, and this side reaches theirs the same way; say how.
-    if let Some(p) = crate::proxy_state::current() {
-        ui::say(&crate::proxy_state::mesh_hint(&p));
-    }
+    // Bind BEFORE saying success. `expose.json` is a REQUEST; only the daemon's
+    // `expose-bound.json` is evidence that a listener exists. This command used
+    // to print the success glyph right after writing the request, so an
+    // automation saw "done" while `expose --list` (and every dial) had nothing.
+    let Some(daemon) = crate::daemon_alive() else {
+        return Err(anyhow::anyhow!(
+            "expose :{port} was saved but NOT bound: there is no running tunlion daemon, so no \
+             live L3 endpoint can bind it. Start one with `tunlion up` (or `tunlion up --userspace` \
+             when this host has no usable TUN) and run `tunlion expose {port}` again."
+        ));
+    };
+
+    // The unix control socket is a fast wake; the bound record is the truth on
+    // every platform (Windows has no control socket).
     notify_daemon().await;
-    Ok(())
+    let state = wait_for_bind(daemon, port, std::time::Duration::from_secs(6)).await;
+    match state {
+        BindOutcome::Bound => {
+            ui::say(&format!(
+                "  {} expose :{port} {} {}  ({}) {}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                ui::glyph_arrow(),
+                target,
+                scope_str(&peers),
+                ui::paint(ui::Tone::Dim, &format!("[bound on the overlay, daemon pid {daemon}]")),
+            ));
+            // Without a TUN, peers reach this port as <this-device>.mesh through
+            // their SOCKS proxy, and this side reaches theirs the same way; say how.
+            if let Some(p) = crate::proxy_state::current() {
+                ui::say(&crate::proxy_state::mesh_hint(&p));
+            }
+            Ok(())
+        }
+        BindOutcome::Failed(why) => Err(anyhow::anyhow!(
+            "expose :{port} failed to bind on the overlay: {why}. It was saved in expose.json and \
+             will be retried when the daemon next reconciles; fix the cause and rerun `tunlion expose {port}`."
+        )),
+        BindOutcome::NoEndpoint => {
+            let l3 = crate::l3_state::current().await;
+            let reason = l3["reason"].as_str().unwrap_or("no live L3 endpoint");
+            let mode = l3["mode"].as_str().unwrap_or("none");
+            Err(anyhow::anyhow!(
+                "expose :{port} was saved but NOT bound: the daemon has no live L3 endpoint \
+                 (state={}, mode={mode}). {reason}. Start L3 with `tunlion set tun-addr auto` and \
+                 `tunlion up` (or `tunlion up --userspace` when no TUN is available), then rerun \
+                 `tunlion expose {port}`.",
+                l3["state"].as_str().unwrap_or("down"),
+            ))
+        }
+        BindOutcome::TimedOut => Err(anyhow::anyhow!(
+            "expose :{port} was saved but NOT bound within 6s: the daemon (pid {daemon}) did not \
+             report a listener. Check `tunlion expose --list` and the daemon log; an L3 endpoint \
+             that is not ready cannot bind, and this command will not claim it did."
+        )),
+    }
+}
+
+/// The result of waiting for the daemon to bind one port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindOutcome {
+    Bound,
+    Failed(String),
+    /// The daemon answered but has no live L3 endpoint at all.
+    NoEndpoint,
+    TimedOut,
+}
+
+/// Decide from the daemon's record. Pure, so every branch is testable without
+/// a listener: a port in `bound` wins; a recorded error means the bind failed;
+/// otherwise nothing has been proven.
+pub fn classify_bind(state: &BoundState, port: u16, l3_ready: bool) -> BindOutcome {
+    if state.ports.contains(&port) {
+        return BindOutcome::Bound;
+    }
+    if let Some(why) = state.errors.get(&port) {
+        return BindOutcome::Failed(why.clone());
+    }
+    if !l3_ready {
+        return BindOutcome::NoEndpoint;
+    }
+    BindOutcome::TimedOut
+}
+
+/// Poll the daemon's bound record until `port` is bound or failed. The daemon
+/// reconciles expose.json on a 1s tick (and immediately on the unix control
+/// socket), so this is a short wait, not the source of truth.
+pub async fn wait_for_bind(
+    daemon: u32,
+    port: u16,
+    timeout: std::time::Duration,
+) -> BindOutcome {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let state = bound_state(Some(daemon));
+        let l3_ready = crate::l3_state::is_ready(&crate::l3_state::read_file_for(Some(daemon)));
+        let outcome = classify_bind(&state, port, l3_ready);
+        if outcome != BindOutcome::TimedOut || tokio::time::Instant::now() >= deadline {
+            return outcome;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// `tunlion unexpose <port>`.
@@ -157,9 +267,28 @@ fn print_list() -> Result<()> {
         ui::say(&ui::paint(ui::Tone::Dim, "  no ports exposed. try: tunlion expose 8080"));
         return Ok(());
     }
+    let daemon = crate::daemon_alive();
+    let state = bound_state(daemon);
     ui::say("  exposed on this device's .mesh address:");
     for b in cfg {
-        ui::say(&format!("    :{} {} {}  ({})", b.port, ui::glyph_arrow(), b.target, scope_str(&b.peers)));
+        // Distinguish REQUESTED from SERVED. Printing "exposed" for a port that
+        // never bound is what let addr+expose look trustworthy with no endpoint.
+        let mark = if state.ports.contains(&b.port) {
+            ui::paint(ui::Tone::Ok, "[bound]").to_string()
+        } else if let Some(why) = state.errors.get(&b.port) {
+            ui::paint(ui::Tone::Err, &format!("[NOT bound: {why}]")).to_string()
+        } else if daemon.is_none() {
+            ui::paint(ui::Tone::Warn, "[NOT bound: no running daemon]").to_string()
+        } else {
+            ui::paint(ui::Tone::Warn, "[NOT bound: no live L3 endpoint]").to_string()
+        };
+        ui::say(&format!(
+            "    :{} {} {}  ({}) {mark}",
+            b.port,
+            ui::glyph_arrow(),
+            b.target,
+            scope_str(&b.peers)
+        ));
     }
     Ok(())
 }
@@ -209,9 +338,15 @@ mod imp {
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
 
-    /// Record the ports THIS daemon has bound right now (see `bound_ports`).
-    fn record_bound(ports: &[u16]) {
-        let v = serde_json::json!({ "pid": std::process::id(), "ports": ports });
+    /// Record the ports THIS daemon has bound right now, plus why any requested
+    /// port failed (see `bound_state`). An error is evidence, not a log line: the
+    /// `expose` command reads it to fail loudly instead of claiming success.
+    fn record_bound(ports: &[u16], errors: &HashMap<u16, String>) {
+        let v = serde_json::json!({
+            "pid": std::process::id(),
+            "ports": ports,
+            "errors": errors,
+        });
         if let Err(e) = crate::platform::SecretFile::write_str(&super::bound_path(), &v.to_string()) {
             crate::ui::debug(&format!("tunlion: could not record the bound expose ports: {e}"));
         }
@@ -255,6 +390,7 @@ mod imp {
             }
             // Bind the ports that are new or changed (unchanged ones are still in
             // `active` and were skipped above).
+            let mut errors: HashMap<u16, String> = HashMap::new();
             for (port, b) in want {
                 if active.contains_key(&port) {
                     continue;
@@ -263,15 +399,19 @@ mod imp {
                     Ok(jh) => {
                         active.insert(port, (b, jh));
                     }
-                    Err(e) => crate::ui::say(&crate::ui::paint(
-                        crate::ui::Tone::Warn,
-                        &format!("  expose :{port} failed: {e}"),
-                    )),
+                    Err(e) => {
+                        let why = e.to_string();
+                        crate::ui::say(&crate::ui::paint(
+                            crate::ui::Tone::Warn,
+                            &format!("  expose :{port} failed: {why}"),
+                        ));
+                        errors.insert(port, why);
+                    }
                 }
             }
             let mut ports: Vec<u16> = active.keys().copied().collect();
             ports.sort_unstable();
-            record_bound(&ports);
+            record_bound(&ports, &errors);
             active.len()
         }
 
@@ -346,6 +486,33 @@ mod tests {
         assert_eq!(scope_str(&None), "any paired device");
         assert_eq!(scope_str(&Some(vec![])), "any paired device");
         assert_eq!(scope_str(&Some(vec!["a".into(), "b".into()])), "a,b");
+    }
+
+    /// The bug this closes: a saved request with no endpoint used to print
+    /// success. No bound port and no live L3 is an explicit no-endpoint, never
+    /// "bound" and never a silent success.
+    #[test]
+    fn a_request_that_did_not_bind_is_never_reported_as_bound() {
+        let empty = BoundState::default();
+        assert_eq!(classify_bind(&empty, 9110, false), BindOutcome::NoEndpoint);
+        assert_eq!(classify_bind(&empty, 9110, true), BindOutcome::TimedOut);
+        let bound = BoundState { ports: vec![9110], errors: Default::default() };
+        assert_eq!(classify_bind(&bound, 9110, true), BindOutcome::Bound);
+        let refused = BoundState {
+            ports: vec![],
+            errors: [(
+                9110,
+                "address already in use (os error 98)".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            classify_bind(&refused, 9110, true),
+            BindOutcome::Failed("address already in use (os error 98)".to_string())
+        );
+        // A different port's failure must not fail this one.
+        assert_eq!(classify_bind(&refused, 9111, true), BindOutcome::TimedOut);
     }
 
     #[test]
