@@ -66,14 +66,14 @@ function build() {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function openPage(browser, { width = BROWSER === 'webkit' ? 1024 : 900, height = BROWSER === 'webkit' ? 768 : 700 } = {}) {
+async function openPage(browser, { width = BROWSER === 'webkit' ? 1024 : 900, height = BROWSER === 'webkit' ? 768 : 700, touch = true } = {}) {
   const page = await browser.newPage({
     viewport: { width, height },
-    hasTouch: true,
-    ...(BROWSER === 'webkit' ? { isMobile: true, deviceScaleFactor: 2, userAgent: IPAD_UA } : {}),
+    hasTouch: touch,
+    ...(BROWSER === 'webkit' && touch ? { isMobile: true, deviceScaleFactor: 2, userAgent: IPAD_UA } : {}),
   });
   page.on('pageerror', (e) => { pageErrors.push(String(e)); console.log('[page-error]', String(e).slice(0, 400)); });
-  await page.goto(`http://127.0.0.1:${PORT}/?preview=webshell-scroll&touch=1`, { waitUntil: 'networkidle' });
+  await page.goto(`http://127.0.0.1:${PORT}/?preview=webshell-scroll&touch=${touch ? 1 : 0}`, { waitUntil: 'networkidle' });
   await page.waitForFunction(() => window.__webterm && window.__scroll, null, { timeout: 10000 })
     .catch(() => fail('WebTerminal / xterm never mounted'));
   await page.evaluate(() => window.__webterm.focus());
@@ -203,6 +203,53 @@ function legacyWheel(code, col, row) {
   await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
   const engine = BROWSER === 'webkit' ? webkit : chromium;
   const browser = await engine.launch({ headless: true });
+
+  // Touch viewing does not ask the OS for a keyboard. Only the explicit button
+  // makes xterm editable/focuses it in the user's click stack. Browsers here do
+  // not display an iOS/Gboard IME; assert the DOM/focus contract, not fake pixels.
+  {
+    const page = await openPage(browser);
+    const keyboard = page.locator('[data-testid="term-keyboard"]');
+    const policy = () => page.evaluate(() => {
+      const ta = document.querySelector('.xterm-helper-textarea');
+      return { readOnly: ta.readOnly, inputMode: ta.getAttribute('inputmode'), focused: document.activeElement === ta };
+    });
+    eq(await keyboard.getAttribute('aria-pressed'), 'false', 'touch starts with keyboard off');
+    eq((await policy()).readOnly, true, 'touch viewing must not expose an editable field');
+    eq((await policy()).inputMode, 'none', 'touch viewing must suppress the IME hint');
+    const p = await cellPoint(page, 4, 4);
+    await page.mouse.click(p.x, p.y);
+    eq((await policy()).readOnly, true, 'terminal tap must not enable typing');
+
+    await keyboard.click();
+    eq(await keyboard.getAttribute('aria-pressed'), 'true', 'Keyboard button enables typing');
+    eq(await policy(), { readOnly: false, inputMode: 'text', focused: true }, 'show keyboard synchronously enables and focuses input');
+    await clearInputs(page);
+    await page.keyboard.type('hello');
+    eq((await inputs(page)).join(''), 'hello', 'explicit keyboard typing reaches PTY');
+    await keyboard.click();
+    eq(await policy(), { readOnly: true, inputMode: 'none', focused: false }, 'hide keyboard disables editing and blurs input');
+    await clearInputs(page);
+    await page.click('[data-key="Esc"]');
+    eq(await inputBytes(page), [[27]], 'accessory keys still work with keyboard hidden');
+    await page.click('[data-key="Redraw"]');
+    eq((await policy()).readOnly, true, 'redraw must not enable typing');
+    eq((await policy()).focused, false, 'accessory actions must not steal editable focus');
+    await keyboard.click();
+    eq(await policy(), { readOnly: false, inputMode: 'text', focused: true }, 'keyboard can reopen after accessory actions');
+    ok('touch keyboard: explicit show/hide; taps, redraw and accessory keys do not reopen it');
+    await page.close();
+  }
+  {
+    const page = await openPage(browser, { touch: false });
+    eq(await page.locator('[data-testid="term-keyboard"]').count(), 0, 'desktop has no touch keyboard toggle');
+    eq(await page.locator('.xterm-helper-textarea').evaluate((ta) => ta.readOnly), false, 'desktop input remains editable');
+    await clearInputs(page);
+    await page.keyboard.type('desktop');
+    eq((await inputs(page)).join(''), 'desktop', 'desktop auto-focused typing remains unchanged');
+    ok('desktop retains normal focus and typing without a keyboard toggle');
+    await page.close();
+  }
 
   // 1. Ordinary normal-buffer terminal: local history, never PTY data.
   {
@@ -385,6 +432,7 @@ function legacyWheel(code, col, row) {
   //    plain typing still reaches the PTY, and a composition commits once.
   {
     const page = await openPage(browser);
+    await page.click('[data-testid="term-keyboard"]');
     const s = await state(page);
     eq(s.textarea, {
       autocorrect: 'off', autocapitalize: 'off', autocomplete: 'off', spellcheck: 'false',
@@ -454,6 +502,7 @@ function legacyWheel(code, col, row) {
     eq(await inputs(page), [sgrWheel(64, 10, 5)], 'sticky Alt corrupted an SGR wheel report');
     eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'true', 'SGR wheel consumed sticky Alt');
     await clearInputs(page);
+    await page.click('[data-testid="term-keyboard"]');
     await page.keyboard.type('a');
     await wait(100);
     eq(await inputBytes(page), [[27, 97]], 'sticky Alt no longer prefixes real text');
@@ -471,6 +520,7 @@ function legacyWheel(code, col, row) {
     eq(await inputBytes(page), [legacyWheel(96, 150, 5)], 'sticky Alt corrupted a legacy wheel report');
     eq(await page.getAttribute('[data-key="alt"]', 'aria-pressed'), 'true', 'legacy wheel consumed sticky Alt');
     await clearInputs(page);
+    await page.click('[data-testid="term-keyboard"]');
     await page.keyboard.type('a');
     await wait(100);
     eq(await inputBytes(page), [[27, 97]], 'sticky Alt no longer prefixes real text after a legacy report');

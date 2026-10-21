@@ -92,6 +92,29 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const [status, setStatus] = useState('connecting')
   const [barOpen, setBarOpen] = useState(false) // the one-line bar, expanded to the full line
   const [kbInset, setKbInset] = useState(0) // visualViewport keyboard height
+  // Touch starts in viewing mode. An explicit, synchronous user gesture opts
+  // into typing; scrolling/reconnecting/repainting must never summon the IME.
+  const [keyboardOpen, setKeyboardOpen] = useState(!isTouch)
+  const keyboardOpenRef = useRef(!isTouch)
+  const focusTerminal = useCallback(() => {
+    if (!isTouch || keyboardOpenRef.current) termRef.current?.focus()
+  }, [])
+  const setKeyboard = useCallback((open) => {
+    const enabled = !isTouch || open
+    keyboardOpenRef.current = enabled
+    setKeyboardOpen(enabled)
+    const ta = hostRef.current?.querySelector('textarea')
+    if (ta) {
+      // inputmode is a hint, not a guarantee on Safari. readOnly prevents an
+      // incidental xterm focus from bringing up its editable keyboard as well.
+      ta.readOnly = !enabled
+      ta.setAttribute('inputmode', enabled ? 'text' : 'none')
+      ta.setAttribute('virtualkeyboardpolicy', enabled ? 'auto' : 'manual')
+      if (!enabled) ta.blur()
+    }
+    // Must stay in the button's click stack: iOS rejects delayed IME focus.
+    if (enabled) termRef.current?.focus()
+  }, [])
   const [atBottom, setAtBottom] = useState(true) // false => show scroll-to-bottom
   const [wheelRoute, setWheelRoute] = useState(SCROLL_HISTORY) // who owns a vertical wheel
   const [toast, setToast] = useState('') // brief copy/paste feedback
@@ -236,8 +259,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     term.scrollToBottom()
     setAtBottom(true)
     haptic()
-    try { term.focus() } catch (e) {}
-  }, [])
+    try { focusTerminal() } catch (e) {}
+  }, [focusTerminal])
   // Page up/down for the accessory bar (a touch-friendly chunk scroll). A near-
   // full-page step (rows - 1) keeps a line of context, like a pager. In local
   // history this moves xterm's scrollback; when the app owns the wheel the same
@@ -430,9 +453,9 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     // Rebind + reattach the CURRENT link (rebindLink unbinds the old binding
     // first, so there is no duplicate handler or leaked poll).
     if (linkRef.current) { try { rebindLink() } catch (e) {} }
-    if (term) { try { term.focus() } catch (e) {} }
+    if (term) { try { focusTerminal() } catch (e) {} }
     haptic()
-  }, [safeFit, rebindLink])
+  }, [safeFit, rebindLink, focusTerminal])
 
   // mount xterm ONCE. This is the ONLY place the Terminal is created/opened and
   // (on final unmount) disposed. It is decoupled from `link`: a reconnect swaps
@@ -494,10 +517,15 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       ta.setAttribute('autocorrect', 'off'); ta.setAttribute('autocapitalize', 'off')
       ta.setAttribute('autocomplete', 'off'); ta.setAttribute('spellcheck', 'false')
       // Hints that suppress Gboard predictive text / suggestions strip on many
-      // keyboards. inputmode stays 'text' (we still want the keyboard); the
-      // enterkeyhint keeps Enter sane. data-gramm disables Grammarly overlays.
+      // keyboards. Touch typing is explicitly enabled by the Keyboard button;
+      // the enterkeyhint keeps Enter sane. data-gramm disables Grammarly overlays.
       ta.setAttribute('enterkeyhint', 'send'); ta.setAttribute('data-gramm', 'false')
       ta.setAttribute('aria-autocomplete', 'none')
+      if (isTouch) {
+        ta.readOnly = !keyboardOpenRef.current
+        ta.setAttribute('inputmode', keyboardOpenRef.current ? 'text' : 'none')
+        ta.setAttribute('virtualkeyboardpolicy', keyboardOpenRef.current ? 'auto' : 'manual')
+      }
       // (b) On touch keyboards, neutralize the IME composition path WITHOUT
       // touching normal typing. Plain (non-composed) keys still flow through
       // xterm's own input handler, which is correct. The corruption is purely
@@ -514,7 +542,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
           composing = false; composingRef.current = false
           // Commit the resolved/autocompleted word ONCE.
           const data = e && e.data ? e.data : ''
-          if (data) {
+          if (data && keyboardOpenRef.current) {
             write(applyMods(data))
             // Predict the committed text now (NOT during composition, so we never
             // double-insert): mirrors typing the resolved chars.
@@ -701,7 +729,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     //   cursor-keys  alternate screen with no wheel reporting -> synthetic
     //                wheel; xterm turns it into Up/Down respecting DECCKM
     // We never preventDefault on a clear horizontal move (allow selection/bar),
-    // and a swipe under a small threshold stays a tap so focus/keyboard work.
+    // and a swipe under a small threshold stays a tap. The explicit keyboard
+    // policy above decides whether that focus may open the soft keyboard.
     const host = hostRef.current
     let tY = 0, tX = 0, tStartX = 0, tStartY = 0, tAccum = 0, tMoved = false, tActive = false
     let tRoute = SCROLL_HISTORY
@@ -772,9 +801,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       if (e.cancelable) e.preventDefault() // stop selection + PTY input on a scroll
     }
     const onTouchEnd = () => {
-      // A genuine tap (no scroll) falls through so xterm focuses + the soft
-      // keyboard opens; a scroll swallowed its motion above. Nothing to do here
-      // beyond resetting; focus on tap is xterm's own job.
+      // A genuine tap falls through to xterm (including TUI mouse reporting),
+      // but its textarea stays non-editable until Keyboard is explicitly on.
       tActive = false
     }
     host.addEventListener('touchstart', onTouchStart, { passive: true })
@@ -784,7 +812,7 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
 
     const ro = new ResizeObserver(() => safeFit())
     ro.observe(hostRef.current)
-    term.focus()
+    focusTerminal()
 
     // Final-unmount cleanup ONLY. This effect has deps [] so it runs exactly
     // once on mount and its cleanup runs exactly once on unmount: the ONLY place
@@ -937,15 +965,18 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   // can stay blank. The terminal was NEVER unmounted, so scrollback and the live
   // PTY are intact. requestAnimationFrame waits for the layout to apply.
   useEffect(() => {
-    if (hidden) return
+    if (hidden) {
+      if (isTouch) setKeyboard(false)
+      return
+    }
     const raf = requestAnimationFrame(() => {
       safeFit()
       const term = termRef.current
       if (term) { try { term.refresh(0, Math.max(0, (term.rows || 1) - 1)) } catch (e) {} }
-      try { term && term.focus() } catch (e) {}
+      try { term && focusTerminal() } catch (e) {}
     })
     return () => cancelAnimationFrame(raf)
-  }, [hidden, safeFit])
+  }, [hidden, safeFit, focusTerminal, setKeyboard])
 
   // visualViewport keyboard avoidance: lift the bar above the soft keyboard.
   // The inset state-set is cheap; the refit is the guarded, coalesced safeFit so
@@ -980,6 +1011,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     try {
       const tmp = document.createElement('textarea')
       tmp.value = text
+      tmp.readOnly = true
+      tmp.setAttribute('inputmode', 'none')
       tmp.style.position = 'fixed'; tmp.style.opacity = '0'; tmp.style.top = '0'
       document.body.appendChild(tmp); tmp.focus(); tmp.select()
       const ok = document.execCommand('copy')
@@ -1020,9 +1053,9 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     if (!text) { showToast('clipboard empty'); return false }
     write(text) // bracketed-paste-safe: the PTY/app decides how to treat it
     haptic(); showToast('pasted')
-    termRef.current && termRef.current.focus()
+    focusTerminal()
     return true
-  }, [write, showToast])
+  }, [write, showToast, focusTerminal])
 
   // Auto-copy on selection (desktop): mirrors a normal terminal's behavior and
   // gives mobile a no-op-safe path. Wired once per mounted terminal.
@@ -1053,10 +1086,10 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     const base = KEYS[label]
     if (base == null) return
     write(applyMods(base))
-    termRef.current && termRef.current.focus()
+    focusTerminal()
   }
-  const toggleCtrl = () => { ctrl.current = !ctrl.current; setCtrlOn(ctrl.current); haptic(); termRef.current?.focus() }
-  const toggleAlt = () => { alt.current = !alt.current; setAltOn(alt.current); haptic(); termRef.current?.focus() }
+  const toggleCtrl = () => { ctrl.current = !ctrl.current; setCtrlOn(ctrl.current); haptic(); focusTerminal() }
+  const toggleAlt = () => { alt.current = !alt.current; setAltOn(alt.current); haptic(); focusTerminal() }
 
   const dot = status === 'ready' ? T.ok : status === 'closed' ? T.bad : T.warn
   // Say what the page buttons actually do in the current context.
@@ -1106,6 +1139,13 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
                 </span>
                 <span aria-hidden="true" style={{ color: T.sub }}>{barOpen ? '\u25b4' : '\u25be'}</span>
               </button>
+              {isTouch && <button type="button" data-testid="term-keyboard"
+                aria-label={keyboardOpen ? 'hide terminal keyboard' : 'show terminal keyboard'}
+                aria-pressed={keyboardOpen} title={keyboardOpen ? 'hide keyboard; keep viewing' : 'show keyboard to type'}
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => { setKeyboard(!keyboardOpenRef.current); haptic() }}
+                style={{ ...hb, color: keyboardOpen ? T.onAccent : T.text, background: keyboardOpen ? accent : 'transparent' }}
+              >Keyboard</button>}
               {onBackground && <button type="button" onClick={onBackground} title="hide (keeps running)" style={hb}>Hide</button>}
             </div>
             {barOpen && (
