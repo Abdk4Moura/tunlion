@@ -17,13 +17,14 @@ hostname
 sha256sum cli/src/codeentry.rs cli/src/pair_cmd.rs cli/src/ui.rs cli/src/join_entry.rs \
   cli/src/join_input.rs cli/src/identity_flow.rs cli/src/file_io.rs cli/src/main.rs cli/src/dispatch.rs \
   cli/src/send_cmd.rs cli/src/recv_cmd.rs crates/filament-pair/src/lib.rs \
+  crates/filament-peerloop/src/recv/dispatch.rs \
   crates/filament-pair/tests/code-input-cases.txt runner/join-entry-pty.py runner/join-input-boundary.py runner/pairing-* \
   frontend/src/lib/codeInput.js frontend/src/lib/pairing.js frontend/src/lib/useTunlion.js frontend/src/ui/Tunlion.jsx frontend/test-code-input.mjs \
   runner/terminal-probe.cjs runner/terminal-visual-review.cjs > "$OUT/SOURCE_SHA256"
 cargo test -p filament-cli --bin tunlion codeentry::tests --locked
 cargo test -p filament-cli --bin tunlion join_entry::tests --locked
 cargo test -p filament-cli --bin tunlion join_input::tests --locked
-cargo test -p filament-cli --bin tunlion explicit_code_surface_tests --locked
+cargo test -p filament-cli --bin tunlion explicit_code_surface --locked
 cargo test -p filament-cli --bin tunlion identity_flow::join_input_tests --locked
 cargo test -p filament-cli --bin tunlion file_io::invitation --locked
 cargo test -p filament-cli --bin tunlion ui:: --locked
