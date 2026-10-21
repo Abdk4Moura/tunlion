@@ -364,16 +364,21 @@ pub async fn open_pty(
         .get(&pid)
         .and_then(|sid_map| sid_map.get(&sid))
         .cloned();
-    if let Some(owner) = incoming_owner.as_deref() {
-        if owner != session_id {
-            conn.log
-                .say(&format!("l2: pty refused: sid {sid:#x} in use"));
-            let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
-                .await;
-            return;
-        }
-    } else if mux.has_stream(sid).await {
+    let has_stream = mux.has_stream(sid).await;
+    let live_owner = if has_stream {
+        mux.stream_owner(sid).await
+    } else {
+        None
+    };
+    let foreign_binding = incoming_owner
+        .as_deref()
+        .is_some_and(|owner| owner != session_id);
+    // A live stream is ours only when it was registered as a PTY stream with
+    // EXACTLY our key. A non-PTY stream (owner None) or another PTY's stream is
+    // never displaced, even if a stale binding claims this sid.
+    let foreign_stream =
+        has_stream && live_owner.as_deref() != Some(session_id.as_str());
+    if foreign_binding || foreign_stream {
         conn.log
             .say(&format!("l2: pty refused: sid {sid:#x} in use"));
         let _ = t
@@ -415,10 +420,16 @@ pub async fn open_pty(
     // one. Removal closes the old mux pipe and resizer, so its input/resize
     // pumps exit instead of accumulating one per reconnect.
     prune_session_attachments(&session_id, muxes, bindings).await;
+    // A duplicate open can carry a sid whose stream is ours but whose binding
+    // was already gone. Release that exact-owned stream too, so the fresh
+    // attachment is the only registration.
+    if mux.stream_owner(sid).await.as_deref() == Some(session_id.as_str()) {
+        mux.drop_stream(sid).await;
+    }
 
     if action == PtyAction::Reattach {
         let Some(sess) = live_session else { return };
-        let Some(rx) = mux.register_stream(sid).await else {
+        let Some(rx) = mux.register_pty_stream(sid, session_id.clone()).await else {
             conn.log
                 .say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
             let _ = t
@@ -458,7 +469,7 @@ pub async fn open_pty(
             .await;
         return;
     };
-    let Some(rx) = mux.register_stream(sid).await else {
+    let Some(rx) = mux.register_pty_stream(sid, session_id.clone()).await else {
         conn.log
             .say(&format!("l2: pty refused: sid {sid:#x} in use"));
         let _ = t
@@ -1510,6 +1521,31 @@ mod tests {
         assert_eq!(h.bindings[PID][&SID], SESSION);
         assert_eq!(h.bindings[PID][&(SID + 1)], SESSION_B);
         assert_eq!(h.c.ends.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_same_key_binding_cannot_make_open_drop_a_foreign_stream() {
+        let mut h = harness(true).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+        // The PTY stream goes away while its binding is still present (the
+        // natural-exit window before the binding is lazily superseded).
+        h.muxes[PID].drop_pty(SID).await;
+        let _foreign = pre_register_sid(&mut h, SID).await;
+
+        open(&mut h, &open_frame("client-1", false)).await;
+
+        assert!(
+            controls(&h)
+                .iter()
+                .any(|v| v["type"] == "l2-close" && v["err"] == "sid in use"),
+            "a foreign stream reusing the sid must be refused"
+        );
+        assert!(
+            h.muxes[PID].has_stream(SID).await,
+            "the foreign stream must not be dropped just because a stale binding named its sid"
+        );
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

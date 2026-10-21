@@ -84,6 +84,12 @@ struct StreamHandle {
     /// the stream it actually owned, never a newer generation that reused the
     /// same sid.
     generation: u64,
+    /// PTY session key that owns this stream, when this is a PTY attachment.
+    /// Forward/mount/exec streams are `None`. The PTY open path uses this to
+    /// tell its own superseded attachment apart from an unrelated stream that
+    /// happens to reuse the same sid; a stale binding must never make it drop
+    /// somebody else's stream.
+    owner: Option<String>,
 }
 
 /// H-1 (DoS): per-link cap on concurrently live streams (file + L2 + PTY share
@@ -218,6 +224,25 @@ impl Mux {
     /// reusing a live sid is a protocol error and the caller must deny the open.
     /// This is the single structural chokepoint every stream type inherits.
     pub async fn register(&self, sid: u32) -> Option<mpsc::Receiver<PipeItem>> {
+        self.register_owned(sid, None).await
+    }
+
+    /// Register a PTY attachment and remember its exact session key. A later
+    /// open for the same sid can then distinguish its own stream from an
+    /// unrelated forward/mount stream before superseding anything.
+    pub async fn register_pty_stream(
+        &self,
+        sid: u32,
+        session_id: String,
+    ) -> Option<mpsc::Receiver<PipeItem>> {
+        self.register_owned(sid, Some(session_id)).await
+    }
+
+    async fn register_owned(
+        &self,
+        sid: u32,
+        owner: Option<String>,
+    ) -> Option<mpsc::Receiver<PipeItem>> {
         let mut streams = self.streams.lock().await;
         if streams.contains_key(&sid) {
             return None; // sid already live: refuse, do NOT overwrite/drop
@@ -233,6 +258,7 @@ impl Mux {
                 tx,
                 read_pump: None,
                 generation,
+                owner,
             },
         );
         Some(rx)
@@ -324,6 +350,17 @@ impl Mux {
     /// generation's exit.
     pub async fn stream_generation(&self, sid: u32) -> Option<u64> {
         self.streams.lock().await.get(&sid).map(|s| s.generation)
+    }
+
+    /// The PTY session key that owns `sid`, if the live stream is a PTY
+    /// attachment. `None` means either no stream at all or a non-PTY stream
+    /// (forward/mount/exec), which a PTY open must never displace.
+    pub async fn stream_owner(&self, sid: u32) -> Option<String> {
+        self.streams
+            .lock()
+            .await
+            .get(&sid)
+            .and_then(|s| s.owner.clone())
     }
 
     /// Drop `sid` only if it is still the SAME registration as `generation`.
