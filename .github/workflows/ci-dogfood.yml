@@ -1,4 +1,4 @@
-# Dogfood: run one CI job whose payload and artifacts travel over tunlion.
+# Dogfood: run a payload job, or reuse one bounded CI worker over tunlion.
 #
 # Dispatch only, from scripts/ci-dogfood.sh, which mints a single-use invitation,
 # sets it as TUNLION_INVITE, and sends the payload once the device shows up.
@@ -7,7 +7,9 @@
 # the binary from the last green `publish-edge` run and verifies its sha256, so
 # the only things this job needs are a key and a payload. Nothing here accepts
 # an arbitrary command string: the payload carries job.json and the steps run
-# exactly its declared `cmd`.
+# exactly its declared `cmd`. The explicit worker_minutes mode instead keeps
+# this single machine/cache alive for multiple trusted owner-driven jobs. Shell
+# access is enabled only for host_name, never through an Internet-facing sshd.
 name: ci-dogfood
 
 on:
@@ -24,25 +26,30 @@ on:
         description: "How long to wait for the payload to arrive"
         required: false
         default: "300"
+      worker_minutes:
+        description: "0: original one-job flow; 1–330: one reusable Tunlion shell worker"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: ci-dogfood-${{ inputs.runner_name }}
-  cancel-in-progress: true
+  group: ${{ inputs.worker_minutes != '0' && 'tunlion-ci-worker' || format('ci-dogfood-{0}', inputs.runner_name) }}
+  cancel-in-progress: ${{ inputs.worker_minutes == '0' }}
 
 jobs:
   job:
     name: job on ${{ inputs.runner_name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: ${{ inputs.worker_minutes != '0' && 360 || 45 }}
     steps:
       # No checkout. The binary comes from a published edge build, hash-checked.
       - name: Fetch the tunlion binary (no repo, no build)
         env:
           GH_TOKEN: ${{ github.token }}
+          WORKER_MODE: ${{ inputs.worker_minutes }}
         run: |
           set -euo pipefail
           echo "WORK=$RUNNER_TEMP/tunlion-work" >> "$GITHUB_ENV"
@@ -64,16 +71,44 @@ jobs:
           chmod +x "$RUNNER_TEMP/bin/tunlion"
           "$RUNNER_TEMP/bin/tunlion" --version
           echo "TUNLION_BIN=$RUNNER_TEMP/bin/tunlion" >> "$GITHUB_ENV"
+          # No source checkout is needed for the worker bootstrap. This key is
+          # public metadata only; dependency/target bytes persist across leases.
+          if [ "$WORKER_MODE" != 0 ]; then
+            lock=$(gh api "repos/${GITHUB_REPOSITORY}/contents/Cargo.lock?ref=main" --jq '.sha')
+            echo "CARGO_CACHE_KEY=$lock" >> "$GITHUB_ENV"
+          fi
+
+      - name: Restore the reusable worker's Cargo cache
+        if: inputs.worker_minutes != '0'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/tunlion-work/cargo-target
+          key: ci-worker-linux-${{ env.CARGO_CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ci-worker-linux-${{ env.CARGO_CACHE_KEY }}-
+            ci-worker-linux-
 
       - name: Join and serve with one command
         env:
           # Read from the environment, not an argv and not a file: the key is
           # never echoed, never written by this job, and never visible in `ps`.
-          TUNLION_AUTHKEY: ${{ secrets.TUNLION_INVITE }}
+          WORKER_INVITE: ${{ secrets.TUNLION_CI_WORKER_INVITE }}
+          LEGACY_INVITE: ${{ secrets.TUNLION_INVITE }}
+          WORKER_MINUTES: ${{ inputs.worker_minutes }}
+          HOST_NAME: ${{ inputs.host_name }}
         run: |
           set -euo pipefail
+          if [ "$WORKER_MINUTES" != 0 ]; then
+            export TUNLION_AUTHKEY="$WORKER_INVITE"
+          else
+            export TUNLION_AUTHKEY="$LEGACY_INVITE"
+          fi
+          unset WORKER_INVITE LEGACY_INVITE
           if [ -z "${TUNLION_AUTHKEY:-}" ]; then
-            echo "::error::TUNLION_INVITE is not set; run scripts/ci-dogfood.sh, which mints it"
+            echo "::error::the mode's invitation secret is not set"
             exit 2
           fi
           # One command: `up` joins when it has no identity, then serves. The
@@ -82,14 +117,53 @@ jobs:
           #
           # `up` has no --json (docs/ci-ux.md), so start it and then read
           # `status --json`, which is the machine-readable "is it up".
-          "$TUNLION_BIN" up --detach --dir "$WORK" --no-interactive
+          if ! [[ "$WORKER_MINUTES" =~ ^[0-9]+$ ]] || (( WORKER_MINUTES > 330 )); then
+            echo "::error::worker_minutes must be 0–330"
+            exit 2
+          fi
+          mkdir -p "$WORK"
+          if (( WORKER_MINUTES > 0 )); then
+            # One trusted caller, not --shell for every paired device. No SSH
+            # daemon or tunnel service is installed. This is an Actions sandbox.
+            "$TUNLION_BIN" up --detach --userspace --dir "$WORK" \
+              --shell-only "$HOST_NAME" --i-know --no-interactive
+          else
+            "$TUNLION_BIN" up --detach --dir "$WORK" --no-interactive
+          fi
           for i in $(seq 1 30); do
             if "$TUNLION_BIN" status --json >/dev/null 2>&1; then break; fi
             sleep 1
           done
           "$TUNLION_BIN" status --json
 
+      - name: Serve multiple jobs on this one worker
+        if: inputs.worker_minutes != '0'
+        env:
+          WORKER_MINUTES: ${{ inputs.worker_minutes }}
+          RUNNER_NAME: ${{ inputs.runner_name }}
+          HOST_NAME: ${{ inputs.host_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/jobs" "$WORK/cargo-target" "$WORK/results"
+          cat > "$WORK/worker.env" <<EOF
+          export CARGO_BUILD_JOBS=2
+          export CARGO_TARGET_DIR='$WORK/cargo-target'
+          export CARGO_PROFILE_DEV_DEBUG=0
+          export CARGO_PROFILE_TEST_DEBUG=0
+          export TUNLION_WORKER_ROOT='$WORK'
+          EOF
+          printf 'worker=%s\nroot=%s\n' "$RUNNER_NAME" "$WORK" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Caller: %s; bounded session: %s minutes\n' "$HOST_NAME" "$WORKER_MINUTES"
+          printf 'Reuse this box with tunlion exec/send; serialize builds with flock.\n'
+          end=$(( $(date +%s) + WORKER_MINUTES * 60 ))
+          while (( $(date +%s) < end )); do
+            # A trusted caller can end the session without cancelling a run.
+            [ ! -f "$WORK/STOP" ] || break
+            sleep 10
+          done
+
       - name: Wait for the job payload
+        if: inputs.worker_minutes == '0'
         env:
           DEADLINE: ${{ inputs.payload_timeout_s }}
         run: |
@@ -109,6 +183,7 @@ jobs:
           exit 6
 
       - name: Run the declared job
+        if: inputs.worker_minutes == '0'
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/job"
@@ -125,6 +200,7 @@ jobs:
           test -f out.tar
 
       - name: Bundle the outputs with their hashes
+        if: inputs.worker_minutes == '0'
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/job"
@@ -135,6 +211,7 @@ jobs:
           echo "BUNDLE=$RUNNER_TEMP/job/bundle.tar" >> "$GITHUB_ENV"
 
       - name: Send the bundle back over tunlion
+        if: inputs.worker_minutes == '0'
         env:
           HOST_NAME: ${{ inputs.host_name }}
         run: |
@@ -143,6 +220,7 @@ jobs:
           echo "bundle sent to $HOST_NAME"
 
       - name: Keep it as a workflow artifact too (belt and braces)
+        if: inputs.worker_minutes == '0'
         uses: actions/upload-artifact@v4
         with:
           name: ci-dogfood-${{ inputs.runner_name }}
