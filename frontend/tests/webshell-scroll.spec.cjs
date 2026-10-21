@@ -1,6 +1,7 @@
 // Browser shell scroll ergonomics gate. Drives the REAL WebTerminal + xterm 6
-// in Chromium with synthetic touch gestures and asserts the bytes that would
-// have gone to the PTY. It FAILS when:
+// in Chromium, and in Playwright WebKit (Safari's engine) with an iPad touch
+// viewport/user-agent when WEBSHELL_BROWSER=webkit. It asserts the bytes that
+// would have gone to the PTY. It FAILS when:
 //   1. an ordinary normal-buffer shell stops scrolling local history, or a
 //      touch scroll leaks wheel/cursor bytes into its PTY;
 //   2. a partial TUI in the NORMAL buffer with mouse reporting does not receive
@@ -16,18 +17,34 @@
 //   7. the mobile textarea hardening / IME commit path regressed.
 //
 //   node frontend/tests/webshell-scroll.spec.cjs        (from the repo root)
+//   WEBSHELL_BROWSER=webkit node frontend/tests/webshell-scroll.spec.cjs
+//
+// Boundary: Playwright WebKit is Safari's engine, not a physical iPad. It does
+// not expose a `Touch` constructor (Safari's real construction API is
+// `document.createTouch`/`createTouchList`), and on Linux it reports
+// navigator.maxTouchPoints=0 even with hasTouch. The gate uses the engine's
+// real Touch/TouchEvent API and the app's existing `?touch=1` preview hook; it
+// does not claim iOS Safari UI, virtual-keyboard, or hardware-touch coverage.
 
 const { spawnSync } = require('child_process');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const { chromium } = require(require.resolve('playwright', { paths: [path.join(__dirname, '..')] }));
+const { chromium, webkit } = require(require.resolve('playwright', { paths: [path.join(__dirname, '..')] }));
 
 const FRONT = path.resolve(__dirname, '..');
 const PORT = 8261;
+// `chromium` is the default so the existing command keeps its old cost.
+// `WEBSHELL_BROWSER=webkit` runs the same gate in Playwright's WebKit engine
+// (Safari's engine) with an iPad touch context. It is not a physical iPad; see
+// the boundary note in `openPage`.
 let server = null;
 const pageErrors = [];
+const BROWSER = (process.env.WEBSHELL_BROWSER || 'chromium').trim().toLowerCase();
+if (BROWSER !== 'chromium' && BROWSER !== 'webkit') fail(`unknown WEBSHELL_BROWSER=${BROWSER}`);
+let loggedContext = false;
+const IPAD_UA = 'Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 function fail(msg) { console.error('[webshell-scroll] FAIL:', msg); try { server && server.close(); } catch (e) {} process.exit(1); }
 function ok(msg) { console.log('[webshell-scroll] OK:', msg); }
 function eq(actual, expected, msg) {
@@ -49,13 +66,33 @@ function build() {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function openPage(browser, { width = 900, height = 700 } = {}) {
-  const page = await browser.newPage({ viewport: { width, height }, hasTouch: true });
+async function openPage(browser, { width = BROWSER === 'webkit' ? 1024 : 900, height = BROWSER === 'webkit' ? 768 : 700 } = {}) {
+  const page = await browser.newPage({
+    viewport: { width, height },
+    hasTouch: true,
+    ...(BROWSER === 'webkit' ? { isMobile: true, deviceScaleFactor: 2, userAgent: IPAD_UA } : {}),
+  });
   page.on('pageerror', (e) => { pageErrors.push(String(e)); console.log('[page-error]', String(e).slice(0, 400)); });
   await page.goto(`http://127.0.0.1:${PORT}/?preview=webshell-scroll&touch=1`, { waitUntil: 'networkidle' });
   await page.waitForFunction(() => window.__webterm && window.__scroll, null, { timeout: 10000 })
     .catch(() => fail('WebTerminal / xterm never mounted'));
   await page.evaluate(() => window.__webterm.focus());
+  // TouchEvent construction is engine-specific. WebKit exposes `Touch` but its
+  // constructor is an illegal constructor (Safari's real API is the legacy
+  // `document.createTouch` + `createTouchList` pair). Do not paper over that:
+  // detect the API actually present and fail if neither exists, rather than
+  // silently turning a touch gesture into a mouse/key gesture.
+  page.__touchMode = await page.evaluate(() => {
+    try { new Touch({ identifier: 1, target: document.body, clientX: 1, clientY: 1, pageX: 1, pageY: 1, screenX: 1, screenY: 1, radiusX: 1, radiusY: 1, force: 1 }); return 'constructor'; } catch (e) {}
+    if (typeof document.createTouch === 'function' && typeof document.createTouchList === 'function') return 'createTouchList';
+    return 'unsupported';
+  });
+  if (page.__touchMode === 'unsupported') fail('this browser exposes no synthetic Touch/TouchEvent construction API');
+  if (!loggedContext) {
+    loggedContext = true;
+    const ua = await page.evaluate(() => navigator.userAgent);
+    console.log(`[webshell-scroll] engine=${BROWSER} viewport=${width}x${height} touchMode=${page.__touchMode} ua=${ua}`);
+  }
   return page;
 }
 
@@ -79,16 +116,23 @@ async function cellPoint(page, col, row) {
 // steps=0 is a tap. `fingers=2` starts a two-finger gesture and then moves one
 // finger, which must leave tActive false in WebTerminal.
 async function swipe(page, { x0, y0, x1 = x0, y1, steps = 1, fingers = 1 }) {
-  return page.evaluate(({ x0, y0, x1, y1, steps, fingers }) => {
+  return page.evaluate(({ x0, y0, x1, y1, steps, fingers, mode }) => {
     const host = document.querySelector('[data-testid="term-host"]');
-    const mk = (x, y, id) => new Touch({
-      identifier: id, target: host,
-      clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y,
-      radiusX: 1, radiusY: 1, force: 1,
-    });
-    const fire = (type, list, changed) => host.dispatchEvent(new TouchEvent(type, {
+    // Chromium exposes `new Touch(...)`. WebKit (Safari's engine) exposes
+    // `Touch` but its constructor is illegal; the API that actually works there
+    // is Safari's legacy `document.createTouch` / `createTouchList`. Use the
+    // engine's real API rather than a JS object that only looks like a Touch.
+    const mk = (x, y, id) => mode === 'createTouchList'
+      ? document.createTouch(window, host, id, x, y, x, y, 1, 1, 1, 1)
+      : new Touch({
+          identifier: id, target: host,
+          clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y,
+          radiusX: 1, radiusY: 1, force: 1,
+        });
+    const list = (xs) => mode === 'createTouchList' ? document.createTouchList(...xs) : xs;
+    const fire = (type, touches, changed) => host.dispatchEvent(new TouchEvent(type, {
       bubbles: true, cancelable: true, composed: true,
-      touches: list, targetTouches: list, changedTouches: changed || list,
+      touches: list(touches), targetTouches: list(touches), changedTouches: list(changed || touches),
     }));
     if (fingers === 2) {
       const a = mk(x0, y0, 1), b = mk(x0, y0 + 24, 2);
@@ -103,30 +147,37 @@ async function swipe(page, { x0, y0, x1 = x0, y1, steps = 1, fingers = 1 }) {
     }
     fire('touchend', []);
     return true;
-  }, { x0, y0, x1, y1, steps, fingers });
+  }, { x0, y0, x1, y1, steps, fingers, mode: page.__touchMode });
 }
 
 // Split gesture primitives, so a spec can change the app's mode/buffer between
 // touchstart and touchmove (the stale-route abort case).
 async function touchStart(page, x, y) {
-  await page.evaluate(({ x, y }) => {
+  await page.evaluate(({ x, y, mode }) => {
     const host = document.querySelector('[data-testid="term-host"]');
-    const t = new Touch({ identifier: 1, target: host, clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y });
-    host.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, composed: true, touches: [t], targetTouches: [t], changedTouches: [t] }));
-  }, { x, y });
+    const t = mode === 'createTouchList'
+      ? document.createTouch(window, host, 1, x, y, x, y, 1, 1, 1, 1)
+      : new Touch({ identifier: 1, target: host, clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y });
+    const l = mode === 'createTouchList' ? document.createTouchList(t) : [t];
+    host.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, composed: true, touches: l, targetTouches: l, changedTouches: l }));
+  }, { x, y, mode: page.__touchMode });
 }
 async function touchMove(page, x, y) {
-  await page.evaluate(({ x, y }) => {
+  await page.evaluate(({ x, y, mode }) => {
     const host = document.querySelector('[data-testid="term-host"]');
-    const t = new Touch({ identifier: 1, target: host, clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y });
-    host.dispatchEvent(new TouchEvent('touchmove', { bubbles: true, cancelable: true, composed: true, touches: [t], targetTouches: [t], changedTouches: [t] }));
-  }, { x, y });
+    const t = mode === 'createTouchList'
+      ? document.createTouch(window, host, 1, x, y, x, y, 1, 1, 1, 1)
+      : new Touch({ identifier: 1, target: host, clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y });
+    const l = mode === 'createTouchList' ? document.createTouchList(t) : [t];
+    host.dispatchEvent(new TouchEvent('touchmove', { bubbles: true, cancelable: true, composed: true, touches: l, targetTouches: l, changedTouches: l }));
+  }, { x, y, mode: page.__touchMode });
 }
 async function touchEnd(page) {
-  await page.evaluate(() => {
+  await page.evaluate(({ mode }) => {
     const host = document.querySelector('[data-testid="term-host"]');
-    host.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, composed: true, touches: [], targetTouches: [], changedTouches: [] }));
-  });
+    const empty = mode === 'createTouchList' ? document.createTouchList() : [];
+    host.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, composed: true, touches: empty, targetTouches: empty, changedTouches: empty }));
+  }, { mode: page.__touchMode });
 }
 
 // Report xterm itself would encode for the ORIGINAL touch cell. We compute the
@@ -150,7 +201,8 @@ function legacyWheel(code, col, row) {
     else { res.setHeader('content-type', 'text/html'); res.end(html); }
   });
   await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
-  const browser = await chromium.launch({ headless: true });
+  const engine = BROWSER === 'webkit' ? webkit : chromium;
+  const browser = await engine.launch({ headless: true });
 
   // 1. Ordinary normal-buffer terminal: local history, never PTY data.
   {
@@ -465,5 +517,5 @@ function legacyWheel(code, col, row) {
   await browser.close();
   server.close();
   if (pageErrors.length) fail(`page errors: ${pageErrors.join(' | ')}`);
-  console.log('[webshell-scroll] PASS');
+  console.log(`[webshell-scroll] PASS (${BROWSER}${BROWSER === 'webkit' ? ', iPad touch context' : ''})`);
 })().catch((e) => fail(String((e && e.stack) || e)));
