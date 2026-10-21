@@ -1182,6 +1182,10 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn env_value_exact<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
     fn env_name_count(env: &[(String, String)], name: &str) -> usize {
         env.iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -1785,13 +1789,11 @@ mod tests {
 
         assert_eq!(env_value(&env, "TERM"), Some("xterm"));
         assert_eq!(
-            env.iter()
-                .find(|(k, _)| k == "term")
-                .map(|(_, v)| v.as_str()),
+            env_value_exact(&env, "term"),
             Some("screen"),
             "Unix names stay case-sensitive, so lower-case term is its own key"
         );
-        assert_eq!(env_value(&env, "Path"), Some(r"C:\explicit\bin"));
+        assert_eq!(env_value_exact(&env, "Path"), Some(r"C:\explicit\bin"));
         assert_eq!(env_value(&env, "HOME"), Some("/explicit/home"));
         assert_eq!(env_value(&env, "USER"), Some("me"));
         assert_eq!(env_value(&env, "SHELL"), Some("/bin/bash"));
