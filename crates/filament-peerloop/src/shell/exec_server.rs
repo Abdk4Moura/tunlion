@@ -1725,22 +1725,20 @@ mod tests {
         assert_eq!(env_value(&env, "TERM"), Some("xterm"));
         assert_eq!(env_value(&env, "LANG"), Some("en_US.UTF-8"));
         assert_eq!(env_value(&env, "TMPDIR"), Some("/tmp"));
-        assert_eq!(
-            env_value(&env, "XDG_CONFIG_HOME"),
-            Some("/home/guest/.config")
-        );
-        assert_eq!(
-            env_value(&env, "XDG_CACHE_HOME"),
-            Some("/home/guest/.cache")
-        );
-        assert_eq!(
-            env_value(&env, "XDG_DATA_HOME"),
-            Some("/home/guest/.local/share")
-        );
-        assert_eq!(
-            env_value(&env, "XDG_STATE_HOME"),
-            Some("/home/guest/.local/state")
-        );
+        let target_home = PathBuf::from("/home/guest");
+        for (name, suffix) in [
+            ("XDG_CONFIG_HOME", ".config"),
+            ("XDG_CACHE_HOME", ".cache"),
+            ("XDG_DATA_HOME", ".local/share"),
+            ("XDG_STATE_HOME", ".local/state"),
+        ] {
+            let expected = target_home.join(suffix);
+            assert_eq!(
+                env_value(&env, name),
+                Some(expected.to_string_lossy().as_ref()),
+                "{name} follows the target home"
+            );
+        }
         assert_ne!(
             env_value(&env, "XDG_RUNTIME_DIR"),
             Some("/run/user/1000"),
@@ -1786,7 +1784,13 @@ mod tests {
         let env = build_env_for(daemon, &explicit, false, &user, false).expect("unix env");
 
         assert_eq!(env_value(&env, "TERM"), Some("xterm"));
-        assert_eq!(env_value(&env, "term"), Some("screen"));
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "term")
+                .map(|(_, v)| v.as_str()),
+            Some("screen"),
+            "Unix names stay case-sensitive, so lower-case term is its own key"
+        );
         assert_eq!(env_value(&env, "Path"), Some(r"C:\explicit\bin"));
         assert_eq!(env_value(&env, "HOME"), Some("/explicit/home"));
         assert_eq!(env_value(&env, "USER"), Some("me"));
@@ -1847,6 +1851,22 @@ mod tests {
         std::env::split_paths(path)
             .map(|dir| dir.join(name))
             .find(|candidate| candidate.is_file())
+    }
+
+    /// Decode a Windows console child's bytes: `wsl.exe` writes UTF-16LE,
+    /// ordinary tools write UTF-8.
+    #[cfg(windows)]
+    fn windows_text(bytes: &[u8]) -> String {
+        let nul = bytes.iter().filter(|b| **b == 0).count();
+        if bytes.len() >= 2 && nul * 4 > bytes.len() {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
     }
 
     #[cfg(windows)]
@@ -1936,12 +1956,16 @@ mod tests {
         let output = command
             .output()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", wsl.display()));
+        // Hosted Windows images have WSL installed but no distribution, so
+        // `wsl.exe --help` prints its usage and exits with 0xffffffff. The
+        // launch itself is the assertion here; no distro execution is claimed.
+        let text = windows_text(&output.stdout);
         assert!(
-            output.status.success(),
-            "wsl.exe failed with the filtered env ({}): stdout={} stderr={}",
+            text.contains("Usage:") || text.contains("wsl.exe"),
+            "wsl.exe did not print its usage ({}): stdout={:?} stderr={:?}",
             output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            text,
+            windows_text(&output.stderr)
         );
     }
 
