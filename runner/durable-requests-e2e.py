@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -18,7 +19,7 @@ import urllib.request
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin", required=True, type=Path)
-    parser.add_argument("--python", required=True)
+    parser.add_argument("--python", help="backend interpreter; omit to bootstrap a job-local venv")
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--fault-hooks", action="store_true")
     args = parser.parse_args()
@@ -39,6 +40,22 @@ def main():
     owner, guest, inbox = work / "owner", work / "guest", work / "inbox"
     for path in (owner, guest, inbox):
         path.mkdir()
+
+    # A bare worker has no Flask/Eventlet. Bootstrap the harness's own venv so
+    # the gate is reproducible rather than depending on hand-installed packages.
+    backend_python = work / ".backend-venv" / "bin" / "python"
+    if not backend_python.exists():
+        subprocess.run([sys.executable, "-m", "venv", str(backend_python.parents[1])],
+                       check=True)
+        subprocess.run([str(backend_python), "-m", "pip", "install", "-q",
+                        "-r", str(repo / "backend" / "requirements.txt")], check=True)
+    if args.python:
+        requested = Path(args.python)
+        if requested.exists():
+            backend_python = requested
+        else:
+            print(f"requested backend python {requested} is absent; using the job-local venv")
+    print(f"backend interpreter: {backend_python}")
 
     def env(config, extra=None):
         return {**os.environ, "TUNLION_CONFIG_DIR": str(config),
@@ -90,7 +107,7 @@ def main():
 
     try:
         backend_log = (work / "backend.log").open("w")
-        backend = subprocess.Popen([args.python, "app.py"], cwd=repo / "backend",
+        backend = subprocess.Popen([str(backend_python), "app.py"], cwd=repo / "backend",
             env={**os.environ, "PORT": str(port), "FIL_ASYNC_MODE": "eventlet",
                  "FIL_SELF_MONKEYPATCH": "1", "FIL_CLAIM_LIMIT": "1000000"},
             stdout=backend_log, stderr=subprocess.STDOUT)

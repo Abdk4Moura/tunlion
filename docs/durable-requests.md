@@ -122,7 +122,9 @@ offline sender will return.
 ## Verification
 
 Isolated worker, source snapshot archived with per-file SHA-256, debug
-`test-hooks` binary:
+`test-hooks` binary. `runner/durable-requests-e2e.py` bootstraps a job-local
+Python venv from `backend/requirements.txt` when `--python` is omitted, so a
+bare worker can reproduce the gate without hand-installed Flask/Eventlet.
 
 - full `filament-peerloop` library: **500 passed**
 - `filament-cli` bin tests: **823 passed**, 2 ignored
