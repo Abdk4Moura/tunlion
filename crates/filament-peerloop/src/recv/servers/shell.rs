@@ -1358,7 +1358,6 @@ mod tests {
     #[tokio::test]
     async fn sixty_four_same_session_reattachments_keep_one_attachment_and_one_shell() {
         let mut h = harness(true).await;
-        insert_live(&h, SESSION);
         open(&mut h, &open_frame("client-1", false)).await;
 
         let shell = h.live.lock().unwrap()[SESSION].clone();
@@ -1408,7 +1407,6 @@ mod tests {
     #[tokio::test]
     async fn replacement_at_cap_frees_its_own_slot_and_preserves_unrelated_streams() {
         let mut h = harness(true).await;
-        insert_live(&h, SESSION);
         open(&mut h, &open_frame("client-1", false)).await;
 
         // Seven unrelated streams + our own attachment = the cap (8).
@@ -1470,12 +1468,15 @@ mod tests {
     #[tokio::test]
     async fn duplicate_same_sid_is_idempotent_and_same_sid_collision_is_named() {
         let mut h = harness(true).await;
-        insert_live(&h, SESSION);
         open(&mut h, &open_frame("client-1", false)).await;
         open(&mut h, &open_frame("client-1", false)).await;
 
         assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
-        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            h.c.attaches.load(Ordering::SeqCst),
+            1,
+            "the duplicate open reattached the same shell once"
+        );
         assert_eq!(h.c.ends.load(Ordering::SeqCst), 0);
         assert_eq!(h.muxes[PID].live_sids().await, vec![SID]);
         assert_eq!(h.muxes[PID].live_resizers().await, 1);
@@ -1514,7 +1515,6 @@ mod tests {
     #[tokio::test]
     async fn cross_device_same_raw_client_id_cannot_replace_another_device() {
         let mut h = harness(true).await;
-        insert_live(&h, SESSION);
         open(&mut h, &open_frame("client-1", false)).await;
 
         add_link(&mut h, PID_B, "phone-b");
