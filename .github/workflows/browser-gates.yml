@@ -96,6 +96,12 @@ jobs:
       - name: relay-honesty
         run: node frontend/tests/relay-honesty.spec.cjs
 
+      # Web-shell readiness: the browser must announce direct:false BEFORE any
+      # SDP. Without it a direct-first CLI waits out its QUIC budget and the
+      # web client sits on "connecting". The Rust unit test covers the cancel.
+      - name: transport-hint
+        run: node frontend/tests/transport-hint.spec.cjs
+
       - name: pake-ux
         env:
           TUNLION_TEST_VENV: python3

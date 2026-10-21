@@ -655,6 +655,11 @@ pub struct DirectPending {
     /// just DROPS the pending (no WebRTC fallback, the relay link is still serving)
     /// and the prober schedules the next backoff.
     pub probe: bool,
+    /// Stop flag for the 6-shot `transport-offer` re-emitter spawned by
+    /// `start_direct_inner`. Cancelling the pending (a browser hint, adoption,
+    /// expiry, replacement) must also stop that task; otherwise it keeps
+    /// advertising a direct dial we have already abandoned for several seconds.
+    pub cancel: Arc<AtomicBool>,
 }
 
 pub struct Conn {
@@ -732,6 +737,11 @@ pub struct Conn {
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
     /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
     pub direct_pending: HashMap<String, DirectPending>,
+    /// Peers that explicitly announced `direct:false` (WebRTC-only, e.g. the
+    /// browser). Kept OUT of the roster because presence pushes replace roster
+    /// entries; this fact must survive every KnownPeer/sync refresh for the
+    /// lifetime of the peer's sid.
+    pub webrtc_only: HashSet<String>,
     /// Bug 2: transport-offers that arrived before the receiver's DirectPending
     /// was created (peer's re-dial after a mid-transfer death). Same class as Bug
     /// 1 (pre-PAKE offers): buffered here and replayed once `start_direct` creates
@@ -954,6 +964,7 @@ impl Conn {
             room_digest_absent: HashMap::new(),
             recv_done: false,
             direct_pending: HashMap::new(),
+            webrtc_only: HashSet::new(),
             buffered_offers: HashMap::new(),
             resil: ResilienceState {
                 stall_repairs: HashMap::new(),
@@ -1444,6 +1455,10 @@ impl Conn {
             "  drop_link({pid}) ordered by {}",
             std::panic::Location::caller()
         ));
+        // The hint is scoped to the sid's link/session. A replacement or a
+        // peer-left must not pin direct off for whatever reuses this sid later;
+        // a browser's fresh PeerLink sends its own hint before the next SDP.
+        self.webrtc_only.remove(pid);
         // #28: dropping a link also discharges any deferred peer-left for it,
         // so a supersede (maybe_adopt) of a deferred same-uid sid can't leave a
         // stale entry blocking adoption. Invariant: deferred_left only ever
@@ -1698,6 +1713,7 @@ impl Conn {
         if self.has_live_transport(pid) {
             return false;
         }
+        self.webrtc_only.remove(pid);
         let removed = self.roster.remove(pid).is_some();
         if removed {
             self.log.debug(&format!("roster: forgot {pid} (known-peer-left)"));
@@ -1736,6 +1752,7 @@ impl Conn {
         }
         for pid in &gone {
             self.roster.remove(pid);
+            self.webrtc_only.remove(pid);
             self.roster_absent.remove(pid);
             self.log.debug(&format!("roster: forgot {pid} (absent from two digests)"));
         }
@@ -2043,6 +2060,96 @@ impl Conn {
     // budget. The whole thing is gated on `direct::direct_enabled()`, so with the
     // flag OFF none of this runs and the WebRTC path is byte-for-byte unchanged.
 
+    /// Remove a pending direct attempt and stop its offer re-emitter. Every
+    /// abandonment path (hint, adoption, expiry) goes through here so the task
+    /// cannot keep advertising a dial that no longer exists.
+    fn take_direct_pending(&mut self, pid: &str) -> Option<DirectPending> {
+        let pending = self.direct_pending.remove(pid)?;
+        pending.cancel.store(true, Ordering::Relaxed);
+        Some(pending)
+    }
+
+    /// Whether a peer explicitly told us it has no direct-QUIC transport.
+    ///
+    /// The browser's PeerLink sends `{type:"transport-hint", direct:false}` as
+    /// its FIRST signal, before any SDP. The direct-first ladder is correct for
+    /// CLI peers, but a browser can never answer a QUIC `transport-offer`, so
+    /// arming the ladder against one only makes it sit out DIRECT_BUDGET (plus
+    /// the fallback tick) before WebRTC is even offered. That wait is exactly
+    /// the web client's "connecting" stall. Treat an explicit `false` as a hard
+    /// skip; absent (all CLI peers, and old browsers) keeps direct-first.
+    pub(crate) fn direct_disabled_by_peer(v: &Value) -> bool {
+        v.get("direct").and_then(Value::as_bool) == Some(false)
+    }
+
+    /// Record a peer's self-declared transport capabilities and cancel any
+    /// direct attempt already armed against it. Returns true when the hint was
+    /// understood (`direct:false`).
+    ///
+    /// This is deliberately separate from the establish effect (`accept_
+    /// transport_hint`) so the state change is synchronous: the very next
+    /// `start_direct` for this peer is a no-op, even if a periodic KnownPeer /
+    /// warm-hold tick interleaves before the new WebRTC link is built.
+    pub(crate) fn note_transport_hint(&mut self, pid: &str, data: &Value) -> bool {
+        if !Self::direct_disabled_by_peer(data) {
+            return false;
+        }
+        let cancelled = self.take_direct_pending(pid).is_some();
+        // ONLY the transport fact is recorded, and `accept_transport_hint`
+        // installs it after the establish below (an establish calls drop_link,
+        // which clears per-link facts). A hint is unauthenticated and arrives
+        // before pair-proof/PAKE; its uid/name must never enter the roster,
+        // where the rest of the loop treats them as presence identity.
+        if cancelled {
+            self.log.debug(&format!(
+                "tunlion: {pid} is WebRTC-only, cancelled the direct-QUIC wait"
+            ));
+        } else {
+            self.log.debug(&format!(
+                "tunlion: {pid} announced direct:false, skipping the direct-QUIC ladder"
+            ));
+        }
+        true
+    }
+
+    /// Apply a peer's transport hint and immediately establish the WebRTC link
+    /// when it says direct is unavailable. Called from the signaling loop before
+    /// any SDP is handled, so the offer/answer starts at once instead of after
+    /// the direct budget expires.
+    pub async fn accept_transport_hint(&mut self, pid: &str, data: &Value) -> bool {
+        if !self.note_transport_hint(pid, data) {
+            return false;
+        }
+        if self.links.contains_key(pid) || self.links.len() >= MAX_LINKS {
+            self.webrtc_only.insert(pid.to_string());
+            return true;
+        }
+        let mut info = self
+            .roster
+            .get(pid)
+            .cloned()
+            .unwrap_or_else(|| json!({ "id": pid }));
+        // Use the hinted uid for the symmetric polite/impolite election only.
+        // It is not written to the roster; the real name/uid arrive with the
+        // authenticated presence/pair-proof events.
+        if info.get("uid").is_none() {
+            if let Some(uid) = data["uid"].as_str().filter(|s| !s.is_empty()) {
+                if net::ensure_ascii_uid(uid).is_ok() {
+                    info["uid"] = json!(uid);
+                }
+            }
+        }
+        if let Err(e) = self.establish_as(info, None).await {
+            self.log
+                .debug(&format!("tunlion: WebRTC establish after transport hint failed for {pid}: {e}"));
+        }
+        // Establish has finished (and may have called drop_link, which clears
+        // per-link facts), so install the fact now. It is scoped to this sid and
+        // dropped by drop_link/peer-left.
+        self.webrtc_only.insert(pid.to_string());
+        true
+    }
+
     /// Begin a direct attempt against `pid`: bind a quinn endpoint, advertise our
     /// candidates via a relayed `transport-offer`, and stash the pending state.
     /// No Link is created yet, it is born (with `peer: None`, pre-trusted) only
@@ -2136,6 +2243,13 @@ impl Conn {
         // the reachable host candidate) instead of building a colliding WebRTC
         // peer that glares with the initiator's offer.
         if !self.direct_ok {
+            return;
+        }
+        // Browser peers announced `direct:false` before their SDP. There is no
+        // QUIC stack on the other end, so arming the ladder would buy nothing
+        // and cost the whole DIRECT_BUDGET before WebRTC is offered. CLI peers
+        // carry no hint and keep direct-first unchanged.
+        if self.webrtc_only.contains(pid) {
             return;
         }
         if !probe && self.resil.relay_committed.contains(pid) {
@@ -2363,12 +2477,17 @@ impl Conn {
         // the cross-machine stall. Re-emitting lets it catch a later offer and
         // dial our (reachable) candidates; the initiator only races the FIRST
         // offer it gets, so the extra emits are harmless once linked.
+        let cancel_emitter = Arc::new(AtomicBool::new(false));
         {
             let sio = self.sio.clone();
             let pid_c = pid.to_string();
+            let cancel = cancel_emitter.clone();
             tokio::spawn(async move {
                 for _ in 0..6 {
                     tokio::time::sleep(Duration::from_millis(1200)).await;
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let _ = sio
                         .emit("signal", json!({ "to": pid_c, "data": offer.clone() }))
                         .await;
@@ -2408,6 +2527,7 @@ impl Conn {
                 peer_server_public: None,
                 server_public_dialed: Arc::new(AtomicBool::new(false)),
                 probe,
+                cancel: cancel_emitter,
             },
         );
         // Replace the serving WebRTC link only after all fallible setup has
@@ -2465,6 +2585,12 @@ impl Conn {
         peer_server_public: Option<String>,
         peer_proto: u8,
     ) {
+        // A peer that announced `direct:false` cannot consume this path. Ignore
+        // a late/contradictory offer rather than spawning a race that could
+        // later replace the WebRTC link the hint asked us to build.
+        if self.webrtc_only.contains(pid) {
+            return;
+        }
         let Some(p) = self.direct_pending.get_mut(pid) else {
             return;
         };
@@ -4027,6 +4153,7 @@ impl Conn {
         };
         let pid = pid_val.to_string();
         self.roster.remove(&pid);
+        self.webrtc_only.remove(&pid);
         if !self.links.contains_key(&pid) {
             return false;
         }
@@ -4439,6 +4566,16 @@ impl Conn {
                 .get(from)
                 .cloned()
                 .unwrap_or_else(|| json!({ "id": from }));
+            // SCOPED fallback, never blanket: only a peer that explicitly
+            // announced `direct:false` (the browser hint) may cancel a pending
+            // direct attempt from its offer. The L2/exec initiator deliberately
+            // races a WebRTC peer against a direct-QUIC dial; cancelling for it
+            // made the acceptor choose WebRTC and broke the direct path's
+            // expiry/revocation close semantics (expiry-race + pty-resume
+            // gates). CLI peers carry no hint, so their pending survives this.
+            if self.webrtc_only.contains(from) {
+                let _ = self.take_direct_pending(from);
+            }
             if self.links.len() < MAX_LINKS {
                 // Forced responder: this link exists to answer THEIR offer.
                 self.establish_as(info, Some(true)).await?;
@@ -4609,6 +4746,58 @@ mod relay_privacy_tests {
             assert!(
                 !seen.iter().any(|t| t.contains("transport-offer")),
                 "relay mode sent a transport-offer: {seen:?}"
+            );
+        });
+    }
+
+    /// A browser says `direct:false`; the acceptor must not even advertise a
+    /// QUIC transport-offer for it. Without this the offer is emitted and the
+    /// WebRTC link is suppressed until the direct budget expires, which is the
+    /// "connecting" stall the web shell reported.
+    #[test]
+    fn a_browser_peer_never_gets_a_transport_offer() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (url, server) = fake_signaling().await;
+            let (itx, _irx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
+            let sio = filament_signal::connect(&url, itx)
+                .await
+                .expect("connect to the fake signaling endpoint");
+            let (tx, _rx) = mpsc::unbounded_channel::<Ev>();
+            let mut conn = Conn::for_command(
+                filament_transport::TransportContext::default(),
+                &url,
+                sio.clone(),
+                tx,
+                "uid-host-test".to_string(),
+                false, // not relay mode
+                None,
+                false,
+                true, // direct requested, as `up --shell` does
+                Arc::new(crate::host::NoLog),
+                Arc::new(crate::host::NoHost),
+            );
+            assert!(conn.direct_ok);
+            let pid = "browser-sid";
+            conn.roster
+                .insert(pid.to_string(), json!({ "id": pid, "direct": false }));
+            conn.webrtc_only.insert(pid.to_string());
+            conn.start_direct(pid, "web", "00").await;
+            assert!(
+                conn.direct_pending.is_empty(),
+                "a browser peer armed the direct-QUIC ladder"
+            );
+            sio.disconnect().await.unwrap();
+            let seen = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .expect("fake signaling ended")
+                .unwrap();
+            assert!(
+                !seen.iter().any(|t| t.contains("transport-offer")),
+                "a browser peer was sent a transport-offer: {seen:?}"
             );
         });
     }
@@ -5823,6 +6012,203 @@ mod warm_identity_tests {
         assert!(!conn.on_retry_due(pid, g).await.unwrap());
         assert!(conn.links[pid].direct, "a stale retry replaced the new link");
         assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+    }
+
+    // --- browser transport hint (web-shell "connecting" stall) -------------
+
+    #[test]
+    fn only_an_explicit_false_disables_direct() {
+        assert!(Conn::direct_disabled_by_peer(
+            &json!({ "direct": false })
+        ));
+        // CLI peers (and older clients) carry no field: direct-first stays.
+        assert!(!Conn::direct_disabled_by_peer(&json!({})));
+        assert!(!Conn::direct_disabled_by_peer(
+            &json!({ "direct": true })
+        ));
+        assert!(!Conn::direct_disabled_by_peer(
+            &json!({ "direct": "false" })
+        ));
+    }
+
+    /// The web-shell regression: a browser sent a valid offer, but the CLI's
+    /// direct-QUIC attempt owned the peer until DIRECT_BUDGET expired, so
+    /// `establish_as` silently refused the responder and the web UI sat on
+    /// "connecting". A transport hint must cancel that wait and build the
+    /// WebRTC link immediately, with no time advance.
+    #[tokio::test]
+    async fn a_browser_transport_hint_establishes_without_the_direct_wait() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let pid = "sid-browser";
+        // Authenticated presence already resolved this peer. An unauthenticated
+        // hint must not be able to replace these fields.
+        conn.roster.insert(
+            pid.to_string(),
+            json!({ "id": pid, "name": "real-device", "uid": "real-uid" }),
+        );
+
+        // A direct attempt already armed, exactly as KnownPeer does before the
+        // hint arrives on the next signaling message.
+        let cancel = Arc::new(AtomicBool::new(false));
+        conn.direct_pending.insert(
+            pid.to_string(),
+            DirectPending {
+                secret: ("web".into(), "00".into()),
+                fleet: false,
+                ephemeral: false,
+                deadline: Instant::now() + Duration::from_secs(30),
+                racing: false,
+                endpoint: None,
+                punch_sock: None,
+                my_srflx: None,
+                peer_server_public: None,
+                server_public_dialed: Arc::new(AtomicBool::new(false)),
+                probe: false,
+                cancel: cancel.clone(),
+            },
+        );
+
+        let t0 = Instant::now();
+        assert!(
+            conn.accept_transport_hint(
+                pid,
+                &json!({ "type": "transport-hint", "direct": false, "uid": "spoof-uid", "name": "spoof-name" }),
+            )
+            .await
+        );
+        assert!(
+            conn.direct_pending.is_empty(),
+            "the direct-QUIC wait was not cancelled"
+        );
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the transport-offer re-emitter was not cancelled"
+        );
+        assert_eq!(conn.roster[pid]["name"], json!("real-device"));
+        assert_eq!(conn.roster[pid]["uid"], json!("real-uid"));
+        assert!(
+            conn.links.contains_key(pid),
+            "the WebRTC responder was not built immediately"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "establish waited {}ms after the hint",
+            t0.elapsed().as_millis()
+        );
+        assert!(conn.webrtc_only.contains(pid));
+
+        // The periodic KnownPeer push replaces the roster entry and has no
+        // `direct` field. The fact lives in the dedicated set, so it survives.
+        conn.maybe_adopt(
+            &json!({ "id": pid, "name": "web", "uid": "browser-uid" }),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            conn.webrtc_only.contains(pid),
+            "a KnownPeer push erased the WebRTC-only fact"
+        );
+
+        // A later KnownPeer / warm-hold tick must not re-arm the wait.
+        conn.start_direct(pid, "web", "00").await;
+        assert!(
+            conn.direct_pending.is_empty(),
+            "a re-announce re-armed the direct wait for a browser peer"
+        );
+    }
+
+    /// A hint is scoped to one sid/link. Drop/replacement and peer-left must
+    /// clear it so a later session on that sid (or a CLI peer reusing the
+    /// roster slot) is direct-first again.
+    #[tokio::test]
+    async fn a_transport_hint_is_cleared_with_its_link_or_peer() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-scoped";
+        conn.webrtc_only.insert(pid.to_string());
+        conn.drop_link(pid);
+        assert!(!conn.webrtc_only.contains(pid), "drop_link kept the hint");
+        conn.webrtc_only.insert(pid.to_string());
+        conn.on_known_peer_left(&json!({ "id": pid, "channel": "chan" }));
+        assert!(
+            !conn.webrtc_only.contains(pid),
+            "known-peer-left kept the hint"
+        );
+        conn.webrtc_only.insert(pid.to_string());
+        conn.on_peer_left(&json!({ "id": pid }));
+        assert!(!conn.webrtc_only.contains(pid), "peer-left kept the hint");
+    }
+
+    /// The L2/exec initiator deliberately races WebRTC against direct. Its
+    /// inbound offer must NOT cancel our pending direct attempt; only an
+    /// explicit `direct:false` hint may do that. Otherwise the direct link's
+    /// expiry/revocation close semantics regress.
+    #[tokio::test]
+    async fn an_offer_from_a_cli_peer_does_not_cancel_its_direct_race() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let pid = "sid-cli-race";
+        let cancel = Arc::new(AtomicBool::new(false));
+        conn.direct_pending.insert(
+            pid.to_string(),
+            DirectPending {
+                secret: ("box".into(), "00".into()),
+                fleet: false,
+                ephemeral: false,
+                deadline: Instant::now() + Duration::from_secs(30),
+                racing: false,
+                endpoint: None,
+                punch_sock: None,
+                my_srflx: None,
+                peer_server_public: None,
+                server_public_dialed: Arc::new(AtomicBool::new(false)),
+                probe: false,
+                cancel: cancel.clone(),
+            },
+        );
+        conn.ensure_responder(
+            pid,
+            &json!({
+                "type": "description",
+                "uid": "cli-uid",
+                "description": { "type": "offer", "sdp": "v=0" }
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            conn.direct_pending.contains_key(pid),
+            "a CLI peer's WebRTC offer cancelled its direct race"
+        );
+        assert!(
+            !cancel.load(Ordering::Relaxed),
+            "a CLI peer's offer cancelled the direct offer re-emitter"
+        );
+        assert!(
+            !conn.links.contains_key(pid),
+            "WebRTC was built while the direct race still owned the peer"
+        );
+    }
+
+    /// Skipping direct for a browser must not disable the relay path: the hint
+    /// only removes the QUIC wait, and the WebRTC link is still built with the
+    /// session's relay policy/config.
+    #[tokio::test]
+    async fn a_hint_still_builds_the_relay_responder() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        conn.relay_only = true;
+        let pid = "sid-relay-browser";
+        assert!(
+            conn.accept_transport_hint(pid, &json!({ "direct": false }))
+                .await
+        );
+        assert!(conn.direct_pending.is_empty());
+        assert!(
+            conn.links.contains_key(pid),
+            "the relay/WebRTC responder was suppressed by the hint"
+        );
     }
 }
 
