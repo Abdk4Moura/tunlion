@@ -632,6 +632,8 @@ mod windows_tests {
     use windows_sys::Win32::Storage::FileSystem::WriteFile;
     use windows_sys::Win32::System::Pipes::CreatePipe;
 
+    static CONSOLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn pipe() -> (usize, usize) {
         let mut read = std::ptr::null_mut();
         let mut write = std::ptr::null_mut();
@@ -908,6 +910,7 @@ mod windows_tests {
 
     #[test]
     fn console_mode_is_restored_when_a_console_is_available() {
+        let _serial = CONSOLE_TEST_LOCK.lock().unwrap();
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         };
@@ -938,6 +941,55 @@ mod windows_tests {
         let mut after = 0u32;
         assert_ne!(unsafe { GetConsoleMode(handle, &mut after) }, 0);
         assert_eq!(before, after, "console mode must be restored");
+        unsafe { CloseHandle(handle) };
+    }
+
+    #[test]
+    fn console_surrogate_pair_is_one_line() {
+        let _serial = CONSOLE_TEST_LOCK.lock().unwrap();
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Console::{
+            FlushConsoleInputBuffer, WriteConsoleInputW, INPUT_RECORD, KEY_EVENT,
+        };
+        let name: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+        // SAFETY: opens the console input device if this process has one.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                0x8000_0000 | 0x4000_0000, // GENERIC_READ | GENERIC_WRITE
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            return; // headless runner: no console input
+        }
+        // SAFETY: console handle; flush and inject three key-down records.
+        let (mut events, written) = unsafe {
+            let _ = FlushConsoleInputBuffer(handle);
+            let mut events: [INPUT_RECORD; 3] = std::mem::zeroed();
+            for (slot, unit) in events.iter_mut().zip([0xD83Du16, 0xDE00, b'\r' as u16]) {
+                slot.EventType = KEY_EVENT as u16;
+                slot.Event.KeyEvent.bKeyDown = 1;
+                slot.Event.KeyEvent.wRepeatCount = 1;
+                slot.Event.KeyEvent.uChar.UnicodeChar = unit;
+            }
+            let mut written = 0u32;
+            let ok = WriteConsoleInputW(handle, events.as_ptr(), 3, &mut written);
+            (ok, written)
+        };
+        if events == 0 || written != 3 {
+            unsafe { CloseHandle(handle) };
+            return; // console input injection unavailable
+        }
+        let (mut owner, mut rx) = owner(handle as usize);
+        assert_eq!(next_line(&mut rx), "😀");
+        assert_eq!(owner.join(), StdinOutcome::Joined);
         unsafe { CloseHandle(handle) };
     }
 
