@@ -1544,6 +1544,26 @@ mod win_at {
         options: u32,
         file_attributes: u32,
     ) -> io::Result<OwnedHandle> {
+        nt_open_with_share(
+            parent,
+            name,
+            disposition,
+            access,
+            options,
+            file_attributes,
+            SHARE_RW,
+        )
+    }
+
+    fn nt_open_with_share(
+        parent: &OwnedHandle,
+        name: &[u16],
+        disposition: u32,
+        access: u32,
+        options: u32,
+        file_attributes: u32,
+        share_access: u32,
+    ) -> io::Result<OwnedHandle> {
         let byte_len = (name.len() * 2) as u16;
         let mut unicode = UnicodeString {
             length: byte_len,
@@ -1571,7 +1591,7 @@ mod win_at {
                 &mut iosb,
                 std::ptr::null_mut(),
                 file_attributes,
-                SHARE_RW,
+                share_access,
                 disposition,
                 options,
                 std::ptr::null_mut(),
@@ -1701,6 +1721,11 @@ mod win_at {
             Ok((win, path))
         }
 
+        #[cfg(test)]
+        pub fn id(&self) -> (u32, u32, u32) {
+            self._id
+        }
+
         /// Test/absolute-path pin. Production admission uses `open_relative`
         /// from the pinned drop directory.
         pub fn open(root: &Path) -> io::Result<Self> {
@@ -1813,13 +1838,19 @@ mod win_at {
         ) -> io::Result<()> {
             let from = units(from_name)?;
             let to = units(to_name)?;
-            let named = nt_open(
+            // The identity open is transient and only reads attributes. It
+            // must SHARE_DELETE because the staging handle we compare against
+            // holds DELETE access (that is what lets finalization rename it);
+            // this does not weaken the pin: the commit still acts on the open
+            // staging HANDLE, never on this name.
+            let named = nt_open_with_share(
                 parent.handle(),
                 &from,
                 FILE_OPEN,
                 WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
                 FILE_NON_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
                 0,
+                SHARE_RW | WinFs::FILE_SHARE_DELETE,
             )?;
             let named_id = stable_id(named.as_raw_handle() as HANDLE)?;
             let source_id = stable_id(source.as_raw_handle() as HANDLE)?;
@@ -3194,6 +3225,92 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pinned_root_identity_survives_an_ancestor_move() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let outer = win_tmp();
+        let root = outer.join("root");
+        std::fs::create_dir(&root).unwrap();
+        let win = win_root(&root);
+        let id = win.id();
+        let moved = outer.with_extension("moved");
+        match std::fs::rename(&outer, &moved) {
+            Ok(()) => {
+                // The path changed; the pinned object did not.
+                assert_eq!(win.id(), id);
+                let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+                let mut part = win
+                    .create_staging(&parent, OsStr::new("x.part"))
+                    .expect("create through the pin after the ancestor move");
+                part.write_all(b"pinned").unwrap();
+                win.rename_staged(&parent, OsStr::new("x.part"), OsStr::new("x"), &part)
+                    .expect("commit through the pin");
+                assert_eq!(std::fs::read(moved.join("root/x")).unwrap(), b"pinned");
+                let _ = std::fs::remove_dir_all(&moved);
+            }
+            Err(error) => {
+                // Windows may refuse to move an ancestor while the pinned
+                // descendant is open. That is the OS-layer guarantee, not a
+                // skip: identity and the live handle still have to work.
+                assert!(
+                    error.raw_os_error().is_some(),
+                    "ancestor move refused: {error}"
+                );
+                assert_eq!(win.id(), id);
+                let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+                let mut part = win.create_staging(&parent, OsStr::new("x.part")).unwrap();
+                part.write_all(b"pinned").unwrap();
+                win.rename_staged(&parent, OsStr::new("x.part"), OsStr::new("x"), &part)
+                    .unwrap();
+                assert_eq!(std::fs::read(root.join("x")).unwrap(), b"pinned");
+                let _ = std::fs::remove_dir_all(&root);
+                let _ = std::fs::remove_dir_all(&outer);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ancestor_that_is_a_file_is_refused() {
+        let root = win_tmp();
+        std::fs::write(root.join("blocker"), b"not a directory").unwrap();
+        let win = win_root(&root);
+        let error = win
+            .ensure_parent(std::path::Path::new("blocker/child"))
+            .expect_err("a file cannot be an ancestor directory");
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(code) if code == 267 // ERROR_DIRECTORY
+            ) || error.kind() == std::io::ErrorKind::NotFound,
+            "unexpected error: {error}"
+        );
+        assert!(!root.join("blocker/child").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_names_reject_ads_trailing_and_device_components() {
+        use std::ffi::OsStr;
+        let root = win_tmp();
+        let win = win_root(&root);
+        let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+        for bad in ["a:b", "a.", "a ", "..", ".", "CON", "LPT1.txt"] {
+            let error = win
+                .create_staging(&parent, OsStr::new(bad))
+                .expect_err("an unsafe/ambiguous Windows name is refused");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{bad:?}: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(windows)]
