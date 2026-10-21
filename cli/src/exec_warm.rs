@@ -38,6 +38,7 @@ mod imp {
         FRAME_STDOUT, read_frame, write_frame,
     };
     use serde_json::{Value, json};
+    use std::path::Path;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio::sync::mpsc;
@@ -75,8 +76,8 @@ mod imp {
     /// before this feature closes an unknown request without a reply; that must
     /// be a cold fallback, not the "reply lost after the open" failure. One
     /// short local round trip is cheap next to a cold establish.
-    async fn supports_warm_exec() -> bool {
-        let Ok(mut sock) = UnixStream::connect(crate::ctl::control_sock_path()).await else {
+    async fn supports_warm_exec_at(path: &Path) -> bool {
+        let Ok(mut sock) = UnixStream::connect(path).await else {
             return false;
         };
         if sock.write_all(b"{\"op\":\"exec-cap\"}\n").await.is_err() || sock.flush().await.is_err()
@@ -103,10 +104,21 @@ mod imp {
         opts: &ExecOpts,
         interrupted: &mut Interrupted,
     ) -> WarmExec {
-        if crate::ctl::reuse_disabled() || !supports_warm_exec().await {
+        try_exec_at(&crate::ctl::control_sock_path(), peer, opts, interrupted).await
+    }
+
+    /// `try_exec` against an explicit socket path, so tests can drive a fake
+    /// daemon with no process-global config or TTY.
+    pub(crate) async fn try_exec_at(
+        path: &Path,
+        peer: &str,
+        opts: &ExecOpts,
+        interrupted: &mut Interrupted,
+    ) -> WarmExec {
+        if crate::ctl::reuse_disabled() || !supports_warm_exec_at(path).await {
             return WarmExec::NoPath;
         }
-        let mut sock = match UnixStream::connect(crate::ctl::control_sock_path()).await {
+        let mut sock = match UnixStream::connect(path).await {
             Ok(s) => s,
             Err(_) => return WarmExec::NoPath,
         };
@@ -359,6 +371,75 @@ mod tests {
     /// The one decision that keeps exec from replaying: only an explicit miss
     /// may fall back. A daemon that already sent `exec-open` reports `Done`,
     /// even when that result is an error, and the caller must not cold-retry.
+
+    /// A control-send failure after `exec-open` is relayed as `failed:`, which
+    /// must be FINAL. This fake daemon speaks the probe + exec op and answers
+    /// exactly what a failed `send_control` produces; the client must not turn
+    /// that into `NoPath` (which would cold-run the command a second time).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_after_open_reply_never_falls_back_to_cold() {
+        use crate::exec_send::ExecOpts;
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{UnixListener, UnixStream};
+
+        async fn read_line(s: &mut UnixStream) -> String {
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = s.read(&mut byte).await.unwrap();
+                if n == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            String::from_utf8(buf).unwrap()
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "filament-warm-exec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let line = read_line(&mut s).await;
+                let v: Value = serde_json::from_str(&line).unwrap();
+                let reply = if v["op"].as_str() == Some("exec-cap") {
+                    json!({ "ok": true })
+                } else {
+                    json!({ "ok": false, "err": "failed: the warm link could not carry the exec open" })
+                };
+                s.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+                s.flush().await.unwrap();
+            }
+        });
+        let opts = ExecOpts {
+            argv: vec!["true".to_string()],
+            tty: false,
+            cwd: None,
+            env: Vec::new(),
+        };
+        let mut never: crate::exec_send::Interrupted =
+            Box::pin(std::future::pending::<(crate::platform::TreeSignal, i32)>());
+        let result = super::imp::try_exec_at(&path, "box", &opts, &mut never).await;
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            WarmExec::Done(Err(_)) => {}
+            WarmExec::NoPath => panic!("a failed after-open reply became a cold fallback"),
+            WarmExec::Done(Ok(code)) => panic!("unexpected exit {code}"),
+        }
+    }
+
     #[test]
     fn only_no_path_falls_back() {
         fn is_fallback(w: &WarmExec) -> bool {

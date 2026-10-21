@@ -150,12 +150,15 @@ async fn run_warm_exec(
     if tty {
         open["tty"] = json!(true);
     }
-    // BEFORE the open: a send failure means no command was started, so a cold
-    // fallback is safe and honest.
+    // ATTEMPTED, NOT NECESSARILY SENT. `send_control` has no "nothing left the
+    // box" guarantee: its bounded select can expire after the write was queued
+    // (net.rs / direct.rs), so the peer may have received `exec-open` and
+    // started the command. A cold fallback here would run it twice. This is
+    // FINAL, never `no warm path`; only failures BEFORE this call may fall back.
     if t.send_control(&open).await.is_err() {
         mux.drop_stream(sid).await;
         mux.drop_stream(err_sid).await;
-        req.reject("no warm path: the warm link could not carry the open")
+        req.reject("failed: the warm link could not carry the exec open")
             .await;
         return;
     }
@@ -265,6 +268,8 @@ async fn run_warm_exec(
     let mut want_err: Option<u64> = None;
     let mut terminal: Option<Value> = None;
     let mut client_gone = false;
+    let mut out_open = true;
+    let mut err_open = true;
     let mut last_heard = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     ticker.tick().await;
@@ -350,7 +355,7 @@ async fn run_warm_exec(
                     break;
                 }
             },
-            item = out_pipe.recv() => match item {
+            item = out_pipe.recv(), if out_open => match item {
                 Some(Some(bytes)) => {
                     last_heard = tokio::time::Instant::now();
                     out_count += bytes.len() as u64;
@@ -363,19 +368,36 @@ async fn run_warm_exec(
                 // `exec-close` carrying the status is what ends it.
                 Some(None) => {}
                 None => {
-                    // The dispatch loop queues the full `l2-close` frame BEFORE
-                    // it drops the stream, so prefer that frame over the
-                    // reason-only fallback (it carries the expiry remedy).
-                    match ctl.try_recv() {
-                        Ok(v) if v["type"].as_str() == Some("l2-close") => {
-                            terminal = Some(v);
+                    out_open = false;
+                    // The pipe can end BEFORE the control frame is polled (a
+                    // fast command's output drains first). Pull everything
+                    // already queued: an `exec-close` carries the exact status
+                    // and byte counts, so dropping it for the generic
+                    // "no status" fallback loses a clean exit.
+                    let mut closed = false;
+                    while let Ok(v) = ctl.try_recv() {
+                        match queued_ctl(&v, sid, &mut status, &mut want_out, &mut want_err) {
+                            QueuedCtl::Ignore => {}
+                            QueuedCtl::Ended => {
+                                closed = true;
+                                break;
+                            }
+                            QueuedCtl::Terminal(v) => {
+                                terminal = Some(v);
+                                break;
+                            }
                         }
-                        _ => terminal = Some(stream_ended(&mux, &peer, sid).await),
+                    }
+                    if terminal.is_none() && !closed {
+                        // The dispatch loop queues the full `l2-close` frame
+                        // BEFORE it drops the stream, so prefer that frame over
+                        // the reason-only fallback (it carries the remedy).
+                        terminal = Some(stream_ended(&mux, &peer, sid).await);
                     }
                     break;
                 }
             },
-            item = err_pipe.recv() => match item {
+            item = err_pipe.recv(), if err_open => match item {
                 Some(Some(bytes)) => {
                     last_heard = tokio::time::Instant::now();
                     err_count += bytes.len() as u64;
@@ -385,7 +407,7 @@ async fn run_warm_exec(
                     }
                 }
                 Some(None) => {}
-                None => {}
+                None => err_open = false,
             },
             _ = ticker.tick() => {
                 if t.is_dead() {
@@ -422,7 +444,7 @@ async fn run_warm_exec(
                 break;
             }
             tokio::select! {
-                item = out_pipe.recv() => match item {
+                item = out_pipe.recv(), if out_open => match item {
                     Some(Some(bytes)) => {
                         out_count += bytes.len() as u64;
                         if out_tx.send(Out::Data(FRAME_STDOUT, bytes)).await.is_err() {
@@ -430,9 +452,9 @@ async fn run_warm_exec(
                             break;
                         }
                     }
-                    _ => {}
+                    _ => out_open = false,
                 },
-                item = err_pipe.recv() => match item {
+                item = err_pipe.recv(), if err_open => match item {
                     Some(Some(bytes)) => {
                         err_count += bytes.len() as u64;
                         if out_tx.send(Out::Data(FRAME_STDERR, bytes)).await.is_err() {
@@ -440,7 +462,7 @@ async fn run_warm_exec(
                             break;
                         }
                     }
-                    _ => {}
+                    _ => err_open = false,
                 },
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
@@ -477,6 +499,35 @@ async fn run_warm_exec(
     // A stream that ended must not leave a half-live remote tree behind.
     if t.is_dead() {
         let _ = tx.send(filament_transport::net::Ev::DropLink(pid));
+    }
+}
+
+/// One already-queued control frame, classified for a stream that ended first.
+enum QueuedCtl {
+    Ignore,
+    /// `exec-close`: the clean end, with the exact status and byte counts.
+    Ended,
+    /// A close/refusal that must be relayed as-is (code/as/reinvite intact).
+    Terminal(Value),
+}
+
+fn queued_ctl(
+    v: &Value,
+    sid: u32,
+    status: &mut Option<i32>,
+    want_out: &mut Option<u64>,
+    want_err: &mut Option<u64>,
+) -> QueuedCtl {
+    match v["type"].as_str() {
+        Some("exec-close") if v["sid"].as_u64() == Some(sid as u64) => {
+            *status = v["status"].as_i64().map(|s| s as i32);
+            *want_out = v["out_bytes"].as_u64();
+            *want_err = v["err_bytes"].as_u64();
+            QueuedCtl::Ended
+        }
+        Some("l2-close") if v["sid"].as_u64() == Some(sid as u64) => QueuedCtl::Terminal(v.clone()),
+        Some("link-revoked") => QueuedCtl::Terminal(v.clone()),
+        _ => QueuedCtl::Ignore,
     }
 }
 
@@ -563,4 +614,46 @@ async fn stream_ended(mux: &Arc<Mux>, peer: &str, sid: u32) -> Value {
 
 fn warm_error(why: &str) -> Value {
     json!({ "type": "warm-error", "err": why })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fast command can drain stdout before the select ever polls the
+    /// control channel. When the pipe then ends, a QUEUED `exec-close` must be
+    /// honoured (status + exact byte counts), not replaced by the generic
+    /// "no exit status" terminal.
+    #[test]
+    fn a_queued_exec_close_survives_the_output_pipe_ending_first() {
+        let sid = 0x8000_0007;
+        let mut status = None;
+        let mut want_out = None;
+        let mut want_err = None;
+        let close = json!({
+            "type": "exec-close", "sid": sid,
+            "status": 3, "out_bytes": 11, "err_bytes": 4,
+        });
+        assert!(matches!(
+            queued_ctl(&close, sid, &mut status, &mut want_out, &mut want_err),
+            QueuedCtl::Ended
+        ));
+        assert_eq!(status, Some(3));
+        assert_eq!(want_out, Some(11));
+        assert_eq!(want_err, Some(4));
+
+        let mut s = None;
+        let mut o = None;
+        let mut e = None;
+        let refusal = json!({ "type": "l2-close", "sid": sid, "err": "denied" });
+        assert!(matches!(
+            queued_ctl(&refusal, sid, &mut s, &mut o, &mut e),
+            QueuedCtl::Terminal(_)
+        ));
+        let other_sid = json!({ "type": "exec-close", "sid": sid + 1, "status": 0 });
+        assert!(matches!(
+            queued_ctl(&other_sid, sid, &mut s, &mut o, &mut e),
+            QueuedCtl::Ignore
+        ));
+    }
 }

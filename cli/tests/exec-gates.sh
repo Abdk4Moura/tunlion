@@ -533,15 +533,19 @@ fi
 # Gate L below re-uses boxB's pairing with boxA.
 cp "$WORK/devices.before-forget.json" "$DB/devices.json"
 
-# ================================================================ GATE W1-W4 ==
+# ================================================================ GATE W1-W6 ==
 # WARM REUSE, as a REAL two-process path: an `up` daemon on A holds the link,
 # and a separate `exec` process rides it over the Unix control socket. These
-# gates assert the four promises that make the fast path safe:
+# gates assert the promises that make the fast path safe:
 #   W1  warm: stdout/stderr/exit byte-exact, and no "waiting" line on a pipe.
 #   W2  explicit cold fallback (TUNLION_NO_WARM_REUSE=1) stays exact.
 #   W3  `-q`: no transient status leaks into a successful run's stderr.
-#   W4  killing the daemon mid-exec NEVER replays the command (no DONE line).
-say W1-W4
+#   W5  a FROZEN serving peer (link still alive) fails around the 12s silence
+#       bound and never replays.
+#   W4  killing the local daemon mid-exec NEVER replays the command.
+#   W6  on a real PTY: the 300ms wait line appears late and is erased before
+#       the final error.
+say W1-W6
 A_DROP="$WORK/Adrop"; mkdir -p "$A_DROP"
 # The standby link is the daemon's job; make that default explicit instead of
 # relying on the runner's persisted settings.
@@ -610,6 +614,33 @@ else
   bad "gateW3: -q leaked status or changed the result (rc=$rcQ out='$OUTQ')"
 fi
 
+# W5: the SERVING peer freezes while the link stays alive. The warm session
+# must notice the missing heartbeats around the 12 s bound and fail, not wait
+# for QUIC's ~23 s idle. A replay would run the whole sleep again.
+say W5
+( timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- \
+    /bin/sh -c 'echo START; sleep 80; echo DONE' >"$WORK/W5.out" 2>"$WORK/W5.err" </dev/null
+  echo $? >"$WORK/W5.rc" ) &
+W5P=$!
+sleep 4
+BDPID=$(cat "$DB/up.pid" 2>/dev/null || true)
+t0=$(now_ms)
+[ -n "$BDPID" ] && kill -STOP "$BDPID" 2>/dev/null
+for _ in $(seq 1 100); do [ -f "$WORK/W5.rc" ] && break; sleep 0.2; done
+took=$(( $(now_ms) - t0 ))
+[ -n "$BDPID" ] && kill -CONT "$BDPID" 2>/dev/null
+wait "$W5P" 2>/dev/null
+rc5=$(cat "$WORK/W5.rc" 2>/dev/null || echo missing)
+echo "## (peer frozen pid=$BDPID) rc=$rc5 ${took}ms out='$(cat "$WORK/W5.out")'"
+if [ -n "$BDPID" ] && [ "$rc5" = "6" ] && [ "$took" -ge 7000 ] && [ "$took" -le 18000 ] \
+   && grep -q START "$WORK/W5.out" && ! grep -q DONE "$WORK/W5.out" \
+   && grep -q "no answer from the peer\|warm link died" "$WORK/W5.err"; then
+  ok "gateW5: a frozen serving peer was bounded at ${took}ms (12s silence), no replay"
+else
+  echo "-- W5.err --"; cat "$WORK/W5.err"
+  bad "gateW5: frozen-peer silence was not bounded around 12s or replayed (rc=$rc5 ${took}ms)"
+fi
+
 # No replay: a warm command's stdout starts, then the DAEMON dies. The remote
 # tree is ended by link death; a cold replay would run the whole command again
 # and eventually print DONE. It must never do that.
@@ -628,6 +659,93 @@ if [ "$rcK" != "0" ] && grep -q START "$WORK/WK.out" && ! grep -q DONE "$WORK/WK
 else
   echo "-- WK.err --"; cat "$WORK/WK.err"
   bad "gateW4: a dead warm link replays or silently succeeds (rc=$rcK out='$(cat "$WORK/WK.out")')"
+fi
+
+
+# W6: the UX line itself, on a REAL PTY. A known-but-offline device makes the
+# cold establish slow enough to cross the 300 ms delay. Assert the wait line
+# appears only after the delay, and that a clear (\r ESC[2K) lands before the
+# final error, so the transient never sits under the command's output.
+say W6
+if [ "$PLATFORM" != "unix" ]; then
+  echo "SKIP gateW6: PTY timing is unix only"
+else
+  "$PYV" - "$DA/devices.json" <<'PY'
+import json, secrets, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.append({"name": "ghost", "secret": secrets.token_hex(32)})
+json.dump(d, open(p, "w"))
+PY
+  "$PYV" - "$BIN" "$DA" "$SERVER" >"$WORK/W6.txt" <<'PY'
+import os, pty, select, subprocess, sys, time, json
+bin, cfg, server = sys.argv[1:4]
+master, slave = pty.openpty()
+env = os.environ.copy()
+env.update(TUNLION_CONFIG_DIR=cfg, TUNLION_NAME="boxA", TERM="xterm", NO_COLOR="1")
+t0 = time.time()
+p = subprocess.Popen([bin, "--server", server, "exec", "ghost", "--", "/bin/true"],
+                     stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True)
+os.close(slave)
+buf = b""
+first = None
+deadline = t0 + 30
+while time.time() < deadline:
+    r, _, _ = select.select([master], [], [], 0.1)
+    if r:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            chunk = b""
+        if chunk:
+            buf += chunk
+            if first is None and b"waiting for known device" in buf:
+                first = time.time() - t0
+            continue
+    if p.poll() is not None:
+        # Drain anything the child wrote just before exiting.
+        for _ in range(20):
+            r, _, _ = select.select([master], [], [], 0.01)
+            if not r:
+                break
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                break
+            buf += chunk
+        break
+if p.poll() is None:
+    p.kill()
+rc = p.wait()
+os.close(master)
+wait_at = buf.find(b"waiting for known device")
+err_at = buf.find(b"did not answer")
+if err_at < 0:
+    err_at = buf.find(b"Error:")
+cleared = 0
+if wait_at >= 0 and err_at > wait_at:
+    cleared = 1 if b"\r\x1b[2K" in buf[wait_at:err_at] else 0
+print("rc=%d" % rc)
+print("first_ms=%d" % int(first * 1000) if first is not None else "first_ms=-1")
+print("has_wait=%d" % (1 if wait_at >= 0 else 0))
+print("has_error=%d" % (1 if err_at >= 0 else 0))
+print("cleared=%d" % cleared)
+PY
+  W6_RC=$(sed -n 's/^rc=//p' "$WORK/W6.txt")
+  W6_FIRST=$(sed -n 's/^first_ms=//p' "$WORK/W6.txt")
+  W6_WAIT=$(sed -n 's/^has_wait=//p' "$WORK/W6.txt")
+  W6_ERR=$(sed -n 's/^has_error=//p' "$WORK/W6.txt")
+  W6_CLEAR=$(sed -n 's/^cleared=//p' "$WORK/W6.txt")
+  echo "## (pty) rc=$W6_RC first_ms=$W6_FIRST wait=$W6_WAIT error=$W6_ERR cleared_before_error=$W6_CLEAR"
+  if [ "$W6_RC" = "6" ] && [ "$W6_WAIT" = "1" ] && [ "$W6_ERR" = "1" ] \
+     && [ "$W6_CLEAR" = "1" ] && [ "$W6_FIRST" -ge 250 ] && [ "$W6_FIRST" -le 2000 ]; then
+    ok "gateW6: 300ms deferred wait line appeared at ${W6_FIRST}ms on a PTY and was cleared before the error"
+  else
+    echo "-- W6.txt --"; cat "$WORK/W6.txt"
+    bad "gateW6: deferred wait line timing/erase was not observed on a PTY"
+  fi
 fi
 
 # ===================================================================== GATE L ==
