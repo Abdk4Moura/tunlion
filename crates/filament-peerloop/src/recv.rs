@@ -84,6 +84,8 @@ pub mod renewal;
 pub mod report;
 pub mod requests;
 #[cfg(feature = "dispatch")]
+pub mod request_delivery;
+#[cfg(feature = "dispatch")]
 pub mod revocation;
 #[cfg(feature = "dispatch")]
 pub mod roster;
@@ -654,6 +656,8 @@ impl CompletionGate {
 /// go through, the offered whole-file digest, the inflight/end/ack markers the
 /// event loop polls, and the injected progress bar and stdout sink.
 pub struct IncomingFile {
+    #[cfg(feature = "dispatch")]
+    pub durable: Option<request_delivery::DeliveryPermit>,
     pub id: String,
     pub name: String,
     pub size: u64,

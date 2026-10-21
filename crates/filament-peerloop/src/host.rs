@@ -263,6 +263,10 @@ pub struct MountTransport {
 /// installs no ssh key and restores no mount, and the loop says so.
 #[async_trait::async_trait]
 pub trait HostServices: Send + Sync + 'static {
+    /// Best-effort hint emitted only after the durable request commit. Clients
+    /// must read a revisioned snapshot; missing or duplicate hints change no
+    /// authority and are not an offline notification promise.
+    fn transfer_request_event(&self, _event: &crate::recv::requests::RequestEvent) {}
     /// The current unix time in seconds, from the host's clock.
     fn now_secs(&self) -> u64 {
         0
@@ -271,6 +275,11 @@ pub trait HostServices: Send + Sync + 'static {
     /// runs `verify` itself so the expiry rule stays in one place.
     fn device_cert_for(&self, _name: &str) -> Option<DeviceCert> {
         None
+    }
+    /// Key-addressed lookup also includes fleet records without pair secrets.
+    fn device_cert_for_key(&self, device_pub: &[u8; 32]) -> Option<DeviceCert> {
+        self.devices_load().into_iter().filter_map(|(name, _)| self.device_cert_for(&name))
+            .find(|cert| cert.device_pub == *device_pub)
     }
     /// The persisted auth-key ceiling for `name`, when that record is a
     /// delegated (joined) device.
@@ -325,6 +334,12 @@ pub trait HostServices: Send + Sync + 'static {
     /// no user signing key, so this is `None` there.
     fn user_key(&self) -> Option<UserKey> {
         None
+    }
+    /// The owner's public user key that names this machine's resources. Unlike
+    /// [`user_key`](Self::user_key), a joined device can answer this from its
+    /// own owner-signed certificate. It is not a signing capability.
+    fn owner_user_pub(&self) -> Option<[u8; 32]> {
+        self.user_key().map(|key| key.public_key_bytes())
     }
     /// Create the receiving inbox, applying the host's own permissions policy
     /// (owner-only on unix). An existing directory is left as the user set it.

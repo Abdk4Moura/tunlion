@@ -22,6 +22,7 @@ use crate::device_name_for_pub;
 use crate::devices_store::devices_load;
 use crate::display_name;
 use crate::dlog;
+use crate::exit_codes::{self, ExitKind};
 use crate::fleet;
 use crate::fleet_indexed_name;
 use crate::fleet_session;
@@ -37,7 +38,7 @@ use crate::load_owner_key;
 use crate::maybe_hint_local_wedge;
 use crate::mk_uid;
 use crate::next_ev;
-use crate::pake_ceremony::{Ceremony, pair_v2_caps};
+use crate::pake_ceremony::{pair_v2_caps, Ceremony};
 use crate::prompt_line;
 use crate::proof_for;
 use crate::protocol;
@@ -49,13 +50,16 @@ use crate::session;
 use crate::shutdown;
 use crate::test_hooks;
 use crate::ui;
-use crate::exit_codes::{self, ExitKind};
-use anyhow::{Context, Result, anyhow, bail};
+use crate::PakeInbound;
+use crate::SendOutcome;
+use crate::DEFAULT_SERVER;
+use crate::MAX_ATTEMPTS;
+use anyhow::{anyhow, bail, Context, Result};
 use filament_transfer::Outgoing;
 use filament_transport::direct;
 use filament_transport::net;
 use net::{Ev, Transport};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,7 +67,131 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 #[allow(clippy::too_many_arguments)]
+/// Stable offer identity supplied only by the retained-send adapter. No pair
+/// secret is copied into the outbox; the normal named-device path resolves it.
+pub(crate) struct RetainedSeed {
+    pub id: String,
+    pub peer_device: [u8; 32],
+    pub manifest: filament_peerloop::recv::requests::CanonicalManifest,
+    /// Revision of the claim this attempt owns. The stream guard requires it to
+    /// remain current, so a takeover after expiry aborts the old writer.
+    pub rev: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct WaitingForReceiver {
+    pub retry_after: u64,
+    pub request_id: Option<String>,
+}
+impl std::fmt::Display for WaitingForReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("offer retained; waiting for receiver approval")
+    }
+}
+impl std::error::Error for WaitingForReceiver {}
+
+#[derive(Debug)]
+pub(crate) struct RetainedDeclined;
+impl std::fmt::Display for RetainedDeclined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the receiver declined the retained offer")
+    }
+}
+impl std::error::Error for RetainedDeclined {}
+
+/// The retained spool no longer matches the exact manifest the outbox recorded.
+/// This is terminal for that offer; retrying the same bytes cannot fix it.
+#[derive(Debug)]
+pub(crate) struct RetainedSourceChanged;
+impl std::fmt::Display for RetainedSourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the retained snapshot no longer matches its exact manifest")
+    }
+}
+impl std::error::Error for RetainedSourceChanged {}
+
+/// The receiver reported a canonical manifest different from the one offered.
+/// That approval can never be satisfied by this offer; retrying is useless.
+#[derive(Debug)]
+pub(crate) struct RetainedManifestMismatch;
+impl std::fmt::Display for RetainedManifestMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the receiver's durable manifest differs from the offered bytes")
+    }
+}
+impl std::error::Error for RetainedManifestMismatch {}
+
+struct RetainedAttemptGuard(Option<filament_peerloop::driver::Cancellation>);
+impl Drop for RetainedAttemptGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.cancel();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_cmd(
+    server: &str,
+    paths: Vec<String>,
+    use_code: bool,
+    word: Option<String>,
+    room: Option<String>,
+    to: Option<String>,
+    name: Option<String>,
+    relay: bool,
+    remember: Option<String>,
+    timeout: Option<u64>,
+) -> Result<()> {
+    send_cmd_inner(
+        server, paths, use_code, word, room, to, name, relay, remember, timeout, None,
+    )
+    .await
+}
+
+pub(crate) async fn send_retained_attempt(
+    server: &str,
+    path: String,
+    peer: String,
+    name: String,
+    relay: bool,
+    timeout: Option<u64>,
+    seed: RetainedSeed,
+) -> Result<()> {
+    send_cmd_inner(
+        server,
+        vec![path],
+        false,
+        None,
+        None,
+        Some(peer),
+        Some(name),
+        relay,
+        None,
+        timeout,
+        Some(seed),
+    )
+    .await
+}
+
+fn retained_peer_matches(conn: &Conn, pid: &str, seed: &RetainedSeed) -> bool {
+    // The possession challenge proves the pinned device key. `link.trusted`
+    // belongs to the sender-side pair-proof verdict and is not set on this side
+    // for a normal WebRTC/relay send; requiring it made retained sends hang.
+    conn.link(pid).is_some_and(|link| {
+        link.identity_binding == crate::capability::BindingStrength::Proven
+            && link.identity_device_pub == Some(seed.peer_device)
+    })
+}
+
+fn tag_retained_offer(offer: &mut Value, seed: Option<&RetainedSeed>) {
+    if let Some(seed) = seed {
+        offer["request"] = json!(seed.id);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_cmd_inner(
     server: &str,
     mut paths: Vec<String>,
     mut use_code: bool,
@@ -74,7 +202,12 @@ pub(crate) async fn send_cmd(
     relay: bool,
     remember: Option<String>,
     timeout: Option<u64>,
+    retained: Option<RetainedSeed>,
 ) -> Result<()> {
+    let attempt_stop = retained
+        .as_ref()
+        .map(|_| filament_peerloop::driver::Cancellation::default());
+    let _attempt_guard = RetainedAttemptGuard(attempt_stop.clone());
     let opened_flow = interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
 
@@ -296,7 +429,12 @@ pub(crate) async fn send_cmd(
                     let packed = b.append_dir_all(&dirname, &path).and_then(|()| b.finish());
                     if let Err(e) = packed {
                         let written = std::fs::metadata(&spool).map(|m| m.len()).unwrap_or(0);
-                        return Err(spool_error(&format!("the directory {p}"), &spool, written, e));
+                        return Err(spool_error(
+                            &format!("the directory {p}"),
+                            &spool,
+                            written,
+                            e,
+                        ));
                     }
                 }
                 let size = std::fs::metadata(&spool)?.len();
@@ -353,6 +491,29 @@ pub(crate) async fn send_cmd(
                 });
             }
         }
+    }
+    if let Some(seed) = &retained {
+        if outgoing.len() != 1 {
+            bail!("a retained attempt must contain one exact offer");
+        }
+        let item = &mut outgoing[0];
+        let Some(full) = item.full.clone() else {
+            return Err(RetainedSourceChanged.into());
+        };
+        let manifest = filament_peerloop::recv::requests::canonical_manifest(
+            &[filament_peerloop::recv::requests::ManifestEntry {
+                path: item.name.clone(),
+                size: item.size,
+                sha256: full,
+                mtime: 0,
+            }],
+            &filament_peerloop::recv::requests::Limits::default(),
+        )?;
+        if manifest != seed.manifest {
+            return Err(RetainedSourceChanged.into());
+        }
+        item.id = seed.id.clone();
+        item.sid = 1;
     }
     for o in &outgoing {
         ui::say(&format!("send: {} ({})", o.name, human(o.size)));
@@ -581,11 +742,9 @@ pub(crate) async fn send_cmd(
     // A connect span for `doctor`'s history (local JSONL only, no telemetry
     // POST). Closed as `up` when the channel to the target opens; any other
     // way out of this function records it as failed (SendSpan's Drop).
-    let mut send_span = SendSpan(
-        known_target
-            .as_ref()
-            .map(|(_, sec)| crate::diag::Attempt::new_local(&crate::diag::peer_hash_from_secret(sec), "send")),
-    );
+    let mut send_span = SendSpan(known_target.as_ref().map(|(_, sec)| {
+        crate::diag::Attempt::new_local(&crate::diag::peer_hash_from_secret(sec), "send")
+    }));
     if let Some(a) = send_span.0.as_mut() {
         a.enter(crate::diag::Phase::Presence);
     }
@@ -766,7 +925,8 @@ pub(crate) async fn send_cmd(
     // streaming task, read when its TransferFailed arrives: a local read
     // failure ends the send (and cancels on the receiver), it is never treated
     // as an interrupted link to resume.
-    let source_failed: Arc<std::sync::Mutex<HashMap<String, String>>> = Arc::new(Default::default());
+    let source_failed: Arc<std::sync::Mutex<HashMap<String, String>>> =
+        Arc::new(Default::default());
     let mut ack_reprobed = false; // re-sent file-end once for the no-ack window?
     let mut reprobed_at: Option<Instant> = None;
     // Typed refusals from the receiver (disk full, a name its filesystem
@@ -797,9 +957,9 @@ pub(crate) async fn send_cmd(
         .unwrap_or_else(|| "the receiver".to_string());
     // One identity service for this send flow: repeated challenges must share
     // its drop-once bookkeeping, not rebuild it per event.
-    let identity = crate::identity_lifecycle::service_with_log(Arc::new(
-        crate::host_impl::CliLog,
-    ));
+    let identity = crate::identity_lifecycle::service_with_log(Arc::new(crate::host_impl::CliLog));
+    let mut retained_nonces = HashMap::new();
+    let retained_holds = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     loop {
         // Never a silent minute: while the peer has not connected, or has
@@ -1121,7 +1281,8 @@ pub(crate) async fn send_cmd(
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
-                        conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done)).await?;
+                        conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done))
+                            .await?;
                     }
                 }
                 // C30 (dissolves the C28 belt): fresh sid = everything
@@ -1138,8 +1299,12 @@ pub(crate) async fn send_cmd(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt_from(p, adopt_wants_active(code_used, use_code, pake_done), AdoptSource::Digest)
-                            .await?;
+                        conn.maybe_adopt_from(
+                            p,
+                            adopt_wants_active(code_used, use_code, pake_done),
+                            AdoptSource::Digest,
+                        )
+                        .await?;
                     }
                     if let Some((name, secret)) = &known_target {
                         let channel = channel_of(secret);
@@ -1219,7 +1384,10 @@ pub(crate) async fn send_cmd(
                 ui::say(&format!(
                     "  code   {}   {}",
                     ui::paint(ui::Tone::Brand, &full),
-                    ui::paint(ui::Tone::Dim, if copied { "(copied to clipboard)" } else { "" })
+                    ui::paint(
+                        ui::Tone::Dim,
+                        if copied { "(copied to clipboard)" } else { "" }
+                    )
                 ));
                 ui::say(&format!(
                     "         {}",
@@ -1278,7 +1446,8 @@ pub(crate) async fn send_cmd(
                 code_used = true;
             }
             Ev::PeerJoined(v) => {
-                conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done)).await?;
+                conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done))
+                    .await?;
             }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
@@ -1336,14 +1505,12 @@ pub(crate) async fn send_cmd(
                 // secret the far side does not hold by design.
                 if data["type"].as_str() == Some("not-recognized") && brokered_target.is_none() {
                     if let Some((n, sec)) = &known_target {
-                        let on_target = conn
-                            .roster
-                            .get(&from)
-                            .and_then(|r| r["channel"].as_str())
+                        let on_target = conn.roster.get(&from).and_then(|r| r["channel"].as_str())
                             == Some(channel_of(sec).as_str());
                         if on_target && !use_code {
                             ui::clear_sticky();
-                            let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                            let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect())
+                                .await;
                             return Err(exit_codes::err(
                                 ExitKind::Denied,
                                 unrecognized_message(n, data["reason"].as_str()),
@@ -1490,7 +1657,9 @@ pub(crate) async fn send_cmd(
                                         // receiver, a replacement that kept the
                                         // partial must still be able to take the
                                         // slot over and resume (gates.sh gate 2).
-                                        if let Some(old) = conn.active.clone().filter(|a| a != &from) {
+                                        if let Some(old) =
+                                            conn.active.clone().filter(|a| a != &from)
+                                        {
                                             ui::debug(&format!(
                                                 "send: {from} authenticated this code; releasing the slot held by {old}"
                                             ));
@@ -1634,6 +1803,11 @@ pub(crate) async fn send_cmd(
                 // By name only: a link built from a bare signal is filed under
                 // its signaling id, and the lab read "ok FfcE6CxL__13XT3tAAXB".
                 let shown = conn.display_name_of(&pid);
+                if retained.is_some() {
+                    if let Some(link) = conn.link_mut(&pid) {
+                        filament_peerloop::identity::resolve_peer_identity(link);
+                    }
+                }
                 if let Some(l) = conn.link(&pid) {
                     match &shown {
                         Some(n) => ui::say(&format!(
@@ -1676,7 +1850,10 @@ pub(crate) async fn send_cmd(
                             "    {}",
                             ui::paint(
                                 ui::Tone::Dim,
-                                &format!("route: {}", crate::conn::shown_direct_route(direct_route, &t))
+                                &format!(
+                                    "route: {}",
+                                    crate::conn::shown_direct_route(direct_route, &t)
+                                )
                             )
                         ));
                     }
@@ -1735,6 +1912,20 @@ pub(crate) async fn send_cmd(
                             ));
                         }
                     }
+                    if let Some(seed) = &retained {
+                        if !retained_peer_matches(&conn, &pid, seed) {
+                            identity
+                                .issue_proven_challenge_and_hold(
+                                    &conn,
+                                    &pid,
+                                    &t,
+                                    &retained_holds,
+                                    &mut retained_nonces,
+                                )
+                                .await;
+                            continue;
+                        }
+                    }
                     // Everything unfinished is offered again below, so it will be
                     // streamed again from the receiver's offset: its delivery-ack
                     // wait starts over, instead of inheriting a window that ran
@@ -1762,7 +1953,7 @@ pub(crate) async fn send_cmd(
                         if o.done {
                             continue;
                         }
-                        let offer = protocol::offer_msg(
+                        let mut offer = protocol::offer_msg(
                             &o.id,
                             o.sid,
                             &o.name,
@@ -1771,6 +1962,7 @@ pub(crate) async fn send_cmd(
                             o.full.as_deref(),
                             o.accepted_once,
                         );
+                        tag_retained_offer(&mut offer, retained.as_ref());
                         t.send_control(&offer).await?;
                         if answer_clock.is_none() {
                             answer_clock = Some(Instant::now());
@@ -1894,6 +2086,14 @@ pub(crate) async fn send_cmd(
                         respond_to_identity_challenge(&identity, &t, &v).await;
                     }
                 }
+                Some("identity-expose") if retained.is_some() => {
+                    if identity.handle_identity_expose(&mut conn, &pid, &v, &mut retained_nonces) {
+                        retained_holds.lock().unwrap().remove(&pid);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = tx.send(Ev::ChannelReady(pid, t));
+                        }
+                    }
+                }
                 // Enroller receives the daemon's nonce challenge — build
                 // EnrollmentPayload and send the response.
                 Some("identity-auth-key-enroll-challenge") => {
@@ -1963,7 +2163,7 @@ pub(crate) async fn send_cmd(
                             if let Some(b) = obj.get(&o.id).and_then(|x| x.as_u64()) {
                                 if o.done && b < o.size {
                                     o.done = false; // not actually done
-                                    // DEBUG, resilience internal (state-divergence re-offer).
+                                                    // DEBUG, resilience internal (state-divergence re-offer).
                                     ui::debug(&ui::paint(
                                         ui::Tone::Warn,
                                         &format!(
@@ -1972,7 +2172,7 @@ pub(crate) async fn send_cmd(
                                         ),
                                     ));
                                     if let Some(t) = conn.transport_of(&pid) {
-                                        let offer = protocol::offer_msg(
+                                        let mut offer = protocol::offer_msg(
                                             &o.id,
                                             o.sid,
                                             &o.name,
@@ -1981,6 +2181,7 @@ pub(crate) async fn send_cmd(
                                             o.full.as_deref(),
                                             true,
                                         );
+                                        tag_retained_offer(&mut offer, retained.as_ref());
                                         let _ = t.send_control(&offer).await;
                                     }
                                 }
@@ -2077,10 +2278,14 @@ pub(crate) async fn send_cmd(
                         // record of this device. Nothing it would answer to an
                         // offer can be a yes, so end here with the reason (exit
                         // 4), as `exec` does, instead of re-offering into it.
-                        if let (Some((n, _)), None, false) = (&known_target, &brokered_target, use_code) {
+                        if let (Some((n, _)), None, false) =
+                            (&known_target, &brokered_target, use_code)
+                        {
                             if conn.is_active(&pid) {
                                 ui::clear_sticky();
-                                let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                                let _ =
+                                    tokio::time::timeout(Duration::from_secs(2), sio.disconnect())
+                                        .await;
                                 return Err(exit_codes::err(
                                     ExitKind::Denied,
                                     unrecognized_message(n, None),
@@ -2101,6 +2306,13 @@ pub(crate) async fn send_cmd(
                     }
                 }
                 Some("file-accept") => {
+                    if let Some(seed) = &retained {
+                        if v["id"].as_str() != Some(seed.id.as_str())
+                            || !retained_peer_matches(&conn, &pid, seed)
+                        {
+                            continue;
+                        }
+                    }
                     answer_clock = Some(Instant::now());
                     receiver_asking = false;
                     // `--remember <name>`: hand the code's peer a FRESH long-lived
@@ -2138,7 +2350,9 @@ pub(crate) async fn send_cmd(
                                 // Not said yet: the receiver's answer decides
                                 // what is true (pair-keep-ack), and the summary
                                 // after the transfer says it if none comes.
-                                ui::debug(&format!("stored our half of the remember as '{stored}'"));
+                                ui::debug(&format!(
+                                    "stored our half of the remember as '{stored}'"
+                                ));
                                 if let Ok(mut g) = crate::shared_defs::REMEMBER_STORED_AS.lock() {
                                     *g = Some(stored.clone());
                                 }
@@ -2184,8 +2398,36 @@ pub(crate) async fn send_cmd(
                     let source_failed = source_failed.clone();
                     let stream_log = send_log.clone();
                     let stream_present = send_present.clone();
+                    // A retained attempt must stop streaming when its bounded
+                    // adapter timeout cancels it or a newer claim supersedes it.
+                    // The library keeps the byte loop; this closure is the CLI's
+                    // policy hook and is absent for ordinary sends.
+                    let stream_guard: Option<filament_peerloop::send::stream::StreamGuard> =
+                        retained.as_ref().and_then(|seed| {
+                            attempt_stop.clone().map(|stop| {
+                                let id = seed.id.clone();
+                                let rev = seed.rev;
+                                let last = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
+                                let guard: filament_peerloop::send::stream::StreamGuard =
+                                    std::sync::Arc::new(move || {
+                                        if stop.is_cancelled() {
+                                            anyhow::bail!("retained attempt cancelled");
+                                        }
+                                        let mut last = last
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner());
+                                        if last.elapsed() >= Duration::from_secs(2) {
+                                            *last = Instant::now();
+                                            drop(last);
+                                            crate::retained_send_cmd::check_stream(&id, rev)?;
+                                        }
+                                        Ok(())
+                                    });
+                                guard
+                            })
+                        });
                     tokio::spawn(async move {
-                        match filament_peerloop::send::stream::stream_one(
+                        match filament_peerloop::send::stream::stream_one_guarded(
                             out,
                             transports,
                             id.clone(),
@@ -2195,6 +2437,7 @@ pub(crate) async fn send_cmd(
                             tx2.clone(),
                             stream_log,
                             stream_present,
+                            stream_guard,
                         )
                         .await
                         {
@@ -2219,6 +2462,14 @@ pub(crate) async fn send_cmd(
                     });
                 }
                 Some("file-decline") => {
+                    if let Some(seed) = &retained {
+                        if v["id"].as_str() == Some(seed.id.as_str())
+                            && retained_peer_matches(&conn, &pid, seed)
+                        {
+                            return Err(RetainedDeclined.into());
+                        }
+                        continue;
+                    }
                     answer_clock = Some(Instant::now());
                     receiver_asking = false;
                     let id = v["id"].as_str().unwrap_or_default();
@@ -2242,7 +2493,9 @@ pub(crate) async fn send_cmd(
                                 // The same remedy exec, forward and mount give
                                 // for this cause, once per send.
                                 if !remedy_said {
-                                    if let Some(peer) = known_target.as_ref().map(|(n, _)| n.clone()) {
+                                    if let Some(peer) =
+                                        known_target.as_ref().map(|(n, _)| n.clone())
+                                    {
                                         if let Some(text) = final_refusal_remedy(&peer, &why) {
                                             ui::critical(&text);
                                             remedy_said = true;
@@ -2251,7 +2504,11 @@ pub(crate) async fn send_cmd(
                                 }
                             }
                             None => {
-                                crate::send_report::note_refused(id, None, "the receiver declined it");
+                                crate::send_report::note_refused(
+                                    id,
+                                    None,
+                                    "the receiver declined it",
+                                );
                                 ui::say(&format!("declined: {}", o.name))
                             }
                         }
@@ -2262,6 +2519,26 @@ pub(crate) async fn send_cmd(
                 // The receiver parked the offer for a person's yes/no; silence
                 // from here on is someone deciding, so the no-answer clock stops.
                 Some("file-pending") => {
+                    if let Some(seed) = &retained {
+                        if v["id"].as_str() != Some(seed.id.as_str())
+                            || !retained_peer_matches(&conn, &pid, seed)
+                        {
+                            continue;
+                        }
+                        if v["durable"].as_bool() == Some(true) {
+                            if v["manifest"].as_str() != Some(seed.manifest.digest.as_str()) {
+                                return Err(RetainedManifestMismatch.into());
+                            }
+                            return Err(WaitingForReceiver {
+                                retry_after: v["retry_after"].as_u64().unwrap_or(30).clamp(1, 3600),
+                                request_id: v["request_id"]
+                                    .as_str()
+                                    .filter(|id| id.len() <= 128)
+                                    .map(str::to_owned),
+                            }
+                            .into());
+                        }
+                    }
                     receiver_asking = true;
                     answer_clock = Some(Instant::now());
                 }
@@ -2272,6 +2549,13 @@ pub(crate) async fn send_cmd(
                 // it). This closes the loop the runner had to fake above the
                 // transport: the sender deterministically KNOWS it landed whole.
                 Some("delivery-ack") => {
+                    if let Some(seed) = &retained {
+                        if v["id"].as_str() != Some(seed.id.as_str())
+                            || !retained_peer_matches(&conn, &pid, seed)
+                        {
+                            continue;
+                        }
+                    }
                     answer_clock = Some(Instant::now());
                     let id = v["id"].as_str().unwrap_or_default();
                     // Additive: a receiver that reports the name it stored the
@@ -2292,10 +2576,8 @@ pub(crate) async fn send_cmd(
                             // another name (shortened past its limit, stripped of
                             // a path, renamed on a collision), and "ok <name>"
                             // about a name that does not exist there was false.
-                            let renamed = crate::send_report::delivered_as(
-                                &o.name,
-                                v["stored"].as_str(),
-                            );
+                            let renamed =
+                                crate::send_report::delivered_as(&o.name, v["stored"].as_str());
                             if let Some(t0) = o.stream_started {
                                 ui::transfer_summary(
                                     &crate::send_report::summary_label(&o.name, renamed.as_deref()),
@@ -2332,7 +2614,9 @@ pub(crate) async fn send_cmd(
                     if let Some(t) = conn.transport() {
                         let _ = tokio::time::timeout(
                             Duration::from_secs(2),
-                            t.send_control(&crate::send_source::cancel_msg(&id, sid, &offered, &why)),
+                            t.send_control(&crate::send_source::cancel_msg(
+                                &id, sid, &offered, &why,
+                            )),
                         )
                         .await;
                         let _ = tokio::time::timeout(Duration::from_secs(2), t.flush()).await;
@@ -2428,7 +2712,7 @@ pub(crate) async fn send_cmd(
                         } else if let Some(t) = conn.transport_of(&pid) {
                             let out = outgoing.lock().await;
                             for o in out.iter().filter(|o| o.accepted_once && !o.done) {
-                                let offer = protocol::offer_msg(
+                                let mut offer = protocol::offer_msg(
                                     &o.id,
                                     o.sid,
                                     &o.name,
@@ -2437,6 +2721,7 @@ pub(crate) async fn send_cmd(
                                     o.full.as_deref(),
                                     true,
                                 );
+                                tag_retained_offer(&mut offer, retained.as_ref());
                                 let _ = t.send_control(&offer).await;
                             }
                         }
@@ -2695,6 +2980,16 @@ pub(crate) async fn send_cmd(
         {
             let out = outgoing.lock().await;
             if !out.is_empty() && out.iter().all(|o| o.done) {
+                if retained.is_some()
+                    && refused.is_empty()
+                    && out.iter().any(|item| !item.acked && !item.declined)
+                {
+                    return Err(WaitingForReceiver {
+                        retry_after: 30,
+                        request_id: None,
+                    }
+                    .into());
+                }
                 if let Some(t) = conn.transport() {
                     // Block until the peer has acked every byte before we exit,
                     // a torn-down QUIC connection drops un-acked send-buffer bytes
@@ -2790,7 +3085,12 @@ fn spool_copy(
 /// on a 16 MB /tmp failed in 23 ms with only "No space left on device (os
 /// error 28)", which named neither the disk that filled nor why it was used.
 /// This names both and the fix: TMPDIR on a disk with room.
-fn spool_error(what: &str, spool: &std::path::Path, written: u64, e: std::io::Error) -> anyhow::Error {
+fn spool_error(
+    what: &str,
+    spool: &std::path::Path,
+    written: u64,
+    e: std::io::Error,
+) -> anyhow::Error {
     let dir = spool.parent().unwrap_or(spool);
     let full = matches!(
         e.kind(),
@@ -2818,7 +3118,11 @@ fn spool_error(what: &str, spool: &std::path::Path, written: u64, e: std::io::Er
 /// that does not exist gave only "Read-only file system (os error 30)" or
 /// "No such file or directory (os error 2)", naming neither TMPDIR nor the
 /// path. `base` is where the spool was to go, `tmpdir` the variable as set.
-fn spool_dir_error(base: &std::path::Path, tmpdir: Option<&str>, e: anyhow::Error) -> anyhow::Error {
+fn spool_dir_error(
+    base: &std::path::Path,
+    tmpdir: Option<&str>,
+    e: anyhow::Error,
+) -> anyhow::Error {
     let source = match tmpdir {
         Some(v) => format!("TMPDIR={v}"),
         None => "TMPDIR is not set, so the system default".to_string(),
@@ -2835,16 +3139,19 @@ fn spool_dir_error(base: &std::path::Path, tmpdir: Option<&str>, e: anyhow::Erro
 /// Private staging directory for `send -` and directory sends, removed with
 /// everything in it when dropped. Created lazily so a plain-file send makes
 /// nothing on disk.
-struct SpoolDir(PathBuf);
+pub(crate) struct SpoolDir(PathBuf);
 
 impl SpoolDir {
     /// A path for `name` inside the (lazily created) private spool dir.
-    fn path_in(slot: &mut Option<SpoolDir>, name: &str) -> Result<PathBuf> {
+    pub(crate) fn path_in(slot: &mut Option<SpoolDir>, name: &str) -> Result<PathBuf> {
         if slot.is_none() {
             let dir = crate::ssh_ca::secure_tempdir("send-spool").map_err(|e| {
                 spool_dir_error(
                     &std::env::temp_dir(),
-                    std::env::var_os("TMPDIR").as_deref().map(|v| v.to_string_lossy()).as_deref(),
+                    std::env::var_os("TMPDIR")
+                        .as_deref()
+                        .map(|v| v.to_string_lossy())
+                        .as_deref(),
                     e,
                 )
             })?;
@@ -2855,7 +3162,7 @@ impl SpoolDir {
 
     /// Create a staging file exclusively: an existing entry (including a
     /// symlink) is an error, never something to write through.
-    fn create(path: &std::path::Path) -> Result<std::fs::File> {
+    pub(crate) fn create(path: &std::path::Path) -> Result<std::fs::File> {
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -2881,7 +3188,11 @@ pub(crate) fn establish_window(flag: Option<u64>, env: Option<&str>) -> Duration
 
 /// A code send's establishment window: `--timeout`, then TUNLION_SEND_TIMEOUT,
 /// then the code's lifetime (`claim`). Pure.
-pub(crate) fn code_establish_window(flag: Option<u64>, env: Option<&str>, claim: Duration) -> Duration {
+pub(crate) fn code_establish_window(
+    flag: Option<u64>,
+    env: Option<&str>,
+    claim: Duration,
+) -> Duration {
     if flag.is_none() && env.and_then(|v| v.trim().parse::<u64>().ok()).is_none() {
         return claim;
     }
@@ -2891,12 +3202,20 @@ pub(crate) fn code_establish_window(flag: Option<u64>, env: Option<&str>, claim:
 /// How long the code really stays usable: the server's `ttl`, cut to the
 /// send's own window when that is shorter (0 = no limit). Pure.
 pub(crate) fn code_expiry_secs(ttl: u64, establish: Duration) -> u64 {
-    if establish.is_zero() { ttl } else { ttl.min(establish.as_secs()) }
+    if establish.is_zero() {
+        ttl
+    } else {
+        ttl.min(establish.as_secs())
+    }
 }
 
 /// "10 min", or "45 s" under two minutes. Pure.
 pub(crate) fn code_expiry_words(secs: u64) -> String {
-    if secs >= 120 { format!("{} min", secs / 60) } else { format!("{secs} s") }
+    if secs >= 120 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
 }
 
 /// How long a known device may show no presence at all before `send` calls it
@@ -2957,7 +3276,11 @@ pub(crate) fn refusal_text(v: &Value) -> Option<String> {
         .filter(|e| !e.trim().is_empty())
         .unwrap_or("the receiver could not store it");
     // Bounded: the text is peer-supplied and goes to a terminal.
-    let clean: String = error.chars().filter(|c| !c.is_control()).take(300).collect();
+    let clean: String = error
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(300)
+        .collect();
     Some(clean)
 }
 
@@ -2971,10 +3294,12 @@ pub(crate) fn final_refusal_remedy(peer: &str, reason: &str) -> Option<String> {
         return None;
     }
     let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
-    Some(match crate::refusal::remedy_from_reason(code, peer, &me, reason) {
-        (text, Some(cmd)) => format!("  {text}\n    {cmd}"),
-        (text, None) => format!("  {text}"),
-    })
+    Some(
+        match crate::refusal::remedy_from_reason(code, peer, &me, reason) {
+            (text, Some(cmd)) => format!("  {text}\n    {cmd}"),
+            (text, None) => format!("  {text}"),
+        },
+    )
 }
 
 /// The refusal a send reports when the target device no longer recognizes
@@ -3104,7 +3429,10 @@ mod unrecognized_tests {
         let m = crate::exec_send::revoked_mid_session("a", &v);
         assert!(m.contains("not recognized"), "{m}");
         assert_eq!(classify_text(&m), ExitKind::Denied, "{m}");
-        let m = crate::exec_send::revoked_mid_session("a", &serde_json::json!({ "type": "link-revoked" }));
+        let m = crate::exec_send::revoked_mid_session(
+            "a",
+            &serde_json::json!({ "type": "link-revoked" }),
+        );
         assert_eq!(classify_text(&m), ExitKind::Denied, "{m}");
     }
 }
@@ -3138,9 +3466,15 @@ mod spool_tests {
     #[test]
     fn a_full_spool_names_the_directory_the_reason_and_tmpdir() {
         let mut input = std::io::Read::take(std::io::repeat(0), 30_000_000);
-        let mut out = Small { room: 16 * 1024 * 1024, got: 0 };
+        let mut out = Small {
+            room: 16 * 1024 * 1024,
+            got: 0,
+        };
         let (written, e) = spool_copy(&mut input, &mut out).unwrap_err();
-        assert!(written <= 16 * 1024 * 1024 && written > 15 * 1024 * 1024, "{written}");
+        assert!(
+            written <= 16 * 1024 * 1024 && written > 15 * 1024 * 1024,
+            "{written}"
+        );
         let spool = std::path::Path::new("/tmp/fil-send-spool-1/stdin");
         let msg = format!("{:#}", spool_error("stdin", spool, written, e));
         assert!(msg.contains("/tmp/fil-send-spool-1"), "{msg}");
@@ -3150,9 +3484,17 @@ mod spool_tests {
         // Anything else is reported as itself, with the spool named.
         let other = format!(
             "{:#}",
-            spool_error("stdin", spool, 0, std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            spool_error(
+                "stdin",
+                spool,
+                0,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+            )
         );
-        assert!(other.contains("could not stage stdin") && !other.contains("TMPDIR="), "{other}");
+        assert!(
+            other.contains("could not stage stdin") && !other.contains("TMPDIR="),
+            "{other}"
+        );
     }
 
     /// `TMPDIR=/var/tmp tunlion send -` on a read-only root, and a TMPDIR that
@@ -3163,16 +3505,30 @@ mod spool_tests {
         let ro = std::io::Error::from_raw_os_error(30);
         let m = format!(
             "{:#}",
-            spool_dir_error(std::path::Path::new("/var/tmp"), Some("/var/tmp"), ro.into())
+            spool_dir_error(
+                std::path::Path::new("/var/tmp"),
+                Some("/var/tmp"),
+                ro.into()
+            )
         );
-        assert!(m.contains("TMPDIR=/var/tmp") && m.contains("in /var/tmp"), "{m}");
+        assert!(
+            m.contains("TMPDIR=/var/tmp") && m.contains("in /var/tmp"),
+            "{m}"
+        );
         assert!(m.contains("os error 30"), "the OS's reason stays: {m}");
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         let m = format!(
             "{:#}",
-            spool_dir_error(std::path::Path::new("/nonexist"), Some("/nonexist"), missing.into())
+            spool_dir_error(
+                std::path::Path::new("/nonexist"),
+                Some("/nonexist"),
+                missing.into()
+            )
         );
-        assert!(m.contains("TMPDIR=/nonexist") && m.contains("existing, writable directory"), "{m}");
+        assert!(
+            m.contains("TMPDIR=/nonexist") && m.contains("existing, writable directory"),
+            "{m}"
+        );
         let unset = format!(
             "{:#}",
             spool_dir_error(std::path::Path::new("/tmp"), None, anyhow::anyhow!("x"))
@@ -3201,9 +3557,11 @@ fn devices_records() -> Vec<serde_json::Value> {
 /// revoked device is denied (exit 4), not offline: the remedy is a decision
 /// here, not a check on the other machine. Pure over the records.
 pub(crate) fn revoked_send_refusal(name: &str, records: &[serde_json::Value]) -> Option<String> {
-    let record = records
-        .iter()
-        .find(|d| d["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))?;
+    let record = records.iter().find(|d| {
+        d["name"]
+            .as_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    })?;
     let revoked = record["certRevoked"].as_bool() == Some(true)
         || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED);
     revoked.then(|| {
@@ -3229,11 +3587,17 @@ mod revoked_send_tests {
         assert!(r.contains("revoked") && !r.contains("offline"), "{r}");
         assert!(r.contains("tunlion devices restore p9-b"), "{r}");
         assert!(r.contains("tunlion devices forget p9-b -y"), "{r}");
-        assert!(revoked_send_refusal("LAPTOP", &records).is_some(), "durable revoke, any case");
+        assert!(
+            revoked_send_refusal("LAPTOP", &records).is_some(),
+            "durable revoke, any case"
+        );
         assert_eq!(revoked_send_refusal("desk", &records), None);
         assert_eq!(revoked_send_refusal("nobody", &records), None);
         use clap::Parser;
-        for cmd in ["tunlion devices restore p9-b", "tunlion devices forget p9-b -y"] {
+        for cmd in [
+            "tunlion devices restore p9-b",
+            "tunlion devices forget p9-b -y",
+        ] {
             let argv: Vec<&str> = cmd.split_whitespace().collect();
             assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{cmd}");
         }
@@ -3256,8 +3620,8 @@ impl Drop for SendSpan {
 #[cfg(test)]
 mod code_window_tests {
     use super::{
-        adopt_wants_active, code_establish_window, code_expiry_secs, code_expiry_words, pake_expiry,
-        pake_partner, PakeExpiry, PakePartner,
+        adopt_wants_active, code_establish_window, code_expiry_secs, code_expiry_words,
+        pake_expiry, pake_partner, PakeExpiry, PakePartner,
     };
     use std::time::Duration;
 
@@ -3265,21 +3629,48 @@ mod code_window_tests {
     fn another_codes_receiver_never_runs_this_ceremony() {
         // Run B: code 2's sender, never claimed, met code 1's receiver in the
         // shared room. Tagged with code 1's nameplate: not ours.
-        assert_eq!(pake_partner(None, "r1", true, Some(false), false), PakePartner::NotOurs);
+        assert_eq!(
+            pake_partner(None, "r1", true, Some(false), false),
+            PakePartner::NotOurs
+        );
         // Even after our code is claimed, a message for another nameplate is
         // not ours (Run A: code 1's sender latched code 2's receiver).
-        assert_eq!(pake_partner(None, "r2", true, Some(false), true), PakePartner::NotOurs);
+        assert_eq!(
+            pake_partner(None, "r2", true, Some(false), true),
+            PakePartner::NotOurs
+        );
         // Our claimer's tagged message opens the ceremony.
-        assert_eq!(pake_partner(None, "r1", true, Some(true), true), PakePartner::Latch);
-        assert_eq!(pake_partner(None, "r1", true, Some(true), false), PakePartner::Latch);
+        assert_eq!(
+            pake_partner(None, "r1", true, Some(true), true),
+            PakePartner::Latch
+        );
+        assert_eq!(
+            pake_partner(None, "r1", true, Some(true), false),
+            PakePartner::Latch
+        );
         // An untagged build counts only once our code was claimed.
-        assert_eq!(pake_partner(None, "r1", true, None, false), PakePartner::NotOurs);
-        assert_eq!(pake_partner(None, "r1", true, None, true), PakePartner::Latch);
+        assert_eq!(
+            pake_partner(None, "r1", true, None, false),
+            PakePartner::NotOurs
+        );
+        assert_eq!(
+            pake_partner(None, "r1", true, None, true),
+            PakePartner::Latch
+        );
         // A confirm cannot open a ceremony.
-        assert_eq!(pake_partner(None, "r1", false, Some(true), true), PakePartner::NotOurs);
+        assert_eq!(
+            pake_partner(None, "r1", false, Some(true), true),
+            PakePartner::NotOurs
+        );
         // Once latched: only that peer, and nobody else, even with our tag.
-        assert_eq!(pake_partner(Some("r1"), "r1", false, Some(true), true), PakePartner::Ours);
-        assert_eq!(pake_partner(Some("r1"), "r2", true, Some(true), true), PakePartner::NotOurs);
+        assert_eq!(
+            pake_partner(Some("r1"), "r1", false, Some(true), true),
+            PakePartner::Ours
+        );
+        assert_eq!(
+            pake_partner(Some("r1"), "r2", true, Some(true), true),
+            PakePartner::NotOurs
+        );
     }
 
     #[test]

@@ -43,6 +43,10 @@ pub const REQUESTS_SCHEMA: u64 = 1;
 const MAX_OFFER_ID: usize = 128;
 const MAX_DESTINATION: usize = 4096;
 const TOMBSTONE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// A Delivering record that has not advanced in this long is abandoned. This is
+/// deliberately separate from the acceptance TTL: an in-progress delivery may
+/// finish after `expires_at`, but it must not remain Delivering forever.
+pub const STALE_DELIVERING_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// A request-store failure. Messages never include file bytes or paths from a
 /// peer's manifest beyond the invalid path itself.
@@ -336,9 +340,9 @@ impl SenderIdentity {
             SenderRelation::SameOwner if self.user_id != owner_user_id => {
                 Some("same-owner claim does not match this owner")
             }
-            SenderRelation::PairedExternal if self.user_id == owner_user_id => {
-                Some("external sender claimed the owner identity")
-            }
+            // A delegated device is legitimately signed by the owner user key.
+            // It stays PairedExternal because it is not an owned device, but its
+            // verified certificate is not an identity forgery.
             _ => None,
         }
     }
@@ -673,6 +677,11 @@ impl RequestStore {
                 .min(sender.expires_at.unwrap_or(u64::MAX));
             let auto_approve = sender.relation == SenderRelation::SameOwner
                 && auto_destination.is_some();
+            if auto_approve && state.requests.iter().any(|record| {
+                record.state.is_active() && record.destination.as_deref() == auto_destination
+            }) {
+                return Err(RequestError::InvalidDestination);
+            }
             let mut record = RequestRecord {
                 id: state.next_id,
                 offer_id: offer_id.to_string(),
@@ -745,6 +754,10 @@ impl RequestStore {
                 return Err(RequestError::OfferExpired(id));
             }
             require_same_sender(&state.requests[index], sender, now, &self.owner_user_id)?;
+            if state.requests.iter().any(|record| record.id != id && record.state.is_active()
+                && record.destination.as_deref() == Some(destination)) {
+                return Err(RequestError::InvalidDestination);
+            }
             state.requests[index].destination = Some(destination.to_string());
             let event = touch(
                 &mut state.rev,
@@ -797,15 +810,24 @@ impl RequestStore {
         })
     }
 
-    /// Mark a delivery that failed locally. The request stays in the snapshot
-    /// as a terminal record until retention prunes it.
+    /// Mark a delivery that failed locally. An Approved offer can also fail
+    /// locally before delivery begins (for example a destination collision or a
+    /// recovery artifact that is not this request's); this leaves a terminal
+    /// Failed record instead of an unstartable Approved one.
     pub fn fail(
         &self,
         id: u64,
         expected_rev: u64,
         now: u64,
     ) -> Result<(RequestRecord, Option<RequestEvent>), RequestError> {
-        terminal_transition(self, id, expected_rev, RequestState::Failed, &[RequestState::Delivering], now)
+        terminal_transition(
+            self,
+            id,
+            expected_rev,
+            RequestState::Failed,
+            &[RequestState::Approved, RequestState::Delivering],
+            now,
+        )
     }
 
     /// Withdraw a request before delivery starts. This is local owner action,
@@ -836,8 +858,40 @@ impl RequestStore {
         sender: &SenderIdentity,
         now: u64,
     ) -> Result<(RequestRecord, Option<RequestEvent>), RequestError> {
+        self.begin_delivery_with_budget(id, expected_rev, sender, now, None)
+    }
+
+    /// Reserve the full manifest against the receiver's current free-space
+    /// observation under the same lock as all other active deliveries. Already
+    /// staged bytes deliberately remain reserved, a conservative restart bound.
+    pub fn begin_delivery_with_budget(
+        &self,
+        id: u64,
+        expected_rev: u64,
+        sender: &SenderIdentity,
+        now: u64,
+        free_bytes: Option<u64>,
+    ) -> Result<(RequestRecord, Option<RequestEvent>), RequestError> {
+        self.begin_delivery_with_budget_sample(id, expected_rev, sender, now, || free_bytes)
+    }
+
+    /// Same reservation, with the free-space observation made INSIDE the store
+    /// lock. An arbitrary external writer can still consume disk after the
+    /// sample, so this narrows the window rather than making reservation atomic
+    /// with every process on the machine.
+    pub fn begin_delivery_with_budget_sample<F>(
+        &self,
+        id: u64,
+        expected_rev: u64,
+        sender: &SenderIdentity,
+        now: u64,
+        free_bytes: F,
+    ) -> Result<(RequestRecord, Option<RequestEvent>), RequestError>
+    where
+        F: FnOnce() -> Option<u64>,
+    {
         sender.validate()?;
-        self.locked(|state| {
+        self.locked(move |state| {
             let index = find_index(state, id)?;
             let current = state.requests[index].rev;
             if current != expected_rev {
@@ -861,6 +915,14 @@ impl RequestStore {
                 return Err(RequestError::OfferExpired(id));
             }
             require_same_sender(&state.requests[index], sender, now, &self.owner_user_id)?;
+            if let Some(free) = free_bytes() {
+                let reserved = state.requests.iter()
+                    .filter(|record| record.id != id && record.state == RequestState::Delivering)
+                    .fold(0u64, |bytes, record| bytes.saturating_add(record.manifest.total_bytes));
+                if reserved.saturating_add(state.requests[index].manifest.total_bytes) > free {
+                    return Err(RequestError::LimitExceeded("insufficient space for active transfers"));
+                }
+            }
             let event = touch(
                 &mut state.rev,
                 &mut state.requests[index],
@@ -918,22 +980,27 @@ impl RequestStore {
     }
 
     /// Expire every active offer whose deadline has passed. One revision bump
-    /// per record keeps cursors honest.
+    /// per record keeps cursors honest. `Delivering` is gated by the separate
+    /// abandoned-delivery timeout, not the acceptance TTL.
     pub fn expire(&self, now: u64) -> Result<Vec<RequestEvent>, RequestError> {
         self.locked(|state| {
             let mut events = Vec::new();
             for index in 0..state.requests.len() {
-                if matches!(
+                let expired_offer = matches!(
                     state.requests[index].state,
                     RequestState::Pending | RequestState::Approved
-                ) && now >= state.requests[index].expires_at
-                {
-                    let event = touch(
-                        &mut state.rev,
-                        &mut state.requests[index],
-                        RequestState::Expired,
-                        now,
-                    );
+                ) && now >= state.requests[index].expires_at;
+                let abandoned_delivery = state.requests[index].state == RequestState::Delivering
+                    && now >= state.requests[index]
+                        .updated_at
+                        .saturating_add(STALE_DELIVERING_SECS);
+                if expired_offer || abandoned_delivery {
+                    let next = if abandoned_delivery {
+                        RequestState::Failed
+                    } else {
+                        RequestState::Expired
+                    };
+                    let event = touch(&mut state.rev, &mut state.requests[index], next, now);
                     events.push(event);
                 }
             }
@@ -1382,6 +1449,52 @@ mod tests {
     }
 
     #[test]
+    fn stale_delivering_is_failed_but_a_recent_delivery_survives() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let manifest = manifest("a.txt", 1);
+        let (pending, _) = store
+            .propose("ext-offer", &external(), &manifest, 60, None, 10)
+            .unwrap();
+        let (approved, _) = store
+            .accept(pending.id, pending.rev, "/inbox", &external(), 11)
+            .unwrap();
+        let (delivering, _) = store
+            .begin_delivery(approved.id, approved.rev, &external(), 12)
+            .unwrap();
+        assert_eq!(delivering.state, RequestState::Delivering);
+        assert!(store
+            .expire(12 + STALE_DELIVERING_SECS - 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.snapshot(None).unwrap().requests[0].state,
+            RequestState::Delivering
+        );
+        let events = store.expire(12 + STALE_DELIVERING_SECS).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, "failed");
+        assert_eq!(
+            store.snapshot(None).unwrap().requests[0].state,
+            RequestState::Failed
+        );
+    }
+
+    #[test]
+    fn an_approved_offer_can_fail_locally_before_delivery_begins() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let manifest = manifest("a.txt", 1);
+        let (approved, _) = store
+            .propose("owner-offer", &owner(), &manifest, 60, Some("/owner-inbox"), 10)
+            .unwrap();
+        assert_eq!(approved.state, RequestState::Approved);
+        let (failed, event) = store.fail(approved.id, approved.rev, 11).unwrap();
+        assert_eq!(failed.state, RequestState::Failed);
+        assert_eq!(event.unwrap().status, "failed");
+    }
+
+    #[test]
     fn exact_delivery_requires_fresh_authority_and_leaves_a_receipt() {
         let dir = temp_dir();
         let store = store(&dir);
@@ -1460,14 +1573,14 @@ mod tests {
         let store = store(&dir);
         let manifest = manifest("a.txt", 1);
         let (approved, _) = store
-            .propose("owner-offer", &owner(), &manifest, 60, Some("/inbox"), 10)
+            .propose("owner-offer", &owner(), &manifest, 60, Some("/owner-inbox"), 10)
             .unwrap();
         let revoked = SenderIdentity {
             revoked: true,
             ..owner()
         };
         assert!(matches!(
-            store.accept(approved.id, approved.rev, "/inbox", &revoked, 11),
+            store.accept(approved.id, approved.rev, "/owner-inbox", &revoked, 11),
             Err(RequestError::SenderRefused(_))
         ));
 

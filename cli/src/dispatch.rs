@@ -608,6 +608,9 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         Cmd::Send {
             paths,
+            defer,
+            resume,
+            cancel,
             code,
             word,
             room,
@@ -618,6 +621,10 @@ pub(crate) async fn async_main() -> Result<()> {
             timeout,
         } => {
             let json_out = ui_caps.json || cli.json;
+            if defer || resume.is_some() || cancel.is_some() {
+                return crate::retained_send_cmd::command(&server, paths, to, name,
+                    relay, timeout, defer, resume, cancel, json_out).await;
+            }
             // Eval item 5: `--remember` was silently a no-op wherever it could
             // not apply. It names the device met over a CODE; without one there
             // is nobody to remember, so refuse rather than ignore it.

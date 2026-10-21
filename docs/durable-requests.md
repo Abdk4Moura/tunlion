@@ -1,7 +1,35 @@
 # Durable transfer requests: first engine slice
 
-Status: library state store implemented; receive-dispatch and CLI wiring are the
-next slice.
+Status: storage foundation, daemon receive adapter, request commands and explicit
+sender-retained retries verified on an isolated leased worker. Not deployed; not
+merged; no production daemon or installed binary was changed.
+
+`--defer` is an opt-in async mode. Ordinary sends keep their existing
+exit-0-means-delivered contract. For `--defer`, exit 0 with `state:"waiting"`
+means accepted and retained, never delivered. A closed non-delivery exits
+non-zero and `delivered:false`.
+
+## Integration contract
+
+- Retention is explicit: `send --defer --to <device>` snapshots payloads in a
+  private, bounded local outbox before making a network attempt. Existing sends
+  and their exit/history contract remain unchanged.
+- `send --resume <offer>` reuses the exact snapshot and stable offer identity.
+  Queued results have `state: waiting` and `delivered: false`, not delivery success.
+  The CLI daemon schedules due offers with the existing sender executable and
+  reaps its owned child on shutdown. No idle-daemon or cloud delivery is implied.
+- Durable offers carry an explicit `request` marker. An older ordinary offer is
+  not silently reinterpreted as this protocol. A capable receiver returns a
+  manifest-bound pending receipt; approval and delivery remain separate.
+- `requests accept <id>` / `requests decline <id>` address incoming file offers.
+  Existing `approve` / `deny` keep their capability-consent meaning. Incoming
+  storage is under `transfer-requests`, separate from legacy `requests.json`.
+- An approved destination is one exact file below the receive root, not an
+  arbitrary path or archive extraction grant. A multi-path send currently creates
+  separate one-file offers; a directory snapshot is one tar object, not an
+  approved expanded tree.
+- The pairing PR and its preview are separate from this backend branch. Neither
+  integration authorizes deployment or production daemon changes.
 
 ## Scope
 
@@ -31,8 +59,10 @@ offline sender will return.
 - States are `pending`, `approved` (accepted; waiting for the sender),
   `delivering`, `denied`, `expired`, `fulfilled`, `failed`, `withdrawn`.
   `approved` never means bytes arrived.
-- Same-owner offers are auto-approved only when the caller supplies a
-  destination. External offers stay pending for review.
+- Owned devices auto-approve only when the caller supplies a destination.
+  Delegated/joined devices are signed by the owner user key but are not owned
+  devices: they stay pending for review. "External" here means not an owner
+  device, not "different user key".
 - Acceptance binds the exact manifest digest and a destination string.
   Destination confinement to receive roots remains the caller's policy.
 - Every write requires a fresh `SenderIdentity` observation, including
@@ -56,23 +86,55 @@ offline sender will return.
   segments and Windows-forbidden characters. NFC/NFD collisions remain for the
   later placement slice.
 
+## Delivery mechanics
+
+- A durable offer is held until the sender's device-key possession is Proven.
+  Shadow-mode receivers issue that challenge only for this explicit protocol.
+- The receiver stages bytes in `.tunlion-request-<id>.part`, hashes them, and
+  rechecks authority before placement. Final placement is a no-overwrite hard
+  link to the exact approved path.
+- The receipt is committed before the delivery acknowledgement. If acknowledgement
+  is lost, the sender's retry sees `fulfilled`, the receiver re-acks, and no
+  second file is placed. Recovery requires the request-specific staged artifact,
+  not merely a file with a matching hash.
+- Writer chunks recheck authority at a bounded interval (2s), and placement
+  always rechecks immediately before the link.
+- Approval reserves space against other active deliveries with a free-space
+  sample taken under the store lock. This is a bound, not an atomic guarantee
+  against every external writer on the filesystem.
+- A transport without `full` SHA-256 is refused for durable admission. A plain
+  daemon offer without the `request` marker keeps the legacy path unchanged.
+
 ## Deliberately not in this slice
 
-- Receive dispatch does not yet create or advance these records on a real
-  `file-offer`.
-- Sender-side retained offers and retry scheduling.
-- Multi-file transport grouping; the current wire offer is one file, stored as
-  a one-entry manifest.
-- Destination confinement, free-space reservations and per-chunk authority
-  rechecks at delivery time.
-- CLI request list/accept/decline adapters over this store.
+- Cancel is sender-local: it stops retries and deletes the private snapshot, but
+  does not claim the receiver withdrew the request. The receiver record expires
+  within 7 days.
+- Multi-file transport grouping is one request per file. A directory is a single
+  tar object, not an approved expanded tree.
+- Core exposes no request UI yet, and `CoreHost::free_space` returns `None`, so
+  Core does not get the free-space reservation bound.
+- Full per-file history across a multi-offer retained send; ordinary history
+  remains terminal one-shot.
+- NFC/NFD collision hardening for eventual file placement.
+- Playwright/dashboard/Core request surfaces.
 
 ## Verification
 
-Remote unit suite: `cargo test -p filament-peerloop --lib requests::tests`.
-Latest cached-worker run: 17 focused tests and 455 full peerloop library tests
-passed. This verifies the library slice, not dispatch wiring or network retries.
-The tests cover canonicalization and unsafe paths, sender refusal, same-owner
-versus external decisions, exact digest/revision binding, restart persistence,
-idempotent decline, tombstone replay refusal, fresh-authority delivery, expiry,
-bounded retention and snapshot resynchronization.
+Isolated worker, source snapshot archived with per-file SHA-256, debug
+`test-hooks` binary:
+
+- full `filament-peerloop` library: **500 passed**
+- `filament-cli` bin tests: **823 passed**, 2 ignored
+- focused request store: **17 passed**
+- retained sender store: **10 passed**
+- real network/restart E2E: proven restricted sender created a pending offer with
+  no bytes; daemon approval plus receiver restart delivered the exact retained
+  snapshot; completed retry made no duplicate; decline never delivered; the
+  sender daemon retried a retained offer; an offline receiver did not lose the
+  offer; an acknowledgement-loss retry reused the committed receipt with no
+  duplicate placement; fresh certificate revocation defeated a prior approval.
+- evidence: worker `results/durable-e2e-20261021T102911`, logs and command
+  records retained.
+
+The Python request model remains a policy simulation, not this Rust runtime.

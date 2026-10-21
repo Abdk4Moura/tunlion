@@ -8,6 +8,7 @@
 
 use crate::host::{HostServices, LogSink, StorageFailure, Tone};
 use crate::present::human;
+use crate::recv::request_delivery::PermitError;
 use crate::recv::{
     age_words, expire_partials, resumable_partials, unique_path, IncomingFile, RecvReport,
     PARTIAL_TTL_SECS,
@@ -157,27 +158,167 @@ pub async fn finalize_incoming(
     report: &RecvReport,
     delivery: &std::sync::Arc<Mutex<HashMap<String, String>>>,
 ) -> Result<bool> {
+    let durable = inc.durable.clone();
+    if let Some(permit) = &durable {
+        match permit.check(host) {
+            Ok(_) => {}
+            Err(PermitError::Authority(error)) => {
+                log.say(&format!("  delivery stopped: {error}"));
+                let _ = permit.fail(host);
+                permit.clean_staged();
+                drop(inc.file);
+                crate::recv::discard_partial(&inc.part_path);
+                return Ok(false);
+            }
+            Err(PermitError::Transient(error)) => {
+                log.say(&format!("  delivery paused: {error}"));
+                return Ok(false);
+            }
+        }
+        if !matches!(crate::recv::verify_incoming(&inc).await, protocol::VerifyResult::Match) {
+            log.say("  delivery stopped: staged bytes do not match the approved manifest");
+            let _ = permit.fail(host);
+            permit.clean_staged();
+            drop(inc.file);
+            crate::recv::discard_partial(&inc.part_path);
+            return Ok(false);
+        }
+    }
     let f = inc.file.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = f.sync_all();
-    })
-    .await;
+    let synced = tokio::task::spawn_blocking(move || f.sync_all()).await;
+    if durable.is_some() {
+        match synced {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                // A sync failure means the bytes may not be durable. Keep the
+                // staged artifact for a retry; do not terminalize the request.
+                log.critical(&format!("  cannot sync the received file: {error}"));
+                return Ok(false);
+            }
+            Err(error) => {
+                log.critical(&format!("  sync task failed for the received file: {error}"));
+                return Ok(false);
+            }
+        }
+    } else {
+        let _ = synced;
+    }
     if !inc.part_path.as_os_str().is_empty() {
         let _ = host.publish_received_file(&inc.file);
     }
     drop(inc.file);
-    let final_path = unique_path(dir, rename_to.unwrap_or(&inc.name));
-    if let Err(e) = tokio::fs::rename(&inc.part_path, &final_path).await {
-        log.say(&log.paint(
-            Tone::Dim,
-            &format!(
-                "  (stream for {} already finalized, duplicate discarded: {e})",
-                inc.name
-            ),
-        ));
-        return Ok(false);
+    let final_path = durable.as_ref().map(|permit| permit.destination.clone())
+        .unwrap_or_else(|| unique_path(dir, rename_to.unwrap_or(&inc.name)));
+    // A durable approval binds this exact destination. Never silently choose
+    // another name or replace a file someone created after approval.
+    if let Some(permit) = &durable {
+        // Authority can change while the file is being hashed/synced. Recheck
+        // immediately before placement, not only at function entry.
+        match permit.check(host) {
+            Ok(_) => {}
+            Err(PermitError::Authority(error)) => {
+                log.say(&format!("  delivery stopped: {error}"));
+                let _ = permit.fail(host);
+                permit.clean_staged();
+                crate::recv::discard_partial(&inc.part_path);
+                return Ok(false);
+            }
+            Err(PermitError::Transient(error)) => {
+                log.say(&format!("  delivery paused: {error}"));
+                return Ok(false);
+            }
+        }
     }
-    let _ = tokio::fs::remove_file(dir.join(format!("{}.part.meta", inc.name))).await;
+    let placed = if durable.is_some() {
+        tokio::fs::hard_link(&inc.part_path, &final_path).await
+    } else {
+        tokio::fs::rename(&inc.part_path, &final_path).await
+    };
+    if let Err(error) = placed {
+        if let Some(permit) = &durable {
+            // A crash after hard_link but before the receipt leaves the final
+            // link already in place. Only that exact artifact counts; a foreign
+            // file at the destination is a terminal collision.
+            if permit.same_artifact() && permit.verify_final().is_ok() {
+                // Continue to the receipt commit below.
+            } else {
+                log.critical(&format!(
+                    "  refused placement for {}: destination is not this request's artifact ({error})",
+                    inc.name
+                ));
+                let _ = permit.remove_final_if_own();
+                let _ = permit.fail(host);
+                permit.clean_staged();
+                crate::recv::discard_partial(&inc.part_path);
+                return Ok(false);
+            }
+        } else {
+            log.say(&log.paint(
+                Tone::Dim,
+                &format!(
+                    "  (stream for {} already finalized, duplicate discarded: {error})",
+                    inc.name
+                ),
+            ));
+            return Ok(false);
+        }
+    }
+    if let Some(permit) = &durable {
+        if let Err(error) = permit.verify_final() {
+            log.critical(&format!(
+                "  refused final placement for {}: {error}",
+                inc.name
+            ));
+            let _ = permit.remove_final_if_own();
+            let _ = permit.fail(host);
+            permit.clean_staged();
+            crate::recv::discard_partial(&inc.part_path);
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        if let Err(error) = std::fs::File::open(&permit.receive_root)
+            .and_then(|directory| directory.sync_all())
+        {
+            // The bytes and the final name exist but the receipt has not
+            // committed. Keep both artifacts for the sender's retry; never
+            // unwind the whole receive loop for a directory fsync failure.
+            log.critical(&format!(
+                "  final directory sync failed; receipt awaits retry: {error}"
+            ));
+            return Ok(false);
+        }
+        // Commit the receipt before acknowledging delivery. A crash between
+        // placement and commit is recovered by matching the request-specific
+        // staged artifact on the sender's retry, never by re-delivering under
+        // another name.
+        match permit.complete(host) {
+            Ok(()) => {
+                permit.clean_staged();
+                crate::recv::discard_partial(&inc.part_path);
+            }
+            Err(PermitError::Authority(error)) => {
+                log.critical(&format!(
+                    "  delivery stopped after placement: {error}"
+                ));
+                let _ = permit.remove_final_if_own();
+                let _ = permit.fail(host);
+                permit.clean_staged();
+                crate::recv::discard_partial(&inc.part_path);
+                return Ok(false);
+            }
+            Err(PermitError::Transient(error)) => {
+                // A store write/read failure is retryable: keep the final link
+                // and the staged part so the next offer can recover the receipt.
+                log.critical(&format!(
+                    "  file placed; delivery receipt awaits retry: {error}"
+                ));
+                return Ok(false);
+            }
+        }
+    }
+    let mut meta_path = inc.part_path.as_os_str().to_owned();
+    meta_path.push(".meta");
+    let _ = tokio::fs::remove_file(PathBuf::from(meta_path)).await;
     let recvd = inc.received.load(Ordering::Relaxed);
     let ok = recvd == inc.size;
     inc.bar.done(recvd);
@@ -200,7 +341,7 @@ pub async fn finalize_incoming(
         let is_archive =
             lname.ends_with(".tar") || lname.ends_with(".tar.gz") || lname.ends_with(".tgz");
         let peer = (!from_name.is_empty()).then_some(from_name);
-        if is_archive && host.settings_get_bool_for("auto-extract", peer) {
+        if is_archive && durable.is_none() && host.settings_get_bool_for("auto-extract", peer) {
             match host.extract_received_archive(&final_path, dir) {
                 Ok(n) => log.say(&format!(
                     "    {} extracted {n} file{} into {}",

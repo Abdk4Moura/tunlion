@@ -20,6 +20,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Optional caller policy checked before each chunk. An ordinary sender passes
+/// `None`; the CLI's retained-send adapter uses it to stop a bounded attempt
+/// after its claim changes or its timeout cancels the operation.
+pub type StreamGuard = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// Stream one offered file from `offset`.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_one(
@@ -32,6 +37,26 @@ pub async fn stream_one(
     tx: mpsc::UnboundedSender<Ev>,
     log: Arc<dyn LogSink>,
     present: Arc<dyn Presentation>,
+) -> Result<()> {
+    stream_one_guarded(
+        outgoing, transports, id, offset, chunk, active_sid, tx, log, present, None,
+    )
+    .await
+}
+
+/// [`stream_one`] with a per-chunk caller policy hook.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_one_guarded(
+    outgoing: Arc<tokio::sync::Mutex<Vec<Outgoing>>>,
+    transports: Vec<Arc<dyn Transport>>,
+    id: String,
+    offset: u64,
+    chunk: usize,
+    active_sid: Option<String>,
+    tx: mpsc::UnboundedSender<Ev>,
+    log: Arc<dyn LogSink>,
+    present: Arc<dyn Presentation>,
+    guard: Option<StreamGuard>,
 ) -> Result<()> {
     let (sid, name, size, path) = {
         let out = outgoing.lock().await;
@@ -75,6 +100,7 @@ pub async fn stream_one(
         let tx = tx.clone();
         let active_sid = active_sid.clone();
         let log = log.clone();
+        let guard = guard.clone();
         handles.push(tokio::spawn(async move {
             let trace =
                 cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
@@ -113,6 +139,9 @@ pub async fn stream_one(
             }
 
             while pos < end {
+                if let Some(guard) = &guard {
+                    guard()?;
+                }
                 let stall = test_hooks::transfer_stall_ms();
                 if stall > 0 {
                     let units = (cur_n as u64).div_ceil(64 * 1024).max(1);
