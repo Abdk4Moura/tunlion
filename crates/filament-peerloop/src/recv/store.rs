@@ -369,7 +369,7 @@ fn before_write_json_array(path: &Path) -> io::Result<()> {
 /// An exclusive, cross-process lock on a sidecar file. On Unix this is
 /// `flock`; on Windows `LockFileEx`; elsewhere it is an ordinary open (the
 /// store's own atomic rename still prevents torn writes).
-struct StoreLock {
+pub(crate) struct StoreLock {
     _file: std::fs::File,
 }
 
@@ -431,7 +431,7 @@ impl StoreLock {
         Ok(Some(Self { _file: file }))
     }
 
-    fn acquire(path: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
         #[allow(unused_mut)]
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(false);
