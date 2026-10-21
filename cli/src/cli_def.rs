@@ -851,7 +851,8 @@ pub(crate) enum Cmd {
         /// Working directory on the remote (default: the daemon's home)
         #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,
-        /// Extra environment as KEY=VALUE (repeatable; TERM/LANG/LC_* pass anyway)
+        /// Extra environment as KEY=VALUE (repeatable; TERM/LANG/LC_* and
+        /// Windows platform essentials pass anyway)
         #[arg(long, value_name = "KEY=VALUE")]
         env: Vec<String>,
         /// The command and its arguments, passed exactly (trailing)

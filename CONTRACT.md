@@ -563,9 +563,14 @@ stream kinds are refused, never misinterpreted.
   open with it missing, unparseable, or outside the L2 sid half is refused
   rather than served with a second locally-allocated sid nobody listens on.
   `cwd` is the requested working directory (default: the daemon's home).
-  `env` carries ONLY the allowlist: `TERM`, `LANG`, `LC_*`, plus explicit
-  `--env KEY=VALUE` pairs. Nothing else from either side's environment
-  crosses the link. `tty` requests a pty instead of pipes.
+  `env` carries ONLY explicit `--env KEY=VALUE` pairs; the receiver also adds
+  a fixed policy allowlist from its own environment: `TERM`, `LANG`, `LC_*`,
+  plus, on Windows, the non-secret platform baseline a child needs to run
+  normally (`SystemRoot`, `WINDIR`, `SYSTEMDRIVE`, `PATH`, `PATHEXT`,
+  `COMSPEC`, `TEMP`/`TMP`, and the profile/program roots). That baseline is
+  local to the receiver and is never sent on the wire. Nothing else from
+  either side's environment crosses the link. `tty` requests a pty instead of
+  pipes.
 - `exec-open-ack` `{ type: "exec-open-ack", sid, out, err }` -- the
   receiver's acceptance: `out` (== `sid`) names the stdout stream, `err`
   (== the open's `err_sid`) the stderr stream. Informational: both pipes

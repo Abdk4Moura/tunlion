@@ -109,28 +109,123 @@ fn default_exec_cwd(process: &dyn ExecProcess, run_as: Option<&str>) -> PathBuf 
     }
 }
 
-/// Build the child's environment: env_clear PLUS the allowlist. TERM, LANG and
-/// LC_* pass through from the daemon's own environment; explicit `--env` pairs
-/// are layered on top (explicit wins on collision). Everything else -- notably
-/// secrets, tokens, and proxy config -- stays on the daemon side of the link.
-fn build_env(
+/// The non-secret Windows variables that make a child a normal Windows
+/// process rather than a bare `CreateProcess`. Only these NAMES cross from the
+/// daemon's environment; every value still comes from the daemon locally and
+/// is never carried on the link.
+///
+/// `SystemRoot`/`WINDIR`/`SYSTEMDRIVE` are what Win32 itself assumes: the
+/// loader, side-by-side resolution, registry views, and the system DLLs and
+/// RNG providers Windows and Node reach for. A child without them is not a
+/// normal Windows process; the reported failure was Node's `ncrypto::CSPRNG`
+/// abort, and handing over the full environment was the workaround this
+/// baseline replaces.
+/// `PATH`/`PATHEXT`/`COMSPEC` are how the child and the shells or Node
+/// process-spawn paths it starts find programs (`cmd.exe` included).
+/// `TEMP`/`TMP` are `GetTempPath` and the staging npm, node-gyp and ordinary
+/// tools do. The profile and program roots are where Node, npm and
+/// toolchains look for config, caches, global prefixes and installed tools.
+/// Deliberately absent: proxy settings, credentials/tokens, `NODE_OPTIONS`,
+/// and every other variable that can carry a secret or change how a command
+/// resolves.
+const WINDOWS_PLATFORM_ENV: &[&str] = &[
+    "SystemRoot",
+    "WINDIR",
+    "SYSTEMDRIVE",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+];
+
+/// Environment names are case-insensitive on Windows and case-sensitive
+/// everywhere else. Keeping the rule explicit makes both behaviours testable
+/// on any host.
+fn env_names_equal(a: &str, b: &str, windows: bool) -> bool {
+    if windows {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// The always-forwarded names: `TERM`, `LANG`, `LC_*` (plus, on Windows, the
+/// platform baseline above). These are inherited from the daemon and are not
+/// a channel for the initiator's environment.
+fn env_name_is_allowed(k: &str, windows: bool) -> bool {
+    if windows {
+        k.eq_ignore_ascii_case("TERM")
+            || k.eq_ignore_ascii_case("LANG")
+            || k.get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LC_"))
+    } else {
+        k == "TERM" || k == "LANG" || k.starts_with("LC_")
+    }
+}
+
+/// Set one pair, replacing an existing name (case-insensitively on Windows) so
+/// the child never receives duplicates the OS would collapse unpredictably.
+fn set_env(out: &mut Vec<(String, String)>, k: &str, v: &str, windows: bool) {
+    if let Some(slot) = out
+        .iter_mut()
+        .find(|(existing, _)| env_names_equal(existing, k, windows))
+    {
+        slot.0 = k.to_string();
+        slot.1 = v.to_string();
+    } else {
+        out.push((k.to_string(), v.to_string()));
+    }
+}
+
+/// Build the child's environment: env_clear PLUS the allowlist. `TERM`, `LANG`
+/// and `LC_*` pass through from the daemon on every platform; Windows also
+/// receives its fixed, non-secret platform baseline. Explicit `--env` pairs are
+/// layered on top and win on collision (case-insensitively on Windows).
+/// Everything else -- notably secrets, tokens, and proxy config -- stays on the
+/// daemon side of the link.
+fn build_env_for(
     daemon: Vec<(String, String)>,
     explicit: &[(String, String)],
+    windows: bool,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in daemon {
-        if k == "TERM" || k == "LANG" || k.starts_with("LC_") {
+        if windows {
+            if let Some(canonical) = WINDOWS_PLATFORM_ENV
+                .iter()
+                .copied()
+                .find(|name| name.eq_ignore_ascii_case(&k))
+            {
+                set_env(&mut out, canonical, &v, true);
+            } else if env_name_is_allowed(&k, true) {
+                set_env(&mut out, &k, &v, true);
+            }
+        } else if env_name_is_allowed(&k, false) {
             out.push((k, v));
         }
     }
     for (k, v) in explicit {
-        if let Some(slot) = out.iter_mut().find(|(ek, _)| ek == k) {
-            slot.1 = v.clone();
-        } else {
-            out.push((k.clone(), v.clone()));
-        }
+        set_env(&mut out, k, v, windows);
     }
     out
+}
+
+fn build_env(
+    daemon: Vec<(String, String)>,
+    explicit: &[(String, String)],
+) -> Vec<(String, String)> {
+    build_env_for(daemon, explicit, cfg!(windows))
 }
 
 async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> anyhow::Result<()> {
@@ -883,6 +978,18 @@ mod tests {
     const SID: u32 = L2_SID_BASE + 1;
     const ERR_SID: u32 = L2_SID_BASE + 2;
 
+    fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn env_name_count(env: &[(String, String)], name: &str) -> usize {
+        env.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .count()
+    }
+
     // A transport that records control messages and stream frames in order.
     #[derive(Default)]
     struct FakeTransport {
@@ -1184,6 +1291,188 @@ mod tests {
             "stdout and stderr never share a channel"
         );
     }
+
+    #[test]
+    fn windows_baseline_is_forwarded_but_secrets_stay_home() {
+        let daemon = vec![
+            ("SystemRoot".into(), r"C:\Windows".into()),
+            ("windir".into(), r"C:\Windows".into()),
+            (
+                "Path".into(),
+                r"C:\Windows\System32;C:\Program Files\nodejs".into(),
+            ),
+            ("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()),
+            ("ComSpec".into(), r"C:\Windows\System32\cmd.exe".into()),
+            ("TEMP".into(), r"C:\Users\me\AppData\Local\Temp".into()),
+            ("TMP".into(), r"C:\Users\me\AppData\Local\Temp".into()),
+            ("USERPROFILE".into(), r"C:\Users\me".into()),
+            ("APPDATA".into(), r"C:\Users\me\AppData\Roaming".into()),
+            ("LOCALAPPDATA".into(), r"C:\Users\me\AppData\Local".into()),
+            ("TERM".into(), "xterm".into()),
+            ("lc_all".into(), "C".into()),
+            ("HTTP_PROXY".into(), "http://proxy.example".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
+            ("NODE_OPTIONS".into(), "--require ./hook.js".into()),
+        ];
+
+        let env = build_env_for(daemon, &[], true);
+
+        assert_eq!(env_value(&env, "SystemRoot"), Some(r"C:\Windows"));
+        assert_eq!(env_value(&env, "WINDIR"), Some(r"C:\Windows"));
+        assert_eq!(
+            env_value(&env, "PATH"),
+            Some(r"C:\Windows\System32;C:\Program Files\nodejs")
+        );
+        assert_eq!(env_value(&env, "PATHEXT"), Some(".COM;.EXE;.BAT;.CMD"));
+        assert_eq!(
+            env_value(&env, "COMSPEC"),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(
+            env_value(&env, "TEMP"),
+            Some(r"C:\Users\me\AppData\Local\Temp")
+        );
+        assert_eq!(
+            env_value(&env, "TMP"),
+            Some(r"C:\Users\me\AppData\Local\Temp")
+        );
+        assert_eq!(env_value(&env, "USERPROFILE"), Some(r"C:\Users\me"));
+        assert_eq!(env_value(&env, "TERM"), Some("xterm"));
+        assert_eq!(env_value(&env, "LC_ALL"), Some("C"));
+        assert_eq!(env_name_count(&env, "PATH"), 1, "no case-duplicate PATH");
+        assert_eq!(env_name_count(&env, "SystemRoot"), 1);
+
+        for secret in ["HTTP_PROXY", "AWS_SECRET_ACCESS_KEY", "NODE_OPTIONS"] {
+            assert_eq!(
+                env_value(&env, secret),
+                None,
+                "{secret} must not cross to the child"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_explicit_env_overrides_baseline_case_insensitively() {
+        let daemon = vec![
+            ("SystemRoot".into(), r"C:\Windows".into()),
+            ("Path".into(), r"C:\daemon\bin".into()),
+            ("TERM".into(), "xterm".into()),
+        ];
+        let explicit = vec![
+            ("systemroot".into(), r"D:\Win".into()),
+            ("PATH".into(), r"C:\explicit\bin".into()),
+            ("term".into(), "screen".into()),
+            ("FOO".into(), "bar".into()),
+        ];
+
+        let env = build_env_for(daemon, &explicit, true);
+
+        assert_eq!(env_value(&env, "SystemRoot"), Some(r"D:\Win"));
+        assert_eq!(env_name_count(&env, "SystemRoot"), 1);
+        assert_eq!(env_value(&env, "PATH"), Some(r"C:\explicit\bin"));
+        assert_eq!(env_name_count(&env, "PATH"), 1);
+        assert_eq!(env_value(&env, "TERM"), Some("screen"));
+        assert_eq!(env_name_count(&env, "TERM"), 1);
+        assert_eq!(env_value(&env, "FOO"), Some("bar"));
+    }
+
+    #[test]
+    fn unix_env_stays_case_sensitive_and_has_no_windows_baseline() {
+        let daemon = vec![
+            ("TERM".into(), "xterm".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("Path".into(), r"C:\daemon\bin".into()),
+            ("SystemRoot".into(), r"C:\Windows".into()),
+        ];
+        let explicit = vec![
+            ("term".into(), "screen".into()),
+            ("Path".into(), r"C:\explicit\bin".into()),
+        ];
+
+        let env = build_env_for(daemon, &explicit, false);
+
+        assert_eq!(
+            env,
+            vec![
+                ("TERM".into(), "xterm".into()),
+                ("LANG".into(), "en_US.UTF-8".into()),
+                ("term".into(), "screen".into()),
+                ("Path".into(), r"C:\explicit\bin".into()),
+            ],
+            "Windows baseline is not injected, and case-different names do not collide"
+        );
+    }
+
+    #[cfg(windows)]
+    fn program_on_path(env: &[(String, String)], name: &str) -> Option<std::path::PathBuf> {
+        let path = env
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))?
+            .1
+            .as_str();
+        std::env::split_paths(path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// Acceptance on a real Windows child: the filtered environment must let
+    /// Node's CSPRNG work and let Node resolve `node` again through PATH.
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_prng_and_nested_node_run_with_the_filtered_env() {
+        let daemon: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let env = build_env_for(daemon, &[], true);
+        assert!(
+            env_value(&env, "SystemRoot").is_some(),
+            "the daemon's own SystemRoot is the source of the baseline"
+        );
+        assert!(env_value(&env, "PATH").is_some());
+
+        let Some(node) = program_on_path(&env, "node.exe") else {
+            if std::env::var_os("CI").is_some() {
+                panic!("node.exe is not on the daemon PATH; Windows Node acceptance cannot run");
+            }
+            eprintln!("skipping Windows Node acceptance: node.exe is not on PATH");
+            return;
+        };
+
+        let output = std::process::Command::new(&node)
+            .args(["-e", NODE_ACCEPTANCE])
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .output()
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", node.display()));
+        assert!(
+            output.status.success(),
+            "node with the filtered env failed ({}): stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+    }
+
+    #[cfg(windows)]
+    const NODE_ACCEPTANCE: &str = r#"
+const crypto = require('crypto');
+const missing = ['SystemRoot', 'WINDIR', 'PATH', 'PATHEXT', 'TEMP', 'TMP']
+  .filter((name) => !process.env[name]);
+if (missing.length) {
+  console.error('missing baseline: ' + missing.join(','));
+  process.exit(2);
+}
+crypto.randomBytes(32);
+crypto.getRandomValues(new Uint8Array(16));
+const { execFileSync } = require('child_process');
+const nested = execFileSync('node', ['-e', 'process.stdout.write("nested-ok")'], { encoding: 'utf8' });
+if (nested !== 'nested-ok') {
+  console.error('nested node output: ' + JSON.stringify(nested));
+  process.exit(3);
+}
+process.stdout.write('ok\n');
+"#;
 
     #[tokio::test]
     async fn serve_refuses_tty_and_missing_program_before_spawning() {

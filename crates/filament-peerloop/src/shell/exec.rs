@@ -89,8 +89,10 @@ pub struct ExecSpawnSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    /// Already filtered: `env_clear` plus the TERM/LANG/LC_* allowlist and
-    /// explicit `--env` pairs. The host must not add the daemon environment.
+    /// Already filtered: `env_clear` plus the platform allowlist
+    /// (`TERM`/`LANG`/`LC_*`, and on Windows the non-secret platform
+    /// baseline) and explicit `--env` pairs. The host must not add the daemon
+    /// environment.
     pub env: Vec<(String, String)>,
 }
 
