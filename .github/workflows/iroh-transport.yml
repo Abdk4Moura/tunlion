@@ -1,0 +1,60 @@
+# iroh transport PoC — a dedicated job, not part of the main test matrix.
+#
+# The crate is default-off, and its tests need iroh's in-process relay server
+# (`test-relay`), so wiring it into test.yml would make every pull request pay
+# for a dependency graph it does not use. This workflow runs only when the PoC
+# (or the lock/workspace that resolves it) changes.
+#
+# iroh 1.4.1 requires rustc >= 1.91; `stable` is at or above that on the hosted
+# runners. The exact toolchain observed in the lease-worker evidence is 1.99.1.
+
+name: iroh transport PoC
+
+on:
+  pull_request:
+    paths:
+      - "crates/filament-transport-iroh/**"
+      - "scripts/iroh-poc.sh"
+      - ".github/workflows/iroh-transport.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iroh-transport-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: relay echo + binding tests (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-iroh-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-iroh-
+
+      - name: Test the PoC
+        run: ./scripts/iroh-poc.sh test
+
+      - name: Run the two-node relay demo
+        run: ./scripts/iroh-poc.sh demo
