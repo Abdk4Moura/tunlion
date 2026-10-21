@@ -16,6 +16,7 @@ import CommandPalette from './CommandPalette.jsx'
 import DiagPanel from './DiagPanel.jsx'
 import { makeTheme, terminalTheme, systemMode, FONT_SANS, FONT_MONO } from './theme.js'
 import { pakeReady, previewCustomCode } from '../lib/pairing.js'
+import { checkCodeInput } from '../lib/codeInput.js'
 import { mintNameplate } from '../lib/words.js'
 import { oneRowPerDevice } from '../net/app/peerRows.js'
 
@@ -227,7 +228,7 @@ function LanChip({ localHelper, T }) {
 // alphanumeric in the formatted string, and (4) restore the caret there in a
 // layout effect (before paint). Counting alphanumerics, not raw offset, makes
 // collapse/strip/paste/backspace all caret-stable regardless of length change.
-function CodeInput({ id, value, onChange, format, onSubmit, onCancel, autoFocus, placeholder, invalid, describedBy, inputRef, T, big }) {
+function CodeInput({ id, value, onChange, format, onFormatError, onSubmit, onCancel, autoFocus, placeholder, invalid, describedBy, inputRef, T, big }) {
   const own = useRef(null)
   const ref = inputRef || own
   const caretRef = useRef(null)
@@ -248,7 +249,17 @@ function CodeInput({ id, value, onChange, format, onSubmit, onCancel, autoFocus,
     const sel = el.selectionStart ?? raw.length
     // How many real (alphanumeric) chars sit before the caret in the raw text?
     const before = (raw.slice(0, sel).match(/[A-Za-z0-9]/g) || []).length
-    const formatted = format(raw)
+    // `format` is the pure browser boundary (see lib/codeInput.js). It may
+    // return either the display string or { value, error }: reserved material
+    // clears the field and reports why; over-limit text stays fully visible.
+    let verdict
+    try {
+      verdict = format(raw)
+    } catch (e) {
+      verdict = { value: '', error: 'That is not a pairing code.' }
+    }
+    const formatted = typeof verdict === 'string' ? verdict : String(verdict?.value ?? '')
+    if (onFormatError) onFormatError(typeof verdict === 'string' ? null : (verdict?.error || null))
     // Walk the formatted string to just past the `before`-th alphanumeric.
     let seen = 0
     let pos = formatted.length
@@ -287,13 +298,15 @@ function CodeInput({ id, value, onChange, format, onSubmit, onCancel, autoFocus,
 }
 
 // "Choose your own code" entry. The user types words (and optionally a
-// number); we show a LIVE normalized preview (the shared WASM normCode/splitCode,
-// so it matches what SPAKE2 hashes), auto-append a dimmed connect number when
-// they typed none, and gate Create on the >= 2-word strength floor, a gentle
-// nudge, never a hard block on typing. On Create we hand the RAW typed string to
-// onGenerateCode (the hook re-parses it with the same shared split).
+// number); we show a LIVE preview from the pure browser boundary plus the
+// shared WASM normCode/splitCode, so it matches what SPAKE2 hashes. Reserved
+// material and over-limit text are refused here without truncation. Create is
+// gated on the >= 2-word strength floor, a gentle nudge rather than a hard block
+// on typing. On Create the canonical typed string goes to onGenerateCode (the
+// hook re-parses it through the same boundary).
 function CustomCodeEntry({ onCreate, onCancel, T, narrow }) {
   const [typed, setTyped] = useState('')
+  const [inputError, setInputError] = useState(null)
   const [ready, setReady] = useState(false)
   // A stable machine-assigned number for the preview (so it doesn't reshuffle on
   // every keystroke); the hook mints the real one at create time.
@@ -302,19 +315,19 @@ function CustomCodeEntry({ onCreate, onCancel, T, narrow }) {
 
   useEffect(() => { pakeReady().then(() => setReady(true)).catch(() => setReady(true)) }, [])
 
-  const format = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
   let pv = null
-  if (ready && typed.trim()) {
+  if (ready && typed.trim() && !inputError) {
     try { pv = previewCustomCode(typed, autoNpRef.current) } catch { pv = null }
   }
-  const canCreate = !!(pv && pv.strongEnough && pv.full)
+  const canCreate = !!(pv && pv.strongEnough && pv.full && !inputError)
   const doCreate = () => { if (canCreate) onCreate(typed) }
 
   return (
     <div style={{ display: 'grid', gap: 8 }}>
       <label htmlFor="tl-custom-code" style={{ fontWeight: 600, fontSize: 15 }}>Choose your own words</label>
       <div style={{ display: 'flex', gap: 10, flexDirection: narrow ? 'column' : 'row' }}>
-        <CodeInput id="tl-custom-code" autoFocus value={typed} onChange={setTyped} format={format}
+        <CodeInput id="tl-custom-code" autoFocus value={typed} onChange={setTyped} format={checkCodeInput}
+          onFormatError={setInputError}
           onSubmit={doCreate} onCancel={onCancel} placeholder="TWO WORDS OR MORE" T={T} describedBy="tl-custom-help" />
         <span style={{ display: 'flex', gap: 8 }}>
           <Btn kind="pri" T={T} narrow={narrow} onClick={doCreate} disabled={!canCreate} testid="custom-create">Create</Btn>
@@ -328,11 +341,13 @@ function CustomCodeEntry({ onCreate, onCancel, T, narrow }) {
           {pv.autoAssigned && <span style={{ fontSize: 13, color: T.sub, fontFamily: FONT_SANS }}>  (number added for you)</span>}
         </div>
       )}
-      <div id="tl-custom-help" data-testid={pv && typed.trim() && !pv.strongEnough ? 'custom-nudge' : undefined}
-        style={{ fontSize: 13, lineHeight: 1.45, color: pv && typed.trim() && !pv.strongEnough ? T.bad : T.sub }}>
-        {pv && typed.trim() && !pv.strongEnough
-          ? (pv.blockedReason || 'Use at least two words, like gigantic-element. Easier to say, harder to guess.')
-          : 'Two words or more. A number is added if you leave it out.'}
+      <div id="tl-custom-help" data-testid={inputError ? 'custom-error' : (pv && typed.trim() && !pv.strongEnough ? 'custom-nudge' : undefined)}
+        style={{ fontSize: 13, lineHeight: 1.45, color: (inputError || (pv && typed.trim() && !pv.strongEnough)) ? T.bad : T.sub }}>
+        {inputError
+          ? inputError
+          : pv && typed.trim() && !pv.strongEnough
+            ? (pv.blockedReason || 'Use at least two words, like gigantic-element. Easier to say, harder to guess.')
+            : 'Two words or more. A number is added if you leave it out.'}
       </div>
     </div>
   )
@@ -344,7 +359,9 @@ function CustomCodeEntry({ onCreate, onCancel, T, narrow }) {
 // remember a device. Receive is the default, since most codes people are handed
 // are file codes.
 function CodeBox({ state, onPairWithCode, onReceiveWithCode, initialCode, openEntryNonce, T, narrow }) {
-  const [code, setCode] = useState(initialCode || '')
+  const initialCheck = checkCodeInput(initialCode || '')
+  const [code, setCode] = useState(initialCheck.value)
+  const [inputError, setInputError] = useState(initialCheck.error)
   const [mode, setMode] = useState('receive')
   const [submitted, setSubmitted] = useState(false)
   const inputRef = useRef(null)
@@ -358,32 +375,47 @@ function CodeBox({ state, onPairWithCode, onReceiveWithCode, initialCode, openEn
     try { inputRef.current && inputRef.current.focus() } catch (e) {}
   }, [openEntryNonce])
 
-  useEffect(() => { if (initialCode) setCode(initialCode) }, [initialCode])
-
-  // Auto-dash: the user types/pastes "grand hawk ruby 8045" or "GRANDHAWKRUBY8045"
-  // and sees dashes either way. Uppercase, collapse any run of spaces/dashes to a
-  // single dash, and drop a leading dash. Safe because the submit path still
-  // canonicalizes via normCode (WASM) before SPAKE2.
-  const formatCode = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
+  useEffect(() => {
+    if (!initialCode) return
+    const checked = checkCodeInput(initialCode)
+    setCode(checked.value)
+    setInputError(checked.error)
+  }, [initialCode])
 
   // Keep the box filled after submitting so the person sees the result and can
-  // fix a mistyped code in place.
+  // fix a mistyped code in place. The pure boundary checks the RESERVED raw
+  // material first and rejects over-limit text without truncating it.
   const submit = () => {
-    const c = code.trim()
-    if (!c) { try { inputRef.current && inputRef.current.focus() } catch (e) {} ; return }
+    const checked = checkCodeInput(code)
+    if (checked.error) {
+      setInputError(checked.error)
+      setSubmitted(false)
+      return
+    }
+    if (!checked.code) {
+      try { inputRef.current && inputRef.current.focus() } catch (e) {}
+      return
+    }
+    setInputError(null)
     setSubmitted(true)
-    if (mode === 'receive') onReceiveWithCode(c)
-    else onPairWithCode(c)
+    // The visible field is the familiar uppercase presentation; the PAKE
+    // parser normalizes case exactly as the CLI's shared split does.
+    if (mode === 'receive') onReceiveWithCode(checked.value)
+    else onPairWithCode(checked.value)
   }
 
   // Show the hook's status when this box started the attempt, or when it is an
   // outcome worth seeing anyway. A 'pairing' left over from an earlier minted
   // code (the person pressed Done) is not news, so it stays hidden.
   const ps = state.pairStatus
-  const fb = ps && (submitted || ps !== 'pairing') ? codeFeedback(ps) : null
+  const inputFb = inputError ? { tone: 'bad', text: inputError, action: null } : null
+  const fb = inputFb || (ps && (submitted || ps !== 'pairing') ? codeFeedback(ps) : null)
   const invalid = fb && fb.tone === 'bad'
   const retry = () => {
-    if (fb && fb.action === 'Enter another code') setCode('')
+    if (fb && fb.action === 'Enter another code') {
+      setCode('')
+      setInputError(null)
+    }
     setSubmitted(false)
     try { inputRef.current && inputRef.current.focus() } catch (e) {}
   }
@@ -400,9 +432,10 @@ function CodeBox({ state, onPairWithCode, onReceiveWithCode, initialCode, openEn
     <div style={{ display: 'grid', gap: 10 }} data-testid={`code-entry-${mode}`}>
       <label htmlFor={id} style={{ fontWeight: 600, fontSize: 15 }}>Enter a code</label>
       <div style={{ display: 'flex', gap: 10, flexDirection: narrow ? 'column' : 'row' }}>
-        <CodeInput id={id} inputRef={inputRef} value={code} onChange={(v) => { setCode(v); if (submitted) setSubmitted(false) }} format={formatCode}
+        <CodeInput id={id} inputRef={inputRef} value={code} onChange={(v) => { setCode(v); if (submitted) setSubmitted(false) }} format={checkCodeInput}
+          onFormatError={(error) => { setInputError(error); if (submitted) setSubmitted(false) }}
           onSubmit={submit} placeholder="WORDS-AND-NUMBER" invalid={invalid} describedBy={id + '-help'} T={T} big />
-        <Btn kind="pri" T={T} narrow={narrow} onClick={submit} testid="code-connect">Connect</Btn>
+        <Btn kind="pri" T={T} narrow={narrow} onClick={submit} disabled={!!inputError} testid="code-connect">Connect</Btn>
       </div>
       <div role="radiogroup" aria-label="What is the code for?" style={{ display: 'flex', border: '1.5px solid ' + T.ink, borderRadius: 7, overflow: 'hidden', maxWidth: narrow ? 'none' : 420 }}>
         {modeBtn('receive', 'Receive a file')}

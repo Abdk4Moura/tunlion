@@ -220,6 +220,45 @@ pub fn norm_code(raw: &str) -> String {
     filtered.chars().take(48).collect()
 }
 
+/// Code-entry cleanup, deliberately separate from the released PAKE normalizer.
+/// Invalid characters separate words instead of silently joining them. No cap:
+/// callers must reject oversize input before invoking the protocol normalizer.
+/// The trailing separator is retained for an editor positioned between words.
+pub fn format_code_input(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out
+}
+
+/// Final code-entry cleanup. Only call after reserving non-code input categories.
+pub fn canonical_code_input(raw: &str) -> String {
+    format_code_input(raw).trim_end_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod code_input_tests {
+    #[test]
+    fn golden_entry_cleanup_is_idempotent_under_released_protocol_normalization() {
+        for line in include_str!("../tests/code-input-cases.txt").lines() {
+            if line.is_empty() || line.starts_with('#') { continue; }
+            let (raw, expected) = line.split_once('|').expect("input|expected");
+            let actual = super::canonical_code_input(raw);
+            assert_eq!(actual, expected);
+            assert_eq!(super::norm_code(&actual), actual);
+        }
+        assert_eq!(super::format_code_input("brave!!!"), "brave-");
+        assert_eq!(super::canonical_code_input(&"a".repeat(49)).len(), 49);
+        // Freeze the released primitive: entry cleanup is not a wire change.
+        assert_eq!(super::norm_code("brave!otter"), "braveotter");
+    }
+}
+
 /// Split a normalized spoken code into (nameplate, password). The nameplate is
 /// the TRAILING numeric group (after the LAST dash); the password is everything
 /// before it. Mirrors the JS `splitCode`. Example:

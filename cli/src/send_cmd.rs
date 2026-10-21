@@ -62,6 +62,41 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// `mint_nameplate` is always three digits. A custom phrase must leave room for
+/// that separator and suffix in the full code `receive` will be given.
+const SEND_NAMEPLATE_LEN: usize = 3;
+const CODE_LIMIT: usize = 48;
+
+/// An explicit `--word` surface: refuse reserved material before cleanup, then
+/// lowercase/separate/collapse with the shared canonicalizer and reject (never
+/// truncate) anything over the 48-character limit.
+fn checked_word(raw: &str) -> Result<String> {
+    crate::join_input::PairingCode::checked_text(raw)
+        .map_err(|error| anyhow!("{}", error.message()))
+}
+
+fn checked_word_option(value: Option<String>) -> Result<Option<String>> {
+    value.map(|raw| checked_word(&raw)).transpose()
+}
+
+/// Keep both words of a chosen phrase and require room for the minted number.
+fn chosen_send_words(normalized: &str) -> Result<String> {
+    let (words, _nameplate) = crate::pake::split_chosen_code(normalized);
+    if words.len() + 1 + SEND_NAMEPLATE_LEN > CODE_LIMIT {
+        bail!("{}", crate::join_input::CodeError::TooLong.message());
+    }
+    Ok(words)
+}
+
+/// The SPAKE2 password for a custom `--word`, validated before any network.
+fn prepare_send_words(raw: &str) -> Result<String> {
+    let words = chosen_send_words(&crate::pake::norm_code(raw))?;
+    if let Err(why) = crate::pake::words::validate_chosen_password(&words, &display_name()) {
+        bail!("'{words}' is too weak: {why}");
+    }
+    Ok(words)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_cmd(
     server: &str,
@@ -75,6 +110,10 @@ pub(crate) async fn send_cmd(
     remember: Option<String>,
     timeout: Option<u64>,
 ) -> Result<()> {
+    // Explicit `--word` crosses the same typed boundary as `join` before any
+    // prompt, echo or network: reservation first, cleanup second. A raw
+    // invitation is therefore never repeated back in the weak-word error.
+    word = checked_word_option(word)?;
     let opened_flow = interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
 
@@ -224,6 +263,15 @@ pub(crate) async fn send_cmd(
             word = Some(crate::pake::words::mint_words());
         }
     }
+    // The interactive gate may have selected or replaced the phrase. Apply the
+    // explicit surface again, then derive/validate the SPAKE2 password BEFORE
+    // connecting: a custom phrase must fit with the three-digit minted
+    // nameplate, and the weak-word check below never sees uncleaned input.
+    word = checked_word_option(word)?;
+    let chosen_words: Option<String> = match word.as_deref() {
+        Some(raw) => Some(prepare_send_words(raw)?),
+        None => None,
+    };
     // --name overrides the offered name, but only makes sense for a SINGLE
     // payload (stdin, or one regular file). With multiple paths or a directory
     // there is no single name to override, so warn that it's ignored.
@@ -598,21 +646,13 @@ pub(crate) async fn send_cmd(
         sess.emit(&sio, "subscribe", json!({ "channels": [channel_of(sec)] }))
             .await;
     } else if use_code {
-        // The words are the user's chosen phrase (--word) or a fresh mint; the
-        // nameplate is ALWAYS machine-minted. `split_chosen_code` keeps both
-        // words of a two-word phrase (it only strips a trailing 3-5 digit group).
-        send_words = match &word {
-            Some(w) => {
-                let (words, _np) = crate::pake::split_chosen_code(&crate::pake::norm_code(w));
-                if let Err(why) =
-                    crate::pake::words::validate_chosen_password(&words, &display_name())
-                {
-                    bail!("'{w}' is too weak: {why}");
-                }
-                words
-            }
-            None => crate::pake::words::mint_words(),
-        };
+        // The words are the user's pre-validated choice (--word) or a fresh
+        // mint; the nameplate is ALWAYS machine-minted. `split_chosen_code`
+        // kept both words of a two-word phrase (it only strips a trailing 3-5
+        // digit group), and the room check already included this nameplate.
+        send_words = chosen_words
+            .clone()
+            .unwrap_or_else(crate::pake::words::mint_words);
         send_nameplate = crate::pake::words::mint_nameplate();
         sio.emit(
             "pair-create",
@@ -3314,5 +3354,29 @@ mod code_window_tests {
         let w = code_establish_window(None, Some("90"), claim);
         assert_eq!(code_expiry_secs(600, w), 90);
         assert_eq!(code_expiry_secs(600, Duration::ZERO), 600);
+    }
+}
+
+#[cfg(test)]
+mod explicit_code_surface_tests {
+    use super::{checked_word, chosen_send_words};
+
+    #[test]
+    fn a_dot_is_a_word_separator_and_reserved_material_is_refused() {
+        assert_eq!(
+            checked_word("Brave.Otter..3141").unwrap(),
+            "brave-otter-3141"
+        );
+        assert!(checked_word("tunlion-invite-brave-otter-3141").is_err());
+        assert!(checked_word("[\"brave-otter-3141\"]").is_err());
+    }
+
+    #[test]
+    fn a_custom_phrase_leaves_room_for_the_three_digit_nameplate() {
+        assert_eq!(chosen_send_words(&"a".repeat(44)).unwrap().len(), 44);
+        assert!(chosen_send_words(&"a".repeat(45)).is_err());
+        // A trailing chosen number is not the minted one: the split removes it
+        // before the room check, exactly as the sender will append three new digits.
+        assert_eq!(chosen_send_words(&format!("{}-999", "a".repeat(44))).unwrap().len(), 44);
     }
 }

@@ -3,7 +3,7 @@
 // a code (or with a malformed one) AND we're allowed to be interactive (see the
 // gate in main.rs), we drop into a browser-like live entry:
 //
-//   * auto-inserts dashes (space -> '-'), refuses bad characters entirely,
+//   * maps spaces/disallowed characters to collapsed dash separators,
 //   * judges the code instantly with color (red / amber / green),
 //   * steers the user (REPL-like: won't submit an incomplete code).
 //
@@ -14,7 +14,11 @@
 // and the actual PAKE parse byte-for-byte.
 
 use crate::ui;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+
+// Matches filament_pair::norm_code. Never preview/submit a silently truncated
+// buffer; creator words must also leave room for the machine-minted suffix.
+const CODE_LIMIT: usize = 48;
 
 /// Which side of the ceremony we're judging for. CREATE = the user is minting a
 /// code for someone else (pair creator / `send --code`); CLAIM = the user is
@@ -50,33 +54,16 @@ pub struct Judgment {
 /// toward the SPAKE2-normalized lower-case form (so what the user sees IS what
 /// gets hashed). Pure + total:
 ///   * lowercase,
-///   * map space (and any whitespace) -> '-',
+///   * map whitespace and every disallowed character -> '-',
 ///   * collapse runs of '-' to a single '-',
 ///   * strip leading '-',
-///   * KEEP only [a-z0-9-]; everything else is dropped (bad chars never enter).
+///   * KEEP only [a-z0-9-], without joining words across discarded punctuation.
 ///
 /// We intentionally do NOT strip a trailing '-' here, the user may be mid-type
 /// between words, and a visible trailing dash is correct feedback. `judge`
 /// tolerates it via the shared split.
 pub fn format_buffer(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut prev_dash = false;
-    for ch in raw.chars() {
-        let mapped = if ch.is_whitespace() { '-' } else { ch.to_ascii_lowercase() };
-        if mapped == '-' {
-            // collapse runs; drop a leading dash entirely
-            if prev_dash || out.is_empty() {
-                continue;
-            }
-            out.push('-');
-            prev_dash = true;
-        } else if mapped.is_ascii_lowercase() || mapped.is_ascii_digit() {
-            out.push(mapped);
-            prev_dash = false;
-        }
-        // anything else (punctuation, symbols, non-ascii) is simply not inserted
-    }
-    out
+    crate::join_input::PairingCode::format_partial(raw)
 }
 
 /// Is `s` a 3-5 ASCII-digit nameplate (the minted-code suffix shape)?
@@ -91,7 +78,15 @@ fn is_nameplate(s: &str) -> bool {
 /// CREATE preview, mint it ONCE per session (like the browser's autoNpRef) and
 /// pass it in, so the preview doesn't reshuffle on every keystroke.
 pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
-    let normalized = crate::pake::norm_code(buf);
+    if crate::join_input::invitation_material(buf) {
+        return Judgment { level: Level::Incomplete, steer: INVITATION_IN_CODE_ENTRY.to_string(), preview: None };
+    }
+    let canonical = crate::join_input::PairingCode::normalize(buf);
+    if canonical.len() > CODE_LIMIT {
+        return Judgment { level: Level::Incomplete,
+            steer: "Code limit: 48 characters; shorten it first.".to_string(), preview: None };
+    }
+    let normalized = crate::pake::norm_code(&canonical);
     let trimmed = normalized.trim_matches('-');
 
     // An INVITATION pasted into a code reader. The buffer filter drops the
@@ -178,6 +173,10 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
                     preview: None,
                 };
             }
+            if words.len() + 1 + auto_nameplate.len() > CODE_LIMIT {
+                return Judgment { level: Level::Incomplete,
+                    steer: "Shorten the words to leave room for the number.".to_string(), preview: None };
+            }
             Judgment {
                 level: Level::Ready,
                 steer: format!("✓ {words}, press enter to create"),
@@ -194,7 +193,7 @@ pub(crate) const INVITATION_IN_CODE_ENTRY: &str =
 
 /// Does the (normalized) buffer hold a pasted invitation? Pure.
 pub(crate) fn pasted_invitation(normalized: &str) -> bool {
-    normalized.starts_with("filament-invite")
+    normalized.starts_with("filament-invite") || normalized.starts_with("tlninv-")
 }
 
 /// In a CREATE entry, a buffer that is a complete received code (two or more
@@ -239,12 +238,46 @@ pub enum Outcome {
 /// never get wrong, a leaked raw mode wedges the user's shell.
 pub struct RawGuard {
     active: bool,
+    rows_below: u16,
+    inline: bool,
+    cursor_controls: bool,
 }
 
 impl RawGuard {
     pub fn enable() -> std::io::Result<RawGuard> {
         crossterm::terminal::enable_raw_mode()?;
-        Ok(RawGuard { active: true })
+        Ok(RawGuard { active: true, rows_below: 0, inline: false, cursor_controls: true })
+    }
+
+    fn enable_inline() -> std::io::Result<RawGuard> {
+        let mut guard = Self::enable()?;
+        if !ui::caps().live {
+            guard.cursor_controls = false;
+            return Ok(guard);
+        }
+        guard.inline = true;
+        let mut err = std::io::stderr();
+        crossterm::execute!(err, crossterm::event::EnableBracketedPaste,
+                           crossterm::cursor::SetCursorStyle::SteadyBar)?;
+        // OSC 12/112 set/reset the terminal caret color. Unsupported terminals
+        // ignore them. NO_COLOR and the CLI color setting must still win.
+        if ui::caps().color {
+            write!(err, "\x1b]12;#e6b450\x1b\\")?;
+            err.flush()?;
+        }
+        Ok(guard)
+    }
+
+    /// Raw mode without any terminal-control output. A `TERM=dumb` fallback
+    /// still needs echo suppressed before a secret is read, but it must never
+    /// emit cursor show/hide or alternate-screen noise. When stdin is not a
+    /// terminal there is no kernel echo to suppress, so this is a no-op guard.
+    pub(crate) fn enable_hidden() -> std::io::Result<RawGuard> {
+        let active = std::io::stdin().is_terminal();
+        if active {
+            crossterm::terminal::enable_raw_mode()?;
+        }
+        Ok(RawGuard { active, rows_below: 0, inline: false, cursor_controls: false })
     }
 }
 
@@ -256,46 +289,255 @@ impl Drop for RawGuard {
             // Move to a fresh line and show the cursor so the prompt that follows
             // starts clean.
             let mut err = std::io::stderr();
-            let _ = crossterm::execute!(err, crossterm::cursor::Show);
+            if self.inline {
+                let _ = crossterm::execute!(err, crossterm::terminal::EndSynchronizedUpdate,
+                                           crossterm::event::DisableBracketedPaste,
+                                           crossterm::cursor::SetCursorStyle::DefaultUserShape);
+                if ui::caps().color {
+                    let _ = write!(err, "\x1b]112\x1b\\");
+                }
+            }
+            if self.cursor_controls {
+                let _ = crossterm::execute!(err, crossterm::cursor::Show);
+            }
+            if self.rows_below > 0 {
+                let _ = crossterm::execute!(err, crossterm::cursor::MoveDown(self.rows_below));
+            }
             let _ = write!(err, "\r\n");
             let _ = err.flush();
         }
     }
 }
 
-/// The color for a level, from the design palette (nothing when color is off).
-fn level_color(level: Level) -> String {
-    ui::tone_code(match level {
-        Level::Empty => ui::Tone::Dim,
-        Level::Incomplete => ui::Tone::Warn,
-        Level::Ready => ui::Tone::Ok,
-    })
+/// Three reserved inline rows, never an alternate screen. Each row leaves the
+/// last terminal cell empty so automatic wrapping cannot move our anchor.
+fn cell_width(character: char) -> usize {
+    // Conservative for arbitrary device labels: non-ASCII may occupy two cells.
+    if character.is_ascii() || character == '✓' || character == '·' { 1 } else { 2 }
 }
 
-/// Render the entry on a SINGLE line, redrawn in place. We deliberately avoid
-/// save/restore-cursor (`\x1b[s`/`\x1b[u`) and newlines: some shells ignore SCO
-/// save/restore, which made the entry walk down a line per keystroke on those
-/// terminals. A single line cleared with CR + erase-line (`\r\x1b[2K`) redraws
-/// consistently on every terminal.
-fn render(prompt: &str, buf: &str, j: &Judgment) {
-    let mut err = std::io::stderr();
-    let reset = ui::tone_reset();
-    let color = level_color(j.level);
-    let preview = match &j.preview {
-        Some(p) => format!("  {}", ui::paint(ui::Tone::Dim, p)),
-        None => String::new(),
-    };
-    // Clear the whole line, then draw: prompt+buffer, a gap, the colored steer
-    // plus optional dim preview.
-    let _ = write!(err, "\r\x1b[2K{prompt}{buf}   {color}{}{reset}{preview}", j.steer);
-    // Put the caret back right after the typed buffer (browser-like), so typing
-    // continues at the end of the code rather than after the steer text.
-    let col = prompt.chars().count() + buf.chars().count();
-    let _ = write!(err, "\r");
-    if col > 0 {
-        let _ = write!(err, "\x1b[{col}C");
+fn clipped(text: &str, width: usize) -> String {
+    let mut cells = 0;
+    text.chars().filter(|c| !c.is_control()).take_while(|c| {
+        cells += cell_width(*c);
+        cells <= width
+    }).collect()
+}
+
+fn cells(text: &str) -> usize {
+    text.chars().map(cell_width).sum()
+}
+
+fn cells_before(text: &str, characters: usize) -> usize {
+    text.chars().take(characters).map(cell_width).sum()
+}
+
+fn entry_window(buf: &str, cursor: usize, width: usize) -> (&str, usize) {
+    let start = cursor.saturating_sub(width.saturating_sub(1));
+    let end = (start + width).min(buf.len());
+    (&buf[start..end], cursor - start)
+}
+
+/// Character-indexed window for the inline field. The code entry buffer is
+/// ASCII, but a file path may be Unicode; slicing it by byte would panic and a
+/// window measured in bytes could hide the caret. Display text passed here is
+/// already escaped to printable ASCII by `join_entry`, so chars are cells.
+fn field_window(text: &str, caret: usize, width: usize) -> (String, usize) {
+    let characters: Vec<char> = text.chars().collect();
+    let caret = caret.min(characters.len());
+    let start = caret.saturating_sub(width.saturating_sub(1));
+    let end = (start + width).min(characters.len());
+    (characters[start..end].iter().collect(), caret - start)
+}
+
+fn entry_hint(j: &Judgment, mode: Mode, width: usize) -> String {
+    match j.level {
+        Level::Empty if width < 60 => match mode {
+            Mode::Create => "Enter generates · Esc cancels".to_string(),
+            Mode::Claim => "Type words-number · Esc cancels".to_string(),
+        },
+        Level::Ready => match (&j.preview, mode) {
+            (Some(code), Mode::Create) => format!("Enter creates {code}"),
+            _ => "Enter accepts this code · Esc cancels".to_string(),
+        },
+        _ => j.steer.clone(),
     }
-    let _ = err.flush();
+}
+
+fn entry_judgment(buf: &str, mode: Mode, nameplate: &str, error: Option<&str>) -> Judgment {
+    match error {
+        Some(message) => Judgment { level: Level::Incomplete, steer: message.to_string(), preview: None },
+        None => judge(buf, mode, nameplate),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EntryFrame {
+    rows: [String; 3],
+    caret: usize,
+}
+
+impl EntryFrame {
+    fn new(prompt: &str, buf: &str, cursor: usize, j: &Judgment, mode: Mode, width: usize) -> Self {
+        let (visible, caret) = entry_window(buf, cursor, width.saturating_sub(2).max(1));
+        Self::from_parts(prompt, visible, caret, &entry_hint(j, mode, width), width)
+    }
+
+    /// Build a frame from an already-displayed field row. `caret` counts
+    /// CHARACTERS, not bytes, so a Unicode (escaped) path cannot split or
+    /// misplace the native caret.
+    fn from_parts(prompt: &str, visible: &str, caret: usize, hint: &str, width: usize) -> Self {
+        Self {
+            rows: [clipped(prompt.trim_end(), width), clipped(&format!("  {visible}"), width),
+                   clipped(&format!("  {hint}"), width)],
+            caret: (2 + cells_before(visible, caret)).min(width.saturating_sub(1)),
+        }
+    }
+}
+
+fn move_entry_cursor(output: &mut String, position: &mut (usize, usize), row: usize, column: usize) {
+    if position.0 != row {
+        let (count, direction) = if position.0 > row { (position.0 - row, 'A') } else { (row - position.0, 'B') };
+        output.push_str(&format!("\x1b[{count}{direction}"));
+    }
+    if position.1 != column { output.push_str(&format!("\x1b[{}G", column + 1)); }
+    *position = (row, column);
+}
+
+/// Paint only changed suffixes, never blank-and-retype an unchanged row. The
+/// native caret is the input indicator; a second yellow `|` served no purpose.
+fn entry_delta(previous: Option<&EntryFrame>, next: &EntryFrame, dim: &str, reset: &str) -> String {
+    let mut output = String::new();
+    let mut position = (1, previous.map_or(0, |frame| frame.caret));
+    for row in 0..3 {
+        let old = previous.map(|frame| frame.rows[row].as_str());
+        let new = &next.rows[row];
+        if old == Some(new.as_str()) { continue; }
+        let prefix = old.map_or(0, |text| text.chars().zip(new.chars())
+            .take_while(|(left, right)| left == right).map(|(character, _)| character.len_utf8()).sum());
+        move_entry_cursor(&mut output, &mut position, row, cells(&new[..prefix]));
+        if old.is_none() { output.push_str("\x1b[2K"); } // once, on reservation only
+        if prefix < new.len() {
+            if row != 1 { output.push_str(dim); }
+            output.push_str(&new[prefix..]);
+            if row != 1 { output.push_str(reset); }
+        }
+        position.1 = cells(new);
+        if old.is_some_and(|text| cells(text) > cells(new)) { output.push_str("\x1b[K"); }
+    }
+    move_entry_cursor(&mut output, &mut position, 1, next.caret);
+    output
+}
+
+/// One buffered write per update; supported terminals present it atomically.
+/// Others still benefit from suffix-only edits with no intervening blank rows.
+fn write_paint(output: &mut impl Write, body: &[u8]) -> std::io::Result<()> {
+    if body.is_empty() { return Ok(()); }
+    let mut frame = Vec::with_capacity(body.len() + 32);
+    crossterm::queue!(frame, crossterm::terminal::BeginSynchronizedUpdate)?;
+    frame.extend_from_slice(body);
+    crossterm::queue!(frame, crossterm::terminal::EndSynchronizedUpdate)?;
+    output.write_all(&frame)?;
+    output.flush()
+}
+
+#[derive(Default)]
+struct EntryPainter {
+    previous: Option<EntryFrame>,
+}
+
+impl EntryPainter {
+    fn draw(&mut self, prompt: &str, buf: &str, cursor: usize, j: &Judgment, mode: Mode) -> std::io::Result<()> {
+        if !ui::caps().live { return Ok(()); }
+        let width = usize::from(crossterm::terminal::size()?.0).saturating_sub(1);
+        let next = EntryFrame::new(prompt, buf, cursor, j, mode, width);
+        let body = entry_delta(self.previous.as_ref(), &next, &ui::tone_code(ui::Tone::Dim), ui::tone_reset());
+        write_paint(&mut std::io::stderr(), body.as_bytes())?;
+        self.previous = Some(next);
+        Ok(())
+    }
+}
+
+/// A small inline field for other credential prompts (`join`). It OWNS the
+/// `RawGuard` and the shared `EntryPainter`, so the caller cannot forget to
+/// restore the terminal and cannot grow a second renderer. The caller only
+/// supplies three plain rows: prompt, already-safe display text, and hint.
+/// `caret` counts characters in the display text.
+///
+/// The display text must be printable ASCII with no control characters. A
+/// masked secret is `*`; non-ASCII input is escaped by the caller, which keeps
+/// the native caret and width arithmetic exact.
+pub(crate) struct InlineField {
+    _guard: RawGuard,
+    painter: EntryPainter,
+    live: bool,
+}
+
+impl InlineField {
+    /// Enable the editor. In a live terminal this reserves three rows and
+    /// enables bracketed paste + a steady native caret; on `TERM=dumb` it only
+    /// suppresses kernel echo, emitting no cursor controls at all.
+    pub(crate) fn open() -> std::io::Result<InlineField> {
+        if !ui::caps().live || !std::io::stdin().is_terminal() {
+            return Ok(InlineField {
+                _guard: RawGuard::enable_hidden()?,
+                painter: EntryPainter::default(),
+                live: false,
+            });
+        }
+        let mut guard = RawGuard::enable_inline()?;
+        // Reserve the three rows before the first paint, even at the bottom of
+        // a terminal. Cleanup leaves the shell below them, not inside a row.
+        write!(std::io::stderr(), "\r\n\r\n\x1b[1A")?;
+        std::io::stderr().flush()?;
+        guard.rows_below = 1;
+        Ok(InlineField { _guard: guard, painter: EntryPainter::default(), live: true })
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.live
+    }
+
+    /// Paint through the shared suffix-only painter. With no changed rows this
+    /// writes nothing (not even an empty synchronized-update pair).
+    pub(crate) fn draw(
+        &mut self,
+        prompt: &str,
+        display: &str,
+        caret: usize,
+        hint: &str,
+    ) -> std::io::Result<()> {
+        if !self.live { return Ok(()); }
+        let width = usize::from(crossterm::terminal::size()?.0).saturating_sub(1);
+        let (visible, caret) = field_window(display, caret, width.saturating_sub(2).max(1));
+        let next = EntryFrame::from_parts(prompt, &visible, caret, hint, width);
+        let body = entry_delta(self.painter.previous.as_ref(), &next, &ui::tone_code(ui::Tone::Dim), ui::tone_reset());
+        write_paint(&mut std::io::stderr(), body.as_bytes())?;
+        self.painter.previous = Some(next);
+        Ok(())
+    }
+
+    /// Reflow invalidates relative row counts. Keep the old snapshot in
+    /// scrollback and start a fresh field at the new bottom; the next draw
+    /// rebuilds the three owned rows.
+    pub(crate) fn resized(&mut self, rows: u16) -> std::io::Result<()> {
+        if !self.live { return Ok(()); }
+        after_resize(rows)?;
+        write!(std::io::stderr(), "\r\n\r\n\x1b[1A")?;
+        std::io::stderr().flush()?;
+        self.painter.previous = None;
+        Ok(())
+    }
+}
+
+/// Reflow invalidates relative row counts. Preserve the old snapshot and start
+/// below it at the terminal bottom; never erase or rewind into unknown history.
+/// Only resizing does this. Normal keystrokes repaint the same owned rows.
+fn after_resize(rows: u16) -> std::io::Result<()> {
+    let mut err = std::io::stderr();
+    crossterm::execute!(err, crossterm::cursor::MoveTo(0, rows.saturating_sub(1)))?;
+    write!(err, "\r\n")?;
+    err.flush()
 }
 
 /// Redraw the picker list in place: a header plus one line per item, the selected
@@ -323,35 +565,37 @@ fn viewport_window(sel: usize, len: usize, max: usize) -> (usize, usize, usize, 
 /// How many list rows a picker shows at once before it starts scrolling.
 const VIEWPORT: usize = 7;
 
-fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints: &[(char, &str)]) {
-    let mut err = std::io::stderr();
+fn render_picker(header: &str, items: &[String], sel: usize, previous_rows: usize, hints: &[(char, &str)]) -> std::io::Result<usize> {
+    let mut frame = Vec::new();
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    let width = usize::from(width).saturating_sub(1);
+    let max_rows = usize::from(height).saturating_sub(6).clamp(1, VIEWPORT);
     // Header + items + (a hint line, when there are hints). The cursor rewind
     // must count exactly what was drawn or the redraw walks up the scrollback.
     // A viewport, so a long list does not scroll the terminal away. The window
     // follows the selection and the counts below say how much is out of sight:
     // a list that silently truncates is worse than one that admits its length.
-    let (first, view, above, below) = viewport_window(sel, items.len(), VIEWPORT);
+    let (first, view, above, below) = viewport_window(sel, items.len(), max_rows);
     let drawn =
         view + 1 + usize::from(above > 0) + usize::from(below > 0) + usize::from(!hints.is_empty());
-    if redraw {
-        let _ = write!(err, "\x1b[{drawn}A");
+    if previous_rows > 0 {
+        write!(frame, "\x1b[{previous_rows}A")?;
     }
-    let _ = write!(err, "\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header));
+    write!(frame, "\r\x1b[2K{}\r\n", ui::paint(ui::Tone::Dim, &clipped(header, width)))?;
     let dim = ui::tone_code(ui::Tone::Dim);
     let reset0 = ui::tone_reset();
     if above > 0 {
-        let _ = write!(err, "\r\x1b[2K  {dim}\u{2191} {above} more{reset0}\r\n");
+        let line = clipped(&format!("  ↑ {above} more"), width);
+        write!(frame, "\r\x1b[2K{dim}{line}{reset0}\r\n")?;
     }
     for (i, it) in items.iter().enumerate().skip(first).take(view) {
-        let (mark, c, r) = if i == sel {
-            ("\u{276f}", ui::tone_code(ui::Tone::Brand), ui::tone_reset())
-        } else {
-            (" ", String::new(), "")
-        };
-        let _ = write!(err, "\r\x1b[2K  {c}{mark} {it}{r}\r\n");
+        let mark = if i == sel { ui::cursor_accent("|") } else { " ".to_string() };
+        let it = clipped(it, width.saturating_sub(4));
+        write!(frame, "\r\x1b[2K  {mark} {it}\r\n")?;
     }
     if below > 0 {
-        let _ = write!(err, "\r\x1b[2K  {dim}\u{2193} {below} more{reset0}\r\n");
+        let line = clipped(&format!("  ↓ {below} more"), width);
+        write!(frame, "\r\x1b[2K{dim}{line}{reset0}\r\n")?;
     }
     // The ambient hint line. Always-visible keybindings beat a menu ITEM for the
     // same job: an item consumes a slot, sits in the arrow-key path, and reads as
@@ -364,9 +608,16 @@ fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints
             line.push_str(&format!(" \u{b7} {k} {label}"));
         }
         line.push_str(" \u{b7} esc cancel");
-        let _ = write!(err, "\r\x1b[2K{dim}{line}{reset}\r\n");
+        let line = clipped(&line, width);
+        write!(frame, "\r\x1b[2K{dim}{line}{reset}\r\n")?;
     }
-    let _ = err.flush();
+    // Viewport counts can add/remove rows as the selection moves. Rewind the
+    // previous frame's height, not the new height; erase stale trailing rows.
+    let stale = previous_rows.saturating_sub(drawn);
+    for _ in 0..stale { write!(frame, "\r\x1b[2K\r\n")?; }
+    if stale > 0 { write!(frame, "\x1b[{stale}A")?; }
+    write_paint(&mut std::io::stderr(), &frame)?;
+    Ok(drawn)
 }
 
 /// Interactive picker: Up/Down (or k/j) to move, Enter to choose, Esc/q/Ctrl-C to
@@ -410,13 +661,20 @@ pub fn pick_with_keys(
     if items.is_empty() {
         return Ok(Picked::Cancelled);
     }
-    let _guard = RawGuard::enable()?;
+    if !ui::caps().live {
+        return pick_plain(header, items, hints);
+    }
+    let _guard = RawGuard::enable_inline()?;
     let mut sel = 0usize;
-    let mut redraw = false;
+    let mut previous_rows = 0;
     loop {
-        render_picker(header, items, sel, redraw, hints);
-        redraw = true;
+        previous_rows = render_picker(header, items, sel, previous_rows, hints)?;
         let ev = event::read()?;
+        if let Event::Resize(_, rows) = ev {
+            after_resize(rows)?;
+            previous_rows = 0;
+            continue;
+        }
         let Event::Key(k) = ev else { continue };
         if k.kind == KeyEventKind::Release {
             continue;
@@ -440,6 +698,33 @@ pub fn pick_with_keys(
     }
 }
 
+/// Real line-oriented fallback: print the menu once, then read explicit lines.
+/// Never emit a cursor command, including during cleanup.
+fn pick_plain(header: &str, items: &[String], hints: &[(char, &str)]) -> std::io::Result<Picked> {
+    let mut err = std::io::stderr();
+    writeln!(err, "{}", clipped(header, usize::MAX))?;
+    for (index, item) in items.iter().enumerate() {
+        writeln!(err, "  {}. {}", index + 1, clipped(item, usize::MAX))?;
+    }
+    for (key, label) in hints { writeln!(err, "  {key}: {}", clipped(label, usize::MAX))?; }
+    loop {
+        write!(err, "Choose a number (Enter = 1, q = cancel): ")?;
+        err.flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 { return Ok(Picked::Cancelled); }
+        let answer = line.trim();
+        if matches!(answer, "q" | "\u{1b}") { return Ok(Picked::Cancelled); }
+        if answer.is_empty() { return Ok(Picked::Item(0)); }
+        if answer.len() == 1 && hints.iter().any(|(key, _)| answer.starts_with(*key)) {
+            return Ok(Picked::Key(answer.chars().next().unwrap()));
+        }
+        if let Ok(index) = answer.parse::<usize>() {
+            if (1..=items.len()).contains(&index) { return Ok(Picked::Item(index - 1)); }
+        }
+        writeln!(err, "Choose 1 through {}.", items.len())?;
+    }
+}
+
 /// Drive the live, steered entry. Returns the user's outcome. The terminal is
 /// ALWAYS restored before returning (RawGuard). `prefill` seeds the buffer (used
 /// for the malformed-arg "fix it" path). Pass the SAME `auto_nameplate` you'll
@@ -447,17 +732,47 @@ pub fn pick_with_keys(
 pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std::io::Result<Outcome> {
     use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-    let _guard = RawGuard::enable()?;
+    let mut guard = RawGuard::enable_inline()?;
+    let mut painter = EntryPainter::default();
 
-    let mut buf = format_buffer(prefill);
-    // Initial paint.
-    {
-        let j = judge(&buf, mode, auto_nameplate);
-        render(prompt, &buf, &j);
+    let mut buf = String::new();
+    let mut cursor = 0;
+    let mut entry_error = insert_text(&mut buf, &mut cursor, prefill).err();
+    // Reserve our three rows before the first draw, even at the bottom of a
+    // terminal. Cleanup leaves the shell below them, not inside the hint row.
+    if ui::caps().live {
+        write!(std::io::stderr(), "\r\n\r\n\x1b[1A")?;
+        guard.rows_below = 1;
+    } else {
+        // Raw mode disables echo before this prompt: an invite accidentally
+        // pasted into this code-only reader must not leak through kernel echo.
+        write!(std::io::stderr(), "{prompt}\r\n  Input hidden; Enter submits, Ctrl-U clears, Esc cancels.\r\n")?;
+        if mode == Mode::Create {
+            write!(std::io::stderr(), "  Type two words, or Enter generates a pair.\r\n")?;
+        }
+        std::io::stderr().flush()?;
     }
+    // Initial paint.
+    painter.draw(prompt, &buf, cursor, &entry_judgment(&buf, mode, auto_nameplate, entry_error), mode)?;
 
     loop {
         let ev = event::read()?;
+        if let Event::Paste(text) = &ev {
+            if entry_error != Some(INVITATION_IN_CODE_ENTRY) {
+                entry_error = insert_text(&mut buf, &mut cursor, text).err();
+            }
+            let j = entry_judgment(&buf, mode, auto_nameplate, entry_error);
+            painter.draw(prompt, &buf, cursor, &j, mode)?;
+            continue; // Pasted Enter/Esc/control bytes are never key events.
+        }
+        if let Event::Resize(_, rows) = ev {
+            if !ui::caps().live { continue; }
+            after_resize(rows)?;
+            write!(std::io::stderr(), "\r\n\r\n\x1b[1A")?;
+            painter.previous = None;
+            painter.draw(prompt, &buf, cursor, &entry_judgment(&buf, mode, auto_nameplate, entry_error), mode)?;
+            continue;
+        }
         let Event::Key(KeyEvent { code, modifiers, kind, .. }) = ev else { continue };
         // Only react to presses (Windows sends Release/Repeat too).
         if kind == KeyEventKind::Release {
@@ -479,12 +794,12 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
             }
             KeyCode::Esc => return Ok(Outcome::Cancelled),
             KeyCode::Enter => {
-                let j = judge(&buf, mode, auto_nameplate);
+                let j = entry_judgment(&buf, mode, auto_nameplate, entry_error);
                 match j.level {
                     Level::Ready => {
                         if mode == Mode::Create {
                             if let Some(code) =
-                                received_code_in_create(&crate::pake::norm_code(&buf))
+                                received_code_in_create(&crate::join_input::PairingCode::normalize(&buf))
                             {
                                 return Ok(Outcome::Claim(code));
                             }
@@ -494,36 +809,76 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
                             // the caller mints the nameplate.
                             Mode::Create => {
                                 let (words, _np) = crate::pake::split_chosen_code(
-                                    &crate::pake::norm_code(&buf),
+                                    &crate::join_input::PairingCode::normalize(&buf),
                                 );
                                 words
                             }
                             // CLAIM submits the normalized full code.
-                            Mode::Claim => crate::pake::norm_code(&buf),
+                            Mode::Claim => crate::join_input::PairingCode::normalize(&buf),
                         };
                         return Ok(Outcome::Submitted(result));
                     }
                     Level::Empty => return Ok(Outcome::Empty),
                     // Incomplete: refuse to submit, keep steering (REPL-like).
-                    Level::Incomplete => { /* fall through, redraw */ }
+                    Level::Incomplete => {
+                        if !ui::caps().live {
+                            write!(std::io::stderr(), "\r\n{}\r\n", j.steer)?;
+                            std::io::stderr().flush()?;
+                        }
+                    }
                 }
             }
             KeyCode::Backspace => {
-                buf.pop();
-                buf = format_buffer(&buf);
+                if cursor > 0 { cursor -= 1; buf.remove(cursor); }
+                if buf.is_empty() || entry_error != Some(INVITATION_IN_CODE_ENTRY) { entry_error = None; }
             }
-            KeyCode::Char(c) => {
-                // Run the new char through the filter by appending then
-                // re-formatting; bad chars are simply not inserted.
-                let mut candidate = buf.clone();
-                candidate.push(c);
-                buf = format_buffer(&candidate);
+            KeyCode::Delete => {
+                if cursor < buf.len() { buf.remove(cursor); }
+                if buf.is_empty() || entry_error != Some(INVITATION_IN_CODE_ENTRY) { entry_error = None; }
+            }
+            KeyCode::Left => cursor = cursor.saturating_sub(1),
+            KeyCode::Right => cursor = (cursor + 1).min(buf.len()),
+            KeyCode::Home => cursor = 0,
+            KeyCode::End => cursor = buf.len(),
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                buf.clear(); cursor = 0; entry_error = None;
+            }
+            KeyCode::Char(c) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                if entry_error != Some(INVITATION_IN_CODE_ENTRY) {
+                    entry_error = insert_text(&mut buf, &mut cursor, &c.to_string()).err();
+                }
             }
             _ => {}
         }
-        let j = judge(&buf, mode, auto_nameplate);
-        render(prompt, &buf, &j);
+        let j = entry_judgment(&buf, mode, auto_nameplate, entry_error);
+        painter.draw(prompt, &buf, cursor, &j, mode)?;
     }
+}
+
+/// Codes are short ASCII, not a transport for invitation material. Reject an
+/// entire oversized/secret paste instead of displaying it or accepting a prefix.
+fn insert_text(buf: &mut String, cursor: &mut usize, text: &str) -> Result<(), &'static str> {
+    if text.len() > 4096 {
+        return Err("Too long; nothing inserted (48-character code limit).");
+    }
+    if crate::join_input::invitation_material(text)
+        || crate::join_input::invitation_material(&format!("{}{}", &buf[..*cursor], text)) {
+        return Err(INVITATION_IN_CODE_ENTRY);
+    }
+    if crate::join_input::reserved_code_path(&format!("{}{}", &buf[..*cursor], text)) {
+        return Err("That is a file path or URL, not a code; use `tunlion join` with an invitation file.");
+    }
+    let left = format_buffer(&format!("{}{}", &buf[..*cursor], text));
+    let candidate = format_buffer(&format!("{}{}", left, &buf[*cursor..]));
+    if candidate.trim_end_matches('-').len() > CODE_LIMIT {
+        return Err("Too long; nothing inserted (48-character code limit).");
+    }
+    if pasted_invitation(&candidate) {
+        return Err(INVITATION_IN_CODE_ENTRY);
+    }
+    *cursor = left.len().min(candidate.len());
+    *buf = candidate;
+    Ok(())
 }
 
 // -------------------------------------------------------------------- tests --
@@ -532,10 +887,202 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
 mod tests {
     use super::*;
 
+    fn quiet_frame(text: &str, caret: usize) -> EntryFrame {
+        EntryFrame { rows: ["  add / choose words".into(), format!("  {text}"),
+            "  add another word".into()], caret: 2 + caret }
+    }
+
+    #[test]
+    fn typing_appends_only_the_new_character_without_erasing_or_repainting() {
+        let old = quiet_frame("kgkg", 4);
+        let new = quiet_frame("kgkgk", 5);
+        assert_eq!(entry_delta(Some(&old), &new, "DIM", "RESET"), "k");
+        assert_eq!(entry_delta(Some(&new), &new, "DIM", "RESET"), "");
+    }
+
+    #[test]
+    fn cursor_navigation_paints_no_text_and_backspace_only_erases_the_old_tail() {
+        let old = quiet_frame("abc", 3);
+        assert_eq!(entry_delta(Some(&old), &quiet_frame("abc", 2), "", ""), "\x1b[5G");
+        assert_eq!(entry_delta(Some(&old), &quiet_frame("ab", 2), "", ""), "\x1b[5G\x1b[K");
+    }
+
+    #[test]
+    fn changed_hints_leave_header_and_input_untouched() {
+        let old = quiet_frame("kg", 2);
+        let mut new = old.clone();
+        new.rows[2] = "  add another word, easier to say".into();
+        let delta = entry_delta(Some(&old), &new, "DIM", "RESET");
+        assert!(delta.contains(", easier to say"));
+        assert!(!delta.contains("choose words"));
+        assert!(!delta.contains("kg"));
+        assert!(!delta.contains("\x1b[2K"));
+    }
+
+    #[test]
+    fn only_the_initial_reservation_clears_rows_and_no_fake_input_marker_is_drawn() {
+        let frame = quiet_frame("abalaka-world", 13);
+        let first = entry_delta(None, &frame, "", "");
+        assert_eq!(first.matches("\x1b[2K").count(), 3);
+        assert!(!first.contains('|'));
+        let next = entry_delta(Some(&frame), &quiet_frame("abalaka-worldx", 14), "", "");
+        assert_eq!(next, "x");
+    }
+
+    #[test]
+    fn paint_is_one_synchronized_buffered_write_and_noops_write_nothing() {
+        #[derive(Default)]
+        struct Output { bytes: Vec<u8>, writes: usize, flushes: usize }
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1; self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.flushes += 1; Ok(()) }
+        }
+        let mut output = Output::default();
+        write_paint(&mut output, b"k").unwrap();
+        assert_eq!(output.bytes, b"\x1b[?2026hk\x1b[?2026l");
+        assert_eq!((output.writes, output.flushes), (1, 1));
+        write_paint(&mut output, b"").unwrap();
+        assert_eq!((output.writes, output.flushes), (1, 1));
+    }
+
+    // PTY drivers exercise this very event loop, not a replica or a production
+    // test flag. See runner/pairing-inline-pty.py for submit/cancel/cleanup.
+    #[test]
+    #[ignore = "requires a PTY; run runner/pairing-inline-pty.py"]
+    fn pty_entry_driver() {
+        let outcome = run("  add / choose words", Mode::Create, "", "1740").unwrap();
+        println!("ENTRY:{outcome:?}");
+    }
+
+    #[test]
+    #[ignore = "requires a PTY; run runner/pairing-inline-pty.py"]
+    fn pty_picker_driver() {
+        let items = (0..12).map(|i| format!("Device {i} — a long label that should not wrap across terminal rows")).collect::<Vec<_>>();
+        println!("PICK:{:?}", pick("tunlion / Devices", &items).unwrap());
+    }
+
+    #[test]
+    fn entry_window_keeps_editing_caret_visible() {
+        assert_eq!(entry_window("abalaka-world", 13, 8), ("a-world", 7));
+        assert_eq!(entry_window("abalaka-world", 0, 8), ("abalaka-", 0));
+        for width in 1..80 {
+            for cursor in 0..=13 {
+                let (shown, col) = entry_window("abalaka-world", cursor, width);
+                assert!(shown.len() <= width);
+                assert!(col < width);
+            }
+        }
+    }
+
+    #[test]
+    fn hints_distinguish_create_claim_and_preview_once() {
+        assert!(entry_hint(&judge("", Mode::Create, "1740"), Mode::Create, 39).contains("generates"));
+        assert!(!entry_hint(&judge("", Mode::Claim, ""), Mode::Claim, 39).contains("generates"));
+        let hint = entry_hint(&judge("abalaka-world", Mode::Create, "1740"), Mode::Create, 95);
+        assert_eq!(hint, "Enter creates abalaka-world-1740");
+        assert_eq!(hint.matches("abalaka-world").count(), 1);
+        assert!(entry_hint(&judge("brave-otter-3141", Mode::Claim, ""), Mode::Claim, 39).contains("accepts"));
+    }
+
+    #[test]
+    fn rejected_input_blocks_submission_even_with_a_ready_or_empty_buffer() {
+        for buf in ["", "abalaka-world"] {
+            let j = entry_judgment(buf, Mode::Create, "1740", Some(INVITATION_IN_CODE_ENTRY));
+            assert_eq!(j.level, Level::Incomplete);
+            assert!(j.preview.is_none());
+            assert_eq!(j.steer, INVITATION_IN_CODE_ENTRY);
+        }
+    }
+
+    #[test]
+    fn protocol_limit_includes_the_minted_nameplate() {
+        let words = "abalaka-world-abalaka-world-brave-otterxxxx";
+        assert_eq!(words.len() + "-1740".len(), CODE_LIMIT);
+        assert_eq!(judge(words, Mode::Create, "1740").level, Level::Ready);
+        let longer = format!("{words}x");
+        assert_eq!(judge(&longer, Mode::Create, "1740").level, Level::Incomplete);
+        let code = format!("{words}-1740");
+        assert_eq!(judge(&code, Mode::Claim, "").level, Level::Ready);
+        assert_eq!(judge(&format!("{code}1"), Mode::Claim, "").level, Level::Incomplete);
+        let mut buf = code.clone();
+        let mut cursor = buf.len();
+        assert!(insert_text(&mut buf, &mut cursor, "1").is_err());
+        assert_eq!(buf, code);
+    }
+
+    #[test]
+    fn clipping_never_emits_control_bytes_or_wraps() {
+        for width in 0..80 {
+            let line = clipped("  hello\x1b[2J\r\n世界✓ · long words", width);
+            assert!(line.chars().count() <= width);
+            assert!(!line.chars().any(char::is_control));
+        }
+    }
+
+    #[test]
+    fn paste_is_only_insertion_and_middle_editing_preserves_suffix() {
+        let mut buf = "brave-3141".to_string();
+        let mut cursor = 6;
+        insert_text(&mut buf, &mut cursor, "otter ").unwrap();
+        assert_eq!(buf, "brave-otter-3141");
+        assert_eq!(cursor, 12);
+        let mut buf = String::new();
+        let mut cursor = 0;
+        insert_text(&mut buf, &mut cursor, "brave\notter\r3141\x03\x1b").unwrap();
+        assert_eq!(buf, "brave-otter-3141-");
+        // Submission is exclusively in Event::Key(Enter), never insert_text.
+        assert_eq!(cursor, buf.len());
+    }
+
+    #[test]
+    fn secret_and_oversized_pastes_leave_buffer_and_cursor_unchanged() {
+        for text in ["filament-invite:v2:SECRET".to_string(),
+                     "TLNINV-SECRET".to_string(), "{\"secret\":true}".to_string(),
+                     "a".repeat(257), "x".repeat(4097)] {
+            let mut buf = "brave-otter".to_string();
+            let mut cursor = 5;
+            assert!(insert_text(&mut buf, &mut cursor, &text).is_err());
+            assert_eq!(buf, "brave-otter");
+            assert_eq!(cursor, 5);
+        }
+    }
+
+    #[test]
+    fn typing_an_invitation_prefix_cannot_reveal_payload() {
+        let mut buf = String::new();
+        let mut cursor = 0;
+        let mut refused = false;
+        for ch in "filament-invite:v2:SECRET".chars() {
+            if insert_text(&mut buf, &mut cursor, &ch.to_string()).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused);
+        assert!(!buf.contains("secret"));
+    }
+
     #[test]
     fn format_lowercases_and_keeps_valid() {
         assert_eq!(format_buffer("Brave-Otter-3141"), "brave-otter-3141");
         assert_eq!(format_buffer("ABC123"), "abc123");
+    }
+
+    #[test]
+    fn final_limit_ignores_the_editors_trailing_separator_without_guessing_material() {
+        let code = format!("{}-{}-1234", "a".repeat(20), "b".repeat(22));
+        let mut buf = code.clone();
+        let mut cursor = buf.len();
+        insert_text(&mut buf, &mut cursor, " ").unwrap();
+        assert_eq!(buf, format!("{code}-"));
+        assert_eq!(judge(&buf, Mode::Claim, "").level, Level::Ready);
+        for raw in ["`[\"brave-otter-3141\"]`", "'TLNINV-brave-otter-3141'"] {
+            let result = judge(raw, Mode::Claim, "");
+            assert_eq!(result.level, Level::Incomplete);
+            assert!(result.preview.is_none());
+        }
     }
 
     #[test]
@@ -554,12 +1101,12 @@ mod tests {
     }
 
     #[test]
-    fn format_rejects_bad_chars_entirely() {
+    fn format_turns_disallowed_characters_into_separators() {
         // '!', '@', '/', emoji etc. never enter the buffer.
-        assert_eq!(format_buffer("brave!otter"), "braveotter");
-        assert_eq!(format_buffer("a@b/c"), "abc");
-        assert_eq!(format_buffer("café"), "caf"); // non-ascii 'é' dropped
-        assert_eq!(format_buffer("UP!!!"), "up");
+        assert_eq!(format_buffer("brave!otter"), "brave-otter");
+        assert_eq!(format_buffer("a@b/c"), "a-b-c");
+        assert_eq!(format_buffer("café"), "caf-");
+        assert_eq!(format_buffer("UP!!!"), "up-");
     }
 
     #[test]

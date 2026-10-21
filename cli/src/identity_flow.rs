@@ -750,61 +750,7 @@ pub(crate) fn join_refusal_already_joined() -> String {
     )
 }
 
-/// What the person handed `join`: the one accept entry takes a code, an
-/// invitation, or the path to an invitation file, and works out which.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum JoinInput {
-    /// A pairing code (normalized): the code ceremony, as `join <code>`.
-    Code(String),
-    /// A path to an invitation file.
-    File(PathBuf),
-    /// Invitation material itself (pasted).
-    Invitation(String),
-    /// A one-time TRANSFER code: that is `receive`, not `join`.
-    TransferCode(String),
-    /// None of those.
-    Unknown,
-}
-
-/// Classify what was typed or pasted at the accept prompt. Pure: the file
-/// test is injected. Order matters: an invitation is recognized by its
-/// prefix before anything normalizes it, and a path that exists wins over a
-/// code-shaped name, the same rule `join <arg>` applies.
-pub(crate) fn classify_join_input(raw: &str, is_file: &dyn Fn(&str) -> bool) -> JoinInput {
-    let t = raw.trim();
-    if t.is_empty() {
-        return JoinInput::Unknown;
-    }
-    if t.starts_with(crate::file_io::INVITE_PREFIX) {
-        return JoinInput::Invitation(t.to_string());
-    }
-    if is_file(t) {
-        return JoinInput::File(PathBuf::from(t));
-    }
-    let code = crate::pake::norm_code(t);
-    let code = code.trim_matches('-');
-    if crate::token_is_pairing_code(code) {
-        return JoinInput::Code(code.to_string());
-    }
-    if crate::regex_lite_code(code) {
-        return JoinInput::TransferCode(code.to_string());
-    }
-    JoinInput::Unknown
-}
-
-/// `join <arg>` where <arg> names a file that is not there: the refusal, or
-/// None when <arg> may be a code (or a file was also given another way). A
-/// code is letters, digits and dashes, so anything with a path separator or a
-/// dot is a file name, never a code. Pure.
-pub(crate) fn join_missing_file_msg(arg: &str, other_source: bool) -> Option<String> {
-    let looks_like_path = arg.contains('/') || arg.contains('\\') || arg.contains('.');
-    if other_source || !looks_like_path || std::path::Path::new(arg).exists() {
-        return None;
-    }
-    Some(format!(
-        "no invitation file at '{arg}'. Check the path, or copy the file here first; a pairing code looks like brave-otter-3141"
-    ))
-}
+pub(crate) use crate::join_input::{classify_join_input, JoinInput};
 
 /// The refusal for an accept input that is none of the things `join` takes.
 pub(crate) fn join_input_not_recognized() -> String {
@@ -815,29 +761,21 @@ pub(crate) fn join_input_not_recognized() -> String {
 }
 
 /// The refusal for a transfer code given to `join`.
-pub(crate) fn join_transfer_code_msg(code: &str) -> String {
-    format!(
-        "'{code}' is a one-time transfer code (from `tunlion send`), not a pairing code. To receive the transfer:  tunlion receive {code}"
-    )
+pub(crate) fn join_transfer_code_msg(_code: &str) -> String {
+    "that is a one-time transfer code (from `tunlion send`), not a pairing code. Use `tunlion receive` with the original transfer code.".to_string()
 }
 
-/// The one accept prompt at a terminal. Invitation material may be pasted, so
-/// it is read on the alternate screen and cleared from the terminal after.
+/// The one accept prompt. The inline reader masks credential material before
+/// painting and returns only after Enter; parsing/authority/file IO stay here.
 fn prompt_accept_input() -> Result<Zeroizing<String>> {
-    use crossterm::{execute, terminal};
-    let mut err = std::io::stderr();
-    execute!(
-        err,
-        terminal::EnterAlternateScreen,
-        terminal::Clear(terminal::ClearType::All)
-    )?;
-    eprintln!(
-        "  Type the pairing code you were given, or paste the invitation, or give the path to\n  \
-         the invitation file. A pasted invitation is cleared from this terminal after reading."
-    );
-    let result = prompt_line("\n  code or invitation: ");
-    let _ = execute!(err, terminal::LeaveAlternateScreen);
-    Ok(Zeroizing::new(result?))
+    match crate::join_entry::read_input()? {
+        crate::join_entry::InputOutcome::Submitted(value) => Ok(value),
+        crate::join_entry::InputOutcome::Cancelled => Err(crate::policy::cancelled()),
+        // The reader's RAII guard has already restored the terminal here.
+        crate::join_entry::InputOutcome::Interrupted => {
+            crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+        }
+    }
 }
 
 /// `join` with nothing on the command line, at a terminal: ask once, then run
@@ -855,18 +793,22 @@ pub(crate) async fn join_guided(
         JoinInput::Code(code) => {
             ui::say(&ui::paint(
                 ui::Tone::Dim,
-                &format!("  that is a pairing code; accepting it as  tunlion join {code}"),
+                "  that is a pairing code; connecting",
             ));
-            crate::pair_cmd::pair_cmd(server, Some(code), name, None, relay, false, Vec::new(), None, false)
+            crate::pair_cmd::pair_cmd(server, Some(code.into_string()), name, None, relay, false, Vec::new(), None, false)
                 .await
         }
-        JoinInput::File(path) => join_cmd(caps, server, relay, Some(path), None, name, to, None).await,
+        JoinInput::File(path) => join_cmd(caps, server, relay, Some(path.into_path()), None, name, to, None).await,
         JoinInput::Invitation(material) => {
-            join_cmd(caps, server, relay, None, None, name, to, Some(Zeroizing::new(material))).await
+            join_cmd(caps, server, relay, None, None, name, to, Some(material.into_secret())).await
         }
-        JoinInput::TransferCode(code) => Err(crate::exit_codes::err(
+        JoinInput::TransferCode(_) => Err(crate::exit_codes::err(
             crate::exit_codes::ExitKind::Usage,
-            join_transfer_code_msg(&code),
+            join_transfer_code_msg(""),
+        )),
+        JoinInput::InvalidCode(error) => Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            error.message(),
         )),
         JoinInput::Unknown => Err(crate::exit_codes::err(
             crate::exit_codes::ExitKind::Usage,
@@ -897,7 +839,11 @@ pub(crate) async fn join_cmd(
         m
     } else {
         Zeroizing::new(if let Some(path) = invite_file.as_deref() {
-            read_owner_only_file(path)?
+            // A masked opaque input can be path-shaped. Do not put that raw
+            // path back into an error chain after the reader kept it hidden.
+            read_owner_only_file(path).map_err(|_| anyhow::anyhow!(
+                "cannot read the invitation file; check that the path exists and permissions are owner-only"
+            ))?
         } else if let Some(fd) = invite_fd {
             read_owner_only_fd(fd)?
         } else {
@@ -906,14 +852,8 @@ pub(crate) async fn join_cmd(
             );
         })
     };
-    // A CODE where an invitation was expected (saved to a file, or handed
-    // over a descriptor): it is not a malformed invitation, it is the other
-    // way in. Say exactly what to run rather than "unknown format".
-    if let JoinInput::Code(code) = classify_join_input(invitation.as_str(), &|_| false) {
-        bail!(
-            "that holds a pairing code ({code}), not an invitation. Accept it with:  tunlion join {code}"
-        );
-    }
+    // An explicit invitation source stays an invitation even when malformed.
+    // Never normalize its bytes or retry another admission ceremony.
     let inv = parse_invitation(invitation.as_str())?;
     if inv.expires <= identity::now_secs() {
         bail!("this invitation has expired");
@@ -1076,52 +1016,40 @@ mod recovery_qr_tests {
 #[cfg(test)]
 mod join_input_tests {
     use super::{classify_join_input, JoinInput};
-    use std::path::PathBuf;
+
+    #[test]
+    fn join_material_debug_is_redacted_and_bom_is_ignored() {
+        let secret = "filament-invite:v2:never-render-this";
+        let input = classify_join_input(&format!(" \u{feff}{secret}\n"), &|_| false);
+        assert_eq!(input, classify_join_input(secret, &|_| false));
+        assert_eq!(format!("{input:?}"), "Invitation(<hidden>)");
+        assert_eq!(format!("{:?}", classify_join_input("hidden-code-1234", &|_| false)), "Code(<hidden>)");
+        assert_eq!(format!("{:?}", classify_join_input("hidden-transfer-123", &|_| false)), "TransferCode(<hidden>)");
+    }
 
     /// Eval item 1: the one accept prompt tells a code from an invitation
     /// from a file, so nobody has to know which reader to open.
     #[test]
     fn the_accept_prompt_tells_code_invitation_and_file_apart() {
         let none = |_: &str| false;
-        assert_eq!(
-            classify_join_input("comic-otter-1950", &none),
-            JoinInput::Code("comic-otter-1950".into())
-        );
+        assert!(matches!(classify_join_input("comic-otter-1950", &none), JoinInput::Code(_)));
         // As a person types it: spaces, capitals, stray whitespace.
         assert_eq!(
             classify_join_input("  Comic Otter 1950\n", &none),
-            JoinInput::Code("comic-otter-1950".into())
+            classify_join_input("comic-otter-1950", &none)
         );
-        assert_eq!(
-            classify_join_input("filament-invite:v2:AbC_d-0", &none),
-            JoinInput::Invitation("filament-invite:v2:AbC_d-0".into())
-        );
+        assert!(matches!(classify_join_input("filament-invite:v2:AbC_d-0", &none), JoinInput::Invitation(_)));
         let file = |p: &str| p == "invite.txt";
-        assert_eq!(classify_join_input("invite.txt", &file), JoinInput::File(PathBuf::from("invite.txt")));
-        assert_eq!(
-            classify_join_input("brave-otter-314", &none),
-            JoinInput::TransferCode("brave-otter-314".into())
-        );
+        assert!(matches!(classify_join_input("invite.txt", &file), JoinInput::File(_)));
+        assert!(matches!(classify_join_input("brave-otter-314", &none), JoinInput::TransferCode(_)));
         assert_eq!(classify_join_input("hello", &none), JoinInput::Unknown);
         assert_eq!(classify_join_input("", &none), JoinInput::Unknown);
         // A transfer code is sent to the verb that takes it.
-        assert!(super::join_transfer_code_msg("brave-otter-314").contains("tunlion receive brave-otter-314"));
+        let message = super::join_transfer_code_msg("brave-otter-314");
+        assert!(message.contains("tunlion receive"));
+        assert!(!message.contains("brave-otter-314"));
     }
 
-    /// Launch matrix: `join inv.txt` with no such file answered "that code
-    /// doesn't look right". A name with a dot or a slash is a file, never a
-    /// code, so a missing one is reported as a missing file.
-    #[test]
-    fn a_missing_invitation_file_is_reported_as_missing_not_as_a_bad_code() {
-        let msg = super::join_missing_file_msg("no-such-dir/inv.txt", false).expect("missing file refused");
-        assert!(msg.contains("no invitation file at 'no-such-dir/inv.txt'"), "{msg}");
-        assert!(super::join_missing_file_msg("inv-missing.txt", false).is_some());
-        // Codes, including a browser's three-digit one, still reach the ceremony.
-        assert_eq!(super::join_missing_file_msg("brave-otter-3141", false), None);
-        assert_eq!(super::join_missing_file_msg("fond-llama-112", false), None);
-        // A file given another way is not second-guessed.
-        assert_eq!(super::join_missing_file_msg("inv.txt", true), None);
-    }
 }
 
 #[cfg(test)]

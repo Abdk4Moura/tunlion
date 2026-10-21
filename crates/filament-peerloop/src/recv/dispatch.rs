@@ -1349,7 +1349,14 @@ async fn recv_run(
         Some(c) => {
             // Split the typed code into (nameplate, words); send ONLY the
             // nameplate. The words become the SPAKE2 password held locally.
-            let normalized = filament_pair::norm_code(c);
+            // Entry cleanup is shared with the CLI and browser: separators are
+            // normalized before the protocol primitive, whose 48-character cap
+            // must never silently shorten a code.
+            let canonical = filament_pair::canonical_code_input(c);
+            if canonical.len() > 48 {
+                bail!("that code is longer than 48 characters; shorten it and try again");
+            }
+            let normalized = filament_pair::norm_code(&canonical);
             let (np, pw) = filament_pair::split_code(&normalized);
             if pw.is_empty() || np.is_empty() {
                 bail!("that code doesn't look right, expected something like brave-otter-371");

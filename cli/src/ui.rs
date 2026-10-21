@@ -328,6 +328,12 @@ pub fn paint(tone: Tone, s: &str) -> String {
     format!("{}{s}\x1b[0m", ansi_code(tone, c.depth, c.bg))
 }
 
+/// Thin interactive marker, deliberately yellow rather than a bold text block.
+/// This is CLI chrome, not an engine log tone.
+pub fn cursor_accent(s: &str) -> String {
+    if caps().color { format!("\x1b[33m{s}\x1b[0m") } else { s.to_string() }
+}
+
 /// The escape that starts `tone` on stderr, or nothing when color is off.
 /// For renderers that write their own lines (pickers, the code entry).
 pub fn tone_code(tone: Tone) -> String {

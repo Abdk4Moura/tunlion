@@ -15,6 +15,7 @@
 import initPake, { PakeSession, canonicalCaps, normCode, splitCode, splitChosenCode as wasmSplitChosenCode } from '../pake/filament_pake.js'
 import pakeWasmUrl from '../pake/filament_pake_bg.wasm?url'
 import { validateChosenPassword } from './words.js'
+import { CodeInputError, normalizeCodeChecked } from './codeInput.js'
 
 let _ready = null
 /// Initialize the WASM module once (idempotent). Vite serves the .wasm via ?url.
@@ -136,11 +137,24 @@ function b64d(str) {
 }
 
 /// Parse a typed spoken code into {nameplate, password} the SAME way the CLI
-/// does (shared WASM normCode/splitCode), so K agrees.
+/// does. The browser entry boundary (`codeInput.js`) cleans/reserves first; the
+/// released WASM normCode then runs on the canonical ASCII result (idempotent),
+/// so released PAKE bytes do not change. On reserved material or an over-limit
+/// code this fails closed with empty nameplate/password and an error message,
+/// never turning the input into a password.
 export function parseSpokenCode(typed) {
-  const normalized = normCode(typed)
-  const [nameplate, password] = splitCode(normalized)
-  return { nameplate, password, normalized }
+  try {
+    const normalized = normCode(normalizeCodeChecked(typed))
+    const [nameplate, password] = splitCode(normalized)
+    return { nameplate, password, normalized, error: null }
+  } catch (error) {
+    return {
+      nameplate: '',
+      password: '',
+      normalized: '',
+      error: error instanceof CodeInputError ? error.message : 'That is not a pairing code.',
+    }
+  }
 }
 
 /// STEERING: count word tokens (letter-runs of >= 2 chars) in a password,
@@ -154,12 +168,28 @@ export function passwordWordTokens(password) {
 
 /// STEERING preview for the browser "choose your own code" entry. Uses the
 /// shared split + Decision #3 password gate (blocklist + identical-word check).
-/// The nameplate is machine-assigned when the user typed none.
+/// The nameplate is machine-assigned when the user typed none. Reserved
+/// material and over-limit text stay out of the password and return a reason.
 export function previewCustomCode(typed, autoNameplate, userName = '') {
-  const { password, nameplate, normalized } = splitChosenCode(typed)
+  const split = splitChosenCode(typed)
+  if (split.error) {
+    return {
+      password: '',
+      nameplate: '',
+      autoAssigned: true,
+      strongEnough: false,
+      blockedReason: split.error,
+      normalized: '',
+      full: '',
+      error: true,
+    }
+  }
+  const { password, nameplate, normalized } = split
   const hasNumber = !!nameplate
   const np = hasNumber ? nameplate : (autoNameplate || '')
-  const blockedReason = validateChosenPassword(password, userName)
+  const blockedReason = password && np && `${password}-${np}`.length > 48
+    ? 'Codes are limited to 48 characters including the number. Shorten the words.'
+    : validateChosenPassword(password, userName)
   return {
     password,
     nameplate: np,
@@ -168,6 +198,7 @@ export function previewCustomCode(typed, autoNameplate, userName = '') {
     blockedReason: blockedReason || null,
     normalized,
     full: password && np ? `${password}-${np}` : '',
+    error: false,
   }
 }
 
@@ -180,7 +211,18 @@ export function previewCustomCode(typed, autoNameplate, userName = '') {
 /// Rust→WASM `splitChosenCode` so the browser is byte-identical to the CLI by
 /// construction (`pakeReady()` MUST have resolved first; uses WASM).
 export function splitChosenCode(typed) {
-  const normalized = normCode(typed)
-  const [password, nameplate] = wasmSplitChosenCode(normalized)
-  return { password, nameplate, normalized }
+  try {
+    // Entry boundary first (reserve/clean/limit), then the released WASM norm
+    // on canonical ASCII. This is the same boundary the claim path uses.
+    const normalized = normCode(normalizeCodeChecked(typed))
+    const [password, nameplate] = wasmSplitChosenCode(normalized)
+    return { password, nameplate, normalized, error: null }
+  } catch (error) {
+    return {
+      password: '',
+      nameplate: '',
+      normalized: '',
+      error: error instanceof CodeInputError ? error.message : 'That is not a pairing code.',
+    }
+  }
 }
