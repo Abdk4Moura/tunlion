@@ -220,6 +220,9 @@ function legacyWheel(code, col, row) {
     const p = await cellPoint(page, 4, 4);
     await page.mouse.click(p.x, p.y);
     eq((await policy()).readOnly, true, 'terminal tap must not enable typing');
+    await clearInputs(page);
+    await page.keyboard.type('hardware');
+    eq((await inputs(page)).join(''), 'hardware', 'focused terminal still accepts physical keys with the software keyboard off');
 
     await keyboard.click();
     eq(await keyboard.getAttribute('aria-pressed'), 'true', 'Keyboard button enables typing');
