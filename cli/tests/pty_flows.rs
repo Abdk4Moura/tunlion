@@ -330,10 +330,13 @@ fn a_code_typed_into_add_is_accepted_not_reminted() {
         "add never opened its word entry; screen:\n{}",
         tail(&t.text())
     );
-    // The pure `judge` tests cover spaces; this PTY cell proves the key path
-    // accepts a complete code without minting, using the canonical spelling so
-    // a terminal-key timing artifact cannot masquerade as a routing failure.
-    t.send("comic-otter-1950");
+    // Type at human pace. A single bulk write lets the pty deliver a paste-like
+    // burst; this cell is about the key path recognizing a code, not about
+    // burst input, and the pure `judge` tests cover the spaces spelling.
+    for ch in "comic-otter-1950".chars() {
+        t.send(&ch.to_string());
+        t.settle(15, 1);
+    }
     assert!(
         t.wait_for_from(before, "code you were given", 10),
         "the entry did not recognize a received code; screen:\n{}",
