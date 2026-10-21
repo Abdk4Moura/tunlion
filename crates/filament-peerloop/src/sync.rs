@@ -373,11 +373,20 @@ pub async fn admit_sync_open(
             match crate::mount_proto::WinRoot::open_relative(drop_dir, &rel, true) {
                 Ok((win, root)) => (root.clone(), RootPin::from_win(win, root)),
                 Err(error) => {
-                    return SyncAdmission::Refused(SyncRefusal::new(
-                        sid,
-                        format!("cannot pin the receive root: {error}"),
-                        t,
-                    ))
+                    // A junction/symlink anywhere on the requested root is an
+                    // escape attempt; keep the historical outside-drop reason
+                    // on the wire. Other failures (a file component, an
+                    // unopenable directory) name their own cause.
+                    let reason = if error.kind() == std::io::ErrorKind::PermissionDenied
+                        && error
+                            .to_string()
+                            .contains("junction/symlink (reparse point)")
+                    {
+                        outside()
+                    } else {
+                        format!("cannot pin the receive root: {error}")
+                    };
+                    return SyncAdmission::Refused(SyncRefusal::new(sid, reason, t));
                 }
             }
         }
@@ -2274,10 +2283,9 @@ mod tests {
         let SyncAdmission::Refused(r) = out else {
             panic!("an ancestor junction must be refused, not admitted");
         };
-        assert!(
-            r.reason.contains("a parent is a junction/symlink (reparse point)"),
-            "the PINNED walk names the junction: {}",
-            r.reason
+        assert_eq!(
+            r.reason, "remote dir is outside this device's drop directory",
+            "a junction root keeps the historical outside-drop wire reason"
         );
         assert!(
             std::fs::read_dir(&outside.0).unwrap().next().is_none(),
