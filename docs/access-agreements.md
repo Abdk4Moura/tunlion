@@ -1,0 +1,118 @@
+# Foreground access agreements
+
+Implementation entry points: `filament_peerloop::access` and
+`filament_peerloop::send::ceremony`. This is a bounded library slice, not a claim
+that all CLI invitations, platform endpoints, or background operation are ready.
+
+## One engine, existing transport
+
+`AccessSpec` composes multiple absolute folder paths with explicit RO/RW modes,
+multiple exact TCP/UDP sockets, shell, and device networking independently.
+`Lifetime::UntilEnded` is the default. The invitation claim deadline is separate:
+once claimed, reconnect and a new scope review do not renew or re-claim it.
+There is no subnet grant, wildcard target, implicit permanent contact, or
+label-based identity. The engine creates no device/certificate/contact records.
+
+The temporary host flow is:
+
+1. Build a typed spec and `TemporaryBinding::new(host_key, &spec, lifetime,
+   claim_deadline)`. Use the existing real nameplate/code allocation; the random
+   offer ID is not a pairing code or bearer credential.
+2. Run `Ceremony::new_temporary` with `TemporaryRole::Host` or `Recipient` over
+   the existing `pake-msg` / `pake-confirm` relay. A recipient may inspect the
+   **untrusted** binding with `inspect_temporary_binding` only to select its
+   ceremony before sending its first element. Do not display actionable scope
+   or act on it yet. Purpose mismatch or an unsupported counterpart fails
+   closed, never falls back to standing pairing. Legacy pairing is unchanged.
+3. After PAKE confirmation, sign `temporary_possession_message(sender, receiver)`
+   with the existing overlay key. The shared `temporary_proof_payload` and
+   `authenticate_temporary_payload` helpers bind both keys, roles, purpose, offer
+   digest and this PAKE session. The result is a sealed `ProvenPeer`.
+4. Host calls `AgreementEngine::offer_bound`, then signs `review_message` and
+   sends the full typed snapshot over the same authenticated transport.
+   Recipient calls `Ceremony::review_temporary_offer`, displays the resulting
+   `AuthenticatedReview`, and only on explicit acceptance signs its
+   `acceptance_message`. Host calls `accept` with that signature and proven peer.
+   Viewing, cancelling and declining do not grant access.
+5. Route temporary service opens to `serve_forward` with the accepted agreement,
+   revision, proven peer, resource ID, SID and the **existing shared per-peer
+   Mux**. Continue feeding subsequent L2 frames/close messages into that same
+   Mux. Do not route temporary opens through standing shell admission, insert a
+   remembered contact, or expose the Mux's unrestricted dial API to the peer.
+
+`serve_forward` uses the existing host connector, L2 acknowledgement, byte pumps
+and close frames. It does not add another permission store or transport. The
+accepted spec, not a peer-supplied hostname/port, selects the exact target.
+`serve_tcp` is the corresponding host seam for an already authenticated stream.
+The Mux's actual `l2-open-ack` / `l2-close` is the activation result; returning
+from a serving task is not proof that an endpoint became available.
+
+## Lifecycle guarantees and limits
+
+- Acceptance signs a domain-separated exact agreement/revision, both peer keys,
+  full resource spec, lifetime, name and claim deadline. Host review and recipient
+  acceptance use different signing domains. Possession alone is not acceptance.
+- Existing-link `ProvenPeer::from_conn` requires a trusted link and **Proven**
+  identity binding, not the inferred name/certificate cache. Delegated links are
+  refused here: this adapter cannot bypass their authoritative signed ceiling.
+- Revision checks and operation admission/removal/end share one mutex. Removal
+  cancels affected operations; end cancels all operations for that agreement.
+  Unrelated agreements' resources and names are left alone. Scope additions,
+  changed targets, RW upgrades, and lifetime extension require a newly accepted
+  full revision. Conservative cancellation occurs on additions/lifetime change.
+- Expiry gates every new operation; active operations have a deadline timer.
+  Disconnect is not end, acceptance, expiry renewal, or a new invitation claim.
+  Reconnect still requires an authenticated peer and the accepted revision.
+- Snapshots are authoritative. Events carry a monotonic cursor and retain 256
+  entries; `reset_required` means reload snapshots. There are at most 128
+  agreements, 64 resources per bundle and 256 concurrent operations per agreement.
+  Terminal records are retained to reject replay; a full foreground instance
+  returns `Capacity` rather than silently evicting legitimate state.
+- This is foreground/in-memory only. Owner cancellation must call `end` and join
+  serving tasks before returning. Process exit kills foreground access; dropping
+  engine state cancels registered operations. Do not claim daemon/background or
+  restart persistence. A durable daemon handoff/readiness protocol is not present.
+- DNS labels normalize to ASCII and allocate base, base-1, base-2, etc., checking
+  remembered and active names without overwriting. Labels remain stable for the
+  agreement, are released at end, and never imply DNS integration. No `.mesh`
+  endpoint, mount path or OS route is advertised by this module.
+
+## Endpoint and authority readiness
+
+| Resource | This slice |
+| --- | --- |
+| Exact TCP service | Real existing L2 Mux / HostServices connector integration; `forward-server` feature and a working host connector required |
+| UDP service | Typed review only; operation returns `Unsupported` |
+| Folder download/mount, RO/RW serving | Typed review only; existing mount servers not agreement-integrated; unavailable |
+| Shell, PTY, exec, SSH | Typed review only; existing shared shell gate remains authoritative; unavailable through this engine |
+| Device networking / subnet | Typed separately; no agreement-aware packet policy integration; unavailable |
+| Background/restart | Unavailable; no durable handoff acknowledgement |
+| Owned/delegated relationship creation | Unavailable; temporary engine does not manufacture ownership or delegated ceilings |
+
+Main at `27d7bfea` contains real feature-gated PTY/exec/mount/forward servers;
+`tunlion-core` deliberately composes a reduced receive/transfer profile. Neither
+fact means those endpoints are ready for temporary agreements. The CLI adapter
+must branch before every ordinary pair enrollment/contact write, preserve real
+PAKE code allocation, own inline review and cancellation, and route scoped opens
+through the shared engine. This document does not claim that adapter is delivered
+by the library commits alone.
+
+Primary-device incoming-shell consent also needs an authoritative local role
+representation migration. Existing `DeviceCert`/principal kinds model owner,
+delegated and fleet trust, not primary appointment. Transport variables named
+`primary` are unrelated. A real implementation must persist role-backed local
+owned-audience opt-in, feed the same effective decision to PTY/exec/SSH admission,
+and revoke their active sessions on opt-out. A preset, hostname, caller boolean,
+or daemon elevation token is not a substitute. No process/account elevation is
+performed by this slice.
+
+## Validation
+
+The access tests cover mixed bundles, full signature/revision/peer binding,
+decline/cancellation, claim-versus-agreement expiry, reconnect refusal after end,
+scope removal, unrelated operations/names, ascending collisions and concurrency.
+The TCP test uses a real localhost listener through `HostServices`, copies bytes
+both ways, then verifies revocation closes both sockets. The ceremony tests run
+two actual SPAKE2 instances and Ed25519 proof/review/acceptance, including purpose,
+role, replay and scope tampering. These are **not** signaling-server/two-device
+CLI end-to-end tests. Remote job commands/results are recorded in the lane report.

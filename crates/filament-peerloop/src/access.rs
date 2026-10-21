@@ -134,10 +134,29 @@ pub struct EventPage {
 
 /// Authenticated full review, returned only after purpose-bound PAKE and host
 /// signature verification. Viewing is not acceptance.
+#[derive(Clone, Debug)]
 pub struct AuthenticatedReview(AgreementSnapshot);
 impl AuthenticatedReview {
     pub fn snapshot(&self) -> &AgreementSnapshot { &self.0 }
     pub fn acceptance_message(&self) -> Result<Vec<u8>, AccessError> { acceptance_bytes(&self.0) }
+    /// Review a new full revision on the established agreement without claiming
+    /// another invitation. The caller retains the most recent review/cursor and
+    /// must discard it when the agreement is ended; no resurrection is implied.
+    pub fn review_revision(&self, snapshot: AgreementSnapshot, host_signature: [u8;64], now: u64)
+        -> Result<Self, AccessError> {
+        snapshot.spec.validate()?;
+        if snapshot.id != self.0.id || snapshot.peer != self.0.peer || snapshot.host_peer != self.0.host_peer
+            || snapshot.relationship != self.0.relationship || snapshot.name != self.0.name
+            || snapshot.claim_expires_at != self.0.claim_expires_at {
+            return Err(AccessError::InvalidProof);
+        }
+        if snapshot.revision <= self.0.revision { return Err(AccessError::StaleRevision); }
+        check_revision(&snapshot, snapshot.revision)?;
+        if snapshot.lifetime.expired(now) { return Err(AccessError::Expired); }
+        filament_id::verify_possession_sig(&snapshot.host_peer, &review_bytes(&snapshot)?, &host_signature)
+            .map_err(|_| AccessError::InvalidProof)?;
+        Ok(Self(snapshot))
+    }
     #[cfg(feature = "dispatch")]
     pub(crate) fn verify(binding: &crate::send::ceremony::TemporaryBinding, snapshot: AgreementSnapshot,
         signature: [u8;64], local_peer: [u8;32], now: u64) -> Result<Self, AccessError> {
@@ -235,10 +254,9 @@ impl ProvenPeer {
 
 impl AgreementEngine {
     pub fn new(local_peer: [u8; 32], remembered_names: impl IntoIterator<Item = String>) -> Self {
-        Self { state: Arc::new(Mutex::new(State {
-            names: remembered_names.into_iter().map(|s| dns_label(&s)).collect(),
-            ..State::default()
-        })), local_peer }
+        let mut state = State::default();
+        state.names = remembered_names.into_iter().map(|s| dns_label(&s)).collect();
+        Self { state: Arc::new(Mutex::new(state)), local_peer }
     }
 
     /// `peer` must come from an authenticated PAKE/proven-link result, not a label.
@@ -680,6 +698,7 @@ mod tests {
     #[tokio::test]
     async fn real_tcp_host_activation_and_live_end_close_socket() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use crate::send::ceremony::{Ceremony, Inbound, TemporaryBinding, TemporaryRole};
         struct TcpHost;
         #[async_trait::async_trait]
         impl HostServices for TcpHost {
@@ -699,9 +718,23 @@ mod tests {
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap();
-        let e = Arc::new(engine()); let k = key();
+        let host_key = key(); let host_pub = peer(&host_key).public_key();
+        let e = Arc::new(AgreementEngine::new(host_pub, Vec::new())); let k = key();
         let scope = AccessSpec { services: vec![ServiceAccess { id: "echo".into(), target, protocol: ServiceProtocol::Tcp }], ..AccessSpec::default() };
-        let s = e.offer(peer(&k), "echo", scope, Lifetime::UntilEnded, 50, 10).unwrap(); accept(&e, &s, &k, 10);
+        let binding = TemporaryBinding::new(host_pub, &scope, Lifetime::UntilEnded, 50).unwrap();
+        let mut a = Ceremony::new_temporary("real test words", "1234", binding.clone(), TemporaryRole::Host);
+        let mut b = Ceremony::new_temporary("real test words", "1234", binding.clone(), TemporaryRole::Recipient);
+        let am = a.msg_payload(); let bm = b.msg_payload();
+        a.on_signal(&bm,None); b.on_signal(&am,None);
+        let ac = a.take_confirm_payload("host-fp","recipient-fp").unwrap();
+        let bc = b.take_confirm_payload("recipient-fp","host-fp").unwrap();
+        assert!(matches!(a.on_signal(&bc,Some(("host-fp","recipient-fp"))),Inbound::Consumed));
+        assert!(matches!(b.on_signal(&ac,Some(("recipient-fp","host-fp"))),Inbound::Consumed));
+        let possession = b.temporary_possession_message(peer(&k).public_key(), host_pub).unwrap();
+        let proven = a.authenticate_temporary_peer(host_pub, peer(&k).public_key(), k.sign(&possession).as_ref().try_into().unwrap()).unwrap();
+        let s = e.offer_bound(proven, &binding, "echo", scope, Lifetime::UntilEnded, 50, 10).unwrap();
+        let review = b.review_temporary_offer(s.clone(), host_key.sign(&e.review_message(&s.id,1,10).unwrap()).as_ref().try_into().unwrap(),peer(&k).public_key(),10).unwrap();
+        e.accept(&s.id,1,proven,k.sign(&review.acceptance_message().unwrap()).as_ref().try_into().unwrap(),10).unwrap();
         let (mut client, mut transport) = tokio::io::duplex(1024);
         let serving = { let e = e.clone(); let id = s.id.clone(); let p = peer(&k);
             tokio::spawn(async move { e.serve_tcp(&id, 1, p, "echo", &mut transport, &TcpHost).await }) };
@@ -718,5 +751,35 @@ mod tests {
         let s = e.offer(peer(&k), "echo", s.spec, Lifetime::UntilEnded, 50, 10).unwrap(); accept(&e, &s, &k, 10);
         let (_, mut stream) = tokio::io::duplex(64);
         assert_eq!(e.serve_tcp(&s.id, 1, peer(&k), "echo", &mut stream, &crate::host::NoHost).await, Err(AccessError::Unsupported));
+
+        // The actual existing L2 mux is also exercised, not only a generic IO seam.
+        struct Capture(tokio::sync::mpsc::UnboundedSender<serde_json::Value>, tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+        #[async_trait::async_trait]
+        impl filament_transport::net::Transport for Capture {
+            async fn send_control(&self, msg: &serde_json::Value) -> anyhow::Result<()> { self.0.send(msg.clone()).unwrap(); Ok(()) }
+            async fn send_frame(&self, _: u32, _: u64, payload: &[u8]) -> anyhow::Result<()> { self.1.send(payload.to_vec()).unwrap(); Ok(()) }
+            async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+            fn max_payload(&self) -> usize { 1024 }
+            fn is_dead(&self) -> bool { false }
+            fn is_alive(&self) -> bool { true }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+        let (controls,mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (frames,mut frame_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mux = crate::l2::Mux::new(Arc::new(Capture(controls,frames)),Arc::new(TcpHost));
+        let sid = crate::l2::L2_SID_BASE | 9;
+        let serving = { let e=e.clone(); let id=s.id.clone(); let mux=mux.clone();
+            tokio::spawn(async move { e.serve_forward(&id,1,proven,"echo",sid,mux,10).await }) };
+        let (mut socket,_) = listener.accept().await.unwrap();
+        let ack = control_rx.recv().await.unwrap(); assert_eq!(ack["type"],"l2-open-ack");
+        mux.on_frame(sid,bytes::Bytes::from_static(b"mux bytes")).await;
+        let mut received=[0;9]; socket.read_exact(&mut received).await.unwrap(); assert_eq!(&received,b"mux bytes");
+        socket.write_all(b"mux reply").await.unwrap();
+        assert_eq!(frame_rx.recv().await.unwrap(),b"mux reply");
+        e.end(&s.id,10).unwrap();
+        assert_eq!(serving.await.unwrap(),Err(AccessError::Ended));
+        assert_eq!(socket.read(&mut received).await.unwrap(),0);
+        assert!(!mux.has_stream(sid).await);
+        let close = control_rx.recv().await.unwrap(); assert_eq!(close["type"],"l2-close");
     }
 }
