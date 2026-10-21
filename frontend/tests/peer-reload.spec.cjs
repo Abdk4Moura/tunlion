@@ -387,7 +387,7 @@ async function runEngine(engine, browser, contextOptions) {
   // 5. Reload the (renamed) current tab. Still one row, still connected.
   await second.reload({ waitUntil: 'domcontentloaded' });
   await second.waitForSelector('[data-testid="device-name-input"]', { timeout: 60000 });
-  if (full) await waitOnlineAndPeer(second, peerName); else await waitOnline(second);
+  if (full) { await waitOnlineAndPeer(second, peerName); await waitPeerReady(second, peerName, 120000); } else await waitOnline(second);
   const g5 = await identity(second);
   if (g5.name !== chosen) fail(`${tag} reload after rename lost the chosen name (${g5.name})`);
   if (g5.gen === g4.gen) fail(`${tag} reload after rename reused the generation`);
@@ -429,7 +429,7 @@ async function runEngine(engine, browser, contextOptions) {
   const gNav = await identity(second);
   await second.goBack({ waitUntil: 'domcontentloaded' });
   await second.waitForSelector('[data-testid="device-name-input"]', { timeout: 60000 });
-  if (full) await waitOnlineAndPeer(second, peerName); else await waitOnline(second);
+  if (full) { await waitOnlineAndPeer(second, peerName); await waitPeerReady(second, peerName, 120000); } else await waitOnline(second);
   const gBack = await identity(second);
   if (gBack.gen === gNav.gen || gBack.gen === g5.gen) fail(`${tag} back/forward reused a retired generation`);
   const persisted = await second.evaluate(() => window.__pageshowPersisted || false);

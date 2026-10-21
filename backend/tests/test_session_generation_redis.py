@@ -56,6 +56,12 @@ class RedisTokenParity(unittest.TestCase):
         self.assertIsNone(self.reg.take_session(token, "wrong-gen"))
         self.assertIsNone(self.reg.take_session("wrong", "g2"))
         self.assertEqual(self.reg.take_session(token, "g2")["sid"], "s3")
+        # Closed token reattaches with the SAME token; its old generation stays retired.
+        reattach = self.claim(token, "g3", "s3b")
+        self.assertEqual((reattach["status"], reattach["token"]), ("new", token))
+        self.assertEqual(self.claim(token, "g2", "s3c")["status"], "retired")
+        tokenless = self.claim(gen="g4", sid="s4")
+        self.assertNotEqual(tokenless["token"], token)
 
     def test_uid_alone_and_wrong_token_are_new_sessions(self):
         victim = self.claim()
@@ -85,6 +91,31 @@ class RedisTokenParity(unittest.TestCase):
         self.assertEqual(expired["status"], "new")
         self.assertNotEqual(expired["token"], token)
 
+    def test_retired_cap_is_global_and_does_not_refuse_owner(self):
+        self.reg.MAX_RETIRED_TOTAL = 8
+        token = self.claim(gen="g0", sid="s0")["token"]
+        statuses = []
+        for i in range(1, 21):
+            statuses.append(self.claim(token, f"g{i}", f"s{i}")["status"])
+        self.assertNotIn("capacity", statuses)
+        self.assertNotIn("denied", statuses)
+        self.assertLessEqual(self.reg.r.zcard(self.reg._retired_key()), 8)
+        self.assertTrue(self.reg.r.zscore(self.reg._retired_key(), f"{token}|g19"))
+        self.assertIsNone(self.reg.r.zscore(self.reg._retired_key(), f"{token}|g20"))
+
+    def test_zset_ttl_and_closed_score_refresh(self):
+        token = self.claim(gen="g1", sid="s1")["token"]
+        self.reg.take_session(token, "g1")
+        self.assertGreater(self.reg.r.ttl(self.reg._sessions()), 0)
+        score = self.reg.r.zscore(self.reg._sessions(), token)
+        self.assertIsNotNone(score)
+        # A stale ZSET score must not prune the closed (valid) record; the
+        # hash TTL, not the score, decides expiry.
+        self.reg.r.zadd(self.reg._sessions(), {token: time.time() - 2 * self.reg.SESSION_TTL})
+        self.claim(gen="g1", sid="s-new")
+        reattach = self.claim(token, "g2", "s2")
+        self.assertEqual((reattach["status"], reattach["token"]), ("new", token))
+
     def test_concurrent_same_token_one_owner_distinct_tokens(self):
         from concurrent.futures import ThreadPoolExecutor
 
@@ -103,9 +134,14 @@ class RedisTokenParity(unittest.TestCase):
         a = self.claim(sid="sa")
         b = self.claim(sid="sb")
         c = self.claim(sid="sc")
-        self.assertNotEqual(a["token"], b["token"])
-        self.assertNotEqual(b["token"], c["token"])
-        self.assertIn("sa", c["evicted"])
+        self.assertEqual(c["status"], "capacity")
+        self.assertIsNone(c["token"])
+        self.assertTrue(self.reg.r.exists(self.reg._sess(a["token"])))
+        self.assertTrue(self.reg.r.exists(self.reg._sess(b["token"])))
+        # Closing a record makes room; a live record is still never evicted.
+        self.reg.take_session(a["token"], "g1")
+        d = self.claim(sid="sd")
+        self.assertEqual(d["status"], "new")
         self.assertFalse(self.reg.r.exists(self.reg._sess(a["token"])))
         self.assertTrue(self.reg.r.exists(self.reg._sess(b["token"])))
 

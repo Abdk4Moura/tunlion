@@ -277,7 +277,9 @@ UI hid it.
   ownership key: an unrelated client that knows the victim's uid but lacks its
   token gets an independent session and cannot evict, close, or join as the
   victim. A legacy no-token client also gets a new independent session.
-  Capacity is on token records only; evicting one loses resume ability, not
+  Capacity is on token records only: expired/closed records are evicted first;
+  if every record is live a new tokenless session is refused with a capacity
+  error instead of superseding a live sid. Eviction loses resume ability, not
   access. gen/sid/token live in one record with one sliding 24h TTL (one Redis
   hash updated by atomic Lua), and retired generations are bounded per token
   with a global 24h TTL/cap. The token is a bearer in localStorage: not rotated,

@@ -211,8 +211,12 @@ class _MemRegistry:
                         "prev": prev, "evicted": evicted}
             # No token, unknown token, or expired token: a fresh independent
             # session. The caller's uid/name are only labels here.
+            made = self._make_room(now)
+            if made is None:
+                return {"status": "capacity", "token": None, "gen": None,
+                        "prev": None, "evicted": evicted}
+            evicted += made
             issued = secrets.token_urlsafe(24)
-            evicted += self._make_room(now)
             self._sessions[issued] = {"sid": sid, "gen": gen, "uid": uid, "name": name,
                                       "last_seen": now, "exp": now + self.SESSION_TTL}
             self._sid_token[sid] = issued
@@ -232,11 +236,19 @@ class _MemRegistry:
         return out
 
     def _make_room(self, now):
-        """Capacity is on TOKEN records only. Evict oldest (live or not); this
-        loses resume ability, never grants access to another session."""
+        """Capacity is on TOKEN records only. Prefer expired/closed/non-live
+        records; never evict a live session. Returns evicted sids, or None when
+        every record is live (caller returns a capacity error)."""
         out = []
         while len(self._sessions) >= self.MAX_SESSIONS and self._sessions:
-            token, rec = min(self._sessions.items(), key=lambda kv: kv[1].get("last_seen", 0))
+            candidates = [
+                (token, rec)
+                for token, rec in self._sessions.items()
+                if not rec.get("sid") or not self._alive(rec.get("sid"))
+            ]
+            if not candidates:
+                return None
+            token, rec = min(candidates, key=lambda kv: kv[1].get("last_seen", 0))
             self._sessions.pop(token, None)
             sid = rec.get("sid")
             if sid:
@@ -456,14 +468,23 @@ class _RedisRegistry:
             """
             local cur = redis.call('HMGET', KEYS[1], 'sid', 'gen')
             local cursid, curgen = cur[1], cur[2]
+            local exists = redis.call('EXISTS', KEYS[1])
+            local has_token = (ARGV[8] ~= '' and exists == 1)
             redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[5])
-            if curgen and curgen ~= '' and ARGV[8] ~= '' then
+            if has_token then
+              -- A token record exists even if it is closed (gen/sid empty).
+              -- The retired check applies to closed slots too.
               if redis.call('ZSCORE', KEYS[2], ARGV[8] .. '|' .. ARGV[1]) then
-                return {'retired', ARGV[8], curgen, cursid or '', ''}
+                return {'retired', ARGV[8], curgen or '', cursid or '', ''}
               end
               redis.call('EXPIRE', KEYS[1], ARGV[4])
               redis.call('HSET', KEYS[1], 'uid', ARGV[9], 'name', ARGV[10], 'last_seen', ARGV[5])
               redis.call('ZADD', KEYS[3], ARGV[5], ARGV[8])
+              redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]) * 2)
+              if (not curgen) or curgen == '' then
+                redis.call('HSET', KEYS[1], 'gen', ARGV[1], 'sid', ARGV[2])
+                return {'new', ARGV[8], ARGV[1], '', ''}
+              end
               if curgen == ARGV[1] then
                 if cursid == ARGV[2] then return {'current', ARGV[8], curgen, '', ''} end
                 redis.call('HSET', KEYS[1], 'sid', ARGV[2])
@@ -478,31 +499,42 @@ class _RedisRegistry:
               redis.call('HSET', KEYS[1], 'gen', ARGV[1], 'sid', ARGV[2])
               return {'new', ARGV[8], ARGV[1], cursid or '', ''}
             end
-            -- No usable token: fresh SESSION. Capacity only evicts token
-            -- records; no uid lookup, so uid alone cannot take over.
+            -- No usable token: fresh SESSION. Capacity prefers expired/closed
+            -- records; it NEVER evicts a live session. If all are live, refuse.
             local evicted = ''
-            local expired = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf',
-                                       tonumber(ARGV[5]) - tonumber(ARGV[4]))
-            for _, tok in ipairs(expired) do
-              local esid = redis.call('HGET', 'filament:session:' .. tok, 'sid')
-              if esid and esid ~= '' then evicted = evicted .. esid .. ',' end
-              redis.call('DEL', 'filament:session:' .. tok)
-              redis.call('ZREM', KEYS[3], tok)
+            local cards = redis.call('ZCARD', KEYS[3])
+            if cards >= tonumber(ARGV[11]) then
+              local all = redis.call('ZRANGE', KEYS[3], 0, -1)
+              for _, tok in ipairs(all) do
+                local skey = 'filament:session:' .. tok
+                if redis.call('EXISTS', skey) == 0 then
+                  redis.call('ZREM', KEYS[3], tok)
+                end
+              end
+              cards = redis.call('ZCARD', KEYS[3])
             end
-            while redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[11]) do
-              local olds = redis.call('ZRANGE', KEYS[3], 0, 0)
-              if #olds == 0 then break end
-              local tok = olds[1]
-              local esid = redis.call('HGET', 'filament:session:' .. tok, 'sid')
-              if esid and esid ~= '' then evicted = evicted .. esid .. ',' end
-              redis.call('DEL', 'filament:session:' .. tok)
-              redis.call('ZREM', KEYS[3], tok)
+            if cards >= tonumber(ARGV[11]) then
+              local all = redis.call('ZRANGE', KEYS[3], 0, -1)
+              for _, tok in ipairs(all) do
+                local skey = 'filament:session:' .. tok
+                local h = redis.call('HMGET', skey, 'sid', 'gen')
+                if (not h[2]) or h[2] == '' then
+                  if h[1] and h[1] ~= '' then evicted = evicted .. h[1] .. ',' end
+                  redis.call('DEL', skey)
+                  redis.call('ZREM', KEYS[3], tok)
+                end
+              end
+              cards = redis.call('ZCARD', KEYS[3])
+            end
+            if cards >= tonumber(ARGV[11]) then
+              return {'capacity', '', '', '', evicted}
             end
             local newkey = 'filament:session:' .. ARGV[7]
             redis.call('HSET', newkey, 'sid', ARGV[2], 'gen', ARGV[1],
                        'uid', ARGV[9], 'name', ARGV[10], 'last_seen', ARGV[5])
             redis.call('EXPIRE', newkey, ARGV[4])
             redis.call('ZADD', KEYS[3], ARGV[5], ARGV[7])
+            redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]) * 2)
             return {'new', ARGV[7], ARGV[1], '', evicted}
             """,
             3, self._sess(lookup), self._retired_key(), self._sessions(),
@@ -548,9 +580,11 @@ class _RedisRegistry:
             redis.call('EXPIRE', KEYS[2], tonumber(ARGV[5]) * 2)
             redis.call('HSET', KEYS[1], 'gen', '', 'sid', '')
             redis.call('EXPIRE', KEYS[1], ARGV[6])
+            redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
+            redis.call('EXPIRE', KEYS[3], tonumber(ARGV[6]) * 2)
             return {sid, room or ''}
             """,
-            2, self._sess(token), self._retired_key(),
+            3, self._sess(token), self._retired_key(), self._sessions(),
             token, gen, _time.time(), self.MAX_RETIRED_TOTAL, self.RETIRED_TTL,
             self.SESSION_TTL,
         )
@@ -832,10 +866,12 @@ def register(socketio, registry):
         status = verdict.get("status")
         owner_token = verdict.get("token")
         effective_gen = verdict.get("gen") or gen
-        if status in ("retired", "denied"):
+        if status in ("retired", "denied", "capacity"):
+            reason = {"retired": "stale-generation", "denied": "invalid",
+                      "capacity": "capacity"}[status]
             _tel("session-retired" if status == "retired" else "session-denied",
                  sid=sid, uid=uid, gen=str(gen)[:8], status=status)
-            emit("session-superseded", {"reason": "stale-generation" if status == "retired" else "invalid"})
+            emit("session-superseded", {"reason": reason})
             return False, None, None
         for evicted_sid in verdict.get("evicted") or []:
             if not evicted_sid or evicted_sid == sid:
@@ -886,10 +922,10 @@ def register(socketio, registry):
         data = data if isinstance(data, dict) else {}
         room = data.get("room")
         raw_name = data.get("name")
-        if not isinstance(raw_name, str) or len(raw_name) > 128:
+        if not isinstance(raw_name, str) or not raw_name or len(raw_name) > 128:
             emit("session-superseded", {"reason": "invalid"})
             return
-        name = raw_name or "anonymous"
+        name = raw_name
         # uid: a stable per-tab identity that survives reconnects (sids don't).
         # It lets peers recognize "same device, new connection" — the basis for
         # transfer resume.
@@ -1088,9 +1124,9 @@ def register(socketio, registry):
         data = data if isinstance(data, dict) else {}
         room = data.get("room")
         raw_name = data.get("name")
-        if not isinstance(raw_name, str) or len(raw_name) > 128:
+        if not isinstance(raw_name, str) or not raw_name or len(raw_name) > 128:
             return {"v": 1, "ok": False, "room": None, "channels": 0, "lease": False}
-        name = raw_name or "anonymous"
+        name = raw_name
         uid = data.get("uid")
         gen = data.get("gen")
         token = data.get("token")

@@ -75,7 +75,14 @@ class TokenOwnership(unittest.TestCase):
         self.assertNotEqual(evil["token"], token)
         self.assertIn(victim_sid, reg._m)
         self.assertEqual(reg._m[victim_sid]["uid"], U1)
-        self.assertNotIn("session-superseded", _names(victim.get_received()))
+        victim_events = victim.get_received()
+        self.assertNotIn("session-superseded", _names(victim_events))
+        joined = next(e for e in victim_events if e["name"] == "peer-joined")["args"][0]
+        self.assertNotIn("token", joined)
+        welcome = next(e for e in attacker.get_received() if e["name"] == "welcome")["args"][0]
+        self.assertTrue(welcome.get("token"))
+        self.assertNotIn("token", welcome["peers"][0])
+        self.assertNotIn(welcome["token"], str(welcome["peers"]))
 
         # A wrong token is also just a new session.
         evil2 = _sync(attacker, "r1", NAME, U1, "attacker-gen-2", "attacker-token")
@@ -146,6 +153,23 @@ class TokenOwnership(unittest.TestCase):
         self.assertNotEqual(d["token"], a["token"])
         self.assertIn(b["token"], reg._sessions)
 
+    def test_live_capacity_refuses_new_sessions(self):
+        reg = signaling._MemRegistry()
+        reg.MAX_SESSIONS = 2
+        a = reg.claim_session(None, "g1", "sa", U1, "pad")
+        b = reg.claim_session(None, "g1", "sb", U2, "laptop")
+        reg.refresh(["sa", "sb"])
+        c = reg.claim_session(None, "g1", "sc", "u3", "nas")
+        self.assertEqual(c["status"], "capacity")
+        self.assertIn(a["token"], reg._sessions)
+        self.assertIn(b["token"], reg._sessions)
+        # Closing one makes room; the live b is still not evicted.
+        reg.take_session(a["token"], "g1")
+        d = reg.claim_session(None, "g1", "sd", "u4", "phone")
+        self.assertEqual(d["status"], "new")
+        self.assertNotIn(a["token"], reg._sessions)
+        self.assertIn(b["token"], reg._sessions)
+
     def test_concurrent_same_token_one_owner_distinct_tokens_coexist(self):
         reg = signaling._MemRegistry()
         first = reg.claim_session(None, "g0", "s0", U1, "pad")
@@ -171,6 +195,16 @@ class TokenOwnership(unittest.TestCase):
         self.assertEqual(expired["status"], "new")
         self.assertNotEqual(expired["token"], token)
 
+    def test_closed_token_reattaches_and_old_generation_stays_retired(self):
+        reg = signaling._MemRegistry()
+        token = reg.claim_session(None, "g1", "s1", U1, "pad")["token"]
+        self.assertEqual(reg.take_session(token, "g1")["sid"], "s1")
+        reattach = reg.claim_session(token, "g2", "s2", U1, "pad")
+        self.assertEqual((reattach["status"], reattach["token"]), ("new", token))
+        self.assertEqual(reg.claim_session(token, "g1", "s3", U1, "pad")["status"], "retired")
+        independent = reg.claim_session(None, "g3", "s4", U1, "pad")
+        self.assertNotEqual(independent["token"], token)
+
     def test_retired_per_token_is_global_bounded_not_refused(self):
         reg = signaling._MemRegistry()
         reg.MAX_RETIRED_TOTAL = 8
@@ -193,6 +227,7 @@ class TokenOwnership(unittest.TestCase):
         for bad_gen in (123, ["g"], {"g": 1}):
             self.assertFalse(_sync(c, "r1", NAME, U1, bad_gen)["ok"])
         self.assertFalse(_sync(c, "r1", 123, U1, "g1")["ok"])
+        self.assertFalse(_sync(c, "r1", "", U1, "g1")["ok"])
         self.assertFalse(_sync(c, "r1", NAME, U1, "g1", token=123)["ok"])
         self.assertFalse(sio.test_client(app).emit("sync", ["not", "a", "dict"], callback=True)["ok"])
 

@@ -9,6 +9,7 @@ Run:  python -m unittest backend.tests.test_session_close_http
 import importlib.util
 import os
 import sys
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -20,6 +21,7 @@ os.environ.setdefault("FIL_DEV", "1")
 os.environ.setdefault("FIL_CORS_ORIGINS", "*")
 
 import config  # noqa: E402  (imported by earlier test modules in discover order)
+import ratelimit  # noqa: E402
 
 config.SECRET = config.SECRET or "session-close-http-test"
 config.DEV = True
@@ -87,15 +89,30 @@ class CloseEndpointHTTP(unittest.TestCase):
         self.assertEqual(self._post({"gen": gen2, "token": token2}).status_code, 204)
         self.assertFalse(self._owned(uid2, gen2, token2))
 
-    def test_rate_limiter_gate_blocks_noop(self):
-        class Closed:
-            def allow(self, keys, now=None):
-                return False
-
-        api._close_limiter = Closed()
+    def test_real_limiter_gate_blocks_after_budget(self):
+        api._close_limiter = ratelimit.MemLimiter(limit=2, window=60)
         uid, gen, _sid, token = self._seed()
+        # Two syntactically valid but tokenless calls consume the real budget.
+        self.assertEqual(self._post({"gen": gen}).status_code, 204)
+        self.assertEqual(self._post({"gen": gen}).status_code, 204)
+        # A valid close now hits the same limiter and is a no-op.
         self.assertEqual(self._post({"gen": gen, "token": token}).status_code, 204)
         self.assertTrue(self._owned(uid, gen, token))
+
+    def test_stale_generation_cannot_close_after_takeover(self):
+        uid, gen1, sid1, token = self._seed()
+        gen2 = "g2-" + uuid.uuid4().hex
+        sid2 = "s2-" + uuid.uuid4().hex
+        takeover = api.REGISTRY.claim_session(token, gen2, sid2, uid, "ipad")
+        self.assertEqual(takeover["status"], "new")
+        api.REGISTRY.add(sid2, "r-http", "ipad", uid, gen2)
+        # Old generation is a no-op; the current generation closes.
+        self.assertEqual(self._post({"gen": gen1, "token": token}).status_code, 204)
+        self.assertTrue(self._owned(uid, gen2, token))
+        self.assertEqual(self._post({"gen": gen2, "token": token}).status_code, 204)
+        self.assertFalse(self._owned(uid, gen2, token))
+        # A close after close is an idempotent no-op too.
+        self.assertEqual(self._post({"gen": gen2, "token": token}).status_code, 204)
 
 
 if __name__ == "__main__":

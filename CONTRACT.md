@@ -196,9 +196,10 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   supersedes its old sid and retires the old generation. A late `sync` from a
   retired generation is refused (`{ok:false, superseded:true}`). Retired
   generations are one global 24h TTL set with a hard total cap; oldest are
-  evicted first, never refusing a valid current owner. Token records have a
-  cardinality cap (LRU eviction loses resume ability only) and one sliding 24h
-  TTL covering sid/gen/token together (one Redis hash/Lua).
+  evicted first, never refusing a valid current owner. Token records have a cardinality cap: expired/closed records are evicted
+  first, and if all are live a new tokenless session is refused with a clear
+  capacity error (never superseding a live sid). One sliding 24h TTL covers
+  sid/gen/token together (one Redis hash/Lua).
 - `pagehide` closes local PeerConnections synchronously, stops link/session/
   pairing/config timers, and `sendBeacon`s `{token, gen}` to
   `POST /api/session/close`. The endpoint requires the token, honors the

@@ -371,7 +371,18 @@ export function useTunlion() {
       // Phase 1: tolerate peers without a UID while measuring the legacy path.
       // Phase 2 removes this branch once stale records and old clients are gone.
       const roleArgs = { myUid: uidRef.current, peerUid: uid, myId: myIdRef.current, peerId: id }
-      const polite = uid == null ? legacyPoliteRole(roleArgs) : politeRole(roleArgs)
+      let polite
+      try {
+        // `known-peer` can precede welcome on a relay reconnect, leaving
+        // myIdRef null briefly. Handle that explicitly instead of letting
+        // politeRole throw into an unhandled promise rejection.
+        polite = (uid == null || myIdRef.current == null)
+          ? legacyPoliteRole(roleArgs)
+          : politeRole(roleArgs)
+      } catch (err) {
+        log.warn('politeness identity missing; deferring role election', id.slice(-6), err)
+        polite = true
+      }
       addPeer({ id, name, uid: uid || null, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
       const link = new PeerLink({
         id,
@@ -727,7 +738,7 @@ export function useTunlion() {
       // Stop talking instead of fighting it: an automatic rejoin would make
       // two tabs supersede each other forever. A reload (new generation) is
       // the intentional way back, and loses no pairing (localStorage stays).
-      sig.on('session-superseded', () => {
+      sig.on('session-superseded', ({ reason } = {}) => {
         if (supersededRef.current) return
         supersededRef.current = true
         tel('session-superseded', {})
@@ -740,7 +751,9 @@ export function useTunlion() {
         sigRef.current?.suspend?.() // never replay this retired generation
         setConnected(false)
         connectedRef.current = false
-        setSuperseded('A newer tab or reload for this device took over the session.')
+        setSuperseded(reason === 'capacity'
+          ? 'The server is at capacity for new sessions right now. Try again shortly.'
+          : 'A newer tab or reload for this device took over the session.')
       })
       // A live device was renamed. Keep the SAME peer/link row and just relabel
       // it (a new peer-joined would be ignored for an existing sid anyway).
