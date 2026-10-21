@@ -1373,7 +1373,7 @@ mod win_at {
     use std::fs::File;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Component, Path, PathBuf};
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
