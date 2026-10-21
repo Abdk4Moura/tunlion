@@ -176,6 +176,11 @@ class _MemRegistry:
             m["name"] = name
             return {"id": sid, "name": name, "uid": m.get("uid")}
 
+    def owned_uid(self, uid):
+        """Whether this uid has ever been claimed (used by legacy no-gen
+        clients: they may not re-use a uid that a token-owning session owns)."""
+        return self._uids.get(uid)
+
     def take_session(self, uid, gen, token=None):
         """Close the active sid for (uid, gen) IF the caller holds its ownership
         token. A wrong/missing token, or a close for an OLD generation, returns
@@ -379,6 +384,11 @@ class _RedisRegistry:
         v["name"] = name
         self.r.hset(self._rk(room), sid, json.dumps(v))
         return {"id": sid, "name": name, "uid": v.get("uid")}
+
+    def owned_uid(self, uid):
+        if self.r.exists(self._gk(uid), self._usk(uid), self._utk(uid)):
+            return {"gen": self.r.get(self._gk(uid)), "sid": self.r.get(self._usk(uid))}
+        return None
 
     def take_session(self, uid, gen, token=None):
         if not uid or not gen or not token:
@@ -645,7 +655,17 @@ def register(socketio, registry):
         ownership token. A uid visible in the roster is not authority. Returns
         (ok, token); on the first claim the relay mints and returns the token
         to this socket alone."""
-        if not uid or not gen:
+        if not uid:
+            return True, None
+        if not gen:
+            # Legacy/CLI clients do not carry a generation. They may still join
+            # fresh uids, but a uid that a token-owning session already owns is
+            # never theirs to re-use (no uid-alone eviction/impersonation).
+            cur = registry.owned_uid(uid)
+            if cur is not None:
+                _tel("session-denied", sid=sid, uid=uid, gen=None)
+                emit("session-superseded", {"reason": "not-owner"})
+                return False, None
             return True, None
         verdict = registry.claim_session(uid, gen, sid, token)
         status = verdict.get("status")

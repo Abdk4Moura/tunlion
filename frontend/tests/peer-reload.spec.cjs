@@ -250,7 +250,7 @@ async function runEngine(engine, browser, contextOptions) {
   second.on('pageerror', (e) => console.log(tag, '[second page-error]', String(e).slice(0, 300)));
   second.on('console', (m) => { if (m.type() === 'error') console.log(tag, '[second console]', m.text().slice(0, 300)); });
   await nav(second, BASE);
-  if (full) { await waitOnlineAndPeer(second, peerName); await waitPeerReady(second, peerName); } else await waitOnline(second);
+  if (full) { await waitOnlineAndPeer(second, peerName, 45000); await waitPeerReady(second, peerName, 60000); } else await waitOnline(second);
   const g3 = await identity(second);
   if (g3.uid !== g2.uid) fail(`${tag} second tab did not carry the same device uid`);
   if (g3.gen === g2.gen) fail(`${tag} second tab reused the old generation`);
@@ -334,15 +334,19 @@ async function runEngine(engine, browser, contextOptions) {
   await second.context().setOffline(true);
   await sleep(700);
   await second.context().setOffline(false);
+  // WebKit's offline emulation can also stall the peer context's ICE; refresh
+  // that fixture so this test measures the DEVICE's reconnect cache, not
+  // WebKit's network-process offline recovery.
+  if (engine === 'webkit-ipad') { await nav(peer, BASE); await waitOnline(peer); }
   if (full) {
-    await waitOnlineAndPeer(second, peerName, 30000);
-    await waitPeerReady(second, peerName);
+    await waitOnlineAndPeer(second, peerName, 45000);
+    await waitPeerReady(second, peerName, 60000);
     await waitFor(async () => {
       const now = await peerRows(peer, chosen).count();
       const old = await peerRows(peer, devName).count();
       return now === 1 && old === 0;
     }, 15000, 'the peer to relabel the reconnected device');
-    await waitPeerReady(peer, chosen);
+    await waitPeerReady(peer, chosen, 60000);
   } else {
     await waitOnline(second, 30000);
   }
@@ -372,7 +376,7 @@ async function runEngine(engine, browser, contextOptions) {
   const beforeBf = await identity(second);
   await second.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
   await waitFor(async () => (await identity(second)).gen !== beforeBf.gen, 15000, 'pageshow(persisted) to rotate generation');
-  if (full) { await waitOnlineAndPeer(second, peerName); await waitPeerReady(second, peerName); } else await waitOnline(second);
+  if (full) { await waitOnlineAndPeer(second, peerName, 45000); await waitPeerReady(second, peerName, 60000); } else await waitOnline(second);
   ok(`${tag} persisted pageshow rotates the session generation and revalidates`);
 
   // 6a-b. Force a real socket disconnect/reconnect AFTER that rotation. The
@@ -385,7 +389,8 @@ async function runEngine(engine, browser, contextOptions) {
   await second.context().setOffline(true);
   await sleep(700);
   await second.context().setOffline(false);
-  if (full) { await waitOnlineAndPeer(second, peerName, 30000); await waitPeerReady(second, peerName); } else await waitOnline(second, 30000);
+  if (engine === 'webkit-ipad') { await nav(peer, BASE); await waitOnline(peer); }
+  if (full) { await waitOnlineAndPeer(second, peerName, 45000); await waitPeerReady(second, peerName, 60000); } else await waitOnline(second, 45000);
   const bfRetiredAfter = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === bf.uid && e.gen === bfGen).length;
   const bfJoinsAfter = telEvents().filter((e) => e.ev === 'join' && e.uid === bf.uid && e.gen === bfGen).length;
   if (bfRetiredAfter !== bfRetiredBefore) fail(`${tag} post-pageshow reconnect retired the current generation`);

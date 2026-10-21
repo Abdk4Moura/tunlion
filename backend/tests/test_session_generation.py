@@ -184,6 +184,9 @@ class OwnershipToken(unittest.TestCase):
         # A no-token claim is equally refused.
         self.assertFalse(_join(attacker, "r1", "ipad", U1, "attacker-gen-2")["ok"])
         self.assertIn(victim_sid, reg._m)
+        # So is a legacy no-generation attempt against an owned uid.
+        self.assertFalse(_join(attacker, "r1", "ipad", U1, None)["ok"])
+        self.assertIn(victim_sid, reg._m)
         # The real owner can still close.
         self.assertTrue(signaling.close_session(sio, reg, U1, "victim-gen", token))
 
