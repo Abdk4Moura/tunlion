@@ -701,7 +701,7 @@ impl Core {
             return Err(CoreError::PhraseMismatch);
         }
         let fingerprint = pending.fingerprint();
-        pending.pending.commit(&self.store()).map_err(id_err)?;
+        DeviceStore::open(&self.dir).commit_pending_identity(pending.pending).map_err(id_err)?;
         Ok(fingerprint)
     }
 
@@ -721,7 +721,7 @@ impl Core {
 
     /// Start the real receive engine for this config directory.
     ///
-    /// Validates that an identity and config exist, takes the same-root
+    /// Bootstraps internal identity on this mutation, validates config, takes the same-root
     /// `up.lock` election (shared with the CLI daemon), starts `recv::dispatch`
     /// on this Core's runtime and waits for its publish-once readiness edge.
     /// A failure releases the lease and joins the task unless it timed out, in
@@ -1147,14 +1147,10 @@ impl Core {
     /// send. The sender never reads `TUNLION_CONFIG_DIR` or spawns the CLI.
     fn prepare_send(&self) -> Result<(SendParts, CoreLease), CoreError> {
         let store = DeviceStore::open(&self.dir);
-        if !store.has_identity() {
-            return Err(CoreError::Identity(
-                "no identity in this config directory; run init or join first".into(),
-            ));
-        }
         let settings =
             CoreSettings::load(&self.dir).map_err(|e| CoreError::Config(e.to_string()))?;
         let server = resolve_server(&settings)?;
+        store.ensure_identity_on_mutation().map_err(id_err)?;
         let relay = settings.relay_only();
         let lease = store
             .try_acquire_engine_lease()
@@ -1223,14 +1219,10 @@ impl Core {
     /// inbox for a daemon, the caller's directory for a one-shot receive.
     fn prepare_engine(&self, engine_dir: PathBuf) -> Result<(EngineParts, CoreLease), CoreError> {
         let store = DeviceStore::open(&self.dir);
-        if !store.has_identity() {
-            return Err(CoreError::Identity(
-                "no identity in this config directory; run init or join first".into(),
-            ));
-        }
         let settings =
             CoreSettings::load(&self.dir).map_err(|e| CoreError::Config(e.to_string()))?;
         let server = resolve_server(&settings)?;
+        store.ensure_identity_on_mutation().map_err(id_err)?;
         let lease = store
             .try_acquire_engine_lease()
             .map_err(|e| CoreError::Engine(format!("engine lease: {e}")))?
@@ -3062,7 +3054,7 @@ mod tests {
         let status = core.status().unwrap();
         assert_eq!(status.fingerprint, None);
         assert_eq!(status.engine, EngineState::NotLinked);
-        assert!(matches!(core.start().unwrap_err(), CoreError::Identity(_)));
+        assert!(!core.config_dir().join("identity.ed25519").exists());
     }
 
     /// A dispatch that observes cancellation cooperatively and then parks until
@@ -3482,11 +3474,26 @@ mod tests {
     }
 
     #[test]
-    fn start_without_identity_is_refused_and_installs_no_engine() {
+    fn engine_preparation_bootstraps_identity_without_dispatch_or_replacement() {
         let core = core();
-        assert!(matches!(core.start().unwrap_err(), CoreError::Identity(_)));
-        // A refused start must not install an engine slot or a lease.
+        let (_parts, lease) = core.prepare_engine(core.dir.join("inbox")).unwrap();
+        let fingerprint = core.fingerprint().unwrap().unwrap();
+        drop(lease);
+        let (_parts, _lease) = core.prepare_send().unwrap();
+        assert_eq!(core.fingerprint().unwrap().as_deref(),Some(fingerprint.as_str()));
         assert_eq!(core.status().unwrap().engine, EngineState::NotLinked);
+    }
+
+    #[test]
+    fn invalid_config_and_corrupt_identity_fail_without_bootstrap_replacement() {
+        let core = core();
+        std::fs::write(core.dir.join("config"),"server\n").unwrap();
+        assert!(matches!(core.prepare_send(),Err(CoreError::Config(_))));
+        assert_eq!(core.fingerprint().unwrap(),None);
+        std::fs::write(core.dir.join("config"),"").unwrap();
+        std::fs::write(core.dir.join("identity.ed25519"),b"corrupt existing key").unwrap();
+        assert!(matches!(core.prepare_send(),Err(CoreError::Identity(_))));
+        assert_eq!(std::fs::read(core.dir.join("identity.ed25519")).unwrap(),b"corrupt existing key");
     }
 
     #[test]
