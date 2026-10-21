@@ -11,6 +11,13 @@
 name: iroh transport PoC
 
 on:
+  # Lane branch: run on every push so the exact head SHA has evidence even
+  # before (or without) a pull request. `workflow_dispatch` alone is not enough
+  # here because GitHub only offers manual dispatch for workflows present on
+  # the default branch.
+  push:
+    branches:
+      - "work/iroh-transport-poc"
   pull_request:
     paths:
       - "crates/filament-transport-iroh/**"
