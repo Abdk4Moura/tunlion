@@ -17,11 +17,11 @@
 //! file keeps them and re-exports the items below, so every daemon call site
 //! still resolves under `crate::daemon_ctl::`.
 
-use crate::conn::{Conn, warm_link_for};
+use crate::conn::{warm_link_for, Conn};
 use crate::control;
 use crate::link_manager::peer_present;
 use filament_transport::net;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -154,11 +154,7 @@ impl LivenessProbes {
             return false;
         };
         let tx = {
-            let mut waiters = self
-                .state
-                .waiters
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut waiters = self.state.waiters.lock().unwrap_or_else(|e| e.into_inner());
             let matches = waiters.get(&nonce).is_some_and(|w| {
                 w.pid == pid && peer.is_some_and(|p| w.peer.eq_ignore_ascii_case(p))
             });
@@ -305,7 +301,11 @@ pub async fn handle_warm_ping(conn: &Conn, probes: &LivenessProbes, req: control
     let log = conn.log.clone();
     tokio::spawn(async move {
         let t0 = Instant::now();
-        let ok = sent && matches!(tokio::time::timeout(window, probe.answered()).await, Ok(true));
+        let ok = sent
+            && matches!(
+                tokio::time::timeout(window, probe.answered()).await,
+                Ok(true)
+            );
         if ok {
             reply["alive_ms"] = json!(t0.elapsed().as_millis() as u64);
             req.reply(&reply).await;
@@ -369,8 +369,7 @@ pub async fn handle_list_warm(conn: &Conn, req: control::Req) {
 /// or reap it on timeout. A `Vec` per pid handles concurrent ssh to one peer (the
 /// ack is identical, so every waiter gets the same answer).
 #[cfg(unix)]
-pub type PendingBootstraps =
-    HashMap<String, Vec<(tokio::net::UnixStream, std::time::Instant)>>;
+pub type PendingBootstraps = HashMap<String, Vec<(tokio::net::UnixStream, std::time::Instant)>>;
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
 /// is diagnosable (visible at `-v` / TUNLION_LOG=debug only).
@@ -431,11 +430,7 @@ pub async fn handle_warm_bootstrap(
 /// the `shell-bootstrap-ack`/`-deny` arms; a no-op if none are pending (e.g. the
 /// peer re-acked, or the waiter was already reaped).
 #[cfg(unix)]
-pub async fn complete_warm_bootstrap(
-    pending: &mut PendingBootstraps,
-    pid: &str,
-    reply: &Value,
-) {
+pub async fn complete_warm_bootstrap(pending: &mut PendingBootstraps, pid: &str, reply: &Value) {
     if let Some(waiters) = pending.remove(pid) {
         for (mut sock, _) in waiters {
             control::send_reply(&mut sock, reply).await;
@@ -493,7 +488,7 @@ pub async fn handle_warm_req(
         control::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
         control::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
         control::ReqKind::Exec { .. } => {
-            crate::l2::warm_exec::handle_warm_exec(conn, l2_muxes, tx, req).await
+            crate::l2::warm_exec::handle_warm_exec(conn, l2_muxes, tx, probes, req).await
         }
         control::ReqKind::Ping { .. } => handle_warm_ping(conn, probes, req).await,
         // Bootstrap is dispatched before this (it defers its reply), so it never
@@ -534,7 +529,9 @@ pub async fn handle_warm_req(
             req.reject("fleet-rendezvous not handled here").await
         }
         control::ReqKind::ListPending => req.reject("list-pending not handled here").await,
-        control::ReqKind::ApproveRequest { .. } => req.reject("approve-request not handled here").await,
+        control::ReqKind::ApproveRequest { .. } => {
+            req.reject("approve-request not handled here").await
+        }
         control::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
     }
 }
@@ -544,7 +541,11 @@ pub async fn handle_warm_req(
 #[cfg(unix)]
 fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
     for (p, l) in conn.links.iter() {
-        if !l.verified_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(peer)) {
+        if !l
+            .verified_name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(peer))
+        {
             continue;
         }
         conn.log.debug(&format!(
@@ -596,7 +597,9 @@ pub async fn handle_warm_open(
     // timeout (the 25s ssh ConnectTimeout we measured). Spawned so the verify wait
     // never blocks the event loop (F8).
     tokio::spawn(async move {
-        match crate::l2::open_stream_verified_reason(&mux, rport, crate::l2::warm_verify_window()).await {
+        match crate::l2::open_stream_verified_reason(&mux, rport, crate::l2::warm_verify_window())
+            .await
+        {
             crate::l2::WarmOpen::Opened(sid, first, rx) => {
                 let sock = req.accept().await;
                 crate::l2::serve_verified_stream(mux, sid, sock, first, rx).await;
@@ -671,7 +674,9 @@ pub async fn handle_warm_pty(
     // pty rather than getting a dead terminal. Spawned so the verify wait never
     // blocks the event loop (F8).
     tokio::spawn(async move {
-        match crate::l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, &cmd, verify).await {
+        match crate::l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, &cmd, verify)
+            .await
+        {
             crate::l2::WarmPtyVerdict::Opened(sid, first, rx_pipe) => {
                 if let Ok(mut m) = warm_ptys.lock() {
                     m.insert(session.clone(), (pid, sid));

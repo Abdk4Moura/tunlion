@@ -64,6 +64,7 @@ pub async fn handle_warm_exec(
     conn: &Conn,
     muxes: &mut MuxMap,
     tx: &mpsc::UnboundedSender<filament_transport::net::Ev>,
+    probes: &crate::daemon_ctl::LivenessProbes,
     req: control::Req,
 ) {
     let control::ReqKind::Exec {
@@ -90,9 +91,54 @@ pub async fn handle_warm_exec(
         .clone();
     let tx = tx.clone();
     let log = conn.log.clone();
+    let probes = probes.clone();
     tokio::spawn(async move {
+        // PREFLIGHT: a held link can be a zombie (alive at the QUIC layer while
+        // black-holing new streams). Sending `exec-open` there and then failing
+        // is FINAL under the no-replay rule, which would turn a healthy cold
+        // path into an exec failure. One bounded reach-ping BEFORE anything is
+        // sent distinguishes "no usable warm path" (safe fallback) from
+        // "open attempted" (final).
+        if !warm_link_answers(&t, &probes, &peer, &pid).await {
+            log.debug(&format!(
+                "warm-exec: link to '{peer}' did not answer a preflight ping; cold fallback"
+            ));
+            let _ = tx.send(filament_transport::net::Ev::DropLink(pid));
+            req.reject("no warm path: warm link did not answer a preflight ping")
+                .await;
+            return;
+        }
         run_warm_exec(mux, t, pid, peer, argv, cwd, env, tty, tx, log, req).await;
     });
+}
+
+/// Bounded liveness check on the exact link we are about to use. It opens
+/// nothing and starts nothing, so a failure here is the ONE safe cold fallback
+/// after a warm link was selected.
+async fn warm_link_answers(
+    t: &Arc<dyn Transport>,
+    probes: &crate::daemon_ctl::LivenessProbes,
+    peer: &str,
+    pid: &str,
+) -> bool {
+    let mut probe = probes.register(peer, pid);
+    let sent = t
+        .send_control(&crate::daemon_ctl::liveness_ping(probe.nonce()))
+        .await
+        .is_ok();
+    if !sent {
+        drop(probe);
+        return false;
+    }
+    let window = crate::daemon_ctl::liveness_window();
+    let answered = matches!(
+        tokio::time::timeout(window, probe.answered()).await,
+        Ok(true)
+    );
+    if !answered {
+        drop(probe);
+    }
+    answered
 }
 
 /// The session body, detached from the receive loop.
@@ -374,25 +420,24 @@ async fn run_warm_exec(
                     // already queued: an `exec-close` carries the exact status
                     // and byte counts, so dropping it for the generic
                     // "no status" fallback loses a clean exit.
-                    let mut closed = false;
-                    while let Ok(v) = ctl.try_recv() {
-                        match queued_ctl(&v, sid, &mut status, &mut want_out, &mut want_err) {
-                            QueuedCtl::Ignore => {}
-                            QueuedCtl::Ended => {
-                                closed = true;
-                                break;
-                            }
-                            QueuedCtl::Terminal(v) => {
-                                terminal = Some(v);
-                                break;
-                            }
+                    match wait_queued_ctl(
+                        &mut ctl,
+                        sid,
+                        &mut status,
+                        &mut want_out,
+                        &mut want_err,
+                        Duration::from_millis(500),
+                    )
+                    .await
+                    {
+                        WaitEnd::Ended => {}
+                        WaitEnd::Terminal(v) => terminal = Some(v),
+                        WaitEnd::None => {
+                            // The dispatch loop queues the full `l2-close` frame
+                            // BEFORE it drops the stream, so prefer that frame over
+                            // the reason-only fallback (it carries the remedy).
+                            terminal = Some(stream_ended(&mux, &peer, sid).await);
                         }
-                    }
-                    if terminal.is_none() && !closed {
-                        // The dispatch loop queues the full `l2-close` frame
-                        // BEFORE it drops the stream, so prefer that frame over
-                        // the reason-only fallback (it carries the remedy).
-                        terminal = Some(stream_ended(&mux, &peer, sid).await);
                     }
                     break;
                 }
@@ -499,6 +544,45 @@ async fn run_warm_exec(
     // A stream that ended must not leave a half-live remote tree behind.
     if t.is_dead() {
         let _ = tx.send(filament_transport::net::Ev::DropLink(pid));
+    }
+}
+
+enum WaitEnd {
+    Ended,
+    Terminal(Value),
+    None,
+}
+
+/// After the output pipe ends, a fast command's `exec-close` can still be in
+/// flight (control and data are separate channels). Read what is queued, then
+/// wait a short bounded grace for the ordered control frame before falling back
+/// to the reason-only terminal. A queued/prefilled frame is handled at once.
+async fn wait_queued_ctl(
+    ctl: &mut mpsc::Receiver<Value>,
+    sid: u32,
+    status: &mut Option<i32>,
+    want_out: &mut Option<u64>,
+    want_err: &mut Option<u64>,
+    grace: Duration,
+) -> WaitEnd {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        let v = match ctl.try_recv() {
+            Ok(v) => Some(v),
+            Err(mpsc::error::TryRecvError::Empty) => {
+                match tokio::time::timeout_at(deadline, ctl.recv()).await {
+                    Ok(Some(v)) => Some(v),
+                    _ => None,
+                }
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => None,
+        };
+        let Some(v) = v else { return WaitEnd::None };
+        match queued_ctl(&v, sid, status, want_out, want_err) {
+            QueuedCtl::Ignore => {}
+            QueuedCtl::Ended => return WaitEnd::Ended,
+            QueuedCtl::Terminal(v) => return WaitEnd::Terminal(v),
+        }
     }
 }
 
@@ -624,6 +708,38 @@ mod tests {
     /// control channel. When the pipe then ends, a QUEUED `exec-close` must be
     /// honoured (status + exact byte counts), not replaced by the generic
     /// "no exit status" terminal.
+    /// The control frame may be a few milliseconds behind the pipe end. The
+    /// helper must wait for it within the grace, not substitute a generic end.
+    #[tokio::test]
+    async fn a_late_exec_close_is_waited_for_not_replaced() {
+        let sid = 0x8000_0009;
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = tx
+                .send(json!({
+                    "type": "exec-close", "sid": sid,
+                    "status": 0, "out_bytes": 2, "err_bytes": 0,
+                }))
+                .await;
+        });
+        let mut status = None;
+        let mut want_out = None;
+        let mut want_err = None;
+        let end = wait_queued_ctl(
+            &mut rx,
+            sid,
+            &mut status,
+            &mut want_out,
+            &mut want_err,
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(matches!(end, WaitEnd::Ended));
+        assert_eq!(status, Some(0));
+        assert_eq!(want_out, Some(2));
+    }
+
     #[test]
     fn a_queued_exec_close_survives_the_output_pipe_ending_first() {
         let sid = 0x8000_0007;
