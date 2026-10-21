@@ -266,7 +266,6 @@ async fn prune_session_attachments(
 /// callback (which cannot reach the receive-loop-owned map), so the entry can
 /// briefly outlive it; validating here keeps a stale key from refusing another
 /// session that legitimately reuses the sid, or from authorizing a close.
-#[cfg(feature = "pty-server")]
 async fn prune_stale_link_bindings(
     pid: &str,
     mux: &Arc<Mux>,
