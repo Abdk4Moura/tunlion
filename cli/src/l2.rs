@@ -221,6 +221,12 @@ pub struct PtySessionHandle {
     /// Set once the task observes the shell exit OR a reap, so a stale handle in
     /// the map is recognized as dead and replaced by a fresh spawn.
     dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Library-installed teardown for the current attachment. The session task
+    /// invokes it on every exit that never returns through the receive loop
+    /// (natural exit, idle/lifetime reap, revocation), so that path also
+    /// releases its mux stream/resizer. A newer attachment replaces the slot;
+    /// only the newest sid is ever released.
+    end_cleanup: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 
 impl PtySessionHandle {
@@ -248,6 +254,20 @@ impl PtySessionHandle {
     /// `pty-close` / user-closed path, NOT a transient channel drop).
     pub fn end(&self) {
         let _ = self.cmd_tx.send(SessionCmd::End);
+    }
+    /// Install the release for the CURRENT attachment. Returns false when the
+    /// session has already ended, in which case the caller must release its
+    /// registrations itself.
+    pub fn set_end_cleanup(&self, cleanup: Box<dyn FnOnce() + Send>) -> bool {
+        let mut slot = self
+            .end_cleanup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_dead() {
+            return false;
+        }
+        *slot = Some(cleanup);
+        true
     }
 }
 
@@ -395,12 +415,14 @@ pub async fn spawn_pty_session(
     let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let end_cleanup = Arc::new(std::sync::Mutex::new(None));
 
     let handle = PtySessionHandle {
         input_tx,
         resize_tx,
         cmd_tx,
         dead: dead.clone(),
+        end_cleanup: end_cleanup.clone(),
     };
 
     // The long-lived session task: it owns the PTY output, the current binding,
@@ -541,6 +563,16 @@ pub async fn spawn_pty_session(
         let _ = child.kill();
         let _ = child.wait();
         dead.store(true, Ordering::Release);
+        // Publish "ended" BEFORE taking the slot. A concurrent attach that
+        // loses the race then sees `is_dead()` and releases its own stream,
+        // instead of storing a cleanup this task has already passed.
+        let cleanup = end_cleanup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
         if let Some(b) = &bind {
             let close = match revoked_reason {
                 Some(reason) => json!({ "type": "l2-close", "sid": b.sid, "err": reason }),
@@ -5890,6 +5922,63 @@ mod h1_tests {
         assert!(
             sessions.get_live("sess-x").await.is_none(),
             "ended session must leave the store"
+        );
+    }
+
+    /// A session that ends on its own runs the attachment release the library
+    /// installed. This is the path no receive-loop event reaches: the mux
+    /// stream/resizer must still be freed (regression: natural shell exit left
+    /// the sid registered until link death).
+    #[tokio::test]
+    async fn natural_session_exit_runs_the_installed_end_cleanup_once() {
+        let _slot_guard = PTY_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !std::path::Path::new("/bin/sh").exists() {
+            return; // environment without /bin/sh: skip rather than fail
+        }
+        let sessions = PtySessions::new();
+        let t = CapTransport::new();
+        let guard = PtyGuard::try_acquire().expect("slot");
+        let sess = spawn_pty_session(
+            sessions.clone(),
+            "sess-natural-end".to_string(),
+            t,
+            L2_SID_BASE | 21,
+            80,
+            24,
+            "xterm-256color",
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 0.2".to_string(),
+            ],
+            guard,
+            None,
+            false,
+        )
+        .await
+        .expect("spawn");
+
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let seen = cleaned.clone();
+        assert!(
+            sess.set_end_cleanup(Box::new(move || seen.store(true, Ordering::SeqCst))),
+            "a live session accepts its release"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "natural exit did not run the installed release"
+        );
+        assert!(
+            sessions.get_live("sess-natural-end").await.is_none(),
+            "ended session must leave the store"
+        );
+        assert!(
+            !sess.set_end_cleanup(Box::new(|| {})),
+            "an already-ended session tells the caller to release its own stream"
         );
     }
 

@@ -243,6 +243,9 @@ impl filament_peerloop::recv::servers::shell::PtySession for l2::PtySessionHandl
     fn end(&self) {
         l2::PtySessionHandle::end(self)
     }
+    fn set_end_cleanup(&self, cleanup: Box<dyn FnOnce() + Send>) -> bool {
+        l2::PtySessionHandle::set_end_cleanup(self, cleanup)
+    }
 }
 
 #[async_trait::async_trait]
