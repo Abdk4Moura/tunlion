@@ -2730,3 +2730,28 @@ pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
         .collect();
     arr
 }
+
+#[cfg(test)]
+mod l3_envelope_tests {
+    use super::*;
+
+    /// `devices --json` must carry the live endpoint state beside the rows:
+    /// an address in a row is not evidence of a route.
+    #[test]
+    fn devices_envelope_carries_the_l3_state() {
+        let l3 = json!({"state": "down", "mode": "none", "reason": "no daemon"});
+        let v = devices_json_envelope(vec![json!({"name": "bob"})], l3.clone());
+        assert_eq!(v["verb"], "devices");
+        assert_eq!(v["schema"], 2);
+        assert_eq!(v["data"]["devices"][0]["name"], "bob");
+        assert_eq!(v["data"]["l3"], l3);
+    }
+
+    #[test]
+    fn devices_envelope_carries_ready_and_mode() {
+        let l3 = json!({"state": "ready", "mode": "userspace"});
+        let v = devices_json_envelope(vec![], l3);
+        assert_eq!(v["data"]["l3"]["state"], "ready");
+        assert_eq!(v["data"]["l3"]["mode"], "userspace");
+    }
+}
