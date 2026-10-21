@@ -6649,8 +6649,14 @@ async fn recv_run(
                 // shell and removes the session so a later open spawns fresh.
                 Some("pty-close") if l2_enabled => {
                     #[cfg(feature = "pty-server")]
-                    crate::recv::servers::shell::pty_close(&ports, &pid, &v, &mut pty_bindings)
-                        .await;
+                    crate::recv::servers::shell::pty_close(
+                        &ports,
+                        &pid,
+                        &v,
+                        &l2_muxes,
+                        &mut pty_bindings,
+                    )
+                    .await;
                 }
                 // Client confirmed the protocol version advertised in mount-open-ack.
                 // The server is already running in that version; this control is

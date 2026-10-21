@@ -79,6 +79,11 @@ type StreamTx = mpsc::Sender<PipeItem>;
 struct StreamHandle {
     tx: StreamTx,
     read_pump: Option<AbortHandle>,
+    /// Monotonic identity for THIS registration. A sid can be reused after its
+    /// stream is torn down; a detached session's late cleanup must only free
+    /// the stream it actually owned, never a newer generation that reused the
+    /// same sid.
+    generation: u64,
 }
 
 /// H-1 (DoS): per-link cap on concurrently live streams (file + L2 + PTY share
@@ -112,6 +117,8 @@ pub struct Mux {
     host: Arc<dyn HostServices>,
     streams: Mutex<HashMap<u32, StreamHandle>>,
     next_sid: AtomicU32,
+    /// Identity source for [`StreamHandle::generation`]. Never reset.
+    next_generation: std::sync::atomic::AtomicU64,
     /// Acceptor only: sids we have seen `l2-open` for and accepted, so a late
     /// duplicate open is ignored. (Initiator allocates, so it can't double-open.)
     accepted: Mutex<HashMap<u32, ()>>,
@@ -167,6 +174,7 @@ impl Mux {
             host,
             streams: Mutex::new(HashMap::new()),
             next_sid: AtomicU32::new(0),
+            next_generation: std::sync::atomic::AtomicU64::new(0),
             accepted: Mutex::new(HashMap::new()),
             resizers: Mutex::new(HashMap::new()),
             open_ack_tx: Mutex::new(HashMap::new()),
@@ -215,11 +223,16 @@ impl Mux {
             return None; // sid already live: refuse, do NOT overwrite/drop
         }
         let (tx, rx) = mpsc::channel::<PipeItem>(256);
+        let generation = self
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         streams.insert(
             sid,
             StreamHandle {
                 tx,
                 read_pump: None,
+                generation,
             },
         );
         Some(rx)
@@ -296,6 +309,45 @@ impl Mux {
             // Dropping `s.tx` closes the pipe; the writer pump (dc_to_socket)
             // sees `recv()` return None and shuts the socket down.
         }
+    }
+
+    /// Is `sid` currently registered on this link? The PTY open path uses this
+    /// to refuse a sid owned by a forward/mount/other stream BEFORE it drops
+    /// anything for a superseded attachment.
+    pub async fn has_stream(&self, sid: u32) -> bool {
+        self.streams.lock().await.contains_key(&sid)
+    }
+
+    /// The identity of the registration currently holding `sid`, if any. A
+    /// cleanup task records this and later calls [`Self::drop_stream_if`] so a
+    /// sid reused by a newer attachment is never torn down by an older
+    /// generation's exit.
+    pub async fn stream_generation(&self, sid: u32) -> Option<u64> {
+        self.streams.lock().await.get(&sid).map(|s| s.generation)
+    }
+
+    /// Drop `sid` only if it is still the SAME registration as `generation`.
+    /// Unlike [`Self::drop_stream`], this is safe to call from a detached
+    /// session's asynchronous teardown: a newer stream that reused the sid has
+    /// a different generation and is left alone.
+    pub async fn drop_stream_if(&self, sid: u32, generation: u64) {
+        let removed = {
+            let mut streams = self.streams.lock().await;
+            match streams.get(&sid) {
+                Some(s) if s.generation == generation => streams.remove(&sid),
+                _ => None,
+            }
+        };
+        let Some(s) = removed else { return };
+        // Same cleanup set as `drop_stream`, but the stream was already removed
+        // under the identity check above.
+        self.resizers.lock().await.remove(&sid);
+        self.open_ack_tx.lock().await.remove(&sid);
+        self.exec_ctl.lock().await.remove(&sid);
+        if let Some(h) = s.read_pump {
+            h.abort();
+        }
+        // Dropping `s.tx` closes the pipe; the host's input pump exits.
     }
 
     /// Register a PTY's resize sender (acceptor). Stored in the mux so it is freed
@@ -1200,6 +1252,28 @@ mod tests {
             Some(Some(bytes)) => assert_eq!(&bytes[..], b"hello"),
             other => panic!("original stream channel broken after refused register: {other:?}"),
         }
+    }
+
+    /// A detached session's late cleanup must not free a NEWER stream that
+    /// reused the same sid. Generations make the release conditional.
+    #[tokio::test]
+    async fn drop_stream_if_spares_a_new_generation_on_the_same_sid() {
+        let mux = Mux::new(MockTransport::new(), Arc::new(NoHost));
+        let sid = L2_SID_BASE | 55;
+        let _old = mux.register_stream(sid).await.expect("first generation");
+        let old = mux.stream_generation(sid).await.expect("generation recorded");
+        mux.drop_stream(sid).await;
+        let _new = mux.register_stream(sid).await.expect("sid reused");
+        let new = mux.stream_generation(sid).await.expect("new generation");
+        assert_ne!(old, new, "a reused sid gets a fresh identity");
+
+        // The OLD generation's cleanup is a no-op against the new stream.
+        mux.drop_stream_if(sid, old).await;
+        assert!(mux.has_stream(sid).await, "old cleanup must not free the new stream");
+        // The CURRENT generation releases it.
+        mux.drop_stream_if(sid, new).await;
+        assert!(!mux.has_stream(sid).await);
+        assert_eq!(mux.live_resizers().await, 0);
     }
 
     /// SECURITY (cross-stream collision): the exact shipped bug. A pty/mount open

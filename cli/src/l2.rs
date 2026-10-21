@@ -221,6 +221,12 @@ pub struct PtySessionHandle {
     /// Set once the task observes the shell exit OR a reap, so a stale handle in
     /// the map is recognized as dead and replaced by a fresh spawn.
     dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Library-installed teardown for the current attachment. The session task
+    /// invokes it on every exit that never returns through the receive loop
+    /// (natural exit, idle/lifetime reap, revocation), so that path also
+    /// releases its mux stream/resizer. A newer attachment replaces the slot;
+    /// only the newest sid is ever released.
+    end_cleanup: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 
 impl PtySessionHandle {
@@ -248,6 +254,20 @@ impl PtySessionHandle {
     /// `pty-close` / user-closed path, NOT a transient channel drop).
     pub fn end(&self) {
         let _ = self.cmd_tx.send(SessionCmd::End);
+    }
+    /// Install the release for the CURRENT attachment. Returns false when the
+    /// session has already ended, in which case the caller must release its
+    /// registrations itself.
+    pub fn set_end_cleanup(&self, cleanup: Box<dyn FnOnce() + Send>) -> bool {
+        let mut slot = self
+            .end_cleanup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_dead() {
+            return false;
+        }
+        *slot = Some(cleanup);
+        true
     }
 }
 
@@ -395,12 +415,14 @@ pub async fn spawn_pty_session(
     let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let end_cleanup = Arc::new(std::sync::Mutex::new(None));
 
     let handle = PtySessionHandle {
         input_tx,
         resize_tx,
         cmd_tx,
         dead: dead.clone(),
+        end_cleanup: end_cleanup.clone(),
     };
 
     // The long-lived session task: it owns the PTY output, the current binding,
@@ -541,6 +563,16 @@ pub async fn spawn_pty_session(
         let _ = child.kill();
         let _ = child.wait();
         dead.store(true, Ordering::Release);
+        // Publish "ended" BEFORE taking the slot. A concurrent attach that
+        // loses the race then sees `is_dead()` and releases its own stream,
+        // instead of storing a cleanup this task has already passed.
+        let cleanup = end_cleanup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
         if let Some(b) = &bind {
             let close = match revoked_reason {
                 Some(reason) => json!({ "type": "l2-close", "sid": b.sid, "err": reason }),
