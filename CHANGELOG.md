@@ -29,11 +29,15 @@ the GitHub release notes.
   The previous fail-closed path is gone. A received file is staged in a
   `.part` created relative to a chain of pinned directory HANDLEs (every
   component opened with `FILE_OPEN_REPARSE_POINT` and refused if it is a
-  junction/symlink), then committed by renaming that open staging HANDLE with
-  `SetFileInformationByHandle(FileRenameInfo, RootDirectory=pinned parent)`.
-  Parent junction/reparse swaps and root movement fail closed with a named
-  error; a destination symlink/junction is replaced as a name and never
-  followed. Filesystems that cannot express the replace return the named
+  junction/symlink). The admitted root is opened ONCE at admission, with
+  `FILE_OPEN_REPARSE_POINT` and a volume-serial/file-index check, and the
+  staging parent HANDLE is retained through finalization; neither is ever
+  reopened by path. The open staging HANDLE is committed with
+  `NtSetInformationFile(FILE_RENAME_INFORMATION, RootDirectory=pinned parent)`.
+  Root/parent renames and junction swaps fail closed (the handles are opened
+  without `FILE_SHARE_DELETE`), and a destination symlink/junction is replaced
+  as a name and never followed. This covers receive/staging/finalization only:
+  sync delete remains on the existing path-based `delete_within` rule. Filesystems that cannot express the replace return the named
   "Windows sync finalization is not supported on this filesystem" error. Unix
   receive behavior is unchanged.
 
