@@ -170,12 +170,21 @@ mod win {
         SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, INPUT_RECORD, KEY_EVENT,
         STD_INPUT_HANDLE,
     };
-    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PeekNamedPipe};
 
     pub struct WindowsStdin {
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
         reason: Arc<std::sync::Mutex<Option<&'static str>>>,
+    }
+
+    #[cfg(test)]
+    impl WindowsStdin {
+        pub(super) fn reader_finished(&self) -> bool {
+            self.handle
+                .as_ref()
+                .is_none_or(|handle| handle.is_finished())
+        }
     }
 
     impl StdinOwner for WindowsStdin {
@@ -230,6 +239,16 @@ mod win {
         question_open: Arc<AtomicBool>,
         present: Arc<dyn Presentation>,
     ) -> Option<Box<dyn StdinOwner>> {
+        spawn_on_handle_raw(input, tx, question_open, present)
+            .map(|owner| Box::new(owner) as Box<dyn StdinOwner>)
+    }
+
+    pub(super) fn spawn_on_handle_raw(
+        input: HANDLE,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) -> Option<WindowsStdin> {
         if input.is_null() {
             return None;
         }
@@ -246,11 +265,11 @@ mod win {
                 }
             }
         });
-        Some(Box::new(WindowsStdin {
+        Some(WindowsStdin {
             stop,
             handle: Some(handle),
             reason,
-        }))
+        })
     }
 
     fn reader(
@@ -271,7 +290,25 @@ mod win {
             }
             return console_reader(input, mode, stop, tx, question_open, present);
         }
-        if kind == FILE_TYPE_PIPE || kind == FILE_TYPE_DISK {
+        if kind == FILE_TYPE_PIPE {
+            // GetFileType also reports sockets as pipes. Probe the pipe
+            // attributes so a socket is a named failure, not an idle reader.
+            // Anonymous pipes are named-pipe-backed and succeed here.
+            if unsafe {
+                GetNamedPipeInfo(
+                    input,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err("windows stdin is a socket, not a pipe");
+            }
+            return byte_reader(input, kind, stop, tx, question_open, present);
+        }
+        if kind == FILE_TYPE_DISK {
             return byte_reader(input, kind, stop, tx, question_open, present);
         }
         Err("windows stdin handle is neither console, pipe, nor disk")
@@ -621,7 +658,9 @@ mod unix_pipe_tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::win::{spawn_on_handle, spawn_panicking_for_test, spawn_stuck_for_test};
+    use super::win::{
+        spawn_on_handle, spawn_on_handle_raw, spawn_panicking_for_test, spawn_stuck_for_test,
+    };
     use filament_peerloop::present::NoScreen;
     use filament_peerloop::recv::ports::StdinOutcome;
     use filament_transport::net::Ev;
@@ -705,6 +744,32 @@ mod windows_tests {
         unsafe {
             CloseHandle(read as *mut _);
         }
+    }
+
+    #[test]
+    fn pipe_eof_is_observed_without_stop() {
+        let (read, write) = pipe();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let owner = spawn_on_handle_raw(
+            read as *mut _,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(NoScreen),
+        )
+        .expect("reader");
+        // SAFETY: closing the only write end produces EOF.
+        unsafe { CloseHandle(write as *mut _) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !owner.reader_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader did not observe pipe EOF without stop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut owner = Box::new(owner) as Box<dyn filament_peerloop::recv::ports::StdinOwner>;
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        unsafe { CloseHandle(read as *mut _) };
     }
 
     #[test]
@@ -819,7 +884,9 @@ mod windows_tests {
         let (mut owner, _rx) = owner(listener.as_raw_socket() as usize);
         match owner.join() {
             StdinOutcome::Detached(reason) => assert!(
-                reason.contains("pipe query failed") || reason.contains("neither console"),
+                reason.contains("socket, not a pipe")
+                    || reason.contains("pipe query failed")
+                    || reason.contains("neither console"),
                 "expected a named failure, got {reason}"
             ),
             other => panic!("expected detached, got {other:?}"),
