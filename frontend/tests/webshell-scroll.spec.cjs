@@ -379,6 +379,77 @@ function legacyWheel(code, col, row) {
     await page.close();
   }
 
+  // 12. Local recovery must not consume server stream slots. A healthy link
+  // with an acked PTY gets repaints only; repeated Redraw/watchdog recovery
+  // keeps openPty at one. A real link swap reattaches exactly once with the
+  // same session id and resume_from.
+  {
+    const page = await openPage(browser);
+    await page.waitForFunction(() => window.__scroll.openPtyCalls().length === 1, null, { timeout: 5000 });
+    await page.waitForFunction(() => typeof window.__webtermRecover === 'function', null, { timeout: 5000 });
+    await page.evaluate(() => { window.__savedTerm = window.__webterm });
+    await feed(page, HISTORY);
+    const before = await page.evaluate(() => {
+      const b = window.__webterm.buffer.active;
+      return { baseY: b.baseY, length: b.length, line: b.getLine(Math.max(0, b.baseY - 1)).translateToString(true) };
+    });
+    await page.evaluate(() => { for (let i = 0; i < 12; i++) window.__webtermRecover(); });
+    await wait(120);
+    const afterCalls = await page.evaluate(() => window.__scroll.openPtyCalls());
+    eq(afterCalls.length, 1, '12 local Redraw recoveries must keep openPty at one');
+    const after = await page.evaluate(() => {
+      const b = window.__webterm.buffer.active;
+      return { baseY: b.baseY, length: b.length, line: b.getLine(Math.max(0, b.baseY - 1)).translateToString(true) };
+    });
+    eq(after, before, 'local Redraw changed scrollback/buffer content');
+    eq(await page.evaluate(() => window.__savedTerm === window.__webterm), true, 'local Redraw replaced the terminal identity');
+
+    // Partial/alternate TUI repaint: still local, still the same terminal.
+    await feed(page, '\x1b[?1049h');
+    await feed(page, '\x1b[?1002h\x1b[?1006h');
+    await feed(page, 'alt marker\r\n');
+    const altBefore = await state(page);
+    eq(altBefore.bufferType, 'alternate', 'alt repaint fixture did not enter alternate screen');
+    await page.evaluate(() => { for (let i = 0; i < 12; i++) window.__webtermRecover(); });
+    await wait(120);
+    const altAfter = await state(page);
+    eq(altAfter.bufferType, 'alternate', 'local Redraw lost the alternate screen');
+    eq(await page.evaluate(() => window.__scroll.openPtyCalls().length), 1, 'alt-screen repaint opened another PTY stream');
+
+    // Watchdog path: fake a stale render with new bytes and let the 1s tick run
+    // redrawRecover. It must recover the renderer locally, not re-open the PTY.
+    await page.evaluate(() => {
+      const w = window.__webtermWatchdog;
+      const b = window.__webterm.buffer.active;
+      w.lastSig = b.length + ':' + b.baseY + ':' + b.cursorY + ':' + b.cursorX;
+      w.renderAt = Date.now() - 5000;
+      w.bytesAt = Date.now() - 5000;
+      w.lastByteCount = w.byteCount;
+      w.byteCount += 17;
+      w.recoverAt = 0;
+    });
+    await page.waitForFunction(() => window.__webtermWatchdog.recoverAt > 0, null, { timeout: 5000 });
+    eq(await page.evaluate(() => window.__scroll.openPtyCalls().length), 1, 'watchdog recovery opened another PTY stream');
+    ok('local Redraw/watchdog: 12x + alt screen + watchdog, one PTY open, terminal/scrollback preserved');
+
+    // Real link replacement: one fresh binding/open, same PTY session, resume_from.
+    const resumeText = 'resume-me';
+    await page.evaluate((t) => window.__scroll.feedLink(t), resumeText);
+    await page.evaluate(() => window.__scroll.swapLink());
+    await page.waitForFunction(() => window.__scroll.openPtyCalls().length === 2, null, { timeout: 5000 });
+    const calls = await page.evaluate(() => window.__scroll.openPtyCalls());
+    eq(calls.length, 2, 'link swap must reattach exactly once');
+    eq(calls[1].link !== calls[0].link, true, 'link swap did not use a replacement link');
+    eq(calls[1].session, calls[0].session, 'reattach changed the stable PTY session id');
+    eq(calls[1].resumeFrom, Buffer.byteLength(resumeText), 'reattach did not resume from the bytes already shown');
+    eq(await page.evaluate(() => window.__savedTerm === window.__webterm), true, 'link swap replaced the terminal identity');
+    await page.evaluate(() => { for (let i = 0; i < 12; i++) window.__webtermRecover(); });
+    await wait(120);
+    eq(await page.evaluate(() => window.__scroll.openPtyCalls().length), 2, 'post-reattach Redraw opened another PTY stream');
+    ok('link swap: one reattach, same session, resume_from preserved; later Redraw stays local');
+    await page.close();
+  }
+
   // 1. Ordinary normal-buffer terminal: local history, never PTY data.
   {
     const page = await openPage(browser);

@@ -136,6 +136,13 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const recvRef = useRef(0)
   const openedRef = useRef(false) // an open went out before: the next is a reattach
   const wasReadyRef = useRef(false) // the shell was live once: a drop is "reconnecting"
+  // Which link owns the current PTY attachment. A local repaint must not call
+  // openPty() again while this link still has an open channel and an acked PTY:
+  // every open consumes a server stream slot. These refs are cleared when the
+  // channel goes down, the PTY closes, or a different link replaces it, so a
+  // genuine reconnect still reattaches with resume_from.
+  const ptyOpenLinkRef = useRef(null)
+  const ptyReadyLinkRef = useRef(null)
   const statusRef = useRef('connecting')
   useEffect(() => { statusRef.current = status }, [status])
   // Predictive / local echo (mosh-style): paints keystrokes instantly, styled,
@@ -451,18 +458,32 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     unbindRef.current = bindLinkRef.current()
   }, [])
   // No-reload recovery: if the screen ever gets stuck (a paused DOM renderer
-  // after a flaky reconnect / a hidden then re-shown host), this re-fits, forces
-  // a FULL repaint of every row, rebinds the current link's PTY callbacks, and
-  // re-opens/reattaches the PTY with our stable session id. Safe to call anytime
-  // (no link / no terminal yet => no-ops), and it never tears down the terminal,
-  // so scrollback survives. Wired to a button near the scroll-to-bottom control.
+  // after a flaky reconnect / a hidden then re-shown host), this re-fits and
+  // forces a FULL repaint of every row. A repaint is LOCAL: when the current
+  // link still has an open channel and its PTY is ready, it must NOT call
+  // openPty() again. Every open consumes a server stream slot, and repeated
+  // Redraw/watchdog recovery was leaking one per click. Only rebind/reattach
+  // when the link is actually down/replaced or the PTY is not ready. Safe to
+  // call anytime (no link / no terminal yet => no-ops), and it never tears down
+  // the terminal, so scrollback survives.
   const redrawRecover = useCallback(() => {
     const term = termRef.current
     safeFit()
     if (term) { try { term.refresh(0, Math.max(0, (term.rows || 1) - 1)) } catch (e) {} }
-    // Rebind + reattach the CURRENT link (rebindLink unbinds the old binding
-    // first, so there is no duplicate handler or leaked poll).
-    if (linkRef.current) { try { rebindLink() } catch (e) {} }
+    const l = linkRef.current
+    const ptyLive = !!(
+      l
+      && (ptyReadyLinkRef.current === l || ptyOpenLinkRef.current === l)
+      && l.channel
+      && l.channel.readyState === 'open'
+      && (!l.pc || l.pc.connectionState === 'connected')
+    )
+    // Rebind + reattach only when the current link is gone/replaced or its PTY
+    // is not owned at all. An open already in flight counts as owned: rebinding
+    // would unbind the handler that receives its pty-ready ack. rebindLink
+    // unbinds first, so a genuine reconnect still creates exactly one new
+    // binding/poll and no duplicate handlers.
+    if (l && !ptyLive) { try { rebindLink() } catch (e) {} }
     if (term) { try { focusTerminal() } catch (e) {} }
     haptic()
   }, [safeFit, rebindLink, focusTerminal])
@@ -627,7 +648,10 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         })
       }
       l.onPtyClose = (refusal) => {
+        if (linkRef.current !== l) return
         wasReadyRef.current = false
+        ptyReadyLinkRef.current = null
+        ptyOpenLinkRef.current = null
         setStatus('closed')
         if (!refusal) { term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n'); return }
         // Refused by the device: say why, and the one command that fixes it
@@ -639,7 +663,9 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         if (grant) term.write(`\x1b[90mto allow it, run this on ${where}:\x1b[0m\r\n  tunlion grant ${me} shell\r\n`)
       }
       l.onPtyReady = () => {
+        if (linkRef.current !== l) return
         wasReadyRef.current = true
+        ptyReadyLinkRef.current = l
         setStatus('ready')
         // The PTY is live (fresh or reattached): make sure its window size matches
         // what we actually render, then nudge a SIGWINCH so a TUI redraws to fit.
@@ -653,17 +679,30 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       // link swap the SAME session id makes this a reattach, not a fresh shell, so
       // the still-running remote PTY replays into this SAME terminal.
       const begin = () => {
-        if (l.channel && l.channel.readyState === 'open') {
-          const cols = term.cols || 80
-          const rows = term.rows || 24
-          // A reattach says how much it already has (resume_from); the first
-          // open says nothing, so it looks exactly as it always did.
-          l.openPty(cols, rows, sessionIdRef.current, openedRef.current ? recvRef.current : undefined)
-          openedRef.current = true
-          setStatus(wasReadyRef.current ? 'reconnecting' : 'connecting')
-          return true
+        const channelUp = !!(l.channel && l.channel.readyState === 'open')
+        const pcUp = !l.pc || l.pc.connectionState === 'connected'
+        if (!channelUp || !pcUp) {
+          // The channel/PC is down: the PTY attachment is no longer usable.
+          // Clear the ownership refs so the next open on this same link is a
+          // genuine reattach, not a skipped duplicate. (Do this before the
+          // pty-open guard; otherwise a Redraw racing the down detector can
+          // unbind the ack handler and then skip the replacement open.)
+          ptyReadyLinkRef.current = null
+          ptyOpenLinkRef.current = null
+          return false
         }
-        return false
+        // Already attached on this link, or an open is in flight: a local
+        // repaint/rebind must not consume another server stream slot.
+        if (ptyReadyLinkRef.current === l || ptyOpenLinkRef.current === l) return true
+        const cols = term.cols || 80
+        const rows = term.rows || 24
+        // A reattach says how much it already has (resume_from); the first
+        // open says nothing, so it looks exactly as it always did.
+        l.openPty(cols, rows, sessionIdRef.current, openedRef.current ? recvRef.current : undefined)
+        ptyOpenLinkRef.current = l
+        openedRef.current = true
+        setStatus(wasReadyRef.current ? 'reconnecting' : 'connecting')
+        return true
       }
       let poll = null
       if (!begin()) poll = setInterval(() => { if (begin()) clearInterval(poll) }, 200)
@@ -864,6 +903,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     if (!link) {
       // The link went away under a live shell: the remote PTY keeps running and
       // the next link reattaches to it, so say so instead of "connecting".
+      ptyReadyLinkRef.current = null
+      ptyOpenLinkRef.current = null
       if (wasReadyRef.current) setStatus('reconnecting')
       return
     }
@@ -888,6 +929,10 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       const down = !ch || ch.readyState !== 'open' || (!!pcs && pcs !== 'connected')
       if (statusRef.current === 'ready' && down) {
         downLinkRef.current = l
+        // The attachment cannot survive a dead channel: allow exactly one
+        // reattach when this link (or its replacement) comes back.
+        ptyReadyLinkRef.current = null
+        ptyOpenLinkRef.current = null
         setStatus('reconnecting')
       } else if (statusRef.current === 'reconnecting' && !down && l && l === downLinkRef.current) {
         downLinkRef.current = null

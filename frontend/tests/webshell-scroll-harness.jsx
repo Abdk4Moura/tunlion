@@ -14,6 +14,9 @@ const T = {
 }
 
 const inputs = []
+const openPtyCalls = []
+let linkSeq = 0
+let swapLinkImpl = null
 let active = null
 
 function recordInput(u8) {
@@ -25,13 +28,19 @@ function recordInput(u8) {
 }
 
 function fakeLink() {
+  const id = 'link-' + (++linkSeq)
   return {
+    id,
     channel: { readyState: 'open', send: () => {} },
     pc: { connectionState: 'connected' },
     _ptySid: null,
     onPtyData: () => {}, onPtyClose: () => {}, onPtyReady: () => {},
-    openPty() {
-      this._ptySid = 1
+    openPty(cols, rows, session, resumeFrom) {
+      // This is the server-stream-consuming call. Count every one, with the
+      // exact reattach inputs, so the gate can prove local repaint does not
+      // issue another PTY open.
+      openPtyCalls.push({ link: id, cols, rows, session, resumeFrom })
+      this._ptySid = openPtyCalls.length
       active = this
       setTimeout(() => { this.onPtyReady() }, 0)
     },
@@ -40,8 +49,6 @@ function fakeLink() {
     sendPtyInput(u8) { recordInput(u8) },
   }
 }
-
-const link = fakeLink()
 
 function state() {
   const t = window.__webterm
@@ -72,6 +79,9 @@ function state() {
 }
 
 window.__scroll = {
+  openPtyCalls: () => openPtyCalls.map((c) => ({ ...c })),
+  swapLink() { if (swapLinkImpl) swapLinkImpl() },
+  currentLink: () => window.__scroll._currentLink,
   // Write output exactly as a PTY chunk would arrive, and resolve after xterm
   // has parsed it (so buffer/mode assertions are not racing the parser).
   feed(text) {
@@ -103,17 +113,24 @@ window.__scroll = {
   state,
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(
-  <WebTerminal
-    link={link}
-    peerName="scroll-vps"
-    relation="remembered"
-    route="direct"
-    T={T}
-    accent="#7CF6C8"
-    font="monospace"
-    instanceId="scroll-harness"
-    viewportPinned
-    onClose={() => {}}
-  />,
-)
+function Harness() {
+  const [link, setLink] = React.useState(() => fakeLink())
+  swapLinkImpl = () => setLink(fakeLink())
+  window.__scroll._currentLink = link.id
+  return (
+    <WebTerminal
+      link={link}
+      peerName="scroll-vps"
+      relation="remembered"
+      route="direct"
+      T={T}
+      accent="#7CF6C8"
+      font="monospace"
+      instanceId="scroll-harness"
+      viewportPinned
+      onClose={() => {}}
+    />
+  )
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Harness />)
