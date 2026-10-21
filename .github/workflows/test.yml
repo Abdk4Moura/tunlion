@@ -336,7 +336,7 @@ jobs:
   # decline, offline-retry and revocation assertions cannot rot silently.
   durable-requests-e2e:
     needs: changes
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: durable requests E2E
     runs-on: ubuntu-latest
     timeout-minutes: 20
