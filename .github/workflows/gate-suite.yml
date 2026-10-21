@@ -284,9 +284,10 @@ jobs:
             # 5: P1 sender delivery, P2 inbox bytes, P3 summary, P4 code not
             # logged, P5 receiver exit 0.
             [cli/tests/core-receive-e2e-gates.sh]=5
-            # 7: R1 sender delivery, R2 inbox bytes, R3 summary, R4 relay route,
-            # R5 coturn allocation, R6 both NAT rules moved, R7 exit/no code.
-            [cli/tests/core-receive-relay-nat-gates.sh]=7
+            # 8: R1 sender delivery, R2 inbox bytes, R3 summary, R4 relay route,
+            # R5 ALLOCATE + relay packets, R6 cross-subnet blocked, R7 both NAT
+            # rules moved, R8 exit/no code.
+            [cli/tests/core-receive-relay-nat-gates.sh]=8
             # 9: H O S A W I G C X (feat/dashboard).
             [cli/tests/dashboard-gates.sh]=9
             # 6: A T I C N Z (feat/demo-command: the offline guided tour).

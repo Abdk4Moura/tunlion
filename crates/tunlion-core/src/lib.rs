@@ -858,9 +858,7 @@ impl Core {
             env,
         );
         fs::create_dir_all(&engine_dir).map_err(io_err)?;
-        let relay = settings
-            .get("relay")
-            .is_some_and(|value| value.eq_ignore_ascii_case("always"));
+        let relay = settings.relay_only();
         let settings_for_peer = settings.clone();
         let settings_for_membership = settings.clone();
         let transport_context = TransportContext::new(
