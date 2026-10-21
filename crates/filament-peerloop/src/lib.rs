@@ -58,6 +58,7 @@
 #![cfg_attr(not(feature = "mesh"), doc = include_str!("mesh_disabled.md"))]
 
 mod adoption;
+pub mod access;
 pub mod conn;
 pub mod consent;
 pub mod control;
