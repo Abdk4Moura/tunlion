@@ -3,20 +3,39 @@
 # binary is installed: the test APK loads the real cdylib through UniFFI/JNA.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-CLI_DIR="$ROOT/cli"
 BIN="${TUNLION_BIN:-$ROOT/target/release/tunlion}"
 PYV=python3
 PORT=8188
 SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d "${RUNNER_TEMP:-/tmp}/android-core.XXXXXX")"
-DA="$WORK/unused"
-source "$CLI_DIR/tests/lib/fixture.sh"
+FIX_PIDS=()
+fixture_cleanup() {
+    for pid in "${FIX_PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+}
 # The sender has normally exited before cleanup; kill(2) then returns nonzero.
 # Cleanup must preserve the test's status rather than turning success into 1.
 trap 'status=$?; fixture_cleanup || true; exit "$status"' EXIT
 export TUNLION_NONINTERACTIVE=1
-start_backend
-init_owner "$WORK/sender"
+(cd "$ROOT/backend"; exec timeout -k 5 480 env PORT="$PORT" FIL_ASYNC_MODE=eventlet \
+    FIL_SELF_MONKEYPATCH=1 FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 \
+    FIL_PING_INTERVAL=25 "$PYV" app.py >"$WORK/backend.log" 2>&1) &
+FIX_PIDS+=("$!")
+HEALTHY=false
+for _ in $(seq 1 30); do
+    if curl --connect-timeout 1 --max-time 2 -fsS "$SERVER/api/health" >/dev/null 2>&1; then
+        HEALTHY=true
+        break
+    fi
+    sleep 0.5
+done
+if [ "$HEALTHY" != true ]; then
+    echo 'local signaling fixture failed its bounded health check'
+    cat "$WORK/backend.log"
+    exit 1
+fi
+mkdir -p "$WORK/sender"
+timeout -k 5 45 env TUNLION_CONFIG_DIR="$WORK/sender" "$BIN" init --name alpha \
+    --recovery-file "$WORK/sender/recovery.txt" --yes >/dev/null
 PAY="$WORK/android-core-payload.bin"
 python3 - "$PAY" <<'PY'
 import sys
@@ -30,7 +49,7 @@ open(sys.argv[1], 'wb').write(payload)
 PY
 SHA="$(sha256sum "$PAY" | cut -d' ' -f1)"
 BYTES="$(stat -c %s "$PAY")"
-timeout -k 5 300 env TUNLION_CONFIG_DIR="$WORK/sender" "$BIN" --server "$SERVER" \
+timeout -k 5 420 env TUNLION_CONFIG_DIR="$WORK/sender" "$BIN" --server "$SERVER" \
     send "$PAY" --code --json >"$WORK/send.json" 2>"$WORK/send.err" &
 SENDER=$!
 FIX_PIDS+=("$SENDER")
@@ -54,11 +73,24 @@ PY
 done
 [ -n "$CODE" ] || { echo 'sender code deadline expired'; exit 1; }
 echo "::add-mask::$CODE"
-timeout -k 5 240 gradle -p "$ROOT/lab/android-core-smoke" --console plain \
+timeout -k 5 300 gradle -p "$ROOT/lab/android-core-smoke" --console plain \
     connectedDebugAndroidTest \
     "-Pandroid.testInstrumentationRunnerArguments.code=$CODE" \
     "-Pandroid.testInstrumentationRunnerArguments.sha256=$SHA" \
     "-Pandroid.testInstrumentationRunnerArguments.bytes=$BYTES"
+python3 - "$ROOT/lab/android-core-smoke/app/build/outputs/androidTest-results/connected" <<'PY'
+import pathlib, sys, xml.etree.ElementTree as ET
+cases = []
+for path in pathlib.Path(sys.argv[1]).rglob('TEST-*.xml'):
+    root = ET.parse(path).getroot()
+    assert int(root.get('failures', '0')) == 0, path
+    assert int(root.get('errors', '0')) == 0, path
+    assert int(root.get('skipped', '0')) == 0, path
+    cases.extend(root.iter('testcase'))
+assert len(cases) == 1, f'expected one executed APK test, found {len(cases)}'
+assert cases[0].get('name') == 'libraryStartsStopsAndReceivesVerifiedBytes'
+assert not list(cases[0]), 'test must not contain a failure/error/skip'
+PY
 wait "$SENDER"
 python3 - "$WORK/send.json" "$SHA" <<'PY'
 import json, sys

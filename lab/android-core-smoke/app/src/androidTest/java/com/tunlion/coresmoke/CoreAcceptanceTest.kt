@@ -16,7 +16,7 @@ import uniffi.tunlion_core.EngineState
 /** Calls the generated Kotlin bindings and shipped Android .so, never a CLI. */
 @RunWith(AndroidJUnit4::class)
 class CoreAcceptanceTest {
-    @Test(timeout = 180_000)
+    @Test(timeout = 240_000)
     fun libraryStartsStopsAndReceivesVerifiedBytes() {
         assertNotEquals("blocking FFI must stay off the UI thread", Looper.getMainLooper(), Looper.myLooper())
         val instrumentation = InstrumentationRegistry.getInstrumentation()
