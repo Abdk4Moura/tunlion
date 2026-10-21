@@ -436,8 +436,21 @@ impl AgreementEngine {
             struct Finish(Cancellation);
             impl Drop for Finish { fn drop(&mut self) { self.0.cancel(); } }
             let _finish = Finish(cancel.clone());
-            let rx = mux.register_stream(sid).await.ok_or(AccessError::Capacity)?;
-            let generation = mux.stream_generation(sid).await.ok_or(AccessError::Unavailable)?;
+            let (rx, generation) = mux.register_access_stream(sid).await.ok_or(AccessError::Capacity)?;
+            struct StreamCleanup { mux: Arc<crate::l2::Mux>, sid: u32, generation: u64, armed: bool }
+            impl Drop for StreamCleanup {
+                fn drop(&mut self) {
+                    if !self.armed { return; }
+                    // The regular cancellation path below awaits cleanup. This
+                    // fallback handles an embedder dropping/aborting the future:
+                    // no detached socket pump may outlive its registered scope.
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        let mux=self.mux.clone(); let sid=self.sid; let generation=self.generation;
+                        runtime.spawn(async move { mux.drop_stream_if(sid,generation).await; });
+                    }
+                }
+            }
+            let mut cleanup = StreamCleanup { mux:mux.clone(),sid,generation,armed:true };
             let deadline = async {
                 match lifetime {
                     Lifetime::UntilEnded => std::future::pending::<()>().await,
@@ -455,6 +468,7 @@ impl AgreementEngine {
                 }
             };
             mux.drop_stream_if(sid, generation).await;
+            cleanup.armed = false;
             if let Err(ref reason) = result {
                 let _ = mux.transport().send_control(&serde_json::json!({"type":"l2-close", "sid":sid, "err":reason.to_string()})).await;
             }
@@ -798,5 +812,20 @@ mod tests {
         assert_eq!(socket.read(&mut received).await.unwrap(),0);
         assert!(!mux.has_stream(sid).await);
         let close = control_rx.recv().await.unwrap(); assert_eq!(close["type"],"l2-close");
+        // Cancellation of the embedding future also reaps pumps. Cleanup must
+        // not remove another stream's SID on this same shared mux.
+        let unrelated_sid = crate::l2::L2_SID_BASE | 10;
+        let _unrelated_rx = mux.register_stream(unrelated_sid).await.unwrap();
+        let next = e.offer(peer(&k),"echo",s.spec.clone(),Lifetime::UntilEnded,50,10).unwrap(); accept(&e,&next,&k,10);
+        let aborted_sid = crate::l2::L2_SID_BASE | 11;
+        let serving = { let e=e.clone(); let id=next.id.clone(); let mux=mux.clone();
+            tokio::spawn(async move { e.serve_forward(&id,1,proven,"echo",aborted_sid,mux,10).await }) };
+        let (mut socket,_) = listener.accept().await.unwrap();
+        assert_eq!(control_rx.recv().await.unwrap()["type"],"l2-open-ack");
+        serving.abort(); assert!(serving.await.unwrap_err().is_cancelled());
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2),socket.read(&mut received)).await.unwrap().unwrap(),0);
+        assert!(!mux.has_stream(aborted_sid).await);
+        assert!(mux.has_stream(unrelated_sid).await);
+        mux.drop_stream(unrelated_sid).await;
     }
 }
