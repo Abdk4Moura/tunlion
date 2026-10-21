@@ -1374,7 +1374,7 @@ mod win_at {
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-    use std::path::{Component, Path, PathBuf};
+    use std::path::{Component, Path};
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
@@ -1534,6 +1534,55 @@ mod win_at {
             return Err(io::Error::last_os_error());
         }
         Ok((info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+    }
+
+    fn nt_open(
+        parent: &OwnedHandle,
+        name: &[u16],
+        disposition: u32,
+        access: u32,
+        options: u32,
+        file_attributes: u32,
+    ) -> io::Result<OwnedHandle> {
+        let byte_len = (name.len() * 2) as u16;
+        let mut unicode = UnicodeString {
+            length: byte_len,
+            maximum_length: byte_len,
+            buffer: name.as_ptr() as *mut u16,
+        };
+        let mut attrs = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: parent.as_raw_handle() as HANDLE,
+            object_name: &mut unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut iosb = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access,
+                &mut attrs,
+                &mut iosb,
+                std::ptr::null_mut(),
+                file_attributes,
+                SHARE_RW,
+                disposition,
+                options,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status < 0 {
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
     }
 
     fn open_root_handle(root: &Path, open_reparse: bool) -> io::Result<OwnedHandle> {
