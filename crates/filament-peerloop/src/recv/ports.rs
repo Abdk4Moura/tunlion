@@ -391,9 +391,9 @@ pub trait RawMode: Send {}
 pub enum StdinOutcome {
     NotStarted,
     Joined,
-    /// The CLI intentionally keeps a process-lifetime reader (Windows stdin
-    /// today). The engine does not own or join it; Core must report the engine
-    /// stopped while this remains external, not "joined".
+    /// An adapter deliberately keeps a process-lifetime reader that the engine
+    /// does not own or join. Core must report the engine stopped while this
+    /// remains external, never "joined".
     External(&'static str),
     Detached(&'static str),
 }

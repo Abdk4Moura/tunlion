@@ -1,9 +1,9 @@
 //! The stdin reader for an interactive receive.
 //!
-//! Unix is owned and cancellable: poll stdin, check an atomic stop flag, and
-//! report `Joined`/`Detached`. Windows is the CLI's process-lifetime detached
-//! reader (the pre-#542 behavior): a blocking thread the engine does not own or
-//! join, reported as `External`. Android has no terminal composition and
+//! Both Unix and Windows are owned and cancellable: readers poll input, check
+//! an atomic stop flag, and report `Joined` or a named `Detached`. `External`
+//! is reserved for an adapter that deliberately keeps a process-lifetime
+//! reader; this file does not use it. Android has no terminal composition and
 //! returns `None`.
 
 use filament_peerloop::present::Presentation;
@@ -22,6 +22,7 @@ fn feed_char(
     question_open: &AtomicBool,
     present: &dyn Presentation,
     line: &mut String,
+    last_was_cr: &mut bool,
 ) {
     if question_open.load(Ordering::Relaxed) && "yYnN".contains(c) && line.is_empty() {
         present.answer_echo(c);
@@ -29,7 +30,17 @@ fn feed_char(
         return;
     }
     match c {
-        '\n' | '\r' => {
+        '\r' => {
+            crate::ui::say("");
+            let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
+            line.clear();
+            *last_was_cr = true;
+        }
+        '\n' => {
+            if *last_was_cr {
+                *last_was_cr = false;
+                return;
+            }
             crate::ui::say("");
             let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
             line.clear();
@@ -40,6 +51,7 @@ fn feed_char(
             }
         }
         c if !c.is_control() => {
+            *last_was_cr = false;
             crate::ui::echo_char(c);
             line.push(c);
         }
@@ -60,6 +72,7 @@ pub fn spawn_stdin(
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1];
         let mut line = String::new();
+        let mut last_was_cr = false;
         while !stop_thread.load(Ordering::Relaxed) {
             if !input_ready(100) {
                 continue;
@@ -73,6 +86,7 @@ pub fn spawn_stdin(
                 &question_open,
                 present.as_ref(),
                 &mut line,
+                &mut last_was_cr,
             );
         }
     });
@@ -228,8 +242,7 @@ mod win {
         let input_usize = input as usize;
         let handle = std::thread::spawn(move || {
             let input = input_usize as HANDLE;
-            let why = reader(input, stop_thread, tx, question_open, present);
-            if let Some(why) = why {
+            if let Err(why) = reader(input, stop_thread, tx, question_open, present) {
                 if let Ok(mut slot) = reason_thread.lock() {
                     *slot = Some(why);
                 }
@@ -249,16 +262,40 @@ mod win {
         tx: mpsc::UnboundedSender<Ev>,
         question_open: Arc<AtomicBool>,
         present: Arc<dyn Presentation>,
-    ) -> Option<&'static str> {
+    ) -> Result<(), &'static str> {
         // SAFETY: GetFileType has no preconditions.
         let kind = unsafe { GetFileType(input) };
         if kind == FILE_TYPE_CHAR {
-            return console_reader(input, stop, tx, question_open, present);
+            let mut mode = 0u32;
+            // A character device may be NUL or a serial port. Only a real
+            // console has a console mode; anything else is named, not spun.
+            if unsafe { GetConsoleMode(input, &mut mode) } == 0 {
+                return Err("windows stdin is a non-console character device");
+            }
+            return console_reader(input, mode, stop, tx, question_open, present);
         }
         if kind == FILE_TYPE_PIPE || kind == FILE_TYPE_DISK {
             return byte_reader(input, kind, stop, tx, question_open, present);
         }
-        Some("windows stdin handle is neither console, pipe, nor disk")
+        Err("windows stdin handle is neither console, pipe, nor disk")
+    }
+
+    fn flush_pending(
+        pending: &mut Vec<u8>,
+        tx: &mpsc::UnboundedSender<Ev>,
+        question_open: &AtomicBool,
+        present: &dyn Presentation,
+        line: &mut String,
+        last_was_cr: &mut bool,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(pending);
+        for ch in text.chars() {
+            feed_char(ch, tx, question_open, present, line, last_was_cr);
+        }
+        pending.clear();
     }
 
     fn byte_reader(
@@ -268,12 +305,21 @@ mod win {
         tx: mpsc::UnboundedSender<Ev>,
         question_open: Arc<AtomicBool>,
         present: Arc<dyn Presentation>,
-    ) -> Option<&'static str> {
+    ) -> Result<(), &'static str> {
         let mut line = String::new();
         let mut pending: Vec<u8> = Vec::new();
+        let mut last_was_cr = false;
         loop {
             if stop.load(Ordering::Relaxed) {
-                return None;
+                flush_pending(
+                    &mut pending,
+                    &tx,
+                    &question_open,
+                    present.as_ref(),
+                    &mut line,
+                    &mut last_was_cr,
+                );
+                return Ok(());
             }
             let mut available = 0u32;
             if kind == FILE_TYPE_PIPE {
@@ -289,11 +335,19 @@ mod win {
                     )
                 };
                 if ok == 0 {
-                    // A closed writer is EOF; any other error ends the reader.
+                    // A closed writer is EOF; any other error is named.
                     if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
-                        return None;
+                        flush_pending(
+                            &mut pending,
+                            &tx,
+                            &question_open,
+                            present.as_ref(),
+                            &mut line,
+                            &mut last_was_cr,
+                        );
+                        return Ok(());
                     }
-                    return None;
+                    return Err("windows stdin pipe query failed");
                 }
                 if available == 0 {
                     std::thread::sleep(std::time::Duration::from_millis(25));
@@ -318,15 +372,44 @@ mod win {
                     std::ptr::null_mut(),
                 )
             };
-            if ok == 0 || read == 0 {
-                return None;
+            if ok == 0 {
+                if kind == FILE_TYPE_PIPE && unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
+                    flush_pending(
+                        &mut pending,
+                        &tx,
+                        &question_open,
+                        present.as_ref(),
+                        &mut line,
+                        &mut last_was_cr,
+                    );
+                    return Ok(());
+                }
+                return Err("windows stdin read failed");
+            }
+            if read == 0 {
+                flush_pending(
+                    &mut pending,
+                    &tx,
+                    &question_open,
+                    present.as_ref(),
+                    &mut line,
+                    &mut last_was_cr,
+                );
+                return Ok(());
             }
             pending.extend_from_slice(&buf[..read as usize]);
             loop {
                 match std::str::from_utf8(&pending) {
                     Ok(text) => {
                         for ch in text.chars() {
-                            feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                            feed_char(
+                                ch,
+                                &tx,
+                                &question_open,
+                                present.as_ref(),
+                                &mut line,
+                                &mut last_was_cr,
+                            );
                         }
                         pending.clear();
                         break;
@@ -336,53 +419,88 @@ mod win {
                         if valid > 0 {
                             let text = unsafe { std::str::from_utf8_unchecked(&pending[..valid]) };
                             for ch in text.chars() {
-                                feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                                feed_char(
+                                    ch,
+                                    &tx,
+                                    &question_open,
+                                    present.as_ref(),
+                                    &mut line,
+                                    &mut last_was_cr,
+                                );
                             }
                             pending.drain(..valid);
                             continue;
                         }
-                        if pending.len() >= 4 {
-                            feed_char('\u{fffd}', &tx, &question_open, present.as_ref(), &mut line);
-                            pending.clear();
-                            break;
+                        match error.error_len() {
+                            Some(invalid) => {
+                                feed_char(
+                                    '\u{fffd}',
+                                    &tx,
+                                    &question_open,
+                                    present.as_ref(),
+                                    &mut line,
+                                    &mut last_was_cr,
+                                );
+                                pending.drain(..invalid);
+                                continue;
+                            }
+                            // Incomplete trailing sequence: keep it for the
+                            // next read or EOF flush.
+                            None => break,
                         }
-                        break;
                     }
                 }
             }
         }
     }
 
+    struct ConsoleModeGuard {
+        input: HANDLE,
+        saved: u32,
+    }
+
+    impl ConsoleModeGuard {
+        fn new(input: HANDLE, saved: u32) -> Self {
+            let raw = saved & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+            // SAFETY: valid console handle and saved mode.
+            unsafe {
+                let _ = SetConsoleMode(input, raw);
+            }
+            Self { input, saved }
+        }
+    }
+
+    impl Drop for ConsoleModeGuard {
+        fn drop(&mut self) {
+            // SAFETY: restore the exact saved console mode, including unwind.
+            unsafe {
+                let _ = SetConsoleMode(self.input, self.saved);
+            }
+        }
+    }
+
     fn console_reader(
         input: HANDLE,
+        saved_mode: u32,
         stop: Arc<AtomicBool>,
         tx: mpsc::UnboundedSender<Ev>,
         question_open: Arc<AtomicBool>,
         present: Arc<dyn Presentation>,
-    ) -> Option<&'static str> {
-        let mut saved_mode = 0u32;
-        // SAFETY: writes one u32; only called for a char device.
-        let have_mode = unsafe { GetConsoleMode(input, &mut saved_mode) } != 0;
-        if have_mode {
-            // Raw-ish input: no line buffering, no echo. Keep processed input
-            // so Ctrl-C still reaches the process signal adapter. Restore on
-            // every exit path below.
-            let raw = saved_mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
-            // SAFETY: valid console handle and mode.
-            unsafe {
-                let _ = SetConsoleMode(input, raw);
-            }
-        }
+    ) -> Result<(), &'static str> {
+        // RAII: restore even if the reader panics or the JoinHandle is retained
+        // after a timeout and only finishes later.
+        let _mode = ConsoleModeGuard::new(input, saved_mode);
         let mut line = String::new();
+        let mut last_was_cr = false;
         let mut high_surrogate: Option<u16> = None;
         let result = loop {
             if stop.load(Ordering::Relaxed) {
-                break None;
+                break Ok(());
             }
             let mut available = 0u32;
             // SAFETY: writes one count.
-            unsafe {
-                let _ = GetNumberOfConsoleInputEvents(input, &mut available);
+            if unsafe { GetNumberOfConsoleInputEvents(input, &mut available) } == 0 {
+                break Err("windows console event query failed");
             }
             if available == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -393,8 +511,11 @@ mod win {
             // SAFETY: one record buffer, one record requested, only after the
             // console reports an event available.
             let ok = unsafe { ReadConsoleInputW(input, &mut record, 1, &mut read) };
-            if ok == 0 || read == 0 {
-                break None;
+            if ok == 0 {
+                break Err("windows console read failed");
+            }
+            if read == 0 {
+                break Ok(());
             }
             if record.EventType as u32 == KEY_EVENT {
                 let key = unsafe { record.Event.KeyEvent };
@@ -407,26 +528,49 @@ mod win {
                             if let Some(ch) =
                                 char::decode_utf16([high, unit]).next().and_then(|r| r.ok())
                             {
-                                feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                                feed_char(
+                                    ch,
+                                    &tx,
+                                    &question_open,
+                                    present.as_ref(),
+                                    &mut line,
+                                    &mut last_was_cr,
+                                );
                             }
                         }
                     } else {
                         high_surrogate = None;
                         if let Some(ch) = char::from_u32(unit as u32).filter(|c| *c != '\0') {
-                            feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                            feed_char(
+                                ch,
+                                &tx,
+                                &question_open,
+                                present.as_ref(),
+                                &mut line,
+                                &mut last_was_cr,
+                            );
                         }
                     }
                 }
             }
         };
-        if have_mode {
-            // SAFETY: restore the exact saved console mode.
-            unsafe {
-                let _ = SetConsoleMode(input, saved_mode);
-            }
-        }
         result
     }
+    #[cfg(test)]
+    pub(super) fn spawn_stuck_for_test() -> Box<dyn StdinOwner> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reason = Arc::new(std::sync::Mutex::new(None));
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        });
+        Box::new(WindowsStdin {
+            stop,
+            handle: Some(handle),
+            reason,
+            detached: false,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn spawn_panicking_for_test() -> Box<dyn StdinOwner> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -482,7 +626,7 @@ mod unix_pipe_tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::win::{spawn_on_handle, spawn_panicking_for_test};
+    use super::win::{spawn_on_handle, spawn_panicking_for_test, spawn_stuck_for_test};
     use filament_peerloop::present::NoScreen;
     use filament_peerloop::recv::ports::StdinOutcome;
     use filament_transport::net::Ev;
@@ -637,5 +781,159 @@ mod windows_tests {
             owner.join(),
             StdinOutcome::Detached("windows stdin reader panicked")
         );
+    }
+
+    #[test]
+    fn idle_pipe_stops_without_eof() {
+        let (read, write) = pipe();
+        let (mut owner, _rx) = owner(read);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        unsafe {
+            CloseHandle(write as *mut _);
+            CloseHandle(read as *mut _);
+        }
+    }
+
+    #[test]
+    fn timeout_returns_detached_and_retains_thread() {
+        let mut owner = spawn_stuck_for_test();
+        let started = std::time::Instant::now();
+        match owner.join() {
+            StdinOutcome::Detached(reason) => assert!(reason.contains("did not stop")),
+            other => panic!("expected detached, got {other:?}"),
+        }
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
+
+    #[test]
+    fn crlf_is_one_line_not_two() {
+        let (read, write) = pipe();
+        write_all(write, b"a\r\nb\r\n");
+        let (mut owner, mut rx) = owner(read);
+        assert_eq!(next_line(&mut rx), "a");
+        assert_eq!(next_line(&mut rx), "b");
+        unsafe {
+            CloseHandle(write as *mut _);
+        }
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        unsafe {
+            CloseHandle(read as *mut _);
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_consumes_only_the_bad_byte() {
+        let (read, write) = pipe();
+        write_all(write, b"\xffhi\nq\n");
+        let (mut owner, mut rx) = owner(read);
+        assert_eq!(next_line(&mut rx), "\u{fffd}hi");
+        assert_eq!(next_line(&mut rx), "q");
+        unsafe {
+            CloseHandle(write as *mut _);
+        }
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        unsafe {
+            CloseHandle(read as *mut _);
+        }
+    }
+
+    #[test]
+    fn multibyte_utf8_split_across_reads_is_preserved() {
+        let (read, write) = pipe();
+        // "é" = C3 A9, then a newline.
+        write_all(write, &[0xC3]);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        write_all(write, &[0xA9, b'\n']);
+        let (mut owner, mut rx) = owner(read);
+        assert_eq!(next_line(&mut rx), "é");
+        unsafe {
+            CloseHandle(write as *mut _);
+        }
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        unsafe {
+            CloseHandle(read as *mut _);
+        }
+    }
+
+    #[test]
+    fn nul_is_named_as_a_non_console_character_device() {
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, OPEN_EXISTING,
+        };
+        let name: Vec<u16> = "NUL\0".encode_utf16().collect();
+        // SAFETY: NUL device is always present.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            return; // no NUL device in this environment
+        }
+        let (mut owner, _rx) = owner(handle as usize);
+        assert_eq!(
+            owner.join(),
+            StdinOutcome::Detached("windows stdin is a non-console character device")
+        );
+        unsafe {
+            CloseHandle(handle);
+        }
+    }
+
+    #[test]
+    fn console_mode_is_restored_when_a_console_is_available() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Console::GetConsoleMode;
+        let name: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+        // SAFETY: opens the console input device if this process has one.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                0x8000_0000 | 0x4000_0000, // GENERIC_READ | GENERIC_WRITE
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            return; // headless runner: no console to restore
+        }
+        let mut before = 0u32;
+        if unsafe { GetConsoleMode(handle, &mut before) } == 0 {
+            unsafe { CloseHandle(handle) };
+            return;
+        }
+        let (mut owner, _rx) = owner(handle as usize);
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        let mut after = 0u32;
+        assert_ne!(unsafe { GetConsoleMode(handle, &mut after) }, 0);
+        assert_eq!(before, after, "console mode must be restored");
+        unsafe { CloseHandle(handle) };
+    }
+
+    #[test]
+    fn invalid_handle_is_named_not_joined() {
+        let (mut owner, _rx) = owner(!0usize);
+        match owner.join() {
+            StdinOutcome::Detached(reason) => {
+                assert!(reason.contains("neither console, pipe, nor disk"))
+            }
+            other => panic!("expected detached, got {other:?}"),
+        }
     }
 }
