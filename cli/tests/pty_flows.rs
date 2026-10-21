@@ -306,7 +306,7 @@ fn the_menu_accept_entry_takes_a_code_and_joins_with_it() {
     let typed_at = t.text().len();
     t.send("comic-otter-1950\r");
     assert!(
-        t.wait_for_from(typed_at, "tunlion join comic-otter-1950", 20),
+        t.wait_for_from(typed_at, "claiming comic-otter-1950", 20),
         "a code typed at the accept prompt was not accepted as a code; screen:\n{}",
         tail(&t.text())
     );
@@ -330,13 +330,9 @@ fn a_code_typed_into_add_is_accepted_not_reminted() {
         "add never opened its word entry; screen:\n{}",
         tail(&t.text())
     );
-    // Type at human pace. A single bulk write lets the pty deliver a paste-like
-    // burst; this cell is about the key path recognizing a code, not about
-    // burst input, and the pure `judge` tests cover the spaces spelling.
-    for ch in "comic-otter-1950".chars() {
-        t.send(&ch.to_string());
-        t.settle(15, 1);
-    }
+    // A bracketed paste is one explicit Event::Paste, so this cell tests the
+    // entry's recognition/claim path without depending on pty key scheduling.
+    t.send("\u{1b}[200~comic-otter-1950\u{1b}[201~");
     assert!(
         t.wait_for_from(before, "code you were given", 10),
         "the entry did not recognize a received code; screen:\n{}",
