@@ -6508,7 +6508,7 @@ async fn recv_run(
                 // back by sid to the mux's per-stream waiter, exactly as data
                 // frames route to their pipes. A frame for no in-flight warm
                 // exec is dropped, never mistaken for a served session's.
-                Some("exec-open-ack") | Some("exec-close") => {
+                Some("exec-open-ack") | Some("exec-close") | Some("exec-alive-ack") => {
                     if let (Some(mux), Some(sid)) = (l2_muxes.get(&pid), l2::wire_sid(&v)) {
                         mux.on_exec_initiator_frame(sid, v.clone()).await;
                     }

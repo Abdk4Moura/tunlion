@@ -50,6 +50,12 @@ const EXEC_ACK_WAIT: Duration = Duration::from_secs(10);
 /// How long a delivered `exec-close` may wait for announced tail bytes. Same
 /// bound as the cold path's drain.
 const EXEC_TAIL_DRAIN: Duration = Duration::from_secs(3);
+/// A running warm exec may hear NOTHING from the serving daemon for this long
+/// before it is declared gone. The daemon answers every `exec-alive` with
+/// `exec-alive-ack` (and output counts too), so a SIGKILLed peer is noticed
+/// here instead of on QUIC's much longer idle timeout. This is the same 12 s
+/// bound the cold initiator uses.
+const EXEC_PEER_SILENT: Duration = Duration::from_secs(12);
 
 /// Handle one `exec` control request. Resolves the warm link inline (cheap) and
 /// spawns the session: waiting for the peer's ack must never block the daemon's
@@ -259,6 +265,7 @@ async fn run_warm_exec(
     let mut want_err: Option<u64> = None;
     let mut terminal: Option<Value> = None;
     let mut client_gone = false;
+    let mut last_heard = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     ticker.tick().await;
     loop {
@@ -310,6 +317,7 @@ async fn run_warm_exec(
             },
             msg = ctl.recv() => match msg {
                 Some(v) if v["type"].as_str() == Some("exec-close") => {
+                    last_heard = tokio::time::Instant::now();
                     status = v["status"].as_i64().map(|s| s as i32);
                     want_out = v["out_bytes"].as_u64();
                     want_err = v["err_bytes"].as_u64();
@@ -318,6 +326,7 @@ async fn run_warm_exec(
                 Some(v) if v["type"].as_str() == Some("l2-close")
                     && v["sid"].as_u64() == Some(sid as u64) =>
                 {
+                    last_heard = tokio::time::Instant::now();
                     // The peer's own close, with its code/as/reinvite fields
                     // intact, so the CLI renders the same refusal the cold path
                     // would (a bare reason loses the expiry remedy).
@@ -325,10 +334,15 @@ async fn run_warm_exec(
                     break;
                 }
                 Some(v) if v["type"].as_str() == Some("link-revoked") => {
+                    last_heard = tokio::time::Instant::now();
                     terminal = Some(v);
                     break;
                 }
-                Some(_) => {}
+                Some(_) => {
+                    // `exec-alive-ack` (and any other answer) proves the peer
+                    // is still there even when the command is quiet.
+                    last_heard = tokio::time::Instant::now();
+                }
                 None => {
                     terminal = Some(warm_error(
                         "the warm exec control channel closed without an exit status",
@@ -338,6 +352,7 @@ async fn run_warm_exec(
             },
             item = out_pipe.recv() => match item {
                 Some(Some(bytes)) => {
+                    last_heard = tokio::time::Instant::now();
                     out_count += bytes.len() as u64;
                     if out_tx.send(Out::Data(FRAME_STDOUT, bytes)).await.is_err() {
                         client_gone = true;
@@ -362,6 +377,7 @@ async fn run_warm_exec(
             },
             item = err_pipe.recv() => match item {
                 Some(Some(bytes)) => {
+                    last_heard = tokio::time::Instant::now();
                     err_count += bytes.len() as u64;
                     if out_tx.send(Out::Data(FRAME_STDERR, bytes)).await.is_err() {
                         client_gone = true;
@@ -374,6 +390,13 @@ async fn run_warm_exec(
             _ = ticker.tick() => {
                 if t.is_dead() {
                     terminal = Some(warm_error("the warm link died during exec"));
+                    break;
+                }
+                if last_heard.elapsed() >= EXEC_PEER_SILENT {
+                    terminal = Some(warm_error(&format!(
+                        "the warm link died during exec: no answer from the peer for {}s",
+                        EXEC_PEER_SILENT.as_secs()
+                    )));
                     break;
                 }
             }
