@@ -223,6 +223,41 @@ mod tests {
     }
 
     #[test]
+    fn head_hash_covers_the_whole_prefix_and_only_the_prefix() {
+        let d = tmp("head");
+        let short = d.join("short.bin");
+        std::fs::write(&short, b"hello").unwrap();
+        let want: String = Sha256::digest(b"hello")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(head_hash(&short).as_deref(), Some(want.as_str()));
+
+        let long = d.join("long.bin");
+        let body: Vec<u8> = (0..(HEAD_BYTES as usize + 4096))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&long, &body).unwrap();
+        let prefix: String = Sha256::digest(&body[..HEAD_BYTES as usize])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(head_hash(&long).as_deref(), Some(prefix.as_str()));
+        assert_ne!(
+            head_hash(&long).as_deref(),
+            Some(
+                Sha256::digest(&body)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+                    .as_str()
+            ),
+            "a file longer than the prefix must not be hashed in full"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn a_read_error_is_an_error_never_a_shorter_digest() {
         assert!(digest_reader(&mut Failing(10)).is_err());
         let (_, n) =

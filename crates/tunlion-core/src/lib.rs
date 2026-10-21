@@ -192,6 +192,11 @@ impl Drop for StopClaim<'_> {
 struct StartClaim<'a> {
     slot: &'a Mutex<EngineSlot>,
     armed: bool,
+    /// The invocation generation this claim owns. It is assigned under the
+    /// engine lock at claim time, before any task exists, so a one-shot job
+    /// can record the engine it was started by rather than reading whatever
+    /// engine happens to own the slot later.
+    generation: u64,
 }
 
 impl<'a> StartClaim<'a> {
@@ -220,12 +225,22 @@ impl<'a> StartClaim<'a> {
             return Err(error);
         }
         *slot = EngineSlot::Claimed;
+        // The generation changes with slot ownership, inside the same critical
+        // section that takes the slot. A concurrent stop or settle that names
+        // the previous generation can therefore never mistake the engine
+        // installed here for the one it owns.
+        let generation = core.engine_seq.fetch_add(1, Ordering::AcqRel) + 1;
         // A new engine replaces any stale send job from a previous engine.
         core.clear_send_job();
         Ok(Self {
             slot: &core.engine,
             armed: true,
+            generation,
         })
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn install(&mut self, engine: EngineTask) -> Result<(), CoreError> {
@@ -871,6 +886,7 @@ impl Core {
             Ok::<(), String>(())
         };
 
+        let generation = claim.generation();
         let (_handle, engine, _watch) = self.spawn_engine(dispatch)?;
         claim.install(engine)?;
         // Publish Running and the lease in one critical section, like start.
@@ -881,7 +897,7 @@ impl Core {
                 "the receive dispatch ended without a result".into(),
             ))
         });
-        let settled = self.settle_one_shot();
+        let settled = self.settle_one_shot(generation);
 
         match result {
             // A cancelled receive is cancelled even if a concurrent stop is
@@ -912,17 +928,13 @@ impl Core {
         paths: Vec<String>,
         timeout: Option<u64>,
     ) -> Result<CreatedCode, CoreError> {
-        let mut events = self.begin_send(
-            paths,
-            SendMode::Code { word: None },
-            true,
-            timeout,
-        )?;
+        let (events, generation) =
+            self.begin_send(paths, SendMode::Code { word: None }, true, timeout)?;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                let settled = self.settle_one_shot();
+                let settled = self.settle_one_shot(generation);
                 settled?;
                 return Err(CoreError::Engine(
                     "the server did not allocate a transfer code in time".into(),
@@ -930,15 +942,19 @@ impl Core {
             }
             match events.recv_timeout(left) {
                 Ok(SendEvent::Code(code)) => {
-                    let engine_seq = self.engine_generation();
-                    *self
-                        .send_job
-                        .lock()
-                        .map_err(|_| {
-                            CoreError::Engine("the send job lock was poisoned".into())
-                        })? = Some(SendJob {
+                    // The job belongs to the generation claimed by THIS
+                    // invocation, not whichever engine owns the slot now. If
+                    // a stop already ended it, do not hand out a code for a
+                    // send that is no longer running and do not publish a
+                    // job a successor could later reap.
+                    if self.engine_generation() != generation {
+                        return Err(CoreError::Cancelled);
+                    }
+                    *self.send_job.lock().map_err(|_| {
+                        CoreError::Engine("the send job lock was poisoned".into())
+                    })? = Some(SendJob {
                         rx: events,
-                        engine_seq,
+                        engine_seq: generation,
                     });
                     return Ok(CreatedCode {
                         code: code.code,
@@ -951,7 +967,7 @@ impl Core {
                     // unreachable server, Cancelled for a stop) is the answer;
                     // do not replace it with a timeout. A failure to settle is
                     // itself surfaced.
-                    let settled = self.settle_one_shot();
+                    let settled = self.settle_one_shot(generation);
                     settled?;
                     return match result {
                         Ok(_) => Err(CoreError::Engine(
@@ -961,14 +977,14 @@ impl Core {
                     };
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let settled = self.settle_one_shot();
+                    let settled = self.settle_one_shot(generation);
                     settled?;
                     return Err(CoreError::Engine(
                         "the server did not allocate a transfer code in time".into(),
                     ));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let settled = self.settle_one_shot();
+                    let settled = self.settle_one_shot(generation);
                     settled?;
                     return Err(CoreError::Engine(
                         "the send dispatch ended before allocating a code".into(),
@@ -995,6 +1011,7 @@ impl Core {
                 "the send job belongs to a previous engine".into(),
             ));
         }
+        let generation = job.engine_seq;
         let result = loop {
             match job.rx.recv() {
                 Ok(SendEvent::Done(result)) => break result,
@@ -1006,7 +1023,10 @@ impl Core {
                 }
             }
         };
-        let settled = self.settle_one_shot();
+        // Generation-tagged: if a stop and a new start landed while this call
+        // was blocked on the channel, the settle is a no-op for the old
+        // generation instead of joining the successor's engine.
+        let settled = self.settle_one_shot(generation);
         match result {
             Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
             other => {
@@ -1036,12 +1056,8 @@ impl Core {
         device: String,
         timeout: Option<u64>,
     ) -> Result<SendResult, CoreError> {
-        let mut events = self.begin_send(
-            paths,
-            SendMode::Device { name: device },
-            false,
-            timeout,
-        )?;
+        let (events, generation) =
+            self.begin_send(paths, SendMode::Device { name: device }, false, timeout)?;
         let result = loop {
             match events.recv() {
                 Ok(SendEvent::Done(result)) => break result,
@@ -1053,7 +1069,7 @@ impl Core {
                 }
             }
         };
-        let settled = self.settle_one_shot();
+        let settled = self.settle_one_shot(generation);
         match result {
             Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
             other => {
@@ -1071,13 +1087,17 @@ impl Core {
         mode: SendMode,
         want_code: bool,
         timeout: Option<u64>,
-    ) -> Result<std::sync::mpsc::Receiver<SendEvent>, CoreError> {
+    ) -> Result<(std::sync::mpsc::Receiver<SendEvent>, u64), CoreError> {
         if paths.is_empty() {
             return Err(CoreError::Usage(
                 "nothing to send; pass at least one regular file".into(),
             ));
         }
         let mut claim = StartClaim::acquire(self)?;
+        // Claimed before the engine exists: the generation is the invocation's
+        // own ownership token, not a read of whoever owns the slot when the
+        // first event arrives.
+        let generation = claim.generation();
         let (parts, lease) = self.prepare_send()?;
         let SendParts {
             ports,
@@ -1108,16 +1128,16 @@ impl Core {
         };
         drop(event_tx);
         let dispatch = move |stop: Cancellation, _readiness: Readiness| async move {
-            let outcome = stop
-                .run(filament_peerloop::send::engine::drive(
-                    request, ports, code_notify, &stop,
-                ))
-                .await;
-            let result = match outcome {
-                DriverOutcome::Cancelled => Err(CoreError::Cancelled),
-                DriverOutcome::Returned(Ok(summary)) => Ok(summary),
-                DriverOutcome::Returned(Err(failure)) => Err(map_send_failure(failure)),
-            };
+            // `drive` handles cancellation itself, so its teardown always runs:
+            // wrapping it in `stop.run` would DROP the future on cancel and
+            // skip the socket/links cleanup. Interrupted maps to Cancelled.
+            let result =
+                match filament_peerloop::send::engine::drive(request, ports, code_notify, &stop)
+                    .await
+                {
+                    Ok(summary) => Ok(summary),
+                    Err(failure) => Err(map_send_failure(failure)),
+                };
             let _ = done_tx.send(SendEvent::Done(result));
             Ok::<(), String>(())
         };
@@ -1125,10 +1145,10 @@ impl Core {
         claim.install(engine)?;
         let published = self.publish_one_shot(lease);
         if let Err(error) = published {
-            let _ = self.settle_one_shot();
+            let _ = self.settle_one_shot(generation);
             return Err(error);
         }
-        Ok(event_rx)
+        Ok((event_rx, generation))
     }
 
     /// The explicit-root host/identity/store/transport composition for one
@@ -1344,8 +1364,13 @@ impl Core {
     /// Join a one-shot dispatch that has already sent its result, releasing the
     /// lease. A concurrent stop may own the join; wait (bounded) for it to
     /// settle instead of stealing its slot.
-    fn settle_one_shot(&self) -> Result<(), CoreError> {
-        match self.stop_blocking_within(Duration::from_secs(5)) {
+    ///
+    /// The `generation` is the one this one-shot invocation claimed before it
+    /// spawned. A job that outlived a stop must not reap (or erase the job of)
+    /// the engine that owns the slot now; the settle is a no-op for a
+    /// superseded generation.
+    fn settle_one_shot(&self, generation: u64) -> Result<(), CoreError> {
+        match self.stop_blocking_generation(Duration::from_secs(5), Some(generation)) {
             Ok(()) => Ok(()),
             Err(CoreError::EngineStopping) => {
                 for _ in 0..5_000 {
@@ -1594,6 +1619,10 @@ impl Core {
         if let Some(error) = blocked {
             return Err(error);
         }
+        // A new engine replaces any stale send job and bumps the generation in
+        // the same critical section that takes ownership.
+        self.clear_send_job();
+        self.engine_seq.fetch_add(1, Ordering::AcqRel);
 
         let cancel = Cancellation::default();
         let engine = if tokio::runtime::Handle::try_current().is_ok() {
@@ -1620,7 +1649,6 @@ impl Core {
             let _entered = runtime.enter();
             Engine::start(cancel, dispatch)
         };
-        self.engine_seq.fetch_add(1, Ordering::AcqRel);
         *slot = EngineSlot::Running(engine);
         Ok(())
     }
@@ -1660,7 +1688,6 @@ impl Core {
         let _entered = runtime.enter();
         let cancel = Cancellation::default();
         let engine = Engine::start(cancel, dispatch);
-        self.engine_seq.fetch_add(1, Ordering::AcqRel);
         let watch = engine.ready_watch();
         Ok((handle, engine, watch))
     }
@@ -1677,6 +1704,16 @@ impl Core {
         }
     }
 
+    /// Clear the send job only when it belongs to `generation`. A settle for a
+    /// superseded engine must not erase the job a successor has just stored.
+    fn clear_send_job_if(&self, generation: u64) {
+        if let Ok(mut job) = self.send_job.lock() {
+            if job.as_ref().is_some_and(|job| job.engine_seq == generation) {
+                *job = None;
+            }
+        }
+    }
+
     fn engine_generation(&self) -> u64 {
         self.engine_seq.load(Ordering::Acquire)
     }
@@ -1688,6 +1725,16 @@ impl Core {
     }
 
     fn stop_blocking_within(&self, bound: Duration) -> Result<(), CoreError> {
+        self.stop_blocking_generation(bound, None)
+    }
+
+    /// A bounded stop that first verifies, under the engine lock, that
+    /// `generation` still owns the slot. `None` is an unconditional stop.
+    fn stop_blocking_generation(
+        &self,
+        bound: Duration,
+        generation: Option<u64>,
+    ) -> Result<(), CoreError> {
         let handle = self
             .runtime
             .lock()
@@ -1696,7 +1743,7 @@ impl Core {
         let result = match handle {
             Some(handle) => std::thread::scope(|scope| {
                 scope
-                    .spawn(move || handle.block_on(self.stop_within(bound)))
+                    .spawn(move || handle.block_on(self.stop_within_generation(bound, generation)))
                     .join()
                     .unwrap_or_else(|_| Err(CoreError::Engine("the stop thread panicked".into())))
             }),
@@ -1707,7 +1754,9 @@ impl Core {
                     .map_err(|error| CoreError::Engine(error.to_string()))?;
                 std::thread::scope(|scope| {
                     scope
-                        .spawn(move || runtime.block_on(self.stop_within(bound)))
+                        .spawn(move || {
+                            runtime.block_on(self.stop_within_generation(bound, generation))
+                        })
                         .join()
                         .unwrap_or_else(|_| {
                             Err(CoreError::Engine("the stop thread panicked".into()))
@@ -1736,9 +1785,22 @@ impl Core {
     /// The bounded form of [`Core::stop`]. A caller that wants a shorter grace
     /// (a test, or a supervisor with its own deadline) uses this.
     pub async fn stop_within(&self, bound: Duration) -> Result<(), CoreError> {
-        // A stop ends this engine's claim on any send job. A later wait_send
-        // must refuse the stale job rather than stop or reap a successor.
-        self.clear_send_job();
+        self.stop_within_generation(bound, None).await
+    }
+
+    /// Stop this invocation, not whatever engine happens to own the slot.
+    ///
+    /// With `Some(generation)`, the generation check and the slot claim happen
+    /// in ONE critical section. A successor start bumps the generation under
+    /// that same lock before installing, so a settle that names an old
+    /// generation can never claim (and then stop) the successor. A generation
+    /// that no longer owns the slot has already been settled by whichever stop
+    /// replaced it, so this is a no-op rather than an error.
+    async fn stop_within_generation(
+        &self,
+        bound: Duration,
+        generation: Option<u64>,
+    ) -> Result<(), CoreError> {
         // Phase 1, under the lock and without awaiting: claim the engine by
         // moving the slot to `Stopping`. `Stopping` both owns the settle and
         // refuses a concurrent start or stop, so no second owner can race the
@@ -1748,6 +1810,23 @@ impl Core {
                 .engine
                 .lock()
                 .map_err(|_| CoreError::Engine("the engine lock was poisoned".into()))?;
+            if let Some(expected) = generation {
+                if self.engine_generation() != expected {
+                    // A successor can only acquire the slot after the engine
+                    // this generation named was joined (every other slot
+                    // state refuses a start), so there is nothing left to
+                    // settle. In particular, do not clear the successor's
+                    // send job.
+                    return Ok(());
+                }
+            }
+            // A stop ends this engine's claim on any send job. A targeted
+            // settle removes only the job of the generation it owns, never a
+            // successor's.
+            match generation {
+                Some(expected) => self.clear_send_job_if(expected),
+                None => self.clear_send_job(),
+            }
             enum Decision {
                 Settled,
                 Refuse,
@@ -2819,6 +2898,63 @@ mod tests {
             Err(CoreError::Cancelled) | Err(CoreError::Engine(_))
         ));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_stale_wait_send_never_stops_the_engine_that_replaced_it() {
+        let core = Arc::new(core());
+        // Engine A owns the slot and a send job tagged with A's generation.
+        let mut claim = StartClaim::acquire(&core).unwrap();
+        let generation = claim.generation();
+        let (_handle, engine, _watch) = core
+            .spawn_engine(|stop, _readiness| async move {
+                stop.run(std::future::pending::<()>()).await;
+                Ok::<(), String>(())
+            })
+            .unwrap();
+        claim.install(engine).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        *core.send_job.lock().unwrap() = Some(SendJob {
+            rx: done_rx,
+            engine_seq: generation,
+        });
+
+        // wait_send takes the job and blocks on its result.
+        let waiting_core = Arc::clone(&core);
+        let waiting = std::thread::spawn(move || waiting_core.wait_send());
+        for _ in 0..2_000 {
+            if core.send_job.lock().unwrap().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(core.send_job.lock().unwrap().is_none(), "job taken");
+
+        // A stop joins A, then a successor B takes the slot. The old wait is
+        // still blocked on A's channel until it delivers its final event.
+        core.stop_blocking().unwrap();
+        core.start_with_dispatch(|stop, _readiness| async move {
+            stop.run(std::future::pending::<()>()).await;
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+
+        // A's result arrives only now. The settle names A's generation, so it
+        // must not join B (the exact check-then-stop race in wait_send).
+        done_tx
+            .send(SendEvent::Done(Err(CoreError::Cancelled)))
+            .unwrap();
+        assert!(matches!(waiting.join().unwrap(), Err(CoreError::Cancelled)));
+        assert_eq!(
+            core.status().unwrap().engine,
+            EngineState::Running,
+            "a stale wait_send stopped the successor engine"
+        );
+        assert!(core.is_engine_running().unwrap());
+
+        core.stop_blocking().unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
     }
 
     #[test]

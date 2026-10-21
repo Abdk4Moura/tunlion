@@ -14,7 +14,7 @@
 //! and acknowledged at the transport).
 
 use crate::conn::Conn;
-use crate::driver::Cancellation;
+use crate::driver::{Cancellation, DriverOutcome};
 use crate::host::{HostServices, LogSink};
 use crate::present::Presentation;
 use crate::recv::dispatch::proof_for;
@@ -320,10 +320,17 @@ async fn offer_unfinished(
 
 /// Drive one one-shot send. The caller owns the cancellation latch and turns
 /// [`Cancellation`] into its own interrupted result.
+///
+/// Teardown is part of the dispatch, not a side effect of dropping handles:
+/// when this returns (success, typed failure, or cancellation) the transfer
+/// tasks are joined, the peer links are force-closed, and the signaling
+/// websocket is closed and its reader and forwarder tasks are awaited. A
+/// stopped send must not leave a live socket behind for the server to time
+/// out.
 pub async fn drive(
     request: SendRequest,
     ports: SendPorts,
-    mut code_notify: Option<CodeNotify>,
+    code_notify: Option<CodeNotify>,
     cancel: &Cancellation,
 ) -> Result<SendSummary, SendFailure> {
     if cancel.is_cancelled() {
@@ -333,7 +340,8 @@ pub async fn drive(
         &request,
         ports.log.as_ref(),
     )?));
-    let use_code = matches!(request.mode, SendMode::Code { .. });
+    // Resolve a known device BEFORE any network work: an unknown petname is a
+    // usage error, not "the server is unreachable".
     let known_target: Option<(String, String)> = match &request.mode {
         SendMode::Device { name } => ports
             .host
@@ -349,17 +357,38 @@ pub async fn drive(
         SendMode::Code { .. } => None,
     };
 
-    let room = net::fetch_auto_room(&ports.transport_context, &request.server)
+    let room = match cancel
+        .run(net::fetch_auto_room(
+            &ports.transport_context,
+            &request.server,
+        ))
         .await
-        .map_err(|error| {
+    {
+        DriverOutcome::Cancelled => return Err(SendFailure::interrupted("the send was cancelled")),
+        DriverOutcome::Returned(result) => result.map_err(|error| {
             SendFailure::unreachable(format!("the signaling server is unreachable: {error}"))
-        })?;
+        })?,
+    };
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(&ports.transport_context, &request.server, tx.clone())
+    // The OWNING handle, so teardown can cancel and await both the socket
+    // reader and the event forwarder. The detached compatibility adapter
+    // leaves a reader task holding the TCP connection after the dispatch
+    // returns, which is exactly a send that `stop` reports stopped while the
+    // server still sees it connected.
+    let signaling = match cancel
+        .run(net::connect_signaling_owned(
+            &ports.transport_context,
+            &request.server,
+            tx.clone(),
+        ))
         .await
-        .map_err(|error| {
+    {
+        DriverOutcome::Cancelled => return Err(SendFailure::interrupted("the send was cancelled")),
+        DriverOutcome::Returned(result) => result.map_err(|error| {
             SendFailure::unreachable(format!("the signaling server is unreachable: {error}"))
-        })?;
+        })?,
+    };
+    let sio = signaling.client().clone();
     let mut sess = Session::new(&request.display_name, &request.uid);
     sess.room = Some(room.clone());
     sess.emit(
@@ -382,6 +411,61 @@ pub async fn drive(
         ports.log.clone(),
         ports.host.clone(),
     );
+
+    let mut stream_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let result = match cancel
+        .run(drive_over(
+            &request,
+            &ports,
+            code_notify,
+            cancel,
+            &sio,
+            &tx,
+            &mut sess,
+            &mut rx,
+            &mut conn,
+            &mut stream_tasks,
+            outgoing,
+            known_target,
+        ))
+        .await
+    {
+        DriverOutcome::Cancelled => Err(SendFailure::interrupted("the send was cancelled")),
+        DriverOutcome::Returned(result) => result,
+    };
+
+    // Honest teardown on every exit path. Transfer tasks are aborted and
+    // joined first: they write to the links closed below. `close_links_for_exit`
+    // then drops the WebRTC/QUIC transports, and `Signaling::shutdown` sends the
+    // Socket.IO disconnect, closes the websocket, and joins the reader and
+    // forwarder. The forwarder's own timeout bounds a peer that ignores Close.
+    for task in stream_tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    conn.close_links_for_exit();
+    let _ = tokio::time::timeout(Duration::from_secs(3), signaling.shutdown()).await;
+    result
+}
+
+/// The connected half of [`drive`]: everything after the signaling socket
+/// exists, so the caller can always tear that socket down.
+#[allow(clippy::too_many_arguments)]
+async fn drive_over(
+    request: &SendRequest,
+    ports: &SendPorts,
+    mut code_notify: Option<CodeNotify>,
+    cancel: &Cancellation,
+    sio: &filament_signal::Client,
+    tx: &mpsc::UnboundedSender<Ev>,
+    sess: &mut Session,
+    rx: &mut mpsc::UnboundedReceiver<Ev>,
+    conn: &mut Conn,
+    stream_tasks: &mut Vec<JoinHandle<()>>,
+    outgoing: Arc<tokio::sync::Mutex<Vec<Outgoing>>>,
+    known_target: Option<(String, String)>,
+) -> Result<SendSummary, SendFailure> {
+    let use_code = matches!(request.mode, SendMode::Code { .. });
 
     let mut send_words = String::new();
     let mut send_nameplate = String::new();
@@ -447,7 +531,6 @@ pub async fn drive(
     let mut sent_all_at: Option<Instant> = None;
     let mut ack_reprobed = false;
     let mut stored: HashMap<String, String> = HashMap::new();
-    let mut stream_tasks: Vec<JoinHandle<()>> = Vec::new();
     let source_failed: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
@@ -587,7 +670,7 @@ pub async fn drive(
                 conn.reap_deferred();
                 None
             }
-            ev = crate::recv::events::next_ev(&mut rx, &conn, false) => {
+            ev = crate::recv::events::next_ev(rx, conn, false) => {
                 ev.map_err(internal)?
             }
         };
@@ -986,7 +1069,10 @@ pub async fn drive(
             _ => {}
         }
     }
-    for task in stream_tasks {
+    // The success path joins every transfer it started before reporting the
+    // summary; an error/cancel path leaves them to `drive`'s teardown, which
+    // aborts and joins the same vector.
+    for task in stream_tasks.drain(..) {
         let _ = task.await;
     }
     let out = outgoing.lock().await;
