@@ -658,6 +658,7 @@ mod tests {
     };
     use crate::conn::{Conn, Link, Presence};
     use crate::host::{CapGate, HostServices, NoHost, VecLog};
+    use crate::l2;
     use crate::l2::{Mux, MuxMap, L2_SID_BASE, MAX_PTYS_GLOBAL, NO_SUCH_SESSION};
     use crate::recv::ports::{test_support, RecvEnv, RecvPorts};
     use crate::refusal::SHELL_OFF_REASON;
@@ -1601,11 +1602,11 @@ mod tests {
             "an old attachment's input pump still consumed bytes: {inputs:?}"
         );
         assert!(
-            inputs.iter().any(|(_, bytes)| bytes == b"NEW"),
+            inputs.iter().any(|(_, bytes)| bytes.as_slice() == b"NEW"),
             "the current attachment did not receive its input: {inputs:?}"
         );
         assert!(
-            !inputs.iter().any(|(_, bytes)| bytes == b"OLD"),
+            !inputs.iter().any(|(_, bytes)| bytes.as_slice() == b"OLD"),
             "a frame for the superseded sid reached a pump: {inputs:?}"
         );
     }

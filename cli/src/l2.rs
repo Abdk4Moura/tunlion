@@ -5925,6 +5925,63 @@ mod h1_tests {
         );
     }
 
+    /// A session that ends on its own runs the attachment release the library
+    /// installed. This is the path no receive-loop event reaches: the mux
+    /// stream/resizer must still be freed (regression: natural shell exit left
+    /// the sid registered until link death).
+    #[tokio::test]
+    async fn natural_session_exit_runs_the_installed_end_cleanup_once() {
+        let _slot_guard = PTY_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !std::path::Path::new("/bin/sh").exists() {
+            return; // environment without /bin/sh: skip rather than fail
+        }
+        let sessions = PtySessions::new();
+        let t = CapTransport::new();
+        let guard = PtyGuard::try_acquire().expect("slot");
+        let sess = spawn_pty_session(
+            sessions.clone(),
+            "sess-natural-end".to_string(),
+            t,
+            L2_SID_BASE | 21,
+            80,
+            24,
+            "xterm-256color",
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 0.2".to_string(),
+            ],
+            guard,
+            None,
+            false,
+        )
+        .await
+        .expect("spawn");
+
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let seen = cleaned.clone();
+        assert!(
+            sess.set_end_cleanup(Box::new(move || seen.store(true, Ordering::SeqCst))),
+            "a live session accepts its release"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "natural exit did not run the installed release"
+        );
+        assert!(
+            sessions.get_live("sess-natural-end").await.is_none(),
+            "ended session must leave the store"
+        );
+        assert!(
+            !sess.set_end_cleanup(Box::new(|| {})),
+            "an already-ended session tells the caller to release its own stream"
+        );
+    }
+
     /// A reattach that says how much output it already has gets only what it
     /// missed: nothing it already showed comes back a second time, and output
     /// produced while detached is not lost.
