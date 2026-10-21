@@ -108,8 +108,22 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       // inputmode is a hint, not a guarantee on Safari. readOnly prevents an
       // incidental xterm focus from bringing up its editable keyboard as well.
       ta.readOnly = !enabled
+      if (enabled) ta.removeAttribute('readonly')
+      else ta.setAttribute('readonly', '')
       ta.setAttribute('inputmode', enabled ? 'text' : 'none')
       ta.setAttribute('virtualkeyboardpolicy', enabled ? 'auto' : 'manual')
+      if (enabled) {
+        // iOS does not raise the soft keyboard when readOnly is merely removed
+        // from an element that was ALREADY focused while read-only. The show
+        // action must be a fresh editable focus: blur, let WebKit observe the
+        // updated attribute/layout, then focus again inside this tap.
+        try { ta.blur() } catch (e) {}
+        void ta.offsetHeight
+        try { termRef.current?.focus() } catch (e) {}
+        if (document.activeElement !== ta) {
+          try { ta.focus({ preventScroll: true }) } catch (e) {}
+        }
+      }
       if (!enabled) {
         // Hidden means the SOFT keyboard is hidden: physical keyboards and
         // their IME must keep working. blur() normally delivers the final
@@ -122,8 +136,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         composingRef.current = false
       }
     }
-    // Must stay in the button's click stack: iOS rejects delayed IME focus.
-    if (enabled) termRef.current?.focus()
+    // Everything above runs synchronously in the button's click stack. iOS
+    // rejects a delayed focus, so there is deliberately no setTimeout here.
   }, [])
   const [atBottom, setAtBottom] = useState(true) // false => show scroll-to-bottom
   const [wheelRoute, setWheelRoute] = useState(SCROLL_HISTORY) // who owns a vertical wheel

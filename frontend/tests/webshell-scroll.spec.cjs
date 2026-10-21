@@ -282,9 +282,20 @@ function legacyWheel(code, col, row) {
     eq((await inputs(page)).join(''), 'tap', 'terminal touch tap must not block physical keys');
 
     // A real touch tap (not a mouse click) on the button is the Safari path.
+    // The textarea is ALREADY focused while readonly. iOS will not raise the
+    // soft keyboard if show merely flips readOnly on that same focus, so the
+    // show action must blur and focus again inside the tap.
+    await page.evaluate(() => {
+      const ta = document.querySelector('.xterm-helper-textarea');
+      window.__kbdFocusLog = [];
+      ta.addEventListener('blur', () => window.__kbdFocusLog.push('blur'));
+      ta.addEventListener('focus', () => window.__kbdFocusLog.push('focus'));
+    });
     await keyboard.tap();
     await waitPressed(page, 'true', 'Keyboard touch tap did not enable typing');
     await waitPolicy(page, { readOnly: false, inputMode: 'text', focused: true }, 'show keyboard synchronously enables and focuses input');
+    eq(await page.evaluate(() => window.__kbdFocusLog.slice(0, 2)), ['blur', 'focus'],
+      'show keyboard must start a fresh editable focus, not just drop readOnly');
     await clearInputs(page);
     await page.keyboard.type('hello');
     await waitInputs(page, 'hello'.length, 'explicit keyboard typing did not reach the PTY');
