@@ -101,6 +101,8 @@ export default function App() {
       onDeclinePakeKeep={qs.declinePakeKeep}
       onForgetDevice={qs.forgetDevice}
       onRenameDevice={qs.renameDevice}
+      onRenameSelf={qs.renameSelf}
+      onReloadTab={() => window.location.reload()}
     />
   )
 }

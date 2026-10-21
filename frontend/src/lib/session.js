@@ -32,7 +32,7 @@ const ACK_MS = 4000 // an ack not seen within this window counts as missed
 // spuriously differ across re-derivations of the same set.
 function digest(s) {
   const chans = [...(s.channels || [])].sort().join(',')
-  return `${s.room || ''}|${s.name || ''}|${s.uid || ''}|${chans}`
+  return `${s.room || ''}|${s.name || ''}|${s.uid || ''}|${s.gen || ''}|${chans}`
 }
 
 // Seeded PRNG (mulberry32), deterministic given telSeed, so a lossy run is
@@ -68,7 +68,7 @@ function readLossConfig() {
 // tel: telemetry fn (ev, data), kept LOW volume: we only emit when state
 //      actually changed or an ack was missed.
 export function createSession(sig, tel = () => {}, onDigest = null) {
-  const desired = { room: null, name: null, uid: null, channels: new Set() }
+  const desired = { room: null, name: null, uid: null, gen: null, channels: new Set() }
   let confirmed = { snapshot: null, at: 0 }
 
   // In-flight guard: 5s tick + kick(socket-up) + kick(visible) all funnel
@@ -107,6 +107,7 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       room: desired.room,
       name: desired.name,
       uid: desired.uid,
+      gen: desired.gen,
       channels: new Set(desired.channels),
     }
     const wire = {
@@ -114,6 +115,7 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       room: snapshot.room,
       name: snapshot.name,
       uid: snapshot.uid,
+      gen: snapshot.gen,
       channels: [...snapshot.channels].sort(),
     }
 
@@ -145,14 +147,21 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
     maybeSync(Date.now())
   }
 
-  const timer = setInterval(() => maybeSync(Date.now()), TICK_MS)
+  let timer = setInterval(() => maybeSync(Date.now()), TICK_MS)
+  // pagehide stops the loop synchronously (no timers left on a page that is
+  // going away). A bfcache restore calls start() again, before recovery.
+  const start = () => {
+    if (timer) return
+    timer = setInterval(() => maybeSync(Date.now()), TICK_MS)
+  }
 
   return {
     // Pure data edit: room membership. kick() to raise immediately.
-    setRoom(room, name, uid) {
+    setRoom(room, name, uid, gen) {
       desired.room = room
       desired.name = name
       desired.uid = uid
+      if (gen !== undefined) desired.gen = gen
     },
     // Pure data edit: known-device presence channels (64-hex strings).
     setChannels(hexArray) {
@@ -184,10 +193,13 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       pendingDigest = null
       maybeSync(Date.now())
     },
-    // Teardown: clears the loop timer (HMR/unmount leak otherwise).
+    // Teardown: clears the loop timer (HMR/unmount/bfcache leak otherwise).
     stop() {
-      clearInterval(timer)
+      if (timer) clearInterval(timer)
+      timer = null
     },
+    // Restart the loop after a bfcache restore stopped it on pagehide.
+    start,
     // Exposed for tests/inspection: do not mutate directly.
     desired,
   }

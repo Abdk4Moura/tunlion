@@ -15,6 +15,7 @@ Redis when the deployment has one, so every replica shares one budget;
 otherwise in a bounded in-process map whose idle keys are evicted.
 """
 import ipaddress
+import threading
 import time
 from collections import OrderedDict, deque
 
@@ -79,6 +80,9 @@ class MemLimiter:
         self.max_keys = max_keys
         self._log = OrderedDict()  # key -> deque of timestamps
         self._ops = 0
+        # async_mode=threading calls allow() from many request threads; without
+        # this, two check-then-charge sequences can both pass the limit.
+        self._lock = threading.Lock()
 
     def _prune(self, key, now):
         q = self._log.get(key)
@@ -96,26 +100,28 @@ class MemLimiter:
 
     def allow(self, keys, now=None):
         now = time.monotonic() if now is None else now
-        self._ops += 1
-        if self._ops % 1024 == 0 or len(self._log) > self.max_keys:
-            self._sweep(now)
-        for key in keys:
-            q = self._prune(key, now)
-            if q is not None and len(q) >= self.limit:
-                return False
-        for key in keys:
-            q = self._log.get(key)
-            if q is None:
-                q = self._log[key] = deque()
-            else:
-                self._log.move_to_end(key)
-            q.append(now)
-        while len(self._log) > self.max_keys:
-            self._log.popitem(last=False)
-        return True
+        with self._lock:
+            self._ops += 1
+            if self._ops % 1024 == 0 or len(self._log) > self.max_keys:
+                self._sweep(now)
+            for key in keys:
+                q = self._prune(key, now)
+                if q is not None and len(q) >= self.limit:
+                    return False
+            for key in keys:
+                q = self._log.get(key)
+                if q is None:
+                    q = self._log[key] = deque()
+                else:
+                    self._log.move_to_end(key)
+                q.append(now)
+            while len(self._log) > self.max_keys:
+                self._log.popitem(last=False)
+            return True
 
     def __len__(self):
-        return len(self._log)
+        with self._lock:
+            return len(self._log)
 
 
 class RedisLimiter:
@@ -138,20 +144,26 @@ class RedisLimiter:
     def allow(self, keys, now=None):
         now = time.time() if now is None else now
         idx = int(now // self.window)
+        rkeys = [self._key(k, idx) for k in keys]
         try:
-            p = self.r.pipeline()
-            for key in keys:
-                p.get(self._key(key, idx))
-            counts = p.execute()
-            if any(int(c or 0) >= self.limit for c in counts):
-                return False
-            p = self.r.pipeline()
-            for key in keys:
-                k = self._key(key, idx)
-                p.incr(k)
-                p.expire(k, int(self.window * 2) + 1)
-            p.execute()
-            return True
+            # Atomic check-then-charge: a GET+INCR pipeline lets two replicas
+            # (or threads) both pass the last slot before either INCR lands.
+            return bool(self.r.eval(
+                """
+                local limit = tonumber(ARGV[1])
+                local ttl = tonumber(ARGV[2])
+                for i = 1, #KEYS do
+                  local c = tonumber(redis.call('GET', KEYS[i]) or '0')
+                  if c >= limit then return 0 end
+                end
+                for i = 1, #KEYS do
+                  local c = redis.call('INCR', KEYS[i])
+                  if c == 1 then redis.call('EXPIRE', KEYS[i], ttl) end
+                end
+                return 1
+                """,
+                len(rkeys), *rkeys, self.limit, int(self.window * 2) + 1,
+            ))
         except Exception:
             return self._fallback.allow(keys)
 

@@ -254,6 +254,64 @@ that peer, including status 'offered'.
 
 ---
 
+## 13. A normal reload left a stale session → no reconnect
+
+**Symptom.** Reloading the tab did not connect, but closing it and opening a
+new one worked. The old page's session was still present and the replacement
+could not claim the device cleanly.
+
+**Problem.** A reload keeps the per-tab `uid` (sessionStorage), so both the
+old and new page briefly present the same device. Nothing on the relay let the
+new page load take ownership; a late `pagehide`/`disconnect` from the old page
+could race the new link. The local name was also generated in sessionStorage
+and never shown, so a device could be `silken-chickadee` on the wire while the
+UI hid it.
+
+**Solution.**
+- **TOKEN-keyed sessions, not uid ownership.** Every page load mints a fresh
+  `gen`. On `join`/`sync` the relay keys the session by a server-minted opaque
+  `token`; uid/name are display attributes only. A join without a token creates
+  a NEW session and returns its token (welcome/sync ack, never a roster). A join
+  with a token reattaches that token's session and may replace its previous sid.
+  A retired generation for that token is refused. A uid alone is NEVER an
+  ownership key: an unrelated client that knows the victim's uid but lacks its
+  token gets an independent session and cannot evict, close, or join as the
+  victim. A legacy no-token client also gets a new independent session.
+  Capacity is on token records only: expired/closed records are evicted first;
+  if every record is live a new tokenless session is refused with a capacity
+  error instead of superseding a live sid. Eviction loses resume ability, not
+  access. gen/sid/token live in one record with one sliding 24h TTL (one Redis
+  hash updated by atomic Lua), and retired generations are bounded per token
+  with a global 24h TTL/cap. The token is a bearer in localStorage: not rotated,
+  no revocation endpoint, expires 24h after the last successful claim.
+- **Synchronous pagehide, not unload-dependent.** `pagehide` closes local
+  `RTCPeerConnection`s, stops link/session/pairing/config timers, and beacons
+  `POST /api/session/close` with `{token, gen}`. The endpoint requires the
+  token, honors the configured origin allowlist, and is rate-limited; it only
+  acts for that token's current generation, so a late close cannot drop a newer
+  session. `pageshow` always revalidates/reconnects; a BFCache
+  restore (or any pagehide/pageshow return) rotates generation first.
+  `visibilitychange` alone does NOT tear down (backgrounding an iPad is
+  normal), and ICE/presence timeouts remain the fallback if `pagehide` never
+  fires. A superseded tab stays suspended across `pageshow`/BFCache/storage
+  events; only an explicit full reload may take over again.
+- **Visible, editable identity.** The device name lives in localStorage (with
+  migration from the old per-tab name), is shown on Home/header and in a name
+  field with a generated default. Renaming sends the SAME `{uid, gen}` and the
+  relay emits `peer-updated`, so peers relabel one row; open tabs also relabel
+  from the `storage` event. Names are labels, not identities -- duplicates are
+  allowed, and ownership/pairing never depends on the name. No duplicate
+  pairing or peer tile. Clearing site data is never part of the recovery path.
+  Optional Firebase signaling has no relay-side token/rename/supersede path;
+  its Firestore presence remains add/remove only.
+
+*Files:* `frontend/src/lib/identity.js`, `frontend/src/lib/useTunlion.js`,
+`frontend/src/lib/session.js`, `frontend/src/lib/signaling.js`,
+`frontend/src/ui/Tunlion.jsx`, `backend/signaling.py`, `backend/app.py`.
+*Gates:* `frontend/tests/peer-identity.spec.cjs`,
+`frontend/tests/peer-reload.spec.cjs`,
+`backend/tests/test_session_generation.py`.
+
 ## Testing
 
 `PeerLink`'s logic is exercised against a mock `RTCPeerConnection` (see the test
@@ -296,3 +354,11 @@ a platform boundary (no filesystem access), not a design choice.
   revokes file handles on navigation.
 - **Multi-instance API scaling** needs the Redis registry (already wired); the
   glare fix (#1) is what makes that safe.
+- **Session ownership state is relay state.** If the relay loses its state
+  (restart without Redis), existing tokens are unknown: each client starts a
+  new independent session. A uid alone never grants access to another session
+  in any window. With Redis the 24h token/session TTL state and atomic Lua
+  survive restarts.
+- **Optional Firebase signaling** remains add/remove presence: it does not
+  implement generation/token supersede, in-place rename, or relay-side close.
+  Those paths are Socket.IO-only.

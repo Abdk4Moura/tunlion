@@ -32,6 +32,19 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The Redis registry is the multi-replica path; exercise its atomic Lua
+    # alongside the in-memory registry so the two ownership implementations
+    # cannot silently drift apart.
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -83,7 +96,7 @@ jobs:
       # pake-ux drives the real backend, so it needs the Python side present.
       # Versions match capability-ci.yml so the two jobs cannot drift apart.
       - name: Install backend deps
-        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0 redis==8.1.0
 
       # pake-ux asserts the built app talks to its own origin, so the dist must
       # be built WITHOUT a production API base. The gate checks this and says so.
@@ -115,6 +128,38 @@ jobs:
         env:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/browser-ui.spec.cjs
+
+      # The local device name and connected peer name are visible, a chosen
+      # name replaces the generated default, and a superseded tab explains
+      # itself without a reset/clear-data instruction. Chromium + WebKit iPad.
+      - name: peer-identity
+        run: node frontend/tests/peer-identity.spec.cjs
+
+      # Generation-safe reload: a normal reload supersedes the old signaling
+      # session, a late close from that generation is ignored, two tabs for one
+      # device resolve to one live session, and rename relabels the same sid.
+      # Real Flask relay + Chromium and WebKit iPad (each in its own process).
+      - name: peer-reload
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/peer-reload.spec.cjs
+
+      # The relay's generation/rename/close semantics, independent of a browser.
+      - name: backend session generation
+        run: python -m unittest backend.tests.test_session_generation
+
+      - name: backend session generation (Redis parity)
+        env:
+          FIL_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+        run: python -m unittest backend.tests.test_session_generation_redis
+
+      - name: backend session close HTTP
+        run: python -m unittest backend.tests.test_session_close_http
+
+      - name: backend rate limiter (Mem + Redis)
+        env:
+          FIL_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+        run: python -m unittest backend.tests.test_ratelimit
 
       # The shell outlives its link: a reattach sends resume_from (exactly the
       # bytes the terminal showed), the bar says reconnecting while the link is

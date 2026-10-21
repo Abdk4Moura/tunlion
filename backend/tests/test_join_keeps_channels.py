@@ -50,7 +50,7 @@ class JoinKeepsChannels(unittest.TestCase):
         b.get_received()
 
         # The browser's legacy join, same room as its sync.
-        b.emit("join", {"room": "rb", "name": "ipad", "uid": "ub"})
+        b.emit("join", {"room": "rb", "name": "ipad", "uid": "ub", "gen": "g-b"})
 
         self.assertTrue(reg.share_channel(a_sid, b_sid),
                         "a room join dropped the socket's known-device channel")

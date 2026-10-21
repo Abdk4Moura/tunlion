@@ -45,8 +45,19 @@ def _make():
 
 
 def _ack(client, payload):
-    """Emit sync with an ack callback and return the ack dict."""
-    return client.emit("sync", payload, callback=True)
+    """Emit sync with an ack callback, reusing this client's token/gen so the
+    test exercises one session across idempotent calls."""
+    if payload is None:
+        return client.emit("sync", None, callback=True)
+    p = dict(payload)
+    p.setdefault("gen", getattr(client, "_gen", "g1"))
+    if getattr(client, "_token", None):
+        p["token"] = client._token
+    ack = client.emit("sync", p, callback=True)
+    if ack and ack.get("token"):
+        client._token = ack["token"]
+        client._gen = ack.get("gen") or p["gen"]
+    return ack
 
 
 def _names(received):
@@ -57,8 +68,12 @@ class SyncAckShape(unittest.TestCase):
     def test_valid_sync_ack(self):
         _app, _sio, c = _make()
         ack = _ack(c, {"v": 1, "room": "r1", "name": "alice", "uid": "u1", "channels": [C1]})
-        self.assertEqual(ack, {"v": 1, "ok": True, "room": "r1", "channels": 1,
-                               "lease": True, "peers": [], "channel_peers": []})
+        self.assertEqual((ack["v"], ack["ok"], ack["room"], ack["channels"], ack["lease"]),
+                         (1, True, "r1", 1, True))
+        self.assertEqual(ack["peers"], [])
+        self.assertEqual(ack["channel_peers"], [])
+        self.assertTrue(ack["token"])
+        self.assertTrue(ack["gen"])
 
     def test_missing_room_rejected(self):
         _app, _sio, c = _make()
@@ -72,7 +87,7 @@ class SyncAckShape(unittest.TestCase):
 
     def test_bad_channels_dropped_from_count(self):
         _app, _sio, c = _make()
-        ack = _ack(c, {"room": "r1", "channels": [C1, BAD, 123, None, C2]})
+        ack = _ack(c, {"room": "r1", "name": "alice", "uid": "u1", "channels": [C1, BAD, 123, None, C2]})
         self.assertEqual(ack["channels"], 2)  # only the two valid hex ids count
 
 
@@ -126,9 +141,9 @@ class SyncMembership(unittest.TestCase):
 
     def test_room_change_reannounces(self):
         _app, _sio, c = _make()
-        ack1 = _ack(c, {"room": "r1", "name": "alice"})
+        ack1 = _ack(c, {"room": "r1", "name": "alice", "uid": "u1"})
         c.get_received()
-        ack2 = _ack(c, {"room": "r2", "name": "alice"})
+        ack2 = _ack(c, {"room": "r2", "name": "alice", "uid": "u1"})
         self.assertEqual(ack2["room"], "r2")
         self.assertNotEqual(ack1["room"], ack2["room"])
         # Moving rooms is a real join: A is announced in r2.
@@ -140,9 +155,9 @@ class SyncChannelUnion(unittest.TestCase):
         """sync [c1] then [c1,c2] -> the sid's subscription is the UNION, and
         each ack reports the count accepted on that call."""
         _app, _sio, c = _make()
-        ack1 = _ack(c, {"room": "r1", "channels": [C1]})
+        ack1 = _ack(c, {"room": "r1", "name": "alice", "uid": "u1", "channels": [C1]})
         self.assertEqual(ack1["channels"], 1)
-        ack2 = _ack(c, {"room": "r1", "channels": [C1, C2]})
+        ack2 = _ack(c, {"room": "r1", "name": "alice", "uid": "u1", "channels": [C1, C2]})
         self.assertEqual(ack2["channels"], 2)
 
     def test_known_peer_emitted_to_channel_member(self):

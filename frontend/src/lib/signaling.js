@@ -8,8 +8,10 @@
 //   sig.on('welcome',     ({ id, peers }) => {})
 //   sig.on('peer-joined', ({ id, name })  => {})
 //   sig.on('peer-left',   ({ id })        => {})
+//   sig.on('peer-updated',({ id, name })  => {})  // in-place rename, same sid
+//   sig.on('session-superseded', ()       => {})  // a newer page load/tab took over
 //   sig.on('signal',      ({ from, data })=> {})
-//   sig.join(room, name)
+//   sig.join(room, name, uid, gen)
 //   sig.signal(toPeerId, data)
 //   sig.leave()
 //
@@ -18,6 +20,7 @@
 
 import { io } from 'socket.io-client'
 import { API_BASE } from './api.js'
+import { loadOwnerToken, saveOwnerToken } from './identity.js'
 import { SOCKET_TIMEOUT_MS, transportsAfterFailure } from './signalTransport.js'
 
 class Emitter {
@@ -43,6 +46,14 @@ class SocketIOSignaling extends Emitter {
     this.kind = 'socketio'
     this.room = null
     this.name = null
+    this.uid = null
+    this.gen = null
+    // Opaque SESSION token, minted by the relay on a tokenless join and
+    // returned only to this socket (welcome/sync ack). Never in a roster.
+    this.token = loadOwnerToken() || null
+    // A page whose session was superseded stops talking. Auto-reconnect must
+    // not replay its retired generation (and must not fight the new owner).
+    this.suspended = false
     // API_BASE === '' → same-origin; otherwise connect to the backend origin.
     // WebSocket FIRST: socket.io's default is HTTP long-poll → upgrade, which
     // costs an extra handshake + upgrade round-trip on every connect (painful at
@@ -65,7 +76,17 @@ class SocketIOSignaling extends Emitter {
       reconnectionDelay: 400,
       reconnectionDelayMax: 2000,
     })
-    for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
+    // welcome is handled separately: it can carry the opaque session token,
+    // which we persist but never surface to the UI/roster.
+    this.socket.on('welcome', (payload) => {
+      if (payload && payload.token) {
+        this.token = payload.token
+        saveOwnerToken(payload.token)
+      }
+      if (payload && payload.gen) this.gen = payload.gen
+      this._emit('welcome', payload)
+    })
+    for (const ev of ['peer-joined', 'peer-left', 'peer-updated', 'session-superseded', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }
     // Resilience: on every (re)connect, rejoin the current room. A reconnect
@@ -75,8 +96,12 @@ class SocketIOSignaling extends Emitter {
     this.socket.on('connect', () => {
       this._connectErrors = 0
       this._openedAt = Date.now()
+      if (this.suspended) {
+        try { this.socket.disconnect() } catch {}
+        return
+      }
       this._emit('status', { connected: true })
-      if (this.room) this.socket.emit('join', { room: this.room, name: this.name, uid: this.uid })
+      this._emitJoin()
     })
     this.socket.on('disconnect', () => {
       this._openedAt = Date.now()
@@ -102,11 +127,34 @@ class SocketIOSignaling extends Emitter {
     if (leadChanged && this.socket.io.engine) this.socket.io.engine.close()
     if (nudge && !this.socket.connected) this.socket.connect()
   }
-  join(room, name, uid) {
+  _emitJoin() {
+    if (this.suspended || !this.room) return
+    this.socket.emit('join', { room: this.room, name: this.name, uid: this.uid, gen: this.gen, token: this.token })
+  }
+  join(room, name, uid, gen) {
     this.room = room
     this.name = name
     this.uid = uid
-    this.socket.emit('join', { room, name, uid })
+    this.gen = gen
+    if (!this.token) this.token = loadOwnerToken() || null
+    // If the socket is still connecting, the `connect` handler emits this once;
+    // emitting here too made two tokenless joins mint two sessions on one sid.
+    if (this.socket.connected) this._emitJoin()
+  }
+  setToken(token) {
+    if (!token) return
+    // The storage event already means localStorage has this value; do not
+    // write it back (that would let a synthetic/foreign event change the
+    // browser's owner token).
+    this.token = token
+  }
+  // Keep the reconnect cache in step with a rename / BFCache generation
+  // rotation. Without this, the auto-rejoin would replay a retired generation
+  // and the relay would correctly mark the page superseded.
+  setIdentity({ name, uid, gen } = {}) {
+    if (name !== undefined) this.name = name
+    if (uid !== undefined) this.uid = uid
+    if (gen !== undefined) this.gen = gen
   }
   signal(to, data) {
     this.socket.emit('signal', { to, data })
@@ -151,7 +199,18 @@ class SocketIOSignaling extends Emitter {
   // digest. Mirrors subscribe's ack shape. lib/session.js owns the loop that
   // decides WHEN to call this; here we only carry the wire.
   sync(state, onAck) {
-    this.socket.emit('sync', state, (resp) => onAck?.(resp))
+    if (!this.token) this.token = loadOwnerToken() || null
+    // Initial join owns token minting. Do not race it with a tokenless sync
+    // (which would create a second, independent session).
+    if (!this.token) return // join mints the token; retry on the session tick
+    this.socket.emit('sync', { ...state, token: this.token }, (resp) => {
+      if (resp && resp.token) {
+        this.token = resp.token
+        saveOwnerToken(resp.token)
+      }
+      if (resp && resp.gen) this.gen = resp.gen
+      onAck?.(resp)
+    })
   }
   // Live socket truth, for the session loop's connected-gate (state captured in
   // closures goes stale; this reads the socket directly).
@@ -160,14 +219,38 @@ class SocketIOSignaling extends Emitter {
   }
   // Force a reconnect attempt (e.g. when a suspended mobile tab resumes).
   reconnect() {
-    if (this.socket && !this.socket.connected) this.socket.connect()
+    if (this.socket && !this.suspended && !this.socket.connected) this.socket.connect()
+  }
+  // Test-only: drop and re-open the signaling socket without touching the
+  // WebRTC links, so a gate can prove the reconnect cache (gen/name) without
+  // conflating it with network emulation.
+  dropForTest() {
+    try { this.socket.disconnect() } catch {}
+    setTimeout(() => { if (!this.suspended) this.socket.connect() }, 100)
+  }
+  // A newer session for this device owns it: stop auto-reconnect and do not
+  // re-emit join (that would replay a retired generation).
+  suspend() {
+    this.suspended = true
+    try { this.socket.disconnect() } catch {}
+  }
+  // Only a fresh page load / explicit takeover may resume.
+  resume() {
+    if (!this.suspended) return
+    this.suspended = false
+    this.socket.connect()
   }
 }
 
 // ----------------------------------------------------------------- Firebase --
 // Serverless signaling over Firestore. Loaded lazily so the Firebase SDK is
 // only pulled in when SIGNALING=firebase. Presence + per-peer signal mailboxes
-// mirror the Socket.IO event contract exactly.
+// mirror the Socket.IO event contract, EXCEPT generation ownership/reload
+// takeover AND in-place rename/cleanup: Firestore presence is added/removed
+// documents and has no relay to mint or verify an ownership token, and
+// setIdentity()/peer-updated/renamed presence has no Firestore equivalent.
+// Those paths are Socket.IO-only; a Firebase deployment keeps its existing
+// add/remove presence semantics (documented as a known limit).
 class FirebaseSignaling extends Emitter {
   constructor(firebaseConfig) {
     super()

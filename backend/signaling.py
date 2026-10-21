@@ -10,13 +10,28 @@ that lets you run many api replicas and scale them up/down on demand, because
 every instance shares the same room state and can deliver to any peer.
 
 Event contract (kept in sync with CONTRACT.md):
-  client -> server   join {room,name} · signal {to,data} · leave {}
-  server -> client   welcome {id,peers:[{id,name}]} · peer-joined {id,name}
-                     peer-left {id} · signal {from,data}
+  client -> server   join {room,name,uid,gen,token} ·
+                     sync {room,name,uid,gen,token,channels}
+                     signal {to,data} · leave {}
+  server -> client   welcome {id,peers:[{id,name,uid}],token?} ·
+                     peer-joined {id,name,uid} · peer-left {id} ·
+                     peer-updated {id,name,uid} · session-superseded {reason} ·
+                     signal {from,data}
+  HTTP               POST /api/session/close {token,gen} (pagehide beacon)
+
+`gen` is a fresh per-page-load generation. `token` is the opaque SESSION key,
+minted by the relay on a tokenless join and returned only to that socket (in
+the welcome/sync ack, never in a roster). A valid token may replace its own
+previous sid; a new generation for that token retires the old one. uid/name are
+display attributes only: a uid alone is never authority, and a tokenless client
+gets an independent session.
 """
 import os
 import re
+import secrets
+import threading
 import time as _time
+from collections import deque
 
 from flask import request
 from flask_socketio import emit, join_room, leave_room
@@ -59,6 +74,32 @@ def _norm_code(raw):
     return re.sub(r"[^a-z0-9-]", "", re.sub(r"\s+", "-", raw.strip().lower()))[:48]
 
 
+_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def _valid_id(value):
+    """Session ids cross a JSON boundary. Require a short, separator-safe str
+    before they become Redis key/hash/zset members or Python dict keys."""
+    return isinstance(value, str) and bool(_ID_RE.match(value))
+
+
+def origin_allowed(origin, allowed):
+    """Whether a pagehide beacon Origin may reach the close endpoint.
+
+    No Origin is allowed (some same-origin beacons omit it) because the bearer
+    token still gates the operation. "*" is the dev/simple default; otherwise
+    the configured list is enforced exactly.
+    """
+    if not origin:
+        return True
+    if allowed == "*":
+        return True
+    try:
+        return origin in allowed
+    except TypeError:
+        return False
+
+
 class _MemRegistry:
     """Process-local membership (single instance).
 
@@ -68,43 +109,243 @@ class _MemRegistry:
     """
 
     LIVE_TTL = 60  # liveness lease; refreshed by the lease loop + on activity
+    SESSION_TTL = 24 * 3600  # token/session lifetime (sliding on use)
+    SESSION_LIVE_WINDOW = 120  # last claim heartbeat; sync is every 5s
+    RETIRED_TTL = 24 * 3600  # per-token generation tombstone lifetime
+    MAX_SESSIONS = 50_000  # token records (LRU-evicted, never uid ownership)
+    MAX_RETIRED_TOTAL = 200_000
 
     def __init__(self):
-        self._m = {}  # sid -> {"room", "name", "uid"}
+        self._m = {}  # sid -> {"room", "name", "uid", "gen"}
         self._live = {}  # sid -> lease expiry (monotonic)
+        # TOKEN -> {"sid", "gen", "uid", "name", "last_seen", "exp"}.
+        # uid/name are display attributes only; the token is the session key.
+        # Retired generations are (token, gen) -> expiry, globally bounded.
+        self._sessions = {}
+        self._sid_token = {}
+        self._retired = {}
+        self._retired_order = deque()
+        # async_mode=threading really is concurrent: claim/take must not
+        # interleave or two generations can both believe they own a session.
+        self._lock = threading.RLock()
 
     def refresh(self, sids):
         """Extend the liveness lease for connected sids."""
         exp = _time.monotonic() + self.LIVE_TTL
-        for sid in sids:
-            self._live[sid] = exp
+        with self._lock:
+            for sid in sids:
+                self._live[sid] = exp
 
     def _alive(self, sid):
         return self._live.get(sid, 0) > _time.monotonic()
 
-    def add(self, sid, room, name, uid=None):
-        self._m[sid] = {"room": room, "name": name, "uid": uid}
-        self.refresh([sid])
+    def add(self, sid, room, name, uid=None, gen=None):
+        with self._lock:
+            self._m[sid] = {"room": room, "name": name, "uid": uid, "gen": gen}
+            self.refresh([sid])
 
     def room_of(self, sid):
-        m = self._m.get(sid)
-        return m["room"] if m else None
+        with self._lock:
+            m = self._m.get(sid)
+            return m["room"] if m else None
 
     def remove(self, sid):
-        self._live.pop(sid, None)
-        m = self._m.pop(sid, None)
-        return m["room"] if m else None
+        with self._lock:
+            self._live.pop(sid, None)
+            # Keep the session's recorded sid: a same-token reconnect uses it
+            # as `prev` and replaces it. Clearing it here made a fresh join
+            # lose its own owner before the room announcement.
+            self._sid_token.pop(sid, None)
+            m = self._m.pop(sid, None)
+            return m["room"] if m else None
+
+    def claim_session(self, token, gen, sid, uid, name):
+        """Create or reattach a TOKEN-keyed session.
+
+        uid/name are display attributes. The token is the only key and the only
+        authority: a caller without a valid token gets a brand-new session and
+        can never evict or close any other session. Returns
+        {status, token, gen, prev, evicted, retired?}.
+        """
+        if not _valid_id(uid) or not _valid_id(gen):
+            return {"status": "denied", "token": None, "gen": None, "prev": None, "evicted": []}
+        if token is not None and (not isinstance(token, str) or not token or len(token) > 512):
+            return {"status": "denied", "token": None, "gen": None, "prev": None, "evicted": []}
+        with self._lock:
+            now = _time.time()
+            self._prune_retired(now)
+            evicted = self._prune_sessions(now)
+            rec = self._sessions.get(token) if token else None
+            if rec and rec.get("exp", 0) <= now:
+                self._sessions.pop(token, None)
+                if rec.get("sid") and rec.get("sid") != sid:
+                    evicted.append(rec["sid"])
+                rec = None
+            if rec is not None:
+                if self._is_retired(token, gen):
+                    return {"status": "retired", "token": token, "gen": rec.get("gen"),
+                            "prev": rec.get("sid"), "evicted": evicted}
+                rec["last_seen"] = now
+                rec["exp"] = now + self.SESSION_TTL
+                rec["uid"] = uid
+                rec["name"] = name
+                if rec.get("gen") == gen:
+                    prev = rec.get("sid")
+                    if prev != sid:
+                        self._sid_token.pop(prev, None)
+                        rec["sid"] = sid
+                        self._sid_token[sid] = token
+                        return {"status": "replace", "token": token, "gen": gen,
+                                "prev": prev, "evicted": evicted}
+                    return {"status": "current", "token": token, "gen": gen,
+                            "prev": None, "evicted": evicted}
+                old = rec.get("gen")
+                prev = rec.get("sid")
+                if old:
+                    self._add_retired(token, old, now)
+                if prev and prev != sid:
+                    self._sid_token.pop(prev, None)
+                rec["gen"] = gen
+                rec["sid"] = sid
+                self._sid_token[sid] = token
+                return {"status": "new", "token": token, "gen": gen,
+                        "prev": prev, "evicted": evicted}
+            # No token, unknown token, or expired token: a fresh independent
+            # session. The caller's uid/name are only labels here.
+            made = self._make_room(now)
+            if made is None:
+                return {"status": "capacity", "token": None, "gen": None,
+                        "prev": None, "evicted": evicted}
+            evicted += made
+            issued = secrets.token_urlsafe(24)
+            self._sessions[issued] = {"sid": sid, "gen": gen, "uid": uid, "name": name,
+                                      "last_seen": now, "exp": now + self.SESSION_TTL}
+            self._sid_token[sid] = issued
+            return {"status": "new", "token": issued, "gen": gen,
+                    "prev": None, "evicted": evicted}
+
+    def _prune_sessions(self, now):
+        """Drop expired token records; return their sids for room cleanup."""
+        out = []
+        for token, rec in list(self._sessions.items()):
+            if rec.get("exp", 0) <= now:
+                self._sessions.pop(token, None)
+                sid = rec.get("sid")
+                if sid:
+                    self._sid_token.pop(sid, None)
+                    out.append(sid)
+        return out
+
+    def _session_live(self, rec, now):
+        """A session is live only if its sid is connected AND its last claim is
+        inside the configured heartbeat window. A stale score with a lingering
+        sid is not live and may be evicted under capacity pressure."""
+        sid = rec.get("sid")
+        if not sid or not self._alive(sid):
+            return False
+        return (now - rec.get("last_seen", 0)) <= self.SESSION_LIVE_WINDOW
+
+    def _make_room(self, now):
+        """Capacity is on TOKEN records only. Prefer expired/closed/non-live
+        records; never evict a live session. Returns evicted sids, or None when
+        every record is live (caller returns a capacity error)."""
+        if len(self._sessions) < self.MAX_SESSIONS:
+            return []
+        out = []
+        candidates = [
+            (token, rec)
+            for token, rec in self._sessions.items()
+            if not self._session_live(rec, now)
+        ]
+        if not candidates:
+            return None
+        # Remove every non-live record on pressure, matching Redis. This frees
+        # multiple stale slots without touching a genuinely live session.
+        for token, rec in candidates:
+            self._sessions.pop(token, None)
+            sid = rec.get("sid")
+            if sid:
+                self._sid_token.pop(sid, None)
+                out.append(sid)
+        return out
+
+    def _prune_retired(self, now):
+        """Global (token, gen) tombstones: 24h TTL + hard total cap."""
+        while self._retired_order:
+            token, gen, exp = self._retired_order[0]
+            if exp > now and len(self._retired) < self.MAX_RETIRED_TOTAL:
+                break
+            self._retired_order.popleft()
+            if self._retired.get((token, gen)) == exp:
+                self._retired.pop((token, gen), None)
+        while len(self._retired) >= self.MAX_RETIRED_TOTAL and self._retired_order:
+            token, gen, exp = self._retired_order.popleft()
+            if self._retired.get((token, gen)) == exp:
+                self._retired.pop((token, gen), None)
+
+    def _is_retired(self, token, gen):
+        exp = self._retired.get((token, gen))
+        if exp is None:
+            return False
+        if exp <= _time.time():
+            self._retired.pop((token, gen), None)
+            return False
+        return True
+
+    def _add_retired(self, token, gen, now):
+        self._prune_retired(now)
+        key = (token, gen)
+        if key in self._retired:
+            return
+        exp = now + self.RETIRED_TTL
+        self._retired[key] = exp
+        self._retired_order.append((token, gen, exp))
+
+    def rename(self, sid, name):
+        with self._lock:
+            m = self._m.get(sid)
+            if not m:
+                return None
+            m["name"] = name
+            return {"id": sid, "name": name, "uid": m.get("uid")}
+
+    def take_session(self, token, gen):
+        """Close the current sid for this token+generation. Wrong/expired token
+        or an old generation returns None."""
+        if not isinstance(token, str) or not token or not _valid_id(gen):
+            return None
+        with self._lock:
+            now = _time.time()
+            rec = self._sessions.get(token)
+            if not rec or rec.get("exp", 0) <= now or rec.get("gen") != gen:
+                return None
+            sid = rec.get("sid")
+            if sid:
+                self._sid_token.pop(sid, None)
+                self._live.pop(sid, None)
+            rec["sid"] = None
+            rec["gen"] = None
+            rec["last_seen"] = now
+            rec["exp"] = now + self.SESSION_TTL
+            self._add_retired(token, gen, now)
+            m = self._m.pop(sid, None) if sid else None
+            return {"sid": sid, "room": m.get("room") if m else None}
 
     def peers_in(self, room, exclude=None):
-        return [
-            {"id": s, "name": v["name"], "uid": v.get("uid")}
-            for s, v in self._m.items()
-            if v["room"] == room and s != exclude and self._alive(s)
-        ]
+        # Snapshot under the same lock that add/remove/take use: iterating a
+        # live dict while another thread mutates it raises RuntimeError.
+        with self._lock:
+            items = list(self._m.items())
+            return [
+                {"id": s, "name": v["name"], "uid": v.get("uid")}
+                for s, v in items
+                if v["room"] == room and s != exclude and self._alive(s)
+            ]
 
     def meta(self, sid):
-        m = self._m.get(sid)
-        return {"id": sid, "name": m["name"], "uid": m.get("uid")} if m else None
+        with self._lock:
+            m = self._m.get(sid)
+            return {"id": sid, "name": m["name"], "uid": m.get("uid")} if m else None
 
     # -- persistent-pair presence channels (C12): a channel id is a hash of an
     # E2E-shared secret; two sids in the same channel are mutually-trusted
@@ -184,6 +425,11 @@ class _RedisRegistry:
     """
 
     TTL = 86400  # room/sid bookkeeping
+    SESSION_TTL = _MemRegistry.SESSION_TTL
+    SESSION_LIVE_WINDOW = _MemRegistry.SESSION_LIVE_WINDOW
+    RETIRED_TTL = _MemRegistry.RETIRED_TTL
+    MAX_SESSIONS = _MemRegistry.MAX_SESSIONS
+    MAX_RETIRED_TOTAL = _MemRegistry.MAX_RETIRED_TOTAL
     LIVE_TTL = 120  # liveness lease; refreshed every ~15s while connected
 
     def __init__(self, url):
@@ -200,15 +446,176 @@ class _RedisRegistry:
     def _lk(self, sid):
         return f"filament:live:{sid}"
 
-    def add(self, sid, room, name, uid=None):
+    def _sess(self, token):
+        return f"filament:session:{token}"
+
+    def _sessions(self):
+        return "filament:sessions"
+
+    def _retired_key(self):
+        return "filament:retired:gens"
+
+    def add(self, sid, room, name, uid=None, gen=None):
         import json
 
         p = self.r.pipeline()
-        p.hset(self._rk(room), sid, json.dumps({"name": name, "uid": uid}))
+        p.hset(self._rk(room), sid, json.dumps({"name": name, "uid": uid, "gen": gen}))
         p.expire(self._rk(room), self.TTL)
         p.set(self._sk(sid), room, ex=self.TTL)
         p.set(self._lk(sid), 1, ex=self.LIVE_TTL)  # liveness lease (#10)
         p.execute()
+
+    def claim_session(self, token, gen, sid, uid, name):
+        """Atomic TOKEN-keyed session claim (no uid ownership anywhere).
+
+        Returns status/token/gen/prev/evicted. An unknown or expired token gets
+        a brand-new SESSION; it can never touch an existing token record.
+        """
+        if not _valid_id(uid) or not _valid_id(gen):
+            return {"status": "denied", "token": None, "gen": None, "prev": None, "evicted": []}
+        if token is not None and (not isinstance(token, str) or not token or len(token) > 512):
+            return {"status": "denied", "token": None, "gen": None, "prev": None, "evicted": []}
+        candidate = secrets.token_urlsafe(24)
+        now = _time.time()
+        lookup = token if token else candidate
+        status, out_token, out_gen, prev, evicted = self.r.eval(
+            """
+            local cur = redis.call('HMGET', KEYS[1], 'sid', 'gen')
+            local cursid, curgen = cur[1], cur[2]
+            local exists = redis.call('EXISTS', KEYS[1])
+            local has_token = (ARGV[8] ~= '' and exists == 1)
+            redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[5])
+            if has_token then
+              -- A token record exists even if it is closed (gen/sid empty).
+              -- The retired check applies to closed slots too.
+              if redis.call('ZSCORE', KEYS[2], ARGV[8] .. '|' .. ARGV[1]) then
+                return {'retired', ARGV[8], curgen or '', cursid or '', ''}
+              end
+              redis.call('EXPIRE', KEYS[1], ARGV[4])
+              redis.call('HSET', KEYS[1], 'uid', ARGV[9], 'name', ARGV[10], 'last_seen', ARGV[5])
+              redis.call('ZADD', KEYS[3], ARGV[5], ARGV[8])
+              redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]) * 2)
+              if (not curgen) or curgen == '' then
+                redis.call('HSET', KEYS[1], 'gen', ARGV[1], 'sid', ARGV[2])
+                return {'new', ARGV[8], ARGV[1], '', ''}
+              end
+              if curgen == ARGV[1] then
+                if cursid == ARGV[2] then return {'current', ARGV[8], curgen, '', ''} end
+                redis.call('HSET', KEYS[1], 'sid', ARGV[2])
+                return {'replace', ARGV[8], curgen, cursid or '', ''}
+              end
+              while redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[6]) do
+                redis.call('ZREMRANGEBYRANK', KEYS[2], 0, 0)
+              end
+              redis.call('ZADD', KEYS[2], tonumber(ARGV[5]) + tonumber(ARGV[12]),
+                         ARGV[8] .. '|' .. curgen)
+              redis.call('EXPIRE', KEYS[2], tonumber(ARGV[12]) * 2)
+              redis.call('HSET', KEYS[1], 'gen', ARGV[1], 'sid', ARGV[2])
+              return {'new', ARGV[8], ARGV[1], cursid or '', ''}
+            end
+            -- No usable token: fresh SESSION. Capacity prefers expired/closed
+            -- records; it NEVER evicts a live session. If all are live, refuse.
+            local evicted = ''
+            local cards = redis.call('ZCARD', KEYS[3])
+            if cards >= tonumber(ARGV[11]) then
+              local all = redis.call('ZRANGE', KEYS[3], 0, -1)
+              for _, tok in ipairs(all) do
+                local skey = 'filament:session:' .. tok
+                if redis.call('EXISTS', skey) == 0 then
+                  redis.call('ZREM', KEYS[3], tok)
+                end
+              end
+              cards = redis.call('ZCARD', KEYS[3])
+            end
+            if cards >= tonumber(ARGV[11]) then
+              local all = redis.call('ZRANGE', KEYS[3], 0, -1)
+              for _, tok in ipairs(all) do
+                local skey = 'filament:session:' .. tok
+                local h = redis.call('HMGET', skey, 'sid', 'gen')
+                local esid, egen = h[1], h[2]
+                local score = redis.call('ZSCORE', KEYS[3], tok)
+                local connected = esid and esid ~= '' and redis.call('EXISTS', 'filament:live:' .. esid) == 1
+                local stale = (not score) or tonumber(score) < (tonumber(ARGV[5]) - tonumber(ARGV[13]))
+                if (not egen) or egen == '' or (not connected) or stale then
+                  if esid and esid ~= '' then evicted = evicted .. esid .. ',' end
+                  redis.call('DEL', skey)
+                  redis.call('ZREM', KEYS[3], tok)
+                end
+              end
+              cards = redis.call('ZCARD', KEYS[3])
+            end
+            if cards >= tonumber(ARGV[11]) then
+              return {'capacity', '', '', '', evicted}
+            end
+            local newkey = 'filament:session:' .. ARGV[7]
+            redis.call('HSET', newkey, 'sid', ARGV[2], 'gen', ARGV[1],
+                       'uid', ARGV[9], 'name', ARGV[10], 'last_seen', ARGV[5])
+            redis.call('EXPIRE', newkey, ARGV[4])
+            redis.call('ZADD', KEYS[3], ARGV[5], ARGV[7])
+            redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]) * 2)
+            return {'new', ARGV[7], ARGV[1], '', evicted}
+            """,
+            3, self._sess(lookup), self._retired_key(), self._sessions(),
+            gen, sid, str(token) if token else "", self.SESSION_TTL, now,
+            self.MAX_RETIRED_TOTAL, candidate,
+            str(token) if token else "",  # ARGV[8] token for existing records
+            uid, name, self.MAX_SESSIONS, self.RETIRED_TTL,
+            self.SESSION_LIVE_WINDOW,
+        )
+        return {"status": status, "token": out_token or None, "gen": out_gen or None,
+                "prev": prev or None,
+                "evicted": [s for s in (evicted or "").split(",") if s]}
+
+    def rename(self, sid, name):
+        import json
+
+        room = self.r.get(self._sk(sid))
+        if not room:
+            return None
+        raw = self.r.hget(self._rk(room), sid)
+        try:
+            v = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            v = {"uid": None}
+        v["name"] = name
+        self.r.hset(self._rk(room), sid, json.dumps(v))
+        return {"id": sid, "name": name, "uid": v.get("uid")}
+
+    def take_session(self, token, gen):
+        if not isinstance(token, str) or not token or not _valid_id(gen):
+            return None
+        sid, room = self.r.eval(
+            """
+            local cur = redis.call('HMGET', KEYS[1], 'sid', 'gen')
+            if not cur[2] or cur[2] ~= ARGV[2] then return {'', ''} end
+            local sid = cur[1]
+            if not sid then return {'', ''} end
+            local room = redis.call('GET', 'filament:sid:' .. sid)
+            while redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[4]) do
+              redis.call('ZREMRANGEBYRANK', KEYS[2], 0, 0)
+            end
+            redis.call('ZADD', KEYS[2], tonumber(ARGV[3]) + tonumber(ARGV[5]),
+                       ARGV[1] .. '|' .. ARGV[2])
+            redis.call('EXPIRE', KEYS[2], tonumber(ARGV[5]) * 2)
+            redis.call('HSET', KEYS[1], 'gen', '', 'sid', '')
+            redis.call('EXPIRE', KEYS[1], ARGV[6])
+            redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
+            redis.call('EXPIRE', KEYS[3], tonumber(ARGV[6]) * 2)
+            return {sid, room or ''}
+            """,
+            3, self._sess(token), self._retired_key(), self._sessions(),
+            token, gen, _time.time(), self.MAX_RETIRED_TOTAL, self.RETIRED_TTL,
+            self.SESSION_TTL,
+        )
+        if not sid:
+            return None
+        if room:
+            p = self.r.pipeline()
+            p.hdel(self._rk(room), sid)
+            p.delete(self._sk(sid))
+            p.delete(self._lk(sid))
+            p.execute()
+        return {"sid": sid, "room": room or None}
 
     def refresh(self, sids):
         """Extend the liveness lease for locally-connected sids."""
@@ -230,6 +637,10 @@ class _RedisRegistry:
             p.delete(self._sk(sid))
             p.delete(self._lk(sid))
             p.execute()
+            # The uid->generation ownership record deliberately survives:
+            # a same-generation socket reconnect reclaims it, a newer
+            # generation still supersedes this sid, and a stale old generation
+            # can never clear the new owner. take_session() drops it on close.
         return room
 
     def meta(self, sid):
@@ -350,6 +761,33 @@ def make_registry(redis_url):
     return _RedisRegistry(redis_url) if redis_url else _MemRegistry()
 
 
+def close_session(socketio, registry, token, gen):
+    """Best-effort pagehide close for one TOKEN+generation.
+
+    Only the token holder with the current generation can close it. A late
+    beacon from an older generation is ignored. Returns bool.
+    """
+    info = registry.take_session(token, gen)
+    if not info:
+        return False
+    sid = info.get("sid")
+    room = info.get("room")
+    if not sid:
+        return False
+    # This runs OUTSIDE a Socket.IO event (an HTTP beacon), where the
+    # Flask-SocketIO wrapper's include_self/skip_sid path reads flask.request.sid
+    # and raises. The underlying server emit addresses sids/rooms directly and
+    # works from any context (including cross-replica with the Redis queue).
+    for ch, others in registry.unsubscribe_all(sid).items():
+        for other in others:
+            socketio.server.emit("known-peer-left", {"id": sid, "channel": ch}, to=other)
+    if room:
+        socketio.server.emit("peer-left", {"id": sid}, to=room)
+    socketio.server.emit("session-superseded", {"reason": "page-closed"}, to=sid)
+    _tel("session-close", sid=sid, gen=str(gen)[:8], tok=str(token)[:8])
+    return True
+
+
 def _tel(event, **kv):
     """Debugger-grade telemetry (C24): one JSON line per lifecycle event,
     prefixed TEL, to stdout -> docker logs. No file contents, no file names."""
@@ -407,7 +845,71 @@ def register(socketio, registry):
 
     socketio.start_background_task(_lease_loop)
 
-    def _do_join(sid, room, name, uid):
+    _session_claim_limiter = ratelimit.make_limiter(
+        "session-claim",
+        int(os.environ.get("FIL_SESSION_CLAIM_LIMIT", "600")),
+        60.0,
+        getattr(registry, "r", None),
+    )
+
+    def _session_claim_allowed(sid):
+        return _session_claim_limiter.allow([
+            f"sid:{sid}",
+            "ip:" + ratelimit.ip_bucket(ratelimit.client_ip(request)),
+        ])
+
+    def _claim_session(sid, uid, gen, token, name):
+        """Create/reattach a token-keyed session and return
+        (ok, owner_token, effective_gen). uid/name are labels only."""
+        if not _valid_id(uid):
+            _tel("session-invalid", sid=sid)
+            emit("session-superseded", {"reason": "invalid"})
+            return False, None, None
+        if gen is None:
+            # Legacy/CLI clients omit a generation. It is server-assigned and
+            # only orders generations for THIS token; it grants no uid rights.
+            gen = secrets.token_urlsafe(8)
+        elif not _valid_id(gen):
+            _tel("session-invalid", sid=sid)
+            emit("session-superseded", {"reason": "invalid"})
+            return False, None, None
+        if token is not None and (not isinstance(token, str) or len(token) > 512):
+            _tel("session-invalid", sid=sid)
+            emit("session-superseded", {"reason": "invalid"})
+            return False, None, None
+        if not _session_claim_allowed(sid):
+            _tel("session-claim-rate-limited", sid=sid, uid=uid)
+            emit("session-superseded", {"reason": "rate-limited"})
+            return False, None, None
+        verdict = registry.claim_session(token, gen, sid, uid, name)
+        status = verdict.get("status")
+        owner_token = verdict.get("token")
+        effective_gen = verdict.get("gen") or gen
+        if status in ("retired", "denied", "capacity"):
+            reason = {"retired": "stale-generation", "denied": "invalid",
+                      "capacity": "capacity"}[status]
+            _tel("session-retired" if status == "retired" else "session-denied",
+                 sid=sid, uid=uid, gen=str(gen)[:8], status=status)
+            emit("session-superseded", {"reason": reason})
+            return False, None, None
+        for evicted_sid in verdict.get("evicted") or []:
+            if not evicted_sid or evicted_sid == sid:
+                continue
+            _tel("session-evicted", sid=evicted_sid, uid=uid)
+            socketio.emit("session-superseded", {"reason": "session-evicted"}, to=evicted_sid)
+            _channel_goodbye(evicted_sid)
+            local_sids.discard(evicted_sid)
+            _leave_room(evicted_sid)
+        prev = verdict.get("prev")
+        if prev and prev != sid:
+            _tel("session-supersede", old=prev, new=sid, uid=uid, gen=str(effective_gen)[:8])
+            socketio.emit("session-superseded", {"reason": "newer-generation"}, to=prev)
+            _channel_goodbye(prev)
+            local_sids.discard(prev)
+            _leave_room(prev)
+        return True, owner_token, effective_gen
+
+    def _do_join(sid, room, name, uid, gen=None, token=None):
         """The room-join effect: leave any prior room, join the new one, and
         announce in both directions. Factored so `sync` can reuse the EXACT
         same flow when (and only when) a sid's room actually changes."""
@@ -419,28 +921,42 @@ def register(socketio, registry):
         _leave_room(sid)
 
         join_room(room)
-        registry.add(sid, room, name, uid)
+        registry.add(sid, room, name, uid, gen)
         peers = [p for p in registry.peers_in(room, exclude=sid) if _sid_alive(p["id"])]
-        _tel("join", sid=sid, uid=uid, room=room, peers=len(peers))
+        _tel("join", sid=sid, uid=uid, gen=str(gen)[:8] if gen else None, room=room, peers=len(peers))
 
         # Tell the joiner who's already here (they initiate offers); tell the
         # room someone arrived. With the Redis message queue these reach peers
-        # on every instance.
-        _push("welcome", {"id": sid, "peers": peers})
+        # on every instance. `token` goes ONLY to the joining socket -- it is
+        # the device ownership secret and must never ride a broadcast roster.
+        welcome = {"id": sid, "peers": peers, "gen": gen}
+        if token:
+            welcome["token"] = token
+        _push("welcome", welcome)
         _push("peer-joined", {"id": sid, "name": name, "uid": uid}, room=room, include_self=False)
 
     @socketio.on("join")
     def on_join(data):
         sid = request.sid
-        room = (data or {}).get("room")
-        name = (data or {}).get("name") or "anonymous"
+        data = data if isinstance(data, dict) else {}
+        room = data.get("room")
+        raw_name = data.get("name")
+        if not isinstance(raw_name, str) or not raw_name or len(raw_name) > 128:
+            emit("session-superseded", {"reason": "invalid"})
+            return
+        name = raw_name
         # uid: a stable per-tab identity that survives reconnects (sids don't).
         # It lets peers recognize "same device, new connection" — the basis for
         # transfer resume.
         uid = (data or {}).get("uid")
+        gen = (data or {}).get("gen")
+        token = (data or {}).get("token")
         if not room:
             return
-        _do_join(sid, room, name, uid)
+        ok, owner_token, effective_gen = _claim_session(sid, uid, gen, token, name)
+        if not ok:
+            return
+        _do_join(sid, room, name, uid, effective_gen, owner_token)
 
     # -- one-time pairing (#11): say the code aloud; it works exactly once. --
     PAIR_TTL = 600  # unclaimed codes evaporate after 10 minutes
@@ -624,22 +1140,42 @@ def register(socketio, registry):
     @socketio.on("sync")
     def on_sync(data=None):
         sid = request.sid
-        data = data or {}
+        data = data if isinstance(data, dict) else {}
         room = data.get("room")
-        name = data.get("name") or "anonymous"
+        raw_name = data.get("name")
+        if not isinstance(raw_name, str) or not raw_name or len(raw_name) > 128:
+            return {"v": 1, "ok": False, "room": None, "channels": 0, "lease": False}
+        name = raw_name
         uid = data.get("uid")
+        gen = data.get("gen")
+        token = data.get("token")
         if not room:
             return {"v": 1, "ok": False, "room": None, "channels": 0, "lease": False}
 
+        # Token-first: a reload's new generation replaces that token's old sid,
+        # and a retired generation cannot take the session back with a late
+        # sync. A uid alone creates an independent session and affects nothing.
+        ok, owner_token, effective_gen = _claim_session(sid, uid, gen, token, name)
+        if not ok:
+            return {"v": 1, "ok": False, "superseded": True, "room": None,
+                    "channels": 0, "lease": False}
+
         # Membership: re-announce ONLY when the room actually changes for this
-        # sid (idempotent — a repeated sync to the same room is silent). When
-        # the room is unchanged we deliberately do NOT re-add (a name/uid edit
-        # without a room change is not re-broadcast); we only refresh the lease.
+        # sid (idempotent — a repeated sync to the same room is silent).
         room_changed = registry.room_of(sid) != room
         if room_changed:
-            _do_join(sid, room, name, uid)
-        elif hasattr(registry, "refresh"):
-            registry.refresh([sid])  # lease refresh only (Redis); no emits
+            _do_join(sid, room, name, uid, effective_gen, owner_token)
+        else:
+            if hasattr(registry, "refresh"):
+                registry.refresh([sid])  # lease refresh only (Redis); no emits
+            # A rename is a relabel of the SAME device: update this sid's
+            # metadata and tell the room, never create a second peer/pairing.
+            me = registry.meta(sid)
+            if me and me.get("name") != name:
+                updated = registry.rename(sid, name)
+                if updated:
+                    emit("peer-updated", updated, room=room, include_self=False)
+                    _tel("rename", sid=sid, uid=uid)
 
         # Subscriptions: union, idempotent, emits known-peer pairs as today AND
         # returns the live channel roster (deterministic discovery).
@@ -657,7 +1193,10 @@ def register(socketio, registry):
         # Ack carries the server's resulting beliefs for this sid; the client
         # compares (digest) instead of assuming any single emit landed.
         digest = {"v": 1, "ok": True, "room": room, "channels": n, "lease": True,
-                  "peers": peers, "channel_peers": chan_peers}
+                  "peers": peers, "channel_peers": chan_peers, "gen": effective_gen}
+        if owner_token:
+            # Same private token as `welcome`; this ack goes to this sid only.
+            digest["token"] = owner_token
         # Also emit the digest as a plain event: the Rust client consumes
         # events through one channel (Ev enum) and skips ack plumbing.
         emit("synced", digest)

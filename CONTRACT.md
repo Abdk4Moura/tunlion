@@ -117,6 +117,8 @@ touch the socket, Firestore, or RTCPeerConnection directly.
 ```ts
 {
   me: { id: string, name: string, color: string } | null,
+  deviceName: string,                // this browser's name, available before welcome
+  superseded: string | null,         // a newer tab/load owns this device; show + offer reload
   connected: boolean,
   signalingKind: "socketio" | "firebase" | null,
 
@@ -161,6 +163,7 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   pairWithCode(code: string): void,           // claim a ONE-TIME code (burned on use)
   generateCode(keyword?: string): Promise<string>, // mint a speakable one-time code
   useAutoRoom(): Promise<void>,               // back to the "people near you" room
+  renameSelf(name: string): string,           // relabel THIS device; same uid/pairing
 }
 ```
 
@@ -176,9 +179,41 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   reconnect"; allow **clear** to abandon it.
 
 ### Signaling additions for resume
-- `join` carries a `uid` (stable per-tab id); `welcome` peers and `peer-joined`
-  include it. Transfer control messages: `file-offer` may carry `resume: true`;
-  `file-accept` carries `offset` (bytes already received).
+- `join` carries a `uid` (stable per-tab id) and a `gen` (fresh per page load);
+  `welcome` peers and `peer-joined` include the uid. Transfer control messages:
+  `file-offer` may carry `resume: true`; `file-accept` carries `offset` (bytes
+  already received).
+
+### Generation-safe reload (web)
+- Every page load mints a new `gen`. Sessions are keyed by a server-minted
+  opaque `token`; uid/name are display attributes only. `join`/`sync` carry
+  `{uid, gen, token}`. A tokenless join creates a NEW session and returns its
+  token (`welcome`/sync ack, never a roster). A valid token reattaches that
+  session and may replace its previous sid; an unknown/expired token becomes a
+  new independent session. A uid alone is never authority and can neither
+  evict nor close another session.
+- A token-bearing `gen` different from that token's current generation
+  supersedes its old sid and retires the old generation. A late `sync` from a
+  retired generation is refused (`{ok:false, superseded:true}`). Retired
+  generations are one global 24h TTL set with a hard total cap; oldest are
+  evicted first, never refusing a valid current owner. Token records have a cardinality cap: expired/closed records are evicted
+  first, and if all are live a new tokenless session is refused with a clear
+  capacity error (never superseding a live sid). One sliding 24h TTL covers
+  sid/gen/token together (one Redis hash/Lua).
+- `pagehide` closes local PeerConnections synchronously, stops link/session/
+  pairing/config timers, and `sendBeacon`s `{token, gen}` to
+  `POST /api/session/close`. The endpoint requires the token, honors the
+  configured origin allowlist, is rate-limited, and only drops that token's
+  current generation. `pageshow` revalidates/reconnects; a BFCache restore (or
+  any pagehide/pageshow return) rotates to a fresh generation first.
+- A rename is an in-place `sync` on the same token. The relay updates that sid
+  and emits `peer-updated {id,name,uid}`; open tabs relabel via `storage`. A
+  superseded tab stays suspended across `pageshow`/BFCache/storage events; only
+  an explicit full reload may take over.
+- The token is a bearer in localStorage: no per-session rotation/revocation,
+  expires 24h after the last successful claim; a live tab refreshes it on sync.
+- Names are human labels, not identities: duplicates are allowed; ownership
+  and pairing are keyed by the token/uid (and pairing secrets), not the name.
 
 ### Part A — `peer.route` (the privacy/trust signal)
 Once a peer connects, `route` tells you the **physical path** ICE chose:

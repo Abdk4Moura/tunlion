@@ -148,9 +148,9 @@ class SignalScope(unittest.TestCase):
 
     def test_signal_reaches_same_room_only(self):
         a, b, z = (_client(self.app, self.sio) for _ in range(3))
-        a.emit("join", {"room": "r1", "name": "a"})
-        b.emit("join", {"room": "r1", "name": "b"})
-        z.emit("join", {"room": "r2", "name": "z"})
+        a.emit("join", {"room": "r1", "name": "a", "uid": "ua", "gen": "g-a"})
+        b.emit("join", {"room": "r1", "name": "b", "uid": "ub", "gen": "g-b"})
+        z.emit("join", {"room": "r2", "name": "z", "uid": "uz", "gen": "g-z"})
         welcome_b = [e for e in b.get_received() if e["name"] == "welcome"][0]
         welcome_z = [e for e in z.get_received() if e["name"] == "welcome"][0]
         a.get_received()
@@ -166,8 +166,8 @@ class SignalScope(unittest.TestCase):
     def test_signal_reaches_a_shared_channel_across_rooms(self):
         ch = "c" * 64
         a, z = _client(self.app, self.sio), _client(self.app, self.sio)
-        a.emit("sync", {"room": "r1", "name": "a", "channels": [ch]}, callback=True)
-        ack = z.emit("sync", {"room": "r2", "name": "z", "channels": [ch]}, callback=True)
+        a.emit("sync", {"room": "r1", "name": "a", "uid": "ua", "gen": "g-a", "channels": [ch]}, callback=True)
+        ack = z.emit("sync", {"room": "r2", "name": "z", "uid": "uz", "gen": "g-z", "channels": [ch]}, callback=True)
         a.get_received()
         z.get_received()
         a_sid = ack["channel_peers"][0]["id"]
@@ -176,7 +176,7 @@ class SignalScope(unittest.TestCase):
 
     def test_signal_without_a_room_is_dropped(self):
         a, b = _client(self.app, self.sio), _client(self.app, self.sio)
-        b.emit("join", {"room": "r1", "name": "b"})
+        b.emit("join", {"room": "r1", "name": "b", "uid": "ub", "gen": "g-b"})
         b_sid = [e for e in b.get_received() if e["name"] == "welcome"][0]["args"][0]["id"]
         a.emit("signal", {"to": b_sid, "data": {}})
         self.assertNotIn("signal", _names(b.get_received()))

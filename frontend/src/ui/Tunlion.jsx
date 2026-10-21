@@ -16,6 +16,7 @@ import CommandPalette from './CommandPalette.jsx'
 import DiagPanel from './DiagPanel.jsx'
 import { makeTheme, terminalTheme, systemMode, FONT_SANS, FONT_MONO } from './theme.js'
 import { pakeReady, previewCustomCode } from '../lib/pairing.js'
+import { randomDeviceName } from '../lib/identity.js'
 import { mintNameplate } from '../lib/words.js'
 import { oneRowPerDevice } from '../net/app/peerRows.js'
 
@@ -690,16 +691,80 @@ function useToast() {
   return [toast, show]
 }
 
+// The local device's name, always visible and editable. A blank commit keeps
+// the current name (a device always has a generated, speakable default); a
+// chosen name commits to the same device identity, not a new pairing.
+function DeviceNameField({ name, onRename, T, narrow }) {
+  const [draft, setDraft] = useState(name || '')
+  const cancelRef = useRef(false)
+  useEffect(() => { setDraft(name || '') }, [name])
+  const commit = () => {
+    // Esc is a real cancel: restore the current name and do NOT call rename,
+    // even though the blur that follows would otherwise commit the draft.
+    if (cancelRef.current) {
+      cancelRef.current = false
+      setDraft(name || '')
+      return
+    }
+    const next = onRename ? onRename(draft) : draft
+    setDraft(next || name || '')
+  }
+  const randomize = () => {
+    const next = randomDeviceName()
+    setDraft(next)
+    onRename?.(next)
+  }
+  return (
+    <div data-testid="local-device" style={{
+      display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+      padding: '9px 12px', borderRadius: 8, border: '1px solid ' + T.rule, background: T.surf,
+    }}>
+      <span style={{ fontSize: 12.5, color: T.sub, letterSpacing: '.02em' }}>This device</span>
+      <input
+        data-testid="device-name-input"
+        className="tl-input"
+        aria-label="This device's name"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() }
+          if (e.key === 'Escape') {
+            e.preventDefault()
+            cancelRef.current = true
+            setDraft(name || '')
+            e.currentTarget.blur()
+          }
+        }}
+        spellCheck="false"
+        autoComplete="off"
+        style={{
+          flex: 1, minWidth: narrow ? 120 : 160, font: '600 14px ' + FONT_SANS, color: T.ink,
+          background: 'transparent', border: 0, borderBottom: '1px dashed ' + T.rule, padding: '4px 2px', minHeight: 32,
+        }}
+      />
+      <button type="button" onClick={randomize} title="Use a generated name" aria-label="Use a random device name"
+        className="tl-focus" style={{
+          border: 0, background: 'none', color: T.sub, font: '500 12.5px ' + FONT_SANS,
+          cursor: 'pointer', padding: '4px 2px', minHeight: 32,
+        }}>Random</button>
+    </div>
+  )
+}
+
 export default function Tunlion(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
     onPairWithCode, onReceiveWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
-    onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, onRenameDevice, initialCode, ui = {} } = props
+    onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, onRenameDevice, onRenameSelf,
+    onReloadTab, initialCode, ui = {} } = props
   const mode = ui.theme === 'light' || ui.theme === 'dark' ? ui.theme : systemMode()
   const T = makeTheme(mode)
   const TT = terminalTheme()
   const peers = oneRowPerDevice(state.peers || [])
   const transfers = state.transfers || []
   const knownDevices = state.knownDevices || []
+  const localName = state.deviceName || state.me?.name || ''
+  const connectedNames = peers.filter((p) => p.status === 'ready').map(peerName)
   const onToggleTheme = ui.onToggleTheme
 
   const [toast, showToast] = useToast()
@@ -831,6 +896,12 @@ export default function Tunlion(props) {
       {!narrow && <nav aria-label="Main" style={{ display: 'flex', gap: 4, marginLeft: 12 }}>{navItems.map(navBtn)}</nav>}
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
         <RelayBanner peers={peers} T={T} />
+        {!narrow && localName && (
+          <span data-testid="header-device-name" title={`This device: ${localName}`}
+            style={{ fontSize: 13, color: T.sub, whiteSpace: 'nowrap', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            You · {localName}
+          </span>
+        )}
         {!narrow && (
           <span role="status" style={{ fontSize: 13, color: state.connected ? T.sub : T.bad, whiteSpace: 'nowrap' }}>
             {state.connected ? 'online' : 'offline, reconnecting'}
@@ -849,6 +920,20 @@ export default function Tunlion(props) {
   )
 
   // ---- pieces of Home -------------------------------------------------------
+  const supersededBanner = state.superseded && (
+    <div role="alert" data-testid="superseded-banner" style={{
+      display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+      margin: narrow ? '8px 16px 0' : '12px 24px 0', padding: '11px 13px', borderRadius: 8,
+      border: '1.5px solid ' + T.warn, background: T.soft, color: T.ink, fontSize: 14, lineHeight: 1.45,
+    }}>
+      <span style={{ flex: 1, minWidth: 200 }}>{state.superseded}</span>
+      <Btn small T={T} narrow={narrow}
+        onClick={onReloadTab || (() => { if (typeof window !== 'undefined') window.location.reload() })}>
+        Reload this tab
+      </Btn>
+    </div>
+  )
+
   const keepBanners = (state.pendingKeeps || []).map((k) => (
     <div key={k.peerId} role="region" aria-label="Remember this device?" style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderRadius: 8, background: T.soft, border: '1.5px solid ' + T.ink, flexWrap: 'wrap' }}>
       <Mark T={T} size={20} anim="knock" />
@@ -919,6 +1004,11 @@ export default function Tunlion(props) {
     <div style={{ display: 'grid', gap: 10 }}>
       <Section T={T} right={<LanChip localHelper={state.localHelper} T={T} />}>Here now · {peers.length}</Section>
       <span style={{ fontSize: 13.5, color: T.sub, lineHeight: 1.45 }}>{roomLine}</span>
+      {connectedNames.length > 0 && (
+        <span data-testid="connected-peer-name" style={{ fontSize: 13.5, color: T.ink, lineHeight: 1.45 }}>
+          Connected to <b>{connectedNames.join(', ')}</b>.
+        </span>
+      )}
       {scope === 'link' && state.roomUrl && (
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
           <span style={{ flex: 1, minWidth: 180, font: '500 13px ' + FONT_MONO, color: T.ink, border: '1px solid ' + T.rule, borderRadius: 6, padding: '10px 12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: T.surf }}>{state.roomUrl}</span>
@@ -962,6 +1052,7 @@ export default function Tunlion(props) {
         </h1>
         <p style={{ margin: 0, fontSize: 15, lineHeight: 1.5, color: T.sub }}>Enter a code from another device, or drop a file to send. Nothing to install, nothing uploaded.</p>
       </div>
+      <DeviceNameField name={localName} onRename={onRenameSelf} T={T} narrow={narrow} />
       {keepBanners}
       {pakeKeepBanners}
       <SessionsStrip sessions={sessionChips} activeId={activeSessionId} onSwitch={switchSession} onClose={closeSession} T={T} narrow={narrow} />
@@ -1153,6 +1244,7 @@ export default function Tunlion(props) {
       {commandPalette}
       {diagPanel}
       {header}
+      {supersededBanner}
       <main style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
         {screen === 'devices' ? devices : home}
       </main>
