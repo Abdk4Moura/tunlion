@@ -2741,6 +2741,38 @@ mod tests {
     }
 
     #[test]
+    fn a_second_wait_send_is_refused_and_does_not_stop_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(enrolled_core(dir.path()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        configured_for(&core, &listener);
+        let payload = dir.path().join("payload.bin");
+        std::fs::write(&payload, b"payload").unwrap();
+        let server = code_alloc_stub(listener);
+        core.create_code(vec![payload.display().to_string()], Some(30))
+            .unwrap();
+
+        let first_core = Arc::clone(&core);
+        let first = std::thread::spawn(move || first_core.wait_send());
+        for _ in 0..2000 {
+            if core.send_job.lock().unwrap().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            matches!(core.wait_send(), Err(CoreError::Engine(_))),
+            "a second wait_send must not consume or stop the first job"
+        );
+        core.stop_blocking().unwrap();
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(CoreError::Cancelled) | Err(CoreError::Engine(_))
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn wait_send_without_create_is_refused() {
         let core = core();
         assert!(matches!(core.wait_send(), Err(CoreError::Engine(_))));

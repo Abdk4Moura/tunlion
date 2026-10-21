@@ -5,7 +5,7 @@
 //! implementation. Exit codes and hindsight sentences stay in the CLI adapter:
 //! this module reports a typed [`SourceFailure`] and the [`SourceRead`] marker.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
@@ -133,7 +133,10 @@ impl std::error::Error for SourceRead {}
 /// The error for a read of `path` that failed mid-transfer.
 pub fn source_read(path: &Path, why: impl std::fmt::Display) -> anyhow::Error {
     anyhow::Error::new(SourceRead {
-        msg: format!("could not read '{}' while sending it: {why}", path.display()),
+        msg: format!(
+            "could not read '{}' while sending it: {why}",
+            path.display()
+        ),
     })
 }
 
@@ -174,7 +177,10 @@ mod tests {
         std::fs::write(&p, b"hello").unwrap();
         let meta = std::fs::metadata(&p).unwrap();
         let got = source_digest(p.to_str().unwrap(), &meta).unwrap();
-        let want: String = Sha256::digest(b"hello").iter().map(|b| format!("{b:02x}")).collect();
+        let want: String = Sha256::digest(b"hello")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert_eq!(got, want);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -197,7 +203,10 @@ mod tests {
             &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         let m = e.to_string();
-        assert!(m.contains("/tmp/unread") && m.contains("cannot read it"), "{m}");
+        assert!(
+            m.contains("/tmp/unread") && m.contains("cannot read it"),
+            "{m}"
+        );
         assert!(m.contains("nothing was sent"), "{m}");
     }
 
@@ -216,7 +225,8 @@ mod tests {
     #[test]
     fn a_read_error_is_an_error_never_a_shorter_digest() {
         assert!(digest_reader(&mut Failing(10)).is_err());
-        let (_, n) = digest_reader(&mut std::io::Read::take(std::io::repeat(1), 3_000_000)).unwrap();
+        let (_, n) =
+            digest_reader(&mut std::io::Read::take(std::io::repeat(1), 3_000_000)).unwrap();
         assert_eq!(n, 3_000_000);
     }
 
@@ -224,7 +234,10 @@ mod tests {
     fn a_mid_transfer_read_failure_is_recognised_through_context() {
         let e = source_read(Path::new("/tmp/x"), "Permission denied").context("stream");
         let m = as_source_read(&e).expect("recognised");
-        assert!(m.contains("/tmp/x") && m.contains("Permission denied"), "{m}");
+        assert!(
+            m.contains("/tmp/x") && m.contains("Permission denied"),
+            "{m}"
+        );
         assert!(as_source_read(&anyhow::anyhow!("channel closed")).is_none());
         let c = cancel_msg("s-1", 1, "a.bin", "gone");
         assert_eq!(c["type"], "file-cancel");

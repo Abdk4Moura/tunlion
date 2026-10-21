@@ -217,8 +217,11 @@ the CLI's interactive/`--remember` paths are not part of this API.
 
 The shared send engine currently accepts **regular files** only. Directories,
 stdin, and the CLI's tar spool are not exposed; they remain CLI concerns. The
-timeout bounds the whole send call. There is no resume after a link loss in this
-slice, and the engine uses the same direct-QUIC/WebRTC transports as the CLI.
+caller's timeout bounds the wait for a receiver to claim or for a known device
+to establish, not a transfer that has already started; after a claim the code
+TTL and claim timeout stop applying, and a separate idle/progress bound prevents
+a silent hang. There is no resume after a link loss in this slice, and the
+engine uses the same direct-QUIC/WebRTC transports as the CLI.
 
 `status().engine` is the slot state a UI polls: `NotLinked` (nothing started),
 `Starting` (startup claimed the Core, or the dispatch is spawned and readiness

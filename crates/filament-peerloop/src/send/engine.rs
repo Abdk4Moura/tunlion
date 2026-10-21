@@ -19,7 +19,7 @@ use crate::host::{HostServices, LogSink};
 use crate::present::Presentation;
 use crate::recv::dispatch::proof_for;
 use crate::recv::identity::IdentityService;
-use crate::send::ceremony::{Ceremony, Inbound as PakeInbound, pair_v2_caps};
+use crate::send::ceremony::{pair_v2_caps, Ceremony, Inbound as PakeInbound};
 use crate::send::source::{as_source_read, head_hash, source_digest};
 use crate::session::Session;
 use anyhow::Result;
@@ -140,28 +140,48 @@ impl std::error::Error for SendFailure {}
 
 impl SendFailure {
     fn usage(message: impl Into<String>) -> Self {
-        Self { kind: SendFailureKind::Usage, message: message.into() }
+        Self {
+            kind: SendFailureKind::Usage,
+            message: message.into(),
+        }
     }
     fn unreachable(message: impl Into<String>) -> Self {
-        Self { kind: SendFailureKind::Unreachable, message: message.into() }
+        Self {
+            kind: SendFailureKind::Unreachable,
+            message: message.into(),
+        }
     }
     fn denied(message: impl Into<String>) -> Self {
-        Self { kind: SendFailureKind::Denied, message: message.into() }
+        Self {
+            kind: SendFailureKind::Denied,
+            message: message.into(),
+        }
     }
     fn partial(message: impl Into<String>) -> Self {
-        Self { kind: SendFailureKind::Partial, message: message.into() }
+        Self {
+            kind: SendFailureKind::Partial,
+            message: message.into(),
+        }
     }
     fn interrupted(message: impl Into<String>) -> Self {
-        Self { kind: SendFailureKind::Interrupted, message: message.into() }
+        Self {
+            kind: SendFailureKind::Interrupted,
+            message: message.into(),
+        }
     }
     fn refused(message: impl Into<String>) -> Self {
-        Self { kind: SendFailureKind::Refused, message: message.into() }
+        Self {
+            kind: SendFailureKind::Refused,
+            message: message.into(),
+        }
     }
     fn engine(message: impl Into<String>) -> Self {
-        Self { kind: SendFailureKind::Engine, message: message.into() }
+        Self {
+            kind: SendFailureKind::Engine,
+            message: message.into(),
+        }
     }
 }
-
 
 /// The claim window (and the code's TTL) applies only until someone claims the
 /// code. After that a slow or large transfer must not be aborted as expired.
@@ -178,11 +198,11 @@ fn internal(error: impl std::fmt::Display) -> SendFailure {
     SendFailure::engine(error.to_string())
 }
 
-
-
 fn build_outgoing(request: &SendRequest, log: &dyn LogSink) -> Result<Vec<Outgoing>, SendFailure> {
     if request.paths.is_empty() {
-        return Err(SendFailure::usage("nothing to send; pass at least one regular file"));
+        return Err(SendFailure::usage(
+            "nothing to send; pass at least one regular file",
+        ));
     }
     let single = request.paths.len() == 1;
     let mut outgoing = Vec::with_capacity(request.paths.len());
@@ -202,15 +222,11 @@ fn build_outgoing(request: &SendRequest, log: &dyn LogSink) -> Result<Vec<Outgoi
         }
         let full = source_digest(&path.display().to_string(), &meta)
             .map_err(|failure| SendFailure::usage(failure.message))?;
-        let name = request
-            .name
-            .clone()
-            .filter(|_| single)
-            .unwrap_or_else(|| {
-                path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string())
-            });
+        let name = request.name.clone().filter(|_| single).unwrap_or_else(|| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        });
         let sid = (i + 1) as u32;
         let out = Outgoing {
             id: format!("{}-{}", request.uid, sid),
@@ -258,7 +274,11 @@ fn code_partner(
                 Some(mine) => mine,
                 None => code_claimed,
             };
-            if ours && is_msg { Partner::Latch } else { Partner::NotOurs }
+            if ours && is_msg {
+                Partner::Latch
+            } else {
+                Partner::NotOurs
+            }
         }
     }
 }
@@ -441,7 +461,12 @@ pub async fn drive(
         if all_done {
             break;
         }
-        if claim_expired(code_used, Instant::now(), claim_deadline, code_deadline) {
+        if claim_expired(
+            code_used || established,
+            Instant::now(),
+            claim_deadline,
+            code_deadline,
+        ) {
             return Err(SendFailure::unreachable(if use_code {
                 "the transfer code expired before it was claimed; nothing was sent".to_string()
             } else {
@@ -454,7 +479,7 @@ pub async fn drive(
                 )
             }));
         }
-        if code_used && !all_done && last_activity.elapsed() >= POST_CLAIM_IDLE {
+        if (code_used || established) && !all_done && last_activity.elapsed() >= POST_CLAIM_IDLE {
             let out = outgoing.lock().await;
             let confirmed = out.iter().filter(|o| o.acked).count();
             let total = out.len();
@@ -469,7 +494,9 @@ pub async fn drive(
         // code receiver.
         for (pid, info, (name, secret)) in conn.expired_direct() {
             conn.establish_as(info, None).await.map_err(|error| {
-                SendFailure::engine(format!("direct fallback establish failed for {pid}: {error}"))
+                SendFailure::engine(format!(
+                    "direct fallback establish failed for {pid}: {error}"
+                ))
             })?;
             if let Some(link) = conn.link_mut(&pid) {
                 link.expected_secret = Some((name, secret));
@@ -573,12 +600,9 @@ pub async fn drive(
                 }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
-                        conn.maybe_adopt(
-                            p,
-                            adopt_wants_active(code_used, use_code, pake_done),
-                        )
-                        .await
-                        .map_err(internal)?;
+                        conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done))
+                            .await
+                            .map_err(internal)?;
                     }
                 }
                 sess.invalidate();
@@ -657,7 +681,9 @@ pub async fn drive(
             }
             Ev::KnownPeer(v) => {
                 if let Some((name, secret)) = &known_target {
-                    if v["channel"].as_str() == Some(crate::recv::store::channel_of(secret).as_str()) {
+                    if v["channel"].as_str()
+                        == Some(crate::recv::store::channel_of(secret).as_str())
+                    {
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
                         conn.start_direct(&pid, name, secret).await;
                         conn.maybe_adopt(&v, true).await.map_err(internal)?;
@@ -682,7 +708,11 @@ pub async fn drive(
                 if data["type"].as_str() == Some("transport-offer") {
                     let cands: Vec<String> = data["addrs"]
                         .as_array()
-                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let srflx = data["srflx"].as_str().map(String::from);
                     let public = data["server_public"].as_str().map(String::from);
@@ -695,11 +725,15 @@ pub async fn drive(
                     if conn.direct_pending.contains_key(&from) {
                         conn.on_transport_offer(&from, cands, srflx, public, proto);
                     } else {
-                        conn.buffered_offers.insert(from.clone(), (cands, srflx, public, proto));
+                        conn.buffered_offers
+                            .insert(from.clone(), (cands, srflx, public, proto));
                     }
                     continue;
                 }
-                if matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm")) {
+                if matches!(
+                    data["type"].as_str(),
+                    Some("pake-msg") | Some("pake-confirm")
+                ) {
                     if let Some(cer) = send_cer.as_mut() {
                         pake_heard.insert(from.clone());
                         match code_partner(
@@ -824,7 +858,10 @@ pub async fn drive(
                     let Some(t) = conn.transport_of(&pid) else {
                         continue;
                     };
-                    let workers = conn.link(&pid).map(|l| l.workers.clone()).unwrap_or_default();
+                    let workers = conn
+                        .link(&pid)
+                        .map(|l| l.workers.clone())
+                        .unwrap_or_default();
                     let mut transports = vec![t];
                     if !crate::recv::transfer_truth::accept_is_sequential(&v) {
                         transports.extend(workers);
@@ -867,7 +904,10 @@ pub async fn drive(
                                         m.insert(id.clone(), why);
                                     }
                                 }
-                                let _ = tx2.send(Ev::TransferFailed { id, err: e.to_string() });
+                                let _ = tx2.send(Ev::TransferFailed {
+                                    id,
+                                    err: e.to_string(),
+                                });
                             }
                         }
                     }));
@@ -916,8 +956,7 @@ pub async fn drive(
                         "the receiver revoked this device during the send",
                     ));
                 }
-                other => {
-                }
+                other => {}
             },
             Ev::TransferFailed { id, err } => {
                 let local = source_failed.lock().ok().and_then(|mut m| m.remove(&id));
@@ -982,8 +1021,6 @@ fn no_peer_message(device: Option<&str>, use_code: bool) -> String {
         _ => "no receiver connected in time; nothing was sent".to_string(),
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
