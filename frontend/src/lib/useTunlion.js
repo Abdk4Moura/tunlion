@@ -17,6 +17,7 @@ import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
 import { mintWords, mintCreatedNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
+import { checkCodeInput } from './codeInput.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink, linkIsLive, reconcileDigest } from '../net/app/recovery.js'
 import { shouldAutoAccept, offersCoveredNow } from '../net/app/accept.js'
@@ -991,7 +992,8 @@ export function useTunlion() {
     // matching the server's _NAMEPLATE_RE) AND at least one word of password
     // before it. The error cases below are derived from the shared split, not a
     // separate regex, keeping a clear case-specific message.
-    const { nameplate, password } = parseSpokenCode(clean)
+    const { nameplate, password, error } = parseSpokenCode(clean)
+    if (error) { setPairStatus(error); return }
     const numericNameplate = /^[0-9]{3,5}$/.test(nameplate)
     if (!numericNameplate) {
       // The shared split's trailing group isn't a numeric nameplate (no number
@@ -1026,7 +1028,8 @@ export function useTunlion() {
     pakeReadyRef.current = true
     // Parse with the SHARED WASM normCode/splitCode so {nameplate, password} is
     // byte-identical to the CLI sender, SPAKE2 hashes exactly this password.
-    const { nameplate, password } = parseSpokenCode(clean)
+    const { nameplate, password, error } = parseSpokenCode(clean)
+    if (error) { setPairStatus(error); return }
     const numericNameplate = /^[0-9]{3,5}$/.test(nameplate)
     if (!numericNameplate) {
       setPairStatus('that code is missing its number, a full code ends in a 3-5 digit number, e.g. brave-otter-3141')
@@ -1050,6 +1053,11 @@ export function useTunlion() {
     const sig = sigRef.current
     if (!sig) return null
     const kw = typeof keyword === 'string' ? keyword : null // UI passes the click event
+    const checked = kw === null ? null : checkCodeInput(kw)
+    if (checked?.error || (kw?.trim() && !checked.code)) {
+      setPairStatus(checked?.error || 'Choose pairing words or leave the field empty to generate them.')
+      return null
+    }
     const t0 = Date.now()
     tel('pair-create-click', { up: connectedRef.current })
     // C24 zombie fix, measured live: a hidden mobile tab's socket dies ~5s
@@ -1103,7 +1111,12 @@ export function useTunlion() {
     // Use the chosen-code split (trailing group is the nameplate ONLY if numeric;
     // otherwise it's part of the words) so `gigantic-element` keeps both words.
     const custom = kw ? splitChosenCode(kw) : null
+    if (custom?.error) { setPairStatus(custom.error); return null }
     const customPassword = custom && /[a-z]{2,}/.test(custom.password) ? custom.password : null
+    if (kw?.trim() && !customPassword) {
+      setPairStatus('Choose pairing words or leave the field empty to generate them.')
+      return null
+    }
     let chosenNameplate = custom && /^[0-9]{3,5}$/.test(custom.nameplate) ? custom.nameplate : null
     return new Promise((resolve) => {
       let retried = false
@@ -1117,6 +1130,11 @@ export function useTunlion() {
         const nameplate = chosenNameplate || mintCreatedNameplate()
         chosenNameplate = null // honor a user-chosen number only on the FIRST try
         const full = `${words}-${nameplate}`
+        if (full.length > 48) {
+          setPairStatus('Codes are limited to 48 characters including the number. Shorten the words.')
+          finish(null)
+          return null
+        }
         // Stash the password so the eventual peer can run SPAKE2 with us.
         pendingPakeRef.current = { nameplate, password: words, full, askedNameplate: custom?.nameplate || null }
         sig.pairCreateV2(nameplate)
