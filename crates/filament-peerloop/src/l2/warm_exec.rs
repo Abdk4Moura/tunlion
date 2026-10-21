@@ -483,9 +483,9 @@ async fn await_ack(
                 Some(_) => {}
                 None => {
                     return match mux.take_close_err(sid).await {
-                        Some(reason) => Ack::Refused(crate::refusal::explain(
-                            "exec", peer, &reason, None, None,
-                        )),
+                        Some(reason) => {
+                            Ack::Refused(format!("'{peer}' refused exec: {reason}"))
+                        }
                         None => Ack::Failed(format!(
                             "'{peer}' closed the exec stream before answering"
                         )),
