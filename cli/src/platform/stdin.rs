@@ -569,7 +569,7 @@ mod windows_tests {
     #[test]
     fn pipe_data_is_utf8_and_joins() {
         let (read, write) = pipe();
-        write_all(write, b"hi\\n");
+        write_all(write, b"hi\n");
         let (mut owner, mut rx) = owner(read);
         assert_eq!(next_line(&mut rx), "hi");
         unsafe {
@@ -585,7 +585,7 @@ mod windows_tests {
     fn regular_file_redirect_is_read_to_eof() {
         let path =
             std::env::temp_dir().join(format!("tunlion-stdin-file-{}.txt", std::process::id()));
-        std::fs::write(&path, b"file line\\n").unwrap();
+        std::fs::write(&path, b"file line\n").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let handle = file.as_raw_handle() as usize;
         let (mut owner, mut rx) = owner(handle);
@@ -601,7 +601,7 @@ mod windows_tests {
         let (mut owner, _rx) = owner(read);
         let writer = std::thread::spawn(move || {
             for _ in 0..10_000 {
-                write_all(write, b"x\\n");
+                write_all(write, b"x\n");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         });
