@@ -112,18 +112,15 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       else ta.setAttribute('readonly', '')
       ta.setAttribute('inputmode', enabled ? 'text' : 'none')
       ta.setAttribute('virtualkeyboardpolicy', enabled ? 'auto' : 'manual')
-      if (enabled) {
-        // iOS does not raise the soft keyboard when readOnly is merely removed
-        // from an element that was ALREADY focused while read-only. The show
-        // action must be a fresh editable focus: blur, let WebKit observe the
-        // updated attribute/layout, then focus again inside this tap.
-        try { ta.blur() } catch (e) {}
-        void ta.offsetHeight
-        try { termRef.current?.focus() } catch (e) {}
-        if (document.activeElement !== ta) {
-          try { ta.focus({ preventScroll: true }) } catch (e) {}
-        }
-      }
+      // iOS only raises the keyboard for a TRUSTED focus of an editable field.
+      // A focus() called inside this click handler is not enough: the other
+      // controls on the screen can take focus back. The visible control is a
+      // <label for=textarea> instead, so the browser itself focuses the now
+      // editable textarea as the label's default activation (a fresh focus
+      // after this blur). Programs that call setKeyboard directly still get the
+      // correct editable state; the user's next terminal tap opens the IME.
+      try { ta.blur() } catch (e) {}
+      void ta.offsetHeight
       if (!enabled) {
         // Hidden means the SOFT keyboard is hidden: physical keyboards and
         // their IME must keep working. blur() normally delivers the final
@@ -144,6 +141,11 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const [toast, setToast] = useState('') // brief copy/paste feedback
   const toastTimer = useRef(0)
   const sessionIdRef = useRef(makeSessionId(instanceId))
+  // The hidden xterm textarea is the only editable target the soft keyboard can
+  // attach to. A <label for=this-id> lets the browser focus it as the label's
+  // own activation, which iOS accepts as trusted; programmatic focus from a
+  // button handler is not reliable there.
+  const inputIdRef = useRef('term-input-' + (instanceId || Math.random().toString(36).slice(2, 10)))
   // Session resume: bytes of this session's output written to the terminal,
   // across every link. A reattach sends it as resume_from so the device replays
   // only what this screen missed, never what it already shows.
@@ -559,6 +561,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     // shell. We also keep the textarea cleared so there is no buffer to replay.
     const ta = hostRef.current.querySelector('textarea')
     if (ta) {
+      ta.id = inputIdRef.current
+      ta.setAttribute('aria-label', 'terminal input')
       ta.setAttribute('autocorrect', 'off'); ta.setAttribute('autocapitalize', 'off')
       ta.setAttribute('autocomplete', 'off'); ta.setAttribute('spellcheck', 'false')
       // Hints that suppress Gboard predictive text / suggestions strip on many
@@ -1216,12 +1220,39 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
                 </span>
                 <span aria-hidden="true" style={{ color: T.sub }}>{barOpen ? '\u25b4' : '\u25be'}</span>
               </button>
-              {isTouch && <button type="button" data-testid="term-keyboard"
-                aria-label={keyboardOpen ? 'hide terminal keyboard' : 'show terminal keyboard'}
-                aria-pressed={keyboardOpen} title={keyboardOpen ? 'hide keyboard; keep viewing' : 'show keyboard to type'}
-                onClick={() => { setKeyboard(!keyboardOpenRef.current); haptic() }}
-                style={{ ...hb, color: keyboardOpen ? T.onAccent : T.text, background: keyboardOpen ? accent : 'transparent' }}
-              >Keyboard</button>}
+              {isTouch && (
+                // A label, not a button, and it STAYS MOUNTED in both states:
+                // its default activation focuses the xterm textarea after
+                // setKeyboard has made it editable, which is the trusted gesture
+                // iOS needs to raise the soft keyboard. Replacing the element
+                // during the click would cancel that default action. On hide we
+                // prevent the default so the label does not refocus the input.
+                <label htmlFor={inputIdRef.current} data-testid="term-keyboard"
+                  role="button" tabIndex={0}
+                  aria-label={keyboardOpen ? 'hide terminal keyboard' : 'show terminal keyboard'}
+                  aria-pressed={keyboardOpen}
+                  title={keyboardOpen ? 'hide keyboard; keep viewing' : 'show keyboard to type'}
+                  onClick={(e) => {
+                    const open = !keyboardOpenRef.current
+                    if (!open) e.preventDefault()
+                    setKeyboard(open)
+                    haptic()
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key !== 'Enter' && e.key !== ' ') return
+                    e.preventDefault()
+                    const open = !keyboardOpenRef.current
+                    setKeyboard(open)
+                    haptic()
+                    if (open) { try { hostRef.current?.querySelector('textarea')?.focus() } catch (err) {} }
+                  }}
+                  style={{
+                    ...hb, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                    userSelect: 'none', color: keyboardOpen ? T.onAccent : T.text,
+                    background: keyboardOpen ? accent : 'transparent',
+                  }}
+                >Keyboard</label>
+              )}
               {onBackground && <button type="button" onClick={onBackground} title="hide (keeps running)" style={hb}>Hide</button>}
             </div>
             {barOpen && (
