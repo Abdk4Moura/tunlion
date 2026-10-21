@@ -562,10 +562,39 @@ stream kinds are refused, never misinterpreted.
   id, announced so both ends use one value (same discipline as `sid`); an
   open with it missing, unparseable, or outside the L2 sid half is refused
   rather than served with a second locally-allocated sid nobody listens on.
-  `cwd` is the requested working directory (default: the daemon's home).
-  `env` carries ONLY the allowlist: `TERM`, `LANG`, `LC_*`, plus explicit
-  `--env KEY=VALUE` pairs. Nothing else from either side's environment
-  crosses the link. `tty` requests a pty instead of pipes.
+  `cwd` is the requested working directory. When absent it defaults to the
+  account the command runs as: the target account's home for `--shell-user`,
+  the daemon account's home otherwise, with `/` as the documented fallback
+  when a dropped account's passwd home is not a directory.
+  `env` carries ONLY explicit `--env KEY=VALUE` pairs on the wire. The receiver
+  builds a user-like, non-secret baseline locally and never sends it:
+  - Unix: `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TERM`, `LANG`/`LC_*`,
+    `TMPDIR`, and `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_DATA_HOME`/
+    `XDG_STATE_HOME` (plus `XDG_RUNTIME_DIR` when the target account's runtime
+    directory exists).
+  - Windows: `SystemRoot`, `WINDIR`, `SYSTEMDRIVE`, `PATH`, `PATHEXT`,
+    `COMSPEC`, `TEMP`/`TMP`, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`, `APPDATA`,
+    `LOCALAPPDATA`, `PROGRAMDATA`, `PROGRAMFILES`, `PROGRAMFILES(X86)`,
+    `COMMONPROGRAMFILES`, `COMMONPROGRAMFILES(X86)`, `PSModulePath`,
+    `USERNAME`, `USERDOMAIN`, `COMPUTERNAME`,
+    `PROCESSOR_ARCHITECTURE`, and the locale/terminal facts `TERM`, `LANG`,
+    `LC_*`.
+  On both platforms `PATH` is the DAEMON'S executable-search path, not a
+  login-shell-resolved PATH for the target account (a login shell would require
+  re-parsing the command and would lose argv exactness). Explicit
+  `--env PATH=...` overrides it.
+  On Unix, `--shell-user` identity and home/shell values come from the password
+  database, not the daemon's environment. On Windows, `--shell-user` is
+  refused because deriving another account's profile requires its token
+  environment (`CreateEnvironmentBlock`) or credentials; the daemon's profile
+  is never copied to a target account. Names are case-insensitive and
+  de-duplicated on Windows. Explicit `--env` pairs win.
+  This is a user-like baseline, NOT a copy of the owner's secret environment.
+  Never inherited by default: `SSH_AUTH_SOCK`, cloud/provider tokens, proxy
+  credentials, `DBUS_SESSION_BUS_ADDRESS`, `NODE_OPTIONS`, and other variables
+  that can carry a secret or change how a command resolves. `--env` is the
+  explicit opt-in. Nothing from either side's environment otherwise crosses
+  the link. `tty` requests a pty instead of pipes.
 - `exec-open-ack` `{ type: "exec-open-ack", sid, out, err }` -- the
   receiver's acceptance: `out` (== `sid`) names the stdout stream, `err`
   (== the open's `err_sid`) the stderr stream. Informational: both pipes

@@ -89,9 +89,26 @@ pub struct ExecSpawnSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    /// Already filtered: `env_clear` plus the TERM/LANG/LC_* allowlist and
-    /// explicit `--env` pairs. The host must not add the daemon environment.
+    /// Already filtered: `env_clear` plus the user-like platform baseline
+    /// (`HOME`/`USER`/`SHELL`/XDG and `TERM`/`LANG`/`LC_*` on Unix; the
+    /// non-secret Windows machine/profile list on Windows) and explicit
+    /// `--env` pairs. The host must not add the daemon environment.
     pub env: Vec<(String, String)>,
+}
+
+/// The account an exec will run as. The host resolves this before the child
+/// environment is built so `HOME`/`USER`/`SHELL` and the default cwd all name
+/// the same account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecUserContext {
+    /// Login name (`USER`/`LOGNAME`, or `USERNAME` on Windows).
+    pub name: String,
+    /// The account's home. Also the default cwd unless the initiator named one.
+    pub home: PathBuf,
+    /// The account's login shell, when the platform knows it.
+    pub shell: Option<String>,
+    /// Unix uid, used only to derive a target account's `XDG_RUNTIME_DIR`.
+    pub uid: Option<u32>,
 }
 
 /// The host's process effects for served exec.
@@ -110,11 +127,12 @@ pub trait ExecProcess: Send + Sync {
     /// allowlist; this method supplies the ambient fact.
     fn daemon_environment(&self) -> Vec<(String, String)>;
 
-    /// The daemon user's home, or the platform default.
-    fn home_dir(&self) -> PathBuf;
-
-    /// The named account's home, when it has a usable one.
-    fn home_of_user(&self, user: &str) -> Option<PathBuf>;
+    /// Resolve the account this exec runs as (`None` = the daemon user,
+    /// `Some` = `--shell-user`). `Err` refuses the exec before any fork; it
+    /// must never fall back to the daemon's identity when a drop was asked
+    /// for. On Unix a dropped account comes from the password database, not
+    /// from the daemon's environment.
+    fn user_context(&self, user: Option<&str>) -> Result<ExecUserContext, String>;
 
     /// The platform's account-drop argv (`runuser -l <user> -- ...` on unix),
     /// or a reason that names the missing capability. The library checks that

@@ -220,6 +220,9 @@ jobs:
       - name: Test Windows pinned-handle path primitives
         shell: bash
         run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'mount_proto::'
+      - name: Test exec child environment (Windows baseline + Node)
+        shell: bash
+        run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'shell::exec_server::tests::'
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats

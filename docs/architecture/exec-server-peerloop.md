@@ -70,10 +70,12 @@ that port rather than reimplemented in the exec module.
 ## Tests
 
 - Library unit tests use a deterministic fake transport and fake child for ack
-  order, separate stream sids, exact argv, env allowlist, cwd refusal, tty
+  order, separate stream sids, exact argv, user-like env baseline, cwd refusal, tty
   refusal, user-drop refuse-not-downgrade, exit code and ladder.
-- The existing real-binary `cli/tests/exec-gates.sh` (gates A-R) remains the
-  end-to-end proof and is unchanged.
+- The real-binary `cli/tests/exec-gates.sh` is the end-to-end proof: gates A-R
+  are 22 passing observations, and `revoke-gates.yml` enforces that count.
+  Gate L covers the `--shell-user` drop's identity and target-user environment
+  (HOME/USER/SHELL/XDG, no daemon profile).
 - CI compiles the library/CLI with `exec-server` off in the existing Android
   boundary jobs. The remote worker additionally ran
   `--no-default-features --features exec-server` to prove feature implication.
