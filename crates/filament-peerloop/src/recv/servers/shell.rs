@@ -1646,11 +1646,14 @@ mod tests {
     #[tokio::test]
     async fn stale_same_key_binding_cannot_make_open_drop_a_foreign_stream() {
         let mut h = harness(true).await;
-        open(&mut h, &open_frame("client-1", false)).await;
-        // The PTY stream goes away while its binding is still present (the
-        // natural-exit window before the binding is lazily superseded).
-        h.muxes[PID].drop_pty(SID).await;
+        // Natural-exit window: the binding outlived its stream, and a foreign
+        // forward/mount stream now owns the sid. The binding map is deliberately
+        // seeded; the PTY never owned a live stream here.
         let _foreign = pre_register_sid(&mut h, SID).await;
+        h.bindings
+            .entry(PID.into())
+            .or_default()
+            .insert(SID, SESSION.into());
 
         open(&mut h, &open_frame("client-1", false)).await;
 
@@ -1664,7 +1667,7 @@ mod tests {
             h.muxes[PID].has_stream(SID).await,
             "the foreign stream must not be dropped just because a stale binding named its sid"
         );
-        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 0);
         assert_eq!(h.c.attaches.load(Ordering::SeqCst), 0);
 
         // Superseding the stale binding on ANOTHER sid also leaves the foreign
@@ -1677,7 +1680,8 @@ mod tests {
         let mut live = h.muxes[PID].live_sids().await;
         live.sort_unstable();
         assert_eq!(live, vec![SID, SID + 1]);
-        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 0);
         assert_eq!(h.bindings[PID].len(), 1);
         assert_eq!(h.bindings[PID][&(SID + 1)], SESSION);
     }
@@ -1721,11 +1725,15 @@ mod tests {
     #[tokio::test]
     async fn pty_close_ignores_a_stale_binding_over_a_foreign_stream() {
         let mut h = harness(true).await;
-        open(&mut h, &open_frame("client-1", false)).await;
-        // Natural-exit window: stream gone, binding still present, then a
-        // foreign (forward/mount) stream reuses the sid.
-        h.muxes[PID].drop_pty(SID).await;
+        // A stale binding names a sid that a foreign (forward/mount) stream now
+        // owns. The bound session is still live, so an unguarded close would
+        // end it and drop somebody else's stream.
         let _foreign = pre_register_sid(&mut h, SID).await;
+        insert_live(&h, SESSION);
+        h.bindings
+            .entry(PID.into())
+            .or_default()
+            .insert(SID, SESSION.into());
 
         pty_close(
             &h.ports,
@@ -1777,6 +1785,26 @@ mod tests {
         )
         .await;
         assert_eq!(h.bindings[PID][&(SID + 1)], SESSION_B);
+    }
+
+    #[tokio::test]
+    async fn different_session_can_reuse_a_sid_after_only_a_stale_binding_remains() {
+        let mut h = harness(true).await;
+        // The stale entry is the only trace of the old owner; no live stream or
+        // PTY watermark exists for this sid.
+        h.bindings
+            .entry(PID.into())
+            .or_default()
+            .insert(SID, SESSION.into());
+        const SESSION_B: &str = "phone\u{1}client-2";
+        insert_live(&h, SESSION_B);
+
+        open(&mut h, &open_frame("client-2", false)).await;
+
+        assert_eq!(h.muxes[PID].live_sids().await, vec![SID]);
+        assert_eq!(h.bindings[PID][&SID], SESSION_B);
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 1);
+        assert_eq!(h.c.ends.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

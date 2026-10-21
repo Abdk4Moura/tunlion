@@ -257,8 +257,11 @@ impl Mux {
             return None; // sid already live: refuse, do NOT overwrite/drop
         }
         let is_pty = owner.is_some();
-        if is_pty && sid <= self.pty_high_water.load(Ordering::Relaxed) {
-            return None; // retired/lower PTY sid: monotonic wire invariant
+        if sid <= self.pty_high_water.load(Ordering::Relaxed) {
+            // Retired/lower PTY sid. This also fences OTHER stream kinds from
+            // reusing it: a delayed `l2-close` for the old PTY must not land on
+            // a newer forward/mount that took the same sid.
+            return None;
         }
         let (tx, rx) = mpsc::channel::<PipeItem>(256);
         let generation = self
@@ -1373,6 +1376,10 @@ mod tests {
                 .is_none(),
             "a retired sid must not start a new generation"
         );
+        assert!(
+            mux.register_stream(sid1).await.is_none(),
+            "another stream kind may not reuse a retired PTY sid either"
+        );
 
         let sid2 = sid1 + 1;
         let _new = mux
@@ -1396,10 +1403,9 @@ mod tests {
         let sid = L2_SID_BASE | 70;
         for _ in 0..200 {
             let mux = Mux::new(MockTransport::new(), Arc::new(NoHost));
-            let _old = mux
-                .register_pty_stream(sid, "old".into())
-                .await
-                .expect("old generation");
+            // Generic stream: the PTY monotonic watermark is irrelevant here;
+            // this test is about aux entries racing with a same-sid generation.
+            let _old = mux.register_stream(sid).await.expect("old generation");
             let gen = mux.stream_generation(sid).await.expect("generation");
             let cleanup = {
                 let mux = mux.clone();
