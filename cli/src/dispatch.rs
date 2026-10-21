@@ -557,6 +557,7 @@ pub(crate) async fn async_main() -> Result<()> {
             | Cmd::Update { .. }
             | Cmd::Skill { .. }
             | Cmd::Demo { .. }
+            | Cmd::WinPtyRelay { .. }
     );
     if !exempt {
         // A verb with its own --json flag must still answer in JSON.
@@ -1916,6 +1917,14 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             }
         }
+        Cmd::WinPtyRelay {
+            cols,
+            rows,
+            resize,
+            argv,
+        } => crate::win_pty::relay(cols, rows, &resize, &argv),
+        #[cfg(all(windows, feature = "test-hooks"))]
+        Cmd::WinPtySmoke { mode } => crate::win_pty::smoke(&mode),
         Cmd::Netcat { peer, rport } => {
             // Hidden one-release alias for the netcat shape, now forward --stdio.
             #[cfg(not(feature = "forward-server"))]

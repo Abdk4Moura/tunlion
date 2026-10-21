@@ -156,6 +156,10 @@ pub const SESSION_BUFFER_CAP: usize = 256 * 1024;
 /// THE VALUE COMES FROM THE PEER and is used to build a filesystem path below,
 /// so anything that is not a plausible terminal name is replaced before it is
 /// ever joined onto a directory (`../../etc/passwd` must not become a probe).
+/// Used by the portable-pty arm only: Windows hands the shell to
+/// `crate::win_pty::relay`, which sets TERM/COLORTERM on the ConPTY itself, so
+/// this helper has no caller in a (non-test) Windows build.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn effective_term(requested: &str) -> String {
     const FALLBACK: &str = "xterm-256color";
     let plausible = !requested.is_empty()
@@ -309,6 +313,27 @@ impl PtySessions {
     }
 }
 
+/// Hand a window size to the Windows pseudoconsole relay.
+///
+/// The relay's resize pipe carries exactly four bytes: `cols` then `rows`, each
+/// little-endian `u16` (`win_pty::relay` decodes the same layout). The relay
+/// clamps zero to one on its side too; we clamp here so the escape sequence the
+/// shell eventually sees is never 0x0.
+///
+/// A pipe write is a `WriteFile` on a synchronous handle, so this can BLOCK once
+/// the pipe buffer is full. Callers run it on the session's dedicated resize
+/// thread, never on the async session loop. `Err` means the relay's read end is
+/// gone (session teardown), not something to retry.
+#[cfg(windows)]
+fn write_pty_resize(resize: &mut std::fs::File, cols: u16, rows: u16) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut buf = [0u8; 4];
+    buf[..2].copy_from_slice(&cols.max(1).to_le_bytes());
+    buf[2..].copy_from_slice(&rows.max(1).to_le_bytes());
+    resize.write_all(&buf)
+}
+
 /// Spawn a brand-new persistent PTY session bound to `(transport, sid)`. Returns
 /// a handle to store in `PtySessions`; the shell runs in a detached task that
 /// outlives the link. `pty_guard` holds the global PTY slot for the session's
@@ -333,57 +358,120 @@ pub async fn spawn_pty_session(
     // ceiling (the grant authorizes); uncovered sessions never set this.
     admitted_via_ceiling: bool,
 ) -> Option<PtySessionHandle> {
-    use crate::platform::pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read as _, Write as _};
+    // Only the portable-pty arm resizes through `PtySize`; Windows writes raw
+    // bytes to the relay's resize pipe instead.
+    #[cfg(not(windows))]
+    use crate::platform::pty::PtySize;
 
-    let size = PtySize {
-        rows: rows.max(1),
-        cols: cols.max(1),
-        pixel_width: 0,
-        pixel_height: 0,
+    // The PTY backend is the one platform seam in this function. Everywhere but
+    // Windows portable-pty opens the pseudoterminal and spawns the shell
+    // directly. On Windows `portable-pty 0.8.1` hardcodes CreateProcessW, so it
+    // cannot start a shell under a different token; the daemon goes through
+    // `crate::win_pty` instead, which launches this executable as a hidden
+    // pseudoconsole relay under the desired token. There is deliberately NO
+    // portable-pty fallback on Windows: falling back would silently serve the
+    // daemon's own (possibly elevated) token.
+    //
+    // Either arm leaves `reader`/`writer` as `Box<dyn Read/Write + Send>` and a
+    // `child` with `kill()`/`wait()`, plus the target the resize arm drives:
+    // the portable-pty master on Unix, the relay's resize pipe on Windows.
+    #[cfg(not(windows))]
+    let (mut reader, mut writer, master, mut child) = {
+        use crate::platform::pty::{CommandBuilder, native_pty_system};
+
+        let size = PtySize {
+            rows: rows.max(1),
+            cols: cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pair = match native_pty_system().openpty(size) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = transport
+                    .send_control(
+                        &json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") }),
+                    )
+                    .await;
+                return None;
+            }
+        };
+        let mut cmd = CommandBuilder::new(&argv[0]);
+        for a in &argv[1..] {
+            cmd.arg(a);
+        }
+        cmd.env("TERM", effective_term(term));
+        // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
+        // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
+        // truecolor fine, so set this to get full-color output (verified: opencode
+        // emits 38;2;R;G;B with this set, 38;5;N without).
+        cmd.env("COLORTERM", "truecolor");
+        cmd.cwd(crate::platform::Paths::home_dir());
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = transport
+                    .send_control(
+                        &json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") }),
+                    )
+                    .await;
+                return None;
+            }
+        };
+        drop(pair.slave); // close our copy so the shell owns the only slave
+        let master = pair.master;
+        let reader = match master.try_clone_reader() {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+        let writer = match master.take_writer() {
+            Ok(w) => w,
+            Err(_) => return None,
+        };
+        (reader, writer, master, child)
     };
-    let pair = match native_pty_system().openpty(size) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = transport
-                .send_control(
-                    &json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") }),
-                )
-                .await;
-            return None;
+
+    #[cfg(windows)]
+    let (mut reader, mut writer, resize, mut child) = {
+        // The relay owns the shell's environment: it fixes TERM/COLORTERM and
+        // the cwd itself, so the requested terminal name is not forwarded here.
+        let _ = term;
+        match crate::win_pty::spawn(&argv, cols, rows) {
+            Ok(pty) => (pty.reader, pty.writer, pty.resize, pty.child),
+            Err(e) => {
+                // Refuse the session exactly like the portable-pty spawn
+                // failure above; never fall back to the daemon's own token.
+                let _ = transport
+                    .send_control(
+                        &json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") }),
+                    )
+                    .await;
+                return None;
+            }
         }
     };
-    let mut cmd = CommandBuilder::new(&argv[0]);
-    for a in &argv[1..] {
-        cmd.arg(a);
-    }
-    cmd.env("TERM", effective_term(term));
-    // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
-    // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
-    // truecolor fine, so set this to get full-color output (verified: opencode
-    // emits 38;2;R;G;B with this set, 38;5;N without).
-    cmd.env("COLORTERM", "truecolor");
-    cmd.cwd(crate::platform::Paths::home_dir());
-    let mut child = match pair.slave.spawn_command(cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = transport
-                .send_control(
-                    &json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") }),
-                )
-                .await;
-            return None;
-        }
-    };
-    drop(pair.slave); // close our copy so the shell owns the only slave
-    let master = pair.master;
-    let mut reader = match master.try_clone_reader() {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-    let mut writer = match master.take_writer() {
-        Ok(w) => w,
-        Err(_) => return None,
+
+    // The resize pipe is a *synchronous* Windows pipe: `write_all` blocks once
+    // its buffer fills (a relay that stopped draining it, or a wedged shell),
+    // and that write happens on the session task, which also drives the output,
+    // input and revocation paths. A dedicated writer thread keeps the loop
+    // non-blocking and preserves resize order. The pipe closes when this task
+    // ends and drops the sender, which is how the relay sees its parent go.
+    #[cfg(windows)]
+    let resize_pipe_tx = {
+        let (tx, rx) = std::sync::mpsc::channel::<(u16, u16)>();
+        std::thread::spawn(move || {
+            let mut pipe = resize;
+            while let Ok((c, r)) = rx.recv() {
+                if write_pty_resize(&mut pipe, c, r).is_err() {
+                    // The relay's read end closed: the session is ending, and
+                    // dropping the pipe here is the last thing it needs.
+                    break;
+                }
+            }
+        });
+        tx
     };
 
     // Blocking PTY-master reads -> async output channel.
@@ -509,7 +597,14 @@ pub async fn spawn_pty_session(
                 },
                 rs = resize_rx.recv() => {
                     if let Some((c, r)) = rs {
+                        #[cfg(not(windows))]
                         let _ = master.resize(PtySize { rows: r.max(1), cols: c.max(1), pixel_width: 0, pixel_height: 0 });
+                        // Unbounded send, so this never blocks the session loop.
+                        // A failed send means the relay's resize pipe is gone;
+                        // the reader thread hits EOF and ends the session, so
+                        // the lost resize needs no handling of its own.
+                        #[cfg(windows)]
+                        let _ = resize_pipe_tx.send((c, r));
                     }
                 }
                 _ = reaper.tick() => {

@@ -466,8 +466,12 @@ pub(crate) enum Cmd {
         /// `grant`: `tunlion shell <this>` (interactive), `tunlion exec <this> -- cmd`
         /// (one command) and `tunlion shell <this> --ssh` (real ssh). Enables the
         /// tunnel acceptor too (forward/netcat), so TUNLION_L2=1 is not needed.
-        /// Strangers still can't get in (pairing is required). Without
-        /// --shell-user the shell runs as you, so this also needs --i-know.
+        /// Strangers still can't get in (pairing is required). On Unix, without
+        /// --shell-user the shell runs as you, so this also needs --i-know. On
+        /// Windows, this serves the linked medium token (never the Administrator
+        /// token, and never a fallback when there is no linked token); add
+        /// --i-know to allow an owner-equivalent fallback. --shell-user is
+        /// refused there.
         /// To allow single devices instead: `tunlion grant <device> shell`.
         #[arg(long)]
         shell: bool,
@@ -485,10 +489,15 @@ pub(crate) enum Cmd {
         /// account (via `runuser`). STRONGLY recommended when `up` runs as root:
         /// without it, a granted device gets a shell as the up-process user
         /// (often root). Requires `up` to run as root (runuser is setuid).
+        /// Not implemented on Windows: `up` refuses it rather than serving the
+        /// shell as the current account and calling it this user.
         #[arg(long, value_name = "USER")]
         shell_user: Option<String>,
         /// Serve the shell as yourself, knowingly: any device let in can do
         /// anything you can, including act as you with your tunlion keys.
+        /// On Windows this waives the linked-medium-token requirement, allowing
+        /// owner-equivalent (current-token) sessions; plain --shell stays on the
+        /// linked medium token.
         #[arg(long)]
         i_know: bool,
         /// Internal: re-invoked after elevation to do the system-level install.
@@ -648,6 +657,26 @@ pub(crate) enum Cmd {
         /// from the network, guarded only by its password). Refused without it.
         #[arg(long)]
         allow_remote: bool,
+    },
+    /// Internal Windows pseudoconsole relay. Runs under the target user token.
+    #[command(hide = true, name = "__win-pty-relay")]
+    WinPtyRelay {
+        #[arg(long)]
+        cols: u16,
+        #[arg(long)]
+        rows: u16,
+        #[arg(long)]
+        resize: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// Internal Windows relay smoke test. Only exists in test-hooks builds.
+    #[cfg(all(windows, feature = "test-hooks"))]
+    #[command(hide = true, name = "__win-pty-smoke")]
+    WinPtySmoke {
+        /// `owner-equivalent` (always available) or `standard` (needs a linked token when elevated).
+        #[arg(long, default_value = "owner-equivalent")]
+        mode: String,
     },
     /// (hidden for one release) The netcat shape moved into `forward --stdio`.
     #[command(hide = true)]
@@ -1320,5 +1349,51 @@ mod tests {
             Cli::try_parse_from(["tunlion", "ephemeral", "enroll", "--auth-key-file", "k"]).is_err(),
             "a second claim verb for the same file must not exist"
         );
+    }
+
+    /// The hidden relay is the wire format `win_pty::spawn` builds: its flags,
+    /// then `--`, then the shell argv verbatim. Shell argv routinely starts with
+    /// a hyphen (`-l`, `-NoLogo`), so those must stay values and never be read as
+    /// tunlion flags. The command stays hidden: it is an internal transport, not
+    /// something a person should discover and hand their own argv to.
+    #[test]
+    fn hidden_win_pty_relay_parses_the_spawn_wire_argv() {
+        use clap::CommandFactory;
+        let shell = ["pwsh", "-NoLogo", "-NoProfile", "-Command", "Get-Location"];
+        let mut words = vec![
+            "__win-pty-relay",
+            "--cols",
+            "120",
+            "--rows",
+            "40",
+            "--resize",
+            "0x1a4",
+            "--",
+        ];
+        words.extend(shell);
+        match parse(&words).expect("the relay's wire argv parses").cmd {
+            Some(crate::Cmd::WinPtyRelay { cols, rows, resize, argv }) => {
+                assert_eq!((cols, rows), (120, 40));
+                assert_eq!(resize, "0x1a4");
+                // `--` is the delimiter, not part of the shell command.
+                assert_eq!(argv, shell);
+            }
+            _ => panic!("`__win-pty-relay` did not parse as the relay"),
+        }
+        // The size and resize pipe are required: a missing one must not become a
+        // silent 0x0 PTY or an empty handle.
+        assert!(parse(&["__win-pty-relay", "--", "pwsh"]).is_err());
+
+        // Hidden surface: registered, not discoverable, absent from --help.
+        let mut cmd = Cli::command();
+        let relay = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "__win-pty-relay")
+            .expect("the relay is registered");
+        assert!(relay.is_hide_set(), "the relay must stay hidden");
+        let help = cmd.render_help().to_string();
+        assert!(!help.contains("__win-pty-relay"), "--help exposes the relay:\n{help}");
+        // And an ordinary command still parses with the relay in the enum.
+        assert!(parse(&["status"]).is_ok());
     }
 }

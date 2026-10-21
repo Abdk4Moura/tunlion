@@ -284,6 +284,7 @@ mod shutdown;
 mod sshd;
 mod sshkeys;
 mod local;
+mod win_pty;
 mod ui;
 mod style;
 mod fleet_ui;
@@ -1740,7 +1741,30 @@ fn verb_on_command_line() -> Option<String> {
     })
 }
 
+/// Test-hooks builds add a large Clap command tree. On a debug Windows build
+/// the default 1 MB main-thread stack overflows while merely constructing it
+/// (before any command runs), so the test build gets a larger stack. Production
+/// builds keep the normal entry point and stack.
+#[cfg(all(windows, feature = "test-hooks"))]
 fn main() -> std::process::ExitCode {
+    match std::thread::Builder::new()
+        .name("tunlion-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(main_inner)
+    {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| std::process::ExitCode::from(1)),
+        Err(_) => main_inner(),
+    }
+}
+
+#[cfg(not(all(windows, feature = "test-hooks")))]
+fn main() -> std::process::ExitCode {
+    main_inner()
+}
+
+fn main_inner() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
