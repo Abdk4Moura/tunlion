@@ -6138,6 +6138,19 @@ async fn recv_run(
                 Some("l2-close") | Some("l2-open")
                     if l2_enabled || v["type"].as_str() == Some("l2-close") =>
                 {
+                    // A warm exec's refusal/expiry arrives as `l2-close` for
+                    // its sid. Hand the FULL frame to the initiator waiter
+                    // BEFORE `on_close` retires the stream, so the CLI can
+                    // render the same code/as/reinvite remedy a cold exec does
+                    // instead of only the bare reason. Data frames are separate,
+                    // and a warmer with no waiter ignores this.
+                    if v["type"].as_str() == Some("l2-close") {
+                        if let (Some(mux), Some(sid)) =
+                            (l2_muxes.get(&pid), l2::wire_sid(&v))
+                        {
+                            mux.on_exec_initiator_frame(sid, v.clone()).await;
+                        }
+                    }
                     if let Some(task) = crate::recv::servers::open_forward(
                         &ports,
                         host.as_ref(),

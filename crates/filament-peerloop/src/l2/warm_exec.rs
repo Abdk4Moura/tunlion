@@ -156,10 +156,12 @@ async fn run_warm_exec(
     // FROM HERE ON an `exec-open` is on the wire: no fallback, ever.
     match await_ack(&mux, &mut ctl, &t, sid, &peer).await {
         Ack::Opened => {}
-        Ack::Refused(why) => {
+        Ack::Refused(frame) => {
             mux.drop_stream(sid).await;
             mux.drop_stream(err_sid).await;
-            req.reject(&format!("refused: {why}")).await;
+            // Carry the WHOLE refusal frame, not just its reason: the CLI builds
+            // the same code/as/reinvite remedy a cold exec prints.
+            req.reject(&format!("refused-frame: {frame}")).await;
             return;
         }
         Ack::Failed(why) => {
@@ -313,13 +315,17 @@ async fn run_warm_exec(
                     want_err = v["err_bytes"].as_u64();
                     break;
                 }
+                Some(v) if v["type"].as_str() == Some("l2-close")
+                    && v["sid"].as_u64() == Some(sid as u64) =>
+                {
+                    // The peer's own close, with its code/as/reinvite fields
+                    // intact, so the CLI renders the same refusal the cold path
+                    // would (a bare reason loses the expiry remedy).
+                    terminal = Some(v);
+                    break;
+                }
                 Some(v) if v["type"].as_str() == Some("link-revoked") => {
-                    terminal = Some(warm_error(&format!(
-                        "'{peer}' refused to continue: {}",
-                        v["reason"]
-                            .as_str()
-                            .unwrap_or(crate::refusal::UNRECOGNIZED_REASON)
-                    )));
+                    terminal = Some(v);
                     break;
                 }
                 Some(_) => {}
@@ -342,7 +348,15 @@ async fn run_warm_exec(
                 // `exec-close` carrying the status is what ends it.
                 Some(None) => {}
                 None => {
-                    terminal = Some(stream_ended(&mux, &peer, sid).await);
+                    // The dispatch loop queues the full `l2-close` frame BEFORE
+                    // it drops the stream, so prefer that frame over the
+                    // reason-only fallback (it carries the expiry remedy).
+                    match ctl.try_recv() {
+                        Ok(v) if v["type"].as_str() == Some("l2-close") => {
+                            terminal = Some(v);
+                        }
+                        _ => terminal = Some(stream_ended(&mux, &peer, sid).await),
+                    }
                     break;
                 }
             },
@@ -446,8 +460,9 @@ async fn run_warm_exec(
 /// The peer's answer to a warm `exec-open`, or the honest reason there was none.
 enum Ack {
     Opened,
-    /// The peer answered with a refusal; the text is already user-facing.
-    Refused(String),
+    /// The peer answered with a refusal: the exact `l2-close`/`link-revoked`
+    /// frame, so the CLI can render its code/as/reinvite remedy.
+    Refused(Value),
     /// The open may have reached the peer, but no answer did. Never a fallback.
     Failed(String),
 }
@@ -472,20 +487,22 @@ async fn await_ack(
                         "'{peer}' closed the exec stream before acknowledging the open"
                     ));
                 }
+                Some(v) if v["type"].as_str() == Some("l2-close")
+                    && v["sid"].as_u64() == Some(sid as u64) =>
+                {
+                    return Ack::Refused(v);
+                }
                 Some(v) if v["type"].as_str() == Some("link-revoked") => {
-                    return Ack::Refused(format!(
-                        "'{peer}' refused to continue: {}",
-                        v["reason"]
-                            .as_str()
-                            .unwrap_or(crate::refusal::UNRECOGNIZED_REASON)
-                    ));
+                    return Ack::Refused(v);
                 }
                 Some(_) => {}
                 None => {
                     return match mux.take_close_err(sid).await {
-                        Some(reason) => {
-                            Ack::Refused(format!("'{peer}' refused exec: {reason}"))
-                        }
+                        Some(reason) => Ack::Refused(json!({
+                            "type": "l2-close",
+                            "sid": sid,
+                            "err": reason,
+                        })),
                         None => Ack::Failed(format!(
                             "'{peer}' closed the exec stream before answering"
                         )),

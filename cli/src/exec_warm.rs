@@ -146,7 +146,7 @@ mod imp {
         // reply is now a failure, never a fallback.
         let reply = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            read_line(&mut sock, 8192),
+            read_line(&mut sock, 64 * 1024),
         )
         .await
         {
@@ -171,6 +171,14 @@ mod imp {
         let err = v["err"].as_str().unwrap_or("rejected").to_string();
         if err.starts_with("no warm path") {
             return WarmExec::NoPath;
+        }
+        if let Some(frame) = err.strip_prefix("refused-frame: ") {
+            if let Ok(v) = serde_json::from_str::<Value>(frame) {
+                return WarmExec::Done(close_result(peer, opts, &v));
+            }
+            return WarmExec::Done(Err(anyhow::anyhow!(
+                "the local daemon sent a malformed warm exec refusal"
+            )));
         }
         if let Some(reason) = err.strip_prefix("refused: ") {
             if let Some(code) = spawn_refusal_code(reason) {
