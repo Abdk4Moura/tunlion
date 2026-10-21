@@ -599,7 +599,11 @@ echo "## measured: warm=${elW}ms cold=${elC}ms"
 OUTQ=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -q exec boxB -- "${CMD_W[@]}" 2>"$WORK/Wq.err" </dev/null)
 rcQ=$?
 echo "## (-q) rc=$rcQ out='$OUTQ' stderr_bytes=$(wc -c <"$WORK/Wq.err")"
-if [ "$rcQ" = "7" ] && [ "$OUTQ" = "out" ] && [ ! -s "$WORK/Wq.err" ]; then
+# The command's own stderr ("err") is expected; the assertion is that no
+# TUNLION status/debug line joined it under -q.
+if [ "$rcQ" = "7" ] && [ "$OUTQ" = "out" ] \
+   && [ "$(wc -l <"$WORK/Wq.err")" = "1" ] && grep -qx "err" "$WORK/Wq.err" \
+   && ! grep -q "waiting for known device\|riding the local daemon\|still reaching" "$WORK/Wq.err"; then
   ok "gateW3: -q printed no status on a successful warm exec, stdout/rc exact"
 else
   echo "-- Wq.err --"; cat "$WORK/Wq.err"
