@@ -1448,7 +1448,7 @@ mod tests {
         assert_eq!(h.c.ends.load(Ordering::SeqCst), 1);
         assert_eq!(h.c.forgets.load(Ordering::SeqCst), 1);
         assert!(h.live.lock().unwrap().is_empty(), "the id is forgotten");
-        assert!(h.bindings[PID].is_empty());
+        assert!(h.bindings.get(PID).map_or(true, |m| m.is_empty()));
         assert_eq!(
             h.muxes[PID].live_streams().await,
             0,
