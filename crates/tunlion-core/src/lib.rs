@@ -26,8 +26,9 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use filament_id::{user_key_path, KeyStore, PendingIdentity, UserKey};
 use filament_peerloop::driver::{
@@ -219,6 +220,8 @@ impl<'a> StartClaim<'a> {
             return Err(error);
         }
         *slot = EngineSlot::Claimed;
+        // A new engine replaces any stale send job from a previous engine.
+        core.clear_send_job();
         Ok(Self {
             slot: &core.engine,
             armed: true,
@@ -282,6 +285,7 @@ struct SendParts {
     server: String,
     display_name: String,
     uid: String,
+    relay: bool,
 }
 
 impl From<SendSummary> for SendResult {
@@ -423,8 +427,25 @@ pub struct Core {
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     /// The completion half of a `create_code` send that is still running. The
     /// engine task itself is in `engine`; this only lets `wait_send` join and
-    /// collect the summary without replacing the one-engine state machine.
-    send_job: Mutex<Option<std::sync::mpsc::Receiver<Result<SendSummary, CoreError>>>>,
+    /// collect the summary without replacing the one-engine state machine. The
+    /// generation is the engine that produced the job: a job left over from a
+    /// stopped engine must never stop its successor.
+    send_job: Mutex<Option<SendJob>>,
+    /// Monotonic id for the engine task. Incremented whenever this Core spawns
+    /// an engine; a send job carries the id it belongs to.
+    engine_seq: AtomicU64,
+}
+
+/// The live completion handle for one `create_code` call.
+struct SendJob {
+    rx: std::sync::mpsc::Receiver<SendEvent>,
+    engine_seq: u64,
+}
+
+/// The two events a code send produces: its allocated code, then its result.
+enum SendEvent {
+    Code(CodeInfo),
+    Done(Result<SendSummary, CoreError>),
 }
 
 /// An identity that exists only in memory until `Core::commit_identity`.
@@ -636,6 +657,7 @@ impl Core {
             engine: Mutex::new(EngineSlot::None),
             runtime: Mutex::new(None),
             send_job: Mutex::new(None),
+            engine_seq: AtomicU64::new(0),
         })
     }
 
@@ -890,47 +912,100 @@ impl Core {
         paths: Vec<String>,
         timeout: Option<u64>,
     ) -> Result<CreatedCode, CoreError> {
-        let (done, code_rx) = self.begin_send(
+        let mut events = self.begin_send(
             paths,
             SendMode::Code { word: None },
             true,
             timeout,
         )?;
-        let code_rx = code_rx.expect("a code send asks for its code");
-        let code = match code_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(code) => code,
-            Err(_) => {
-                let _ = self.settle_one_shot();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let settled = self.settle_one_shot();
+                settled?;
                 return Err(CoreError::Engine(
                     "the server did not allocate a transfer code in time".into(),
                 ));
             }
-        };
-        *self
-            .send_job
-            .lock()
-            .map_err(|_| CoreError::Engine("the send job lock was poisoned".into()))? = Some(done);
-        Ok(CreatedCode {
-            code: code.code,
-            expires_in_secs: code.expires_in_secs,
-        })
+            match events.recv_timeout(left) {
+                Ok(SendEvent::Code(code)) => {
+                    let engine_seq = self.engine_generation();
+                    *self
+                        .send_job
+                        .lock()
+                        .map_err(|_| {
+                            CoreError::Engine("the send job lock was poisoned".into())
+                        })? = Some(SendJob {
+                        rx: events,
+                        engine_seq,
+                    });
+                    return Ok(CreatedCode {
+                        code: code.code,
+                        expires_in_secs: code.expires_in_secs,
+                    });
+                }
+                Ok(SendEvent::Done(result)) => {
+                    // The engine failed before a code existed. The typed error
+                    // (Usage for a bad local path, Unreachable for an
+                    // unreachable server, Cancelled for a stop) is the answer;
+                    // do not replace it with a timeout. A failure to settle is
+                    // itself surfaced.
+                    let settled = self.settle_one_shot();
+                    settled?;
+                    return match result {
+                        Ok(_) => Err(CoreError::Engine(
+                            "the send completed before allocating a code".into(),
+                        )),
+                        Err(error) => Err(error),
+                    };
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let settled = self.settle_one_shot();
+                    settled?;
+                    return Err(CoreError::Engine(
+                        "the server did not allocate a transfer code in time".into(),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let settled = self.settle_one_shot();
+                    settled?;
+                    return Err(CoreError::Engine(
+                        "the send dispatch ended before allocating a code".into(),
+                    ));
+                }
+            }
+        }
     }
 
     /// Wait for the send started by `create_code` and return its per-file
     /// result. Joins the engine and releases the same-root lease, exactly like
     /// `receive_code` does for a receive.
     pub fn wait_send(&self) -> Result<SendResult, CoreError> {
-        let done = self
+        let job = self
             .send_job
             .lock()
             .map_err(|_| CoreError::Engine("the send job lock was poisoned".into()))?
             .take()
             .ok_or_else(|| CoreError::Engine("no code send is in progress".into()))?;
-        let result = done.recv().unwrap_or_else(|_| {
-            Err(CoreError::Engine(
-                "the send dispatch ended without a result".into(),
-            ))
-        });
+        if job.engine_seq != self.engine_generation() {
+            // A stopped/replaced engine left this job behind. It must not stop
+            // or reap the engine that owns the slot now.
+            return Err(CoreError::Engine(
+                "the send job belongs to a previous engine".into(),
+            ));
+        }
+        let result = loop {
+            match job.rx.recv() {
+                Ok(SendEvent::Done(result)) => break result,
+                Ok(SendEvent::Code(_)) => continue,
+                Err(_) => {
+                    break Err(CoreError::Engine(
+                        "the send dispatch ended without a result".into(),
+                    ))
+                }
+            }
+        };
         let settled = self.settle_one_shot();
         match result {
             Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
@@ -961,17 +1036,23 @@ impl Core {
         device: String,
         timeout: Option<u64>,
     ) -> Result<SendResult, CoreError> {
-        let (done, _) = self.begin_send(
+        let mut events = self.begin_send(
             paths,
-            SendMode::Device { name: device.clone() },
+            SendMode::Device { name: device },
             false,
             timeout,
         )?;
-        let result = done.recv().unwrap_or_else(|_| {
-            Err(CoreError::Engine(
-                "the send dispatch ended without a result".into(),
-            ))
-        });
+        let result = loop {
+            match events.recv() {
+                Ok(SendEvent::Done(result)) => break result,
+                Ok(SendEvent::Code(_)) => continue,
+                Err(_) => {
+                    break Err(CoreError::Engine(
+                        "the send dispatch ended without a result".into(),
+                    ))
+                }
+            }
+        };
         let settled = self.settle_one_shot();
         match result {
             Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
@@ -990,13 +1071,7 @@ impl Core {
         mode: SendMode,
         want_code: bool,
         timeout: Option<u64>,
-    ) -> Result<
-        (
-            std::sync::mpsc::Receiver<Result<SendSummary, CoreError>>,
-            Option<std::sync::mpsc::Receiver<CodeInfo>>,
-        ),
-        CoreError,
-    > {
+    ) -> Result<std::sync::mpsc::Receiver<SendEvent>, CoreError> {
         if paths.is_empty() {
             return Err(CoreError::Usage(
                 "nothing to send; pass at least one regular file".into(),
@@ -1009,28 +1084,33 @@ impl Core {
             server,
             display_name,
             uid,
+            relay,
         } = parts;
         let request = SendRequest {
             server,
             paths: paths.into_iter().map(PathBuf::from).collect(),
             name: None,
             mode,
-            relay: false,
+            relay,
             timeout,
             display_name,
             uid,
         };
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let (code_tx, code_rx) = if want_code {
-            let (tx, rx) = std::sync::mpsc::channel();
-            (Some(tx), Some(rx))
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<SendEvent>();
+        let done_tx = event_tx.clone();
+        let code_notify: Option<filament_peerloop::send::engine::CodeNotify> = if want_code {
+            let tx = event_tx.clone();
+            Some(Box::new(move |code| {
+                let _ = tx.send(SendEvent::Code(code));
+            }))
         } else {
-            (None, None)
+            None
         };
+        drop(event_tx);
         let dispatch = move |stop: Cancellation, _readiness: Readiness| async move {
             let outcome = stop
                 .run(filament_peerloop::send::engine::drive(
-                    request, ports, code_tx, &stop,
+                    request, ports, code_notify, &stop,
                 ))
                 .await;
             let result = match outcome {
@@ -1038,7 +1118,7 @@ impl Core {
                 DriverOutcome::Returned(Ok(summary)) => Ok(summary),
                 DriverOutcome::Returned(Err(failure)) => Err(map_send_failure(failure)),
             };
-            let _ = done_tx.send(result);
+            let _ = done_tx.send(SendEvent::Done(result));
             Ok::<(), String>(())
         };
         let (_handle, engine, _watch) = self.spawn_engine(dispatch)?;
@@ -1048,7 +1128,7 @@ impl Core {
             let _ = self.settle_one_shot();
             return Err(error);
         }
-        Ok((done_rx, code_rx))
+        Ok(event_rx)
     }
 
     /// The explicit-root host/identity/store/transport composition for one
@@ -1063,6 +1143,7 @@ impl Core {
         let settings =
             CoreSettings::load(&self.dir).map_err(|e| CoreError::Config(e.to_string()))?;
         let server = resolve_server(&settings)?;
+        let relay = settings.relay_only();
         let lease = store
             .try_acquire_engine_lease()
             .map_err(|e| CoreError::Engine(format!("engine lease: {e}")))?
@@ -1118,6 +1199,7 @@ impl Core {
                 server,
                 display_name,
                 uid,
+                relay,
             },
             lease,
         ))
@@ -1253,7 +1335,7 @@ impl Core {
                     }
                 }
                 Err(CoreError::Stop(
-                    "the receive engine stopped while it was starting".into(),
+                    "the one-shot engine stopped while it was starting".into(),
                 ))
             }
         }
@@ -1538,6 +1620,7 @@ impl Core {
             let _entered = runtime.enter();
             Engine::start(cancel, dispatch)
         };
+        self.engine_seq.fetch_add(1, Ordering::AcqRel);
         *slot = EngineSlot::Running(engine);
         Ok(())
     }
@@ -1577,6 +1660,7 @@ impl Core {
         let _entered = runtime.enter();
         let cancel = Cancellation::default();
         let engine = Engine::start(cancel, dispatch);
+        self.engine_seq.fetch_add(1, Ordering::AcqRel);
         let watch = engine.ready_watch();
         Ok((handle, engine, watch))
     }
@@ -1585,6 +1669,16 @@ impl Core {
         if let Ok(mut lease) = self.lease.lock() {
             *lease = None;
         }
+    }
+
+    fn clear_send_job(&self) {
+        if let Ok(mut job) = self.send_job.lock() {
+            *job = None;
+        }
+    }
+
+    fn engine_generation(&self) -> u64 {
+        self.engine_seq.load(Ordering::Acquire)
     }
 
     /// The synchronous form FFI uses. It runs `stop_within` on a fresh OS
@@ -1642,6 +1736,9 @@ impl Core {
     /// The bounded form of [`Core::stop`]. A caller that wants a shorter grace
     /// (a test, or a supervisor with its own deadline) uses this.
     pub async fn stop_within(&self, bound: Duration) -> Result<(), CoreError> {
+        // A stop ends this engine's claim on any send job. A later wait_send
+        // must refuse the stale job rather than stop or reap a successor.
+        self.clear_send_job();
         // Phase 1, under the lock and without awaiting: claim the engine by
         // moving the slot to `Stopping`. `Stopping` both owns the settle and
         // refuses a concurrent start or stop, so no second owner can race the
@@ -2018,6 +2115,61 @@ mod tests {
             });
         });
         (handle, events_rx)
+    }
+
+    /// A signaling stub that answers a real `pair-create` with `pair-ok` and
+    /// then keeps the socket open, so `create_code` can return a claimable code.
+    fn code_alloc_stub(listener: std::net::TcpListener) -> std::thread::JoinHandle<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let _ = ws.send(Message::Text("0{}".into())).await;
+                while let Some(Ok(message)) = ws.next().await {
+                    match message {
+                        Message::Text(text) if text == "40" => {
+                            let _ = ws.send(Message::Text("40{}".into())).await;
+                            let _ = ws
+                                .send(Message::Text(
+                                    r#"42["welcome",{"id":"stub","peers":[]}]"#.into(),
+                                ))
+                                .await;
+                        }
+                        Message::Text(text)
+                            if text.starts_with("42")
+                                && text.contains("pair-create") =>
+                        {
+                            let nameplate = text
+                                .split("\"nameplate\":\"")
+                                .nth(1)
+                                .and_then(|rest| rest.split('\"').next())
+                                .unwrap_or("3141");
+                            let reply = format!(
+                                r#"42["pair-ok",{{"nameplate":"{nameplate}","ttl":600,"v":2}}]"#
+                            );
+                            let _ = ws.send(Message::Text(reply.into())).await;
+                        }
+                        Message::Text(text) if text.starts_with("41") => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        Message::Close(_) => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        })
     }
 
     /// A Core with a committed identity, ready for the engine/receive paths.
@@ -2450,6 +2602,173 @@ mod tests {
             }]
         );
         assert_eq!(summary.bytes, 5);
+    }
+
+    #[test]
+    fn create_code_allocates_a_real_code_and_stop_releases_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = enrolled_core(dir.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        configured_for(&core, &listener);
+        let payload = dir.path().join("payload.bin");
+        std::fs::write(&payload, b"payload").unwrap();
+        let server = code_alloc_stub(listener);
+
+        let created = core
+            .create_code(vec![payload.display().to_string()], Some(30))
+            .unwrap();
+        assert!(created.code.contains('-'), "{}", created.code);
+        assert!(created.expires_in_secs > 0);
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+
+        core.stop_blocking().unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "a stopped code send must release the root lease"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn create_code_bad_local_path_is_usage_and_releases_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = enrolled_core(dir.path());
+        let missing = dir.path().join("does-not-exist.bin");
+        let error = core
+            .create_code(vec![missing.display().to_string()], Some(5))
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Usage(_)),
+            "a bad local path must be Usage, got {error:?}"
+        );
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "the failed allocation must release the root lease"
+        );
+    }
+
+    #[test]
+    fn create_code_unreachable_server_is_a_typed_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = enrolled_core(dir.path());
+        std::fs::write(
+            core.config_dir().join("config"),
+            "server http://127.0.0.1:1
+",
+        )
+        .unwrap();
+        let payload = dir.path().join("payload.bin");
+        std::fs::write(&payload, b"payload").unwrap();
+        let error = core
+            .create_code(vec![payload.display().to_string()], Some(3))
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Unreachable(_) | CoreError::Refused(_)),
+            "an unreachable server must be Unreachable/Refused, got {error:?}"
+        );
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "the failed allocation must release the root lease"
+        );
+    }
+
+    #[test]
+    fn stop_during_code_allocation_returns_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(enrolled_core(dir.path()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        configured_for(&core, &listener);
+        let payload = dir.path().join("payload.bin");
+        std::fs::write(&payload, b"payload").unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (server, accepted) = gated_signaling_stub(listener, gate_rx);
+        let receive_core = Arc::clone(&core);
+        let created = std::thread::spawn(move || {
+            receive_core.create_code(vec![payload.display().to_string()], Some(30))
+        });
+        accepted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sender reached the signaling stub");
+        core.stop_blocking().unwrap();
+        assert!(
+            matches!(created.join().unwrap(), Err(CoreError::Cancelled)),
+            "a stop during allocation must be Cancelled"
+        );
+        assert_eq!(core.status().unwrap().engine, EngineState::Stopped);
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "a cancelled allocation must release the root lease"
+        );
+        let _ = gate_tx.send(());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stop_clears_the_send_job_and_wait_send_never_stops_the_next_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = enrolled_core(dir.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        configured_for(&core, &listener);
+        let payload = dir.path().join("payload.bin");
+        std::fs::write(&payload, b"payload").unwrap();
+        let server = code_alloc_stub(listener);
+        core.create_code(vec![payload.display().to_string()], Some(30))
+            .unwrap();
+        core.stop_blocking().unwrap();
+
+        // A fresh engine owns the slot. The stale send job was cleared by stop,
+        // so wait_send must not consume it and stop this new engine.
+        core.start_with_dispatch(|stop, _readiness| async move {
+            stop.run(std::future::pending::<()>()).await;
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        assert_eq!(core.status().unwrap().engine, EngineState::Running);
+        assert!(matches!(core.wait_send(), Err(CoreError::Engine(_))));
+        assert_eq!(
+            core.status().unwrap().engine,
+            EngineState::Running,
+            "wait_send stopped an engine it did not own"
+        );
+        core.stop_blocking().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn wait_send_without_create_is_refused() {
+        let core = core();
+        assert!(matches!(core.wait_send(), Err(CoreError::Engine(_))));
+        assert!(matches!(core.wait_send(), Err(CoreError::Engine(_))));
+    }
+
+    #[test]
+    fn send_to_device_unknown_is_usage_and_releases_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = enrolled_core(dir.path());
+        let payload = dir.path().join("payload.bin");
+        std::fs::write(&payload, b"payload").unwrap();
+        let error = core
+            .send_to_device(
+                vec![payload.display().to_string()],
+                "no-such-device".to_string(),
+                Some(3),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Usage(_)),
+            "an unknown petname must be Usage, got {error:?}"
+        );
+        let probe = DeviceStore::open(core.config_dir());
+        assert!(
+            probe.try_acquire_engine_lease().unwrap().is_some(),
+            "the failed send must release the root lease"
+        );
     }
 
     #[test]

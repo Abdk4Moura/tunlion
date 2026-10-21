@@ -66,6 +66,32 @@ pub fn digest_reader(r: &mut impl Read) -> std::io::Result<(String, u64)> {
     Ok((h.finalize().iter().map(|b| format!("{b:02x}")).collect(), n))
 }
 
+/// SHA-256 of the first 256 KiB of `path`, or `None` when it cannot be read.
+/// Reads in a loop: a single `read` may return short, and the CLI's original
+/// helper hashed a short prefix only for small/odd readers.
+pub const HEAD_BYTES: u64 = 256 * 1024;
+
+pub fn head_hash(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = Sha256::new();
+    let mut remaining = HEAD_BYTES;
+    let mut buf = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        match f.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => {
+                h.update(&buf[..n]);
+                remaining -= n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// A source that cannot be opened or read.
 pub fn unreadable_input(path: &str, e: &std::io::Error) -> SourceFailure {
     if e.kind() == std::io::ErrorKind::NotFound {

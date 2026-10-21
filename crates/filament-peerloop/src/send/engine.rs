@@ -20,7 +20,7 @@ use crate::present::Presentation;
 use crate::recv::dispatch::proof_for;
 use crate::recv::identity::IdentityService;
 use crate::send::ceremony::{Ceremony, Inbound as PakeInbound, pair_v2_caps};
-use crate::send::source::{as_source_read, source_digest};
+use crate::send::source::{as_source_read, head_hash, source_digest};
 use crate::session::Session;
 use anyhow::Result;
 use filament_id::IntroScope;
@@ -47,7 +47,9 @@ const CLAIM_WINDOW: Duration = Duration::from_secs(600);
 const ACK_WAIT: Duration = Duration::from_secs(15);
 const ACK_REPROBE: Duration = Duration::from_secs(5);
 const PAKE_GRACE: Duration = Duration::from_secs(60);
-const HEAD_BYTES: u64 = 256 * 1024;
+/// After a claim/established link, the transfer may legitimately outlive the
+/// code's TTL. This is an idle/progress bound, not a code-expiry bound.
+const POST_CLAIM_IDLE: Duration = Duration::from_secs(900);
 
 /// How this send finds its one receiver.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +76,9 @@ pub struct SendRequest {
 
 /// The host seams this engine needs. The CLI and Core each supply their own
 /// explicit implementation; there is no process-global lookup here.
+/// Called exactly once, when the signaling server has allocated the code.
+pub type CodeNotify = Box<dyn Fn(CodeInfo) + Send + 'static>;
+
 pub struct SendPorts {
     pub host: Arc<dyn HostServices>,
     pub identity: Arc<IdentityService>,
@@ -158,19 +163,22 @@ impl SendFailure {
 }
 
 
+/// The claim window (and the code's TTL) applies only until someone claims the
+/// code. After that a slow or large transfer must not be aborted as expired.
+fn claim_expired(
+    code_used: bool,
+    now: Instant,
+    claim_deadline: Instant,
+    code_deadline: Option<Instant>,
+) -> bool {
+    !code_used && (now >= claim_deadline || code_deadline.is_some_and(|d| now >= d))
+}
+
 fn internal(error: impl std::fmt::Display) -> SendFailure {
     SendFailure::engine(error.to_string())
 }
 
-fn head_hash(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; HEAD_BYTES as usize];
-    let n = f.read(&mut buf).ok()?;
-    let mut h = Sha256::new();
-    h.update(&buf[..n]);
-    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-}
+
 
 fn build_outgoing(request: &SendRequest, log: &dyn LogSink) -> Result<Vec<Outgoing>, SendFailure> {
     if request.paths.is_empty() {
@@ -295,7 +303,7 @@ async fn offer_unfinished(
 pub async fn drive(
     request: SendRequest,
     ports: SendPorts,
-    code_tx: Option<std::sync::mpsc::Sender<CodeInfo>>,
+    mut code_notify: Option<CodeNotify>,
     cancel: &Cancellation,
 ) -> Result<SendSummary, SendFailure> {
     if cancel.is_cancelled() {
@@ -323,11 +331,15 @@ pub async fn drive(
 
     let room = net::fetch_auto_room(&ports.transport_context, &request.server)
         .await
-        .map_err(internal)?;
+        .map_err(|error| {
+            SendFailure::unreachable(format!("the signaling server is unreachable: {error}"))
+        })?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(&ports.transport_context, &request.server, tx.clone())
         .await
-        .map_err(internal)?;
+        .map_err(|error| {
+            SendFailure::unreachable(format!("the signaling server is unreachable: {error}"))
+        })?;
     let mut sess = Session::new(&request.display_name, &request.uid);
     sess.room = Some(room.clone());
     sess.emit(
@@ -401,13 +413,16 @@ pub async fn drive(
     let mut code_used = !use_code && known_target.is_none();
     let mut code_info: Option<CodeInfo> = None;
     let mut code_deadline: Option<Instant> = None;
-    let mut code_tx = code_tx;
     let mut code_sent_to_caller = false;
-    let claim_deadline = Instant::now() + CLAIM_WINDOW;
-    let request_deadline = request
+    // The caller's timeout bounds the CLAIM (or the wait for a known device),
+    // not the transfer that follows. Once a receiver claims/establishes, the
+    // code's TTL and this claim bound stop applying.
+    let claim_deadline = request
         .timeout
         .filter(|secs| *secs > 0)
-        .map(|secs| Instant::now() + Duration::from_secs(secs));
+        .map(|secs| Instant::now() + Duration::from_secs(secs))
+        .unwrap_or_else(|| Instant::now() + CLAIM_WINDOW);
+    let mut last_activity = Instant::now();
     let mut established = false;
     let mut sent_all_at: Option<Instant> = None;
     let mut ack_reprobed = false;
@@ -426,34 +441,27 @@ pub async fn drive(
         if all_done {
             break;
         }
-        if let Some(deadline) = request_deadline {
-            if Instant::now() >= deadline {
-                return Err(SendFailure::unreachable(format!(
-                    "the send did not complete within its timeout; {}",
-                    no_peer_message(
-                        known_target.as_ref().map(|(n, _)| n.as_str()),
-                        use_code,
-                    )
-                )));
-            }
+        if claim_expired(code_used, Instant::now(), claim_deadline, code_deadline) {
+            return Err(SendFailure::unreachable(if use_code {
+                "the transfer code expired before it was claimed; nothing was sent".to_string()
+            } else {
+                format!(
+                    "'{}' did not appear on the server in time; nothing was sent",
+                    known_target
+                        .as_ref()
+                        .map(|(n, _)| n.as_str())
+                        .unwrap_or("the device")
+                )
+            }));
         }
-        if !use_code && known_target.is_some() && !established && Instant::now() >= claim_deadline {
+        if code_used && !all_done && last_activity.elapsed() >= POST_CLAIM_IDLE {
+            let out = outgoing.lock().await;
+            let confirmed = out.iter().filter(|o| o.acked).count();
+            let total = out.len();
             return Err(SendFailure::unreachable(format!(
-                "'{}' did not appear on the server in time",
-                known_target.as_ref().map(|(n, _)| n.as_str()).unwrap_or("the device")
+                "the receiver stopped making progress for {}s after claiming; {confirmed}/{total} file(s) confirmed",
+                POST_CLAIM_IDLE.as_secs()
             )));
-        }
-        if use_code && code_info.is_none() && Instant::now() >= claim_deadline {
-            return Err(SendFailure::unreachable(
-                "the server did not allocate a transfer code in time",
-            ));
-        }
-        if let Some(deadline) = code_deadline {
-            if Instant::now() >= deadline {
-                return Err(SendFailure::unreachable(
-                    "the transfer code expired before a receiver completed the transfer; nothing was sent",
-                ));
-            }
         }
         // A direct attempt that timed out without an authenticated QUIC
         // connection falls back to the WebRTC establish. The CLI loop does this
@@ -557,6 +565,7 @@ pub async fn drive(
             }
         };
         let Some(ev) = ev else { continue };
+        last_activity = Instant::now();
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -589,7 +598,7 @@ pub async fn drive(
             }
             Ev::PairOk(v) => {
                 let ttl = v["ttl"].as_u64().unwrap_or(CODE_TTL.as_secs());
-                let expires = code_expiry_secs(ttl, request_deadline, claim_deadline);
+                let expires = code_expiry_secs(ttl, claim_deadline);
                 let code = format!("{send_words}-{send_nameplate}");
                 ports.log.say("");
                 ports.log.say(&format!(
@@ -604,8 +613,8 @@ pub async fn drive(
                 });
                 if !code_sent_to_caller {
                     code_sent_to_caller = true;
-                    if let Some(tx) = code_tx.take() {
-                        let _ = tx.send(code_info.clone().expect("just set"));
+                    if let Some(notify) = code_notify.take() {
+                        notify(code_info.clone().expect("just set"));
                     }
                 }
             }
@@ -635,6 +644,10 @@ pub async fn drive(
             }
             Ev::PairUsed(_) => {
                 code_used = true;
+                // The code did its job. A late claimer or a slow/large transfer
+                // must not be aborted by the code's TTL or the claim timeout.
+                code_deadline = None;
+                last_activity = Instant::now();
                 ports.log.say("code claimed, connecting...");
             }
             Ev::PeerJoined(v) => {
@@ -714,6 +727,8 @@ pub async fn drive(
                                 if let Some(secret) = cer.secret().cloned() {
                                     if !pake_done {
                                         pake_done = true;
+                                        code_deadline = None;
+                                        last_activity = Instant::now();
                                         ports.log.say("  authenticated, sending");
                                         let promotion = if cer.peer_supports_direct() {
                                             conn.start_direct_promote(&from, &from, &secret).await
@@ -775,6 +790,7 @@ pub async fn drive(
                     continue;
                 }
                 established = true;
+                last_activity = Instant::now();
                 let is_direct = conn.link(&pid).is_some_and(|l| l.direct);
                 if let Some(l) = conn.link(&pid) {
                     if !is_direct {
@@ -883,6 +899,17 @@ pub async fn drive(
                         o.done = true;
                     }
                 }
+                Some("pair-proof-ack") => {
+                    if v["ok"].as_bool() == Some(false) && !use_code {
+                        return Err(SendFailure::denied(format!(
+                            "'{}' refused this device's identity proof; pair the device again",
+                            known_target
+                                .as_ref()
+                                .map(|(n, _)| n.as_str())
+                                .unwrap_or("the receiver")
+                        )));
+                    }
+                }
                 Some("file-pending") => {}
                 Some("link-revoked") => {
                     return Err(SendFailure::denied(
@@ -943,14 +970,9 @@ pub async fn drive(
     })
 }
 
-fn code_expiry_secs(ttl: u64, request: Option<Instant>, claim: Instant) -> u64 {
-    let now = Instant::now();
-    let mut secs = ttl;
-    if let Some(request) = request {
-        secs = secs.min(request.saturating_duration_since(now).as_secs());
-    }
-    secs = secs.min(claim.saturating_duration_since(now).as_secs());
-    secs.max(1)
+fn code_expiry_secs(ttl: u64, claim: Instant) -> u64 {
+    ttl.min(claim.saturating_duration_since(Instant::now()).as_secs())
+        .max(1)
 }
 
 fn no_peer_message(device: Option<&str>, use_code: bool) -> String {
@@ -961,3 +983,31 @@ fn no_peer_message(device: Option<&str>, use_code: bool) -> String {
     }
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_claimed_code_is_not_expired_by_its_ttl_or_claim_bound() {
+        let now = Instant::now();
+        let claim = now.checked_sub(Duration::from_secs(1)).unwrap();
+        let code = now.checked_sub(Duration::from_secs(1));
+        assert!(
+            !claim_expired(true, now, claim, code),
+            "a claimed code must let the transfer outlive the code TTL"
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_code_expires_at_the_claim_bound_or_ttl() {
+        let now = Instant::now();
+        let claim = now.checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(claim_expired(false, now, claim, None));
+        let claim = now + Duration::from_secs(30);
+        let code = now.checked_sub(Duration::from_secs(1));
+        assert!(claim_expired(false, now, claim, code));
+        assert!(!claim_expired(false, now, claim, None));
+    }
+}
