@@ -142,30 +142,62 @@ pub fn spawn_stdin(
 }
 
 // ---------------------------------------------------------------- Windows --
-// Windows stdin stays the CLI's process-lifetime reader (the behavior main had
-// before #542). The engine does not own or join it; cleanup reports External.
+// Windows stdin is owned now. Polling avoids blocking reads on pipes and the
+// console, so stop is exact without overlapped I/O or cross-thread cancels.
 #[cfg(windows)]
 mod win {
     use super::*;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_BROKEN_PIPE, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileType, ReadFile, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, ReadConsoleInputW,
+        SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, INPUT_RECORD, KEY_EVENT,
+        STD_INPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
     pub struct WindowsStdin {
+        stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
+        reason: Arc<std::sync::Mutex<Option<&'static str>>>,
+        detached: bool,
     }
 
     impl StdinOwner for WindowsStdin {
         fn stop(&mut self) {
-            // Deliberately no-op: this is a CLI process-lifetime reader, not
-            // engine-owned work.
+            self.stop.store(true, Ordering::Relaxed);
         }
         fn join(&mut self) -> StdinOutcome {
-            // Drop the handle to detach; never claim a join.
-            let _ = self.handle.take();
-            StdinOutcome::External("windows stdin is a CLI process-lifetime reader")
+            self.stop();
+            let Some(handle) = self.handle.take() else {
+                return StdinOutcome::NotStarted;
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !handle.is_finished() {
+                if std::time::Instant::now() >= deadline {
+                    self.detached = true;
+                    self.handle = Some(handle);
+                    return StdinOutcome::Detached("windows stdin reader did not stop within 2s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if handle.join().is_err() {
+                return StdinOutcome::Detached("windows stdin reader panicked");
+            }
+            if let Some(reason) = *self.reason.lock().unwrap() {
+                return StdinOutcome::Detached(reason);
+            }
+            StdinOutcome::Joined
         }
     }
 
     impl Drop for WindowsStdin {
         fn drop(&mut self) {
+            // Safe while the reader is running: set the flag and detach. No
+            // unbounded join in Drop, and no handle owned by the thread.
+            self.stop.store(true, Ordering::Relaxed);
             let _ = self.handle.take();
         }
     }
@@ -175,24 +207,237 @@ mod win {
         question_open: Arc<AtomicBool>,
         present: Arc<dyn Presentation>,
     ) -> Option<Box<dyn StdinOwner>> {
-        use std::io::Read;
+        // SAFETY: standard handle; the reader only observes it.
+        let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        spawn_on_handle(input, tx, question_open, present)
+    }
+
+    pub(super) fn spawn_on_handle(
+        input: HANDLE,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) -> Option<Box<dyn StdinOwner>> {
+        if input.is_null() {
+            return None;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let reason = Arc::new(std::sync::Mutex::new(None));
+        let reason_thread = reason.clone();
+        let input_usize = input as usize;
         let handle = std::thread::spawn(move || {
-            let mut stdin = std::io::stdin();
-            let mut buf = [0u8; 1];
-            let mut line = String::new();
-            while stdin.read(&mut buf).map(|n| n == 1).unwrap_or(false) {
-                feed_char(
-                    buf[0] as char,
-                    &tx,
-                    &question_open,
-                    present.as_ref(),
-                    &mut line,
-                );
+            let input = input_usize as HANDLE;
+            let why = reader(input, stop_thread, tx, question_open, present);
+            if let Some(why) = why {
+                if let Ok(mut slot) = reason_thread.lock() {
+                    *slot = Some(why);
+                }
             }
         });
         Some(Box::new(WindowsStdin {
+            stop,
             handle: Some(handle),
+            reason,
+            detached: false,
         }))
+    }
+
+    fn reader(
+        input: HANDLE,
+        stop: Arc<AtomicBool>,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) -> Option<&'static str> {
+        // SAFETY: GetFileType has no preconditions.
+        let kind = unsafe { GetFileType(input) };
+        if kind == FILE_TYPE_CHAR {
+            return console_reader(input, stop, tx, question_open, present);
+        }
+        if kind == FILE_TYPE_PIPE || kind == FILE_TYPE_DISK {
+            return byte_reader(input, kind, stop, tx, question_open, present);
+        }
+        Some("windows stdin handle is neither console, pipe, nor disk")
+    }
+
+    fn byte_reader(
+        input: HANDLE,
+        kind: u32,
+        stop: Arc<AtomicBool>,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) -> Option<&'static str> {
+        let mut line = String::new();
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let mut available = 0u32;
+            if kind == FILE_TYPE_PIPE {
+                // SAFETY: PeekNamedPipe writes only the available count.
+                let ok = unsafe {
+                    PeekNamedPipe(
+                        input,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    // A closed writer is EOF; any other error ends the reader.
+                    if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
+                        return None;
+                    }
+                    return None;
+                }
+                if available == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+            }
+            let mut buf = [0u8; 4096];
+            let want = if kind == FILE_TYPE_PIPE {
+                available.min(buf.len() as u32)
+            } else {
+                buf.len() as u32
+            };
+            let mut read = 0u32;
+            // SAFETY: for a pipe PeekNamedPipe proved data; for a disk read it
+            // is a normal synchronous file read, never a pending overlapped I/O.
+            let ok = unsafe {
+                ReadFile(
+                    input,
+                    buf.as_mut_ptr(),
+                    want,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || read == 0 {
+                return None;
+            }
+            pending.extend_from_slice(&buf[..read as usize]);
+            loop {
+                match std::str::from_utf8(&pending) {
+                    Ok(text) => {
+                        for ch in text.chars() {
+                            feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                        }
+                        pending.clear();
+                        break;
+                    }
+                    Err(error) => {
+                        let valid = error.valid_up_to();
+                        if valid > 0 {
+                            let text = unsafe { std::str::from_utf8_unchecked(&pending[..valid]) };
+                            for ch in text.chars() {
+                                feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                            }
+                            pending.drain(..valid);
+                            continue;
+                        }
+                        if pending.len() >= 4 {
+                            feed_char('\u{fffd}', &tx, &question_open, present.as_ref(), &mut line);
+                            pending.clear();
+                            break;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn console_reader(
+        input: HANDLE,
+        stop: Arc<AtomicBool>,
+        tx: mpsc::UnboundedSender<Ev>,
+        question_open: Arc<AtomicBool>,
+        present: Arc<dyn Presentation>,
+    ) -> Option<&'static str> {
+        let mut saved_mode = 0u32;
+        // SAFETY: writes one u32; only called for a char device.
+        let have_mode = unsafe { GetConsoleMode(input, &mut saved_mode) } != 0;
+        if have_mode {
+            // Raw-ish input: no line buffering, no echo. Keep processed input
+            // so Ctrl-C still reaches the process signal adapter. Restore on
+            // every exit path below.
+            let raw = saved_mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+            // SAFETY: valid console handle and mode.
+            unsafe {
+                let _ = SetConsoleMode(input, raw);
+            }
+        }
+        let mut line = String::new();
+        let mut high_surrogate: Option<u16> = None;
+        let result = loop {
+            if stop.load(Ordering::Relaxed) {
+                break None;
+            }
+            let mut available = 0u32;
+            // SAFETY: writes one count.
+            unsafe {
+                let _ = GetNumberOfConsoleInputEvents(input, &mut available);
+            }
+            if available == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
+            let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            let mut read = 0u32;
+            // SAFETY: one record buffer, one record requested, only after the
+            // console reports an event available.
+            let ok = unsafe { ReadConsoleInputW(input, &mut record, 1, &mut read) };
+            if ok == 0 || read == 0 {
+                break None;
+            }
+            if record.EventType as u32 == KEY_EVENT {
+                let key = unsafe { record.Event.KeyEvent };
+                if key.bKeyDown != 0 {
+                    let unit = unsafe { key.uChar.UnicodeChar };
+                    if (0xD800..=0xDBFF).contains(&unit) {
+                        high_surrogate = Some(unit);
+                    } else if (0xDC00..=0xDFFF).contains(&unit) {
+                        if let Some(high) = high_surrogate.take() {
+                            if let Some(ch) =
+                                char::decode_utf16([high, unit]).next().and_then(|r| r.ok())
+                            {
+                                feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                            }
+                        }
+                    } else {
+                        high_surrogate = None;
+                        if let Some(ch) = char::from_u32(unit as u32).filter(|c| *c != '\0') {
+                            feed_char(ch, &tx, &question_open, present.as_ref(), &mut line);
+                        }
+                    }
+                }
+            }
+        };
+        if have_mode {
+            // SAFETY: restore the exact saved console mode.
+            unsafe {
+                let _ = SetConsoleMode(input, saved_mode);
+            }
+        }
+        result
+    }
+    #[cfg(test)]
+    pub(super) fn spawn_panicking_for_test() -> Box<dyn StdinOwner> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reason = Arc::new(std::sync::Mutex::new(None));
+        let handle = std::thread::spawn(|| panic!("stdin test panic"));
+        Box::new(WindowsStdin {
+            stop,
+            handle: Some(handle),
+            reason,
+            detached: false,
+        })
     }
 }
 
@@ -237,19 +482,160 @@ mod unix_pipe_tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
+    use super::win::{spawn_on_handle, spawn_panicking_for_test};
+    use filament_peerloop::present::NoScreen;
+    use filament_peerloop::recv::ports::StdinOutcome;
+    use filament_transport::net::Ev;
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    fn pipe() -> (usize, usize) {
+        let mut read = std::ptr::null_mut();
+        let mut write = std::ptr::null_mut();
+        // SAFETY: two out pointers and default security.
+        assert_ne!(
+            unsafe { CreatePipe(&mut read, &mut write, std::ptr::null_mut(), 0) },
+            0
+        );
+        (read as usize, write as usize)
+    }
+
+    fn write_all(handle: usize, bytes: &[u8]) {
+        let mut wrote = 0u32;
+        // SAFETY: caller keeps the write handle open.
+        assert_ne!(
+            unsafe {
+                WriteFile(
+                    handle as *mut _,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut wrote,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(wrote as usize, bytes.len());
+    }
+
+    fn owner(
+        handle: usize,
+    ) -> (
+        Box<dyn filament_peerloop::recv::ports::StdinOwner>,
+        tokio::sync::mpsc::UnboundedReceiver<Ev>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            spawn_on_handle(
+                handle as *mut _,
+                tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(NoScreen),
+            )
+            .expect("reader"),
+            rx,
+        )
+    }
+
+    fn next_line(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Ev>) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Ok(Ev::StdinLine(line)) = rx.try_recv() {
+                return line;
+            }
+            assert!(std::time::Instant::now() < deadline, "no line delivered");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
-    fn windows_stdin_is_an_explicit_external_reader() {
-        use super::spawn_stdin;
-        use filament_peerloop::present::NoScreen;
-        use filament_peerloop::recv::ports::StdinOutcome;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut owner = spawn_stdin(tx, Arc::new(AtomicBool::new(false)), Arc::new(NoScreen))
-            .expect("Windows has the CLI process-lifetime reader");
+    fn pipe_eof_without_data_joins() {
+        let (read, write) = pipe();
+        let (mut owner, _rx) = owner(read);
+        // SAFETY: closing the only write end produces EOF.
+        unsafe {
+            CloseHandle(write as *mut _);
+        }
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        unsafe {
+            CloseHandle(read as *mut _);
+        }
+    }
+
+    #[test]
+    fn pipe_data_is_utf8_and_joins() {
+        let (read, write) = pipe();
+        write_all(write, b"hi\\n");
+        let (mut owner, mut rx) = owner(read);
+        assert_eq!(next_line(&mut rx), "hi");
+        unsafe {
+            CloseHandle(write as *mut _);
+        }
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        unsafe {
+            CloseHandle(read as *mut _);
+        }
+    }
+
+    #[test]
+    fn regular_file_redirect_is_read_to_eof() {
+        let path =
+            std::env::temp_dir().join(format!("tunlion-stdin-file-{}.txt", std::process::id()));
+        std::fs::write(&path, b"file line\\n").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let handle = file.as_raw_handle() as usize;
+        let (mut owner, mut rx) = owner(handle);
+        assert_eq!(next_line(&mut rx), "file line");
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn continuous_pipe_data_still_stops() {
+        let (read, write) = pipe();
+        let (mut owner, _rx) = owner(read);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                write_all(write, b"x\\n");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        assert_eq!(owner.join(), StdinOutcome::Joined);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        unsafe {
+            CloseHandle(write as *mut _);
+        }
+        let _ = writer.join();
+        unsafe {
+            CloseHandle(read as *mut _);
+        }
+    }
+
+    #[test]
+    fn drop_while_reader_is_running_does_not_block() {
+        let (read, write) = pipe();
+        let (owner, _rx) = owner(read);
+        let started = std::time::Instant::now();
+        drop(owner);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // The detached reader may still be polling: leak both handles rather
+        // than close one under it. Process exit reclaims them.
+        let _ = (read, write);
+    }
+
+    #[test]
+    fn panic_is_reported_as_detached() {
+        let mut owner = spawn_panicking_for_test();
         assert_eq!(
             owner.join(),
-            StdinOutcome::External("windows stdin is a CLI process-lifetime reader")
+            StdinOutcome::Detached("windows stdin reader panicked")
         );
     }
 }
