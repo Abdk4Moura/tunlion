@@ -2861,7 +2861,10 @@ mod tests {
 
     #[cfg(windows)]
     fn win_junction(target: &std::path::Path, link: &std::path::Path) -> bool {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW)
             .arg("/C")
             .arg("mklink")
             .arg("/J")
