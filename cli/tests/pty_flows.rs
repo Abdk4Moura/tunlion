@@ -306,7 +306,7 @@ fn the_menu_accept_entry_takes_a_code_and_joins_with_it() {
     let typed_at = t.text().len();
     t.send("comic-otter-1950\r");
     assert!(
-        t.wait_for_from(typed_at, "claiming comic-otter-1950", 20),
+        t.wait_for_from(typed_at, "that is a pairing code; connecting", 20),
         "a code typed at the accept prompt was not accepted as a code; screen:\n{}",
         tail(&t.text())
     );
