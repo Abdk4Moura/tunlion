@@ -11,7 +11,9 @@ SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d "${RUNNER_TEMP:-/tmp}/android-core.XXXXXX")"
 DA="$WORK/unused"
 source "$CLI_DIR/tests/lib/fixture.sh"
-trap fixture_cleanup EXIT
+# The sender has normally exited before cleanup; kill(2) then returns nonzero.
+# Cleanup must preserve the test's status rather than turning success into 1.
+trap 'status=$?; fixture_cleanup || true; exit "$status"' EXIT
 export TUNLION_NONINTERACTIVE=1
 start_backend
 init_owner "$WORK/sender"
