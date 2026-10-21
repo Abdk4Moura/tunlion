@@ -70,7 +70,7 @@ that port rather than reimplemented in the exec module.
 ## Tests
 
 - Library unit tests use a deterministic fake transport and fake child for ack
-  order, separate stream sids, exact argv, env allowlist, cwd refusal, tty
+  order, separate stream sids, exact argv, user-like env baseline, cwd refusal, tty
   refusal, user-drop refuse-not-downgrade, exit code and ladder.
 - The existing real-binary `cli/tests/exec-gates.sh` (gates A-R) remains the
   end-to-end proof and is unchanged.

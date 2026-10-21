@@ -8,7 +8,8 @@ use anyhow::Result;
 
 /// Shell invocation now lives in the peer-loop crate (a process rule with no
 /// host opinion); this path re-exports it so existing callers keep resolving.
-pub use filament_peerloop::shell::ShellHost;
+pub use filament_peerloop::shell::exec::ExecUserContext;
+use filament_peerloop::shell::ShellHost;
 
 /// Platform-specific paths for the tunlion CLI.
 ///
@@ -20,6 +21,66 @@ pub use filament_peerloop::shell::ShellHost;
 /// All paths honor `TUNLION_CONFIG_DIR` as an override (hermetic tests,
 /// custom deployments).
 pub struct Paths;
+
+/// Resolve a Unix account record through the reentrant password API. `None`
+/// asks for the daemon's effective uid; a named account is looked up exactly.
+/// Returns None for a missing account or an unusable (non-absolute) home, so
+/// callers can fail closed instead of guessing.
+#[cfg(unix)]
+fn passwd_user_context(name: Option<&str>) -> Option<ExecUserContext> {
+    use std::ffi::{CStr, CString};
+
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwnam_r/getpwuid_r write only into `pwd` and `buf`, both
+    // owned here and sized as passed; `result` is either null or `&pwd`.
+    let rc = unsafe {
+        match name {
+            Some(name) => {
+                let c_name = CString::new(name).ok()?;
+                libc::getpwnam_r(
+                    c_name.as_ptr(),
+                    &mut pwd,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                )
+            }
+            None => libc::getpwuid_r(
+                libc::geteuid(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            ),
+        }
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+
+    let field = |p: *mut libc::c_char| -> Option<String> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: the passwd call above populated a NUL-terminated string in
+        // `buf` (or a static string) that lives as long as this borrow.
+        unsafe { CStr::from_ptr(p) }
+            .to_str()
+            .ok()
+            .map(str::to_string)
+    };
+    let name = field(pwd.pw_name).filter(|s| !s.is_empty())?;
+    let home = field(pwd.pw_dir).filter(|s| Path::new(s.as_str()).is_absolute())?;
+    let shell = field(pwd.pw_shell).filter(|s| !s.is_empty());
+    Some(ExecUserContext {
+        name,
+        home: PathBuf::from(home),
+        shell,
+        uid: Some(pwd.pw_uid),
+    })
+}
 
 impl Paths {
     /// Config directory root.
@@ -156,7 +217,10 @@ impl Paths {
     /// Unix). The exec path spawns argv[] directly with no shell, so the drop
     /// uses runuser's command form (`-u <user> -- <program> <args>`) instead of
     /// `-l <user>`, which would need a shell to carry the command and lose argv
-    /// exactness. No user: the argv is returned unchanged.
+    /// exactness. `-p` keeps the exact, already-filtered environment the
+    /// library built: without it runuser rewrites HOME/USER/LOGNAME, which
+    /// would defeat both the target-user policy and an explicit `--env`
+    /// override. No user: the argv is returned unchanged.
     ///
     /// Err where the PTY drop does not exist (Windows, see `shell_argv`): the
     /// caller must REFUSE the exec rather than run it as the daemon user, which
@@ -174,7 +238,13 @@ impl Paths {
         };
         #[cfg(unix)]
         {
-            let mut argv: Vec<String> = vec!["runuser".into(), "-u".into(), user.into(), "--".into()];
+            let mut argv: Vec<String> = vec![
+                "runuser".into(),
+                "-p".into(),
+                "-u".into(),
+                user.into(),
+                "--".into(),
+            ];
             argv.extend(direct);
             Ok(argv)
         }
@@ -187,36 +257,96 @@ impl Paths {
         }
     }
 
-    /// Home directory of a named local account, when the platform can say.
-    /// Used to give a dropped exec the same starting directory a login shell
-    /// for that account would have. None when unknown; callers fall back.
-    pub fn home_of_user(user: &str) -> Option<PathBuf> {
+    /// The account `tunlion exec` will actually run as, resolved before the
+    /// child environment is built. `None` means the daemon user.
+    ///
+    /// Unix `--shell-user`: name/home/shell/uid come from the password
+    /// database, never from the daemon's HOME/USER/SHELL. An unresolvable
+    /// account is an error, so the exec is refused instead of running with the
+    /// daemon's identity environment. For the daemon's own account the live
+    /// login environment is preferred when it names an absolute home, with
+    /// passwd as the fallback (the same rule `home_dir` uses).
+    ///
+    /// Windows: only the daemon's own account can be served; `--shell-user` is
+    /// refused because deriving another account's profile needs its token
+    /// (`CreateEnvironmentBlock`) or credentials. No daemon profile is ever
+    /// handed to a target account.
+    pub fn exec_user_context(user: Option<&str>) -> std::result::Result<ExecUserContext, String> {
         #[cfg(unix)]
         {
-            use std::ffi::{CStr, CString};
-            let name = CString::new(user).ok()?;
-            // SAFETY: getpwnam_r writes only into `pwd` and `buf`, both owned
-            // here and sized as passed; `result` is either null or `&pwd`.
-            let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-            let mut buf = vec![0 as libc::c_char; 16 * 1024];
-            let mut result: *mut libc::passwd = std::ptr::null_mut();
-            let rc = unsafe {
-                libc::getpwnam_r(name.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
-            };
-            if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
-                return None;
+            if let Some(name) = user {
+                return passwd_user_context(Some(name)).ok_or_else(|| {
+                    format!(
+                        "exec refused: --shell-user {name} is not a resolvable local account (password database lookup failed); running as the daemon user would ignore that setting"
+                    )
+                });
             }
-            let dir = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_str().ok()?;
-            if dir.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(dir))
+            if let Some(passwd) = passwd_user_context(None) {
+                let name = std::env::var("USER")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var("LOGNAME").ok().filter(|s| !s.is_empty()))
+                    .unwrap_or(passwd.name);
+                let home = std::env::var("HOME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_absolute())
+                    .unwrap_or(passwd.home);
+                let shell = std::env::var("SHELL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or(passwd.shell);
+                return Ok(ExecUserContext {
+                    name,
+                    home,
+                    shell,
+                    uid: passwd.uid,
+                });
             }
+            // No passwd entry for the daemon user (minimal container). Keep the
+            // existing env-based fallback for the daemon itself; a target user
+            // still fails closed above.
+            let name = std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .unwrap_or_default();
+            Ok(ExecUserContext {
+                name,
+                home: Self::home_dir(),
+                shell: std::env::var("SHELL").ok().filter(|s| !s.is_empty()),
+                uid: None,
+            })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = user;
-            None
+            if let Some(name) = user {
+                return Err(format!(
+                    "exec refused: --shell-user {name} is set but Windows cannot derive a target account's token environment; refusing to run with the daemon's profile"
+                ));
+            }
+            Ok(ExecUserContext {
+                name: std::env::var("USERNAME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default(),
+                home: Self::home_dir_known().unwrap_or_else(|| PathBuf::from(".")),
+                shell: None,
+                uid: None,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            if let Some(name) = user {
+                return Err(format!(
+                    "exec refused: --shell-user {name} is not supported on this platform"
+                ));
+            }
+            Ok(ExecUserContext {
+                name: String::new(),
+                home: Self::home_dir(),
+                shell: None,
+                uid: None,
+            })
         }
     }
 
@@ -2699,10 +2829,34 @@ mod tests {
     #[test]
     fn exec_as_user_argv_drops_through_runuser_on_unix() {
         let argv = Paths::exec_as_user_argv("/usr/bin/id", &["-un".into()], Some("nobody")).unwrap();
-        assert_eq!(argv, vec!["runuser", "-u", "nobody", "--", "/usr/bin/id", "-un"]);
+        assert_eq!(
+            argv,
+            vec![
+                "runuser",
+                "-p",
+                "-u",
+                "nobody",
+                "--",
+                "/usr/bin/id",
+                "-un"
+            ]
+        );
         // Same tool as the PTY drop: one mechanism, not two.
         let (pty, _) = Paths::shell_argv(Some("bash"), None, Some("nobody"));
         assert_eq!(pty[0], argv[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_user_context_uses_passwd_and_refuses_unknown_targets() {
+        let daemon = Paths::exec_user_context(None).expect("daemon account resolves");
+        assert!(!daemon.name.is_empty());
+        assert!(daemon.home.is_absolute(), "{:?}", daemon.home);
+
+        let err = Paths::exec_user_context(Some("tunlion-no-such-account-570"))
+            .expect_err("an unknown target must fail closed");
+        assert!(err.contains("not a resolvable local account"), "{err}");
+        assert!(err.contains("--shell-user"), "{err}");
     }
 
     #[cfg(not(unix))]
@@ -2710,6 +2864,15 @@ mod tests {
     fn exec_as_user_argv_refuses_where_no_drop_exists() {
         let err = Paths::exec_as_user_argv("cmd", &[], Some("nobody")).unwrap_err();
         assert!(err.contains("--shell-user"), "{err}");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn exec_user_context_never_copies_the_daemon_profile_to_a_target() {
+        let err = Paths::exec_user_context(Some("nobody"))
+            .expect_err("a target account has no token environment here");
+        assert!(err.contains("--shell-user nobody"), "{err}");
+        assert!(err.contains("daemon's profile"), "{err}");
     }
 
     #[test]

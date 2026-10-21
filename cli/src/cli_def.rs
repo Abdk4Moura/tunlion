@@ -848,11 +848,11 @@ pub(crate) enum Cmd {
         /// Allocate a pty instead of pipes (refused loudly until supported)
         #[arg(long)]
         tty: bool,
-        /// Working directory on the remote (default: the daemon's home)
+        /// Working directory on the remote (default: the account's home)
         #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,
-        /// Extra environment as KEY=VALUE (repeatable; TERM/LANG/LC_* and
-        /// Windows platform essentials pass anyway)
+        /// Extra environment as KEY=VALUE (repeatable; account/platform
+        /// essentials already pass, but secret/session variables do not)
         #[arg(long, value_name = "KEY=VALUE")]
         env: Vec<String>,
         /// The command and its arguments, passed exactly (trailing)

@@ -34,7 +34,9 @@ use crate::l2::mux::{ExecCtl, TreeSignal};
 use crate::recv::dispatch::{park_on_deny, ParkKind, ParkedOpen};
 use crate::refusal::{expired_at_from_reason, Code, Refusal};
 use crate::shell::admit::{admit_exec_open, ShellAdmission, ShellAdmissionConfig};
-use crate::shell::exec::{alive_deadline, ExecChild, ExecOpen, ExecProcess, ExecSpawnSpec};
+use crate::shell::exec::{
+    alive_deadline, ExecChild, ExecOpen, ExecProcess, ExecSpawnSpec, ExecUserContext,
+};
 use crate::shell_gate::ShellPolicy;
 use filament_cap::capability::CAP_SHELL;
 use filament_transport::net::Transport;
@@ -96,17 +98,16 @@ fn exec_spawn_plan(
     })
 }
 
-/// Starting directory when the initiator names none: the daemon user's home,
-/// or for a dropped exec the target account's home (what its login shell
-/// would get), falling back to `/` when that account has no usable home.
-fn default_exec_cwd(process: &dyn ExecProcess, run_as: Option<&str>) -> PathBuf {
-    match run_as {
-        None => process.home_dir(),
-        Some(user) => process
-            .home_of_user(user)
-            .filter(|h| h.is_dir())
-            .unwrap_or_else(|| PathBuf::from("/")),
-    }
+/// Starting directory when the initiator names none: the account's home, or
+/// `/` when a dropped account has no usable home (the same fallback a login
+/// shell documents for an account whose passwd home is missing). `HOME` still
+/// names the account's passwd home, so the exception is named here rather than
+/// silently substituting the daemon's identity.
+fn default_exec_cwd(user: &ExecUserContext) -> PathBuf {
+    user.home
+        .is_dir()
+        .then(|| user.home.clone())
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// The non-secret Windows variables that make a child a normal Windows
@@ -117,17 +118,25 @@ fn default_exec_cwd(process: &dyn ExecProcess, run_as: Option<&str>) -> PathBuf 
 /// `SystemRoot`/`WINDIR`/`SYSTEMDRIVE` are what Win32 itself assumes: the
 /// loader, side-by-side resolution, registry views, and the system DLLs and
 /// RNG providers Windows and Node reach for. A child without them is not a
-/// normal Windows process; the reported failure was Node's `ncrypto::CSPRNG`
-/// abort, and handing over the full environment was the workaround this
-/// baseline replaces.
+/// normal Windows process; the reported failures were Node's `ncrypto::CSPRNG`
+/// abort and WSL refusing to launch, and handing over the full environment was
+/// the workaround this baseline replaces.
 /// `PATH`/`PATHEXT`/`COMSPEC` are how the child and the shells or Node
 /// process-spawn paths it starts find programs (`cmd.exe` included).
 /// `TEMP`/`TMP` are `GetTempPath` and the staging npm, node-gyp and ordinary
 /// tools do. The profile and program roots are where Node, npm and
 /// toolchains look for config, caches, global prefixes and installed tools.
+/// `PSModulePath`, the account name/domain and the processor identity are the
+/// same kind of non-secret machine fact and are routinely read by toolchains.
+///
+/// This list is only ever used for the daemon's own account on Windows:
+/// `--shell-user` is refused there because running as another account needs
+/// its token/credentials. If that changes, the target's environment must come
+/// from `CreateEnvironmentBlock` on the target token (then be filtered through
+/// this list), never from the daemon's `USERPROFILE`/`APPDATA`/`HOMEDRIVE`.
 /// Deliberately absent: proxy settings, credentials/tokens, `NODE_OPTIONS`,
-/// and every other variable that can carry a secret or change how a command
-/// resolves.
+/// `SSH_AUTH_SOCK`, session-bus addresses, and every other variable that can
+/// carry a secret or change how a command resolves.
 const WINDOWS_PLATFORM_ENV: &[&str] = &[
     "SystemRoot",
     "WINDIR",
@@ -147,7 +156,35 @@ const WINDOWS_PLATFORM_ENV: &[&str] = &[
     "PROGRAMFILES(X86)",
     "COMMONPROGRAMFILES",
     "COMMONPROGRAMFILES(X86)",
+    "PSModulePath",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "PROCESSOR_ARCHITECTURE",
 ];
+
+/// The Unix half of the same policy. Identity values are replaced from the
+/// resolved account (passwd for `--shell-user`, the daemon's own login facts
+/// otherwise); `PATH` remains the daemon's search path because argv[0] was
+/// already resolved against it and a login-shell PATH would require re-running
+/// a shell. `TMPDIR` and XDG roots are target-home based for a dropped account.
+const UNIX_PLATFORM_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PATH",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+];
+
+/// The Unix default when the daemon has no usable PATH. It is the conventional
+/// system path, not a copy of any account's private bin directories.
+const UNIX_DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Environment names are case-insensitive on Windows and case-sensitive
 /// everywhere else. Keeping the rule explicit makes both behaviours testable
@@ -160,18 +197,24 @@ fn env_names_equal(a: &str, b: &str, windows: bool) -> bool {
     }
 }
 
-/// The always-forwarded names: `TERM`, `LANG`, `LC_*` (plus, on Windows, the
-/// platform baseline above). These are inherited from the daemon and are not
-/// a channel for the initiator's environment.
+/// `TERM`, `LANG` and `LC_*` are locale/terminal facts, not credentials, and
+/// pass through from the daemon on every platform. Everything else comes from
+/// the platform allowlists above.
 fn env_name_is_allowed(k: &str, windows: bool) -> bool {
-    if windows {
-        k.eq_ignore_ascii_case("TERM")
-            || k.eq_ignore_ascii_case("LANG")
-            || k.get(..3)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LC_"))
+    let names = if windows {
+        WINDOWS_PLATFORM_ENV
     } else {
-        k == "TERM" || k == "LANG" || k.starts_with("LC_")
-    }
+        UNIX_PLATFORM_ENV
+    };
+    names.iter().any(|name| env_names_equal(name, k, windows))
+        || if windows {
+            k.eq_ignore_ascii_case("TERM")
+                || k.eq_ignore_ascii_case("LANG")
+                || k.get(..3)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LC_"))
+        } else {
+            k == "TERM" || k == "LANG" || k.starts_with("LC_")
+        }
 }
 
 /// Set one pair, replacing an existing name (case-insensitively on Windows) so
@@ -188,17 +231,62 @@ fn set_env(out: &mut Vec<(String, String)>, k: &str, v: &str, windows: bool) {
     }
 }
 
-/// Build the child's environment: env_clear PLUS the allowlist. `TERM`, `LANG`
-/// and `LC_*` pass through from the daemon on every platform; Windows also
-/// receives its fixed, non-secret platform baseline. Explicit `--env` pairs are
-/// layered on top and win on collision (case-insensitively on Windows).
-/// Everything else -- notably secrets, tokens, and proxy config -- stays on the
-/// daemon side of the link.
+fn remove_env(out: &mut Vec<(String, String)>, k: &str, windows: bool) {
+    out.retain(|(existing, _)| !env_names_equal(existing, k, windows));
+}
+
+fn has_env(out: &[(String, String)], k: &str, windows: bool) -> bool {
+    out.iter()
+        .any(|(existing, _)| env_names_equal(existing, k, windows))
+}
+
+fn ensure_env(out: &mut Vec<(String, String)>, k: &str, v: &str, windows: bool) {
+    if !has_env(out, k, windows) {
+        out.push((k.to_string(), v.to_string()));
+    }
+}
+
+/// Split a `C:\Users\name` home into `(C:, \Users\name)` for the legacy
+/// HOMEDRIVE/HOMEPATH pair Windows tools still read. UNC and drive-relative
+/// homes are left alone: inventing a drive for them would be worse than
+/// omitting the pair.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_home_parts(home: &Path) -> Option<(String, String)> {
+    let text = home.to_str()?;
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let rest = &text[2..];
+    if !rest.starts_with('\\') {
+        return None;
+    }
+    let rest = if rest.is_empty() { "\\" } else { rest };
+    Some((text[..2].to_string(), rest.to_string()))
+}
+
+/// Build the child's environment: `env_clear` PLUS a user-like baseline.
+/// Explicit `--env` pairs are layered on top and win on collision
+/// (case-insensitively on Windows). `dropped` means `--shell-user`; on Unix
+/// the identity and XDG values come from the passwd record for that account,
+/// never from the daemon's environment. On Windows a dropped child is refused:
+/// without the target token there is no safe way to derive its profile, and
+/// copying the daemon's profile is exactly the identity leak this policy
+/// forbids.
 fn build_env_for(
     daemon: Vec<(String, String)>,
     explicit: &[(String, String)],
     windows: bool,
-) -> Vec<(String, String)> {
+    user: &ExecUserContext,
+    dropped: bool,
+) -> Result<Vec<(String, String)>, String> {
+    if windows && dropped {
+        return Err(format!(
+            "exec refused: --shell-user {} needs the target account's token environment; refusing to copy the daemon's Windows profile",
+            user.name
+        ));
+    }
+
     let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in daemon {
         if windows {
@@ -215,17 +303,102 @@ fn build_env_for(
             out.push((k, v));
         }
     }
+
+    if windows {
+        // Same account only (the target case returned above). Fill gaps from
+        // the resolved daemon account, never synthesize a different profile.
+        if !user.name.is_empty() {
+            ensure_env(&mut out, "USERNAME", &user.name, true);
+        }
+        if user.home.is_absolute() {
+            ensure_env(&mut out, "USERPROFILE", &user.home.to_string_lossy(), true);
+            if let Some((drive, path)) = windows_home_parts(&user.home) {
+                ensure_env(&mut out, "HOMEDRIVE", &drive, true);
+                ensure_env(&mut out, "HOMEPATH", &path, true);
+            }
+            ensure_env(
+                &mut out,
+                "APPDATA",
+                &user.home.join("AppData").join("Roaming").to_string_lossy(),
+                true,
+            );
+            ensure_env(
+                &mut out,
+                "LOCALAPPDATA",
+                &user.home.join("AppData").join("Local").to_string_lossy(),
+                true,
+            );
+        }
+    } else {
+        // Identity always names the account the child actually runs as. For
+        // the daemon user this is the same login fact the host resolved for
+        // the default cwd; for --shell-user it is the passwd record, not the
+        // daemon's HOME/USER/SHELL.
+        set_env(&mut out, "HOME", &user.home.to_string_lossy(), false);
+        set_env(&mut out, "USER", &user.name, false);
+        set_env(&mut out, "LOGNAME", &user.name, false);
+        set_env(
+            &mut out,
+            "SHELL",
+            user.shell.as_deref().unwrap_or("/bin/sh"),
+            false,
+        );
+        ensure_env(&mut out, "PATH", UNIX_DEFAULT_PATH, false);
+
+        let home = user.home.as_path();
+        if dropped {
+            // A target account must not inherit the daemon's private temp or
+            // session XDG roots. /tmp is the shared, documented fallback.
+            remove_env(&mut out, "TMPDIR", false);
+            set_env(&mut out, "TMPDIR", "/tmp", false);
+            for (name, suffix) in [
+                ("XDG_CONFIG_HOME", ".config"),
+                ("XDG_CACHE_HOME", ".cache"),
+                ("XDG_DATA_HOME", ".local/share"),
+                ("XDG_STATE_HOME", ".local/state"),
+            ] {
+                remove_env(&mut out, name, false);
+                set_env(&mut out, name, &home.join(suffix).to_string_lossy(), false);
+            }
+            remove_env(&mut out, "XDG_RUNTIME_DIR", false);
+            if let Some(uid) = user.uid {
+                let runtime = PathBuf::from(format!("/run/user/{uid}"));
+                if runtime.is_dir() {
+                    set_env(
+                        &mut out,
+                        "XDG_RUNTIME_DIR",
+                        &runtime.to_string_lossy(),
+                        false,
+                    );
+                }
+            }
+        } else {
+            ensure_env(&mut out, "TMPDIR", "/tmp", false);
+            for (name, suffix) in [
+                ("XDG_CONFIG_HOME", ".config"),
+                ("XDG_CACHE_HOME", ".cache"),
+                ("XDG_DATA_HOME", ".local/share"),
+                ("XDG_STATE_HOME", ".local/state"),
+            ] {
+                let default = home.join(suffix);
+                ensure_env(&mut out, name, &default.to_string_lossy(), false);
+            }
+        }
+    }
+
     for (k, v) in explicit {
         set_env(&mut out, k, v, windows);
     }
-    out
+    Ok(out)
 }
 
 fn build_env(
     daemon: Vec<(String, String)>,
     explicit: &[(String, String)],
-) -> Vec<(String, String)> {
-    build_env_for(daemon, explicit, cfg!(windows))
+    user: &ExecUserContext,
+    dropped: bool,
+) -> Result<Vec<(String, String)>, String> {
+    build_env_for(daemon, explicit, cfg!(windows), user, dropped)
 }
 
 async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> anyhow::Result<()> {
@@ -409,10 +582,18 @@ pub async fn serve_exec(
             return;
         }
     };
-    let cwd = req
-        .cwd
-        .clone()
-        .unwrap_or_else(|| default_exec_cwd(process.as_ref(), plan.run_as.as_deref()));
+    let dropped = plan.run_as.is_some();
+    let user = match process.user_context(plan.run_as.as_deref()) {
+        Ok(user) => user,
+        Err(reason) => {
+            log.say(&format!("l2: {reason}"));
+            let _ = t
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
+                .await;
+            return;
+        }
+    };
+    let cwd = req.cwd.clone().unwrap_or_else(|| default_exec_cwd(&user));
     if !cwd.is_dir() {
         // Fail closed: a requested directory that does not exist refuses
         // rather than silently running somewhere else.
@@ -421,7 +602,16 @@ pub async fn serve_exec(
             .await;
         return;
     }
-    let env = build_env(process.daemon_environment(), &req.env);
+    let env = match build_env(process.daemon_environment(), &req.env, &user, dropped) {
+        Ok(env) => env,
+        Err(reason) => {
+            log.say(&format!("l2: {reason}"));
+            let _ = t
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
+                .await;
+            return;
+        }
+    };
     let spec = ExecSpawnSpec {
         program: plan.program,
         args: plan.args,
@@ -1127,7 +1317,8 @@ mod tests {
     struct FakeProcess {
         program: Option<PathBuf>,
         daemon_env: Vec<(String, String)>,
-        home: PathBuf,
+        context: ExecUserContext,
+        target_context: Result<ExecUserContext, String>,
         user_drop: Result<Vec<String>, String>,
         child: Mutex<Option<FakeChild>>,
         spawned: Mutex<Option<ExecSpawnSpec>>,
@@ -1135,6 +1326,7 @@ mod tests {
 
     impl FakeProcess {
         fn new(child: FakeChild) -> Self {
+            let home = std::env::temp_dir();
             Self {
                 program: Some(PathBuf::from("/bin/echo")),
                 daemon_env: vec![
@@ -1142,7 +1334,18 @@ mod tests {
                     ("LC_ALL".into(), "C".into()),
                     ("SECRET".into(), "nope".into()),
                 ],
-                home: std::env::temp_dir(),
+                context: ExecUserContext {
+                    name: "daemon".into(),
+                    home: home.clone(),
+                    shell: Some("/bin/sh".into()),
+                    uid: Some(1000),
+                },
+                target_context: Ok(ExecUserContext {
+                    name: "target".into(),
+                    home,
+                    shell: Some("/bin/sh".into()),
+                    uid: Some(1001),
+                }),
                 user_drop: Err("no drop here".into()),
                 child: Mutex::new(Some(child)),
                 spawned: Mutex::new(None),
@@ -1160,11 +1363,11 @@ mod tests {
         fn daemon_environment(&self) -> Vec<(String, String)> {
             self.daemon_env.clone()
         }
-        fn home_dir(&self) -> PathBuf {
-            self.home.clone()
-        }
-        fn home_of_user(&self, _user: &str) -> Option<PathBuf> {
-            Some(self.home.clone())
+        fn user_context(&self, user: Option<&str>) -> Result<ExecUserContext, String> {
+            match user {
+                None => Ok(self.context.clone()),
+                Some(_) => self.target_context.clone(),
+            }
         }
         fn user_drop_argv(
             &self,
@@ -1208,6 +1411,15 @@ mod tests {
         t: Arc<FakeTransport>,
         req: ExecOpen,
     ) -> Result<(), tokio::time::error::Elapsed> {
+        serve_with_user(process, t, req, None).await
+    }
+
+    async fn serve_with_user(
+        process: Arc<FakeProcess>,
+        t: Arc<FakeTransport>,
+        req: ExecOpen,
+        shell_user: Option<&str>,
+    ) -> Result<(), tokio::time::error::Elapsed> {
         let mux = l2::Mux::new(t.clone(), host());
         let (_stdin_tx, stdin_rx) = mpsc::channel(1);
         let (_ctl_tx, ctl_rx) = mpsc::channel(1);
@@ -1226,7 +1438,7 @@ mod tests {
                     policy_allows: true,
                     admitted_via_ceiling: false,
                 },
-                None,
+                shell_user.map(str::to_string),
                 process,
                 host(),
                 Arc::new(VecLog::new()),
@@ -1258,13 +1470,17 @@ mod tests {
         );
         assert_eq!(spec.cwd, std::env::temp_dir());
         assert_eq!(
-            spec.env,
-            vec![
-                ("TERM".into(), "explicit".into()),
-                ("LC_ALL".into(), "C".into()),
-                ("FOO".into(), "bar".into()),
-            ],
-            "allowlist only, explicit wins, secrets dropped"
+            env_value(&spec.env, "TERM"),
+            Some("explicit"),
+            "explicit wins over the daemon's TERM"
+        );
+        assert_eq!(env_name_count(&spec.env, "TERM"), 1);
+        assert_eq!(env_value(&spec.env, "LC_ALL"), Some("C"));
+        assert_eq!(env_value(&spec.env, "FOO"), Some("bar"));
+        assert_eq!(
+            env_value(&spec.env, "SECRET"),
+            None,
+            "secrets stay on the daemon side"
         );
 
         let controls = t.controls();
@@ -1305,6 +1521,7 @@ mod tests {
         let daemon = vec![
             ("SystemRoot".into(), r"C:\Windows".into()),
             ("windir".into(), r"C:\Windows".into()),
+            ("SYSTEMDRIVE".into(), "C:".into()),
             (
                 "Path".into(),
                 r"C:\Windows\System32;C:\Program Files\nodejs".into(),
@@ -1314,19 +1531,45 @@ mod tests {
             ("TEMP".into(), r"C:\Users\me\AppData\Local\Temp".into()),
             ("TMP".into(), r"C:\Users\me\AppData\Local\Temp".into()),
             ("USERPROFILE".into(), r"C:\Users\me".into()),
+            ("HOMEDRIVE".into(), "C:".into()),
+            ("HOMEPATH".into(), r"\Users\me".into()),
             ("APPDATA".into(), r"C:\Users\me\AppData\Roaming".into()),
             ("LOCALAPPDATA".into(), r"C:\Users\me\AppData\Local".into()),
+            ("PROGRAMDATA".into(), r"C:\ProgramData".into()),
+            ("PROGRAMFILES".into(), r"C:\Program Files".into()),
+            ("PROGRAMFILES(X86)".into(), r"C:\Program Files (x86)".into()),
+            (
+                "PSModulePath".into(),
+                r"C:\Users\me\Documents\PowerShell\Modules;C:\Program Files\PowerShell\Modules"
+                    .into(),
+            ),
+            ("USERNAME".into(), "me".into()),
+            ("USERDOMAIN".into(), "CORP".into()),
+            ("COMPUTERNAME".into(), "BOX".into()),
+            ("PROCESSOR_ARCHITECTURE".into(), "AMD64".into()),
             ("TERM".into(), "xterm".into()),
             ("lc_all".into(), "C".into()),
             ("HTTP_PROXY".into(), "http://proxy.example".into()),
             ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
             ("NODE_OPTIONS".into(), "--require ./hook.js".into()),
+            ("SSH_AUTH_SOCK".into(), r"\\.\pipe\ssh".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            ),
         ];
+        let user = ExecUserContext {
+            name: "me".into(),
+            home: PathBuf::from(r"C:\Users\me"),
+            shell: None,
+            uid: None,
+        };
 
-        let env = build_env_for(daemon, &[], true);
+        let env = build_env_for(daemon, &[], true, &user, false).expect("windows env");
 
         assert_eq!(env_value(&env, "SystemRoot"), Some(r"C:\Windows"));
         assert_eq!(env_value(&env, "WINDIR"), Some(r"C:\Windows"));
+        assert_eq!(env_value(&env, "SYSTEMDRIVE"), Some("C:"));
         assert_eq!(
             env_value(&env, "PATH"),
             Some(r"C:\Windows\System32;C:\Program Files\nodejs")
@@ -1345,12 +1588,42 @@ mod tests {
             Some(r"C:\Users\me\AppData\Local\Temp")
         );
         assert_eq!(env_value(&env, "USERPROFILE"), Some(r"C:\Users\me"));
+        assert_eq!(env_value(&env, "HOMEDRIVE"), Some("C:"));
+        assert_eq!(env_value(&env, "HOMEPATH"), Some(r"\Users\me"));
+        assert_eq!(
+            env_value(&env, "APPDATA"),
+            Some(r"C:\Users\me\AppData\Roaming")
+        );
+        assert_eq!(
+            env_value(&env, "LOCALAPPDATA"),
+            Some(r"C:\Users\me\AppData\Local")
+        );
+        assert_eq!(env_value(&env, "PROGRAMDATA"), Some(r"C:\ProgramData"));
+        assert_eq!(env_value(&env, "PROGRAMFILES"), Some(r"C:\Program Files"));
+        assert_eq!(
+            env_value(&env, "PROGRAMFILES(X86)"),
+            Some(r"C:\Program Files (x86)")
+        );
+        assert_eq!(
+            env_value(&env, "PSMODULEPATH"),
+            Some(r"C:\Users\me\Documents\PowerShell\Modules;C:\Program Files\PowerShell\Modules")
+        );
+        assert_eq!(env_value(&env, "USERNAME"), Some("me"));
+        assert_eq!(env_value(&env, "USERDOMAIN"), Some("CORP"));
+        assert_eq!(env_value(&env, "COMPUTERNAME"), Some("BOX"));
+        assert_eq!(env_value(&env, "PROCESSOR_ARCHITECTURE"), Some("AMD64"));
         assert_eq!(env_value(&env, "TERM"), Some("xterm"));
         assert_eq!(env_value(&env, "LC_ALL"), Some("C"));
         assert_eq!(env_name_count(&env, "PATH"), 1, "no case-duplicate PATH");
         assert_eq!(env_name_count(&env, "SystemRoot"), 1);
 
-        for secret in ["HTTP_PROXY", "AWS_SECRET_ACCESS_KEY", "NODE_OPTIONS"] {
+        for secret in [
+            "HTTP_PROXY",
+            "AWS_SECRET_ACCESS_KEY",
+            "NODE_OPTIONS",
+            "SSH_AUTH_SOCK",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
             assert_eq!(
                 env_value(&env, secret),
                 None,
@@ -1372,8 +1645,14 @@ mod tests {
             ("term".into(), "screen".into()),
             ("FOO".into(), "bar".into()),
         ];
+        let user = ExecUserContext {
+            name: "me".into(),
+            home: PathBuf::from(r"C:\Users\me"),
+            shell: None,
+            uid: None,
+        };
 
-        let env = build_env_for(daemon, &explicit, true);
+        let env = build_env_for(daemon, &explicit, true, &user, false).expect("windows env");
 
         assert_eq!(env_value(&env, "SystemRoot"), Some(r"D:\Win"));
         assert_eq!(env_name_count(&env, "SystemRoot"), 1);
@@ -1385,29 +1664,176 @@ mod tests {
     }
 
     #[test]
+    fn windows_target_user_env_is_refused_not_copied_from_the_daemon() {
+        let target = ExecUserContext {
+            name: "guest".into(),
+            home: PathBuf::from(r"D:\Users\guest"),
+            shell: None,
+            uid: None,
+        };
+        let err = build_env_for(
+            vec![
+                ("USERPROFILE".into(), r"C:\Users\owner".into()),
+                ("APPDATA".into(), r"C:\Users\owner\AppData\Roaming".into()),
+            ],
+            &[],
+            true,
+            &target,
+            true,
+        )
+        .expect_err("a Windows target account needs its own token environment");
+        assert!(err.contains("--shell-user guest"), "{err}");
+        assert!(err.contains("token environment"), "{err}");
+    }
+
+    #[test]
+    fn unix_target_user_env_uses_passwd_identity_not_the_daemon_profile() {
+        let daemon = vec![
+            ("HOME".into(), "/home/daemon".into()),
+            ("USER".into(), "daemon".into()),
+            ("LOGNAME".into(), "daemon".into()),
+            ("SHELL".into(), "/bin/daemon-shell".into()),
+            ("PATH".into(), "/daemon/bin:/usr/bin".into()),
+            ("TMPDIR".into(), "/home/daemon/tmp".into()),
+            ("XDG_CONFIG_HOME".into(), "/home/daemon/.config".into()),
+            ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+            ("TERM".into(), "xterm".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("SSH_AUTH_SOCK".into(), "/tmp/daemon-agent.sock".into()),
+            ("NODE_OPTIONS".into(), "--require ./hook.js".into()),
+            ("HTTP_PROXY".into(), "http://proxy.example".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            ),
+            ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
+        ];
+        let target = ExecUserContext {
+            name: "guest".into(),
+            home: PathBuf::from("/home/guest"),
+            shell: Some("/bin/zsh".into()),
+            uid: Some(1001),
+        };
+
+        let env = build_env_for(daemon, &[], false, &target, true).expect("unix env");
+
+        assert_eq!(env_value(&env, "HOME"), Some("/home/guest"));
+        assert_eq!(env_value(&env, "USER"), Some("guest"));
+        assert_eq!(env_value(&env, "LOGNAME"), Some("guest"));
+        assert_eq!(env_value(&env, "SHELL"), Some("/bin/zsh"));
+        assert_eq!(env_value(&env, "PATH"), Some("/daemon/bin:/usr/bin"));
+        assert_eq!(env_value(&env, "TERM"), Some("xterm"));
+        assert_eq!(env_value(&env, "LANG"), Some("en_US.UTF-8"));
+        assert_eq!(env_value(&env, "TMPDIR"), Some("/tmp"));
+        assert_eq!(
+            env_value(&env, "XDG_CONFIG_HOME"),
+            Some("/home/guest/.config")
+        );
+        assert_eq!(
+            env_value(&env, "XDG_CACHE_HOME"),
+            Some("/home/guest/.cache")
+        );
+        assert_eq!(
+            env_value(&env, "XDG_DATA_HOME"),
+            Some("/home/guest/.local/share")
+        );
+        assert_eq!(
+            env_value(&env, "XDG_STATE_HOME"),
+            Some("/home/guest/.local/state")
+        );
+        assert_ne!(
+            env_value(&env, "XDG_RUNTIME_DIR"),
+            Some("/run/user/1000"),
+            "the daemon session's runtime dir must not follow the target account"
+        );
+
+        for secret in [
+            "SSH_AUTH_SOCK",
+            "NODE_OPTIONS",
+            "HTTP_PROXY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert_eq!(
+                env_value(&env, secret),
+                None,
+                "{secret} must not cross to the child"
+            );
+        }
+    }
+
+    #[test]
     fn unix_env_stays_case_sensitive_and_has_no_windows_baseline() {
         let daemon = vec![
             ("TERM".into(), "xterm".into()),
             ("LANG".into(), "en_US.UTF-8".into()),
             ("Path".into(), r"C:\daemon\bin".into()),
             ("SystemRoot".into(), r"C:\Windows".into()),
+            ("SSH_AUTH_SOCK".into(), "/tmp/agent".into()),
         ];
         let explicit = vec![
             ("term".into(), "screen".into()),
             ("Path".into(), r"C:\explicit\bin".into()),
+            ("HOME".into(), "/explicit/home".into()),
         ];
+        let user = ExecUserContext {
+            name: "me".into(),
+            home: PathBuf::from("/home/me"),
+            shell: Some("/bin/bash".into()),
+            uid: Some(1000),
+        };
 
-        let env = build_env_for(daemon, &explicit, false);
+        let env = build_env_for(daemon, &explicit, false, &user, false).expect("unix env");
 
+        assert_eq!(env_value(&env, "TERM"), Some("xterm"));
+        assert_eq!(env_value(&env, "term"), Some("screen"));
+        assert_eq!(env_value(&env, "Path"), Some(r"C:\explicit\bin"));
+        assert_eq!(env_value(&env, "HOME"), Some("/explicit/home"));
+        assert_eq!(env_value(&env, "USER"), Some("me"));
+        assert_eq!(env_value(&env, "SHELL"), Some("/bin/bash"));
+        assert_eq!(env_value(&env, "SystemRoot"), None);
+        assert_eq!(env_value(&env, "SSH_AUTH_SOCK"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_child_sees_resolved_home_user_shell_and_cwd() {
+        let home = std::env::temp_dir().join(format!(
+            "tunlion-exec-child-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&home).expect("create test home");
+        let user = ExecUserContext {
+            name: "tunlion-exec-user".into(),
+            home: home.clone(),
+            shell: Some("/bin/sh".into()),
+            uid: Some(4242),
+        };
+        let env = build_env_for(Vec::new(), &[], false, &user, true).expect("unix env");
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"printf '%s|%s|%s|%s|%s' "$HOME" "$USER" "$LOGNAME" "$SHELL" "$PWD""#)
+            .current_dir(&home)
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .output()
+            .expect("spawn /bin/sh");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(
+            output.status.success(),
+            "sh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(
-            env,
-            vec![
-                ("TERM".into(), "xterm".into()),
-                ("LANG".into(), "en_US.UTF-8".into()),
-                ("term".into(), "screen".into()),
-                ("Path".into(), r"C:\explicit\bin".into()),
-            ],
-            "Windows baseline is not injected, and case-different names do not collide"
+            String::from_utf8_lossy(&output.stdout),
+            format!(
+                "{}|tunlion-exec-user|tunlion-exec-user|/bin/sh|{}",
+                home.display(),
+                home.display()
+            )
         );
     }
 
@@ -1423,15 +1849,32 @@ mod tests {
             .find(|candidate| candidate.is_file())
     }
 
+    #[cfg(windows)]
+    fn windows_current_user() -> ExecUserContext {
+        ExecUserContext {
+            name: std::env::var("USERNAME").unwrap_or_default(),
+            home: std::env::var("USERPROFILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir()),
+            shell: None,
+            uid: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_filtered_env() -> Vec<(String, String)> {
+        let daemon: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        build_env_for(daemon, &[], true, &windows_current_user(), false).expect("windows env")
+    }
+
     /// Acceptance on a real Windows child: the filtered environment must let
     /// Node's CSPRNG work and let Node resolve `node` again through PATH.
     #[cfg(windows)]
     #[test]
     fn windows_child_prng_and_nested_node_run_with_the_filtered_env() {
-        let daemon: Vec<(String, String)> = std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .collect();
-        let env = build_env_for(daemon, &[], true);
+        let env = windows_filtered_env();
         assert!(
             env_value(&env, "SystemRoot").is_some(),
             "the daemon's own SystemRoot is the source of the baseline"
@@ -1465,10 +1908,47 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
     }
 
+    /// A WSL-style launch: `wsl.exe` is a Windows child that needs the same
+    /// baseline. `--help` does not require an installed distribution, so this
+    /// proves the executable starts without turning a missing distro into a
+    /// skip.
+    #[cfg(windows)]
+    #[test]
+    fn windows_wsl_executable_starts_with_the_filtered_env() {
+        let env = windows_filtered_env();
+        let system_root =
+            env_value(&env, "SystemRoot").expect("SystemRoot is in the filtered baseline");
+        let wsl = std::path::Path::new(system_root)
+            .join("System32")
+            .join("wsl.exe");
+        assert!(
+            wsl.is_file(),
+            "{} is missing from the Windows image",
+            wsl.display()
+        );
+
+        let mut command = std::process::Command::new(&wsl);
+        command
+            .arg("--help")
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .output()
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", wsl.display()));
+        assert!(
+            output.status.success(),
+            "wsl.exe failed with the filtered env ({}): stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(windows)]
     const NODE_ACCEPTANCE: &str = r#"
 const crypto = require('crypto');
-const missing = ['SystemRoot', 'WINDIR', 'PATH', 'PATHEXT', 'TEMP', 'TMP']
+const missing = ['SystemRoot', 'WINDIR', 'PATH', 'PATHEXT', 'COMSPEC', 'TEMP', 'TMP', 'USERPROFILE', 'USERNAME']
   .filter((name) => !process.env[name]);
 if (missing.length) {
   console.error('missing baseline: ' + missing.join(','));
@@ -1477,10 +1957,15 @@ if (missing.length) {
 crypto.randomBytes(32);
 crypto.getRandomValues(new Uint8Array(16));
 const { execFileSync } = require('child_process');
+const cmdRoot = execFileSync(process.env.COMSPEC, ['/C', 'echo %SystemRoot%'], { encoding: 'utf8' }).trim();
+if (cmdRoot.toLowerCase() !== process.env.SystemRoot.toLowerCase()) {
+  console.error('cmd.exe saw SystemRoot=' + JSON.stringify(cmdRoot));
+  process.exit(3);
+}
 const nested = execFileSync('node', ['-e', 'process.stdout.write("nested-ok")'], { encoding: 'utf8' });
 if (nested !== 'nested-ok') {
   console.error('nested node output: ' + JSON.stringify(nested));
-  process.exit(3);
+  process.exit(4);
 }
 process.stdout.write('ok\n');
 "#;
@@ -1557,6 +2042,94 @@ process.stdout.write('ok\n');
         assert_eq!(t.controls()[0]["err"], "cwd does not exist");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_user_env_and_cwd_come_from_the_target_not_the_daemon() {
+        let mut process = FakeProcess::new(FakeChild::new(
+            b"",
+            b"",
+            ExecExit {
+                code: Some(0),
+                signal: None,
+            },
+        ));
+        process.daemon_env = vec![
+            ("HOME".into(), "/home/daemon".into()),
+            ("USER".into(), "daemon".into()),
+            ("LOGNAME".into(), "daemon".into()),
+            ("SHELL".into(), "/bin/daemon-shell".into()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("SECRET".into(), "nope".into()),
+        ];
+        process.user_drop = Ok(vec![
+            "/usr/sbin/runuser".into(),
+            "-p".into(),
+            "-u".into(),
+            "guest".into(),
+            "--".into(),
+        ]);
+        process.program = Some(PathBuf::from("/usr/sbin/runuser"));
+        let target_home = std::env::temp_dir();
+        process.target_context = Ok(ExecUserContext {
+            name: "guest".into(),
+            home: target_home.clone(),
+            shell: Some("/bin/zsh".into()),
+            uid: Some(1001),
+        });
+        let mut req = request();
+        req.cwd = None;
+
+        let t = Arc::new(FakeTransport::default());
+        serve_with_user(process.clone(), t.clone(), req, Some("guest"))
+            .await
+            .expect("serve finishes");
+
+        let spec = process.spawned().expect("spawn happened");
+        assert_eq!(spec.cwd, target_home, "default cwd is the target home");
+        assert_eq!(env_value(&spec.env, "HOME"), target_home.to_str());
+        assert_eq!(env_value(&spec.env, "USER"), Some("guest"));
+        assert_eq!(env_value(&spec.env, "LOGNAME"), Some("guest"));
+        assert_eq!(env_value(&spec.env, "SHELL"), Some("/bin/zsh"));
+        assert_ne!(env_value(&spec.env, "HOME"), Some("/home/daemon"));
+        assert_ne!(env_value(&spec.env, "SHELL"), Some("/bin/daemon-shell"));
+        assert_eq!(env_value(&spec.env, "SECRET"), None);
+    }
+
+    #[tokio::test]
+    async fn unresolved_shell_user_refuses_before_spawn() {
+        let mut process = FakeProcess::new(FakeChild::new(
+            b"",
+            b"",
+            ExecExit {
+                code: Some(0),
+                signal: None,
+            },
+        ));
+        process.user_drop = Ok(vec![
+            "/usr/sbin/runuser".into(),
+            "-p".into(),
+            "-u".into(),
+            "ghost".into(),
+            "--".into(),
+        ]);
+        process.program = Some(PathBuf::from("/usr/sbin/runuser"));
+        process.target_context =
+            Err("exec refused: --shell-user ghost is not a resolvable local account".into());
+        let t = Arc::new(FakeTransport::default());
+        serve_with_user(process.clone(), t.clone(), request(), Some("ghost"))
+            .await
+            .expect("serve finishes");
+
+        assert!(
+            process.spawned().is_none(),
+            "an unknown account must not run"
+        );
+        assert_eq!(
+            t.controls()[0]["err"],
+            "exec refused: --shell-user ghost is not a resolvable local account"
+        );
+    }
+
     #[test]
     fn user_drop_is_all_or_refused_never_silently_dropped() {
         let mut process = FakeProcess::new(FakeChild::new(
@@ -1625,19 +2198,26 @@ process.stdout.write('ok\n');
     }
 
     #[test]
-    fn default_cwd_follows_the_account() {
-        let process = FakeProcess::new(FakeChild::new(
-            b"",
-            b"",
-            ExecExit {
-                code: Some(0),
-                signal: None,
-            },
-        ));
-        assert_eq!(default_exec_cwd(&process, None), std::env::temp_dir());
+    fn default_cwd_uses_the_account_home_and_a_documented_root_fallback() {
+        let home = std::env::temp_dir();
+        let user = ExecUserContext {
+            name: "somebody".into(),
+            home: home.clone(),
+            shell: Some("/bin/sh".into()),
+            uid: Some(1000),
+        };
+        assert_eq!(default_exec_cwd(&user), home);
+
+        let missing = ExecUserContext {
+            name: "nobody".into(),
+            home: PathBuf::from("/definitely/not/here/xyz"),
+            shell: None,
+            uid: None,
+        };
         assert_eq!(
-            default_exec_cwd(&process, Some("nobody")),
-            std::env::temp_dir()
+            default_exec_cwd(&missing),
+            PathBuf::from("/"),
+            "a passwd home that is not a directory falls back to / explicitly"
         );
     }
 

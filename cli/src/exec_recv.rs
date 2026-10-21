@@ -13,7 +13,9 @@
 #[cfg(feature = "exec-server")]
 use filament_peerloop::l2::mux::TreeSignal;
 #[cfg(feature = "exec-server")]
-use filament_peerloop::shell::exec::{ExecChild, ExecExit, ExecProcess, ExecSpawnSpec};
+use filament_peerloop::shell::exec::{
+    ExecChild, ExecExit, ExecProcess, ExecSpawnSpec, ExecUserContext,
+};
 #[cfg(feature = "exec-server")]
 use std::path::Path;
 #[cfg(feature = "exec-server")]
@@ -238,12 +240,8 @@ impl ExecProcess for CliExecProcess {
             .collect()
     }
 
-    fn home_dir(&self) -> PathBuf {
-        crate::platform::Paths::home_dir()
-    }
-
-    fn home_of_user(&self, user: &str) -> Option<PathBuf> {
-        crate::platform::Paths::home_of_user(user)
+    fn user_context(&self, user: Option<&str>) -> Result<ExecUserContext, String> {
+        crate::platform::Paths::exec_user_context(user)
     }
 
     fn user_drop_argv(
