@@ -140,6 +140,12 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const [wheelRoute, setWheelRoute] = useState(SCROLL_HISTORY) // who owns a vertical wheel
   const [toast, setToast] = useState('') // brief copy/paste feedback
   const toastTimer = useRef(0)
+  // Fallback paste sheet: some browsers (notably iOS Safari) reject a
+  // programmatic clipboard read even inside a tap. A real, visible textarea
+  // lets the user use the system Paste menu, then insert the text once.
+  const [pasteOpen, setPasteOpen] = useState(false)
+  const [pasteDraft, setPasteDraft] = useState('')
+  const pasteRef = useRef(null)
   const sessionIdRef = useRef(makeSessionId(instanceId))
   // The hidden xterm textarea is the only editable target the soft keyboard can
   // attach to. A <label for=this-id> lets the browser focus it as the label's
@@ -1120,23 +1126,51 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         text = lines.join('\n').replace(/\n+$/, '')
       } catch (e) {}
     }
+    const scope = term.getSelection() ? 'selection' : 'screen'
     if (!text || !text.length) { showToast('nothing to copy'); return false }
     const ok = await writeClipboard(text)
-    haptic(); showToast(ok ? 'copied' : 'copy blocked')
+    haptic(); showToast(ok ? `copied ${scope}` : 'copy blocked')
     return ok
   }, [writeClipboard, showToast])
 
-  const pasteClipboard = useCallback(async () => {
-    let text = ''
-    try { text = await navigator.clipboard.readText() } catch (e) {
-      showToast('paste blocked: allow clipboard'); return false
-    }
-    if (!text) { showToast('clipboard empty'); return false }
-    write(text) // bracketed-paste-safe: the PTY/app decides how to treat it
+  const insertPaste = useCallback((text) => {
+    if (!text) return false
+    // Normalize line endings so Chromium's textarea (LF) and WebKit's (CR) send
+    // the same bytes for the same paste.
+    write(String(text).replace(/\r\n?/g, '\n')) // the PTY/app decides how to treat it
+    setPasteOpen(false)
+    setPasteDraft('')
     haptic(); showToast('pasted')
     focusTerminal()
     return true
   }, [write, showToast, focusTerminal])
+
+  const pasteClipboard = useCallback(async () => {
+    let text = ''
+    try { text = await navigator.clipboard.readText() } catch (e) {
+      // The browser refused the direct read. Do not dead-end the user: open a
+      // real textarea where the system Paste menu is available.
+      setPasteDraft('')
+      setPasteOpen(true)
+      showToast('paste below')
+      return false
+    }
+    if (!text) {
+      setPasteDraft('')
+      setPasteOpen(true)
+      showToast('paste below')
+      return false
+    }
+    return insertPaste(text)
+  }, [insertPaste, showToast])
+
+  // Focus the fallback field when the sheet opens. This is a visible field, so
+  // a tap (or this focus) is a normal editable target, not a hidden IME trick.
+  useEffect(() => {
+    if (!pasteOpen) return undefined
+    const t = setTimeout(() => { try { pasteRef.current?.focus() } catch (e) {} }, 30)
+    return () => clearTimeout(t)
+  }, [pasteOpen])
 
   // Auto-copy on selection (desktop): mirrors a normal terminal's behavior and
   // gives mobile a no-op-safe path. Wired once per mounted terminal.
@@ -1323,6 +1357,48 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
             border: `1px solid ${T.line}`, boxShadow: '0 2px 10px rgba(0,0,0,.45)',
             whiteSpace: 'nowrap',
           }}>{toast}</div>
+        )}
+        {/* Fallback paste sheet. Direct clipboard reads are frequently blocked
+            on iOS Safari; a visible textarea makes the system Paste menu
+            reachable without pretending the read succeeded. */}
+        {pasteOpen && (
+          <div data-testid="paste-sheet" role="dialog" aria-modal="true" aria-label="Paste into terminal"
+            onKeyDown={(e) => {
+              if (e.key !== 'Escape') return
+              e.stopPropagation()
+              setPasteOpen(false); setPasteDraft('')
+            }}
+            style={{
+              position: 'absolute', inset: 0, zIndex: 8, padding: 14,
+              background: 'rgba(0,0,0,.55)', display: 'grid', placeItems: 'center',
+            }}>
+            <div style={{
+              width: 'min(560px, 100%)', boxSizing: 'border-box', display: 'grid', gap: 10,
+              padding: 14, borderRadius: 10, background: T.panel, border: `1px solid ${T.line}`,
+              boxShadow: '0 10px 36px rgba(0,0,0,.55)',
+            }}>
+              <div style={{ font: `600 14px ${uiFont || font}`, color: T.text }}>Paste into terminal</div>
+              <div style={{ font: `12.5px/1.45 ${uiFont || font}`, color: T.sub }}>
+                The browser blocked direct clipboard access. Tap the box and use Paste from the system menu, then Insert.
+              </div>
+              <textarea ref={pasteRef} data-testid="paste-input" value={pasteDraft}
+                onChange={(e) => setPasteDraft(e.target.value)}
+                rows={5} spellCheck={false} autoCapitalize="off" autoCorrect="off" placeholder="Paste here"
+                style={{
+                  width: '100%', boxSizing: 'border-box', resize: 'vertical', padding: 8,
+                  font: `13px/1.4 ${font}`, color: T.text, background: T.bg,
+                  border: `1px solid ${T.line}`, borderRadius: 6,
+                }} />
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <button type="button" data-testid="paste-cancel"
+                  onClick={() => { setPasteOpen(false); setPasteDraft('') }}
+                  style={{ minHeight: 40, padding: '0 14px', borderRadius: 7, cursor: 'pointer', font: `600 13px ${uiFont || font}`, color: T.text, background: 'transparent', border: `1.5px solid ${T.line}` }}>Cancel</button>
+                <button type="button" data-testid="paste-insert" disabled={!pasteDraft}
+                  onClick={() => insertPaste(pasteDraft)}
+                  style={{ minHeight: 40, padding: '0 14px', borderRadius: 7, cursor: pasteDraft ? 'pointer' : 'default', font: `600 13px ${uiFont || font}`, color: T.onAccent, background: accent, border: `1px solid ${accent}`, opacity: pasteDraft ? 1 : 0.5 }}>Insert</button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
       {/* accessory key bar (always on touch; handy on desktop too) */}
