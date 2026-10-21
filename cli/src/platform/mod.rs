@@ -82,6 +82,24 @@ fn passwd_user_context(name: Option<&str>) -> Option<ExecUserContext> {
     })
 }
 
+/// The daemon's live login environment, used only to refine the passwd facts
+/// for the daemon's own account (a test or container may set HOME to a
+/// different absolute directory). Dropped accounts never consult this.
+#[cfg(unix)]
+fn daemon_login_env() -> (Option<String>, Option<PathBuf>, Option<String>) {
+    let name = std::env::var("USER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("LOGNAME").ok().filter(|s| !s.is_empty()));
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty());
+    (name, home, shell)
+}
+
 impl Paths {
     /// Config directory root.
     pub fn config_dir() -> PathBuf {
@@ -282,38 +300,22 @@ impl Paths {
                 });
             }
             if let Some(passwd) = passwd_user_context(None) {
-                let name = std::env::var("USER")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| std::env::var("LOGNAME").ok().filter(|s| !s.is_empty()))
-                    .unwrap_or(passwd.name);
-                let home = std::env::var("HOME")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_absolute())
-                    .unwrap_or(passwd.home);
-                let shell = std::env::var("SHELL")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .or(passwd.shell);
+                let (env_name, env_home, env_shell) = daemon_login_env();
                 return Ok(ExecUserContext {
-                    name,
-                    home,
-                    shell,
+                    name: env_name.unwrap_or(passwd.name),
+                    home: env_home.unwrap_or(passwd.home),
+                    shell: env_shell.or(passwd.shell),
                     uid: passwd.uid,
                 });
             }
             // No passwd entry for the daemon user (minimal container). Keep the
             // existing env-based fallback for the daemon itself; a target user
             // still fails closed above.
-            let name = std::env::var("USER")
-                .or_else(|_| std::env::var("LOGNAME"))
-                .unwrap_or_default();
+            let (name, _, shell) = daemon_login_env();
             Ok(ExecUserContext {
-                name,
+                name: name.unwrap_or_default(),
                 home: Self::home_dir(),
-                shell: std::env::var("SHELL").ok().filter(|s| !s.is_empty()),
+                shell,
                 uid: None,
             })
         }
