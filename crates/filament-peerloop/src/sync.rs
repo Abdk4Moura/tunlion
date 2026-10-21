@@ -1084,7 +1084,10 @@ pub mod serving {
 
         #[cfg(windows)]
         fn junction(target: &Path, link: &Path) -> bool {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             std::process::Command::new("cmd")
+                .creation_flags(CREATE_NO_WINDOW)
                 .arg("/C")
                 .arg("mklink")
                 .arg("/J")
