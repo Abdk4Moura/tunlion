@@ -121,8 +121,11 @@ export function checkCodeInput(raw) {
   if (reason) {
     return { value: '', code: '', error: MESSAGES[reason], reason }
   }
-  const value = formatPartial(raw)
-  const code = finishPartial(value)
+  const partial = formatPartial(raw)
+  // The visible field keeps the familiar uppercase pairing-code presentation;
+  // the PAKE value below stays canonical lower-case.
+  const value = partial.toUpperCase()
+  const code = finishPartial(partial)
   if (code.length > CODE_LIMIT) {
     return { value, code: '', error: MESSAGES['too-long'], reason: 'too-long' }
   }
