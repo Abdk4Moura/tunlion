@@ -111,9 +111,18 @@ async function openPage(browser, { width = BROWSER === 'webkit' ? 1024 : 900, he
     ...(BROWSER === 'webkit' && touch ? { isMobile: true, deviceScaleFactor: 2, userAgent: IPAD_UA } : {}),
   });
   page.on('pageerror', (e) => { pageErrors.push(String(e)); console.log('[page-error]', String(e).slice(0, 400)); });
+  page.on('console', (m) => { if (m.type() === 'error') console.log('[console-error]', m.text().slice(0, 400)); });
   await page.goto(`http://127.0.0.1:${PORT}/?preview=webshell-scroll&touch=${touch ? 1 : 0}`, { waitUntil: 'networkidle' });
   await page.waitForFunction(() => window.__webterm && window.__scroll, null, { timeout: 10000 })
-    .catch(() => fail('WebTerminal / xterm never mounted'));
+    .catch(async () => {
+      const d = await page.evaluate(() => ({
+        webterm: !!window.__webterm, scroll: !!window.__scroll,
+        root: (document.getElementById('root') || {}).innerHTML,
+        body: document.body.innerHTML.slice(0, 200),
+      })).catch((e) => ({ evalError: String(e) }));
+      console.log('[mount-debug]', JSON.stringify(d).slice(0, 1200));
+      fail('WebTerminal / xterm never mounted');
+    });
   // The component focuses the helper textarea on mount (readonly on touch).
   // Wait for that real state instead of calling term.focus() from the harness,
   // which would mask a missing mount-focus regression.
