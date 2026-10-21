@@ -1343,9 +1343,662 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
     }
 }
 
-#[cfg(not(unix))]
+// ------------------------------------------------------- Windows "at" layer --
+//
+// The Unix arms above make every containment decision with a directory fd the
+// kernel keeps beneath the root: openat2 RESOLVE_BENEATH on Linux, an
+// O_NOFOLLOW component walk elsewhere, and renameat/unlinkat relative to that
+// parent. Windows has no `openat`; the equivalent is a pinned chain of
+// directory HANDLEs opened with `NtCreateFile(RootDirectory=parent)` plus
+// FILE_OPEN_REPARSE_POINT at every step:
+//
+//   * a component that is a junction/symlink opens as itself and is refused,
+//     so a parent swapped for a reparse point cannot redirect the walk;
+//   * the final parent HANDLE is pinned for the whole operation, so renaming
+//     an ancestor path afterwards cannot move the target;
+//   * the staging file is created relative to that pinned parent with
+//     FILE_CREATE (exclusive) and FILE_OPEN_REPARSE_POINT, never by path;
+//   * finalization renames the OPEN staging HANDLE with
+//     SetFileInformationByHandle(FileRenameInfo, RootDirectory=parent), which
+//     replaces (never follows) an existing destination entry. A destination
+//     symlink/junction is replaced as a name, so its target is untouched.
+//
+// Windows offers no portable handle-relative rename across different
+// directories in one call, and sync's staging name always sits beside its
+// target. A caller asking for different parents therefore gets an explicit
+// Unsupported error rather than a path-based fallback.
+#[cfg(windows)]
+mod win_at {
+    use std::ffi::{c_void, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::path::{Component, Path, PathBuf};
+    use windows_sys::Win32::Foundation::{
+        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem as WinFs;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut c_void,
+        security_quality_of_service: *mut c_void,
+    }
+
+    /// `IO_STATUS_BLOCK` is a union of NTSTATUS/PVOID followed by ULONG_PTR.
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: usize,
+        information: usize,
+    }
+
+    /// Layout matches `FILE_RENAME_INFO` (BOOLEAN/Flags union, HANDLE, ULONG,
+    /// WCHAR[]); the name is written into the trailing variable-length space.
+    #[repr(C)]
+    struct FileRenameInfo {
+        replace_if_exists: u8,
+        root_directory: HANDLE,
+        file_name_length: u32,
+        file_name: [u16; 1],
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn NtSetInformationFile(
+            file_handle: HANDLE,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    const FILE_DIRECTORY_FILE: u32 = 0x1;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+    const FILE_OPEN: u32 = 1;
+    const FILE_CREATE: u32 = 2;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    /// `FILE_RENAME_INFORMATION` (ntddk.h). Win32's
+    /// SetFileInformationByHandle(FileRenameInfo) rejects the RootDirectory
+    /// form with ERROR_INVALID_PARAMETER, so the handle-relative rename goes
+    /// straight to the NT information class the structure was designed for.
+    const FILE_RENAME_INFORMATION: u32 = 10;
+    /// No FILE_SHARE_DELETE: while a directory/file HANDLE is pinned, another
+    /// handle cannot rename, replace or delete it. That is what makes the
+    /// retained root/parent/staging handles stable for the whole receive.
+    const SHARE_RW: u32 = WinFs::FILE_SHARE_READ | WinFs::FILE_SHARE_WRITE;
+    /// `FILE_ADD_FILE`/`FILE_DELETE_CHILD` are what a handle-relative create
+    /// and replace need on the pinned parent, not just list/read.
+    const DIR_ACCESS: u32 = WinFs::FILE_LIST_DIRECTORY
+        | WinFs::FILE_TRAVERSE
+        | WinFs::FILE_ADD_FILE
+        | WinFs::FILE_DELETE_CHILD
+        | WinFs::FILE_READ_ATTRIBUTES
+        | WinFs::SYNCHRONIZE;
+    const OPEN_REPARSE: u32 = WinFs::FILE_FLAG_OPEN_REPARSE_POINT;
+    const ACCESS_READ: u32 = GENERIC_READ | WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE;
+    const ACCESS_READ_WRITE: u32 = GENERIC_READ | GENERIC_WRITE | WinFs::DELETE | WinFs::SYNCHRONIZE;
+
+    fn denied(what: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, what)
+    }
+
+    /// One path component as NT wants it: case-insensitive, relative to a
+    /// pinned parent, with no Win32 name games (ADS colon, trailing dot/space,
+    /// reserved DOS device names). `..`/`.`/separators never reach here: sync
+    /// paths are validated by `safe_relpath` first, and this repeats the check
+    /// because the primitive is also reachable from tests and future callers.
+    fn units(name: &OsStr) -> io::Result<Vec<u16>> {
+        let wide: Vec<u16> = name.encode_wide().collect();
+        if wide.is_empty() || wide.len() > 255 {
+            return Err(denied("Windows sync path component is empty or too long"));
+        }
+        let text = String::from_utf16_lossy(&wide);
+        if text == "." || text == ".." {
+            return Err(denied("Windows sync path component is not a plain name"));
+        }
+        if wide.iter().any(|&u| {
+            u == u16::from(b':')
+                || u == u16::from(b'\\')
+                || u == u16::from(b'/')
+                || u < 0x20
+        }) {
+            return Err(denied(
+                "Windows sync path component contains a separator, stream colon or control character",
+            ));
+        }
+        if text.ends_with('.') || text.ends_with(' ') {
+            return Err(denied(
+                "Windows sync path component ends in a dot or space (Win32 name ambiguity)",
+            ));
+        }
+        // DOS device names are special in path-based Win32 APIs. NT relative
+        // opens do not apply that mapping, but refusing them keeps a future
+        // path-based caller from reintroducing the ambiguity.
+        let stem = text.split('.').next().unwrap_or("").to_ascii_uppercase();
+        let reserved = matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL"
+                | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+                | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        );
+        if reserved {
+            return Err(denied(
+                "Windows sync path component is a reserved DOS device name",
+            ));
+        }
+        Ok(wide)
+    }
+
+    fn attributes(handle: HANDLE) -> io::Result<u32> {
+        let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { WinFs::GetFileInformationByHandle(handle, &mut info) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.dwFileAttributes)
+    }
+
+    fn file_id(handle: HANDLE) -> io::Result<(u32, u32, u32)> {
+        let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { WinFs::GetFileInformationByHandle(handle, &mut info) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+    }
+
+    fn nt_open(
+        parent: &OwnedHandle,
+        name: &[u16],
+        disposition: u32,
+        access: u32,
+        options: u32,
+        file_attributes: u32,
+    ) -> io::Result<OwnedHandle> {
+        nt_open_with_share(
+            parent,
+            name,
+            disposition,
+            access,
+            options,
+            file_attributes,
+            SHARE_RW,
+        )
+    }
+
+    fn nt_open_with_share(
+        parent: &OwnedHandle,
+        name: &[u16],
+        disposition: u32,
+        access: u32,
+        options: u32,
+        file_attributes: u32,
+        share_access: u32,
+    ) -> io::Result<OwnedHandle> {
+        let byte_len = (name.len() * 2) as u16;
+        let mut unicode = UnicodeString {
+            length: byte_len,
+            maximum_length: byte_len,
+            buffer: name.as_ptr() as *mut u16,
+        };
+        let mut attrs = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: parent.as_raw_handle() as HANDLE,
+            object_name: &mut unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut iosb = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access,
+                &mut attrs,
+                &mut iosb,
+                std::ptr::null_mut(),
+                file_attributes,
+                share_access,
+                disposition,
+                options,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status < 0 {
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
+    }
+
+    fn open_root_handle(root: &Path, open_reparse: bool) -> io::Result<OwnedHandle> {
+        let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut flags = WinFs::FILE_FLAG_BACKUP_SEMANTICS;
+        if open_reparse {
+            flags |= OPEN_REPARSE;
+        }
+        let handle = unsafe {
+            WinFs::CreateFileW(
+                wide.as_ptr(),
+                DIR_ACCESS,
+                SHARE_RW,
+                std::ptr::null(),
+                WinFs::OPEN_EXISTING,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let owned = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        let attrs = attributes(owned.as_raw_handle() as HANDLE)?;
+        if attrs & WinFs::FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(denied("Windows sync root is not a directory"));
+        }
+        if attrs & WinFs::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(denied(
+                "refusing Windows sync root: the admitted root is a junction/symlink (reparse point)",
+            ));
+        }
+        Ok(owned)
+    }
+
+    pub(super) fn ensure_stable_id(id: (u32, u32, u32)) -> io::Result<(u32, u32, u32)> {
+        if id.0 == 0 || (id.1 == 0 && id.2 == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows sync finalization is not supported on this filesystem: it exposes no stable file identity (volume serial/file index)",
+            ));
+        }
+        Ok(id)
+    }
+
+    fn stable_id(handle: HANDLE) -> io::Result<(u32, u32, u32)> {
+        ensure_stable_id(file_id(handle)?)
+    }
+
+    /// The admitted root, opened ONCE and retained for the whole receive.
+    ///
+    /// Every later create/open/rename is relative to this HANDLE; the path is
+    /// never reopened. It is opened with FILE_OPEN_REPARSE_POINT (so a junction
+    /// at the admitted path is refused rather than followed) and without
+    /// FILE_SHARE_DELETE (so no other handle can rename or delete the root
+    /// while the receive holds it). A second, following open at pin time must
+    /// report the same volume serial + file index: a root swapped between
+    /// canonicalisation and pinning is refused.
+    #[derive(Debug)]
+    pub(crate) struct WinRoot {
+        handle: OwnedHandle,
+        _id: (u32, u32, u32),
+    }
+
+    /// All directory HANDLEs from the pinned root down to the staging parent.
+    /// Retaining the ancestors (no FILE_SHARE_DELETE) blocks renames of any
+    /// component, not just the final parent.
+    #[derive(Debug)]
+    pub(crate) struct PinnedParent {
+        chain: Vec<OwnedHandle>,
+    }
+
+    impl PinnedParent {
+        pub fn handle(&self) -> &OwnedHandle {
+            self.chain.last().expect("a pinned parent chain is non-empty")
+        }
+    }
+
+    impl WinRoot {
+        /// Production admission: open the drop directory, then walk/create the
+        /// requested root relative to it. Every component is opened with
+        /// FILE_OPEN_REPARSE_POINT and refused if it is a reparse point, so an
+        /// ancestor junction cannot redirect the pin; missing directories are
+        /// created relative to the HANDLE, never by path.
+        pub fn open_relative(drop_dir: &Path, rel: &Path) -> io::Result<(Self, PathBuf)> {
+            let mut current = open_root_handle(drop_dir, false)?;
+            for component in rel.components() {
+                match component {
+                    Component::Normal(name) => {
+                        let name = units(name)?;
+                        current = open_or_create_dir(&current, &name)?;
+                    }
+                    Component::CurDir => {}
+                    _ => {
+                        return Err(denied(
+                            "Windows sync path component escapes the pinned root",
+                        ))
+                    }
+                }
+            }
+            let id = stable_id(current.as_raw_handle() as HANDLE)?;
+            let win = Self { handle: current, _id: id };
+            let path = win.final_path()?;
+            Ok((win, path))
+        }
+
+        #[cfg(test)]
+        pub fn id(&self) -> (u32, u32, u32) {
+            self._id
+        }
+
+        /// Test-only absolute-path pin. Production admission MUST use
+        /// `open_relative` from the pinned drop directory; keeping this out of
+        /// non-test builds prevents a path-rooted pin from being reintroduced.
+        #[cfg(test)]
+        pub fn open(root: &Path) -> io::Result<Self> {
+            let handle = open_root_handle(root, true)?;
+            let id = stable_id(handle.as_raw_handle() as HANDLE)?;
+            let follow = open_root_handle(root, false)?;
+            let follow_id = stable_id(follow.as_raw_handle() as HANDLE)?;
+            if follow_id != id {
+                return Err(denied(
+                    "Windows sync root changed while pinning; refusing the receive",
+                ));
+            }
+            Ok(Self { handle, _id: id })
+        }
+
+        fn final_path(&self) -> io::Result<PathBuf> {
+            use std::os::windows::ffi::OsStringExt;
+            let mut buf = vec![0u16; 512];
+            loop {
+                let n = unsafe {
+                    WinFs::GetFinalPathNameByHandleW(
+                        self.handle.as_raw_handle() as HANDLE,
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                        0,
+                    )
+                };
+                if n == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if (n as usize) < buf.len() {
+                    return Ok(PathBuf::from(std::ffi::OsString::from_wide(
+                        &buf[..n as usize],
+                    )));
+                }
+                buf.resize(n as usize + 1, 0);
+            }
+        }
+
+        /// Walk/recreate `parent_rel` relative to the pinned root. A missing
+        /// component is created with FILE_CREATE in the directory HANDLE we
+        /// already hold, never by path; a junction/symlink component is
+        /// refused. Every ancestor HANDLE is retained so none can be renamed.
+        pub fn ensure_parent(&self, parent_rel: &Path) -> io::Result<PinnedParent> {
+            let mut chain = vec![self.handle.try_clone()?];
+            for component in parent_rel.components() {
+                match component {
+                    Component::Normal(name) => {
+                        let name = units(name)?;
+                        let next = open_or_create_dir(
+                            chain.last().expect("chain is non-empty"),
+                            &name,
+                        )?;
+                        chain.push(next);
+                    }
+                    Component::CurDir => {}
+                    _ => {
+                        return Err(denied(
+                            "Windows sync path component escapes the pinned root",
+                        ))
+                    }
+                }
+            }
+            Ok(PinnedParent { chain })
+        }
+
+        pub fn create_staging(&self, parent: &PinnedParent, name: &OsStr) -> io::Result<File> {
+            let name = units(name)?;
+            let file = nt_open(
+                parent.handle(),
+                &name,
+                FILE_CREATE,
+                ACCESS_READ_WRITE,
+                FILE_NON_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_ATTRIBUTE_NORMAL,
+            )?;
+            Ok(File::from(file))
+        }
+
+        pub fn open_existing(&self, parent: &PinnedParent, name: &OsStr) -> io::Result<File> {
+            let name = units(name)?;
+            let file = nt_open(
+                parent.handle(),
+                &name,
+                FILE_OPEN,
+                ACCESS_READ,
+                FILE_NON_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+            )?;
+            let attrs = attributes(file.as_raw_handle() as HANDLE)?;
+            if attrs & WinFs::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(denied(
+                    "refusing Windows sync path: the final name is a junction/symlink (reparse point)",
+                ));
+            }
+            if attrs & WinFs::FILE_ATTRIBUTE_DIRECTORY != 0 {
+                return Err(denied("Windows sync destination is a directory, not a file"));
+            }
+            Ok(File::from(file))
+        }
+
+        /// Rename the open staging HANDLE into the SAME pinned parent. There is
+        /// deliberately no path parameter: the parent cannot be re-resolved.
+        pub fn rename_staged(
+            &self,
+            parent: &PinnedParent,
+            from_name: &OsStr,
+            to_name: &OsStr,
+            source: &File,
+        ) -> io::Result<()> {
+            let from = units(from_name)?;
+            let to = units(to_name)?;
+            // The identity open is transient and only reads attributes. It
+            // must SHARE_DELETE because the staging handle we compare against
+            // holds DELETE access (that is what lets finalization rename it);
+            // this does not weaken the pin: the commit still acts on the open
+            // staging HANDLE, never on this name.
+            let named = nt_open_with_share(
+                parent.handle(),
+                &from,
+                FILE_OPEN,
+                WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
+                FILE_NON_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+                SHARE_RW | WinFs::FILE_SHARE_DELETE,
+            )?;
+            let named_id = stable_id(named.as_raw_handle() as HANDLE)?;
+            let source_id = stable_id(source.as_raw_handle() as HANDLE)?;
+            if named_id != source_id {
+                return Err(denied(
+                    "staging name no longer identifies this transfer's open file; refusing rename",
+                ));
+            }
+            drop(named);
+            rename_handle(parent.handle(), &to, source)
+        }
+    }
+
+    fn check_dir(child: OwnedHandle) -> io::Result<OwnedHandle> {
+        let attrs = attributes(child.as_raw_handle() as HANDLE)?;
+        if attrs & WinFs::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(denied(
+                "refusing Windows sync path: a parent is a junction/symlink (reparse point)",
+            ));
+        }
+        if attrs & WinFs::FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(denied("Windows sync path parent is not a directory"));
+        }
+        Ok(child)
+    }
+
+    fn open_or_create_dir(parent: &OwnedHandle, name: &[u16]) -> io::Result<OwnedHandle> {
+        match nt_open(
+            parent,
+            name,
+            FILE_OPEN,
+            DIR_ACCESS,
+            FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+            0,
+        ) {
+            Ok(child) => check_dir(child),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match nt_open(
+                    parent,
+                    name,
+                    FILE_CREATE,
+                    DIR_ACCESS,
+                    FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                    WinFs::FILE_ATTRIBUTE_DIRECTORY,
+                ) {
+                    Ok(child) => check_dir(child),
+                    Err(create) if create.kind() == io::ErrorKind::AlreadyExists => {
+                        let child = nt_open(
+                            parent,
+                            name,
+                            FILE_OPEN,
+                            DIR_ACCESS,
+                            FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                            0,
+                        )?;
+                        check_dir(child)
+                    }
+                    Err(create) => Err(create),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn unsupported(error: io::Error) -> io::Error {
+        let code = error.raw_os_error().unwrap_or(0);
+        // ERROR_INVALID_FUNCTION, ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED,
+        // ERROR_INVALID_PARAMETER: the filesystem cannot express the
+        // handle-relative replace. Everything else keeps its real error.
+        if matches!(code, 1 | 17 | 50 | 87) {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Windows sync finalization is not supported on this filesystem: {error}"),
+            )
+        } else {
+            error
+        }
+    }
+
+    fn rename_handle(
+        parent: &OwnedHandle,
+        to_name: &[u16],
+        source: &File,
+    ) -> io::Result<()> {
+        let name_bytes = to_name.len() * 2;
+        let offset = std::mem::offset_of!(FileRenameInfo, file_name);
+        let size = offset + name_bytes;
+        // u64 words keep the buffer aligned for the HANDLE in the struct; a
+        // Vec<u8> only promises byte alignment.
+        let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
+        let info = buffer.as_mut_ptr() as *mut FileRenameInfo;
+        unsafe {
+            (*info).replace_if_exists = 1;
+            (*info).root_directory = parent.as_raw_handle() as HANDLE;
+            (*info).file_name_length = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                to_name.as_ptr(),
+                std::ptr::addr_of_mut!((*info).file_name) as *mut u16,
+                to_name.len(),
+            );
+        }
+        let mut iosb = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtSetInformationFile(
+                source.as_raw_handle() as HANDLE,
+                &mut iosb,
+                buffer.as_mut_ptr() as *mut c_void,
+                size as u32,
+                FILE_RENAME_INFORMATION,
+            )
+        };
+        if status < 0 {
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(unsupported(io::Error::from_raw_os_error(code as i32)));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_ensure_stable_id(id: (u32, u32, u32)) -> std::io::Result<()> {
+    win_at::ensure_stable_id(id).map(|_| ())
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_unsupported_error(code: i32) -> std::io::Error {
+    win_at::unsupported(std::io::Error::from_raw_os_error(code))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool, create_mode: u32) -> std::io::Result<std::fs::File> {
-    // Non-Unix fallback: canonicalize + starts_with (no TOCTOU guarantee).
+    canonical_open_beneath(root, rel_path, flags, deny_symlinks, create_mode)
+}
+
+#[cfg(windows)]
+pub(crate) use win_at::{PinnedParent, WinRoot};
+
+#[cfg(windows)]
+pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool, create_mode: u32) -> std::io::Result<std::fs::File> {
+    // A deny_symlinks caller (the receive `.part` writers) needs the HANDLE
+    // pinned across the whole operation; there is no such path-based form, so
+    // refuse rather than silently using a weaker fallback. The mount surface
+    // keeps its historical canonicalize arm (WinFsp is the live mount path).
+    if deny_symlinks {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Windows receive requires the pinned root adapter; path-based deny-symlink opens are refused",
+        ));
+    }
+    canonical_open_beneath(root, rel_path, flags, deny_symlinks, create_mode)
+}
+
+#[cfg(not(unix))]
+fn canonical_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool, create_mode: u32) -> std::io::Result<std::fs::File> {
     // There are no POSIX modes here; the file takes the directory's ACL.
     let _ = create_mode;
     let full = root.join(rel_path);
@@ -1610,10 +2263,15 @@ fn beneath_rename(
 
 /// Atomically rename one path to another while keeping both parents beneath
 /// `root`. Unix performs the rename relative to stable parent directory
-/// handles. Windows currently fails closed because its path-based resolver
-/// cannot prove resistance to concurrent ancestor reparse-point replacement.
-/// Other non-Unix targets retain the canonical-parent fallback, which cannot
-/// resist concurrent parent replacement.
+/// handles. Windows resolves both parents to pinned directory HANDLEs (every
+/// component opened with FILE_OPEN_REPARSE_POINT and refused if it is a
+/// reparse point), verifies the staging name still identifies `source_file`,
+/// and renames that HANDLE with SetFileInformationByHandle(FileRenameInfo,
+/// RootDirectory=parent), replacing the destination entry without following
+/// it. Both names must share one parent (sync's staging contract); anything
+/// else is an explicit Unsupported error, never a path fallback. Other
+/// non-Unix targets retain the canonical-parent fallback, which cannot resist
+/// concurrent parent replacement.
 #[cfg(unix)]
 pub fn safe_rename_beneath(
     root: &std::path::Path,
@@ -1626,27 +2284,32 @@ pub fn safe_rename_beneath(
     beneath_rename(&from_parent, &from_name, &to_parent, &to_name)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn safe_rename_beneath(
+    _root: &std::path::Path,
+    _from_rel: &std::path::Path,
+    _to_rel: &std::path::Path,
+    _source_file: &std::fs::File,
+) -> std::io::Result<()> {
+    // Sync finalization goes through the retained staging-parent HANDLE
+    // (`WinRoot::rename_staged`); a path-rooted rename would reopen the root
+    // and is refused.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Windows sync finalization requires the pinned staging parent; path-based rename is refused",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn safe_rename_beneath(
     root: &std::path::Path,
     from_rel: &std::path::Path,
     to_rel: &std::path::Path,
-    source_file: &std::fs::File,
+    _source_file: &std::fs::File,
 ) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = (root, from_rel, to_rel, source_file);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "sync finalization is disabled on Windows until ancestor-safe handle-relative staging is available",
-        ));
-    }
-    #[cfg(not(windows))]
-    {
-        let (from_parent, from_name) = resolve_parent_beneath(root, from_rel)?;
-        let (to_parent, to_name) = resolve_parent_beneath(root, to_rel)?;
-        beneath_rename(&from_parent, &from_name, &to_parent, &to_name)
-    }
+    let (from_parent, from_name) = resolve_parent_beneath(root, from_rel)?;
+    let (to_parent, to_name) = resolve_parent_beneath(root, to_rel)?;
+    beneath_rename(&from_parent, &from_name, &to_parent, &to_name)
 }
 
 /// Remove a name beneath `root` without following its final component. Unix
@@ -1703,11 +2366,7 @@ pub fn safe_unlink_staged_beneath(
 }
 
 #[cfg(windows)]
-pub fn safe_unlink_staged_beneath(
-    _root: &std::path::Path,
-    _rel: &std::path::Path,
-    file: &std::fs::File,
-) -> std::io::Result<()> {
+pub(crate) fn safe_delete_open_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
     #[repr(C)]
@@ -1738,6 +2397,15 @@ pub fn safe_unlink_staged_beneath(
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub fn safe_unlink_staged_beneath(
+    _root: &std::path::Path,
+    _rel: &std::path::Path,
+    file: &std::fs::File,
+) -> std::io::Result<()> {
+    safe_delete_open_file(file)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2379,6 +3047,381 @@ mod tests {
             *transport.controls.lock().unwrap(),
             vec![serde_json::json!({"type": "l2-close", "sid": 9, "err": "device revoked"})]
         );
+    }
+
+
+    #[cfg(windows)]
+    fn win_tmp() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tunlion-win-at-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[cfg(windows)]
+    fn win_junction(target: &std::path::Path, link: &std::path::Path) -> bool {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    fn win_symlink_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+
+    /// Required adversarial coverage must not silently skip. These helpers
+    /// panic with the exact capability that is missing, so the Windows job is
+    /// red rather than green-but-uncovered.
+    #[cfg(windows)]
+    fn require_junction(target: &std::path::Path, link: &std::path::Path) {
+        assert!(
+            win_junction(target, link),
+            "required Windows coverage: mklink /J (junction creation) is unavailable on this runner"
+        );
+    }
+
+    #[cfg(windows)]
+    fn require_symlink(target: &std::path::Path, link: &std::path::Path) {
+        assert!(
+            win_symlink_file(target, link),
+            "required Windows coverage: file symlink creation is unavailable on this runner"
+        );
+    }
+
+    #[cfg(windows)]
+    fn win_root(path: &std::path::Path) -> WinRoot {
+        WinRoot::open(path).expect("pin the admitted root")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pinned_root_stage_and_rename_are_handle_relative() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let root = win_tmp();
+        let win = win_root(&root);
+        let parent = win
+            .ensure_parent(std::path::Path::new("nested"))
+            .expect("create the missing parent relative to the pinned root");
+        let mut part = win
+            .create_staging(&parent, OsStr::new("file.txt.part"))
+            .expect("exclusive create beneath the pinned parent");
+        part.write_all(b"payload").unwrap();
+        part.sync_all().unwrap();
+        win.rename_staged(
+            &parent,
+            OsStr::new("file.txt.part"),
+            OsStr::new("file.txt"),
+            &part,
+        )
+        .expect("same-parent handle-relative rename");
+        assert_eq!(
+            std::fs::read(root.join("nested/file.txt")).unwrap(),
+            b"payload"
+        );
+        assert!(!root.join("nested/file.txt.part").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pinned_root_refuses_a_reparse_root() {
+        let root = win_tmp();
+        let outside = win_tmp();
+        require_junction(&outside, &root.join("link"));
+        let error = WinRoot::open(&root.join("link")).expect_err("a reparse root is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "refusing Windows sync root: the admitted root is a junction/symlink (reparse point)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_refuses_a_junction_parent() {
+        let root = win_tmp();
+        let outside = win_tmp();
+        require_junction(&outside, &root.join("nested"));
+        let win = win_root(&root);
+        let error = win
+            .ensure_parent(std::path::Path::new("nested"))
+            .expect_err("a junction parent must never be traversed");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "refusing Windows sync path: a parent is a junction/symlink (reparse point)"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing was created through the junction"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rename_replaces_a_destination_link_without_following_it() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let root = win_tmp();
+        let outside = win_tmp();
+        let outside_file = outside.join("outside.txt");
+        std::fs::write(&outside_file, b"outside remains").unwrap();
+        require_symlink(&outside_file, &root.join("file.txt"));
+        let win = win_root(&root);
+        let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+        let mut part = win
+            .create_staging(&parent, OsStr::new("file.txt.part"))
+            .expect("create staging file");
+        part.write_all(b"new content").unwrap();
+        win.rename_staged(
+            &parent,
+            OsStr::new("file.txt.part"),
+            OsStr::new("file.txt"),
+            &part,
+        )
+        .expect("replace the destination entry");
+
+        assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"new content");
+        assert!(
+            !std::fs::symlink_metadata(root.join("file.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the rename replaced the link entry itself"
+        );
+        assert_eq!(
+            std::fs::read(&outside_file).unwrap(),
+            b"outside remains",
+            "the rename replaced the entry, never the link target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pinned_root_identity_survives_an_ancestor_move() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let outer = win_tmp();
+        let root = outer.join("root");
+        std::fs::create_dir(&root).unwrap();
+        let win = win_root(&root);
+        let id = win.id();
+        let moved = outer.with_extension("moved");
+        match std::fs::rename(&outer, &moved) {
+            Ok(()) => {
+                // The path changed; the pinned object did not.
+                assert_eq!(win.id(), id);
+                let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+                let mut part = win
+                    .create_staging(&parent, OsStr::new("x.part"))
+                    .expect("create through the pin after the ancestor move");
+                part.write_all(b"pinned").unwrap();
+                win.rename_staged(&parent, OsStr::new("x.part"), OsStr::new("x"), &part)
+                    .expect("commit through the pin");
+                assert_eq!(std::fs::read(moved.join("root/x")).unwrap(), b"pinned");
+                let _ = std::fs::remove_dir_all(&moved);
+            }
+            Err(error) => {
+                // Windows refuses to move an ancestor while the pinned
+                // descendant is open. That is the OS-layer guarantee, not a
+                // skip: the pin's identity must be unchanged and the original
+                // tree must still be intact.
+                assert!(
+                    error.raw_os_error().is_some(),
+                    "ancestor move refused: {error}"
+                );
+                assert_eq!(win.id(), id);
+                assert!(root.is_dir());
+                assert!(!moved.exists());
+                let _ = std::fs::remove_dir_all(&root);
+                let _ = std::fs::remove_dir_all(&outer);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ancestor_that_is_a_file_is_refused() {
+        let root = win_tmp();
+        std::fs::write(root.join("blocker"), b"not a directory").unwrap();
+        let win = win_root(&root);
+        let error = win
+            .ensure_parent(std::path::Path::new("blocker/child"))
+            .expect_err("a file cannot be an ancestor directory");
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(code) if code == 267 // ERROR_DIRECTORY
+            ) || error.kind() == std::io::ErrorKind::NotFound,
+            "unexpected error: {error}"
+        );
+        assert!(!root.join("blocker/child").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_names_reject_ads_trailing_and_device_components() {
+        use std::ffi::OsStr;
+        let root = win_tmp();
+        let win = win_root(&root);
+        let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+        for bad in ["a:b", "a.", "a ", "..", ".", "CON", "LPT1.txt"] {
+            let error = win
+                .create_staging(&parent, OsStr::new(bad))
+                .expect_err("an unsafe/ambiguous Windows name is refused");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{bad:?}: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pinned_root_blocks_replacing_the_root_path() {
+        let root = win_tmp();
+        let moved = root.with_extension("moved");
+        let _win = win_root(&root);
+        let error = std::fs::rename(&root, &moved)
+            .expect_err("the pinned root HANDLE must block replacing its path");
+        assert!(
+            error.raw_os_error().is_some(),
+            "the OS refused the root rename: {error}"
+        );
+        assert!(root.is_dir());
+        assert!(!moved.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rename_cannot_name_a_cross_directory_target() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let root = win_tmp();
+        let win = win_root(&root);
+        let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+        let mut part = win
+            .create_staging(&parent, OsStr::new("a.part"))
+            .expect("create staging");
+        part.write_all(b"x").unwrap();
+        let error = win
+            .rename_staged(&parent, OsStr::new("a.part"), OsStr::new("sub/a"), &part)
+            .expect_err("the target is a single component under the pinned parent");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("separator, stream colon or control character"),
+            "{error}"
+        );
+        assert!(!root.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_identity_mismatch_is_refused() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let root = win_tmp();
+        let win = win_root(&root);
+        let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+        let mut a = win
+            .create_staging(&parent, OsStr::new("a.part"))
+            .expect("create a");
+        a.write_all(b"verified content").unwrap();
+        let mut b = win
+            .create_staging(&parent, OsStr::new("b.part"))
+            .expect("create b");
+        b.write_all(b"other content").unwrap();
+        let error = win
+            .rename_staged(&parent, OsStr::new("a.part"), OsStr::new("a"), &b)
+            .expect_err("a different open file must not be renamed under this name");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "staging name no longer identifies this transfer's open file; refusing rename"
+        );
+        assert!(!root.join("a").exists());
+        assert!(root.join("a.part").exists());
+        assert!(root.join("b.part").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_rooted_staging_and_rename_are_refused() {
+        let root = win_tmp();
+        std::fs::write(root.join("x.part"), b"x").unwrap();
+        let source = std::fs::File::open(root.join("x.part")).unwrap();
+        let rename = safe_rename_beneath(
+            &root,
+            std::path::Path::new("x.part"),
+            std::path::Path::new("x"),
+            &source,
+        )
+        .expect_err("a path-rooted rename has no pinned root");
+        assert_eq!(rename.kind(), std::io::ErrorKind::Unsupported);
+        assert!(rename.to_string().contains("pinned staging parent"));
+
+        let open = safe_open_beneath(
+            &root,
+            std::path::Path::new("x.part"),
+            0,
+            true,
+            0,
+        )
+        .expect_err("a path-rooted deny-symlink open has no pinned root");
+        assert_eq!(open.kind(), std::io::ErrorKind::Unsupported);
+        assert!(open.to_string().contains("pinned root adapter"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unsupported_filesystem_errors_are_named_and_zero_ids_are_refused() {
+        for code in [1, 17, 50, 87] {
+            let error = windows_unsupported_error(code);
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "code {code}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("not supported on this filesystem"),
+                "code {code}: {error}"
+            );
+        }
+        for id in [(0, 0, 0), (0, 1, 1), (7, 0, 0)] {
+            let error = windows_ensure_stable_id(id).expect_err("zero/absent identity is unsupported");
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("stable file identity"));
+        }
+        windows_ensure_stable_id((7, 1, 2)).expect("a real identity is accepted");
     }
 
 }

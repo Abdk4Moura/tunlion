@@ -9896,6 +9896,7 @@ mod lifecycle_tests {
             mux,
             sid: 0x8000_0101,
             root: std::env::temp_dir(),
+            pin: crate::sync::RootPin::path_only(&std::env::temp_dir()),
             delete: false,
             dry_run: false,
             stream,

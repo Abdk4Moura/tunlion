@@ -214,9 +214,12 @@ jobs:
       - name: Test the transfer crate (Windows path bounds)
         shell: bash
         run: cargo test --release --manifest-path crates/filament-transfer/Cargo.toml
-      - name: Test sync admission (Windows confinement and fail-closed receive)
+      - name: Test sync receive (Windows confinement, staging and finalization)
         shell: bash
-        run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'sync::tests::'
+        run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'sync::'
+      - name: Test Windows pinned-handle path primitives
+        shell: bash
+        run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'mount_proto::'
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats

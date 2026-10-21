@@ -167,6 +167,83 @@ pub enum SyncAdmission {
     Ignored,
 }
 
+/// The admitted receive root, opened/pinned once at admission.
+///
+/// On Windows this owns the directory HANDLE every staging and finalization
+/// operation is relative to, so a later root-path swap cannot redirect a write.
+/// Unix keeps its canonical path and the existing openat2/renameat arms, which
+/// already act on kernel-pinned parents.
+pub struct RootPin {
+    root: PathBuf,
+    #[cfg(windows)]
+    win: Option<crate::mount_proto::WinRoot>,
+}
+
+impl RootPin {
+    /// Pin the canonical root. Fails closed if the root is a reparse point, has
+    /// no stable identity, or changes between canonicalisation and pinning.
+    ///
+    /// Windows production admission does not use this path-rooted form
+    /// (`from_win` after `WinRoot::open_relative`); the method stays available
+    /// to non-Windows admission and to tests.
+    #[cfg(any(not(windows), test))]
+    pub fn open(root: &Path) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                root: root.to_path_buf(),
+                win: Some(crate::mount_proto::WinRoot::open(root)?),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self {
+                root: root.to_path_buf(),
+            })
+        }
+    }
+
+    /// Path-only pin for a dry run, which never writes.
+    pub fn path_only(root: &Path) -> Self {
+        #[cfg(windows)]
+        {
+            Self {
+                root: root.to_path_buf(),
+                win: None,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Self {
+                root: root.to_path_buf(),
+            }
+        }
+    }
+
+    /// Wrap a root already pinned by the Windows relative walk.
+    #[cfg(windows)]
+    pub fn from_win(win: crate::mount_proto::WinRoot, root: PathBuf) -> Self {
+        Self {
+            root,
+            win: Some(win),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    #[cfg(windows)]
+    fn win(&self) -> std::io::Result<&crate::mount_proto::WinRoot> {
+        self.win.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Windows sync receive requires a root pinned at admission",
+            )
+        })
+    }
+}
+
 /// An admitted sync stream.
 pub struct SyncAccepted {
     pub sid: u32,
@@ -177,6 +254,8 @@ pub struct SyncAccepted {
     /// The canonical confined destination root (or the not-yet-created target
     /// of a dry run, which is why no files are written for one).
     pub root: PathBuf,
+    /// The same root, pinned for the receive's whole lifetime.
+    pub pin: RootPin,
     pub dry_run: bool,
     pub delete: bool,
     pub rx: mpsc::Receiver<PipeItem>,
@@ -281,9 +360,66 @@ pub async fn admit_sync_open(
     // grant-only decision it would have failed anyway, and the gate sees the
     // real scope. A dry run must not create the destination.
     let dry_run = v["dry_run"].as_bool() == Some(true);
-    let root = match resolve_root(drop_dir, v["root"].as_str().unwrap_or(""), !dry_run) {
-        Ok(root) => root,
-        Err(reason) => return SyncAdmission::Refused(SyncRefusal::new(sid, reason, t)),
+    let request = v["root"].as_str().unwrap_or("");
+    #[cfg(windows)]
+    let (root, pin) = {
+        let outside = || "remote dir is outside this device's drop directory".to_string();
+        let rel = match windows_root_rel(drop_dir, request) {
+            Some(rel) => rel,
+            None => return SyncAdmission::Refused(SyncRefusal::new(sid, outside(), t)),
+        };
+        if dry_run {
+            // Nothing is written; the ack names the requested path.
+            let root = drop_dir.join(&rel);
+            let pin = RootPin::path_only(&root);
+            (root, pin)
+        } else {
+            // Walk/create the root relative to the drop directory HANDLE. No
+            // path-based resolve_root/create_content_dirs runs on Windows, so
+            // an ancestor junction cannot redirect the pin or create dirs
+            // outside. Every component is refused if it is a reparse point.
+            match crate::mount_proto::WinRoot::open_relative(drop_dir, &rel) {
+                Ok((win, root)) => (root.clone(), RootPin::from_win(win, root)),
+                Err(error) => {
+                    // A junction/symlink anywhere on the requested root is an
+                    // escape attempt; keep the historical outside-drop reason
+                    // on the wire. Other failures (a file component, an
+                    // unopenable directory) name their own cause.
+                    let reason = if error.kind() == std::io::ErrorKind::PermissionDenied
+                        && error
+                            .to_string()
+                            .contains("junction/symlink (reparse point)")
+                    {
+                        outside()
+                    } else {
+                        format!("cannot pin the receive root: {error}")
+                    };
+                    return SyncAdmission::Refused(SyncRefusal::new(sid, reason, t));
+                }
+            }
+        }
+    };
+    #[cfg(not(windows))]
+    let (root, pin) = {
+        let root = match resolve_root(drop_dir, request, !dry_run) {
+            Ok(root) => root,
+            Err(reason) => return SyncAdmission::Refused(SyncRefusal::new(sid, reason, t)),
+        };
+        let pin = if dry_run {
+            RootPin::path_only(&root)
+        } else {
+            match RootPin::open(&root) {
+                Ok(pin) => pin,
+                Err(error) => {
+                    return SyncAdmission::Refused(SyncRefusal::new(
+                        sid,
+                        format!("cannot pin the receive root: {error}"),
+                        t,
+                    ))
+                }
+            }
+        };
+        (root, pin)
     };
 
     // Snapshot trust and the peer's name BEFORE `peer_authz` lazily resolves
@@ -381,12 +517,35 @@ pub async fn admit_sync_open(
         sid,
         who,
         root,
+        pin,
         dry_run,
         delete,
         rx,
         mux,
         transport: t,
     })
+}
+
+/// Resolve a sync root request to a relative path for the Windows HANDLE walk.
+/// Only lexical work happens here; the walk itself is relative to the pinned
+/// drop directory and refuses reparse points on every component.
+#[cfg(windows)]
+fn windows_root_rel(drop_dir: &Path, request: &str) -> Option<PathBuf> {
+    use filament_transfer::path_bounds::{path_within, safe_relpath};
+
+    let rel = match request.trim() {
+        "" | "." => PathBuf::new(),
+        r if Path::new(r).is_absolute() => {
+            let inside = Path::new(r).strip_prefix(drop_dir).ok()?;
+            if inside.as_os_str().is_empty() {
+                PathBuf::new()
+            } else {
+                safe_relpath(&inside.to_string_lossy())?
+            }
+        }
+        r => safe_relpath(r)?,
+    };
+    path_within(drop_dir, &drop_dir.join(&rel)).then_some(rel)
 }
 
 /// Stateful receiver for an admitted sync stream. This module owns record
@@ -429,6 +588,9 @@ pub mod serving {
         pub mux: Arc<Mux>,
         pub sid: u32,
         pub root: PathBuf,
+        /// Opened at admission; Windows performs every create/open/rename
+        /// relative to it and never reopens the root path.
+        pub pin: super::RootPin,
         pub delete: bool,
         pub dry_run: bool,
         pub stream: mpsc::Receiver<Option<Bytes>>,
@@ -491,6 +653,63 @@ pub mod serving {
                     &self.rel,
                     file,
                 );
+            }
+        }
+    }
+
+    /// Windows staging keeps the pinned parent HANDLE and the bare names. The
+    /// commit renames the open file through that HANDLE; the root path is never
+    /// reopened, and cleanup is by handle.
+    #[cfg(windows)]
+    struct StagedPart {
+        parent: crate::mount_proto::PinnedParent,
+        part_name: std::ffi::OsString,
+        target_name: std::ffi::OsString,
+        file: Option<std::fs::File>,
+        committed: bool,
+    }
+
+    #[cfg(windows)]
+    impl StagedPart {
+        fn new(
+            parent: crate::mount_proto::PinnedParent,
+            part_name: std::ffi::OsString,
+            target_name: std::ffi::OsString,
+            file: std::fs::File,
+        ) -> Self {
+            Self {
+                parent,
+                part_name,
+                target_name,
+                file: Some(file),
+                committed: false,
+            }
+        }
+
+        fn file(&self) -> &std::fs::File {
+            self.file.as_ref().expect("uncommitted staging file is present")
+        }
+
+        fn file_mut(&mut self) -> &mut std::fs::File {
+            self.file.as_mut().expect("uncommitted staging file is present")
+        }
+
+        fn commit(&mut self, win: &crate::mount_proto::WinRoot) -> std::io::Result<()> {
+            let file = self.file.as_ref().expect("uncommitted staging file is present");
+            win.rename_staged(&self.parent, &self.part_name, &self.target_name, file)?;
+            self.committed = true;
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for StagedPart {
+        fn drop(&mut self) {
+            if self.committed {
+                return;
+            }
+            if let Some(file) = self.file.as_ref() {
+                let _ = crate::mount_proto::safe_delete_open_file(file);
             }
         }
     }
@@ -693,19 +912,9 @@ pub mod serving {
         max_record_bytes: usize,
         commit_state: &Arc<std::sync::Mutex<bool>>,
     ) -> Result<()> {
-        #[cfg(windows)]
-        {
-            let _ = (record, commit_state);
-            discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
-            bail!("Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed");
-        }
-        #[cfg(not(windows))]
-        {
-            receive_file_confined(cfg, record, recs, cancel, max_record_bytes, commit_state).await
-        }
+        receive_file_confined(cfg, record, recs, cancel, max_record_bytes, commit_state).await
     }
 
-    #[cfg(not(windows))]
     async fn receive_file_confined(
         cfg: &mut SyncServeConfig,
         record: &Value,
@@ -720,13 +929,64 @@ pub mod serving {
         let full = record["full"].as_str().unwrap_or("").to_string();
         let target = cfg.root.join(&rel);
         if !path_within(&cfg.root, &target) { bail!("path escapes the remote dir"); }
-        if let Some(parent) = target.parent() { bound_parent(&cfg.root, parent)?; }
-        let part_name = format!(
-            "{}.part", rel.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-        );
+        // Unix keeps its path_bounds + openat2/renameat arms. Windows pins the
+        // admitted root at admission and walks/creates parents relative to it;
+        // the staging parent HANDLE is retained through finalization and no
+        // root/parent path is ever reopened.
+        #[cfg(not(windows))]
         let mut part_rel = rel.clone();
-        part_rel.set_file_name(part_name);
+        #[cfg(not(windows))]
+        if let Some(parent) = target.parent() { bound_parent(&cfg.root, parent)?; }
+        #[cfg(not(windows))]
+        {
+            let part_name = format!(
+                "{}.part", rel.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            );
+            part_rel.set_file_name(part_name);
+        }
+        #[cfg(not(windows))]
         let source = match safe_open_existing_file(&cfg.root, &rel) {
+            Ok(source) => match source.metadata() {
+                Ok(metadata) if metadata.is_file() => Some(source),
+                Ok(_) => {
+                    discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                    bail!("destination exists and is not a regular file");
+                }
+                Err(error) => {
+                    discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                    return Err(error.into());
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                return Err(error.into());
+            }
+        };
+        #[cfg(windows)]
+        let (parent, part_name, target_name) = {
+            let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+            let target_name = rel
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("unsafe path"))?
+                .to_os_string();
+            let mut part_name = target_name.clone();
+            part_name.push(".part");
+            let parent = match cfg.pin.win().and_then(|win| win.ensure_parent(parent_rel)) {
+                Ok(parent) => parent,
+                Err(error) => {
+                    discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                    return Err(error.into());
+                }
+            };
+            (parent, part_name, target_name)
+        };
+        #[cfg(windows)]
+        let source = match cfg
+            .pin
+            .win()
+            .and_then(|win| win.open_existing(&parent, &target_name))
+        {
             Ok(source) => match source.metadata() {
                 Ok(metadata) if metadata.is_file() => Some(source),
                 Ok(_) => {
@@ -748,6 +1008,7 @@ pub mod serving {
         // existing name and reopen it: that can follow a planted/replaced
         // symlink. Existing stale `.part` files fail closed. CREATE_NEW / O_EXCL
         // also closes the check/open race without a preceding path lookup.
+        #[cfg(not(windows))]
         let file = match safe_create_part(&cfg.root, &part_rel) {
             Ok(file) => file,
             Err(error) => {
@@ -755,7 +1016,22 @@ pub mod serving {
                 return Err(error.into());
             }
         };
+        #[cfg(windows)]
+        let file = match cfg
+            .pin
+            .win()
+            .and_then(|win| win.create_staging(&parent, &part_name))
+        {
+            Ok(file) => file,
+            Err(error) => {
+                discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
+                return Err(error.into());
+            }
+        };
+        #[cfg(not(windows))]
         let mut staged = StagedPart::new(&cfg.root, &part_rel, file);
+        #[cfg(windows)]
+        let mut staged = StagedPart::new(parent, part_name, target_name, file);
         #[cfg(test)]
         if let Some((entered, release)) = &cfg.staging_gate {
             entered.notify_one();
@@ -816,8 +1092,13 @@ pub mod serving {
         if *cancelled {
             bail!("sync cancelled");
         }
-        crate::mount_proto::safe_rename_beneath(&cfg.root, &part_rel, &rel, staged.file())?;
-        staged.mark_committed();
+        #[cfg(not(windows))]
+        {
+            crate::mount_proto::safe_rename_beneath(&cfg.root, &part_rel, &rel, staged.file())?;
+            staged.mark_committed();
+        }
+        #[cfg(windows)]
+        cfg.pin.win().and_then(|win| staged.commit(win))?;
         drop(cancelled);
         Ok(())
     }
@@ -853,7 +1134,7 @@ pub mod serving {
                 0o600,
             )
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(root.join(rel))
         }
@@ -865,7 +1146,7 @@ pub mod serving {
         {
             crate::mount_proto::safe_open_beneath(root, rel, libc::O_RDONLY, true, 0)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let path = root.join(rel);
             std::fs::File::open(path)
@@ -892,6 +1173,7 @@ pub mod serving {
     mod tests {
         use super::*;
         use crate::host::{HostServices, NoHost};
+        use crate::sync::RootPin;
         use filament_transport::net::Transport;
         use sha2::Digest;
         use std::sync::Mutex;
@@ -991,6 +1273,17 @@ pub mod serving {
             finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             staging_gate: Option<(Arc<Notify>, Arc<Notify>)>,
         ) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
+            let pin = RootPin::open(root).expect("pin the test receive root");
+            setup_with_pin(root, pin, wire, finalization_gate, staging_gate).await
+        }
+
+        async fn setup_with_pin(
+            root: &Path,
+            pin: RootPin,
+            wire: Vec<u8>,
+            finalization_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+            staging_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        ) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
             let host: Arc<dyn HostServices> = Arc::new(NoHost);
             let transport = Arc::new(CaptureTransport::default());
             let mux = Mux::new(transport.clone(), host);
@@ -1003,6 +1296,7 @@ pub mod serving {
                 mux: mux.clone(),
                 sid: SID,
                 root: root.to_path_buf(),
+                pin,
                 delete: true,
                 dry_run: false,
                 stream,
@@ -1087,33 +1381,410 @@ pub mod serving {
         }
 
         #[cfg(windows)]
-        #[tokio::test]
-        async fn windows_receive_fails_closed_without_touching_target_or_staging() {
-            let root = TempRoot::new();
-            std::fs::write(root.0.join("file.txt"), b"original").unwrap();
-            let bytes = b"must not be written";
-            let digest = sha2::Sha256::digest(bytes).iter()
-                .map(|b| format!("{b:02x}")).collect::<String>();
+        fn junction(target: &Path, link: &Path) -> bool {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new("cmd")
+                .creation_flags(CREATE_NO_WINDOW)
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        /// Required adversarial coverage must not silently skip: a runner that
+        /// cannot create junctions/symlinks fails here with the missing
+        /// capability named.
+        #[cfg(windows)]
+        fn require_junction(target: &Path, link: &Path) {
+            assert!(
+                junction(target, link),
+                "required Windows coverage: mklink /J (junction creation) is unavailable"
+            );
+        }
+
+        #[cfg(windows)]
+        fn require_symlink(target: &Path, link: &Path) {
+            assert!(
+                std::os::windows::fs::symlink_file(target, link).is_ok(),
+                "required Windows coverage: file symlink creation is unavailable"
+            );
+        }
+
+        #[cfg(windows)]
+        fn receive_wire(rel: &str, bytes: &[u8]) -> Vec<u8> {
+            let digest = sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             let mut wire = Vec::new();
             record(&json!({"type":"manifest", "files":[]}), &mut wire);
-            record(&json!({"type":"file", "p":"file.txt", "size":bytes.len(), "full":digest}), &mut wire);
+            record(
+                &json!({"type":"file", "p":rel, "size":bytes.len(), "full":digest}),
+                &mut wire,
+            );
             record(&json!({"type":"chunk", "idx":0}), &mut wire);
             record_bytes(bytes, &mut wire);
             record(&json!({"type":"file-end"}), &mut wire);
             record(&json!({"type":"done"}), &mut wire);
+            wire
+        }
 
-            let (task, mux, transport) = setup(&root.0, wire).await;
+        #[cfg(windows)]
+        async fn receive_one(
+            root: &Path,
+            rel: &str,
+            bytes: &[u8],
+        ) -> (SyncServeTask, Arc<Mux>, Arc<CaptureTransport>) {
+            setup(root, receive_wire(rel, bytes)).await
+        }
+
+        #[cfg(windows)]
+        fn root_with_sub() -> (TempRoot, PathBuf) {
+            let real = TempRoot::new();
+            let sub = real.0.join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            (real, sub)
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_receive_commits_a_new_file_and_replaces_an_existing_one() {
+            let root = TempRoot::new();
+            let bytes = b"first payload";
+            let (task, mux, transport) = receive_one(&root.0, "file.txt", bytes).await;
             assert!(task.join().await.unwrap().is_ok());
-            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), b"original");
-            assert!(!root.0.join("file.txt.part").exists());
             let replies = outgoing_json(&transport);
-            assert_eq!(replies[1]["type"], "file-ack");
-            assert_eq!(replies[1]["ok"], false);
-            let reason = replies[1]["err"].as_str().unwrap();
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), bytes);
+            assert!(!root.0.join("file.txt.part").exists());
+            assert_eq!(mux.live_streams().await, 0);
+
+            std::fs::write(root.0.join("file.txt"), b"old content").unwrap();
+            let replacement = b"second payload, longer";
+            let (task, mux, transport) = receive_one(&root.0, "file.txt", replacement).await;
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
             assert_eq!(
-                reason,
-                "Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed",
+                std::fs::read(root.0.join("file.txt")).unwrap(),
+                replacement
             );
+            assert!(!root.0.join("file.txt.part").exists());
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_receive_without_a_pinned_root_fails_closed() {
+            let root = TempRoot::new();
+            let bytes = b"must not be written";
+            let pin = RootPin::path_only(&root.0);
+            let (task, mux, transport) = setup_with_pin(
+                &root.0,
+                pin,
+                receive_wire("file.txt", bytes),
+                None,
+                None,
+            )
+            .await;
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], false);
+            assert!(
+                replies[1]["err"]
+                    .as_str()
+                    .unwrap()
+                    .contains("requires a root pinned at admission"),
+                "replies: {replies:?}"
+            );
+            assert!(!root.0.join("file.txt").exists());
+            assert!(!root.0.join("file.txt.part").exists());
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_stale_part_is_never_adopted_and_cleanup_is_identity_bound() {
+            let root = TempRoot::new();
+            std::fs::write(root.0.join("file.txt.part"), b"stale staging").unwrap();
+            let bytes = b"new bytes";
+            let (task, mux, transport) = receive_one(&root.0, "file.txt", bytes).await;
+            assert!(task.join().await.unwrap().is_ok());
+            assert_eq!(
+                std::fs::read(root.0.join("file.txt.part")).unwrap(),
+                b"stale staging",
+                "an existing .part is refused, never truncated or adopted"
+            );
+            assert!(!root.0.join("file.txt").exists());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], false);
+            assert!(replies[1]["err"].as_str().unwrap().contains("exists"));
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_receive_refuses_a_junction_parent_with_the_pinned_walk_error() {
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            require_junction(&outside.0, &root.0.join("nested"));
+            let bytes = b"confined";
+            let (task, mux, transport) =
+                receive_one(&root.0, "nested/file.txt", bytes).await;
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], false);
+            assert_eq!(
+                replies[1]["err"].as_str().unwrap(),
+                "refusing Windows sync path: a parent is a junction/symlink (reparse point)",
+                "the PINNED walk names the junction, not a path-bounds fallback"
+            );
+            assert!(
+                std::fs::read_dir(&outside.0).unwrap().next().is_none(),
+                "nothing was created through the junction"
+            );
+            assert!(!root.0.join("nested/file.txt").exists());
+            assert_eq!(mux.live_streams().await, 0);
+            let _ = std::fs::remove_dir_all(&root.0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_replaced_root_path_before_staging_writes_only_to_the_pinned_root() {
+            let (real, sub) = root_with_sub();
+            let pin = RootPin::open(&sub).expect("pin the admitted root");
+            let outside = TempRoot::new();
+            // The path the config carries is now a junction outside the real
+            // admitted directory. Any implementation that reopens the root by
+            // path would write here; the pinned handle must not.
+            let replaced = real.0.join("replaced");
+            require_junction(&outside.0, &replaced);
+            let bytes = b"pinned before staging";
+            let (task, mux, transport) = setup_with_pin(
+                &replaced,
+                pin,
+                receive_wire("file.txt", bytes),
+                None,
+                None,
+            )
+            .await;
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(std::fs::read(sub.join("file.txt")).unwrap(), bytes);
+            assert!(
+                std::fs::read_dir(&outside.0).unwrap().next().is_none(),
+                "the replaced root path was never written through"
+            );
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_replaced_root_path_during_finalization_writes_only_to_the_pinned_root() {
+            let (real, sub) = root_with_sub();
+            let pin = RootPin::open(&sub).expect("pin the admitted root");
+            let outside = TempRoot::new();
+            let replaced = real.0.join("replaced");
+            require_junction(&outside.0, &replaced);
+            let bytes = b"pinned through finalization";
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_pin(
+                &replaced,
+                pin,
+                receive_wire("file.txt", bytes),
+                Some((entered.clone(), release.clone())),
+                None,
+            )
+            .await;
+            entered.notified().await;
+            // The stage exists and the finalization is paused. The config path
+            // is still the outside junction; the commit must use the pinned
+            // parent, not that path.
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(std::fs::read(sub.join("file.txt")).unwrap(), bytes);
+            assert!(
+                std::fs::read_dir(&outside.0).unwrap().next().is_none(),
+                "finalization used the pinned root, not the replaced path"
+            );
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_parent_rename_after_staging_is_blocked_by_the_pinned_handle() {
+            let root = TempRoot::new();
+            std::fs::create_dir(root.0.join("nested")).unwrap();
+            let bytes = b"parent pinned";
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_finalization_gate(
+                &root.0,
+                receive_wire("nested/file.txt", bytes),
+                Some((entered.clone(), release.clone())),
+            )
+            .await;
+            entered.notified().await;
+            let error = std::fs::rename(root.0.join("nested"), root.0.join("nested-moved"))
+                .expect_err("the pinned parent handle must block a rename");
+            assert!(
+                error.raw_os_error().is_some(),
+                "the OS refused the rename: {error}"
+            );
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(std::fs::read(root.0.join("nested/file.txt")).unwrap(), bytes);
+            assert!(!root.0.join("nested-moved").exists());
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_two_level_ancestor_rename_is_blocked_by_the_retained_chain() {
+            let root = TempRoot::new();
+            std::fs::create_dir_all(root.0.join("nested/deep")).unwrap();
+            let bytes = b"ancestors pinned";
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_finalization_gate(
+                &root.0,
+                receive_wire("nested/deep/file.txt", bytes),
+                Some((entered.clone(), release.clone())),
+            )
+            .await;
+            entered.notified().await;
+            // `nested` is two levels above the staging file; the retained chain
+            // (root + nested + deep) must block renaming it.
+            let error = std::fs::rename(root.0.join("nested"), root.0.join("nested-moved"))
+                .expect_err("the retained ancestor HANDLE must block the rename");
+            assert!(
+                error.raw_os_error().is_some(),
+                "the OS refused the ancestor rename: {error}"
+            );
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(
+                std::fs::read(root.0.join("nested/deep/file.txt")).unwrap(),
+                bytes
+            );
+            assert!(!root.0.join("nested-moved").exists());
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_staging_name_replacement_is_blocked_until_commit() {
+            let root = TempRoot::new();
+            let bytes = b"stage pinned";
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_finalization_gate(
+                &root.0,
+                receive_wire("file.txt", bytes),
+                Some((entered.clone(), release.clone())),
+            )
+            .await;
+            entered.notified().await;
+            let error = std::fs::rename(root.0.join("file.txt.part"), root.0.join("other.part"))
+                .expect_err("the open staging handle must block a rename");
+            assert!(
+                error.raw_os_error().is_some(),
+                "the OS refused the rename: {error}"
+            );
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), bytes);
+            assert!(!root.0.join("other.part").exists());
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_staging_hardlink_or_rename_out_of_the_parent_is_not_an_escape() {
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            let bytes = b"staged content";
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (task, mux, transport) = setup_with_finalization_gate(
+                &root.0,
+                receive_wire("file.txt", bytes),
+                Some((entered.clone(), release.clone())),
+            )
+            .await;
+            entered.notified().await;
+            // A rename out of the pinned parent must be refused; a hard link
+            // is a second name for the SAME verified inode and cannot change
+            // what finalization commits.
+            let moved = std::fs::rename(
+                root.0.join("file.txt.part"),
+                outside.0.join("file.txt.part"),
+            );
+            assert!(moved.is_err(), "the pinned staging name cannot be moved out");
+            let linked = std::fs::hard_link(
+                root.0.join("file.txt.part"),
+                outside.0.join("stolen.bin"),
+            );
+            release.notify_one();
+
+            assert!(task.join().await.unwrap().is_ok());
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], true, "replies: {replies:?}");
+            assert_eq!(std::fs::read(root.0.join("file.txt")).unwrap(), bytes);
+            if linked.is_ok() {
+                assert_eq!(
+                    std::fs::read(outside.0.join("stolen.bin")).unwrap(),
+                    bytes,
+                    "the extra name points at the same verified content, not an escape"
+                );
+            }
+            assert_eq!(mux.live_streams().await, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn windows_receive_refuses_a_destination_link_without_writing_through_it() {
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            let outside_file = outside.0.join("outside.txt");
+            std::fs::write(&outside_file, b"outside remains").unwrap();
+            require_symlink(&outside_file, &root.0.join("file.txt"));
+            let bytes = b"new content";
+            let (task, mux, transport) = receive_one(&root.0, "file.txt", bytes).await;
+            assert!(task.join().await.unwrap().is_ok());
+            assert_eq!(
+                std::fs::read(&outside_file).unwrap(),
+                b"outside remains",
+                "the link target was never written through"
+            );
+            assert!(
+                std::fs::symlink_metadata(root.0.join("file.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the refused receive left the destination link in place"
+            );
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], false);
             assert_eq!(mux.live_streams().await, 0);
         }
 
@@ -1185,7 +1856,7 @@ pub mod serving {
             assert_eq!(mux.live_streams().await, 0);
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         #[tokio::test]
         async fn cancellation_after_stage_creation_cleans_stage_and_retry_succeeds() {
             let root = TempRoot::new();
@@ -1621,6 +2292,67 @@ mod tests {
                 "no symlink support on this platform",
             ))
         }
+    }
+
+    #[cfg(windows)]
+    fn win_junction(target: &Path, link: &Path) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let ok = std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            ok,
+            "required Windows coverage: mklink /J (junction creation) is unavailable"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_admission_refuses_an_ancestor_junction_root() {
+        let share = Share::new();
+        let outside = Share::new();
+        win_junction(&outside.0, &share.0.join("anc"));
+        let t = Arc::new(CaptureTransport::default());
+        let host = TestHost::new(false, Verdict::Allow);
+        let (mut conn, _far) = connection(host, t.clone(), true, true, Some("phone")).await;
+        let mut muxes = MuxMap::new();
+        let out = admit_sync_open(&mut conn, PID, &open("anc/sub", SID), &mut muxes, &share.0).await;
+        let SyncAdmission::Refused(r) = out else {
+            panic!("an ancestor junction must be refused, not admitted");
+        };
+        assert_eq!(
+            r.reason, "remote dir is outside this device's drop directory",
+            "a junction root keeps the historical outside-drop wire reason"
+        );
+        assert!(
+            std::fs::read_dir(&outside.0).unwrap().next().is_none(),
+            "nothing was created through the ancestor junction"
+        );
+        assert!(!share.0.join("anc/sub").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_admission_creates_a_missing_root_relative_to_the_drop_dir() {
+        let share = Share::new();
+        let t = Arc::new(CaptureTransport::default());
+        let host = TestHost::new(false, Verdict::Allow);
+        let (mut conn, _far) = connection(host, t.clone(), true, true, Some("phone")).await;
+        let mut muxes = MuxMap::new();
+        let out = admit_sync_open(&mut conn, PID, &open("new/deep", SID), &mut muxes, &share.0).await;
+        let SyncAdmission::Accepted(a) = out else {
+            panic!("a valid trusted open must be admitted");
+        };
+        assert!(share.0.join("new/deep").is_dir());
+        assert_eq!(a.root, share.0.join("new/deep").canonicalize().unwrap());
     }
 
     #[tokio::test]

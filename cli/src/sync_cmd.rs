@@ -638,10 +638,13 @@ mod tests {
 
     #[test]
     fn windows_sync_refusal_is_operator_visible_without_genericizing_reason() {
-        let reason = "Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed";
+        // Windows receive now works for NTFS; an unsupported filesystem still
+        // fails closed with this named reason, and the renderer must keep it
+        // verbatim instead of replacing it with a generic sentence.
+        let reason = "Windows sync finalization is not supported on this filesystem: the filesystem cannot express a handle-relative replace";
         assert_eq!(
             file_result_text("failed", "docs/notes.txt", 123, Some(reason)),
-            "failed: Windows sync receive disabled: race-safe parent-relative rename unavailable; no target or .part file was changed  docs/notes.txt",
+            "failed: Windows sync finalization is not supported on this filesystem: the filesystem cannot express a handle-relative replace  docs/notes.txt",
         );
         let mut report = Report {
             json: true,
