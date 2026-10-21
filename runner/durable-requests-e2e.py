@@ -37,6 +37,11 @@ def main():
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     server = f"http://127.0.0.1:{port}"
+    passes = [0]
+    def okay(message):
+        passes[0] += 1
+        print(f"PASS: {message}", flush=True)
+
     owner, guest, inbox = work / "owner", work / "guest", work / "inbox"
     configured = work / "configured-inbox"
     for path in (owner, guest, inbox, configured):
@@ -143,7 +148,7 @@ def main():
         request = state()["requests"][0]
         assert request["state"] == "pending", request
         assert not list(inbox.iterdir()), "bytes/staging arrived before approval"
-        print("PASS: proven restricted sender created one offer and no unsolicited bytes", flush=True)
+        okay("proven restricted sender created one offer and no unsolicited bytes")
 
         stop(receiver)
         listing = run(owner, "requests").stdout
@@ -162,7 +167,7 @@ def main():
         target = Path(approved["destination"])
         assert target.read_bytes() == original
         assert state()["requests"][0]["state"] == "fulfilled"
-        print("PASS: offline approval and process restart delivered the retained exact snapshot", flush=True)
+        okay("offline approval and process restart delivered the retained exact snapshot")
 
         # A completed sender retry must reach the receiver, get its receipt, and
         # still create no second request or duplicate file.
@@ -172,7 +177,7 @@ def main():
         assert sorted(path.name for path in inbox.iterdir()) == before
         assert len(state()["requests"]) == 1
         assert state()["requests"][0]["state"] == "fulfilled"
-        print("PASS: completed retry reached the receipt and made no duplicate", flush=True)
+        okay("completed retry reached the receipt and made no duplicate")
 
         declined_source = work / "decline.bin"
         declined_source.write_bytes(b"never approved")
@@ -181,13 +186,15 @@ def main():
         declined_id = queued["offers"][0]["id"]
         pending = next(item for item in state()["requests"] if item["state"] == "pending")
         run(owner, "requests", "decline", pending["id"])
-        denied = json_result(run(guest, "--json", "send", "--resume", declined_id,
-                                 "--timeout", "15", success=False))
+        denied_run = run(guest, "--json", "send", "--resume", declined_id,
+                         "--timeout", "15", success=False)
+        assert denied_run.returncode != 0, denied_run
+        denied = json_result(denied_run)
         assert denied["delivered"] is False and denied["state"] == "closed", denied
         assert denied["offers"][0]["state"] == "denied", denied
         assert next(item for item in state()["requests"] if item["id"] == pending["id"])["state"] == "denied"
         assert not (inbox / "decline.bin").exists()
-        print("PASS: a recorded decline reached the sender and never delivered bytes", flush=True)
+        okay("a recorded decline reached the sender and never delivered bytes")
 
         # Actual sender-daemon scheduling, not a simulated retry loop.
         automatic_source = work / "automatic.bin"
@@ -207,7 +214,7 @@ def main():
                  "sender's verified delivery receipt", seconds=15)
         stop(sender_daemon)
         assert Path(next(item for item in state()["requests"] if item["id"] == pending["id"])["destination"]).read_bytes() == automatic_source.read_bytes()
-        print("PASS: the sender daemon retried a retained offer and reaped its attempt", flush=True)
+        okay("the sender daemon retried a retained offer and reaped its attempt")
 
         # Offline receiver: persistence is sender-local, no cloud mailbox.
         stop(receiver)
@@ -224,7 +231,7 @@ def main():
         run(owner, "requests", "accept", pending["id"])
         delivered = json_result(run(guest, "--json", "send", "--resume", offline_id, "--timeout", "15"))
         assert delivered["delivered"] is True
-        print("PASS: offline receiver did not lose the sender-retained offer", flush=True)
+        okay("offline receiver did not lose the sender-retained offer")
 
         if args.fault_hooks:
             # The real receiver commits then drops the link at the ack boundary.
@@ -250,7 +257,7 @@ def main():
             assert delivered["delivered"] is True
             assert len(list(inbox.glob("receipt*"))) == 1
             assert (inbox / "receipt.bin").read_bytes() == receipt_source.read_bytes()
-            print("PASS: committed receipt survived ack loss and restart without duplicate placement", flush=True)
+            okay("committed receipt survived ack loss and restart without duplicate placement")
 
         # Revocation stays authoritative after review and receiver restart.
         revoked_source = work / "revoked.bin"
@@ -261,14 +268,17 @@ def main():
         pending = next(item for item in state()["requests"] if item["state"] == "pending")
         run(owner, "requests", "accept", pending["id"])
         run(owner, "--yes", "revoke", "guest", "--certificate")
-        revoked = json_result(run(guest, "--json", "send", "--resume", revoked_id,
-                                  "--timeout", "15", success=False))
+        revoked_run = run(guest, "--json", "send", "--resume", revoked_id,
+                          "--timeout", "15", success=False)
+        assert revoked_run.returncode != 0, revoked_run
+        revoked = json_result(revoked_run)
         assert revoked["delivered"] is False and revoked["state"] == "closed", revoked
         assert revoked["offers"][0]["state"] == "denied", revoked
         assert next(item for item in state()["requests"] if item["id"] == pending["id"])["state"] == "failed"
         assert not (inbox / "revoked.bin").exists()
-        print("PASS: fresh revocation retired the approval and never delivered", flush=True)
-        (work / "summary.json").write_text(json.dumps({"ok": True,
+        okay("fresh revocation retired the approval and never delivered")
+        assert passes[0] == 8, f"expected 8 PASS lines, got {passes[0]}"
+        (work / "summary.json").write_text(json.dumps({"ok": True, "passes": passes[0],
             "sha256": hashlib.sha256(original).hexdigest(), "commands": logs}, indent=2))
     finally:
         for child in reversed(processes):
