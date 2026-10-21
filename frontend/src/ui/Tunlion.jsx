@@ -398,8 +398,10 @@ function CodeBox({ state, onPairWithCode, onReceiveWithCode, initialCode, openEn
     }
     setInputError(null)
     setSubmitted(true)
-    if (mode === 'receive') onReceiveWithCode(checked.code)
-    else onPairWithCode(checked.code)
+    // The visible field is the familiar uppercase presentation; the PAKE
+    // parser normalizes case exactly as the CLI's shared split does.
+    if (mode === 'receive') onReceiveWithCode(checked.value)
+    else onPairWithCode(checked.value)
   }
 
   // Show the hook's status when this box started the attempt, or when it is an
