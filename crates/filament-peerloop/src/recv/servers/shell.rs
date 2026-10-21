@@ -102,8 +102,10 @@ pub trait PtySession: Send + Sync {
     /// when the session already ended, so the caller releases its stream
     /// immediately instead of leaving it registered forever.
     fn set_end_cleanup(&self, _cleanup: Box<dyn FnOnce() + Send>) -> bool {
-        // Reduced/fake hosts have no session task to notify.
-        true
+        // A host that cannot notify us on session end must NOT claim it will:
+        // returning true here would drop the release and leak the stream. The
+        // caller treats false as "release it now".
+        false
     }
 }
 
@@ -228,13 +230,17 @@ async fn install_end_cleanup(mux: &Arc<Mux>, sid: u32, sess: &Arc<dyn PtySession
 #[cfg(feature = "pty-server")]
 async fn prune_session_attachments(
     session_id: &str,
+    keep: Option<(&str, u32)>,
     muxes: &HashMap<String, Arc<Mux>>,
     bindings: &mut HashMap<String, HashMap<u32, String>>,
 ) {
     let mut stale: Vec<(String, u32)> = Vec::new();
     for (binding_pid, sid_map) in bindings.iter_mut() {
         sid_map.retain(|old_sid, key| {
-            if key == session_id {
+            let kept = keep.is_some_and(|(keep_pid, keep_sid)| {
+                keep_pid == binding_pid.as_str() && keep_sid == *old_sid
+            });
+            if key == session_id && !kept {
                 stale.push((binding_pid.clone(), *old_sid));
                 false
             } else {
@@ -253,6 +259,43 @@ async fn prune_session_attachments(
             }
         }
     }
+}
+
+/// Drop bindings on `pid` whose sid no longer names a stream owned by that
+/// exact session key. Natural session exit releases the stream through the end
+/// callback (which cannot reach the receive-loop-owned map), so the entry can
+/// briefly outlive it; validating here keeps a stale key from refusing another
+/// session that legitimately reuses the sid, or from authorizing a close.
+#[cfg(feature = "pty-server")]
+async fn prune_stale_link_bindings(
+    pid: &str,
+    mux: &Arc<Mux>,
+    bindings: &mut HashMap<String, HashMap<u32, String>>,
+) {
+    let entries: Vec<(u32, String)> = bindings
+        .get(pid)
+        .map(|sid_map| {
+            sid_map
+                .iter()
+                .map(|(sid, key)| (*sid, key.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut stale = Vec::new();
+    for (sid, key) in entries {
+        if mux.stream_owner(sid).await.as_deref() != Some(key.as_str()) {
+            stale.push(sid);
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+    if let Some(sid_map) = bindings.get_mut(pid) {
+        for sid in stale {
+            sid_map.remove(&sid);
+        }
+    }
+    bindings.retain(|_, sid_map| !sid_map.is_empty());
 }
 
 #[cfg(feature = "pty-server")]
@@ -360,11 +403,14 @@ pub async fn open_pty(
         return;
     }
 
+    // A natural session exit releases its stream but cannot reach this map.
+    // Validate first so a stale entry neither refuses a legitimate new owner of
+    // the sid nor authorizes ending/dropping a stream it does not own.
+    prune_stale_link_bindings(&pid, &mux, bindings).await;
+
     // OWNERSHIP BEFORE ANY DESTRUCTIVE CLEANUP. A sid already bound to another
     // exact session key, or a live stream this link carries without a PTY
     // binding for OUR key, belongs to someone else: refuse and leave it whole.
-    // A duplicate open for the same key is the one case that may replace its
-    // own attachment.
     let incoming_owner = bindings
         .get(&pid)
         .and_then(|sid_map| sid_map.get(&sid))
@@ -375,6 +421,8 @@ pub async fn open_pty(
     } else {
         None
     };
+    let duplicate =
+        live_session.is_some() && has_stream && live_owner.as_deref() == Some(session_id.as_str());
     let foreign_binding = incoming_owner
         .as_deref()
         .is_some_and(|owner| owner != session_id);
@@ -388,6 +436,17 @@ pub async fn open_pty(
             .say(&format!("l2: pty refused: sid {sid:#x} in use"));
         let _ = t
             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
+            .await;
+        return;
+    }
+    // MONOTONIC PTY SIDS: a new attachment may only use a sid ABOVE every PTY
+    // sid this link has registered. Duplicate opens of the live sid are
+    // idempotent and decided above; a retired/lower sid is refused by name.
+    if !duplicate && mux.pty_sid_retired(sid) {
+        conn.log
+            .say(&format!("l2: pty refused: sid {sid:#x} is retired"));
+        let _ = t
+            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid retired" }))
             .await;
         return;
     }
@@ -408,7 +467,12 @@ pub async fn open_pty(
             }
         }
     }
-    let projected = live.saturating_sub(own_live) + 1;
+    // A duplicate keeps its live stream; a fresh attachment adds one.
+    let projected = if duplicate {
+        live.saturating_sub(own_live)
+    } else {
+        live.saturating_sub(own_live) + 1
+    };
     if projected > l2::MAX_STREAMS_PER_LINK {
         let what = if action == PtyAction::Reattach {
             "reattach"
@@ -425,13 +489,28 @@ pub async fn open_pty(
 
     // Supersede this session's previous attachment(s), on this link or another
     // one. Removal closes the old mux pipe and resizer, so its input/resize
-    // pumps exit instead of accumulating one per reconnect.
-    prune_session_attachments(&session_id, muxes, bindings).await;
-    // A duplicate open can carry a sid whose stream is ours but whose binding
-    // was already gone. Release that exact-owned stream too, so the fresh
-    // attachment is the only registration.
-    if mux.stream_owner(sid).await.as_deref() == Some(session_id.as_str()) {
-        mux.drop_stream(sid).await;
+    // pumps exit instead of accumulating one per reconnect. A duplicate keeps
+    // the currently live (pid, sid) attachment.
+    let keep = duplicate.then_some((pid.as_str(), sid));
+    prune_session_attachments(&session_id, keep, muxes, bindings).await;
+
+    if duplicate {
+        let Some(sess) = live_session else { return };
+        let _ = t
+            .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
+            .await;
+        sess.attach(t.clone(), sid, plan.resume_from);
+        sess.resize(cols, rows);
+        bindings
+            .entry(pid.clone())
+            .or_default()
+            .insert(sid, session_id.clone());
+        install_end_cleanup(&mux, sid, &sess).await;
+        conn.log.say(&format!(
+            "l2: pty REATTACHED to '{}', {cols}x{rows}",
+            dev.unwrap_or_default()
+        ));
+        return;
     }
 
     if action == PtyAction::Reattach {
@@ -577,6 +656,9 @@ pub async fn pty_resize(
     let Some(sid) = l2::wire_sid(v) else { return };
     let cols = v["cols"].as_u64().unwrap_or(80) as u16;
     let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+    if let Some(mux) = muxes.get(pid) {
+        prune_stale_link_bindings(pid, mux, bindings).await;
+    }
     if let Some(sid_map) = bindings.get(pid) {
         if let Some(session_id) = sid_map.get(&sid) {
             if let Some(sess) = ports.pty.get_live(session_id).await {
@@ -612,6 +694,12 @@ pub async fn pty_close(
     let Some(raw) = v["session"].as_str().filter(|s| !s.is_empty()) else {
         return;
     };
+    // Drop bindings whose stream has already ended before resolving. The
+    // receive-loop-owned map can outlive a natural exit, and a stale entry must
+    // not authorize ending or dropping a stream its sid now points at.
+    if let Some(mux) = muxes.get(pid) {
+        prune_stale_link_bindings(pid, mux, bindings).await;
+    }
     // Resolve ONLY inside the closing link's own bindings. The session store is
     // process-wide and keyed by the device-scoped id, so a frame-named key
     // would let any peer end/forget another device's shell. A key this link
@@ -628,7 +716,25 @@ pub async fn pty_close(
         return;
     }
     let mut ended: Vec<&str> = Vec::new();
-    for (_, session_id) in &matches {
+    for (matched_sid, session_id) in &matches {
+        // OWNERSHIP CHECK: the sid must still be the stream THIS exact session
+        // opened. A stale binding over a reused/foreign stream is removed at
+        // the end, but it may not end/forget the session or drop that stream.
+        let owns = match muxes.get(pid) {
+            Some(mux) => {
+                mux.stream_owner(*matched_sid).await.as_deref() == Some(session_id.as_str())
+            }
+            None => false,
+        };
+        if !owns {
+            continue;
+        }
+        // The close is the end of THIS link's attachment: release its stream
+        // and resizer now instead of waiting for the initiator's l2-close
+        // (which a closing tab may never send) or for the link to die.
+        if let Some(mux) = muxes.get(pid) {
+            mux.drop_stream(*matched_sid).await;
+        }
         if ended.contains(&session_id.as_str()) {
             continue;
         }
@@ -645,14 +751,7 @@ pub async fn pty_close(
     if let Some(sid_map) = bindings.get_mut(pid) {
         sid_map.retain(|sid, _| !matches.iter().any(|(matched, _)| matched == sid));
     }
-    // The close is the end of THIS link's attachment: release its stream and
-    // resizer now instead of waiting for the initiator's l2-close (which a
-    // closing tab may never send) or for the link to die.
-    if let Some(mux) = muxes.get(pid) {
-        for (matched_sid, _) in &matches {
-            mux.drop_stream(*matched_sid).await;
-        }
-    }
+    bindings.retain(|_, sid_map| !sid_map.is_empty());
 }
 
 pub async fn detach_link_ptys(
@@ -672,7 +771,8 @@ pub async fn detach_link_ptys(
 #[cfg(all(test, feature = "pty-server"))]
 mod tests {
     use super::{
-        open_pty, pty_close, pty_open_action, PtyAction, PtyBackend, PtySession, PtySpawnSpec,
+        install_end_cleanup, open_pty, pty_close, pty_open_action, PtyAction, PtyBackend,
+        PtySession, PtySpawnSpec,
     };
     use crate::conn::{Conn, Link, Presence};
     use crate::host::{CapGate, HostServices, NoHost, VecLog};
@@ -1356,9 +1456,15 @@ mod tests {
             "pty-close releases its own stream and resizer"
         );
 
-        // Re-opening the SAME stable id after the close must spawn a fresh
-        // shell. Before `forget` this reattached to the dying handle.
-        open(&mut h, &open_frame("client-1", false)).await;
+        // PTY sids are monotonic, so the reopened terminal uses the next sid.
+        // Re-opening the SAME stable session id must spawn a fresh shell (not
+        // reattach to the dying handle), and the retired sid must not be
+        // reusable for a new stream.
+        open(
+            &mut h,
+            &open_frame_sid("client-1", false, SID + 1),
+        )
+        .await;
         assert_eq!(
             h.c.spawns.load(Ordering::SeqCst),
             2,
@@ -1370,7 +1476,15 @@ mod tests {
             "close->reopen never takes the reattach path"
         );
         assert_eq!(h.c.forgets.load(Ordering::SeqCst), 1);
-        assert_eq!(h.bindings[PID][&SID], SESSION);
+        assert_eq!(h.bindings[PID][&(SID + 1)], SESSION);
+        open(&mut h, &open_frame("client-1", false)).await;
+        assert!(
+            controls(&h)
+                .iter()
+                .any(|v| v["type"] == "l2-close" && v["err"] == "sid retired"),
+            "a retired sid must be refused by name"
+        );
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1567,6 +1681,133 @@ mod tests {
         assert_eq!(h.c.attaches.load(Ordering::SeqCst), 1);
         assert_eq!(h.bindings[PID].len(), 1);
         assert_eq!(h.bindings[PID][&(SID + 1)], SESSION);
+    }
+
+    #[tokio::test]
+    async fn duplicate_after_reattach_is_idempotent_and_retired_sid_is_named() {
+        let mut h = harness(true).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+        open(
+            &mut h,
+            &open_frame_sid("client-1", false, SID + 1),
+        )
+        .await;
+        assert_eq!(h.muxes[PID].live_sids().await, vec![SID + 1]);
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 1);
+
+        // Duplicate of the CURRENT sid: reattach the same stream, no churn.
+        let streams_before = h.muxes[PID].live_streams().await;
+        open(
+            &mut h,
+            &open_frame_sid("client-1", false, SID + 1),
+        )
+        .await;
+        assert_eq!(h.muxes[PID].live_streams().await, streams_before);
+        assert_eq!(h.muxes[PID].live_sids().await, vec![SID + 1]);
+        assert_eq!(h.muxes[PID].live_resizers().await, 1);
+        assert_eq!(h.bindings[PID].len(), 1);
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 2);
+        assert_eq!(h.c.spawns.load(Ordering::SeqCst), 1);
+
+        // The superseded sid is retired: naming it again is refused by name and
+        // cannot disturb the current generation.
+        open(&mut h, &open_frame("client-1", false)).await;
+        assert!(controls(&h)
+            .iter()
+            .any(|v| v["type"] == "l2-close" && v["err"] == "sid retired"));
+        assert_eq!(h.muxes[PID].live_sids().await, vec![SID + 1]);
+        assert_eq!(h.c.attaches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pty_close_ignores_a_stale_binding_over_a_foreign_stream() {
+        let mut h = harness(true).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+        // Natural-exit window: stream gone, binding still present, then a
+        // foreign (forward/mount) stream reuses the sid.
+        h.muxes[PID].drop_pty(SID).await;
+        let _foreign = pre_register_sid(&mut h, SID).await;
+
+        pty_close(
+            &h.ports,
+            PID,
+            &json!({"type": "pty-close", "session": "client-1"}),
+            &h.muxes,
+            &mut h.bindings,
+        )
+        .await;
+
+        assert_eq!(h.c.ends.load(Ordering::SeqCst), 0, "foreign stream's owner must not be ended");
+        assert_eq!(h.c.forgets.load(Ordering::SeqCst), 0);
+        assert!(
+            h.muxes[PID].has_stream(SID).await,
+            "pty-close must not drop a stream the binding no longer owns"
+        );
+        assert!(
+            h.bindings.get(PID).map_or(true, |m| m.is_empty()),
+            "the stale binding is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_session_reusing_a_stale_binding_sid_is_told_retired_not_foreign() {
+        let mut h = harness(true).await;
+        open(&mut h, &open_frame("client-1", false)).await;
+        h.muxes[PID].drop_pty(SID).await; // natural-exit window: binding remains
+        const SESSION_B: &str = "phone\u{1}client-2";
+        insert_live(&h, SESSION_B);
+
+        open(&mut h, &open_frame("client-2", false)).await;
+
+        assert!(
+            controls(&h)
+                .iter()
+                .any(|v| v["type"] == "l2-close" && v["err"] == "sid retired"),
+            "the stale binding is removed, and the monotonic rule names the real reason"
+        );
+        assert!(!controls(&h)
+            .iter()
+            .any(|v| v["type"] == "l2-close" && v["err"] == "sid in use"));
+        assert!(h.bindings.get(PID).map_or(true, |m| m.is_empty()));
+        assert_eq!(h.c.ends.load(Ordering::SeqCst), 0);
+
+        // The next monotonic sid works for the other client.
+        open(
+            &mut h,
+            &open_frame_sid("client-2", false, SID + 1),
+        )
+        .await;
+        assert_eq!(h.bindings[PID][&(SID + 1)], SESSION_B);
+    }
+
+    #[tokio::test]
+    async fn a_host_without_end_notification_releases_the_stream_immediately() {
+        struct DefaultCleanupSession;
+        impl PtySession for DefaultCleanupSession {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn attach(&self, _t: Arc<dyn Transport>, _sid: u32, _resume_from: Option<u64>) {}
+            fn resize(&self, _cols: u16, _rows: u16) {}
+            fn detach(&self) {}
+            fn end(&self) {}
+        }
+
+        let mux = Mux::new(Arc::new(CaptureTransport::default()), Arc::new(AllowHost));
+        let sid = SID + 40;
+        let _rx = mux.register_pty_stream(sid, SESSION.into()).await.unwrap();
+        let (rtx, _rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        mux.register_resizer(sid, rtx).await;
+        let sess: Arc<dyn PtySession> = Arc::new(DefaultCleanupSession);
+
+        install_end_cleanup(&mux, sid, &sess).await;
+
+        assert_eq!(
+            mux.live_streams().await,
+            0,
+            "a default host cannot notify, so the caller must release now"
+        );
+        assert_eq!(mux.live_resizers().await, 0);
     }
 
     #[tokio::test]
