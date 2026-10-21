@@ -1726,8 +1726,10 @@ mod win_at {
             self._id
         }
 
-        /// Test/absolute-path pin. Production admission uses `open_relative`
-        /// from the pinned drop directory.
+        /// Test-only absolute-path pin. Production admission MUST use
+        /// `open_relative` from the pinned drop directory; keeping this out of
+        /// non-test builds prevents a path-rooted pin from being reintroduced.
+        #[cfg(test)]
         pub fn open(root: &Path) -> io::Result<Self> {
             let handle = open_root_handle(root, true)?;
             let id = stable_id(handle.as_raw_handle() as HANDLE)?;

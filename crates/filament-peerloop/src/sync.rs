@@ -182,6 +182,11 @@ pub struct RootPin {
 impl RootPin {
     /// Pin the canonical root. Fails closed if the root is a reparse point, has
     /// no stable identity, or changes between canonicalisation and pinning.
+    ///
+    /// Windows production admission does not use this path-rooted form
+    /// (`from_win` after `WinRoot::open_relative`); the method stays available
+    /// to non-Windows admission and to tests.
+    #[cfg(any(not(windows), test))]
     pub fn open(root: &Path) -> std::io::Result<Self> {
         #[cfg(windows)]
         {
@@ -229,10 +234,13 @@ impl RootPin {
     }
 
     #[cfg(windows)]
-    fn win(&self) -> &crate::mount_proto::WinRoot {
-        self.win
-            .as_ref()
-            .expect("a non-dry-run sync receive root is pinned")
+    fn win(&self) -> std::io::Result<&crate::mount_proto::WinRoot> {
+        self.win.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Windows sync receive requires a root pinned at admission",
+            )
+        })
     }
 }
 
@@ -964,7 +972,7 @@ pub mod serving {
                 .to_os_string();
             let mut part_name = target_name.clone();
             part_name.push(".part");
-            let parent = match cfg.pin.win().ensure_parent(parent_rel) {
+            let parent = match cfg.pin.win().and_then(|win| win.ensure_parent(parent_rel)) {
                 Ok(parent) => parent,
                 Err(error) => {
                     discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
@@ -974,7 +982,11 @@ pub mod serving {
             (parent, part_name, target_name)
         };
         #[cfg(windows)]
-        let source = match cfg.pin.win().open_existing(&parent, &target_name) {
+        let source = match cfg
+            .pin
+            .win()
+            .and_then(|win| win.open_existing(&parent, &target_name))
+        {
             Ok(source) => match source.metadata() {
                 Ok(metadata) if metadata.is_file() => Some(source),
                 Ok(_) => {
@@ -1005,7 +1017,11 @@ pub mod serving {
             }
         };
         #[cfg(windows)]
-        let file = match cfg.pin.win().create_staging(&parent, &part_name) {
+        let file = match cfg
+            .pin
+            .win()
+            .and_then(|win| win.create_staging(&parent, &part_name))
+        {
             Ok(file) => file,
             Err(error) => {
                 discard_file_payload(cfg, recs, cancel, max_record_bytes).await?;
@@ -1082,7 +1098,7 @@ pub mod serving {
             staged.mark_committed();
         }
         #[cfg(windows)]
-        staged.commit(cfg.pin.win())?;
+        cfg.pin.win().and_then(|win| staged.commit(win))?;
         drop(cancelled);
         Ok(())
     }
