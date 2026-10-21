@@ -432,6 +432,20 @@ pub(crate) fn say_section(all: bool) -> Result<()> {
     Ok(())
 }
 
+/// The inbox the running daemon actually serves. `up --dir` records its root in
+/// `up.inbox`; the configured drop dir is only the fallback when no daemon has
+/// ever recorded one. Approving under the configured dir while the daemon served
+/// another root made every sender retry fail the receive-root confinement check.
+fn receiver_root() -> PathBuf {
+    if let Ok(raw) = std::fs::read_to_string(crate::recv_files::daemon_inbox_marker()) {
+        let recorded = PathBuf::from(raw.trim());
+        if !recorded.as_os_str().is_empty() {
+            return recorded;
+        }
+    }
+    crate::drop_dir(None)
+}
+
 /// Accept one durable offer. The sender's current authority is re-observed by
 /// the shared adapter; nothing from the stored snapshot is treated as a grant.
 pub(crate) fn accept(id: u64, to: Option<&Path>, rev: Option<u64>) -> Result<()> {
@@ -446,7 +460,7 @@ pub(crate) fn accept(id: u64, to: Option<&Path>, rev: Option<u64>) -> Result<()>
             state_label(record.state)
         );
     }
-    let destination = destination_for(&crate::drop_dir(None), &record, to)?;
+    let destination = destination_for(&receiver_root(), &record, to)?;
     let destination_text = destination
         .to_str()
         .ok_or_else(|| anyhow!("destination path is not valid UTF-8"))?;

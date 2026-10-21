@@ -38,7 +38,8 @@ def main():
         port = sock.getsockname()[1]
     server = f"http://127.0.0.1:{port}"
     owner, guest, inbox = work / "owner", work / "guest", work / "inbox"
-    for path in (owner, guest, inbox):
+    configured = work / "configured-inbox"
+    for path in (owner, guest, inbox, configured):
         path.mkdir()
 
     # A bare worker has no Flask/Eventlet. Bootstrap the harness's own venv so
@@ -121,7 +122,9 @@ def main():
                 return False
         wait_for(healthy, "isolated backend")
         run(owner, "init", "--name", "alpha", "--recovery-file", owner / "recovery", "--yes")
-        run(owner, "config", "dir", inbox)
+        # Deliberately different from the daemon's --dir: approval must use the
+        # inbox the running daemon actually records, not the configured default.
+        run(owner, "config", "dir", configured)
         receiver = spawn(owner, "receiver-first", "up", "--dir", inbox)
         time.sleep(2)
         invitation = work / "invitation"
@@ -161,12 +164,15 @@ def main():
         assert state()["requests"][0]["state"] == "fulfilled"
         print("PASS: offline approval and process restart delivered the retained exact snapshot", flush=True)
 
-        # A completed sender retry cannot create another incoming request/file.
+        # A completed sender retry must reach the receiver, get its receipt, and
+        # still create no second request or duplicate file.
         before = sorted(path.name for path in inbox.iterdir())
-        run(guest, "--json", "send", "--resume", offer_id, "--timeout", "10", success=False)
+        repeated = json_result(run(guest, "--json", "send", "--resume", offer_id, "--timeout", "10"))
+        assert repeated["delivered"] is True and repeated["state"] == "delivered", repeated
         assert sorted(path.name for path in inbox.iterdir()) == before
         assert len(state()["requests"]) == 1
-        print("PASS: completed retry did not create a second request or duplicate delivery", flush=True)
+        assert state()["requests"][0]["state"] == "fulfilled"
+        print("PASS: completed retry reached the receipt and made no duplicate", flush=True)
 
         declined_source = work / "decline.bin"
         declined_source.write_bytes(b"never approved")
@@ -175,9 +181,13 @@ def main():
         declined_id = queued["offers"][0]["id"]
         pending = next(item for item in state()["requests"] if item["state"] == "pending")
         run(owner, "requests", "decline", pending["id"])
-        run(guest, "--json", "send", "--resume", declined_id, "--timeout", "15", success=False)
+        denied = json_result(run(guest, "--json", "send", "--resume", declined_id,
+                                 "--timeout", "15", success=False))
+        assert denied["delivered"] is False and denied["state"] == "closed", denied
+        assert denied["offers"][0]["state"] == "denied", denied
+        assert next(item for item in state()["requests"] if item["id"] == pending["id"])["state"] == "denied"
         assert not (inbox / "decline.bin").exists()
-        print("PASS: a recorded decline never delivered bytes", flush=True)
+        print("PASS: a recorded decline reached the sender and never delivered bytes", flush=True)
 
         # Actual sender-daemon scheduling, not a simulated retry loop.
         automatic_source = work / "automatic.bin"
@@ -251,9 +261,13 @@ def main():
         pending = next(item for item in state()["requests"] if item["state"] == "pending")
         run(owner, "requests", "accept", pending["id"])
         run(owner, "--yes", "revoke", "guest", "--certificate")
-        run(guest, "--json", "send", "--resume", revoked_id, "--timeout", "15", success=False)
+        revoked = json_result(run(guest, "--json", "send", "--resume", revoked_id,
+                                  "--timeout", "15", success=False))
+        assert revoked["delivered"] is False and revoked["state"] == "closed", revoked
+        assert revoked["offers"][0]["state"] == "denied", revoked
+        assert next(item for item in state()["requests"] if item["id"] == pending["id"])["state"] == "failed"
         assert not (inbox / "revoked.bin").exists()
-        print("PASS: fresh revocation defeated a prior exact approval", flush=True)
+        print("PASS: fresh revocation retired the approval and never delivered", flush=True)
         (work / "summary.json").write_text(json.dumps({"ok": True,
             "sha256": hashlib.sha256(original).hexdigest(), "commands": logs}, indent=2))
     finally:

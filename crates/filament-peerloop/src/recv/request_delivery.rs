@@ -69,7 +69,23 @@ pub fn admit(conn: &mut crate::conn::Conn, pid: &str, offer: &Value, root: &Path
     { bail!("durable transfers require a proven paired sender"); }
     let device = auth.idev.ok_or_else(|| anyhow!("sender identity is unresolved"))?;
     let host = conn.host.as_ref();
-    let sender = current_sender(host, &hex::encode(device))?;
+    let wire_id = offer["request"].as_str()
+        .ok_or_else(|| anyhow!("offer has no durable request identity"))?;
+    if wire_id.is_empty() || wire_id.len() > 128
+        || wire_id.chars().any(char::is_control)
+    { bail!("invalid transfer offer identity"); }
+    let device_id = hex::encode(device);
+    let offer_id = hex::encode(Sha256::digest(format!("{device_id}:{wire_id}").as_bytes()));
+    let sender = match current_sender(host, &device_id) {
+        Ok(sender) => sender,
+        Err(error) => {
+            // The sender was approved, then revoked/removed/expired before it
+            // re-offered. Retire the receiver record instead of leaving an
+            // un-actionable Approved row that no fresh authority can satisfy.
+            let _ = fail_offer(host, &offer_id);
+            return Err(error);
+        }
+    };
     if auth.iusr.map(hex::encode).as_deref() != Some(sender.user_id.as_str()) {
         bail!("link identity does not match the current sender certificate");
     }
@@ -82,12 +98,6 @@ pub fn admit(conn: &mut crate::conn::Conn, pid: &str, offer: &Value, root: &Path
         sha256: offer["full"].as_str().ok_or_else(|| anyhow!("offer requires a whole-file SHA-256"))?.to_owned(),
         mtime: 0,
     }], &Limits::default())?;
-    let wire_id = offer["request"].as_str()
-        .ok_or_else(|| anyhow!("offer has no durable request identity"))?;
-    if wire_id.is_empty() || wire_id.len() > 128
-        || wire_id.chars().any(char::is_control)
-    { bail!("invalid transfer offer identity"); }
-    let offer_id = hex::encode(Sha256::digest(format!("{}:{wire_id}", sender.device_id).as_bytes()));
     super::files::ensure_inbox(host, root)?;
     let destination = super::unique_path(&std::fs::canonicalize(root)?, &name);
     let auto_destination = owned_sender(host, &sender).then(|| destination.to_string_lossy().into_owned());
@@ -185,6 +195,24 @@ pub fn store(host: &dyn HostServices) -> Result<RequestStore> {
     let root = host.config_dir();
     if root.as_os_str().is_empty() { bail!("transfer request storage is unavailable"); }
     Ok(RequestStore::open(root.join(DIRECTORY), owner_id(host)?, Limits::default())?)
+}
+
+fn fail_offer(host: &dyn HostServices, offer_id: &str) -> Result<()> {
+    let inbox = store(host)?;
+    if let Some(record) = inbox
+        .snapshot(None)?
+        .requests
+        .into_iter()
+        .find(|record| record.offer_id == offer_id)
+    {
+        if matches!(record.state, RequestState::Approved | RequestState::Delivering) {
+            let (_, event) = inbox.fail(record.id, record.rev, host.now_secs())?;
+            if let Some(event) = event {
+                host.transfer_request_event(&event);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve by cryptographic device id, never by the sender's displayed name.
@@ -385,7 +413,8 @@ impl DeliveryPermit {
     }
 
     /// True only when the final path and the request-specific staged part are
-    /// the same artifact: inode identity on Unix, exact size+SHA-256 elsewhere.
+    /// the same artifact by file identity. This is Unix-only; a matching hash
+    /// does not prove identity and must never authorize deleting a destination.
     pub fn same_artifact(&self) -> bool {
         let part = std::fs::symlink_metadata(self.staged_path());
         let final_path = std::fs::symlink_metadata(&self.destination);
@@ -400,8 +429,8 @@ impl DeliveryPermit {
         }
         #[cfg(not(unix))]
         {
-            self.verify_file(&self.staged_path()).is_ok()
-                && self.verify_file(&self.destination).is_ok()
+            let _ = (part, final_meta);
+            false
         }
     }
 
@@ -412,9 +441,9 @@ impl DeliveryPermit {
     }
 
     /// A crash-recovery candidate: the destination exists, and it is the
-    /// request-specific staged artifact (same inode on Unix; exact size/hash on
-    /// other platforms). A bare file that merely matches the digest is not
-    /// enough.
+    /// request-specific staged artifact by file identity. A bare file that
+    /// merely matches the digest is not enough, and non-Unix hosts cannot prove
+    /// identity, so they refuse recovery rather than guess.
     pub fn recoverable(&self) -> Result<bool, PermitError> {
         let final_meta = match std::fs::symlink_metadata(&self.destination) {
             Ok(metadata) => metadata,
@@ -441,14 +470,26 @@ impl DeliveryPermit {
                 ));
             }
         }
-        self.verify_file(&part)?;
-        self.verify_file(&self.destination)?;
-        Ok(true)
+        #[cfg(not(unix))]
+        {
+            let _ = (part_meta, final_meta, part);
+            Err(PermitError::authority(
+                "this platform cannot prove the staged artifact identity; remove the destination and retry",
+            ))
+        }
+        #[cfg(unix)]
+        {
+            self.verify_file(&part)?;
+            self.verify_file(&self.destination)?;
+            Ok(true)
+        }
     }
 
-    /// Verify the final path after placement, including that it is still the
-    /// same artifact as the staged part.
+    /// Verify the final path after placement. Unix also requires the same file
+    /// identity as the staged part; non-Unix has no identity primitive here, so
+    /// it verifies the bytes just linked and never claims crash recovery.
     pub fn verify_final(&self) -> Result<(), PermitError> {
+        #[cfg(unix)]
         if !self.same_artifact() {
             return Err(PermitError::authority(
                 "final destination is not this request's staged artifact",

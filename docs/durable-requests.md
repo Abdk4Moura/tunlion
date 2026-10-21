@@ -95,8 +95,10 @@ offline sender will return.
   link to the exact approved path.
 - The receipt is committed before the delivery acknowledgement. If acknowledgement
   is lost, the sender's retry sees `fulfilled`, the receiver re-acks, and no
-  second file is placed. Recovery requires the request-specific staged artifact,
-  not merely a file with a matching hash.
+  second file is placed. On Unix, recovery requires the request-specific staged
+  artifact by device/inode identity, not merely a file with a matching hash.
+  Non-Unix hosts refuse hash-only recovery and never delete a destination on
+  that basis; they require a fresh transfer after a crash.
 - Writer chunks recheck authority at a bounded interval (2s), and placement
   always rechecks immediately before the link.
 - Approval reserves space against other active deliveries with a free-space
@@ -126,9 +128,9 @@ Isolated worker, source snapshot archived with per-file SHA-256, debug
 Python venv from `backend/requirements.txt` when `--python` is omitted, so a
 bare worker can reproduce the gate without hand-installed Flask/Eventlet.
 
-- full `filament-peerloop` library: **500 passed**
-- `filament-cli` bin tests: **823 passed**, 2 ignored
-- focused request store: **17 passed**
+- full `filament-peerloop` library: **524 passed**
+- `filament-cli` bin tests: **804 passed**, 2 ignored
+- focused request store: **19 passed**
 - retained sender store: **10 passed**
 - real network/restart E2E: proven restricted sender created a pending offer with
   no bytes; daemon approval plus receiver restart delivered the exact retained
@@ -136,7 +138,10 @@ bare worker can reproduce the gate without hand-installed Flask/Eventlet.
   sender daemon retried a retained offer; an offline receiver did not lose the
   offer; an acknowledgement-loss retry reused the committed receipt with no
   duplicate placement; fresh certificate revocation defeated a prior approval.
-- evidence: worker `results/durable-e2e-20261021T102911`, logs and command
-  records retained.
+- evidence: worker `results/durable-e2e-bootstrap-20261021T121317`, sanitized
+  logs archived locally. The gate bootstraps its own backend venv.
+- the E2E is wired into CI as its own job, not a manual-only script; it requires
+  `--fault-hooks` and asserts the sender/receiver terminal states, not just the
+  absence of a duplicate file.
 
 The Python request model remains a policy simulation, not this Rust runtime.

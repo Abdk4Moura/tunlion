@@ -661,6 +661,9 @@ impl RequestStore {
             if active >= self.limits.max_pending {
                 return Err(RequestError::LimitExceeded("request queue is full"));
             }
+            // Make room for this offer by pruning terminal records first. Active
+            // records are never evicted; if they alone exceed the cap, refuse.
+            prune_state_for(state, &self.limits, now, manifest.serialized_bytes);
             let queued_bytes: usize = state
                 .requests
                 .iter()
@@ -1111,6 +1114,10 @@ fn touch(
 }
 
 fn prune_state(state: &mut DiskState, limits: &Limits, now: u64) {
+    prune_state_for(state, limits, now, 0);
+}
+
+fn prune_state_for(state: &mut DiskState, limits: &Limits, now: u64, reserve_bytes: usize) {
     state
         .tombstones
         .retain(|tombstone| tombstone.expires_at > now);
@@ -1127,15 +1134,42 @@ fn prune_state(state: &mut DiskState, limits: &Limits, now: u64) {
     // Revision is the monotonic terminal sequence. A wall clock can step back,
     // which would otherwise prune the record just written and lose its receipt.
     terminal.sort_unstable_by_key(|(_, rev)| *rev);
-    if terminal.len() <= limits.max_terminal {
-        return;
-    }
-    let remove = terminal.len() - limits.max_terminal;
-    let doomed: HashSet<u64> = terminal
+    let remove_by_count = terminal.len().saturating_sub(limits.max_terminal);
+    let mut doomed: HashSet<u64> = terminal
         .iter()
-        .take(remove)
+        .take(remove_by_count)
         .map(|(_, rev)| *rev)
         .collect();
+    // Count alone is not enough: many large terminal manifests can fill the
+    // aggregate byte budget and make every new offer fail even though pruning
+    // would admit it. Prune the oldest terminal records by revision until the
+    // retained snapshot fits. Active records are never evicted here.
+    let mut retained_bytes: usize = state
+        .requests
+        .iter()
+        .filter(|record| {
+            !(record.state.is_terminal() && doomed.contains(&record.rev))
+        })
+        .map(|record| record.manifest.serialized_bytes)
+        .sum();
+    if retained_bytes.saturating_add(reserve_bytes) > limits.max_queue_bytes {
+        for (_, rev) in terminal.iter().skip(remove_by_count) {
+            if retained_bytes.saturating_add(reserve_bytes) <= limits.max_queue_bytes {
+                break;
+            }
+            if let Some(record) = state
+                .requests
+                .iter()
+                .find(|record| record.state.is_terminal() && record.rev == *rev)
+            {
+                retained_bytes = retained_bytes.saturating_sub(record.manifest.serialized_bytes);
+                doomed.insert(*rev);
+            }
+        }
+    }
+    if doomed.is_empty() {
+        return;
+    }
     let removed: Vec<(String, String, u64)> = state
         .requests
         .iter()
@@ -1681,5 +1715,29 @@ mod tests {
             store.propose("too-big", &external(), &manifest, 60, None, 10),
             Err(RequestError::LimitExceeded(_))
         ));
+    }
+
+    #[test]
+    fn terminal_manifests_are_pruned_to_the_aggregate_byte_budget() {
+        let dir = temp_dir();
+        let large = manifest(&"a".repeat(200), 1);
+        let small = manifest("b", 1);
+        let limits = Limits {
+            max_queue_bytes: large.serialized_bytes + small.serialized_bytes - 1,
+            max_terminal: 10,
+            ..Limits::default()
+        };
+        let store = RequestStore::open(dir.0.as_path(), "user-owner", limits).unwrap();
+        let (old, _) = store
+            .propose("old", &external(), &large, 60, None, 10)
+            .unwrap();
+        store.decline(old.id, old.rev, 11).unwrap();
+        let (new, _) = store
+            .propose("new", &external(), &small, 60, None, 12)
+            .unwrap();
+        let snapshot = store.snapshot(None).unwrap();
+        assert!(snapshot.requests.iter().any(|record| record.id == new.id));
+        assert!(!snapshot.requests.iter().any(|record| record.id == old.id));
+        assert!(snapshot.requests.iter().all(|record| record.state.is_active() || record.id == new.id));
     }
 }
