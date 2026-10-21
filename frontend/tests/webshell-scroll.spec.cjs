@@ -84,10 +84,9 @@ async function waitInputs(page, n, msg) {
     fail(`${msg}: ${e && e.message ? e.message : e}`);
   }
 }
-async function stubClipboard(page, { read = '', write = null } = {}) {
-  await page.evaluate(({ read, write }) => {
+async function stubClipboard(page, { read = '' } = {}) {
+  await page.evaluate(({ read }) => {
     window.__copied = null
-    window.__clipRead = read
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: {
@@ -98,9 +97,7 @@ async function stubClipboard(page, { read = '', write = null } = {}) {
         },
       },
     })
-    // Keep a record of what production asked to copy, if it uses the fallback.
-    if (write !== null) window.__clipWanted = write
-  }, { read, write })
+  }, { read })
 }
 async function tapHostAt(page, x, y) {
   const host = page.locator('[data-testid="term-host"]');
