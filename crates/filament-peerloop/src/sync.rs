@@ -363,7 +363,8 @@ pub async fn admit_sync_open(
         if dry_run {
             // Nothing is written; the ack names the requested path.
             let root = drop_dir.join(&rel);
-            (root, RootPin::path_only(&root))
+            let pin = RootPin::path_only(&root);
+            (root, pin)
         } else {
             // Walk/create the root relative to the drop directory HANDLE. No
             // path-based resolve_root/create_content_dirs runs on Windows, so
