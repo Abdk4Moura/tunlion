@@ -167,4 +167,10 @@ impl Req {
     pub async fn reply(self, _v: &Value) {
         match self {}
     }
+
+    /// Uninhabited here, so this is never called; the control loop still names
+    /// the refusal path on every target.
+    pub async fn reject(self, _err: &str) {
+        match self {}
+    }
 }

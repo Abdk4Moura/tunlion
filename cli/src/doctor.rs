@@ -443,7 +443,11 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     let ifaces = list_interfaces();
     let history = diag::summarize(HISTORY_LIMIT);
     // Local file read (fast, no IO worth joining): sshd CA trust presence.
+    #[cfg(feature = "ssh-server")]
     let sshca = crate::sshd::check_sshd_ca();
+    #[cfg(not(feature = "ssh-server"))]
+    let sshca: std::result::Result<String, String> =
+        Err("sshd configuration is not available in this build".to_string());
     // The RUNNING daemon, not just a fresh connection from here: a daemon stuck
     // re-dialing the server passed every check above while no peer could reach
     // it. See daemon_health.

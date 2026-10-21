@@ -19,12 +19,21 @@ TOOLING_FEATURES = {"bindgen", "cli", "cargo-metadata"}
 # sectors and mesh/fleet route state must not be selected by this library root,
 # even when another workspace member or a host tooling build enables them.
 REDUCED_PEERLOOP_FEATURES = {"dispatch"}
-FORBIDDEN_PEERLOOP_FEATURES = {"mesh", "fleet", "mount-server", "forward-server"}
+FORBIDDEN_PEERLOOP_FEATURES = {
+    "mesh",
+    "fleet",
+    "mount-server",
+    "mount-daemon",
+    "forward-server",
+    "exec-server",
+    "pty-server",
+    "ssh-sign",
+    "ssh-bootstrap",
+}
 FORBIDDEN_REDUCED_PACKAGES = {"filament-overlay", "filament-fleet", "filament-cli"}
-# `authkeys-managed` is an unconditional peerloop dependency today. Its only
-# use is the sshd shell-bootstrap arm; the reduced Core refuses that open, so it
-# is compiled but inert. It is explicitly allowed here, not claimed excluded.
-INERT_REDUCED_PACKAGES = {"authkeys-managed"}
+# `authkeys-managed` is now optional behind `ssh-bootstrap`, which the reduced
+# Core does not enable. The reduced graph has nothing inert to allow here.
+INERT_REDUCED_PACKAGES = set()
 
 
 def check_fleet_graph():

@@ -229,6 +229,21 @@ pub enum StorageFailure {
     Permission,
 }
 
+/// How to reach a peer with sshfs, as the host resolved it: managed key paths,
+/// the bootstrap result and the optional L3 destination. The mount handler owns
+/// the argv; this is only the machine's answer about where the peer is.
+#[derive(Clone, Debug)]
+pub struct MountTransport {
+    pub login: String,
+    pub host: String,
+    pub rport: u16,
+    pub key_path: PathBuf,
+    pub known_hosts_path: PathBuf,
+    /// `login@peer.mesh` when an L3 path is proven reachable; `None` falls back
+    /// to the L2 ProxyCommand.
+    pub direct_dest: Option<String>,
+}
+
 /// The non-terminal host facts `Conn` reads. Same rationale as [`LogSink`]: one
 /// owned object per session, implemented by the CLI over its own modules.
 ///
@@ -460,6 +475,41 @@ pub trait HostServices: Send + Sync + 'static {
     /// already ignores this result while reaping a dead tracked mount.
     fn remove_mount(&self, _local: &str) -> Result<(), String> {
         Err("this host does not support mounts".to_string())
+    }
+    /// Resolve everything sshfs needs to reach `peer` (managed key, pinned host
+    /// key, bootstrap/cache, optional L3 destination).
+    ///
+    /// HOST-BOUND: this establishes/uses a peer link and reads the key store.
+    /// A host without ssh-bootstrap REFUSES; the mount handler reports the
+    /// bootstrap failure and spawns nothing.
+    async fn prepare_mount_transport(
+        &self,
+        _server: &str,
+        _peer: &str,
+        _relay: bool,
+        _port: u16,
+    ) -> Result<MountTransport, String> {
+        Err("this host cannot bootstrap an ssh transport".to_string())
+    }
+    /// This process's executable path, used to build the L2 ProxyCommand.
+    fn current_exe(&self) -> PathBuf {
+        std::env::current_exe().unwrap_or_default()
+    }
+    /// Atomic, owner-only write of a private file (temp + rename where the host
+    /// supports it). Defaults to a plain write for embedders; the CLI uses its
+    /// `SecretFile`.
+    fn write_private_file(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        std::fs::write(path, data)
+    }
+    /// The legacy `capExpires.<capability>` deadline for a device record, if
+    /// any. Used by the ssh-certificate validity clamp.
+    fn device_cap_expiry(&self, _name: &str, _capability: &str) -> Option<u64> {
+        None
+    }
+    /// Is this device public key present in the device store? The settle-hold
+    /// decision needs it to know whether a proof could ever bind.
+    fn device_known(&self, _device_pub: &[u8; 32]) -> bool {
+        false
     }
     /// Seed the owner's self genesis capability header and its ratchet when
     /// this machine has an owner key and the store lacks them. A store WRITE,

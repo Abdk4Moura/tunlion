@@ -4,7 +4,7 @@
 
 use filament_peerloop::conn::Conn;
 use filament_peerloop::control::Req;
-use filament_peerloop::host::HostServices;
+use filament_peerloop::host::{HostServices, LogSink};
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -61,7 +61,16 @@ pub(crate) async fn mount(
     mounts: &mut crate::DaemonMounts,
     last_check: &mut std::time::Instant,
 ) {
-    crate::daemon_ctl::handle_mount(req, server, relay, mounts, last_check).await
+    crate::daemon_ctl::handle_mount(
+        req,
+        server,
+        relay,
+        mounts,
+        last_check,
+        &crate::host_impl::CliHost,
+        crate::host_impl::cli_log().as_ref(),
+    )
+    .await
 }
 #[cfg(not(unix))]
 pub(crate) async fn mount(
@@ -76,7 +85,13 @@ pub(crate) async fn mount(
 
 #[cfg(unix)]
 pub(crate) async fn unmount(req: Req, mounts: &mut crate::DaemonMounts) {
-    crate::daemon_ctl::handle_unmount(req, mounts).await
+    crate::daemon_ctl::handle_unmount(
+        req,
+        mounts,
+        &crate::host_impl::CliHost,
+        crate::host_impl::cli_log().as_ref(),
+    )
+    .await
 }
 #[cfg(not(unix))]
 pub(crate) async fn unmount(req: Req, _mounts: &mut crate::DaemonMounts) {
@@ -85,7 +100,13 @@ pub(crate) async fn unmount(req: Req, _mounts: &mut crate::DaemonMounts) {
 
 #[cfg(unix)]
 pub(crate) async fn list_mounts(req: Req, mounts: &crate::DaemonMounts) {
-    crate::daemon_ctl::handle_list_mounts(req, mounts).await
+    crate::daemon_ctl::handle_list_mounts(
+        req,
+        mounts,
+        &crate::host_impl::CliHost,
+        crate::host_impl::cli_log().as_ref(),
+    )
+    .await
 }
 #[cfg(not(unix))]
 pub(crate) async fn list_mounts(req: Req, _mounts: &crate::DaemonMounts) {
@@ -94,7 +115,13 @@ pub(crate) async fn list_mounts(req: Req, _mounts: &crate::DaemonMounts) {
 
 #[cfg(unix)]
 pub(crate) async fn mount_health(req: Req, mounts: &crate::DaemonMounts) {
-    crate::daemon_ctl::handle_mount_health(req, mounts).await
+    crate::daemon_ctl::handle_mount_health(
+        req,
+        mounts,
+        &crate::host_impl::CliHost,
+        crate::host_impl::cli_log().as_ref(),
+    )
+    .await
 }
 #[cfg(not(unix))]
 pub(crate) async fn mount_health(req: Req, _mounts: &crate::DaemonMounts) {
@@ -118,6 +145,22 @@ pub(crate) async fn open_mount(
     _v: &serde_json::Value,
     _muxes: &mut std::collections::HashMap<String, std::sync::Arc<filament_peerloop::l2::Mux>>,
     _share_root: &std::path::Path,
+) {
+}
+
+#[cfg(all(feature = "mount-daemon", unix))]
+pub(crate) async fn mount_health_tick(
+    host: &dyn HostServices,
+    mounts: &mut crate::DaemonMounts,
+    log: &dyn LogSink,
+) {
+    mounts.health_tick(host, log).await;
+}
+#[cfg(not(all(feature = "mount-daemon", unix)))]
+pub(crate) async fn mount_health_tick(
+    _host: &dyn HostServices,
+    _mounts: &mut crate::DaemonMounts,
+    _log: &dyn LogSink,
 ) {
 }
 

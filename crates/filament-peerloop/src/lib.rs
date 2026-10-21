@@ -81,6 +81,7 @@ pub mod mount_proto;
 pub mod mesh;
 mod petname;
 pub mod present;
+pub mod process;
 pub mod recv;
 pub mod refusal;
 pub mod resilience;
@@ -89,6 +90,7 @@ pub mod secret;
 pub mod session;
 pub mod shell;
 pub mod shell_gate;
+pub mod ssh_ca;
 pub mod sync;
 #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 pub(crate) mod test_hooks;

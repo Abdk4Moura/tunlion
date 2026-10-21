@@ -15,6 +15,7 @@
 pub mod forward;
 pub mod mux;
 pub mod policy;
+pub mod warm;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +28,12 @@ pub type MuxMap = HashMap<String, Arc<mux::Mux>>;
 pub use mux::{
     ExecCtl, L2_SID_BASE, MAX_STREAMS_PER_LINK, Mux, OpenOutcome, OpenVerdict, PipeItem,
     TreeSignal, is_l2_sid, serve_stream, wire_sid,
+};
+pub use warm::{open_stream, open_stream_verified_reason, WarmOpen};
+#[cfg(unix)]
+pub use warm::{
+    open_pty_stream_verified, serve_opened_stream, serve_verified_stream, warm_verify_window,
+    WarmPtyVerdict,
 };
 
 /// Process-wide live-PTY cap shared by acceptors and hosts.

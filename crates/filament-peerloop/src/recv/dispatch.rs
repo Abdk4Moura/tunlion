@@ -3081,6 +3081,7 @@ async fn recv_run(
                 // as the command liked (observed: five minutes of `sleep`
                 // after the initiator was gone). End them, and detach the
                 // shells this link carried so their idle reaper runs.
+                #[cfg(feature = "pty-server")]
                 crate::recv::servers::shell::retire_link(
                     &ports,
                     &pid,
@@ -3821,6 +3822,7 @@ async fn recv_run(
                     ));
                     sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                     conn.drop_link(&pid);
+                    #[cfg(feature = "pty-server")]
                     crate::recv::servers::shell::retire_link(
                         &ports,
                         &pid,
@@ -6226,6 +6228,7 @@ async fn recv_run(
                     }
                     continue;
                 }
+                #[cfg(feature = "ssh-bootstrap")]
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {
                         crate::conn::dropped_no_transport(log.as_ref(), &pid, "shell-bootstrap");
@@ -6444,6 +6447,18 @@ async fn recv_run(
                         }
                     }
                 }
+                #[cfg(not(feature = "ssh-bootstrap"))]
+                Some("shell-bootstrap") if l2_enabled => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": "ssh bootstrap is not available in this build",
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
                 // web-shell (browser terminal): spawn a login shell in a PTY and
                 // bridge it to a sid stream. Same deny-by-default gate as
                 // shell-bootstrap, a PTY is a superset of ssh-key access, so it
@@ -6619,6 +6634,7 @@ async fn recv_run(
                     // #4: resize the persistent session bound to this sid (not a
                     // link-local serve_pty). Falls back to the mux resizer if the
                     // sid isn't a known session binding (defensive).
+                    #[cfg(feature = "pty-server")]
                     crate::recv::servers::shell::pty_resize(
                         &ports,
                         &pid,
@@ -6632,6 +6648,7 @@ async fn recv_run(
                 // Distinct from a bare channel drop, which only DETACHES. Kills the
                 // shell and removes the session so a later open spawns fresh.
                 Some("pty-close") if l2_enabled => {
+                    #[cfg(feature = "pty-server")]
                     crate::recv::servers::shell::pty_close(&ports, &pid, &v, &mut pty_bindings)
                         .await;
                 }
@@ -8877,6 +8894,7 @@ async fn recv_run(
                         && (s == "failed" || s == "closed")
                         && !pty_bindings.is_empty()
                     {
+                        #[cfg(feature = "pty-server")]
                         crate::recv::servers::shell::detach_link_ptys(
                             &ports,
                             &pid,
