@@ -4357,6 +4357,14 @@ async fn recv_run(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // A browser's PeerLink sends its transport hint BEFORE any SDP.
+                // Apply it here, in the same ordered signal path as the offer,
+                // so the direct-QUIC wait is cancelled and the WebRTC responder
+                // is built immediately instead of after DIRECT_BUDGET.
+                if data["type"].as_str() == Some("transport-hint") {
+                    conn.accept_transport_hint(&from, &data).await;
+                    continue;
+                }
                 // rung-1: a relayed transport-offer carries the peer's direct
                 // candidates, start the simultaneous-open + auth race.
                 if data["type"].as_str() == Some("transport-offer") {

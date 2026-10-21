@@ -333,6 +333,19 @@ export function legacyPoliteRole({ myUid, peerUid, myId, peerId }) {
   return true
 }
 
+// A browser has no direct-QUIC rung: the native clients race an authenticated
+// QUIC dial before falling back to WebRTC, and a browser can never answer that
+// transport-offer. Without a hint a direct-first CLI spends its whole direct
+// budget (plus the fallback tick) waiting before it even sends an SDP answer,
+// which is the web client's "connecting" stall. Send `direct:false` as the
+// FIRST signal of every link, BEFORE any offer/candidate, so the CLI can skip
+// that ladder for this peer while keeping direct-first for CLI peers. Old CLIs
+// ignore an unknown signal type, so this is a pure latency hint, not a protocol
+// dependency (identity/PAKE still gate trust).
+export function transportHint(uid, name) {
+  return { type: 'transport-hint', v: 1, direct: false, uid: uid || null, name: name || null }
+}
+
 
 export class PeerLink {
   /**
@@ -437,6 +450,15 @@ export class PeerLink {
     // at ladder exhaustion. The amber RELAY UI then lights itself off the normal
     // `_detectRoute()`→onRoute('relayed') path; P5 later upgrades back to direct.
     this.relayOnly = !!relayOnly
+    // Transport hint FIRST (before the RTCPeerConnection and therefore before
+    // any offer/candidate): tell a direct-first CLI not to wait out its direct
+    // budget for a peer that cannot speak QUIC. Sent synchronously so it is
+    // ordered ahead of every SDP on the same signaling socket.
+    try {
+      this.sendSignal(transportHint(this.myUid, this.name))
+    } catch (err) {
+      rlog.debug('transport hint failed', this.id.slice(-6), err)
+    }
     this.pc = new RTCPeerConnection({
       iceServers,
       // Pre-gather a candidate so the srflx/relay path is ready the moment the

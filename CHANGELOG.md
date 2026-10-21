@@ -27,6 +27,15 @@ the GitHub release notes.
 
 ### Fixed
 
+- The web shell no longer waits out the direct-QUIC budget before connecting. A
+  browser cannot answer a QUIC `transport-offer`, but the acceptor treated it
+  like a CLI peer and suppressed the WebRTC offer until the direct attempt
+  expired (5s plus the fallback tick), which the web client showed as
+  "connecting". The browser now sends `{type:"transport-hint",direct:false}`
+  before any SDP; the CLI cancels/skips the direct ladder for that peer and
+  answers WebRTC immediately. CLI peers carry no hint, so direct-first is
+  unchanged for them.
+
 - The first command typed into `tunlion shell` before the remote prompt appears
   now runs when Enter is pressed. Input typed ahead is captured while the local
   terminal is still in cooked mode, where Enter arrives as LF; a Windows ConPTY

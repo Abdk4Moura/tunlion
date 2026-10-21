@@ -1320,6 +1320,13 @@ pub(crate) async fn send_cmd(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // A browser's PeerLink sends its transport hint BEFORE any SDP.
+                // Apply it first so a WebRTC-only peer does not sit out the
+                // direct-QUIC budget before we answer its offer.
+                if data["type"].as_str() == Some("transport-hint") {
+                    conn.accept_transport_hint(&from, &data).await;
+                    continue;
+                }
                 // The device we dialed answered that it does not recognize us (it
                 // forgot this one while it ran). Only from a peer met on the
                 // target's own meeting place, and never on a brokered one, whose
