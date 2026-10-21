@@ -61,8 +61,8 @@ impl CodeError {
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::TooLong => "Codes are limited to 48 characters after normalization; nothing was truncated. Shorten the code.",
-            Self::ReservedMaterial => "That is invitation material, not a spoken code. Use tunlion join with a file or hidden input.",
-            Self::ReservedPath => "That is a path or URL, not a spoken code. Use tunlion join with an invitation file.",
+            Self::ReservedMaterial => "That is invitation material, not a spoken code. Use `tunlion join` with a file or hidden input.",
+            Self::ReservedPath => "That is a path or URL, not a spoken code. Use `tunlion join` with an invitation file.",
         }
     }
 }

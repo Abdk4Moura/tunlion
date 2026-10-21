@@ -1424,7 +1424,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     JoinInput::Code(code) => pair_cmd(&server, Some(code.into_string()), name, None, relay, false, Vec::new(), None, false).await,
                     JoinInput::File(path) => join_cmd(&ui_caps, &server, relay, Some(path.into_path()), None, name, to, None).await,
                     JoinInput::Invitation(_) => Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage,
-                        "Invitation material must not be passed in argv. Run tunlion join and paste it, or use --invite-file/--invite-fd.")),
+                        "Invitation material must not be passed in argv. Run `tunlion join` and paste it, or use --invite-file/--invite-fd.")),
                     JoinInput::TransferCode(_) => Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage,
                         crate::identity_flow::join_transfer_code_msg(""))),
                     JoinInput::InvalidCode(error) => Err(crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, error.message())),

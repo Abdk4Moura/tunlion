@@ -762,7 +762,7 @@ pub(crate) fn join_input_not_recognized() -> String {
 
 /// The refusal for a transfer code given to `join`.
 pub(crate) fn join_transfer_code_msg(_code: &str) -> String {
-    "that is a one-time transfer code (from `tunlion send`), not a pairing code. Use tunlion receive with the original transfer code.".to_string()
+    "that is a one-time transfer code (from `tunlion send`), not a pairing code. Use `tunlion receive` with the original transfer code.".to_string()
 }
 
 /// The one accept prompt. The inline reader masks credential material before

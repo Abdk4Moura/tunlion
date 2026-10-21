@@ -866,7 +866,7 @@ fn insert_text(buf: &mut String, cursor: &mut usize, text: &str) -> Result<(), &
         return Err(INVITATION_IN_CODE_ENTRY);
     }
     if crate::join_input::reserved_code_path(&format!("{}{}", &buf[..*cursor], text)) {
-        return Err("That is a file path or URL, not a code; use tunlion join with an invitation file.");
+        return Err("That is a file path or URL, not a code; use `tunlion join` with an invitation file.");
     }
     let left = format_buffer(&format!("{}{}", &buf[..*cursor], text));
     let candidate = format_buffer(&format!("{}{}", left, &buf[*cursor..]));
