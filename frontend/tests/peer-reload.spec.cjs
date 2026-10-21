@@ -372,8 +372,25 @@ async function runEngine(engine, browser, contextOptions) {
   const beforeBf = await identity(second);
   await second.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
   await waitFor(async () => (await identity(second)).gen !== beforeBf.gen, 15000, 'pageshow(persisted) to rotate generation');
-  if (full) await waitOnlineAndPeer(second, peerName); else await waitOnline(second);
+  if (full) { await waitOnlineAndPeer(second, peerName); await waitPeerReady(second, peerName); } else await waitOnline(second);
   ok(`${tag} persisted pageshow rotates the session generation and revalidates`);
+
+  // 6a-b. Force a real socket disconnect/reconnect AFTER that rotation. The
+  //       reconnect cache must carry the rotated gen; replaying the retired one
+  //       would be refused as superseded.
+  const bf = await identity(second);
+  const bfGen = bf.gen.slice(0, 8);
+  const bfRetiredBefore = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === bf.uid && e.gen === bfGen).length;
+  const bfJoinsBefore = telEvents().filter((e) => e.ev === 'join' && e.uid === bf.uid && e.gen === bfGen).length;
+  await second.context().setOffline(true);
+  await sleep(700);
+  await second.context().setOffline(false);
+  if (full) { await waitOnlineAndPeer(second, peerName, 30000); await waitPeerReady(second, peerName); } else await waitOnline(second, 30000);
+  const bfRetiredAfter = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === bf.uid && e.gen === bfGen).length;
+  const bfJoinsAfter = telEvents().filter((e) => e.ev === 'join' && e.uid === bf.uid && e.gen === bfGen).length;
+  if (bfRetiredAfter !== bfRetiredBefore) fail(`${tag} post-pageshow reconnect retired the current generation`);
+  if (bfJoinsAfter <= bfJoinsBefore) fail(`${tag} post-pageshow reconnect did not rejoin with the current generation`);
+  ok(`${tag} socket reconnect after pageshow rotation replays the new generation`);
 
   // 6b. Back/forward. If this engine uses BFCache we get pageshow(persisted) and
   //    the page rotates generation; if not, it is an ordinary fresh load. Both
