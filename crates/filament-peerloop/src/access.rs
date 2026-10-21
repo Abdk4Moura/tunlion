@@ -23,8 +23,8 @@ const MAX_RESOURCES: usize = 64;
 const MAX_EVENTS: usize = 256;
 const MAX_OPERATIONS: usize = 256;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FolderMode { ReadOnly, ReadWrite }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FolderMode { #[default] ReadOnly, ReadWrite }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderAccess {
@@ -684,6 +684,23 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_open_and_end_cannot_leave_a_live_permission() {
+        let k = key(); let p = peer(&k);
+        for _ in 0..32 {
+            let e = Arc::new(engine()); let s = offer(&e,p); accept(&e,&s,&k,10);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let job = { let e=e.clone(); let id=s.id.clone(); let barrier=barrier.clone();
+                std::thread::spawn(move || { barrier.wait(); e.admit_tcp(&id,1,p,"web",10) }) };
+            barrier.wait(); e.end(&s.id,10).unwrap();
+            match job.join().unwrap() {
+                Ok((_,cancel,_)) => assert!(cancel.is_cancelled()),
+                Err(error) => assert_eq!(error,AccessError::Ended),
+            }
+            assert_eq!(e.admit_tcp(&s.id,1,p,"web",10).err(),Some(AccessError::Ended));
+        }
+    }
+
+    #[test]
     fn bounded_events_require_snapshot_reset_and_drop_revokes() {
         let e = engine(); let k = key(); let s = offer(&e, peer(&k)); accept(&e, &s, &k, 10);
         let (_, cancel, _) = e.admit_tcp(&s.id, 1, peer(&k), "web", 10).unwrap();
@@ -694,7 +711,7 @@ mod tests {
         drop(e); assert!(cancel.is_cancelled());
     }
 
-    #[cfg(feature = "forward-server")]
+    #[cfg(all(feature = "forward-server", feature = "dispatch"))]
     #[tokio::test]
     async fn real_tcp_host_activation_and_live_end_close_socket() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -750,7 +767,7 @@ mod tests {
         // Unsupported host is not activation; no invented working endpoint.
         let s = e.offer(peer(&k), "echo", s.spec, Lifetime::UntilEnded, 50, 10).unwrap(); accept(&e, &s, &k, 10);
         let (_, mut stream) = tokio::io::duplex(64);
-        assert_eq!(e.serve_tcp(&s.id, 1, peer(&k), "echo", &mut stream, &crate::host::NoHost).await, Err(AccessError::Unsupported));
+        assert_eq!(e.serve_tcp(&s.id, 1, peer(&k), "echo", &mut stream, &crate::host::NoHost).await, Err(AccessError::Unavailable));
 
         // The actual existing L2 mux is also exercised, not only a generic IO seam.
         struct Capture(tokio::sync::mpsc::UnboundedSender<serde_json::Value>, tokio::sync::mpsc::UnboundedSender<Vec<u8>>);

@@ -106,6 +106,27 @@ and revoke their active sessions on opt-out. A preset, hostname, caller boolean,
 or daemon elevation token is not a substitute. No process/account elevation is
 performed by this slice.
 
+The required migration is phased, not an unsigned settings shortcut:
+
+1. `crates/filament-id/src/lib.rs`: define a versioned owner-authorized role
+   designation bound to the device key, owner domain and monotonic designation
+   revision. Settle appointment/removal/last-admin authority before interpreting
+   it as primary status. Do not reinterpret transport primacy or existing certs.
+2. `crates/filament-peerloop/src/recv/store.rs`: persist and verify that role
+   statement separately from a device name, plus a private local incoming-shell
+   opt-in bound to the local device key and owned audience. Missing/invalid
+   role facts must not turn ordinary paired devices into owned primaries.
+3. `crates/filament-peerloop/src/shell_gate.rs` and `host.rs`: expose the verified
+   local consent decision as one restrictive input to the existing common
+   PTY/exec/SSH gate; never a permissive replacement for delegated ceilings.
+   `recv/servers/shell.rs`, `shell/admit.rs`, `ssh_ca.rs`, and the existing
+   `HostServices::live_session_cut`/session cancellation paths must consume the
+   same opt-out revocation generation for already-active sessions.
+4. CLI settings and daemon host adapters (a separate lane) write the local
+   opt-in on explicit user mutation, disclose the bound local account, distinguish
+   saved consent from serving readiness, and report platform launch failures.
+   Reduced `tunlion-core` must continue to refuse absent endpoints.
+
 ## Validation
 
 The access tests cover mixed bundles, full signature/revision/peer binding,

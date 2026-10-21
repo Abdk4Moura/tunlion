@@ -638,11 +638,11 @@ mod tests {
         let spec = AccessSpec { services: vec![ServiceAccess { id: "web".into(), target: "127.0.0.1:8080".parse().unwrap(), protocol: ServiceProtocol::Tcp }], ..AccessSpec::default() };
         let binding = TemporaryBinding::new(hp, &spec, Lifetime::UntilEnded, 100).unwrap();
         let (a,b) = temporary_pair(binding.clone());
-        let (_, different_session) = temporary_pair(binding.clone());
+        let (different_session, _) = temporary_pair(binding.clone());
         let recipient_msg = b.temporary_possession_message(rp, hp).unwrap();
         let recipient_sig: [u8;64] = recipient.sign(&recipient_msg).as_ref().try_into().unwrap();
         let proven_recipient = a.authenticate_temporary_peer(hp, rp, recipient_sig).unwrap();
-        assert_eq!(different_session.authenticate_temporary_peer(rp, hp, recipient_sig).err(), Some(AccessError::InvalidProof));
+        assert_eq!(different_session.authenticate_temporary_peer(hp, rp, recipient_sig).err(), Some(AccessError::InvalidProof));
         assert_eq!(a.authenticate_temporary_peer(hp, hp, recipient_sig).err(), Some(AccessError::InvalidProof));
         let host_msg = a.temporary_possession_message(hp, rp).unwrap();
         let host_sig = host.sign(&host_msg).as_ref().try_into().unwrap();
