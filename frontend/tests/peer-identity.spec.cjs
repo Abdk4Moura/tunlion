@@ -89,6 +89,16 @@ async function run(browserName, browser, contextOptions) {
   if (!renames.includes('studio-ipad')) fail(`${tag} blank commit did not fall back to the current name: ${JSON.stringify(renames)}`);
   ok(`${tag} a blank name falls back to the current identity (${afterBlank})`);
 
+  // 3b. Escape is a cancel, not a commit.
+  const beforeEsc = await input.inputValue();
+  await input.fill('discard-me');
+  await input.press('Escape');
+  await page.waitForTimeout(100);
+  if ((await input.inputValue()) !== beforeEsc) fail(`${tag} Escape did not restore the current name (${await input.inputValue()})`);
+  renames = await page.evaluate(() => window.__renames.splice(0));
+  if (renames.includes('discard-me')) fail(`${tag} Escape committed the discarded name: ${JSON.stringify(renames)}`);
+  ok(`${tag} Escape cancels a name edit instead of committing it`);
+
   // 4. "Random" gives a generated, visible default.
   await page.getByRole('button', { name: 'Use a random device name' }).click();
   await page.waitForTimeout(100);

@@ -92,6 +92,16 @@ socketio = SocketIO(
 REGISTRY = signaling.make_registry(config.REDIS_URL)
 signaling.register(socketio, REGISTRY)
 
+# Pagehide beacons are bearer-token authenticated (uid+gen+token). They are NOT
+# a way to evict a peer from a uid alone. Keep a per-IP budget and honor the
+# configured origin allowlist when it is not the wildcard dev default.
+_CLOSE_LIMIT = int(os.environ.get("FIL_CLOSE_LIMIT", "120"))
+_close_limiter = ratelimit.make_limiter("session-close", _CLOSE_LIMIT, 60.0,
+                                        getattr(REGISTRY, "r", None))
+_ALLOWED_ORIGINS = "*" if config.CORS_ALLOWED_ORIGINS == "*" else [
+    o.strip() for o in config.CORS_ALLOWED_ORIGINS.split(",") if o.strip()
+]
+
 
 # ---------------------------------------------------------------- REST API ---
 @app.get("/api/config")
@@ -188,11 +198,26 @@ def telemetry():
 
 
 # ------------------------------------------------------- Session close -------
+def _origin_allowed(origin):
+    if not origin:
+        return True  # some same-origin beacons omit Origin; the token still gates it
+    if _ALLOWED_ORIGINS == "*":
+        return True
+    return origin in _ALLOWED_ORIGINS
+
+
 @app.post("/api/session/close")
 def session_close():
-    """Synchronous pagehide beacon: drop this session only if (uid, gen) still
-    owns the device. A late beacon from the previous page load is ignored, so a
-    normal reload cannot drop the replacement link."""
+    """Synchronous pagehide beacon: drop this session only if the caller holds
+    the device's private ownership token AND (uid, gen) still own it. A late,
+    forged or cross-origin beacon cannot drop a live link; it always returns
+    the same 204 so it cannot be used as a uid/token oracle."""
+    origin = request.headers.get("Origin")
+    if not _origin_allowed(origin):
+        return "", 204
+    ip_key = "ip:" + ratelimit.ip_bucket(ratelimit.client_ip(request))
+    if not _close_limiter.allow([ip_key]):
+        return "", 204
     raw = request.get_data(cache=False, as_text=True)[:2048]
     try:
         body = json.loads(raw or "{}")
@@ -200,10 +225,9 @@ def session_close():
         body = {}
     if not isinstance(body, dict):
         body = {}
-    uid = body.get("uid")
-    gen = body.get("gen")
-    if isinstance(uid, str) and isinstance(gen, str):
-        signaling.close_session(socketio, REGISTRY, uid[:128], gen[:128])
+    uid, gen, token = body.get("uid"), body.get("gen"), body.get("token")
+    if isinstance(uid, str) and isinstance(gen, str) and isinstance(token, str):
+        signaling.close_session(socketio, REGISTRY, uid[:128], gen[:128], token[:256])
     return "", 204
 
 

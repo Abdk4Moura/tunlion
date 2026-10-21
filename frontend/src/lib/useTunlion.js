@@ -16,7 +16,7 @@ import * as linkdiag from './linkdiag.js'
 import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
 import { mintWords, mintCreatedNameplate } from './words.js'
-import { loadDeviceName, saveDeviceName, tabUid, currentGeneration, rotateGeneration } from './identity.js'
+import { loadDeviceName, saveDeviceName, loadOwnerToken, tabUid, currentGeneration, rotateGeneration } from './identity.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink, linkIsLive, reconcileDigest } from '../net/app/recovery.js'
@@ -44,9 +44,9 @@ function roomFromUrl() {
 // sendBeacon is synchronous from the page's point of view and survives unload;
 // never await it. The relay ignores it when a newer generation already owns the
 // device, so a late beacon cannot drop the replacement link.
-function beaconSessionClose(uid, gen) {
-  if (!uid || !gen) return
-  const body = JSON.stringify({ uid, gen })
+function beaconSessionClose(uid, gen, token) {
+  if (!uid || !gen || !token) return
+  const body = JSON.stringify({ uid, gen, token })
   try {
     if (navigator.sendBeacon && navigator.sendBeacon(api('/api/session/close'), body)) return
   } catch {}
@@ -82,6 +82,7 @@ export function useTunlion() {
   const linksRef = useRef(new Map()) // peerId -> PeerLink
   const transferOwner = useRef(new Map()) // transferId -> peerId
   const cfgRef = useRef(null)
+  const cfgTimerRef = useRef(null)
   const myNameRef = useRef(deviceName)
   const myIdRef = useRef(null) // our current socket id, for the politeness tiebreaker (#1)
   const uidRef = useRef(tabUid()) // stable per-tab identity (resume)
@@ -212,6 +213,9 @@ export function useTunlion() {
     setDeviceName(next)
     setMe((prev) => (prev ? { ...prev, name: next, color: colorFor(prev.id) } : prev))
     if (changed) {
+      // Keep the reconnect cache in step too: otherwise a socket reconnect
+      // would replay the old name.
+      sigRef.current?.setIdentity?.({ name: next, uid: uidRef.current, gen: genRef.current })
       // Level-triggered: the next sync carries the same uid+gen with the new
       // name; the relay updates the existing session and tells the room.
       sessionRef.current?.setRoom(roomIdRef.current, next, uidRef.current, genRef.current)
@@ -219,6 +223,46 @@ export function useTunlion() {
       tel('self-renamed', {})
     }
     return next
+  }, [])
+
+  // Another tab renamed this browser or received the ownership token from the
+  // relay. Keep every open tab's label/identity cache in step (the storage
+  // event fires in the OTHER tabs, never the writer).
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (e.key === 'tunlion.ownerToken' && e.newValue) {
+        sigRef.current?.setToken?.(e.newValue)
+        if (supersededRef.current) {
+          // A near-simultaneous tab won the first-claim race and just stored
+          // the minted token. We can now rejoin legitimately with a fresh gen.
+          supersededRef.current = false
+          setSuperseded(null)
+          genRef.current = rotateGeneration()
+          try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
+          sigRef.current?.setIdentity?.({ name: myNameRef.current, uid: uidRef.current, gen: genRef.current })
+          sigRef.current?.resume?.()
+          sessionRef.current?.start()
+          sessionRef.current?.setRoom(roomIdRef.current, myNameRef.current, uidRef.current, genRef.current)
+          sessionRef.current?.invalidate()
+          sessionRef.current?.kick()
+          return
+        }
+        sessionRef.current?.kick()
+        return
+      }
+      if (e.key !== 'tunlion.deviceName' || !e.newValue) return
+      const next = saveDeviceName(e.newValue)
+      if (!next || next === myNameRef.current) return
+      myNameRef.current = next
+      setDeviceName(next)
+      setMe((prev) => (prev ? { ...prev, name: next } : prev))
+      sigRef.current?.setIdentity?.({ name: next, uid: uidRef.current, gen: genRef.current })
+      sessionRef.current?.setRoom(roomIdRef.current, next, uidRef.current, genRef.current)
+      sessionRef.current?.kick()
+      tel('self-renamed-other-tab', {})
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
   }, [])
 
   // C27: remembering is a TRUST GRANT (the holder can find and auto-connect
@@ -690,6 +734,7 @@ export function useTunlion() {
         setPendingKeeps([])
         setPendingPakeKeep([])
         sessionRef.current?.stop()
+        sigRef.current?.suspend?.() // never replay this retired generation
         setConnected(false)
         connectedRef.current = false
         setSuperseded('A newer tab or reload for this device took over the session.')
@@ -1255,12 +1300,19 @@ export function useTunlion() {
   // ---- fresh ICE credentials (#9) ------------------------------------------
   // TURN creds in /api/config are time-limited HMACs; a tab open past their TTL
   // would hand stale creds to NEW links. Keep cfgRef fresh in the background.
-  useEffect(() => {
-    const t = setInterval(() => {
+  const startCfgRefresh = useCallback(() => {
+    if (cfgTimerRef.current) clearInterval(cfgTimerRef.current)
+    cfgTimerRef.current = setInterval(() => {
       fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
     }, 10 * 60 * 1000)
-    return () => clearInterval(t)
   }, [])
+  useEffect(() => {
+    startCfgRefresh()
+    return () => {
+      if (cfgTimerRef.current) clearInterval(cfgTimerRef.current)
+      cfgTimerRef.current = null
+    }
+  }, [startCfgRefresh])
 
   // ---- resilience: nudge a reconnect when a suspended tab resumes ----------
   // Mobile browsers freeze background tabs and throttle timers, so socket.io's
@@ -1355,7 +1407,9 @@ export function useTunlion() {
       linksRef.current.clear()
       setPeers([]) // those links are gone; a bfcache restore repopulates from the roster
       sessionRef.current?.stop()
-      beaconSessionClose(uidRef.current, genRef.current)
+      if (cfgTimerRef.current) { clearInterval(cfgTimerRef.current); cfgTimerRef.current = null }
+      if (pairTimerRef.current) { clearTimeout(pairTimerRef.current); pairTimerRef.current = null }
+      beaconSessionClose(uidRef.current, genRef.current, loadOwnerToken())
     }
     // pageshow fires on a normal load AND on a BFCache restore. Always
     // revalidate/reconnect; a restored page also rotates to a fresh generation,
@@ -1371,11 +1425,16 @@ export function useTunlion() {
         try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
         supersededRef.current = false
         setSuperseded(null)
+        // Update the reconnect cache BEFORE any socket reconnect can replay the
+        // retired generation in `join`.
+        sigRef.current?.setIdentity?.({ name: myNameRef.current, uid: uidRef.current, gen: genRef.current })
+        sigRef.current?.resume?.()
         sessionRef.current?.setRoom(roomIdRef.current, myNameRef.current, uidRef.current, genRef.current)
         sessionRef.current?.invalidate()
         tel('bfcache-restore', { gen: genRef.current.slice(0, 8) })
       }
       sessionRef.current?.start()
+      startCfgRefresh()
       recover()
     }
     document.addEventListener('visibilitychange', onVisibility)
@@ -1396,7 +1455,7 @@ export function useTunlion() {
       window.removeEventListener('online', onNetworkChange)
       conn?.removeEventListener?.('change', onNetworkChange)
     }
-  }, [subscribeKnown])
+  }, [subscribeKnown, startCfgRefresh])
 
   // ---- Part C: optional native LAN-discovery helper ------------------------
   // If the Tunlion Local helper (experiments/localsend-discovery) is running,

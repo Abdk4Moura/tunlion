@@ -61,6 +61,9 @@ function startBackend() {
       ...process.env, PORT: String(PORT), FIL_ASYNC_MODE: 'threading',
       FIL_CLAIM_LIMIT: '1000000', FIL_PING_TIMEOUT: '120', FIL_PING_INTERVAL: '25',
       FIL_SECRET: 'peer-reload-test-secret',
+      // Same-origin only for the close beacon; the cross-origin test below
+      // proves the endpoint refuses an otherwise-valid token from elsewhere.
+      FIL_CORS_ORIGINS: BASE,
     },
     stdio: ['ignore', backendLogFd, backendLogFd],
   });
@@ -138,6 +141,28 @@ async function waitPeerVisible(page, name, timeout = 25000) {
   await waitFor(async () => (await peerRows(page, name).count()) === 1, timeout, `peer ${name} visible`);
 }
 
+// A row saying "ready" means the real PeerLink reached connectionState
+// connected; this is the live WebRTC assertion, not just "a name rendered".
+async function waitPeerReady(page, name, timeout = 30000) {
+  await waitFor(async () => {
+    const row = peerRows(page, name).first();
+    if ((await row.count()) !== 1) return false;
+    return /\bready\b/i.test(await row.innerText().catch(() => ''));
+  }, timeout, `peer ${name} ready (WebRTC data channel)`);
+}
+
+async function ownerToken(page) {
+  return page.evaluate(() => localStorage.getItem('tunlion.ownerToken') || '');
+}
+
+function closeCount(uid, gen) {
+  return telEvents().filter((e) => e.ev === 'session-close' && e.uid === uid && e.gen === gen.slice(0, 8)).length;
+}
+
+async function postClose(ctx, body, headers = {}) {
+  return ctx.request.post(`${BASE}/api/session/close`, { data: body, headers });
+}
+
 async function waitOnlineAndPeer(page, peerName, timeout = 30000) {
   await waitFor(async () => {
     const id = await identity(page);
@@ -151,11 +176,10 @@ async function waitOnline(page, timeout = 30000) {
 
 async function runEngine(engine, browser, contextOptions) {
   const tag = `[${engine}]`;
-  // WebKit headless is not reliable enough for a live WebRTC data channel in
-  // this container; the render gate covers both engines, and this spec proves
-  // the peer row/relabel path in Chromium. WebKit still exercises the real
-  // relay, reload, supersede, late-close and rename signaling below.
-  const full = engine === 'chromium';
+  // Both engines take the FULL path: real peer row + ready WebRTC data
+  // channel, not just "the page says online". Each engine runs in its own
+  // child process so one engine's renderer memory cannot starve the other.
+  const full = true;
   const trackPageshow = () => {
     window.__pageshowPersisted = false;
     window.addEventListener('pageshow', (e) => { if (e.persisted) window.__pageshowPersisted = true; });
@@ -190,6 +214,9 @@ async function runEngine(engine, browser, contextOptions) {
   if (full) {
     await waitOnlineAndPeer(dev, peerName);
     await waitPeerVisible(peer, devName);
+    // Prove a REAL WebRTC data channel, not merely a rendered row.
+    await waitPeerReady(dev, peerName);
+    await waitPeerReady(peer, devName);
   } else {
     await waitOnline(dev);
   }
@@ -200,7 +227,7 @@ async function runEngine(engine, browser, contextOptions) {
   // 1. A normal reload reconnects by itself and keeps the SAME device name/uid.
   await dev.reload({ waitUntil: 'domcontentloaded' });
   await dev.waitForSelector('[data-testid="device-name-input"]', { timeout: 60000 });
-  if (full) await waitOnlineAndPeer(dev, peerName); else await waitOnline(dev);
+  if (full) { await waitOnlineAndPeer(dev, peerName); await waitPeerReady(dev, peerName); } else await waitOnline(dev);
   const g2 = await identity(dev);
   if (g2.uid !== g1.uid) fail(`${tag} reload changed the device uid (${g1.uid} -> ${g2.uid})`);
   if (g2.name !== devName) fail(`${tag} reload lost the device name (${devName} -> ${g2.name})`);
@@ -223,7 +250,7 @@ async function runEngine(engine, browser, contextOptions) {
   second.on('pageerror', (e) => console.log(tag, '[second page-error]', String(e).slice(0, 300)));
   second.on('console', (m) => { if (m.type() === 'error') console.log(tag, '[second console]', m.text().slice(0, 300)); });
   await nav(second, BASE);
-  if (full) await waitOnlineAndPeer(second, peerName); else await waitOnline(second);
+  if (full) { await waitOnlineAndPeer(second, peerName); await waitPeerReady(second, peerName); } else await waitOnline(second);
   const g3 = await identity(second);
   if (g3.uid !== g2.uid) fail(`${tag} second tab did not carry the same device uid`);
   if (g3.gen === g2.gen) fail(`${tag} second tab reused the old generation`);
@@ -250,6 +277,27 @@ async function runEngine(engine, browser, contextOptions) {
   if (closeEvents.length) fail(`${tag} stale close was accepted by the relay: ${JSON.stringify(closeEvents)}`);
   ok(`${tag} a late close from the old generation is ignored; the new link stays up`);
 
+  // 3b. The close endpoint is authenticated: no token, a wrong token, and a
+  //     cross-origin request with the right token must all leave the session
+  //     online. (The endpoint returns 204 either way, so the proof is state.)
+  const owner = await ownerToken(second);
+  if (!owner) fail(`${tag} the relay did not mint an ownership token for the browser`);
+  const live = await identity(second);
+  const closesBefore = closeCount(live.uid, live.gen);
+  const attempts = [
+    { data: { uid: live.uid, gen: live.gen } },
+    { data: { uid: live.uid, gen: live.gen, token: 'attacker-token' } },
+    { data: { uid: live.uid, gen: live.gen, token: owner }, headers: { Origin: 'https://evil.example' } },
+  ];
+  for (const a of attempts) {
+    const r = await postClose(second.context(), a.data, a.headers);
+    if (r.status() !== 204) fail(`${tag} close endpoint did not hide the refusal as 204: ${r.status()}`);
+  }
+  await sleep(1200);
+  if (closeCount(live.uid, live.gen) !== closesBefore) fail(`${tag} an unauthenticated/wrong/cross-origin close was accepted`);
+  if (full) await waitOnlineAndPeer(second, peerName, 10000); else await waitOnline(second, 10000);
+  ok(`${tag} close endpoint refuses no-token, wrong-token and cross-origin calls; the live session stays up`);
+
   // 4. Renaming updates the SAME device (uid+generation), and the peer's row is
   //    relabeled in place — never a second pairing/row.
   const chosen = 'studio-ipad-' + engine.replace(/[^a-z]/g, '').slice(0, 6);
@@ -269,7 +317,43 @@ async function runEngine(engine, browser, contextOptions) {
     if ((await peerRows(peer, chosen).count()) !== 1) fail(`${tag} rename created a duplicate peer row`);
     if ((await peerRows(peer, devName).count()) !== 0) fail(`${tag} old name still has a peer row after rename`);
   }
-  ok(`${tag} rename relabeled the same device (${chosen}); same uid+generation${full ? ', one row' : ''}`);
+  // The other open tab shares localStorage but has a different uid; the
+  // storage event must relabel it in place too.
+  const devNameField = dev.getByLabel("This device's name", { exact: true });
+  await waitFor(async () => (await devNameField.inputValue()) === chosen, 15000,
+    'the other open tab to receive the rename storage event');
+  ok(`${tag} rename relabeled the same device (${chosen}); other open tab updated${full ? ', one row' : ''}`);
+
+  // 4b. A socket disconnect/reconnect must replay the CURRENT generation/name
+  //     from the signaling cache. A stale cached gen would be retired and the
+  //     open tab would be marked superseded.
+  const beforeReconnect = await identity(second);
+  const gen8 = beforeReconnect.gen.slice(0, 8);
+  const retiredBefore = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === g3.uid && e.gen === gen8).length;
+  const joinsBefore = telEvents().filter((e) => e.ev === 'join' && e.uid === g3.uid && e.gen === gen8).length;
+  await second.context().setOffline(true);
+  await sleep(700);
+  await second.context().setOffline(false);
+  if (full) {
+    await waitOnlineAndPeer(second, peerName, 30000);
+    await waitPeerReady(second, peerName);
+    await waitFor(async () => {
+      const now = await peerRows(peer, chosen).count();
+      const old = await peerRows(peer, devName).count();
+      return now === 1 && old === 0;
+    }, 15000, 'the peer to relabel the reconnected device');
+    await waitPeerReady(peer, chosen);
+  } else {
+    await waitOnline(second, 30000);
+  }
+  const afterReconnect = await identity(second);
+  if (afterReconnect.gen !== beforeReconnect.gen) fail(`${tag} a socket reconnect changed the page generation`);
+  if (afterReconnect.name !== chosen) fail(`${tag} a socket reconnect lost the chosen name`);
+  const retiredAfter = telEvents().filter((e) => e.ev === 'session-retired' && e.uid === g3.uid && e.gen === gen8).length;
+  const joinsAfter = telEvents().filter((e) => e.ev === 'join' && e.uid === g3.uid && e.gen === gen8).length;
+  if (retiredAfter !== retiredBefore) fail(`${tag} reconnect retired the current generation (${retiredBefore} -> ${retiredAfter})`);
+  if (joinsAfter <= joinsBefore) fail(`${tag} reconnect did not rejoin with the current generation (${joinsBefore} -> ${joinsAfter})`);
+  ok(`${tag} socket reconnect after rename replays the current generation/name, not a retired one`);
 
   // 5. Reload the (renamed) current tab. Still one row, still connected.
   await second.reload({ waitUntil: 'domcontentloaded' });
@@ -307,6 +391,17 @@ async function runEngine(engine, browser, contextOptions) {
 
   const finalBody = (await second.locator('body').innerText()).toLowerCase();
   if (/clear (site )?data|reset (the )?browser/.test(finalBody)) fail(`${tag} UI offers a clear-data/reset path`);
+
+  // 7. The authenticated close path still works for the live generation.
+  const finalId = await identity(second);
+  const finalToken = await ownerToken(second);
+  const beforeAuthClose = closeCount(finalId.uid, finalId.gen);
+  const okClose = await postClose(second.context(), { uid: finalId.uid, gen: finalId.gen, token: finalToken },
+    { Origin: BASE });
+  if (okClose.status() !== 204) fail(`${tag} authenticated close returned ${okClose.status()}`);
+  await waitFor(() => closeCount(finalId.uid, finalId.gen) === beforeAuthClose + 1, 10000,
+    'the authenticated close to be applied');
+  ok(`${tag} the owner's authenticated close is applied`);
 
   await second.close();
   await dev.close();

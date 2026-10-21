@@ -5,7 +5,9 @@
 //   * the DEVICE NAME is the human label this browser shows to peers and to
 //     its own user. It is stored in localStorage so every tab on the same
 //     browser is recognisably the same device, and a rename is a relabel of
-//     that one identity (the signaling uid does not change).
+//     that one identity (the signaling uid does not change). Names are NOT
+//     unique identities: two people may choose the same word pair, and
+//     ownership/pairing is carried by the relay token / pair secret instead.
 //
 //   * the SESSION GENERATION is minted fresh on every page load. It is NOT
 //     persisted anywhere, so a reload/bfcache restore is a new generation of
@@ -20,6 +22,7 @@ import { ADJ, ANIMAL } from './words.js'
 const NAME_KEY = 'tunlion.deviceName'
 const LEGACY_NAME_KEY = 'tunlion.name' // per-tab name used before this module
 const UID_KEY = 'tunlion.uid'
+const OWNER_KEY = 'tunlion.ownerToken'
 const MAX_NAME = 48
 
 function cryptoPick(list) {
@@ -97,6 +100,19 @@ export function tabUid() {
   } catch {
     return Math.random().toString(36).slice(2) + Date.now().toString(36)
   }
+}
+
+/// The relay-minted ownership token for this browser. Stored alongside the
+/// device name so a reload/new tab presents it on its first sync; it is NEVER
+/// used for display and never goes into a roster.
+export function loadOwnerToken() {
+  try { return localStorage.getItem(OWNER_KEY) || '' } catch { return '' }
+}
+
+export function saveOwnerToken(token) {
+  const t = String(token || '')
+  if (!t) return
+  try { localStorage.setItem(OWNER_KEY, t) } catch {}
 }
 
 function newGeneration() {

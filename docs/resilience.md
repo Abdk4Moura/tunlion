@@ -268,25 +268,33 @@ and never shown, so a device could be `silken-chickadee` on the wire while the
 UI hid it.
 
 **Solution.**
-- **Generation ownership.** Every page load mints a fresh `gen` (never
-  persisted). `join`/`sync` carry `{uid, gen}`. A different, non-retired `gen`
-  for the same uid supersedes the old sid immediately; the relay tells the old
-  page `session-superseded`, removes its room/channel presence, and retires the
-  old generation. A late `sync` from a retired generation is refused. A same-
-  generation socket reconnect still reclaims its own session.
+- **Generation ownership, with a private token.** Every page load mints a
+  fresh `gen` (never persisted). On the first claim for a uid the relay mints a
+  private ownership `token` and returns it only to that socket (`welcome` /
+  sync ack); it is never in a roster. `join`/`sync` carry `{uid, gen, token}`.
+  A token-bearing, non-retired `gen` supersedes the old sid immediately; the
+  relay tells the old page `session-superseded`, removes its room/channel
+  presence, and retires the old generation (uncapped). A late `sync` from a
+  retired generation is refused. A uid alone is NOT authority: an unrelated
+  room client that learned the victim's uid cannot evict or close it without
+  the token. A same-generation socket reconnect still reclaims its own session.
 - **Synchronous pagehide, not unload-dependent.** `pagehide` closes local
-  `RTCPeerConnection`s, stops link/session timers, and beacons
-  `POST /api/session/close` with `{uid, gen}`. The endpoint only acts when that
-  generation still owns the uid, so the reload's late close cannot drop the new
-  link. `pageshow` always revalidates/reconnects; a BFCache restore rotates
-  generation first. `visibilitychange` alone does NOT tear down (backgrounding
-  an iPad is normal), and ICE/presence timeouts remain the fallback if
-  `pagehide` never fires.
+  `RTCPeerConnection`s, stops link/session/pairing/config timers, and beacons
+  `POST /api/session/close` with `{uid, gen, token}`. The endpoint requires the
+  token, honors the configured origin allowlist, and is rate-limited; it only
+  acts when that generation still owns the uid, so the reload's late close
+  cannot drop the new link. `pageshow` always revalidates/reconnects; a BFCache
+  restore (or any pagehide/pageshow return) rotates generation first.
+  `visibilitychange` alone does NOT tear down (backgrounding an iPad is
+  normal), and ICE/presence timeouts remain the fallback if `pagehide` never
+  fires.
 - **Visible, editable identity.** The device name lives in localStorage (with
   migration from the old per-tab name), is shown on Home/header and in a name
   field with a generated default. Renaming sends the SAME `{uid, gen}` and the
-  relay emits `peer-updated`, so peers relabel one row; no duplicate pairing or
-  peer tile. Clearing site data is never part of the recovery path.
+  relay emits `peer-updated`, so peers relabel one row; open tabs also relabel
+  from the `storage` event. Names are labels, not identities -- duplicates are
+  allowed, and ownership/pairing never depends on the name. No duplicate
+  pairing or peer tile. Clearing site data is never part of the recovery path.
 
 *Files:* `frontend/src/lib/identity.js`, `frontend/src/lib/useTunlion.js`,
 `frontend/src/lib/session.js`, `frontend/src/lib/signaling.js`,

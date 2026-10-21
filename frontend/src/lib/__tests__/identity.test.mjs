@@ -17,7 +17,8 @@ globalThis.sessionStorage = sessionStorage
 
 const {
   loadDeviceName, saveDeviceName, normalizeDeviceName,
-  randomDeviceName, currentGeneration, rotateGeneration,
+  randomDeviceName, loadOwnerToken, saveOwnerToken,
+  currentGeneration, rotateGeneration,
 } = await import('../identity.js')
 
 let ok = true
@@ -49,6 +50,12 @@ eq('chosen name saves', saveDeviceName('studio-ipad'), 'studio-ipad')
 eq('chosen name loads', loadDeviceName(), 'studio-ipad')
 eq('blank keeps current', saveDeviceName('   '), 'studio-ipad')
 eq('blank did not clear storage', localStorage.getItem('tunlion.deviceName'), 'studio-ipad')
+
+// The relay-minted ownership token is persisted but is NOT the device name.
+eq('no token before the relay mints one', loadOwnerToken(), '')
+saveOwnerToken('owner-secret-123')
+eq('owner token persists', loadOwnerToken(), 'owner-secret-123')
+eq('owner token is not the name', localStorage.getItem('tunlion.deviceName') !== loadOwnerToken(), true)
 
 // Generation: one per page load, rotated explicitly, never in storage.
 const g1 = currentGeneration()

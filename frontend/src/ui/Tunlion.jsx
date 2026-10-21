@@ -696,8 +696,16 @@ function useToast() {
 // chosen name commits to the same device identity, not a new pairing.
 function DeviceNameField({ name, onRename, T, narrow }) {
   const [draft, setDraft] = useState(name || '')
+  const cancelRef = useRef(false)
   useEffect(() => { setDraft(name || '') }, [name])
   const commit = () => {
+    // Esc is a real cancel: restore the current name and do NOT call rename,
+    // even though the blur that follows would otherwise commit the draft.
+    if (cancelRef.current) {
+      cancelRef.current = false
+      setDraft(name || '')
+      return
+    }
     const next = onRename ? onRename(draft) : draft
     setDraft(next || name || '')
   }
@@ -721,7 +729,12 @@ function DeviceNameField({ name, onRename, T, narrow }) {
         onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() }
-          if (e.key === 'Escape') { setDraft(name || ''); e.currentTarget.blur() }
+          if (e.key === 'Escape') {
+            e.preventDefault()
+            cancelRef.current = true
+            setDraft(name || '')
+            e.currentTarget.blur()
+          }
         }}
         spellCheck="false"
         autoComplete="off"
