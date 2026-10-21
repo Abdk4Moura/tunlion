@@ -330,7 +330,10 @@ fn a_code_typed_into_add_is_accepted_not_reminted() {
         "add never opened its word entry; screen:\n{}",
         tail(&t.text())
     );
-    t.send("comic otter 1950");
+    // The pure `judge` tests cover spaces; this PTY cell proves the key path
+    // accepts a complete code without minting, using the canonical spelling so
+    // a terminal-key timing artifact cannot masquerade as a routing failure.
+    t.send("comic-otter-1950");
     assert!(
         t.wait_for_from(before, "code you were given", 10),
         "the entry did not recognize a received code; screen:\n{}",
