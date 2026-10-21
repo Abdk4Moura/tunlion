@@ -1196,7 +1196,12 @@ pub mod serving {
             // still clean the mux sid and write nothing through the junction.
             let result = task.join().await.unwrap();
             assert!(result.is_err(), "a junction parent must abort the receive");
-            assert!(result.unwrap_err().contains("escapes the remote dir"));
+            let replies = outgoing_json(&transport);
+            assert_eq!(replies[1]["ok"], false);
+            assert!(
+                replies[1]["err"].as_str().unwrap().contains("escapes the remote dir"),
+                "the per-file ack names the escape: {replies:?}"
+            );
             assert!(
                 std::fs::read_dir(&outside.0).unwrap().next().is_none(),
                 "nothing was created through the junction"
