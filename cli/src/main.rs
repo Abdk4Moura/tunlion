@@ -104,6 +104,7 @@ mod membership;
 mod pair_cmd;
 mod access_ui;
 mod temporary_session;
+mod access_end;
 #[cfg(test)]
 use pair_cmd::invitation_not_a_code_msg;
 /// `tunlion up` / `tunlion logs`.

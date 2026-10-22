@@ -10,6 +10,14 @@ This uses two isolated processes on one Linux worker, not two physical devices o
 Windows. Earlier missing-backend and activation-ack failures were hard failures,
 then repaired; they were never reclassified as success.
 
+The later two-service run at `d3603dd1` passed its read/removal/retained-stream/
+addition assertions but **failed the final End receipt**. That failure is not a
+green multi-resource result. The follow-up cleanup exchange revokes locally
+first, retries End/receipt messages within a fixed budget, confirms the receipt
+before closing transport, and cancels pending scope review. Its exact-tree unit
+and real CLI regressions must pass before treating the latest End changes as
+validated. The historical `81919a30` result does not validate those later edits.
+
 ## Implemented code paths
 
 Run `tunlion add` in a terminal and choose **Temporary access**:

@@ -29,6 +29,7 @@ pub(crate) struct Session {
     established: bool,
     ended: bool,
     proof_deadline: Option<std::time::Instant>,
+    end_exchange: crate::access_end::Exchange,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     endpoints: Vec<Endpoint>,
     pending_opens: PendingOpens,
@@ -57,7 +58,7 @@ impl Session {
     fn new(binding: TemporaryBinding, role: TemporaryRole) -> Self {
         Self { binding, role, host_spec: None, claim_expires: 0, local: None, peer: None,
             engine: None, review: None, snapshot: None, sent_proof: false, mux: None,
-            pending: Vec::new(), active: false, established: false, ended: false, proof_deadline: None,
+            pending: Vec::new(), active: false, established: false, ended: false, proof_deadline: None, end_exchange: crate::access_end::Exchange::default(),
             tasks: Vec::new(), endpoints: Vec::new(), pending_opens: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())), controls: None,
             stop_controls: Arc::new(AtomicBool::new(false)), review_cancel: Arc::new(AtomicBool::new(false)),
             review_thread: None, review_result: None }
@@ -69,6 +70,11 @@ impl Session {
 
     pub(crate) fn is_active(&self) -> bool { self.established && !self.ended }
 
+    pub(crate) fn poll_interval(&self) -> std::time::Duration {
+        if self.end_exchange.is_ending() { std::time::Duration::from_millis(100) }
+        else { std::time::Duration::from_secs(2) }
+    }
+
     fn mux(&mut self, conn: &crate::conn::Conn, pid: &str) -> Result<Arc<Mux>> {
         if let Some(mux) = &self.mux { return Ok(mux.clone()); }
         let transport = conn.transport_of(pid).ok_or_else(|| anyhow!("temporary transport unavailable"))?;
@@ -79,6 +85,7 @@ impl Session {
 
     pub(crate) async fn progress(&mut self, ceremony: &Ceremony, conn: &crate::conn::Conn, pid: &str) -> Result<bool> {
         if self.ended { return Ok(true); }
+        if self.end_exchange.is_ending() { return Ok(self.advance_end().await); }
         if self.mux.as_ref().is_some_and(|mux| mux.transport().is_dead()) {
             self.shutdown().await;
             bail!("temporary transport disconnected; reconnect is unavailable in this build; no replacement code or permanent contact was created");
@@ -106,10 +113,12 @@ impl Session {
             if let Some(thread) = self.review_thread.take() { let _ = thread.join(); }
             let review = self.review.as_ref().ok_or_else(|| anyhow!("scope review unavailable"))?;
             if let Err(error) = decision {
-                mux.transport().send_control(&json!({"type":"access-decline","v":1,
-                    "id":review.snapshot().id,"revision":review.snapshot().revision})).await?;
+                let decline = json!({"type":"access-decline","v":1,
+                    "id":review.snapshot().id,"revision":review.snapshot().revision});
                 eprintln!("  Temporary access declined: {}", crate::access_ui::terminal_label(&error.to_string()));
                 self.shutdown().await;
+                mux.transport().send_control(&decline).await?;
+                drain_final_control(&mux).await;
                 self.ended = true;
                 return Ok(true);
             }
@@ -131,10 +140,10 @@ impl Session {
             if self.active {
                 let snapshot = engine.snapshot(&self.binding.offer_id, crate::identity::now_secs())?;
                 if matches!(snapshot.state, AgreementState::Ended | AgreementState::Expired | AgreementState::Declined) {
-                    mux.transport().send_control(&json!({"type":"access-end","v":1,"id":snapshot.id})).await?;
                     self.shutdown().await;
-                    eprintln!("  Temporary access ended.");
-                    return Ok(true);
+                    self.end_exchange.begin_local(std::time::Instant::now());
+                    eprintln!("  Temporary access ended here; waiting for peer acknowledgement.");
+                    return Ok(self.advance_end().await);
                 }
             }
         }
@@ -165,6 +174,27 @@ impl Session {
         }
         let local = *self.local.get_or_insert(crate::overlay::overlay_pubkey_bytes()?);
         let mux = self.mux(conn, pid)?;
+        if let Some(message) = crate::access_end::Message::parse(kind) {
+            version(&payload)?;
+            if payload["id"].as_str() != Some(self.binding.offer_id.as_str()) { bail!("wrong temporary agreement"); }
+            if message == crate::access_end::Message::End && !self.end_exchange.is_ending() {
+                // Revoke/close before issuing a receipt. This also cancels an
+                // in-progress scope review and any queued acceptance decision.
+                self.shutdown().await;
+            }
+            self.end_exchange.receive(message, std::time::Instant::now());
+            self.advance_end().await;
+            return Ok(());
+        }
+        if self.end_exchange.is_ending() && kind != "l2-close" {
+            // Late acceptance, offer, activation, or ack cannot restart scope.
+            if kind == "access-open" {
+                if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) {
+                    let _ = mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"temporary access ended"})).await;
+                }
+            }
+            return Ok(());
+        }
         match kind {
             "access-possession" => {
                 let peer = ceremony.authenticate_temporary_payload(local, &payload)?;
@@ -207,8 +237,17 @@ impl Session {
                     .ok_or_else(|| anyhow!("wrong temporary agreement"))?;
                 let revision = payload["revision"].as_u64().ok_or_else(|| anyhow!("missing temporary revision"))?;
                 let engine = self.engine.as_ref().unwrap();
-                let snapshot = engine.accept(id, revision, self.peer.ok_or_else(|| anyhow!("peer proof unavailable"))?,
-                    signature(&payload)?, crate::identity::now_secs())?;
+                let snapshot = match engine.accept(id, revision, self.peer.ok_or_else(|| anyhow!("peer proof unavailable"))?,
+                    signature(&payload)?, crate::identity::now_secs()) {
+                    Ok(snapshot) => snapshot,
+                    Err(filament_peerloop::access::AccessError::Ended | filament_peerloop::access::AccessError::Expired) => {
+                        self.shutdown().await;
+                        self.end_exchange.begin_local(std::time::Instant::now());
+                        self.advance_end().await;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 mux.transport().send_control(&json!({"type":"access-active","v":1,"id":snapshot.id,"revision":snapshot.revision})).await?;
                 self.active = true;
                 self.established = true;
@@ -280,13 +319,6 @@ impl Session {
                 self.ended = true;
                 eprintln!("  Temporary access declined by the other device.");
             }
-            "access-end" => {
-                version(&payload)?;
-                if payload["id"].as_str() != Some(self.binding.offer_id.as_str()) { bail!("wrong temporary agreement"); }
-                self.shutdown().await;
-                self.ended = true;
-                eprintln!("  Temporary access ended by the host.");
-            }
             _ => bail!("temporary access control is unavailable or invalid"),
         }
         Ok(())
@@ -302,13 +334,44 @@ impl Session {
         if let Some(engine) = &self.engine { let _ = engine.end(&self.binding.offer_id, crate::identity::now_secs()); }
         self.endpoints.clear();
         if let Some(mux) = &self.mux { mux.shutdown_all().await; }
+        let join_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         for mut task in self.tasks.drain(..) {
-            if tokio::time::timeout(std::time::Duration::from_secs(1), &mut task).await.is_err() {
+            if tokio::time::timeout_at(join_deadline, &mut task).await.is_err() {
                 task.abort();
                 let _ = task.await;
             }
         }
         self.active = false;
+    }
+
+    async fn advance_end(&mut self) -> bool {
+        let transport = self.mux.as_ref().map(|mux| mux.transport());
+        let connected = transport.as_ref().is_some_and(|transport| transport.is_alive() && !transport.is_dead());
+        let step = self.end_exchange.poll(std::time::Instant::now(), connected);
+        let mut failed = false;
+        for message in step.messages {
+            let Some(transport) = &transport else { failed = true; break; };
+            let frame = json!({"type":message.wire(),"v":1,"id":self.binding.offer_id});
+            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(1), transport.send_control(&frame)).await, Ok(Ok(()))) {
+                failed = true;
+                break;
+            }
+        }
+        let outcome = step.outcome.or_else(|| if failed {
+            self.end_exchange.poll(std::time::Instant::now(), false).outcome
+        } else { None });
+        let Some(outcome) = outcome else { return false; };
+        if !failed {
+            if let Some(mux) = &self.mux { drain_final_control(mux).await; }
+        }
+        self.ended = true;
+        match outcome {
+            crate::access_end::Outcome::PeerAcknowledged => eprintln!("  Temporary access ended · peer acknowledged."),
+            crate::access_end::Outcome::Confirmed => eprintln!("  Temporary access ended by the host."),
+            crate::access_end::Outcome::TimedOut => eprintln!("  Temporary access ended here; peer acknowledgement unavailable."),
+            crate::access_end::Outcome::Disconnected => eprintln!("  Temporary access ended here; peer disconnected before final receipt."),
+        }
+        true
     }
 
     fn stop_review(&mut self) {
@@ -338,6 +401,15 @@ fn signature(payload: &Value) -> Result<[u8; 64]> {
     let encoded = payload["signature"].as_str().filter(|value| value.len() == 128)
         .ok_or_else(|| anyhow!("invalid temporary signature"))?;
     hex::decode(encoded)?.try_into().map_err(|_| anyhow!("invalid temporary signature"))
+}
+
+async fn drain_final_control(mux: &Arc<Mux>) {
+    let transport = mux.transport();
+    match tokio::time::timeout(std::time::Duration::from_secs(3), transport.drain_finish()).await {
+        Ok(Ok(())) => {},
+        Ok(Err(error)) => crate::ui::debug(&format!("temporary final-control drain failed: {}", crate::access_ui::terminal_label(&error.to_string()))),
+        Err(_) => crate::ui::debug("temporary final-control drain timed out; local endpoints are closed"),
+    }
 }
 
 async fn send_review(engine: &AgreementEngine, snapshot: &AgreementSnapshot, mux: &Arc<Mux>) -> Result<()> {

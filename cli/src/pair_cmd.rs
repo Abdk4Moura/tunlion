@@ -1093,7 +1093,8 @@ async fn pair_with_purpose(
             }
         }
 
-        let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        let poll_interval = temporary.as_ref().map_or(Duration::from_secs(2), |session| session.poll_interval());
+        let ev = match tokio::time::timeout(poll_interval, rx.recv()).await {
             Ok(Some(ev)) => ev,
             Ok(None) => bail!("signaling closed"),
             Err(_) => continue,

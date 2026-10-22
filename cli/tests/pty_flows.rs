@@ -586,6 +586,7 @@ fn temporary_service_pairing_uses_real_transport_and_end_closes_the_socket() {
         outcome => panic!("revocation did not close the active service socket: {outcome:?}"),
     }
     assert!(host.wait_for_from(at, &format!("{MARK}> "), 30), "host did not exit:\n{}", tail(&host.text()));
+    assert!(host.text()[at..].contains("peer acknowledged"), "host exited without an End receipt:\n{}", tail(&host.text()));
     for label in ["temporary-live-host", "temporary-live-recipient"] {
         let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
         assert!(dir.join("overlay.ed25519").exists(), "confirmed mutation did not persist the internal device key");
@@ -768,6 +769,7 @@ fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acc
     let at = recipient.text().len();
     host.send("\x1b[A\r");
     assert!(recipient.wait_for_from(at, "Temporary access ended", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(host.wait_for("peer acknowledged", 15), "host did not receive the teardown receipt:\n{}", tail(&host.text()));
     for label in ["temporary-revision-host", "temporary-revision-recipient"] {
         let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
         for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] { assert!(!dir.join(file).exists(), "temporary revision wrote {file}"); }
@@ -794,6 +796,55 @@ fn declining_a_temporary_service_offer_never_activates_a_listener_or_contact() {
     for label in ["temporary-decline-host", "temporary-decline-recipient"] {
         let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
         for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] { assert!(!dir.join(file).exists(), "decline wrote {file}"); }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ending_while_a_revised_scope_is_being_reviewed_cancels_the_review_and_closes_endpoints() {
+    let Some(backend) = backend() else { return; };
+    let original = EchoService::start();
+    let addition = EchoService::start();
+    let (mut host, exe) = fresh_term("temporary-review-end-host");
+    let (mut recipient, _) = fresh_term("temporary-review-end-recipient");
+    let code = offer_temporary_services(&mut host, &exe, &backend.url, &[original.address]);
+    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    recipient.send("\r");
+    assert!(recipient.wait_for("Local service service-0 at ", 30), "{}", tail(&recipient.text()));
+    assert!(host.wait_for("RUNNING ACCESS", 30), "{}", tail(&host.text()));
+    let address = temporary_endpoint(&recipient, "service-0");
+    let mut socket = std::net::TcpStream::connect(address).unwrap();
+    assert_echo(&mut socket, b"before-revision", &host, &recipient);
+    let at = host.text().len();
+    host.send("\r");
+    assert!(host.wait_for_from(at, "CHANGE ACCESS", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\x1b[B\r");
+    assert!(host.wait_for_from(at, "port or IP:port:", 20), "{}", tail(&host.text()));
+    host.send(&format!("{}\r", addition.address));
+    let at = host.text().len();
+    host.send("\x1b[A\x1b[A\r");
+    assert!(host.wait_for_from(at, "APPLY CHANGE?", 20), "{}", tail(&host.text()));
+    let recipient_at = recipient.text().len();
+    host.send("\r");
+    assert!(recipient.wait_for_from(recipient_at, "revision 2", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "ACCEPT THIS SCOPE?", 20), "{}", tail(&recipient.text()));
+    let end_at = host.text().len();
+    host.send("\x1b[A\r"); // End wins while the recipient has not accepted.
+    assert!(recipient.wait_for_from(recipient_at, "Temporary access ended", 15), "End blocked behind the review:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(host.wait_for_from(end_at, "peer acknowledged", 15), "{}", tail(&host.text()));
+    assert!(!recipient.text()[recipient_at..].contains("Local service service-1"), "unaccepted resource activated");
+    assert!(std::net::TcpStream::connect(address).is_err(), "End left the old listener open");
+    assert!(recipient.wait_for_from(recipient_at, &format!("{MARK}> "), 15), "recipient review thread survived End:\n{}", tail(&recipient.text()));
+    let after_end = recipient.text().len();
+    recipient.send("\r"); // Late Enter belongs to the shell, never the cancelled review.
+    recipient.settle(200, 2);
+    assert!(!recipient.text()[after_end..].contains("Temporary access active"));
+    for label in ["temporary-review-end-host", "temporary-review-end-recipient"] {
+        let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+        for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] {
+            assert!(!dir.join(file).exists(), "review/End race wrote standing state: {file}");
+        }
     }
 }
 
