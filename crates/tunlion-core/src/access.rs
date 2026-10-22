@@ -81,3 +81,24 @@ fn validate_endpoints(spec:&AccessSpec)->Result<(),AccessError>{
     if !spec.folders.is_empty() && !cfg!(target_os="linux"){return Err(AccessError::Unsupported);}
     Ok(())
 }
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+    #[test]
+    fn inspection_and_unavailable_scope_do_not_bootstrap_or_make_contacts(){
+        let root=tempfile::tempdir().unwrap();let core=Core::open(root.path()).unwrap();
+        assert!(core.access_snapshot().unwrap().is_none());assert!(core.access_events(0).is_err());
+        assert!(core.prepare_access_offer(AccessSpec{shell:true,..AccessSpec::default()},Lifetime::UntilEnded,u64::MAX).is_err());
+        assert!(!root.path().join("identity.ed25519").exists());assert!(!root.path().join("overlay.ed25519").exists());assert!(!root.path().join("devices.json").exists());
+    }
+    #[cfg(feature="access-endpoints")]
+    #[test]
+    fn real_offer_draft_bootstraps_once_without_standing_permissions(){
+        let root=tempfile::tempdir().unwrap();let core=Core::open(root.path()).unwrap();
+        let scope=AccessSpec{services:vec![ServiceAccess{id:"web".into(),target:"127.0.0.1:8080".parse().unwrap(),protocol:ServiceProtocol::Tcp}],..AccessSpec::default()};
+        let draft=core.prepare_access_offer(scope.clone(),Lifetime::UntilEnded,filament_id::now_secs()+600).unwrap();
+        let again=core.prepare_access_offer(scope,Lifetime::UntilEnded,filament_id::now_secs()+600).unwrap();assert_eq!(draft.binding.host_peer,again.binding.host_peer);assert_ne!(draft.binding.offer_id,again.binding.offer_id);
+        assert!(!root.path().join("devices.json").exists());assert!(!root.path().join("caps.json").exists());assert!(core.access_snapshot().unwrap().is_none());
+    }
+}

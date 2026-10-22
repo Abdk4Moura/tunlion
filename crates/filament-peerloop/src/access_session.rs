@@ -158,7 +158,7 @@ impl AccessDispatch {
             tokio::select!{
                 biased;
                 _=stop.run(std::future::pending::<()>())=>{self.cleanup().await;if let Some(s)=&self.snapshot{let _=self.send(json!({"type":"access-end","v":1,"id":s.id})).await;}return Ok(());},
-                _=core_stop.run(std::future::pending::<()>())=>return Ok(()),
+                _=core_stop.run(std::future::pending::<()>())=>{self.cleanup().await;if let Some(s)=&self.snapshot{let _=self.send(json!({"type":"access-end","v":1,"id":s.id})).await;}return Ok(());},
                 command=self.commands.recv()=>match command{
                     None=>return Ok(()),
                     Some(Command::End(reply))=>{
@@ -263,7 +263,7 @@ impl AccessDispatch {
         let current=self.snapshot.as_ref().ok_or(AccessError::NotFound)?;
         if payload["id"].as_str()!=Some(&current.id){return Err(AccessError::NotFound);}
         match kind{
-            "access-end"=>{self.ending=true;self.cleanup().await;self.send(json!({"type":"access-end-ack","v":1,"id":payload["id"]})).await?;self.view(AccessPhase::Ended,true,None);return Ok(true);},
+            "access-end"=>{self.ending=true;self.cleanup().await;let _=self.send(json!({"type":"access-end-ack","v":1,"id":payload["id"]})).await;self.view(AccessPhase::Ended,false,None);return Ok(true);},
             "access-end-ack" if self.ending=>{self.view(AccessPhase::Ended,true,None);return Ok(true);},
             "access-accept" if self.engine.is_some() && !self.ending=>{
                 let revision=payload["revision"].as_u64().ok_or(AccessError::InvalidSpec)?;
@@ -290,3 +290,110 @@ impl AccessDispatch {
     }
 }
 fn signature(value:&Value)->Result<[u8;64],AccessError>{let raw=value["signature"].as_str().filter(|s|s.len()==128).ok_or(AccessError::InvalidProof)?;hex::decode(raw).map_err(|_|AccessError::InvalidProof)?.try_into().map_err(|_|AccessError::InvalidProof)}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::{ServiceAccess,ServiceProtocol};
+    use crate::host::NoHost;
+    use crate::send::ceremony::Inbound;
+    struct Fixture(std::path::PathBuf);
+    impl Fixture{fn new()->Self{let mut r=[0;16];getrandom::getrandom(&mut r).unwrap();let root=std::env::temp_dir().join(format!("access-session-{}",hex::encode(r)));std::fs::create_dir(&root).unwrap();Self(root)}}
+    impl Drop for Fixture{fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+    struct Port(mpsc::Sender<AccessInbound>);
+    #[async_trait::async_trait]
+    impl filament_transport::net::Transport for Port{
+        async fn send_control(&self,v:&Value)->anyhow::Result<()>{self.0.send(AccessInbound::Control(v.clone())).await.map_err(|_|anyhow::anyhow!("peer closed"))}
+        async fn send_frame(&self,sid:u32,_:u64,data:&[u8])->anyhow::Result<()>{self.0.send(AccessInbound::Frame{sid,data:Bytes::copy_from_slice(data)}).await.map_err(|_|anyhow::anyhow!("peer closed"))}
+        async fn flush(&self)->anyhow::Result<()>{Ok(())}
+        fn max_payload(&self)->usize{65536}fn is_dead(&self)->bool{false}fn is_alive(&self)->bool{true}fn as_any(&self)->&dyn std::any::Any{self}
+    }
+    struct Host;
+    #[async_trait::async_trait]
+    impl HostServices for Host{
+        fn now_secs(&self)->u64{10}
+        fn settings_get_str(&self,k:&str)->Option<String>{NoHost.settings_get_str(k)}
+        fn devices_load(&self)->Vec<(String,String)>{vec![]}
+        fn is_self_uid(&self,a:&str,b:Option<&str>)->bool{NoHost.is_self_uid(a,b)}
+        fn rejoin_unwarned(&self)->Duration{NoHost.rejoin_unwarned()}
+        fn relay_banner(&self)->String{String::new()}fn relay_forbidden(&self)->bool{false}
+        fn channel_of(&self,s:&str)->String{NoHost.channel_of(s)}fn roster_snapshot_json(&self)->Option<String>{None}fn fleet_rv_present(&self)->bool{false}
+        async fn connect_local_stream(&self,h:&str,p:u16)->std::io::Result<tokio::net::TcpStream>{tokio::net::TcpStream::connect((h,p)).await}
+    }
+    fn pair(spec:AccessSpec)->(Fixture,AccessDispatch,AccessHandle,AccessDispatch,AccessHandle){
+        let fixture=Fixture::new();let hostkey=OverlayKey::new(fixture.0.join("host.ed25519"));let recipientkey=OverlayKey::new(fixture.0.join("recipient.ed25519"));
+        let hostpub=hostkey.public_key_bytes().unwrap();let _=recipientkey.public_key_bytes().unwrap();
+        let binding=TemporaryBinding::new(hostpub,&spec,Lifetime::UntilEnded,50).unwrap();
+        let mut host=Ceremony::new_temporary("session fixture words","1234",binding.clone(),TemporaryRole::Host);
+        let mut recipient=Ceremony::new_temporary("session fixture words","1234",binding.clone(),TemporaryRole::Recipient);
+        let hm=host.msg_payload();let rm=recipient.msg_payload();host.on_signal(&rm,None);recipient.on_signal(&hm,None);
+        let hc=host.take_confirm_payload("host-fp","recipient-fp").unwrap();let rc=recipient.take_confirm_payload("recipient-fp","host-fp").unwrap();
+        assert!(matches!(host.on_signal(&rc,Some(("host-fp","recipient-fp"))),Inbound::Consumed));
+        assert!(matches!(recipient.on_signal(&hc,Some(("recipient-fp","host-fp"))),Inbound::Consumed));
+        assert!(host.confirmed_temporary_transport("host-fp","recipient-fp"));assert!(!host.confirmed_temporary_transport("recipient-fp","host-fp"));
+        let (htx,hrx)=access_channel();let(rtx,rrx)=access_channel();
+        // Test-only construction inside this module; production has only the
+        // sealed from_conn constructor, which checks the actual DTLS link.
+        let host_connection=AuthenticatedAccessConnection{ceremony:host,transport:Arc::new(Port(rtx)),incoming:hrx};
+        let recipient_connection=AuthenticatedAccessConnection{ceremony:recipient,transport:Arc::new(Port(htx)),incoming:rrx};
+        let draft=AccessOfferDraft{binding,spec,lifetime:Lifetime::UntilEnded,claim_expires_at:50,label:"existing-device".into()};
+        let(host,hh)=AccessDispatch::new(host_connection,hostkey,Arc::new(Host),Some(draft),vec![]).unwrap();
+        let(recipient,rh)=AccessDispatch::new(recipient_connection,recipientkey,Arc::new(NoHost),None,vec![]).unwrap();
+        (fixture,host,hh,recipient,rh)
+    }
+    async fn phase(handle:&AccessHandle,phase:AccessPhase){tokio::time::timeout(Duration::from_secs(3),async{loop{let view=handle.snapshot().unwrap();if view.phase==phase{return;}assert!(view.phase!=AccessPhase::Failed,"{:?}",view.failure);tokio::task::yield_now().await;}}).await.unwrap();}
+
+    #[test]
+    fn observations_are_bounded_and_handles_do_not_invent_contact_state(){
+        let(fixture,_host,handle,_recipient,_other)=pair(AccessSpec::default());
+        let observer=handle.observer();for _ in 0..140{observer.publish(AccessView{phase:AccessPhase::Review,agreement:None,peer_acknowledged_end:false,failure:None});}
+        let events=observer.events(0).unwrap();assert!(events.reset_required);assert_eq!(events.events.len(),128);assert!(!observer.events(events.latest).unwrap().reset_required);
+        assert!(!fixture.0.join("devices.json").exists());assert!(!fixture.0.join("caps.json").exists());
+    }
+
+    #[cfg(feature="forward-server")]
+    #[tokio::test]
+    async fn real_control_proof_accept_and_tcp_end_is_owned_and_never_creates_contacts(){
+        use tokio::io::{AsyncReadExt,AsyncWriteExt};
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let spec=AccessSpec{services:vec![ServiceAccess{id:"echo".into(),target:listener.local_addr().unwrap(),protocol:ServiceProtocol::Tcp}],..AccessSpec::default()};
+        let(fixture,host,hh,recipient,rh)=pair(spec);
+        let stop=Cancellation::default();let hosttask=tokio::spawn(host.drive(stop.clone()));let recipienttask=tokio::spawn(recipient.drive(Cancellation::default()));
+        phase(&rh,AccessPhase::Review).await;assert_eq!(hh.snapshot().unwrap().agreement.unwrap().state,AgreementState::Offered);
+        let accepted=rh.accept(1).await.unwrap();assert_eq!(accepted.state,AgreementState::Active);
+        let mut pipe=rh.open_service(1,"echo".into()).await.unwrap();let(mut socket,_)=listener.accept().await.unwrap();
+        pipe.transport.send_frame(pipe.sid,0,b"real tcp").await.unwrap();let mut bytes=[0;8];socket.read_exact(&mut bytes).await.unwrap();assert_eq!(&bytes,b"real tcp");
+        socket.write_all(b"reply").await.unwrap();let response=pipe.stream.as_mut().unwrap().recv().await.unwrap().unwrap();assert_eq!(&response[..],b"reply");
+        assert_eq!(hh.end().await.unwrap().state,AgreementState::Ended);assert_eq!(hh.end().await.unwrap().state,AgreementState::Ended);
+        assert_eq!(socket.read(&mut bytes).await.unwrap(),0);
+        let _=tokio::time::timeout(Duration::from_secs(3),hosttask).await.unwrap().unwrap();let _=tokio::time::timeout(Duration::from_secs(3),recipienttask).await.unwrap().unwrap();
+        assert_eq!(rh.snapshot().unwrap().phase,AccessPhase::Ended);
+        assert!(!fixture.0.join("devices.json").exists());assert!(!fixture.0.join("caps.json").exists());
+    }
+
+    #[tokio::test]
+    async fn dropping_handle_or_core_stop_ends_the_same_engine_without_accepting(){
+        let(_fixture,host,hh,recipient,rh)=pair(AccessSpec::default());let observer=hh.observer();
+        let hosttask=tokio::spawn(host.drive(Cancellation::default()));let recipienttask=tokio::spawn(recipient.drive(Cancellation::default()));
+        phase(&rh,AccessPhase::Review).await;drop(hh);
+        let _=tokio::time::timeout(Duration::from_secs(3),hosttask).await.unwrap().unwrap();let _=tokio::time::timeout(Duration::from_secs(3),recipienttask).await.unwrap().unwrap();
+        assert_eq!(observer.snapshot().unwrap().agreement.unwrap().state,AgreementState::Ended);
+        let(_fixture,host,_hh,recipient,rh)=pair(AccessSpec::default());let stop=Cancellation::default();let hosttask=tokio::spawn(host.drive(stop.clone()));let recipienttask=tokio::spawn(recipient.drive(Cancellation::default()));
+        phase(&rh,AccessPhase::Review).await;stop.cancel();let _=tokio::time::timeout(Duration::from_secs(3),hosttask).await.unwrap().unwrap();let _=tokio::time::timeout(Duration::from_secs(3),recipienttask).await.unwrap().unwrap();assert_ne!(rh.snapshot().unwrap().agreement.unwrap().state,AgreementState::Active);
+    }
+
+    #[cfg(all(feature="mount-server",target_os="linux"))]
+    #[tokio::test]
+    async fn public_handle_folder_pipe_uses_real_protocol_bytes_and_revokes(){
+        use crate::access::{FolderAccess,FolderMode};use crate::mount_proto::{MountClient,MountOp,MountResult,path_encode};
+        let folder=Fixture::new();let expected:Vec<u8>=(0..65549).map(|n|(n%256)as u8).collect();std::fs::write(folder.0.join("file"),&expected).unwrap();
+        let spec=AccessSpec{folders:vec![FolderAccess::canonical("docs".into(),&folder.0,FolderMode::ReadOnly).unwrap()],..AccessSpec::default()};
+        let(_fixture,host,hh,recipient,rh)=pair(spec);let ht=tokio::spawn(host.drive(Cancellation::default()));let rt=tokio::spawn(recipient.drive(Cancellation::default()));
+        phase(&rh,AccessPhase::Review).await;rh.accept(1).await.unwrap();
+        let mut pipe=rh.open_folder(1,"docs".into()).await.unwrap();
+        let mut client=MountClient::from_mux_v2_with_mode(pipe.transport.clone(),pipe.sid,pipe.stream.take().unwrap(),pipe.folder_caps.take().unwrap(),FolderMode::ReadOnly);
+        let opened=client.call(MountOp::Open{path:path_encode(std::path::Path::new("file")),flags:libc::O_RDONLY}).await.unwrap();let MountResult::Ok(opened)=opened.result else{panic!("open failed")};let fh=opened["fh"].as_u64().unwrap();
+        let mut bytes=Vec::new();let cancel=Cancellation::default();loop{let read=client.read_binary(fh,bytes.len()as u64,32768,Duration::from_secs(2),&cancel).await.unwrap();if read.is_empty(){break;}bytes.extend_from_slice(&read);}assert_eq!(bytes,expected);
+        hh.end().await.unwrap();let _=ht.await.unwrap();let _=rt.await.unwrap();assert!(client.read_binary(fh,0,1,Duration::from_secs(2),&cancel).await.is_err());
+    }
+}
