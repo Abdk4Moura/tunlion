@@ -23,20 +23,23 @@ the GitHub release notes.
   automation saw a failure while the fleet gained a device. The owner now
   re-sends the stored certificate as an idempotent receipt (same device key,
   same persisted signed bounds, no second use) and the joining side exits 0
-  with `"receipt": "reissued"`. The receipt is reissued after an owner restart
-  (the durable use count path) and is refused for a key on the separate
-  revoked-keys list, even when the record still lacks a revocation marker. An
-  owner that cannot prove the retry is the same enrollment still refuses.
+  with `"receipt": "reissued"`. A retry is recognized before use accounting, so
+  `--reuse N` and `--reuse forever` invitations no longer consume another use or
+  rotate the certificate/secret; only a different device key or different signed
+  bounds takes the ordinary claim path. The receipt also runs after an owner
+  restart (the durable use count path) and refuses a key on the separate
+  revoked-keys list, even when the record still lacks a revocation marker.
 - **`join` commits the identity as one recoverable unit.** The accepted
   acknowledgement is journaled (`join.pending.json`), then `devices.json` is
   written, and the local certificate is written LAST. A failure used to leave a
   certificate and an overlay key without a device store, so `up` said "no
   identity yet, and no paired devices" while the owner held the device. The next
   `join` or `up` now finishes the journal; a certificate whose overlay key no
-  longer matches, a corrupt certificate record, a non-file/unparseable
-  `devices.json`, or an accepted journal with no certificate is refused with
-  the reset/rejoin path instead of presenting an address the fleet never
-  certified. `reset` also removes the journal and the `devices.json.bak` a
+  longer matches, a certificate whose signature is invalid or has expired, a
+  corrupt certificate record, a non-file/unparseable `devices.json`, a record
+  without a name, a joined store without the owner record the certificate names,
+  or an accepted journal with no certificate is refused with the reset/rejoin
+  path instead of presenting an address the fleet never certified. `reset` also removes the journal and the `devices.json.bak` a
   half-write leaves behind.
 - `addr --json` now reports `displayName` and `meshName` separately (and keeps
   `name`/`mesh` as the mesh label). `--name-as` is documented and printed as a

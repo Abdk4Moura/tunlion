@@ -24,6 +24,8 @@
 #       display-only and does not rename the mesh
 #   J9  the human `addr` readout says --name-as is display-only
 #   J10 a corrupt certificate is refused by `addr`, not treated as "no identity"
+#   J11 a multi-use invitation retry is a receipt: one use, same secret/cert
+#   J12 a joined store must hold its owner record, not just any JSON array
 #
 # Hermetic localhost fixture. TUNLION_BIN points at the built binary.
 set -uo pipefail
@@ -113,7 +115,12 @@ fi
 
 say "J3: a local commit failure leaves no certificate, only a journal"
 rm -f "$DG/identity/device-cert.json" "$DG/devices.json"
-mkdir "$DG/devices.json"   # the store cannot be written over a directory
+# A valid, parseable empty store passes the read-only preflight. Its LOCK
+# sidecar is a directory, so the locked commit fails AFTER the acknowledgement
+# is journaled -- exactly the crash/IO window this journal exists for.
+printf '[]' >"$DG/devices.json"
+rm -f "$DG/devices.json.lock"
+mkdir "$DG/devices.json.lock"
 timeout 90 "${G_ENV[@]}" "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" \
   --name "$NAME" --no-interactive >"$WORK/j3.out" 2>&1
 RC3=$?
@@ -136,7 +143,7 @@ else
 fi
 
 say "J4: the next join finishes the accepted journal"
-rmdir "$DG/devices.json"
+rmdir "$DG/devices.json.lock"
 timeout 30 "${G_ENV[@]}" "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" \
   --name "$NAME" --no-interactive >"$WORK/j4.out" 2>&1
 RC4=$?
@@ -190,6 +197,65 @@ if [ "$RC10" != 0 ] && grep -q "certificate record" "$WORK/j10.err" "$WORK/j10.o
 else
   cat "$WORK/j10.out" "$WORK/j10.err"
   bad "J10: a corrupt certificate was treated as no identity (rc=$RC10)"
+fi
+
+say "J11: a multi-use invitation retry is a receipt, not a second use"
+DM="$WORK/multi"; mkdir -p "$DM"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" add --for mreuse --reuse 5 --out "$WORK/multi-inv.txt" --yes   >"$WORK/j11-add.log" 2>&1 || { cat "$WORK/j11-add.log"; fixture_die "J11 setup: could not mint a multi-use invitation"; }
+timeout 90 env TUNLION_CONFIG_DIR="$DM" "$BIN" --server "$SERVER" join --invite-file "$WORK/multi-inv.txt"   --name mreuse --no-interactive >"$WORK/j11a.out" 2>&1
+RC11A=$?
+uses_now() {
+  "$PYV" - "$DA/used-invitations.json" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: print(-1); raise SystemExit
+print(sum(int(e.get("uses",0)) for e in d))
+PY
+}
+secret_now() {
+  "$PYV" - "$DM/devices.json" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: print(""); raise SystemExit
+print(next((r.get("secret","") for r in d if r.get("secret")), ""))
+PY
+}
+USES1=$(uses_now)
+SECRET1=$(secret_now)
+CERT1=$(sha256sum "$DM/identity/device-cert.json" | cut -d' ' -f1)
+rm -f "$DM/identity/device-cert.json" "$DM/devices.json"
+timeout 90 env TUNLION_CONFIG_DIR="$DM" "$BIN" --server "$SERVER" join --invite-file "$WORK/multi-inv.txt"   --name mreuse --no-interactive --json >"$WORK/j11b.out" 2>"$WORK/j11b.err"
+RC11B=$?
+USES2=$(uses_now)
+SECRET2=$(secret_now)
+CERT2=$(sha256sum "$DM/identity/device-cert.json" | cut -d' ' -f1)
+if [ "$RC11A" = 0 ] && [ "$RC11B" = 0 ] && [ "$USES1" = "$USES2" ] \
+   && [ -n "$SECRET1" ] && [ "$SECRET1" = "$SECRET2" ] && [ "$CERT1" = "$CERT2" ] \
+   && grep -q '"alreadyEnrolled": true' "$WORK/j11b.out"; then
+  ok "J11: the retry re-sent the receipt without consuming a second use or rotating the secret"
+else
+  echo "rcA=$RC11A rcB=$RC11B uses=$USES1->$USES2 secret1='${SECRET1:0:8}' secret2='${SECRET2:0:8}' secretStable=$([ "$SECRET1" = "$SECRET2" ] && echo yes || echo no)"
+  cat "$WORK/j11a.out" "$WORK/j11b.out" "$WORK/j11b.err"
+  bad "J11: a multi-use retry consumed another use or rotated the enrollment"
+fi
+
+say "J12: a joined store needs its owner record, not merely parseable JSON"
+DSHAPE="$WORK/store-shape"; cp -a "$DG" "$DSHAPE"
+J12_BAD=0
+for shape in '[]|no owner record' '[1]|non-object record' '[{}]|without a name' '{garbage|cannot be parsed'; do
+  body=${shape%%|*}; needle=${shape#*|}
+  printf '%s' "$body" >"$DSHAPE/devices.json"
+  timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12.out" 2>"$WORK/j12.err"
+  rc=$?
+  if [ "$rc" = 0 ] || ! grep -q "$needle" "$WORK/j12.out" "$WORK/j12.err"; then
+    echo "shape=$body rc=$rc expected='$needle'"; cat "$WORK/j12.out" "$WORK/j12.err"
+    J12_BAD=1
+  fi
+done
+if [ "$J12_BAD" = 0 ]; then
+  ok "J12: empty, scalar, nameless and unparseable joined stores are all refused"
+else
+  bad "J12: a joined store with no owner record was accepted"
 fi
 
 say "J7: reset removes the half-join journal and backup"

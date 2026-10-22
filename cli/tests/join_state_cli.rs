@@ -322,3 +322,28 @@ fn addr_refuses_an_accepted_journal_without_a_certificate() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&owner);
 }
+
+/// A structurally parseable certificate with an invalid signature must not be
+/// presented: the fleet rejects it later, which looks like a transport fault.
+#[test]
+fn addr_refuses_a_certificate_with_a_bad_signature() {
+    let dir = scratch("bad-signature");
+    init(&dir, "alpha");
+    let path = dir.join("identity/device-cert.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let sig = record["cert"]["sig"].as_str().unwrap().to_string();
+    let flipped = if sig.starts_with("00") { "01" } else { "00" };
+    record["cert"]["sig"] = serde_json::json!(format!("{flipped}{}", &sig[2..]));
+    std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+    let out = run(&dir, &["addr", "--json"]);
+    assert!(!out.status.success(), "addr must refuse a bad signature");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("not valid"), "{text}");
+    assert!(text.contains("tunlion reset"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

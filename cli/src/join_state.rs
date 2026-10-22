@@ -121,6 +121,17 @@ impl JoinState {
                 path.display()
             )
         })?;
+        // Structural parsing is not validity. An expired certificate or a
+        // signature that does not chain to its user key is exactly what the
+        // fleet rejects later; refuse it here with the repair path instead of
+        // presenting it as a transport problem.
+        cert.verify(crate::identity::now_secs()).map_err(|e| {
+            anyhow::anyhow!(
+                "this device's certificate at {} is not valid ({e}); repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                path.display()
+            )
+        })?;
         Ok(Some(cert))
     }
 
@@ -372,62 +383,141 @@ impl JoinState {
         Ok(())
     }
 
-    /// A joined device (no owner key) whose certificate exists but whose
-    /// `devices.json` is gone is a half-join. An owner device legitimately has
-    /// no devices.json until its first pair, so only the joined shape is
-    /// refused.
-    pub(crate) fn check_complete_join(&self) -> Result<()> {
-        if self.read_local_cert()?.is_none() || self.root.join("identity.ed25519").exists() {
-            return Ok(());
-        }
+    /// Read and validate `devices.json` whenever it exists.
+    ///
+    /// A store that is a directory, unparseable, not an array, or holds a
+    /// non-object/nameless record is a broken device store for every device,
+    /// with or without a certificate. `up_refused_for_identity` treats
+    /// unparseable text as "not empty", which used to let a keyless device
+    /// start on top of a corrupt store.
+    fn read_store_records(&self) -> Result<Option<Vec<Value>>> {
         let devices = self.devices_path();
         match std::fs::metadata(&devices) {
-            Ok(meta) if meta.is_file() => {
-                let raw = std::fs::read_to_string(&devices).with_context(|| {
-                    format!(
-                        "this device's joined store at {} cannot be read; repair: \
-                         `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
-                        devices.display()
-                    )
-                })?;
-                serde_json::from_str::<Vec<Value>>(&raw).map_err(|e| {
-                    anyhow::anyhow!(
-                        "this device's joined store at {} cannot be parsed ({e}); repair: \
-                         `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
-                        devices.display()
-                    )
-                })?;
-                return Ok(());
-            }
+            Ok(meta) if meta.is_file() => {}
             Ok(_) => bail!(
-                "this device's joined store at {} is not a regular file, so the join is incomplete. \
-                 Repair: `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation.",
+                "this device's store at {} is not a regular file; repair: `tunlion down -y`, \
+                 then `tunlion reset -y`, then join again with a fresh invitation",
                 devices.display()
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| {
-                format!(
-                    "cannot inspect this device's joined store at {}; repair: `tunlion down -y`, \
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "cannot inspect this device's store at {}; repair: `tunlion down -y`, \
                          then `tunlion reset -y`, then join again with a fresh invitation",
-                    devices.display()
-                )
-            }),
+                        devices.display()
+                    )
+                });
+            }
         }
-        if self.devices_backup_path().is_file() {
-            bail!(
+        let raw = std::fs::read_to_string(&devices).with_context(|| {
+            format!(
+                "this device's store at {} cannot be read; repair: `tunlion down -y`, \
+                 then `tunlion reset -y`, then join again with a fresh invitation",
+                devices.display()
+            )
+        })?;
+        let records: Vec<Value> = serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "this device's store at {} cannot be parsed ({e}); repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                devices.display()
+            )
+        })?;
+        for (index, record) in records.iter().enumerate() {
+            let Some(obj) = record.as_object() else {
+                bail!(
+                    "this device's store at {} has a non-object record at index {index}; repair: \
+                     `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                    devices.display()
+                );
+            };
+            if obj
+                .get("name")
+                .and_then(Value::as_str)
+                .map_or(true, |n| n.trim().is_empty())
+            {
+                bail!(
+                    "this device's store at {} has a record without a name at index {index}; repair: \
+                     `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                    devices.display()
+                );
+            }
+            if let Some(secret) = obj.get("secret").and_then(Value::as_str) {
+                if hex::decode(secret).map(|b| b.len()).ok() != Some(32) {
+                    bail!(
+                        "this device's store at {} has an invalid pair secret at index {index}; repair: \
+                         `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                        devices.display()
+                    );
+                }
+            }
+        }
+        Ok(Some(records))
+    }
+
+    /// A joined device must hold the owner record its certificate names: the
+    /// same owner user key, a different device key (the owner's), a usable pair
+    /// secret and a name. A syntactically valid `[]` is not a joined store.
+    fn check_owner_record(&self, cert: &DeviceCert, records: &[Value]) -> Result<()> {
+        let owner_user = hex::encode(cert.user_pub);
+        let has_owner = records.iter().any(|record| {
+            let Some(owner) = DeviceCert::from_json(&record["deviceCert"]) else {
+                return false;
+            };
+            owner.user_pub == cert.user_pub
+                && owner.device_pub != cert.device_pub
+                && record["name"]
+                    .as_str()
+                    .is_some_and(|name| !name.trim().is_empty())
+                && record["secret"]
+                    .as_str()
+                    .is_some_and(|s| hex::decode(s).map(|b| b.len()).ok() == Some(32))
+        });
+        if has_owner {
+            return Ok(());
+        }
+        bail!(
+            "the join did not finish: this device's certificate names owner {owner_user}, but \
+             devices.json has no owner record for that identity. Repair: `tunlion down -y`, then \
+             `tunlion reset -y`, then join again with a fresh invitation from the owner."
+        )
+    }
+
+    /// Validate the local identity and the device store together.
+    ///
+    /// The store is inspected whenever it exists, even with no certificate (a
+    /// keyless pair store) or on an owner device: a directory, invalid JSON,
+    /// a non-array or a nameless record is never a healthy store. A JOINED
+    /// certificate additionally needs its owner record and a key binding, so a
+    /// valid certificate plus `[]`, `[1]` or `[{}]` is refused.
+    pub(crate) fn check_complete_join(&self) -> Result<()> {
+        let cert = self.read_local_cert()?;
+        let records = self.read_store_records()?;
+        let Some(cert) = cert else {
+            return Ok(());
+        };
+        // An owner device legitimately has no paired devices yet. Its local
+        // certificate is still verified above.
+        if self.root.join("identity.ed25519").exists() {
+            return Ok(());
+        }
+        match records {
+            Some(records) => self.check_owner_record(&cert, &records),
+            None if self.devices_backup_path().is_file() => bail!(
                 "the join did not finish: this device has a joined certificate but no devices.json. \
                  A backup is at {}. Restore it only if it is this device's own store \
                  (`cp {0} {1}`); otherwise run `tunlion reset -y` and join again with a fresh invitation. \
                  `tunlion up` will not start a half-joined device.",
                 self.devices_backup_path().display(),
                 self.devices_path().display()
-            );
+            ),
+            None => bail!(
+                "the join did not finish: this device has a joined certificate but no devices.json, so it \
+                 holds no record of the owner it joined. Run `tunlion reset -y`, then join again with a fresh \
+                 invitation. `tunlion up` will not start a half-joined device."
+            ),
         }
-        bail!(
-            "the join did not finish: this device has a joined certificate but no devices.json, so it \
-             holds no record of the owner it joined. Run `tunlion reset -y`, then join again with a fresh \
-             invitation. `tunlion up` will not start a half-joined device."
-        )
     }
 
     /// A read-only command must not print an address for a join whose accepted
@@ -682,6 +772,133 @@ mod tests {
             .to_string();
         assert!(err.contains("still pending locally"), "{err}");
         assert!(err.contains("tunlion up"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    fn write_store(root: &Path, value: Value) {
+        crate::platform::SecretFile::write_str(
+            &root.join(DEVICES_FILE),
+            &serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_joined_certificate_needs_a_real_owner_record_not_just_valid_json() {
+        let root = temp("owner-record");
+        write_overlay(&root);
+        let overlay = JoinState::at(&root).overlay_pub().unwrap();
+        let cert = cert_for(3, overlay, 3600);
+        crate::platform::SecretFile::write_str(
+            &root.join("identity/device-cert.json"),
+            &json!({"name": "joined", "cert": cert.to_json()}).to_string(),
+        )
+        .unwrap();
+        let state = JoinState::at(&root);
+        let owner_cert = cert_for(3, [9u8; 32], 3600);
+        let secret = "11".repeat(32);
+
+        for (label, store, needle) in [
+            ("empty array", json!([]), "no owner record"),
+            ("scalar record", json!([1]), "non-object record"),
+            ("nameless record", json!([{}]), "without a name"),
+            (
+                "no owner certificate",
+                json!([{ "name": "owner", "secret": secret }]),
+                "no owner record",
+            ),
+            (
+                "different owner user key",
+                json!([{
+                    "name": "owner",
+                    "secret": secret,
+                    "deviceCert": cert_for(4, [9u8; 32], 3600).to_json()
+                }]),
+                "no owner record",
+            ),
+        ] {
+            write_store(&root, store);
+            let err = state.check_complete_join().unwrap_err().to_string();
+            assert!(err.contains(needle), "{label}: {err}");
+        }
+
+        write_store(
+            &root,
+            json!([{
+                "name": "owner",
+                "secret": secret,
+                "deviceCert": owner_cert.to_json()
+            }]),
+        );
+        state
+            .check_complete_join()
+            .expect("a real owner record for the certificate's owner is complete");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bad_store_is_refused_even_without_a_certificate() {
+        let root = temp("bad-store-keyless");
+        let state = JoinState::at(&root);
+        crate::platform::SecretFile::write_str(&root.join(DEVICES_FILE), "{garbage").unwrap();
+        let err = state.check_complete_join().unwrap_err().to_string();
+        assert!(err.contains("cannot be parsed"), "{err}");
+
+        write_store(&root, json!([1]));
+        let err = state.check_complete_join().unwrap_err().to_string();
+        assert!(err.contains("non-object record"), "{err}");
+
+        let _ = std::fs::remove_file(root.join(DEVICES_FILE));
+        std::fs::create_dir(root.join(DEVICES_FILE)).unwrap();
+        let err = state.check_complete_join().unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        // An empty array with no identity is a legitimate empty pair store.
+        std::fs::remove_dir(root.join(DEVICES_FILE)).unwrap();
+        write_store(&root, json!([]));
+        state
+            .check_complete_join()
+            .expect("a keyless empty store is not corruption");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bad_signature_or_expired_certificate_is_refused() {
+        let root = temp("cert-validity");
+        write_overlay(&root);
+        let overlay = JoinState::at(&root).overlay_pub().unwrap();
+        let mut cert = cert_for(3, overlay, 3600);
+        cert.sig[0] ^= 0xFF;
+        crate::platform::SecretFile::write_str(
+            &root.join("identity/device-cert.json"),
+            &json!({"name": "joined", "cert": cert.to_json()}).to_string(),
+        )
+        .unwrap();
+        let err = JoinState::at(&root)
+            .check_key_binding()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not valid"), "{err}");
+        assert!(err.contains("tunlion reset"), "{err}");
+
+        let user = crate::identity::UserKey::from_seed(&[3u8; 32]).unwrap();
+        let expired = DeviceCert::certify(
+            &user,
+            overlay,
+            crate::identity::now_secs().saturating_sub(7200),
+            3600,
+        )
+        .unwrap();
+        crate::platform::SecretFile::write_str(
+            &root.join("identity/device-cert.json"),
+            &json!({"name": "joined", "cert": expired.to_json()}).to_string(),
+        )
+        .unwrap();
+        let err = JoinState::at(&root)
+            .check_key_binding()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expired"), "{err}");
+        assert!(err.contains("tunlion reset"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

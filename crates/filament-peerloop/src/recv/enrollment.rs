@@ -213,6 +213,21 @@ impl EnrollmentService {
 
         match payload.verify(&owner_pub, &nonce, &verifier_pub) {
             Ok((enroll_pub, device_pub, ak)) => {
+                // A retry of an enrollment this owner ALREADY COMMITTED is a
+                // receipt, before any use accounting. This matters for
+                // `--reuse N`/`--reuse forever`: the live and durable counters
+                // still have room, so the ordinary path below would consume a
+                // SECOND use, mint a new certificate and rotate the secret just
+                // because an acknowledgement was lost. Only a different device
+                // key (or different signed bounds) reaches the ordinary path.
+                if self
+                    .reissue_enrolment_receipt(
+                        conn, &pid, &owner_key, device_pub, enroll_pub, &ak,
+                    )
+                    .await
+                {
+                    return;
+                }
                 // Burn ON SUCCESS only (never-reset live counter).
                 if let Err(e) = self
                     .runtime
