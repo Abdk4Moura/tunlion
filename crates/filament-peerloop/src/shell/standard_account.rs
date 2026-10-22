@@ -11,10 +11,28 @@ pub enum ShellAccountError { Unsupported,PrivilegedService,IdentityChanged,Unava
 impl std::fmt::Display for ShellAccountError{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"standard local account: {self:?}")}}
 impl std::error::Error for ShellAccountError{}
 
+/// The resolved local login identity, revalidated immediately before a spawn.
+///
+/// This is the account half of [`StandardLocalExecProcess`], shared with the
+/// PTY seam: both refuse a root/service identity and a real/effective UID
+/// mismatch, and neither performs account switching. The value is the OS
+/// password-database record for this process, never an environment label.
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub struct StandardLocalAccount(ExecUserContext);
+impl StandardLocalAccount {
+    pub fn resolve()->Result<Self,ShellAccountError>{current_standard_account().map(Self)}
+    /// Re-read the OS identity and refuse if it changed since `resolve`.
+    pub fn revalidate(&self)->Result<(),ShellAccountError>{
+        let current=current_standard_account()?;
+        if current!=self.0{return Err(ShellAccountError::IdentityChanged);}Ok(())
+    }
+    pub fn context(&self)->&ExecUserContext{&self.0}
+}
+
 pub struct StandardLocalExecProcess { inner:Arc<dyn ExecProcess>,account:ExecUserContext }
 impl StandardLocalExecProcess {
     pub fn new(inner:Arc<dyn ExecProcess>)->Result<Self,ShellAccountError>{
-        let account=current_standard_account()?;Ok(Self{inner,account})
+        let account=StandardLocalAccount::resolve()?.0;Ok(Self{inner,account})
     }
     pub fn account(&self)->&ExecUserContext{&self.account}
     fn revalidate(&self)->Result<ExecUserContext,ShellAccountError>{
@@ -95,6 +113,7 @@ mod tests{
         if real==0||effective==0{assert!(matches!(StandardLocalExecProcess::new(Arc::new(Host)),Err(ShellAccountError::PrivilegedService)));return;}
         if real!=effective{assert!(matches!(StandardLocalExecProcess::new(Arc::new(Host)),Err(ShellAccountError::IdentityChanged)));return;}
         let process=StandardLocalExecProcess::new(Arc::new(Host)).unwrap();assert_eq!(process.account().uid,Some(real));assert_ne!(process.account().name,"untrusted-daemon-label");assert_eq!(process.user_context(None).unwrap(),*process.account());assert!(process.user_context(Some("other")).is_err());assert!(process.user_drop_argv(Path::new("/bin/sh"),&[],"other").is_err());
+        let account=StandardLocalAccount::resolve().unwrap();assert_eq!(account.context(),process.account());assert!(account.revalidate().is_ok());
         let spec=ExecSpawnSpec{program:"/bin/true".into(),args:vec![],cwd:process.account().home.clone(),env:vec![]};assert!(process.spawn(spec).err().unwrap().contains("existing process primitive"));
     }
     #[cfg(not(unix))]

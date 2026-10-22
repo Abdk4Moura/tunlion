@@ -200,8 +200,7 @@ impl PtyBackend for UnavailablePty {
 /// on every exit path that does not come back through the receive loop
 /// (natural shell exit, reaper, revocation, store removal). The generation
 /// check makes a late exit harmless if the sid has since been reused.
-#[cfg(feature = "pty-server")]
-async fn install_end_cleanup(mux: &Arc<Mux>, sid: u32, sess: &Arc<dyn PtySession>) {
+pub async fn install_end_cleanup(mux: &Arc<Mux>, sid: u32, sess: &Arc<dyn PtySession>) {
     let Some(generation) = mux.stream_generation(sid).await else {
         return;
     };
@@ -217,6 +216,104 @@ async fn install_end_cleanup(mux: &Arc<Mux>, sid: u32, sess: &Arc<dyn PtySession
         mux.drop_stream_if(sid, generation).await;
     }
 }
+
+/// Why a fresh PTY attachment could not be created. `attach_pty` has already
+/// sent the precise close (or the backend did); the caller only decides what to
+/// log.
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub enum PtyAttachError {
+    Capacity,
+    Collision,
+    Refused(String),
+    BackendRefused,
+}
+
+/// Create ONE fresh PTY attachment on an already-admitted mux/stream id.
+///
+/// This is the shared host seam for the standing `pty-open` endpoint and the
+/// agreement-scoped PTY endpoint: reservation, collision-safe stream identity,
+/// resize registration, the ack, the host spawn, pumps and natural-end cleanup
+/// are written once. It performs NO authorization decision; the caller must
+/// have admitted the open. `before_spawn` is the caller's last identity check
+/// (the agreement path revalidates its standard nonroot account there).
+///
+/// Returns the live session, or `None` after sending the precise close itself
+/// (capability/collision/revalidation refusal or a backend spawn refusal).
+pub async fn attach_pty(
+    mux: &Arc<Mux>,
+    transport: Arc<dyn Transport>,
+    sid: u32,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+    term: String,
+    argv: Vec<String>,
+    device_pub: Option<[u8; 32]>,
+    admitted_via_ceiling: bool,
+    backend: &dyn PtyBackend,
+    before_spawn: impl FnOnce() -> Result<(), String>,
+) -> Result<Arc<dyn PtySession>, PtyAttachError> {
+    // The cap is the host's: `reserve` returns the one slot it enforces, and
+    // the same figure is named in the refusal, so it cannot drift.
+    let Some(reservation) = backend.reserve() else {
+        let _ = transport
+            .send_control(&json!({
+                "type": "l2-close", "sid": sid, "err": "too many streams",
+            }))
+            .await;
+        return Err(PtyAttachError::Capacity);
+    };
+    let Some(rx) = mux
+        .register_pty_stream(sid, session_id.clone())
+        .await
+    else {
+        let _ = transport
+            .send_control(&json!({
+                "type": "l2-close", "sid": sid, "err": "sid in use",
+            }))
+            .await;
+        return Err(PtyAttachError::Collision);
+    };
+    let (rtx, rrx) = mpsc::unbounded_channel::<(u16, u16)>();
+    mux.register_resizer(sid, rtx).await;
+    // Revalidate immediately before the host spawn. On failure, release the
+    // reserved slot, the stream and the resizer and name the refusal.
+    if let Err(reason) = before_spawn() {
+        mux.drop_pty(sid).await;
+        let _ = transport
+            .send_control(&json!({
+                "type": "l2-close", "sid": sid, "err": reason,
+            }))
+            .await;
+        return Err(PtyAttachError::Refused(reason));
+    }
+    let _ = transport
+        .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
+        .await;
+    let spec = PtySpawnSpec {
+        session_id,
+        transport,
+        sid,
+        cols,
+        rows,
+        term,
+        argv,
+        device_pub,
+        admitted_via_ceiling,
+    };
+    match backend.spawn(spec, reservation).await {
+        Some(sess) => {
+            backend.start_pumps(sess.clone(), rx, rrx);
+            install_end_cleanup(mux, sid, &sess).await;
+            Ok(sess)
+        }
+        None => {
+            mux.drop_pty(sid).await;
+            Err(PtyAttachError::BackendRefused)
+        }
+    }
+}
+
 
 /// Remove every binding whose EXACT admitted key is `session_id`, and close the
 /// stream/resizer each one owned. The key is device-scoped by admission, so
@@ -541,35 +638,9 @@ pub async fn open_pty(
         ));
         return;
     }
-    // The cap is the host's: `reserve` returns the one slot it enforces, and
-    // the same figure is named in the log, so the refusal cannot drift from
-    // the check. No second constant lives here.
-    let Some(reservation) = backend.reserve() else {
-        conn.log.say(&format!(
-            "l2: pty refused: too many PTYs (global cap {})",
-            l2::MAX_PTYS_GLOBAL
-        ));
-        let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
-            .await;
-        return;
-    };
-    let Some(rx) = mux.register_pty_stream(sid, session_id.clone()).await else {
-        conn.log
-            .say(&format!("l2: pty refused: sid {sid:#x} in use"));
-        let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
-            .await;
-        return;
-    };
-    let (rtx, rrx) = mpsc::unbounded_channel::<(u16, u16)>();
-    mux.register_resizer(sid, rtx).await;
-    let _ = t
-        .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
-        .await;
     // The argv is resolved by the host's shell policy (its shell program and
-    // user-drop decision), then the host spawns; the library keeps the framing
-    // and session identity.
+    // user-drop decision), then the ONE shared attachment seam acks, reserves
+    // and spawns. The library keeps the framing and session identity.
     let shell_argv = backend.shell_argv(shell_user);
     let shell_host = ShellHost::new(&shell_argv);
     let argv = if pty_cmd.is_empty() {
@@ -577,34 +648,39 @@ pub async fn open_pty(
     } else {
         shell_host.exec_cmd_args(&pty_cmd)
     };
-    let spec = PtySpawnSpec {
-        session_id: session_id.clone(),
-        transport: t.clone(),
-        sid,
-        cols,
-        rows,
-        term,
-        argv,
-        device_pub,
-        admitted_via_ceiling,
-    };
-    match backend.spawn(spec, reservation).await {
-        Some(sess) => {
-            bindings
-                .entry(pid.clone())
-                .or_default()
-                .insert(sid, session_id.clone());
-            backend.start_pumps(sess.clone(), rx, rrx);
-            install_end_cleanup(&mux, sid, &sess).await;
+    let _sess = match attach_pty(
+        &mux, t.clone(), sid, session_id.clone(), cols, rows, term, argv,
+        device_pub, admitted_via_ceiling, backend, || Ok(()),
+    )
+    .await
+    {
+        Ok(sess) => sess,
+        Err(PtyAttachError::Capacity) => {
             conn.log.say(&format!(
-                "l2: pty granted to '{}', {cols}x{rows}",
-                dev.unwrap_or_default()
+                "l2: pty refused: too many PTYs (global cap {})",
+                l2::MAX_PTYS_GLOBAL
             ));
+            return;
         }
-        None => {
-            mux.drop_pty(sid).await;
+        Err(PtyAttachError::Collision) => {
+            conn.log
+                .say(&format!("l2: pty refused: sid {sid:#x} in use"));
+            return;
         }
-    }
+        Err(PtyAttachError::Refused(reason)) => {
+            conn.log.say(&format!("l2: pty refused: {reason}"));
+            return;
+        }
+        Err(PtyAttachError::BackendRefused) => return,
+    };
+    bindings
+        .entry(pid.clone())
+        .or_default()
+        .insert(sid, session_id.clone());
+    conn.log.say(&format!(
+        "l2: pty granted to '{}', {cols}x{rows}",
+        dev.unwrap_or_default()
+    ));
 }
 
 /// A build with `pty-server` off compiles no orchestration and no backend. The

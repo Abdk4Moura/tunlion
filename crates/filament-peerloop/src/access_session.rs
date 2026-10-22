@@ -30,17 +30,36 @@ pub struct ShellRequest {
     pub alive_ms:Option<u64>,
 }
 
-/// The host's existing process primitive plus log sink, supplied by an
-/// embedder that can serve shell-class exec. The access endpoint itself never
-/// invents a process backend; without this runtime a shell open is refused.
+/// The exact terminal facts of one agreement-scoped interactive PTY. The host
+/// sanitizes `term`/`cols`/`rows` with the same parser as `pty-open`; `cmd`
+/// empty means an interactive login shell, non-empty is the existing one-shot
+/// PTY command form. There is no resume/reattach field by design.
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub struct PtyRequest {
+    pub cols:u16,
+    pub rows:u16,
+    pub term:String,
+    pub cmd:String,
+}
+
+/// The host's existing process/PTY primitives plus log sink, supplied by an
+/// embedder that can serve agreement shell resources. The access endpoint never
+/// invents a backend; without the matching capability an open is refused.
 #[derive(Clone)]
 pub struct ShellRuntime {
-    pub process:Arc<dyn crate::shell::exec::ExecProcess>,
+    pub process:Option<Arc<dyn crate::shell::exec::ExecProcess>>,
+    pub pty:Option<Arc<dyn crate::recv::servers::shell::PtyBackend>>,
     pub log:Arc<dyn crate::host::LogSink>,
 }
 impl ShellRuntime {
     pub fn new(process:Arc<dyn crate::shell::exec::ExecProcess>, log:Arc<dyn crate::host::LogSink>) -> Self {
-        Self { process, log }
+        Self { process:Some(process), pty:None, log }
+    }
+    pub fn pty_only(pty:Arc<dyn crate::recv::servers::shell::PtyBackend>, log:Arc<dyn crate::host::LogSink>) -> Self {
+        Self { process:None, pty:Some(pty), log }
+    }
+    pub fn with_pty(mut self, pty:Arc<dyn crate::recv::servers::shell::PtyBackend>) -> Self {
+        self.pty=Some(pty); self
     }
 }
 
@@ -91,6 +110,47 @@ impl Drop for AccessShell {
     }
 }
 
+/// One live agreement-scoped interactive PTY attachment on the initiator side.
+/// Bytes written with [`write`](Self::write) are terminal input; `stream` is the
+/// terminal output. [`resize`](Self::resize) uses the existing `pty-resize`
+/// control frame. Dropping/closing sends the existing `l2-close` for this sid;
+/// the host ends the shell and its process tree.
+pub struct AccessPty {
+    pub sid:u32,
+    pub transport:Arc<dyn filament_transport::net::Transport>,
+    pub stream:Option<mpsc::Receiver<crate::l2::PipeItem>>,
+    mux:Arc<Mux>,generation:u64,closed:bool,
+}
+impl AccessPty {
+    pub async fn write(&self,bytes:&[u8])->Result<(),AccessError>{
+        self.transport.send_frame(self.sid,0,bytes).await.map_err(|_|AccessError::Unavailable)
+    }
+    pub async fn resize(&self,cols:u16,rows:u16)->Result<(),AccessError>{
+        self.transport.send_control(&json!({"type":"pty-resize","sid":self.sid,"cols":cols,"rows":rows})).await.map_err(|_|AccessError::Unavailable)
+    }
+    /// End the attachment now and close its stream. Idempotent.
+    pub async fn close(&mut self)->Result<(),AccessError>{
+        if self.closed{return Ok(());}
+        self.closed=true;
+        // Release the local stream first: a failed control send must not leave
+        // the attachment's pipe registered.
+        self.mux.drop_stream(self.sid).await;
+        self.transport.send_control(&json!({"type":"l2-close","sid":self.sid})).await.map_err(|_|AccessError::Unavailable)
+    }
+}
+impl Drop for AccessPty {
+    fn drop(&mut self){
+        if self.closed{return;}
+        if let Ok(rt)=tokio::runtime::Handle::try_current(){
+            let mux=self.mux.clone();let sid=self.sid;let generation=self.generation;
+            rt.spawn(async move{
+                mux.drop_stream_if(sid,generation).await;
+                let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid})).await;
+            });
+        }
+    }
+}
+
 pub struct AuthenticatedAccessConnection {
     ceremony:Ceremony,
     transport:Arc<dyn filament_transport::net::Transport>,
@@ -130,7 +190,8 @@ impl AccessObserver {
 type Reply=oneshot::Sender<Result<AgreementSnapshot,AccessError>>;
 type OpenReply=oneshot::Sender<Result<AccessPipe,AccessError>>;
 type ShellReply=oneshot::Sender<Result<AccessShell,AccessError>>;
-enum Command { Accept(u64,Reply),Update(u64,AccessSpec,Lifetime,Reply),End(Reply),Open(u64,String,bool,OpenReply),OpenShell(u64,ShellRequest,ShellReply) }
+type PtyReply=oneshot::Sender<Result<AccessPty,AccessError>>;
+enum Command { Accept(u64,Reply),Update(u64,AccessSpec,Lifetime,Reply),End(Reply),Open(u64,String,bool,OpenReply),OpenShell(u64,ShellRequest,ShellReply),OpenPty(u64,PtyRequest,PtyReply) }
 /// Own this pipe for the entire operation. Dropping it closes only its own SID.
 pub struct AccessPipe {
     pub sid:u32,pub transport:Arc<dyn filament_transport::net::Transport>,
@@ -146,6 +207,11 @@ struct PendingShell {
     stderr:mpsc::Receiver<crate::l2::PipeItem>,
     control:mpsc::Receiver<Value>,
     err_sid:u32,generation:u64,err_generation:u64,
+}
+struct PendingPty {
+    reply:PtyReply,
+    stream:mpsc::Receiver<crate::l2::PipeItem>,
+    generation:u64,
 }
 struct Client { tx:mpsc::Sender<Command>,stop:Cancellation,observer:AccessObserver }
 impl Drop for Client {fn drop(&mut self){self.stop.cancel();}}
@@ -178,6 +244,13 @@ impl AccessHandle {
         let(tx,rx)=oneshot::channel();self.0.tx.send(Command::OpenShell(revision,request,tx)).await.map_err(|_|AccessError::Ended)?;
         tokio::time::timeout(Duration::from_secs(10),rx).await.map_err(|_|AccessError::Unavailable)?.map_err(|_|AccessError::Ended)?
     }
+    /// Open an interactive PTY on the accepted agreement's shell resource. The
+    /// host re-checks agreement/revision/peer/scope and spawns through its real
+    /// PTY backend; no resume/reattach is offered.
+    pub async fn open_pty(&self,revision:u64,request:PtyRequest)->Result<AccessPty,AccessError>{
+        let(tx,rx)=oneshot::channel();self.0.tx.send(Command::OpenPty(revision,request,tx)).await.map_err(|_|AccessError::Ended)?;
+        tokio::time::timeout(Duration::from_secs(10),rx).await.map_err(|_|AccessError::Unavailable)?.map_err(|_|AccessError::Ended)?
+    }
     async fn open(&self,revision:u64,resource:String,folder:bool)->Result<AccessPipe,AccessError>{
         let(tx,rx)=oneshot::channel();self.0.tx.send(Command::Open(revision,resource,folder,tx)).await.map_err(|_|AccessError::Ended)?;
         tokio::time::timeout(Duration::from_secs(10),rx).await.map_err(|_|AccessError::Unavailable)?.map_err(|_|AccessError::Ended)?
@@ -192,6 +265,7 @@ pub struct AccessDispatch {
     mux:Arc<Mux>,tasks:tokio::task::JoinSet<()>,ending:bool,
     pending_accept:Option<(u64,Reply)>,pending_opens:std::collections::BTreeMap<u32,PendingOpen>,
     pending_shells:std::collections::BTreeMap<u32,PendingShell>,shell:Option<ShellRuntime>,
+    pending_ptys:std::collections::BTreeMap<u32,PendingPty>,
 }
 impl AccessDispatch {
     pub fn new(connection:AuthenticatedAccessConnection,key:OverlayKey,host:Arc<dyn HostServices>,draft:Option<AccessOfferDraft>,names:Vec<String>)->Result<(Self,AccessHandle),AccessError>{
@@ -219,7 +293,7 @@ impl AccessDispatch {
         let handle=AccessHandle(Arc::new(Client{tx,stop:stop.clone(),observer:observer.clone()}));
         let engine=draft.as_ref().map(|_|Arc::new(AgreementEngine::new(local,names)));
         let mux=Mux::new(connection.transport.clone(),host.clone());
-        Ok((Self{connection,key,host,draft,commands,stop,observer,engine,peer:None,review:None,snapshot:None,mux,tasks:tokio::task::JoinSet::new(),ending:false,pending_accept:None,pending_opens:std::collections::BTreeMap::new(),pending_shells:std::collections::BTreeMap::new(),shell},handle))
+        Ok((Self{connection,key,host,draft,commands,stop,observer,engine,peer:None,review:None,snapshot:None,mux,tasks:tokio::task::JoinSet::new(),ending:false,pending_accept:None,pending_opens:std::collections::BTreeMap::new(),pending_shells:std::collections::BTreeMap::new(),shell,pending_ptys:std::collections::BTreeMap::new()},handle))
     }
     fn view(&self,phase:AccessPhase,ack:bool,failure:Option<String>){self.observer.publish(AccessView{phase,agreement:self.snapshot.clone(),peer_acknowledged_end:ack,failure});}
     async fn send(&self,payload:Value)->Result<(),AccessError>{
@@ -237,6 +311,7 @@ impl AccessDispatch {
         if let Some((_,reply))=self.pending_accept.take(){let _=reply.send(Err(AccessError::Ended));}
         for(_,pending)in std::mem::take(&mut self.pending_opens){let _=pending.reply.send(Err(AccessError::Ended));}
         for(_,pending)in std::mem::take(&mut self.pending_shells){let _=pending.reply.send(Err(AccessError::Ended));}
+        for(_,pending)in std::mem::take(&mut self.pending_ptys){let _=pending.reply.send(Err(AccessError::Ended));}
         if let Some(s)=&mut self.snapshot{if !matches!(s.state,AgreementState::Ended|AgreementState::Expired|AgreementState::Declined){s.state=AgreementState::Ended;s.accepted_revision=None;}}
     }
     pub async fn drive(mut self,core_stop:Cancellation)->Result<(),AccessError>{
@@ -285,6 +360,10 @@ impl AccessDispatch {
                         let result=self.begin_shell(revision,&request).await;
                         match result{Ok((sid,err_sid,stdout,stderr,control,generation,err_generation))=>{self.pending_shells.insert(sid,PendingShell{reply,stdout,stderr,control,err_sid,generation,err_generation});},Err(error)=>{let _=reply.send(Err(error));}}
                     },
+                    Some(Command::OpenPty(revision,request,reply))=>{
+                        let result=self.begin_pty(revision,&request).await;
+                        match result{Ok((sid,stream,generation))=>{self.pending_ptys.insert(sid,PendingPty{reply,stream,generation});},Err(error)=>{let _=reply.send(Err(error));}}
+                    },
                     Some(Command::Update(revision,spec,lifetime,reply))=>{
                         let result=if self.ending{Err(AccessError::Ended)}else if let (Some(engine),Some(s))=(&self.engine,&self.snapshot){engine.revise(&s.id,revision,spec,lifetime,self.host.now_secs())}else{Err(AccessError::Unsupported)};
                         if let Ok(s)=&result{self.snapshot=Some(s.clone());self.send_review().await?;self.view(AccessPhase::AwaitingAcceptance,false,None);}
@@ -303,6 +382,8 @@ impl AccessDispatch {
                     for sid in abandoned{if let Some(open)=self.pending_opens.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;let _=self.send(json!({"type":"l2-close","sid":sid})).await;}}
                     let abandoned_shells:Vec<_>=self.pending_shells.iter().filter(|(_,open)|open.reply.is_closed()).map(|(sid,_)|*sid).collect();
                     for sid in abandoned_shells{if let Some(open)=self.pending_shells.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;self.mux.drop_stream_if(open.err_sid,open.err_generation).await;let _=self.send(json!({"type":"l2-close","sid":sid})).await;}}
+                    let abandoned_ptys:Vec<_>=self.pending_ptys.iter().filter(|(_,open)|open.reply.is_closed()).map(|(sid,_)|*sid).collect();
+                    for sid in abandoned_ptys{if let Some(open)=self.pending_ptys.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;let _=self.send(json!({"type":"l2-close","sid":sid})).await;}}
                     if self.pending_accept.as_ref().is_some_and(|(_,reply)|reply.is_closed()){return Err(AccessError::Unavailable);}
                     if end_deadline.is_some_and(|at|tokio::time::Instant::now()>=at){return Ok(());}
                     if self.snapshot.is_none() && tokio::time::Instant::now()>=proof_deadline{return Err(AccessError::Expired);}
@@ -360,10 +441,26 @@ impl AccessDispatch {
         }
         Ok((sid,err_sid,stdout,stderr,control,generation,err_generation))
     }
+    async fn begin_pty(&self,revision:u64,request:&PtyRequest)->Result<(u32,mpsc::Receiver<crate::l2::PipeItem>,u64),AccessError>{
+        if self.ending{return Err(AccessError::Ended);}if self.engine.is_some(){return Err(AccessError::Unsupported);}
+        let s=self.snapshot.as_ref().ok_or(AccessError::NotAccepted)?;
+        if s.state!=AgreementState::Active || s.accepted_revision!=Some(revision){return Err(AccessError::NotAccepted);}
+        if s.revision!=revision{return Err(AccessError::StaleRevision);}
+        if !s.spec.shell{return Err(AccessError::InvalidSpec);}
+        if self.pending_opens.len()+self.pending_shells.len()+self.pending_ptys.len()>=crate::l2::MAX_STREAMS_PER_LINK{return Err(AccessError::Capacity);}
+        let sid=self.mux.alloc_sid();
+        let mut frame=json!({"type":"access-open","v":1,"id":s.id,"revision":revision,"sid":sid,"kind":"pty","cols":request.cols,"rows":request.rows,"term":request.term});
+        let fields=crate::shell::admit::parse_pty_open_fields(&frame);
+        frame["cols"]=json!(fields.cols);frame["rows"]=json!(fields.rows);frame["term"]=json!(fields.term);
+        if !fields.cmd.is_empty(){frame["cmd"]=json!(fields.cmd);}
+        let (stream,generation)=self.mux.register_access_stream(sid).await.ok_or(AccessError::Capacity)?;
+        if let Err(error)=self.send(frame).await{self.mux.drop_stream_if(sid,generation).await;return Err(error);}
+        Ok((sid,stream,generation))
+    }
     async fn control(&mut self,payload:Value)->Result<bool,AccessError>{
         if serde_json::to_vec(&payload).map_err(|_|AccessError::InvalidSpec)?.len()>128*1024{return Err(AccessError::Capacity);}
         let kind=payload["type"].as_str().ok_or(AccessError::InvalidSpec)?;
-        if kind=="l2-close"{if let Some(sid)=crate::l2::wire_sid(&payload){self.mux.on_close(sid,payload["err"].as_str()).await;if let Some(open)=self.pending_opens.remove(&sid){let _=open.reply.send(Err(AccessError::Unavailable));}if let Some(open)=self.pending_shells.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;self.mux.drop_stream_if(open.err_sid,open.err_generation).await;let _=open.reply.send(Err(AccessError::Unavailable));}}return Ok(false);}
+        if kind=="l2-close"{if let Some(sid)=crate::l2::wire_sid(&payload){self.mux.on_close(sid,payload["err"].as_str()).await;if let Some(open)=self.pending_opens.remove(&sid){let _=open.reply.send(Err(AccessError::Unavailable));}if let Some(open)=self.pending_shells.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;self.mux.drop_stream_if(open.err_sid,open.err_generation).await;let _=open.reply.send(Err(AccessError::Unavailable));}if let Some(open)=self.pending_ptys.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;let _=open.reply.send(Err(AccessError::Unavailable));}}return Ok(false);}
         if matches!(kind,"l2-open-ack"|"mount-open-ack"){
             let sid=crate::l2::wire_sid(&payload).ok_or(AccessError::InvalidSpec)?;
             if let Some(open)=self.pending_opens.remove(&sid){
@@ -390,6 +487,20 @@ impl AccessDispatch {
                     let shell=AccessShell{sid,err_sid:open.err_sid,transport:self.mux.transport(),stdout:Some(open.stdout),stderr:Some(open.stderr),control:Some(open.control),mux:self.mux.clone(),generation:open.generation,err_generation:open.err_generation};
                     let _=open.reply.send(Ok(shell));
                 }
+            }return Ok(false);
+        }
+        if kind=="pty-open-ack"{
+            let sid=crate::l2::wire_sid(&payload).ok_or(AccessError::InvalidSpec)?;
+            if let Some(open)=self.pending_ptys.remove(&sid){
+                let pipe=AccessPty{sid,transport:self.mux.transport(),stream:Some(open.stream),mux:self.mux.clone(),generation:open.generation,closed:false};
+                let _=open.reply.send(Ok(pipe));
+            }return Ok(false);
+        }
+        if kind=="pty-resize"{
+            if let Some(sid)=crate::l2::wire_sid(&payload){
+                let cols=payload["cols"].as_u64().unwrap_or(80) as u16;
+                let rows=payload["rows"].as_u64().unwrap_or(24) as u16;
+                self.mux.resize_pty(sid,cols,rows).await;
             }return Ok(false);
         }
         if matches!(kind,"exec-close"|"exec-alive-ack"){
@@ -460,14 +571,34 @@ impl AccessDispatch {
                                 let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"shell is not available in this build"})).await;
                                 return Ok(false);
                             };
+                            let Some(process)=runtime.process.clone()else{
+                                let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"exec shell is not available in this build"})).await;
+                                return Ok(false);
+                            };
                             let request=crate::shell::exec::parse_exec_open(&payload).ok_or(AccessError::InvalidSpec)?;
-                            self.tasks.spawn(async move{let result=engine.serve_shell(&id,revision,peer,sid,request,mux.clone(),host,runtime.process,runtime.log).await;if let Err(error)=result{let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;}});
+                            self.tasks.spawn(async move{let result=engine.serve_shell(&id,revision,peer,sid,request,mux.clone(),host,process,runtime.log).await;if let Err(error)=result{let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;}});
                         }
                         #[cfg(not(feature="exec-server"))]
                         {
                             let _=(engine,id,revision,peer,host);
                             let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"exec receive is not available in this build"})).await;
                         }
+                    }
+                    "pty"=>{
+                        if payload["resume"].as_bool().unwrap_or(false)||payload["resume_from"].is_u64(){
+                            let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"temporary pty does not support resume"})).await;
+                            return Ok(false);
+                        }
+                        let Some(runtime)=self.shell.clone()else{
+                            let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"pty is not available in this build"})).await;
+                            return Ok(false);
+                        };
+                        let Some(backend)=runtime.pty.clone()else{
+                            let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"pty is not available in this build"})).await;
+                            return Ok(false);
+                        };
+                        let request=crate::shell::admit::parse_pty_open_fields(&payload);
+                        self.tasks.spawn(async move{let result=engine.serve_pty(&id,revision,peer,sid,request,mux.clone(),host,backend).await;if let Err(error)=result{let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;}});
                     }
                     kind=>{
                         let folder=kind=="folder";
@@ -680,6 +811,127 @@ mod tests {
             let closed=tokio::time::timeout(Duration::from_secs(3),async{loop{match shell.stdout.as_mut().unwrap().recv().await{None|Some(None)=>return,Some(Some(_))=>panic!("unexpected bytes after end")}}}).await;
             assert!(closed.is_ok(),"end closes the shell stream");
             assert_eq!(rh.snapshot().unwrap().phase,AccessPhase::Ended);
+        }
+    }
+
+    #[cfg(all(unix, feature="pty-server"))]
+    mod pty_contract {
+        use super::*;
+        use crate::recv::servers::shell::{PtyBackend,PtySession,PtySpawnSpec};
+        use std::sync::atomic::{AtomicBool,AtomicU32,Ordering};
+
+        struct FakePtySession {
+            transport:std::sync::Mutex<Option<Arc<dyn filament_transport::net::Transport>>>,
+            sid:AtomicU32,
+            cols:Arc<AtomicU32>,rows:Arc<AtomicU32>,
+            dead:AtomicBool,
+            cleanup:std::sync::Mutex<Option<Box<dyn FnOnce()+Send>>>,
+        }
+        impl FakePtySession {
+            fn new()->Self{Self{transport:std::sync::Mutex::new(None),sid:AtomicU32::new(0),cols:Arc::new(AtomicU32::new(0)),rows:Arc::new(AtomicU32::new(0)),dead:AtomicBool::new(false),cleanup:std::sync::Mutex::new(None)}}
+            fn size(&self)->(u16,u16){(self.cols.load(Ordering::Relaxed)as u16,self.rows.load(Ordering::Relaxed)as u16)}
+        }
+        impl PtySession for FakePtySession {
+            fn as_any(&self)->&dyn std::any::Any{self}
+            fn attach(&self,t:Arc<dyn filament_transport::net::Transport>,sid:u32,_:Option<u64>){*self.transport.lock().unwrap()=Some(t);self.sid.store(sid,Ordering::Relaxed);}
+            fn resize(&self,cols:u16,rows:u16){self.cols.store(cols as u32,Ordering::Relaxed);self.rows.store(rows as u32,Ordering::Relaxed);}
+            fn detach(&self){}
+            fn end(&self){
+                if self.dead.swap(true,Ordering::AcqRel){return;}
+                if let Some(cleanup)=self.cleanup.lock().unwrap().take(){cleanup();}
+            }
+            fn set_end_cleanup(&self,cleanup:Box<dyn FnOnce()+Send>)->bool{
+                if self.dead.load(Ordering::Acquire){return false;}
+                *self.cleanup.lock().unwrap()=Some(cleanup);true
+            }
+        }
+
+        #[derive(Clone)]
+        struct FakePty {
+            session:Arc<std::sync::Mutex<Option<Arc<FakePtySession>>>>,
+            argv:Arc<std::sync::Mutex<Option<Vec<String>>>>,
+            reserved:Arc<AtomicU32>,
+        }
+        impl FakePty {
+            fn new()->Self{Self{session:Arc::new(std::sync::Mutex::new(None)),argv:Arc::new(std::sync::Mutex::new(None)),reserved:Arc::new(AtomicU32::new(0))}}
+            fn session(&self)->Arc<FakePtySession>{self.session.lock().unwrap().as_ref().unwrap().clone()}
+        }
+        #[async_trait::async_trait]
+        impl PtyBackend for FakePty {
+            async fn get_live(&self,_:&str)->Option<Arc<dyn PtySession>>{self.session.lock().unwrap().clone().map(|s|s as Arc<dyn PtySession>)}
+            fn reserve(&self)->Option<Box<dyn std::any::Any+Send>>{self.reserved.fetch_add(1,Ordering::Relaxed);Some(Box::new(()))}
+            async fn spawn(&self,spec:PtySpawnSpec,_:Box<dyn std::any::Any+Send>)->Option<Arc<dyn PtySession>>{
+                let session=Arc::new(FakePtySession::new());
+                session.attach(spec.transport.clone(),spec.sid,None);
+                session.resize(spec.cols,spec.rows);
+                *self.argv.lock().unwrap()=Some(spec.argv.clone());
+                *self.session.lock().unwrap()=Some(session.clone());
+                Some(session as Arc<dyn PtySession>)
+            }
+            async fn forget(&self,_:&str){*self.session.lock().unwrap()=None;}
+            fn start_pumps(&self,session:Arc<dyn PtySession>,input:mpsc::Receiver<crate::l2::PipeItem>,resize:tokio::sync::mpsc::UnboundedReceiver<(u16,u16)>){
+                let Some(fake)=session.as_any().downcast_ref::<FakePtySession>()else{return;};
+                let transport=fake.transport.lock().unwrap().clone();
+                let sid=fake.sid.load(Ordering::Relaxed);
+                let cols=fake.cols.clone();
+                let rows=fake.rows.clone();
+                tokio::spawn(async move{
+                    let mut input=input;
+                    while let Some(item)=input.recv().await{
+                        match item{
+                            Some(bytes)=>{
+                                if let Some(t)=&transport{
+                                    let mut echo=b"echo:".to_vec();echo.extend_from_slice(&bytes);
+                                    if t.send_frame(sid,0,&echo).await.is_err(){return;}
+                                }
+                            }
+                            None=>return,
+                        }
+                    }
+                });
+                tokio::spawn(async move{
+                    let mut resize=resize;
+                    while let Some((c,r))=resize.recv().await{
+                        cols.store(c as u32,Ordering::Relaxed);
+                        rows.store(r as u32,Ordering::Relaxed);
+                    }
+                });
+            }
+            fn shell_argv(&self,_:&Option<String>)->Vec<String>{vec!["/bin/sh".into(),"-i".into()]}
+            fn user_drop_available(&self,_:&Option<String>)->bool{false}
+        }
+
+        async fn until(mut ready:impl FnMut()->bool){tokio::time::timeout(Duration::from_secs(3),async{while !ready(){tokio::task::yield_now().await;}}).await.unwrap();}
+
+        #[tokio::test]
+        async fn interactive_pty_is_agreement_scoped_and_end_kills_the_session(){
+            if unsafe{libc::geteuid()}==0{return;}
+            let backend=Arc::new(FakePty::new());
+            let runtime=ShellRuntime::pty_only(backend.clone(),Arc::new(crate::host::NoLog));
+            let spec=AccessSpec{shell:true,..AccessSpec::default()};
+            let(fixture,host,hh,recipient,rh)=pair_with(spec,Some(runtime));
+            let ht=tokio::spawn(host.drive(Cancellation::default()));let rt=tokio::spawn(recipient.drive(Cancellation::default()));
+            phase(&rh,AccessPhase::Review).await;
+            let early=rh.open_pty(1,PtyRequest{cols:80,rows:24,term:"xterm-256color".into(),cmd:String::new()}).await;
+            assert_eq!(early.err(),Some(AccessError::NotAccepted));
+            rh.accept(1).await.unwrap();
+            let mut pty=rh.open_pty(1,PtyRequest{cols:100,rows:40,term:"xterm-256color".into(),cmd:String::new()}).await.unwrap();
+            assert_eq!(backend.reserved.load(Ordering::Relaxed),1,"the shared PTY seam reserved exactly one slot");
+            let session=backend.session();
+            assert_eq!(session.size(),(100,40),"initial terminal size reached the backend");
+            assert_eq!(backend.argv.lock().unwrap().clone().unwrap(),vec!["/bin/sh","-i","-l"],"interactive login argv is resolved once");
+            pty.write(b"typed").await.unwrap();
+            let echo=tokio::time::timeout(Duration::from_secs(3),pty.stream.as_mut().unwrap().recv()).await.unwrap().unwrap().unwrap();
+            assert_eq!(&echo[..],b"echo:typed");
+            pty.resize(120,50).await.unwrap();
+            until(||session.size()==(120,50)).await;
+            assert_eq!(hh.end().await.unwrap().state,AgreementState::Ended);
+            let _=tokio::time::timeout(Duration::from_secs(3),ht).await.unwrap().unwrap();
+            let _=tokio::time::timeout(Duration::from_secs(3),rt).await.unwrap().unwrap();
+            until(||session.dead.load(Ordering::Acquire)).await;
+            let closed=tokio::time::timeout(Duration::from_secs(3),async{loop{match pty.stream.as_mut().unwrap().recv().await{None|Some(None)=>return,Some(Some(_))=>panic!("unexpected bytes after end")}}}).await;
+            assert!(closed.is_ok(),"end closes the terminal stream");
+            assert!(!fixture.0.join("devices.json").exists());assert!(!fixture.0.join("caps.json").exists());
         }
     }
 }

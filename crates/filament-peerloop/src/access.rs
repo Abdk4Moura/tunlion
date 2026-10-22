@@ -240,6 +240,41 @@ impl Drop for ShellCleanup {
         }
     }
 }
+/// The PTY session is owned by the host's session map, so dropping this future
+/// does not end it by itself. The guard ends the shell on every abnormal exit
+/// and releases the host's record asynchronously.
+#[cfg(unix)]
+struct PtySessionGuard {
+    session: Option<Arc<dyn crate::recv::servers::shell::PtySession>>,
+    backend: Arc<dyn crate::recv::servers::shell::PtyBackend>,
+    session_id: String, mux: Arc<crate::l2::Mux>, sid: u32, armed: bool,
+}
+#[cfg(unix)]
+impl Drop for PtySessionGuard {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        if let Some(session) = &self.session { session.end(); }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let backend=self.backend.clone(); let session_id=self.session_id.clone();
+            let mux=self.mux.clone(); let sid=self.sid;
+            runtime.spawn(async move {
+                backend.forget(&session_id).await;
+                mux.drop_pty(sid).await;
+            });
+        }
+    }
+}
+#[cfg(unix)]
+async fn teardown_pty(
+    session: &Arc<dyn crate::recv::servers::shell::PtySession>,
+    backend: &dyn crate::recv::servers::shell::PtyBackend,
+    session_id: &str, mux: &Arc<crate::l2::Mux>, sid: u32,
+) {
+    session.end();
+    backend.forget(session_id).await;
+    mux.drop_pty(sid).await;
+}
+
 struct Agreement { snapshot: AgreementSnapshot, operations: Vec<Operation>, claimed: bool }
 #[derive(Default)]
 struct State {
@@ -621,6 +656,117 @@ impl AgreementEngine {
         }
     }
 
+    /// Serve one agreement-scoped interactive PTY over the EXISTING PTY host
+    /// seam and the accepted agreement's Mux/transport.
+    ///
+    /// Admission is the same agreement check as exec shell: exact accepted
+    /// revision, exact proven peer, live state and `spec.shell`; there is no
+    /// caller boolean and the standing shell grant/ceiling gate is not
+    /// substituted. The account is resolved with `StandardLocalAccount` (the
+    /// account half of `StandardLocalExecProcess`) and revalidated immediately
+    /// before the host spawn; root/service identity, UID changes and account
+    /// switching are refused. Windows returns `Unsupported`.
+    ///
+    /// The shared `recv::servers::shell::attach_pty` seam owns reservation,
+    /// stream/resizer registration, ack/spawn and pumps, so the standing PTY
+    /// endpoint and this one do not diverge. End/removal/expiry/drop ends the
+    /// session through `PtySession::end` (the host kills the shell process
+    /// tree) and forgets the host's session record. This is a one-shot
+    /// interactive attachment; it intentionally offers no resume/reattach.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_pty(&self, id: &str, revision: u64, peer: ProvenPeer, sid: u32,
+        request: crate::shell::admit::PtyOpenFields, mux: Arc<crate::l2::Mux>,
+        host: Arc<dyn HostServices>, backend: Arc<dyn crate::recv::servers::shell::PtyBackend>)
+        -> Result<(), AccessError> {
+        #[cfg(not(unix))]
+        { let _ = (id, revision, peer, sid, request, mux, host, backend); Err(AccessError::Unsupported) }
+        #[cfg(unix)]
+        {
+            use crate::recv::servers::shell::attach_pty;
+            use crate::shell::standard_account::{ShellAccountError, StandardLocalAccount};
+            if host.delegated_access_for(&peer.0).is_some() { return Err(AccessError::Unsupported); }
+            if !crate::l2::is_l2_sid(sid) { return Err(AccessError::InvalidSpec); }
+            let now = host.now_secs();
+            let (cancel, lifetime) = self.admit_shell(id, revision, peer, now)?;
+            struct Finish(Cancellation);
+            impl Drop for Finish { fn drop(&mut self) { self.0.cancel(); } }
+            let _finish = Finish(cancel.clone());
+            let account = StandardLocalAccount::resolve().map_err(|error| match error {
+                ShellAccountError::Unsupported => AccessError::Unsupported,
+                ShellAccountError::IdentityChanged => AccessError::Ended,
+                ShellAccountError::PrivilegedService | ShellAccountError::Unavailable
+                    => AccessError::Unavailable,
+            })?;
+            let shell = crate::shell::ShellHost::new(&backend.shell_argv(&None));
+            let argv = if request.cmd.is_empty() {
+                shell.interactive_args()
+            } else {
+                shell.exec_cmd_args(&request.cmd)
+            };
+            if argv.is_empty() { return Err(AccessError::Unavailable); }
+            let session_id = format!("agreement\u{1}{id}\u{1}{sid:#x}");
+            let session = match attach_pty(
+                &mux, mux.transport(), sid, session_id.clone(), request.cols, request.rows,
+                request.term, argv, None, false, backend.as_ref(),
+                || account.revalidate().map_err(|error| error.to_string()),
+            ).await {
+                Ok(session) => session,
+                // attach_pty sent the precise close (cap, collision, identity
+                // revalidation or a backend spawn refusal).
+                Err(_) => return Ok(()),
+            };
+            let mut guard = PtySessionGuard {
+                session: Some(session.clone()), backend: backend.clone(),
+                session_id: session_id.clone(), mux: mux.clone(), sid, armed: true,
+            };
+            let expires = match lifetime {
+                Lifetime::UntilEnded => None,
+                Lifetime::ExpiresAt(at) => Some(tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(at.saturating_sub(now))),
+            };
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        match expires {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        teardown_pty(&session, backend.as_ref(), &session_id, &mux, sid).await;
+                        guard.armed = false;
+                        let _ = mux.transport().send_control(
+                            &serde_json::json!({"type":"l2-close","sid":sid,"err":AccessError::Expired.to_string()}),
+                        ).await;
+                        return Err(AccessError::Expired);
+                    }
+                    outcome = cancel.run(std::future::pending::<()>()) => {
+                        let _ = outcome;
+                        teardown_pty(&session, backend.as_ref(), &session_id, &mux, sid).await;
+                        guard.armed = false;
+                        let _ = mux.transport().send_control(
+                            &serde_json::json!({"type":"l2-close","sid":sid,"err":AccessError::Ended.to_string()}),
+                        ).await;
+                        return Err(AccessError::Ended);
+                    }
+                    _ = tick.tick() => {
+                        // A client l2-close drops the stream; a natural shell
+                        // exit drops it through the host's end cleanup. Either
+                        // way this attachment is over: end the tree and forget
+                        // the session id so a later open cannot reattach it.
+                        if mux.stream_generation(sid).await.is_none() {
+                            teardown_pty(&session, backend.as_ref(), &session_id, &mux, sid).await;
+                            guard.armed = false;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Serve the existing confined filesystem protocol for an accepted folder.
     /// Linux pins a directory descriptor before acknowledgement, so renaming or
     /// substituting the offered path cannot redirect a live share. Other hosts
@@ -981,6 +1127,29 @@ mod tests {
             fn as_any(&self) -> &dyn std::any::Any { self }
         }
 
+        /// Proves the PTY endpoint reaches no backend effect before agreement
+        /// admission for the exact peer/revision.
+        struct NeverPty;
+        #[async_trait::async_trait]
+        impl crate::recv::servers::shell::PtyBackend for NeverPty {
+            async fn get_live(&self, _: &str) -> Option<Arc<dyn crate::recv::servers::shell::PtySession>> {
+                panic!("looked up a session before admission")
+            }
+            fn reserve(&self) -> Option<Box<dyn std::any::Any + Send>> { panic!("reserved before admission") }
+            async fn spawn(&self, _: crate::recv::servers::shell::PtySpawnSpec,
+                _: Box<dyn std::any::Any + Send>) -> Option<Arc<dyn crate::recv::servers::shell::PtySession>> {
+                panic!("spawned before admission")
+            }
+            async fn forget(&self, _: &str) { panic!("forgot a session before admission") }
+            fn start_pumps(&self, _: Arc<dyn crate::recv::servers::shell::PtySession>,
+                _: tokio::sync::mpsc::Receiver<crate::l2::PipeItem>,
+                _: tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>) {
+                panic!("started pumps before admission")
+            }
+            fn shell_argv(&self, _: &Option<String>) -> Vec<String> { panic!("resolved argv before admission") }
+            fn user_drop_available(&self, _: &Option<String>) -> bool { panic!("checked a user drop") }
+        }
+
         /// Proves the endpoint never reaches program resolution, the account
         /// mechanism, or the existing spawn primitive while the agreement is
         /// not accepted for this exact peer/revision.
@@ -1021,8 +1190,27 @@ mod tests {
             assert_eq!(result, Err(AccessError::StaleRevision));
             assert!(!mux.has_stream(sid).await);
         }
-    }
+        #[tokio::test]
+        async fn pty_serving_checks_the_agreement_before_it_reaches_the_backend() {
+            let e = engine(); let k = key(); let other = key(); let p = peer(&k);
+            let s = offer(&e, p);
+            let mux = crate::l2::Mux::new(Arc::new(NullTransport), Arc::new(Host));
+            let sid = crate::l2::L2_SID_BASE | 63;
+            let request = crate::shell::admit::PtyOpenFields {
+                term: "xterm-256color".into(), cmd: String::new(), cols: 100, rows: 40,
+            };
+            let result = e.serve_pty(&s.id, 1, p, sid, request.clone(), mux.clone(),
+                Arc::new(Host), Arc::new(NeverPty)).await;
+            assert_eq!(result, Err(AccessError::NotAccepted));
+            assert!(!mux.has_stream(sid).await);
 
+            accept(&e, &s, &k, 10);
+            let result = e.serve_pty(&s.id, 1, peer(&other), sid, request, mux.clone(),
+                Arc::new(Host), Arc::new(NeverPty)).await;
+            assert_eq!(result, Err(AccessError::WrongPeer));
+            assert!(!mux.has_stream(sid).await);
+        }
+    }
     #[test]
     fn scoped_removal_cancels_only_affected_operations_and_names() {
         let e = engine(); let k = key();
