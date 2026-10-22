@@ -4,9 +4,10 @@ Implementation entry points: `filament_peerloop::access` and
 `filament_peerloop::send::ceremony`. This is a bounded library slice, not a claim
 that all CLI invitations, platform endpoints, or background operation are ready.
 
-**Paused checkpoint:** subsequent `serve_folder` / per-request mount admission
-and raw transport control-limit edits are source-only and unvalidated. Do not
-enable folder capability from these commits until remote compile/tests pass.
+**Validated library checkpoint:** exact-tree remote core08 at `8f8d66e5` passed
+Linux `serve_folder` / per-request mount admission and raw transport control-limit
+tests plus reduced/default/Core checks. This does not prove CLI folder download,
+FUSE/WinFsp mount activation, or cross-platform endpoint readiness.
 The validated boundary and exact jobs are in
 [access-agreement-validation.md](access-agreement-validation.md).
 
@@ -89,7 +90,8 @@ from a serving task is not proof that an endpoint became available.
 | --- | --- |
 | Exact TCP service | Real existing L2 Mux / HostServices connector integration; `forward-server` feature and a working host connector required |
 | UDP service | Typed review only; operation returns `Unsupported` |
-| Folder download/mount, RO/RW serving | Typed review only; existing mount servers not agreement-integrated; unavailable |
+| Folder RO/RW protocol serving | Linux `mount-server` profile uses accepted canonical root, pinned directory descriptor, existing confined filesystem protocol and per-request agreement admission; other platforms return `Unsupported` |
+| Recipient folder download / local mount | Client activation/UI not integrated here; no successful local mount path is promised |
 | Shell, PTY, exec, SSH | Typed review only; existing shared shell gate remains authoritative; unavailable through this engine |
 | Device networking / subnet | Typed separately; no agreement-aware packet policy integration; unavailable |
 | Background/restart | Unavailable; no durable handoff acknowledgement |

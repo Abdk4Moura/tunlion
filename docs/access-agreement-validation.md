@@ -75,13 +75,40 @@ remote directory is
 local full log is
 `/root/.local/share/opencode/shell/cd31f2124f23b5c0556ebda23ab6bff6bdc91712/sh_160b1022f001yCLbIrs7UVwPli.out`.
 
-## Paused, unvalidated follow-ups
+## Exact-tree core08 follow-up
+
+After coordinator confirmation of replacement worker run `39718656335`, the
+parent authorized this exact command from clean
+`8f8d66e5e73cfe9ed4628875f13a1097776ae729`:
+
+```sh
+bash /root/opencode-work/worker-job.sh core-access08-8f8d66e5-20261022a /root/opencode-work/access-agreement-core -- bash -lc 'set -euo pipefail; timeout 1200 bash -lc "cargo test -p filament-peerloop --lib access::tests -- --test-threads=2 && cargo test -p filament-peerloop --lib mount_proto::tests -- --test-threads=2 && cargo test -p filament-pair --lib && cargo test -p filament-transport --lib control_limits::tests && cargo check -p filament-peerloop --no-default-features --features dispatch && cargo check -p filament-peerloop --lib && cargo check -p tunlion-core --lib"' > /root/pairing-ux/evidence/access-checkpoint-20261022/core08-8f8d66e5.log 2>&1
+```
+
+Exit 0. Results: **11 access tests, 36 existing mount-protocol tests, 23 pairing
+tests, and 1 raw control-limit test passed**. Reduced dispatch, default peerloop
+library, and tunlion-core library checks all passed. Existing warnings remain.
+
+Remote source/job:
+`/home/runner/work/_temp/tunlion-work/jobs/core-access08-8f8d66e5-20261022a`.
+The durable raw log is the redirect target above; direct redirection preserves
+the wrapper exit status. No local build/test/formatter was run.
+
+New folder fixtures confirm real existing-protocol RO reads, rejection of RO
+write/rename and symlink/parent escapes, RW writes and rename, no redirect to a
+substituted live root, per-buffered-request admission after revocation, and
+task-abort cleanup. A filesystem request admitted before revocation may finish;
+there is no rollback promise. This remains library integration coverage, not a
+CLI folder download/mount or two-device platform-endpoint claim.
+
+## Prior paused checkpoint (superseded by core08)
 
 At the coordinator's usage-limit pause, there are no active lane jobs. The old
 worker lease is rolling to run `39718656335`; no job 08 was submitted and no new
 CPU work should start before the coordinator confirms the same worker reachable.
 
-Source-only follow-ups after run 07, not claimed compiled or passing:
+At that pause these follow-ups were source-only; core08 above subsequently
+validated all three against the exact recorded tree:
 
 - Linux folder endpoint: `serve_folder` reuses the existing mount server,
   pins a directory descriptor, owns cancellation/join, and adds per-request
