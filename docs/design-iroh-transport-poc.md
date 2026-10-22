@@ -1,20 +1,20 @@
 # iroh as an optional relay transport — PoC design note
 
 **Status:** proof of concept, feature-gated, not integrated, not merged.
-**Date:** 2026-10-21.
-**Base:** `work/iroh-transport-poc` is stacked on `feat/filament-peerloop-l3`
-(rebased onto `fc973ba5`). That branch carries the current `filament-peerloop`
-crate and the current `Transport` trait, and it contains current `origin/main`
-at `27d7bfea` (2026-10-21, "web: show device identity and make reloads
-generation-safe"). `27d7bfea` is an ancestor of this branch's head, so this work
-is **not** based on a stale `main` checkout. (Some local worktrees still have an
-old `main` ref at `2e8820db`; that ref is not what this branch was built on.)
+**Date:** 2026-10-22.
+**Base:** `work/iroh-transport-poc` is based on `main` at `138369e6`
+(2026-10-22), after the L3 stack merged: #574 `df25564e` and #575 `138369e6`.
+It was previously stacked on `feat/filament-peerloop-l3`; that branch has been
+merged into `main`, and this branch was rebased onto `main`. `origin/main` is an
+ancestor of this head, so this work is **not** based on a stale `main` checkout.
+(Some local worktrees still show an old `main` ref at `2e8820db`; that ref is
+not what this branch is based on.)
 
 > **Handoff correction.** An earlier handoff note said `main` was five weeks
-> stale. That was wrong: current `origin/main` is `27d7bfea`, it is contained in
-> this branch, and the PoC is stacked on `feat/filament-peerloop-l3`, not on
-> `main`. The dependency and L3-lane work this PoC builds on is already in that
-> stack.
+> stale. That was wrong: `main` moved to `27d7bfea`, then to `138369e6` when the
+> L3 stack merged, and this branch now sits directly on `138369e6`. The reviewed
+> PoC tree was preserved across the retarget: the only change outside the
+> existing crate is the base already present in `main`.
 
 **Non-goals, explicit:** no production cutover, no daemon changes, no change to
 `cli/src/l3.rs`, `cli/src/tun/**`, `filament-peerloop/src/mesh.rs`,
