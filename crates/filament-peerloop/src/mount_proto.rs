@@ -2848,6 +2848,20 @@ mod win_at {
         (access, disposition)
     }
 
+    fn check_open_count(len: usize) -> Result<(), super::MountError> {
+        if len >= super::MAX_OPEN_FILES_PER_STREAM {
+            Err(super::MountError {
+                code: super::EMFILE,
+                msg: format!(
+                    "too many open files on this mount (max {})",
+                    super::MAX_OPEN_FILES_PER_STREAM
+                ),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Serve the existing mount protocol for a Windows agreement folder. Every
     /// request is resolved relative to the retained root HANDLE and every
     /// directory component is opened with `FILE_OPEN_REPARSE_POINT`; there is
@@ -2865,7 +2879,7 @@ mod win_at {
         use super::{
             do_read, do_write, file_stat, open_mutates, path_decode, path_encode, DirEntry,
             FileStat, MountError, MountOp, MountResponse, MountResult, EACCES, EBADF, EINVAL,
-            EMFILE, EROFS, MAX_OPEN_FILES_PER_STREAM,
+            EROFS,
         };
 
         if read_only {
@@ -2892,19 +2906,6 @@ mod win_at {
                     },
                     None,
                 );
-            }
-        }
-
-        fn check_open_count(len: usize) -> Result<(), MountError> {
-            if len >= MAX_OPEN_FILES_PER_STREAM {
-                Err(MountError {
-                    code: EMFILE,
-                    msg: format!(
-                        "too many open files on this mount (max {MAX_OPEN_FILES_PER_STREAM})"
-                    ),
-                })
-            } else {
-                Ok(())
             }
         }
 
