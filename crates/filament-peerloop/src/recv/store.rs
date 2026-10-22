@@ -2183,6 +2183,30 @@ mod store_guards {
     }
 
     #[test]
+    fn a_key_in_the_revocation_list_is_revoked_and_damage_fails_closed() {
+        let root = unique("revoked-keys");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        let device = [0xABu8; 32];
+        let key = hex::encode(device);
+        // Absent list: not revoked.
+        assert!(!store.device_key_revoked(&device, now_secs()));
+        std::fs::write(
+            store.key_revocations_path(),
+            json!([{ "devicePub": key, "certExpires": now_secs() + 3600 }]).to_string(),
+        )
+        .unwrap();
+        assert!(
+            store.device_key_revoked(&device, now_secs()),
+            "the separate revoked-keys list must revoke even without a record marker"
+        );
+        // An unreadable/damaged list must read as revoked, never as "nothing".
+        std::fs::write(store.key_revocations_path(), b"{garbage").unwrap();
+        assert!(store.device_key_revoked(&device, now_secs()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn cap_store_keeps_a_backup_and_refuses_to_write_over_damage() {
         let root = unique("caps");
         std::fs::create_dir_all(&root).unwrap();

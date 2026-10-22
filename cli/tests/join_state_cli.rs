@@ -256,3 +256,69 @@ fn addr_refuses_a_certificate_key_mismatch() {
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
 }
+
+/// A corrupt certificate must not read as "no identity" and let `addr` print an
+/// address the certificate cannot back.
+#[test]
+fn addr_refuses_a_corrupt_certificate() {
+    let dir = scratch("corrupt-cert");
+    init(&dir, "alpha");
+    std::fs::write(
+        dir.join("identity/device-cert.json"),
+        r#"{"name":"alpha","cert":{}}"#,
+    )
+    .unwrap();
+    let out = run(&dir, &["addr", "--json"]);
+    assert!(
+        !out.status.success(),
+        "addr must refuse a corrupt certificate"
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("certificate record"), "{text}");
+    assert!(text.contains("tunlion reset"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An accepted journal whose certificate was not written is not an address yet.
+#[test]
+fn addr_refuses_an_accepted_journal_without_a_certificate() {
+    let dir = scratch("accepted-journal-addr");
+    let owner = scratch("accepted-journal-owner");
+    init(&owner, "owner");
+    std::fs::copy(owner.join("overlay.ed25519"), dir.join("overlay.ed25519")).unwrap();
+    let overlay = {
+        let pkcs8 = std::fs::read(dir.join("overlay.ed25519")).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
+        use ring::signature::KeyPair;
+        hex::encode(key.public_key().as_ref())
+    };
+    std::fs::write(
+        dir.join("join.pending.json"),
+        serde_json::json!({
+            "version": 1,
+            "devicePub": overlay,
+            "ownerName": "owner",
+            "startedAt": 1,
+            "accepted": { "name": "joined" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = run(&dir, &["addr", "--json"]);
+    assert!(
+        !out.status.success(),
+        "addr must refuse an uncommitted join"
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("still pending locally"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&owner);
+}

@@ -21,7 +21,7 @@ use crate::conn::Conn;
 use crate::host::{LogSink, Tone};
 use crate::recv::identity::local_device_cert;
 use crate::recv::store::{
-    sanitize_device_name, DeviceStore, OverlayKey, PRINCIPAL_STATE_LAPSED,
+    sanitize_device_name, DeviceStore, InvitationRefusal, OverlayKey, PRINCIPAL_STATE_LAPSED,
     PRINCIPAL_STATE_REVOKED,
 };
 use anyhow::Result;
@@ -262,6 +262,22 @@ impl EnrollmentService {
                         "enroll response refused: invitation {:?} (durable use count)",
                         refusal
                     ));
+                    // The live burn counter is empty after an OWNER RESTART, so
+                    // a retry of an enrollment this owner already committed
+                    // reaches this durable refusal instead of the live one.
+                    // Answer with the same idempotent receipt; otherwise a
+                    // restart turns an accepted join into "already used".
+                    if matches!(
+                        refusal,
+                        InvitationRefusal::AlreadyUsed | InvitationRefusal::UseLimitReached
+                    ) && self
+                        .reissue_enrolment_receipt(
+                            conn, &pid, &owner_key, device_pub, enroll_pub, &ak,
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     self.deny(&t, refusal.wire_reason()).await;
                     return;
                 }
@@ -432,9 +448,19 @@ impl EnrollmentService {
         let Some(record) = self.store.devices_find_by_device_pub(&device_pub) else {
             return false;
         };
-        let Some((name, secret, cert)) =
-            receipt_from_record(&record, ak, device_pub, owner_key.public_key_bytes())
-        else {
+        // A separate `devices forget` records the key revocation BEFORE it
+        // removes the record/grants. If that later step failed, the record is
+        // still here but the key is revoked; a receipt would hand back a cert
+        // and secret the owner has already killed. `device_key_revoked` is
+        // fail-closed (an unreadable list reads as revoked).
+        let key_revoked = self.store.device_key_revoked(&device_pub, now_secs());
+        let Some((name, secret, cert)) = receipt_from_record(
+            &record,
+            ak,
+            device_pub,
+            owner_key.public_key_bytes(),
+            key_revoked,
+        ) else {
             return false;
         };
         let Ok((_, mut ack)) =
@@ -559,8 +585,9 @@ pub fn receipt_from_record(
     ak: &filament_cap::ephemeral::AuthKey,
     device_pub: [u8; 32],
     owner_pub: [u8; 32],
+    key_revoked: bool,
 ) -> Option<(String, String, DeviceCert)> {
-    if ak.ephemeral {
+    if ak.ephemeral || key_revoked {
         return None;
     }
     if enrollment_refusal(record).is_some() {
@@ -577,19 +604,24 @@ pub fn receipt_from_record(
     if record["principalKind"].as_str() != Some("delegated") {
         return None;
     }
-    if record["caps"].as_array().map(|caps| {
-        caps.iter()
-            .filter_map(|c| c.as_str())
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    }) != Some(ak.caps.clone())
-    {
+    // The SIGNED bounds, not the mutable/effective view. `caps` is a local
+    // grant mirror and `principalMaxOffline` is the effective budget (local
+    // policy may tighten it); neither is the enrollment's commitment. A
+    // missing or malformed signed field fails closed: an absent offline
+    // ceiling must not be read as "any budget".
+    let signed_ceiling = record["principalCeiling"]
+        .as_array()?
+        .iter()
+        .map(|c| c.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    if signed_ceiling != ak.caps {
         return None;
     }
-    if let Some(stored) = record["principalMaxOffline"].as_u64() {
-        if stored != ak.max_offline {
-            return None;
-        }
+    if record["principalMaxOfflineCeiling"].as_u64()? != ak.max_offline {
+        return None;
+    }
+    if record["principalExpires"].as_u64()? != ak.expires {
+        return None;
     }
     let name = record["name"].as_str()?.to_string();
     let secret = record["secret"].as_str()?.to_string();
@@ -655,13 +687,19 @@ mod tests {
         // rounded to whenever this second ticked".
         let issued = expires.saturating_sub(3600);
         let cert = DeviceCert::certify(owner, device_pub, issued, 3600).unwrap();
+        // The shape `upsert_peer_record` actually writes: signed bounds are
+        // `principalCeiling`/`principalMaxOfflineCeiling`/`principalExpires`,
+        // while `caps`/`principalMaxOffline` are mutable/effective views.
         json!({
             "name": "joined-device",
             "secret": "11".repeat(32),
             "deviceCert": cert.to_json(),
             "caps": caps,
             "principalKind": "delegated",
+            "principalCeiling": caps,
+            "principalExpires": expires,
             "principalMaxOffline": max_offline,
+            "principalMaxOfflineCeiling": max_offline,
         })
     }
 
@@ -679,7 +717,7 @@ mod tests {
         assert_eq!(record["caps"], json!(["transfer"]));
         assert_eq!(ak.caps, vec!["transfer".to_string()]);
         let (name, secret, cert) =
-            receipt_from_record(&record, &ak, device_pub, owner.public_key_bytes())
+            receipt_from_record(&record, &ak, device_pub, owner.public_key_bytes(), false)
                 .expect("the committed record is exactly this enrollment");
         assert_eq!(name, "joined-device");
         assert_eq!(secret, "11".repeat(32));
@@ -694,17 +732,73 @@ mod tests {
         let ak = auth_key_for(&["transfer"], 3600);
         let record = delegated_record(&owner, device_pub, ak.expires, &["transfer"], ak.max_offline);
         // A different device key must not inherit this receipt.
-        assert!(receipt_from_record(&record, &ak, [8u8; 32], owner.public_key_bytes()).is_none());
+        assert!(receipt_from_record(&record, &ak, [8u8; 32], owner.public_key_bytes(), false).is_none());
         // A revoked record is refused.
         let mut revoked = record.clone();
         revoked["principalState"] = json!("revoked");
-        assert!(receipt_from_record(&revoked, &ak, device_pub, owner.public_key_bytes()).is_none());
-        // A different ceiling is refused (the new invitation is not this one).
+        assert!(receipt_from_record(&revoked, &ak, device_pub, owner.public_key_bytes(), false).is_none());
+        // A key in the SEPARATE revoked-keys list is refused even when the
+        // record still carries no revocation marker (a partial forget).
+        assert!(receipt_from_record(&record, &ak, device_pub, owner.public_key_bytes(), true).is_none());
+        // A different signed ceiling is refused (the new invitation is not this one).
         let wider = auth_key_for(&["transfer", "shell"], 3600);
-        assert!(receipt_from_record(&record, &wider, device_pub, owner.public_key_bytes()).is_none());
+        assert!(receipt_from_record(&record, &wider, device_pub, owner.public_key_bytes(), false).is_none());
         // A different owner key is refused.
         let other_owner = filament_id::UserKey::from_seed(&[4u8; 32]).unwrap();
-        assert!(receipt_from_record(&record, &ak, device_pub, other_owner.public_key_bytes()).is_none());
+        assert!(receipt_from_record(&record, &ak, device_pub, other_owner.public_key_bytes(), false).is_none());
+    }
+
+    #[test]
+    fn a_receipt_validates_the_persisted_signed_bounds_not_mutable_views() {
+        let owner = filament_id::UserKey::from_seed(&[9u8; 32]).unwrap();
+        let device_pub = [7u8; 32];
+        let ak = auth_key_for(&["transfer"], 3600);
+        let record = delegated_record(&owner, device_pub, ak.expires, &["transfer"], ak.max_offline);
+
+        // Local grant/revoke changes `caps`; the receipt is still the same
+        // enrollment and must not be refused for a mutable mirror.
+        let mut locally_granted = record.clone();
+        locally_granted["caps"] = json!(["transfer", "mount"]);
+        assert!(
+            receipt_from_record(&locally_granted, &ak, device_pub, owner.public_key_bytes(), false).is_some()
+        );
+        // Local policy may tighten the EFFECTIVE offline budget.
+        let mut tightened = record.clone();
+        tightened["principalMaxOffline"] = json!(ak.max_offline.saturating_sub(60));
+        assert!(
+            receipt_from_record(&tightened, &ak, device_pub, owner.public_key_bytes(), false).is_some()
+        );
+
+        // A missing effective field is fine; a missing SIGNED field is not.
+        let mut no_effective_offline = record.clone();
+        no_effective_offline.as_object_mut().unwrap().remove("principalMaxOffline");
+        assert!(
+            receipt_from_record(&no_effective_offline, &ak, device_pub, owner.public_key_bytes(), false).is_some()
+        );
+        for field in [
+            "principalCeiling",
+            "principalMaxOfflineCeiling",
+            "principalExpires",
+        ] {
+            let mut missing = record.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                receipt_from_record(&missing, &ak, device_pub, owner.public_key_bytes(), false).is_none(),
+                "missing {field} must fail closed"
+            );
+        }
+        // A locally widened persisted ceiling must not stand in for the signed one.
+        let mut changed_ceiling = record.clone();
+        changed_ceiling["principalCeiling"] = json!(["transfer", "shell"]);
+        assert!(
+            receipt_from_record(&changed_ceiling, &ak, device_pub, owner.public_key_bytes(), false).is_none()
+        );
+        // An absent signed offline ceiling is not "any budget".
+        let mut no_offline_ceiling = record.clone();
+        no_offline_ceiling["principalMaxOfflineCeiling"] = json!(null);
+        assert!(
+            receipt_from_record(&no_offline_ceiling, &ak, device_pub, owner.public_key_bytes(), false).is_none()
+        );
     }
 
     #[test]

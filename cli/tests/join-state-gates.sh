@@ -13,6 +13,7 @@
 #       with a reissued receipt, and does NOT consume/relabel the enrollment
 #   J3  a local commit failure leaves NO certificate (certificate is last) and
 #       keeps a journal
+#   J3b `addr --json` refuses an accepted journal whose certificate is not written
 #   J4  the next join finishes that journal without a second enrollment request
 #   J5  an overlay key that does not match the certificate is refused by `up`
 #       with a named repair path (not a transport-looking error)
@@ -22,6 +23,7 @@
 #   J8  `addr --json` exposes displayName and meshName distinctly; --name-as is
 #       display-only and does not rename the mesh
 #   J9  the human `addr` readout says --name-as is display-only
+#   J10 a corrupt certificate is refused by `addr`, not treated as "no identity"
 #
 # Hermetic localhost fixture. TUNLION_BIN points at the built binary.
 set -uo pipefail
@@ -70,6 +72,21 @@ OVERLAY_BEFORE=$(timeout 10 "${G_ENV[@]}" "$BIN" addr --json 2>/dev/null \
 CERT_BEFORE=$(sha256sum "$DG/identity/device-cert.json" 2>/dev/null | cut -d' ' -f1)
 
 say "J2: an already-used invitation after the owner accepted is a RECEIPT, exit 0"
+# RESTART the owner first, so its in-memory single-use burn counter is empty and
+# the retry reaches the DURABLE used-invitations refusal. That is the path that
+# used to deny without reissuing (the gate used to keep one owner process alive
+# and only proved the live-burn path).
+PID_BEFORE=$(cat "$DA/up.pid" 2>/dev/null || true)
+"${O_ENV[@]}" "$BIN" down -y >"$WORK/owner-down.log" 2>&1
+sleep 2
+start_acceptor "$DA"
+OWNER_PID="${FIX_PIDS[-1]}"
+sleep 2
+PID_AFTER=$(cat "$DA/up.pid" 2>/dev/null || true)
+if [ -z "$PID_BEFORE" ] || [ -z "$PID_AFTER" ] || [ "$PID_BEFORE" = "$PID_AFTER" ]; then
+  cat "$WORK/owner-down.log"
+  fixture_die "J2 setup: the owner did not restart (before='$PID_BEFORE' after='$PID_AFTER'), so the durable-restart path would be untested"
+fi
 # Lose the local half of the commit, keep the overlay key: this is the state the
 # Windows report reached (owner certified; local store write failed).
 rm -f "$DG/identity/device-cert.json" "$DG/devices.json"
@@ -106,6 +123,16 @@ if [ "$RC3" != 0 ] && [ ! -f "$DG/identity/device-cert.json" ] \
 else
   cat "$WORK/j3.out"
   bad "J3: a failed commit left a half identity (rc=$RC3 cert=$(test -f "$DG/identity/device-cert.json" && echo yes || echo no) journal=$(test -f "$DG/join.pending.json" && echo yes || echo no))"
+fi
+
+say "J3b: addr refuses an accepted journal before its certificate is written"
+timeout 15 "${G_ENV[@]}" "$BIN" addr --json >"$WORK/j3b.out" 2>"$WORK/j3b.err"
+RC3B=$?
+if [ "$RC3B" != 0 ] && grep -q "still pending locally" "$WORK/j3b.err" "$WORK/j3b.out"; then
+  ok "J3b: addr refuses the accepted-but-uncommitted journal"
+else
+  cat "$WORK/j3b.out" "$WORK/j3b.err"
+  bad "J3b: addr printed an address for an uncommitted accepted join (rc=$RC3B)"
 fi
 
 say "J4: the next join finishes the accepted journal"
@@ -149,6 +176,20 @@ if [ "$RC6" != 0 ] && grep -q "overlay key" "$WORK/j6.err" "$WORK/j6.out"; then
 else
   cat "$WORK/j6.out" "$WORK/j6.err"
   bad "J6: addr printed an address for the mismatched identity (rc=$RC6)"
+fi
+
+say "J10: a corrupt certificate is refused, not read as absent"
+DBAD="$WORK/corrupt-cert"
+cp -a "$DG" "$DBAD"
+printf '{"name":"joined","cert":{}}\n' >"$DBAD/identity/device-cert.json"
+timeout 15 env TUNLION_CONFIG_DIR="$DBAD" "$BIN" addr --json >"$WORK/j10.out" 2>"$WORK/j10.err"
+RC10=$?
+if [ "$RC10" != 0 ] && grep -q "certificate record" "$WORK/j10.err" "$WORK/j10.out" \
+   && grep -q "tunlion reset" "$WORK/j10.err" "$WORK/j10.out"; then
+  ok "J10: addr refuses a corrupt certificate with the repair path"
+else
+  cat "$WORK/j10.out" "$WORK/j10.err"
+  bad "J10: a corrupt certificate was treated as no identity (rc=$RC10)"
 fi
 
 say "J7: reset removes the half-join journal and backup"

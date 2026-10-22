@@ -90,6 +90,40 @@ impl JoinState {
         serde_json::from_str(&raw).ok()
     }
 
+    /// The local certificate, read strictly. Absent is `Ok(None)`; present but
+    /// unreadable, unparseable or missing its `cert` is an ERROR. Treating that
+    /// as "no certificate" made `up`/`addr` fail open on a corrupt identity.
+    fn read_local_cert(&self) -> Result<Option<DeviceCert>> {
+        let path = self.local_cert_path();
+        let raw =
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e).with_context(|| {
+                    format!(
+                        "cannot read this device's certificate at {}; repair: `tunlion down -y`, \
+                         then `tunlion reset -y`, then join again with a fresh invitation",
+                        path.display()
+                    )
+                }),
+            };
+        let record: Value = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "this device's certificate record at {} cannot be parsed; repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                path.display()
+            )
+        })?;
+        let cert = DeviceCert::from_json(&record["cert"]).ok_or_else(|| {
+            anyhow::anyhow!(
+                "this device's certificate record at {} has no valid `cert`; repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                path.display()
+            )
+        })?;
+        Ok(Some(cert))
+    }
+
     /// The overlay public key on disk, without generating one.
     pub(crate) fn overlay_pub(&self) -> Option<[u8; 32]> {
         filament_peerloop::recv::store::OverlayKey::new(self.overlay_path())
@@ -316,10 +350,7 @@ impl JoinState {
                 }
             }
         }
-        let Some(record) = self.local_cert_record() else {
-            return Ok(());
-        };
-        let Some(cert) = DeviceCert::from_json(&record["cert"]) else {
+        let Some(cert) = self.read_local_cert()? else {
             return Ok(());
         };
         let enrolled = hex::encode(cert.device_pub);
@@ -346,13 +377,43 @@ impl JoinState {
     /// no devices.json until its first pair, so only the joined shape is
     /// refused.
     pub(crate) fn check_complete_join(&self) -> Result<()> {
-        if self.local_cert_record().is_none() || self.root.join("identity.ed25519").exists() {
+        if self.read_local_cert()?.is_none() || self.root.join("identity.ed25519").exists() {
             return Ok(());
         }
-        if self.devices_path().exists() {
-            return Ok(());
+        let devices = self.devices_path();
+        match std::fs::metadata(&devices) {
+            Ok(meta) if meta.is_file() => {
+                let raw = std::fs::read_to_string(&devices).with_context(|| {
+                    format!(
+                        "this device's joined store at {} cannot be read; repair: \
+                         `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                        devices.display()
+                    )
+                })?;
+                serde_json::from_str::<Vec<Value>>(&raw).map_err(|e| {
+                    anyhow::anyhow!(
+                        "this device's joined store at {} cannot be parsed ({e}); repair: \
+                         `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                        devices.display()
+                    )
+                })?;
+                return Ok(());
+            }
+            Ok(_) => bail!(
+                "this device's joined store at {} is not a regular file, so the join is incomplete. \
+                 Repair: `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation.",
+                devices.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| {
+                format!(
+                    "cannot inspect this device's joined store at {}; repair: `tunlion down -y`, \
+                         then `tunlion reset -y`, then join again with a fresh invitation",
+                    devices.display()
+                )
+            }),
         }
-        if self.devices_backup_path().exists() {
+        if self.devices_backup_path().is_file() {
             bail!(
                 "the join did not finish: this device has a joined certificate but no devices.json. \
                  A backup is at {}. Restore it only if it is this device's own store \
@@ -367,6 +428,23 @@ impl JoinState {
              holds no record of the owner it joined. Run `tunlion reset -y`, then join again with a fresh \
              invitation. `tunlion up` will not start a half-joined device."
         )
+    }
+
+    /// A read-only command must not print an address for a join whose accepted
+    /// acknowledgement is still sitting in the journal: the certificate (the
+    /// identity) has not been committed yet.
+    pub(crate) fn check_pending_accepted_not_committed(&self) -> Result<()> {
+        let Some(pending) = self.pending() else {
+            return Ok(());
+        };
+        if pending.get("accepted").is_some() && self.read_local_cert()?.is_none() {
+            bail!(
+                "a join the owner already accepted is still pending locally (the certificate was \
+                 not written). Run `tunlion up` (or `tunlion join`) to finish it before `addr`; \
+                 do not treat the overlay address as a joined identity yet."
+            );
+        }
+        Ok(())
     }
 
     /// What `up` should say when a join was started but no acknowledgement ever
@@ -414,7 +492,9 @@ pub(crate) fn prepare_up() -> Result<Option<String>> {
 pub(crate) fn check_for_readout() -> Result<()> {
     let state = JoinState::current();
     state.check_key_binding()?;
-    state.check_complete_join()
+    state.check_complete_join()?;
+    state.check_pending_accepted_not_committed()?;
+    state.check_pending_for_up()
 }
 
 #[cfg(test)]
@@ -537,6 +617,71 @@ mod tests {
         let err = state.check_key_binding().unwrap_err().to_string();
         assert!(err.contains("a join started with overlay key"), "{err}");
         assert!(err.contains("reset"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_corrupt_certificate_is_refused_not_treated_as_absent() {
+        let root = temp("corrupt-cert");
+        write_overlay(&root);
+        crate::platform::SecretFile::write_str(
+            &root.join("identity/device-cert.json"),
+            r#"{"name":"joined","cert":{}}"#,
+        )
+        .unwrap();
+        let state = JoinState::at(&root);
+        let err = state.check_key_binding().unwrap_err().to_string();
+        assert!(err.contains("certificate record"), "{err}");
+        assert!(err.contains("tunlion reset"), "{err}");
+        let err = state.check_complete_join().unwrap_err().to_string();
+        assert!(err.contains("tunlion reset"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_devices_json_directory_is_not_a_joined_store() {
+        let root = temp("devices-dir");
+        write_overlay(&root);
+        let overlay = JoinState::at(&root).overlay_pub().unwrap();
+        let cert = cert_for(3, overlay, 3600);
+        crate::platform::SecretFile::write_str(
+            &root.join("identity/device-cert.json"),
+            &json!({"name": "joined", "cert": cert.to_json()}).to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir(root.join(DEVICES_FILE)).unwrap();
+        let err = JoinState::at(&root)
+            .check_complete_join()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(err.contains("tunlion reset"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_accepted_journal_without_a_certificate_blocks_the_readout() {
+        let root = temp("accepted-journal");
+        write_overlay(&root);
+        let state = JoinState::at(&root);
+        let overlay = hex::encode(state.overlay_pub().unwrap());
+        crate::platform::SecretFile::write_str(
+            &root.join(PENDING_FILE),
+            &json!({
+                "version": 1,
+                "devicePub": overlay,
+                "ownerName": "owner",
+                "startedAt": 1,
+                "accepted": { "name": "joined" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = state
+            .check_pending_accepted_not_committed()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("still pending locally"), "{err}");
+        assert!(err.contains("tunlion up"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
