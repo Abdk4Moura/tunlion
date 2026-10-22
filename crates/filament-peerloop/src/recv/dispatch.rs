@@ -1589,9 +1589,20 @@ async fn recv_run(
                         Some("userspace") => L3Mode::Userspace,
                         _ => L3Mode::Auto,
                     };
+                    // Publish `starting` BEFORE the endpoint is created. A slow
+                    // TUN/Wintun/netstack start otherwise leaves siblings reading
+                    // the old `down` (or a stale record) and calling an address
+                    // unusable. Only the Ok arm below may turn this into `ready`.
+                    l3_status = {
+                        let mut report = |text: &str| host.l3_state_report(text);
+                        l3_start_begin(mode, &mut report)
+                    };
                     match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
                             l3_status = L3Status::ready(l3_mode_word(m.is_userspace()));
+                            if let Ok(text) = serde_json::to_string(&l3_status) {
+                                host.l3_state_report(&text);
+                            }
                             let addr = m.my_addr().map(|a| a.to_string()).unwrap_or(cidr);
 
                             // Subnet router: if this machine offers prefixes, make
@@ -1736,6 +1747,9 @@ async fn recv_run(
                         Err(e) => {
                             log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
                             l3_status = L3Status::down("none", e.to_string());
+                            if let Ok(text) = serde_json::to_string(&l3_status) {
+                                host.l3_state_report(&text);
+                            }
                             None
                         }
                     }
@@ -9348,6 +9362,23 @@ fn note_refusal(
         report.note_refused(name, size, token, msg, class);
     }
 }
+/// Publish `starting` before the packet endpoint is created, and return the
+/// state dispatch keeps while `l3_start` runs. Split out so the ordering is
+/// testable without a TUN: the callback runs exactly once, before the caller
+/// performs its (possibly slow) start.
+#[cfg(feature = "mesh")]
+fn l3_start_begin(mode: L3Mode, report: &mut dyn FnMut(&str)) -> L3Status {
+    let mode_word = match mode {
+        L3Mode::Userspace => "userspace",
+        L3Mode::Kernel | L3Mode::Auto => "kernel",
+    };
+    let status = L3Status::starting(mode_word);
+    if let Ok(text) = serde_json::to_string(&status) {
+        report(&text);
+    }
+    status
+}
+
 #[cfg(test)]
 mod caps_reannounce_tests {
     use super::caps_reannounce;
@@ -10486,5 +10517,42 @@ mod inventory {
                 "receive-loop test {name} is missing or duplicated"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "mesh"))]
+mod l3_start_state_tests {
+    use super::*;
+
+    /// The state a sibling reads WHILE a slow start is in flight. It must be
+    /// `starting`, published before the (here simulated) slow call, not the old
+    /// `down` and not a premature `ready`.
+    #[test]
+    fn starting_is_published_before_a_slow_start_completes() {
+        let mut published: Vec<String> = Vec::new();
+        let status = l3_start_begin(L3Mode::Auto, &mut |text| published.push(text.to_string()));
+        assert_eq!(status.state, "starting");
+        assert_eq!(published.len(), 1, "exactly one starting report before the call");
+        let v: Value = serde_json::from_str(&published[0]).unwrap();
+        assert_eq!(v["state"], "starting");
+        assert_eq!(v["mode"], "kernel", "Auto is attempting the kernel plane first");
+        assert!(v.get("reason").is_none(), "starting is not a failure");
+
+        // Stand in for a slow host.l3_start: no ready/down has been published,
+        // so addr/expose still see `starting`.
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&published[0]).unwrap()["state"],
+            "starting"
+        );
+
+        // The ready transition is a LATER report, and only that one is ready.
+        let ready = L3Status::ready("userspace");
+        published.push(serde_json::to_string(&ready).unwrap());
+        assert_eq!(
+            serde_json::from_str::<Value>(published.last().unwrap()).unwrap()["state"],
+            "ready"
+        );
     }
 }

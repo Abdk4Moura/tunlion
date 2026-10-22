@@ -21,7 +21,7 @@ use crate::ui;
 /// One exposed port: listen on the overlay `port`, forward to `target`
 /// (`host:port`), optionally restricted to `peers` (petnames; `None`/empty = any
 /// paired device).
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     pub port: u16,
     pub target: String,
@@ -55,6 +55,10 @@ fn bound_path() -> PathBuf {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoundState {
     pub ports: Vec<u16>,
+    /// The exact Binding each bound port currently serves. The port alone is not
+    /// enough: `expose 8080 --to newtarget` replaces an existing listener, and an
+    /// old record for :8080 must never satisfy the new request.
+    pub bindings: std::collections::HashMap<u16, Binding>,
     pub errors: std::collections::HashMap<u16, String>,
 }
 
@@ -73,6 +77,16 @@ pub fn bound_state(daemon: Option<u32>) -> BoundState {
         .as_array()
         .map(|a| a.iter().filter_map(|p| p.as_u64().and_then(|n| u16::try_from(n).ok())).collect())
         .unwrap_or_default();
+    let bindings = v["bindings"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, b)| {
+                    Some((k.parse::<u16>().ok()?, serde_json::from_value::<Binding>(b.clone()).ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let errors = v["errors"]
         .as_object()
         .map(|m| {
@@ -83,7 +97,7 @@ pub fn bound_state(daemon: Option<u32>) -> BoundState {
                 .collect()
         })
         .unwrap_or_default();
-    BoundState { ports, errors }
+    BoundState { ports, bindings, errors }
 }
 
 /// The ports the daemon has recorded as bound.
@@ -137,9 +151,10 @@ pub async fn expose_cmd(
     let target = resolve_target(port, &to);
     let peers = (!peers.is_empty()).then_some(peers);
 
+    let binding = Binding { port, target: target.clone(), peers: peers.clone() };
     let mut cfg = load();
     cfg.retain(|b| b.port != port);
-    cfg.push(Binding { port, target: target.clone(), peers: peers.clone() });
+    cfg.push(binding.clone());
     cfg.sort_by_key(|b| b.port);
     save(&cfg)?;
 
@@ -158,7 +173,7 @@ pub async fn expose_cmd(
     // The unix control socket is a fast wake; the bound record is the truth on
     // every platform (Windows has no control socket).
     notify_daemon().await;
-    let state = wait_for_bind(daemon, port, std::time::Duration::from_secs(6)).await;
+    let state = wait_for_bind(daemon, &binding, std::time::Duration::from_secs(6)).await;
     match state {
         BindOutcome::Bound => {
             ui::say(&format!(
@@ -211,13 +226,13 @@ pub enum BindOutcome {
 }
 
 /// Decide from the daemon's record. Pure, so every branch is testable without
-/// a listener: a port in `bound` wins; a recorded error means the bind failed;
-/// otherwise nothing has been proven.
-pub fn classify_bind(state: &BoundState, port: u16, l3_ready: bool) -> BindOutcome {
-    if state.ports.contains(&port) {
+/// a listener. The EXACT binding must be present: an old listener on the same
+/// port (a replaced target) is not this request's proof.
+pub fn classify_bind(state: &BoundState, want: &Binding, l3_ready: bool) -> BindOutcome {
+    if state.bindings.get(&want.port) == Some(want) {
         return BindOutcome::Bound;
     }
-    if let Some(why) = state.errors.get(&port) {
+    if let Some(why) = state.errors.get(&want.port) {
         return BindOutcome::Failed(why.clone());
     }
     if !l3_ready {
@@ -226,19 +241,19 @@ pub fn classify_bind(state: &BoundState, port: u16, l3_ready: bool) -> BindOutco
     BindOutcome::TimedOut
 }
 
-/// Poll the daemon's bound record until `port` is bound or failed. The daemon
-/// reconciles expose.json on a 1s tick (and immediately on the unix control
-/// socket), so this is a short wait, not the source of truth.
+/// Poll the daemon's bound record until THIS binding is bound or failed. The
+/// daemon reconciles expose.json on a 1s tick (and immediately on the unix
+/// control socket), so this is a short wait, not the source of truth.
 pub async fn wait_for_bind(
     daemon: u32,
-    port: u16,
+    want: &Binding,
     timeout: std::time::Duration,
 ) -> BindOutcome {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let state = bound_state(Some(daemon));
         let l3_ready = crate::l3_state::is_ready(&crate::l3_state::read_file_for(Some(daemon)));
-        let outcome = classify_bind(&state, port, l3_ready);
+        let outcome = classify_bind(&state, want, l3_ready);
         if outcome != BindOutcome::TimedOut || tokio::time::Instant::now() >= deadline {
             return outcome;
         }
@@ -273,12 +288,14 @@ fn print_list() -> Result<()> {
     for b in cfg {
         // Distinguish REQUESTED from SERVED. Printing "exposed" for a port that
         // never bound is what let addr+expose look trustworthy with no endpoint.
-        let mark = if state.ports.contains(&b.port) {
+        let mark = if state.bindings.get(&b.port) == Some(&b) {
             ui::paint(ui::Tone::Ok, "[bound]").to_string()
         } else if let Some(why) = state.errors.get(&b.port) {
             ui::paint(ui::Tone::Err, &format!("[NOT bound: {why}]")).to_string()
         } else if daemon.is_none() {
             ui::paint(ui::Tone::Warn, "[NOT bound: no running daemon]").to_string()
+        } else if state.bindings.contains_key(&b.port) {
+            ui::paint(ui::Tone::Warn, "[NOT bound: old target still serving]").to_string()
         } else {
             ui::paint(ui::Tone::Warn, "[NOT bound: no live L3 endpoint]").to_string()
         };
@@ -341,10 +358,11 @@ mod imp {
     /// Record the ports THIS daemon has bound right now, plus why any requested
     /// port failed (see `bound_state`). An error is evidence, not a log line: the
     /// `expose` command reads it to fail loudly instead of claiming success.
-    fn record_bound(ports: &[u16], errors: &HashMap<u16, String>) {
+    fn record_bound(ports: &[u16], bindings: &HashMap<u16, Binding>, errors: &HashMap<u16, String>) {
         let v = serde_json::json!({
             "pid": std::process::id(),
             "ports": ports,
+            "bindings": bindings,
             "errors": errors,
         });
         if let Err(e) = crate::platform::SecretFile::write_str(&super::bound_path(), &v.to_string()) {
@@ -411,7 +429,9 @@ mod imp {
             }
             let mut ports: Vec<u16> = active.keys().copied().collect();
             ports.sort_unstable();
-            record_bound(&ports, &errors);
+            let bindings: HashMap<u16, Binding> =
+                active.iter().map(|(p, (b, _))| (*p, b.clone())).collect();
+            record_bound(&ports, &bindings, &errors);
             active.len()
         }
 
@@ -493,13 +513,19 @@ mod tests {
     /// "bound" and never a silent success.
     #[test]
     fn a_request_that_did_not_bind_is_never_reported_as_bound() {
+        let want = Binding { port: 9110, target: "127.0.0.1:9110".into(), peers: None };
         let empty = BoundState::default();
-        assert_eq!(classify_bind(&empty, 9110, false), BindOutcome::NoEndpoint);
-        assert_eq!(classify_bind(&empty, 9110, true), BindOutcome::TimedOut);
-        let bound = BoundState { ports: vec![9110], errors: Default::default() };
-        assert_eq!(classify_bind(&bound, 9110, true), BindOutcome::Bound);
+        assert_eq!(classify_bind(&empty, &want, false), BindOutcome::NoEndpoint);
+        assert_eq!(classify_bind(&empty, &want, true), BindOutcome::TimedOut);
+        let bound = BoundState {
+            ports: vec![9110],
+            bindings: [(9110, want.clone())].into_iter().collect(),
+            errors: Default::default(),
+        };
+        assert_eq!(classify_bind(&bound, &want, true), BindOutcome::Bound);
         let refused = BoundState {
             ports: vec![],
+            bindings: Default::default(),
             errors: [(
                 9110,
                 "address already in use (os error 98)".to_string(),
@@ -508,11 +534,89 @@ mod tests {
             .collect(),
         };
         assert_eq!(
-            classify_bind(&refused, 9110, true),
+            classify_bind(&refused, &want, true),
             BindOutcome::Failed("address already in use (os error 98)".to_string())
         );
         // A different port's failure must not fail this one.
-        assert_eq!(classify_bind(&refused, 9111, true), BindOutcome::TimedOut);
+        let other = Binding { port: 9111, ..want.clone() };
+        assert_eq!(classify_bind(&refused, &other, true), BindOutcome::TimedOut);
+    }
+
+    fn write_bound(pid: u32, bindings: &[Binding], errors: &[(u16, &str)]) {
+        let bmap: std::collections::HashMap<String, Binding> =
+            bindings.iter().map(|b| (b.port.to_string(), b.clone())).collect();
+        let emap: std::collections::HashMap<String, String> = errors
+            .iter()
+            .map(|(p, e)| (p.to_string(), (*e).to_string()))
+            .collect();
+        let ports: Vec<u16> = bindings.iter().map(|b| b.port).collect();
+        let v = serde_json::json!({
+            "pid": pid,
+            "ports": ports,
+            "bindings": bmap,
+            "errors": emap,
+        });
+        crate::platform::SecretFile::write_str(&super::bound_path(), &v.to_string()).unwrap();
+    }
+
+    struct Restore(Option<std::ffi::OsString>, std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                    None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    /// Replacing an already-bound port must not be satisfied by the OLD binding.
+    /// Both apply paths end in `wait_for_bind`: the control socket asks the
+    /// daemon immediately, and Windows waits for the 1s tick. The record is the
+    /// same, so the old (port,target) pair is never proof for the new one.
+    #[tokio::test]
+    async fn replacing_a_bound_port_ignores_the_old_binding_on_both_apply_paths() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-expose-rev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let _restore = Restore(previous, dir);
+
+        let pid = std::process::id();
+        crate::l3_state::write(&filament_peerloop::mesh::L3Status::ready("userspace"));
+        let old = Binding { port: 8080, target: "127.0.0.1:8080".into(), peers: None };
+        let new = Binding { port: 8080, target: "127.0.0.1:9090".into(), peers: None };
+        write_bound(pid, &[old.clone()], &[]);
+
+        // Control-socket path: an immediate reply carrying only the old binding
+        // is still not proof. This is the record a fast `reload-expose` sees
+        // before the Exposer has swapped the listener.
+        assert_eq!(
+            classify_bind(&bound_state(Some(pid)), &new, true),
+            BindOutcome::TimedOut,
+            "the old target on :8080 must not report the new target as bound"
+        );
+
+        // Windows-tick path: the daemon swaps the listener and rewrites the
+        // record on its next reconcile. Only then may the command say BOUND.
+        let new_for_tick = new.clone();
+        let updater = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            write_bound(pid, &[new_for_tick], &[]);
+        });
+        let started = tokio::time::Instant::now();
+        let outcome = wait_for_bind(pid, &new, std::time::Duration::from_secs(2)).await;
+        updater.await.unwrap();
+        assert_eq!(outcome, BindOutcome::Bound);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "must wait for the new binding, not accept the old one"
+        );
+        assert_eq!(classify_bind(&bound_state(Some(pid)), &new, true), BindOutcome::Bound);
     }
 
     #[test]
