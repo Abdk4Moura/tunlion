@@ -1,0 +1,62 @@
+# filament-transport-iroh — an OPTIONAL iroh relay rung for tunlion's transport
+# ladder. This is a bounded proof of concept, not a replacement for the direct
+# QUIC, WebRTC or TURN paths.
+#
+# Everything that touches iroh is behind `iroh-transport`, which is OFF by
+# default. With the feature off this crate compiles to two constants and a
+# runtime-gate helper, so it can sit in the workspace without adding iroh to
+# anybody else's dependency graph.
+#
+# The identity rule: tunlion's Ed25519 device key stays the trust root. The iroh
+# endpoint key is DERIVED from it (or, in `Direct` mode, is the device key
+# itself), and the node id is published with a device-key signature. There is no
+# second identity to enrol, revoke or explain.
+[package]
+name = "filament-transport-iroh"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+description = "Feature-gated iroh relay transport PoC for tunlion (device-key-bound)"
+readme = "README.md"
+keywords = ["transport", "iroh", "relay", "poc", "ed25519"]
+categories = ["network-programming"]
+
+[features]
+default = []
+# The whole implementation. Off by default on purpose.
+iroh-transport = [
+    "dep:filament-transport",
+    "dep:iroh",
+]
+# In-process self-signed relay for tests/examples. Never enabled in a product
+# build: it pulls iroh's relay server and axum into the graph.
+test-relay = ["iroh-transport", "iroh/test-utils"]
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+bytes = "1.11.1"
+hex = "0.4"
+hkdf = "0.12"
+serde_json = "1.0.150"
+sha2 = "0.10"
+# The library needs runtime + time + sync + TCP probes only. `macros` and the
+# multi-thread runtime are for tests/examples and live in dev-dependencies.
+tokio = { version = "1.52.3", features = ["rt", "sync", "time", "net"] }
+zeroize = "1.8"
+
+filament-transport = { path = "../filament-transport", version = "0.1.0", optional = true }
+# Pinned to the API this PoC was written and tested against (1.4.x, 2026-10-21).
+# `default-features = false` keeps the n0 public relay map, metrics, portmapper
+# and default address lookup OUT of a crate whose whole point is "explicit
+# relays only".
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net"] }
+
+[[example]]
+name = "relay_echo"
+required-features = ["iroh-transport", "test-relay"]
