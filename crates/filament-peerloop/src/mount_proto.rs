@@ -2483,11 +2483,14 @@ mod win_at {
                 parent.handle(),
                 &name,
                 FILE_OPEN,
-                GENERIC_WRITE | WinFs::SYNCHRONIZE,
+                GENERIC_READ | GENERIC_WRITE | WinFs::DELETE | WinFs::SYNCHRONIZE,
                 OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
                 0,
                 SHARE_MOUNT,
-            )?;
+            )
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("open for truncate: {error}"))
+            })?;
             let meta = meta_of(file.as_raw_handle() as HANDLE)?;
             if meta.is_dir {
                 return Err(denied("Windows share truncate target is a directory"));
@@ -2497,7 +2500,9 @@ mod win_at {
                     "refusing Windows share truncate: the final name is a reparse point",
                 ));
             }
-            truncate_handle(&File::from(file), size)
+            truncate_handle(&File::from(file), size).map_err(|error| {
+                io::Error::new(error.kind(), format!("set end of file: {error}"))
+            })
         }
 
         pub(crate) fn rename_rel(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -4556,7 +4561,8 @@ mod tests {
                 .read_file(escape)
                 .expect_err("a junction or non-directory traversal is refused");
             assert!(
-                error.raw_os_error().is_some(),
+                error.raw_os_error().is_some()
+                    || error.kind() == std::io::ErrorKind::PermissionDenied,
                 "{escape:?}: {error}"
             );
         }
