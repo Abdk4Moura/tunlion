@@ -105,7 +105,7 @@ UI says so and adds no mount/route.
 | Background/restart | Unavailable; no durable handoff acknowledgement |
 | Owned/delegated relationship creation | Unavailable; temporary engine does not manufacture ownership or delegated ceilings |
 
-### Agreement-scoped shell (exec-class)
+### Agreement-scoped shell (exec and PTY)
 
 `AccessHandle::open_shell` sends the existing exec vocabulary (`argv`, `cwd`,
 `env`, `alive_ms`) in an `access-open` with `kind: "shell"`, on the accepted
@@ -121,18 +121,34 @@ account is the daemon's existing nonroot login account read from the password
 database, revalidated immediately before spawn. Account switching is refused, as
 is root/effective-UID mismatch; there is no daemon-identity, SYSTEM-token or
 elevation fallback. Windows keeps returning `Unsupported` until a standard token
-backend exists. This is exec-class serving, not a PTY: `tty: true` is still
-refused.
+backend exists. The exec-class form is not a PTY: `tty: true` on an exec open is
+still refused.
 
-The shell session is an operation in the agreement. End, a removing revision, or
-dropping the engine latches its cancellation and drops the owned `ExecChild`
-(the host contract ends the process tree); reconnect cannot revive a terminal
-agreement. An acceptor must pass `ShellRuntime` to `AccessDispatch::new_with_shell`;
-a `spec.shell` offer without that backend fails closed instead of advertising an
-endpoint it cannot serve. The reduced `tunlion-core` profile still has no embedded
-process backend, so it continues to refuse drafting a shell offer even though the
-library/driver API and initiator-side `open_shell` are available to a host adapter
-that owns one.
+`AccessHandle::open_pty` sends `access-open` with `kind: "pty"` and the existing
+terminal fields (`cols`, `rows`, `term`, optional one-shot `cmd`) on that same
+Mux/transport. `AgreementEngine::serve_pty` applies the same exact
+agreement/peer/revision/`spec.shell` admission, resolves and revalidates the
+standard nonroot account, then delegates to the existing PTY host seam:
+`recv::servers::shell::attach_pty` owns reservation, PTY stream/owner
+registration, the resize channel, `pty-open-ack`, spawn and pumps. The standing
+`pty-open` endpoint uses that same seam, so admission policy and field
+sanitization are shared rather than duplicated. Terminal input rides `sid`,
+output comes back on it, `pty-resize` reaches the existing resizer, and closing
+the stream or dropping the handle sends the existing `l2-close`. PTY sessions are
+one-shot: `resume`/`resume_from` is refused, so reconnect cannot revive a
+terminal agreement or reattach its shell.
+
+The shell session (exec or PTY) is an operation in the agreement. End, a removing
+revision, expiry or dropping the engine latches its cancellation; exec drops the
+owned `ExecChild`, while PTY calls the host's `PtySession::end` (which kills the
+shell and closes its PTY) and forgets the host session record. An acceptor must
+pass `ShellRuntime` to `AccessDispatch::new_with_shell`; use `with_pty` or
+`pty_only` to supply a real `PtyBackend`. A `spec.shell` offer without any
+matching backend fails closed instead of advertising an endpoint it cannot
+serve. The reduced `tunlion-core` profile still has no embedded process/PTY
+backend, so it continues to refuse drafting a shell offer even though the
+library/driver API and initiator-side opens are available to a host adapter that
+owns one.
 
 Main at `27d7bfea` contains real feature-gated PTY/exec/mount/forward servers;
 `tunlion-core` deliberately composes a reduced receive/transfer profile. Neither

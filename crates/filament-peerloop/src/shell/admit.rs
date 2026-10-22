@@ -117,6 +117,32 @@ pub struct PtyOpen {
     pub admitted_via_ceiling: bool,
 }
 
+/// Sanitized terminal fields shared by the standing PTY endpoint and the
+/// agreement PTY endpoint. This is WIRE SANITIZATION ONLY: who may open, under
+/// which policy, remains in the caller's admission path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PtyOpenFields {
+    pub term: String,
+    pub cmd: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Apply the historical PTY field defaults/bounds once. `cols`/`rows` keep the
+/// existing truncating `as u16` behaviour; `$TERM` is validated and capped.
+pub fn parse_pty_open_fields(v: &Value) -> PtyOpenFields {
+    PtyOpenFields {
+        term: v["term"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_graphic()))
+            .unwrap_or("xterm-256color")
+            .to_string(),
+        cmd: v["cmd"].as_str().unwrap_or("").to_string(),
+        cols: v["cols"].as_u64().unwrap_or(80) as u16,
+        rows: v["rows"].as_u64().unwrap_or(24) as u16,
+    }
+}
+
 /// Admit one `pty-open` frame.
 ///
 /// `user_drop_unavailable` is evaluated only after the gate allows, exactly
@@ -184,8 +210,6 @@ pub async fn admit_pty_open(
         let _ = t.send_control(&refusal.close_frame(sid)).await;
         return ShellAdmission::Ignored;
     }
-    let cols = v["cols"].as_u64().unwrap_or(80) as u16;
-    let rows = v["rows"].as_u64().unwrap_or(24) as u16;
     // #4: a stable, client-chosen session id binds reconnects to the same
     // persistent PTY. DEVICE-SCOPED: prefixed with the verified device so a
     // client id from device A can never address device B's session (no
@@ -201,25 +225,19 @@ pub async fn admit_pty_open(
         Some(s) => format!("{}\u{1}{}", device.as_deref().unwrap_or(pid), s),
         None => format!("{pid}:{sid:#x}"),
     };
-    // $TERM forwarded by the client (so the remote matches the user's actual
-    // terminal); validated + capped, sane default.
-    let term = v["term"]
-        .as_str()
-        .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_graphic()))
-        .unwrap_or("xterm-256color")
-        .to_string();
+    let fields = parse_pty_open_fields(v);
     let plan = PtyOpen {
         session,
-        term,
+        term: fields.term,
         // One-shot command (non-empty when pty one-shot was requested).
-        cmd: v["cmd"].as_str().unwrap_or("").to_string(),
+        cmd: fields.cmd,
         // RESUME-ONLY (warm-drop fall-through): the client wants to REATTACH an
         // existing session and never start a fresh shell, so a clean warm exit
         // can't turn into a surprise re-login.
         resume: v["resume"].as_bool().unwrap_or(false),
         resume_from: v["resume_from"].as_u64(),
-        cols,
-        rows,
+        cols: fields.cols,
+        rows: fields.rows,
         // Ceiling-admitted (covered, grantless) sessions must die when the
         // ceiling narrows; grant-admitted ones ignore it.
         admitted_via_ceiling: gate_inputs.ceiling_covers && !gate_inputs.has_grant,
