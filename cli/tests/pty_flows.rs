@@ -566,12 +566,15 @@ fn temporary_service_pairing_uses_real_transport_and_end_closes_the_socket() {
     assert!(host.wait_for("RUNNING ACCESS", 30), "{}", tail(&host.text()));
     let text = recipient.text();
     let address = text.split("Local service service-0 at ").nth(1).unwrap().split_whitespace().next().unwrap();
-    let mut socket = std::net::TcpStream::connect(address).unwrap();
+    let mut socket = std::net::TcpStream::connect(address).unwrap_or_else(|error| panic!(
+        "temporary endpoint connect failed: {error}\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text())));
     socket.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
-    socket.write_all(b"temporary-service-real-payload").unwrap();
+    socket.write_all(b"temporary-service-real-payload").unwrap_or_else(|error| panic!(
+        "temporary endpoint write failed: {error}\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text())));
     let mut reply = [0; 30];
     let expected = b"temporary-service-real-payload";
-    socket.read_exact(&mut reply[..expected.len()]).unwrap();
+    socket.read_exact(&mut reply[..expected.len()]).unwrap_or_else(|error| panic!(
+        "temporary service echo failed before End: {error}\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text())));
     assert_eq!(&reply[..expected.len()], expected);
     let at = host.text().len();
     host.send("\x1b[A\r"); // End access, without a shell/daemon/config operation.

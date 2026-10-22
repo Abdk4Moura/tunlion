@@ -6,6 +6,7 @@ use filament_peerloop::access::{AccessSpec, AgreementEngine, AgreementSnapshot, 
 use filament_peerloop::l2::{Mux, OpenOutcome, serve_stream};
 use filament_peerloop::send::ceremony::{Ceremony, TemporaryBinding, TemporaryRole};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::mpsc;
 
@@ -30,6 +31,7 @@ pub(crate) struct Session {
     proof_deadline: Option<std::time::Instant>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     endpoints: Vec<Endpoint>,
+    pending_opens: PendingOpens,
     controls: Option<mpsc::Receiver<AgreementSnapshot>>,
     stop_controls: Arc<AtomicBool>,
     review_cancel: Arc<AtomicBool>,
@@ -56,7 +58,7 @@ impl Session {
         Self { binding, role, host_spec: None, claim_expires: 0, local: None, peer: None,
             engine: None, review: None, snapshot: None, sent_proof: false, mux: None,
             pending: Vec::new(), active: false, established: false, ended: false, proof_deadline: None,
-            tasks: Vec::new(), endpoints: Vec::new(), controls: None,
+            tasks: Vec::new(), endpoints: Vec::new(), pending_opens: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())), controls: None,
             stop_controls: Arc::new(AtomicBool::new(false)), review_cancel: Arc::new(AtomicBool::new(false)),
             review_thread: None, review_result: None }
     }
@@ -230,7 +232,7 @@ impl Session {
                 self.active = true;
                 self.established = true;
                 eprintln!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime));
-                reconcile_services(&mut self.endpoints, snapshot, mux.clone()).await?;
+                reconcile_services(&mut self.endpoints, snapshot, mux.clone(), self.pending_opens.clone()).await?;
                 for folder in &snapshot.spec.folders {
                     eprintln!("  Folder {}: unavailable (scoped folder endpoint is not integrated).", crate::access_ui::terminal_label(&folder.id));
                 }
@@ -260,7 +262,11 @@ impl Session {
                 }));
             }
             "l2-open-ack" => {
-                if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) { mux.on_open_ack(sid).await; }
+                if self.role == TemporaryRole::Recipient {
+                    if let (Some(snapshot), Some(sid)) = (self.snapshot.as_ref(), filament_peerloop::l2::wire_sid(&payload)) {
+                        complete_open_ack(&mux, &self.pending_opens, snapshot, self.active, sid, &payload).await;
+                    }
+                }
             }
             "l2-close" => {
                 if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) { mux.on_close(sid, payload["err"].as_str()).await; }
@@ -348,7 +354,41 @@ struct Endpoint {
 }
 impl Drop for Endpoint { fn drop(&mut self) { self.task.abort(); } }
 
-async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementSnapshot, mux: Arc<Mux>) -> Result<()> {
+#[derive(Clone)]
+struct PendingOpen { generation: u64, revision: u64, resource: String }
+type PendingOpens = Arc<tokio::sync::Mutex<BTreeMap<u32, PendingOpen>>>;
+
+// A timed-out/aborted open cannot leave its waiter or SID available for a late
+// ack. Generation-qualified cleanup cannot tear down a replacement stream.
+struct OpenRegistration { mux: Arc<Mux>, pending: PendingOpens, sid: u32, generation: u64 }
+impl Drop for OpenRegistration {
+    fn drop(&mut self) {
+        let (mux, pending, sid, generation) = (self.mux.clone(), self.pending.clone(), self.sid, self.generation);
+        tokio::spawn(async move {
+            let mut entries = pending.lock().await;
+            if entries.get(&sid).is_some_and(|entry| entry.generation == generation) { entries.remove(&sid); }
+            drop(entries);
+            mux.drop_stream_if(sid, generation).await;
+        });
+    }
+}
+
+async fn complete_open_ack(mux: &Arc<Mux>, pending: &PendingOpens, snapshot: &AgreementSnapshot,
+    active: bool, sid: u32, payload: &Value) -> bool {
+    if !active || snapshot.state != AgreementState::Active || snapshot.accepted_revision != Some(snapshot.revision)
+        || !filament_peerloop::l2::is_l2_sid(sid) { return false; }
+    let mut entries = pending.lock().await;
+    let Some(open) = entries.get(&sid) else { return false; };
+    if open.revision != snapshot.revision || !snapshot.spec.services.iter().any(|service| service.id == open.resource)
+        || mux.stream_generation(sid).await != Some(open.generation) { return false; }
+    entries.remove(&sid);
+    let Some(waiter) = mux.take_open_ack(sid).await else { return false; };
+    // Unlike warm-forward probing, this path waits on an explicit oneshot, not
+    // a pipe liveness marker. No marker or duplicate ack reaches user TCP data.
+    waiter.send(OpenOutcome::Opened(payload.clone())).is_ok()
+}
+
+async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementSnapshot, mux: Arc<Mux>, pending: PendingOpens) -> Result<()> {
     endpoints.retain(|endpoint| snapshot.spec.services.contains(&endpoint.service));
     for endpoint in endpoints.iter() { let _ = endpoint.revision.send(Some(snapshot.revision)); }
     for service in &snapshot.spec.services {
@@ -367,6 +407,7 @@ async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementS
         let (revision_tx, revision_rx) = tokio::sync::watch::channel(Some(snapshot.revision));
         let resource = service.id.clone();
         let mux = mux.clone();
+        let pending = pending.clone();
         let task = tokio::spawn(async move {
             let mut streams = tokio::task::JoinSet::new();
             loop {
@@ -375,10 +416,12 @@ async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementS
                         let Ok((socket, _)) = incoming else { break; };
                         let Some(revision) = *revision_rx.borrow() else { drop(socket); continue; };
                         if streams.len() >= 64 { drop(socket); continue; }
-                        let (mux, id, resource) = (mux.clone(), id.clone(), resource.clone());
+                        let (mux, id, resource, pending) = (mux.clone(), id.clone(), resource.clone(), pending.clone());
                         streams.spawn(async move {
                             let sid = mux.alloc_sid();
-                            let Some(pipe) = mux.register_stream(sid).await else { return; };
+                            let Some((pipe, generation)) = mux.register_access_stream(sid).await else { return; };
+                            let _registration = OpenRegistration { mux: mux.clone(), pending: pending.clone(), sid, generation };
+                            pending.lock().await.insert(sid, PendingOpen { generation, revision, resource: resource.clone() });
                             let ack = mux.arm_open_ack(sid).await;
                             if mux.transport().send_control(&json!({"type":"access-open","v":1,"id":id,"revision":revision,"resource":resource,"sid":sid})).await.is_err() {
                                 mux.drop_stream(sid).await;
@@ -444,6 +487,70 @@ fn bound_snapshot(snapshot: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AckTransport;
+    #[async_trait::async_trait]
+    impl filament_transport::net::Transport for AckTransport {
+        async fn send_control(&self, _: &Value) -> Result<()> { Ok(()) }
+        async fn send_frame(&self, _: u32, _: u64, _: &[u8]) -> Result<()> { Ok(()) }
+        async fn flush(&self) -> Result<()> { Ok(()) }
+        fn max_payload(&self) -> usize { 1024 }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    fn ack_fixture() -> (Arc<Mux>, PendingOpens, AgreementSnapshot) {
+        let mux = Mux::new(Arc::new(AckTransport), Arc::new(filament_peerloop::host::NoHost));
+        let pending = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let mut spec = AccessSpec::default();
+        spec.services.push(filament_peerloop::access::ServiceAccess {
+            id: "service-0".into(), target: "127.0.0.1:3000".parse().unwrap(),
+            protocol: filament_peerloop::access::ServiceProtocol::Tcp,
+        });
+        let snapshot = AgreementSnapshot { id: "test-only-not-an-invitation".into(), revision: 1,
+            peer: [2;32], host_peer: [1;32], name: "test".into(),
+            relationship: filament_peerloop::access::Relationship::Temporary,
+            spec, lifetime: Lifetime::UntilEnded, claim_expires_at: 100,
+            state: AgreementState::Active, accepted_revision: Some(1) };
+        (mux, pending, snapshot)
+    }
+
+    #[tokio::test]
+    async fn temporary_ack_wakes_once_without_inserting_user_bytes() {
+        let (mux, pending, snapshot) = ack_fixture();
+        let sid = mux.alloc_sid();
+        let (mut pipe, generation) = mux.register_access_stream(sid).await.unwrap();
+        let ack = mux.arm_open_ack(sid).await;
+        pending.lock().await.insert(sid, PendingOpen { generation, revision: 1, resource: "service-0".into() });
+        let payload = json!({"type":"l2-open-ack","sid":sid});
+        assert!(!complete_open_ack(&mux, &pending, &snapshot, false, sid, &payload).await, "inactive agreement acknowledged");
+        assert!(complete_open_ack(&mux, &pending, &snapshot, true, sid, &payload).await);
+        assert!(matches!(tokio::time::timeout(std::time::Duration::from_millis(50), ack).await.unwrap().unwrap(), OpenOutcome::Opened(_)));
+        assert!(!complete_open_ack(&mux, &pending, &snapshot, true, sid, &payload).await, "duplicate acknowledgement");
+        assert!(matches!(pipe.try_recv(), Err(mpsc::error::TryRecvError::Empty)), "liveness marker leaked into user pipe");
+        mux.drop_stream_if(sid, generation).await;
+    }
+
+    #[tokio::test]
+    async fn refusal_timeout_and_late_ack_cannot_resurrect_streams() {
+        let (mux, pending, snapshot) = ack_fixture();
+        let sid = mux.alloc_sid();
+        let (_pipe, generation) = mux.register_access_stream(sid).await.unwrap();
+        let ack = mux.arm_open_ack(sid).await;
+        pending.lock().await.insert(sid, PendingOpen { generation, revision: 1, resource: "service-0".into() });
+        mux.on_close(sid, Some("target refused")).await;
+        assert!(matches!(ack.await.unwrap(), OpenOutcome::Refused(reason) if reason == "target refused"));
+        let payload = json!({"type":"l2-open-ack","sid":sid});
+        assert!(!complete_open_ack(&mux, &pending, &snapshot, true, sid, &payload).await);
+        let (_pipe, next_generation) = mux.register_access_stream(sid).await.unwrap();
+        let mut next_ack = mux.arm_open_ack(sid).await;
+        assert!(!complete_open_ack(&mux, &pending, &snapshot, true, sid, &payload).await, "stale generation acknowledged replacement");
+        assert!(matches!(next_ack.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(1), next_ack).await.is_err());
+        mux.drop_stream_if(sid, next_generation).await;
+        pending.lock().await.remove(&sid);
+        assert!(!complete_open_ack(&mux, &pending, &snapshot, true, sid, &payload).await);
+        assert_eq!(mux.live_streams().await, 0);
+    }
 
     #[test]
     fn metadata_is_bounded_before_typed_snapshot_allocation() {
