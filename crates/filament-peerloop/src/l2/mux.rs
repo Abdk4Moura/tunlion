@@ -210,6 +210,10 @@ impl Mux {
         self.transport.clone()
     }
 
+    pub(crate) fn access_delegated_principal(&self, key: &[u8;32]) -> bool {
+        self.host.delegated_access_for(key).is_some()
+    }
+
     pub fn alloc_sid(&self) -> u32 {
         // Mask the counter to the low 30 bits so a long-lived link never escapes
         // into the L2 flag (0x80000000) OR the answerer-role bit (0x40000000).

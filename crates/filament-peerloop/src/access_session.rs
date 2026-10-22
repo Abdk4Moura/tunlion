@@ -195,6 +195,7 @@ impl AccessDispatch {
                 },
                 _=tick.tick()=>{
                     if self.connection.transport.is_dead(){return Err(AccessError::Unavailable);}
+                    if self.peer.is_some_and(|peer|self.host.delegated_access_for(&peer.public_key()).is_some()){return Err(AccessError::Unsupported);}
                     let abandoned:Vec<_>=self.pending_opens.iter().filter(|(_,open)|open.reply.is_closed()).map(|(sid,_)|*sid).collect();
                     for sid in abandoned{if let Some(open)=self.pending_opens.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;let _=self.send(json!({"type":"l2-close","sid":sid})).await;}}
                     if self.pending_accept.as_ref().is_some_and(|(_,reply)|reply.is_closed()){return Err(AccessError::Unavailable);}
@@ -245,6 +246,10 @@ impl AccessDispatch {
         let local=self.key.public_key_bytes().map_err(|_|AccessError::Unavailable)?;
         if kind=="access-possession"{
             let peer=self.connection.ceremony.authenticate_temporary_payload(local,&payload)?;
+            // Temporary scope must not turn an already-known delegated
+            // principal into an unrestricted pairwise grant. The signed-ceiling
+            // adapter is not composed here, so refuse that mode explicitly.
+            if self.host.delegated_access_for(&peer.public_key()).is_some(){return Err(AccessError::Unsupported);}
             if self.peer.is_some_and(|old|old.public_key()!=peer.public_key()){return Err(AccessError::WrongPeer);}
             if self.peer.is_some(){return Ok(false);}self.peer=Some(peer);
             if let Some(draft)=self.draft.take(){
@@ -266,6 +271,7 @@ impl AccessDispatch {
             "access-end"=>{self.ending=true;self.cleanup().await;let _=self.send(json!({"type":"access-end-ack","v":1,"id":payload["id"]})).await;self.view(AccessPhase::Ended,false,None);return Ok(true);},
             "access-end-ack" if self.ending=>{self.view(AccessPhase::Ended,true,None);return Ok(true);},
             "access-accept" if self.engine.is_some() && !self.ending=>{
+                if self.host.delegated_access_for(&peer.public_key()).is_some(){return Err(AccessError::Unsupported);}
                 let revision=payload["revision"].as_u64().ok_or(AccessError::InvalidSpec)?;
                 let s=self.engine.as_ref().ok_or(AccessError::Unsupported)?.accept(&current.id,revision,peer,signature(&payload)?,self.host.now_secs())?;
                 self.send(json!({"type":"access-active","v":1,"id":s.id,"revision":s.revision})).await?;self.snapshot=Some(s);self.view(AccessPhase::Active,false,None);
@@ -278,6 +284,7 @@ impl AccessDispatch {
                 if let Some((_,reply))=self.pending_accept.take(){let _=reply.send(self.snapshot.clone().ok_or(AccessError::NotFound));}
             },
             "access-open" if self.engine.is_some() && !self.ending=>{
+                if self.host.delegated_access_for(&peer.public_key()).is_some(){return Err(AccessError::Unsupported);}
                 let revision=payload["revision"].as_u64().ok_or(AccessError::InvalidSpec)?;let sid=crate::l2::wire_sid(&payload).ok_or(AccessError::InvalidSpec)?;
                 let resource=payload["resource"].as_str().filter(|id|id.len()<=128).ok_or(AccessError::InvalidSpec)?.to_string();
                 if self.tasks.len()>=crate::l2::MAX_STREAMS_PER_LINK{return Err(AccessError::Capacity);}
@@ -308,7 +315,8 @@ mod tests {
         async fn flush(&self)->anyhow::Result<()>{Ok(())}
         fn max_payload(&self)->usize{65536}fn is_dead(&self)->bool{false}fn is_alive(&self)->bool{true}fn as_any(&self)->&dyn std::any::Any{self}
     }
-    struct Host;
+    #[derive(Default)]
+    struct Host{delegated:bool}
     #[async_trait::async_trait]
     impl HostServices for Host{
         fn now_secs(&self)->u64{10}
@@ -318,6 +326,7 @@ mod tests {
         fn rejoin_unwarned(&self)->Duration{NoHost.rejoin_unwarned()}
         fn relay_banner(&self)->String{String::new()}fn relay_forbidden(&self)->bool{false}
         fn channel_of(&self,s:&str)->String{NoHost.channel_of(s)}fn roster_snapshot_json(&self)->Option<String>{None}fn fleet_rv_present(&self)->bool{false}
+        fn delegated_access_for(&self,_:&[u8;32])->Option<crate::host::DelegatedAccess>{self.delegated.then(||crate::host::DelegatedAccess{ceiling:vec!["transfer".into()],deadline:u64::MAX})}
         async fn connect_local_stream(&self,h:&str,p:u16)->std::io::Result<tokio::net::TcpStream>{tokio::net::TcpStream::connect((h,p)).await}
     }
     fn pair(spec:AccessSpec)->(Fixture,AccessDispatch,AccessHandle,AccessDispatch,AccessHandle){
@@ -337,7 +346,7 @@ mod tests {
         let host_connection=AuthenticatedAccessConnection{ceremony:host,transport:Arc::new(Port(rtx)),incoming:hrx};
         let recipient_connection=AuthenticatedAccessConnection{ceremony:recipient,transport:Arc::new(Port(htx)),incoming:rrx};
         let draft=AccessOfferDraft{binding,spec,lifetime:Lifetime::UntilEnded,claim_expires_at:50,label:"existing-device".into()};
-        let(host,hh)=AccessDispatch::new(host_connection,hostkey,Arc::new(Host),Some(draft),vec![]).unwrap();
+        let(host,hh)=AccessDispatch::new(host_connection,hostkey,Arc::new(Host::default()),Some(draft),vec![]).unwrap();
         let(recipient,rh)=AccessDispatch::new(recipient_connection,recipientkey,Arc::new(NoHost),None,vec![]).unwrap();
         (fixture,host,hh,recipient,rh)
     }
@@ -349,6 +358,14 @@ mod tests {
         let observer=handle.observer();for _ in 0..140{observer.publish(AccessView{phase:AccessPhase::Review,agreement:None,peer_acknowledged_end:false,failure:None});}
         let events=observer.events(0).unwrap();assert!(events.reset_required);assert_eq!(events.events.len(),128);assert!(!observer.events(events.latest).unwrap().reset_required);
         assert!(!fixture.0.join("devices.json").exists());assert!(!fixture.0.join("caps.json").exists());
+    }
+
+    #[tokio::test]
+    async fn known_delegated_peer_cannot_use_temporary_proof_to_bypass_signed_ceiling(){
+        let(_fixture,mut host,hh,recipient,rh)=pair(AccessSpec::default());host.host=Arc::new(Host{delegated:true});
+        let ht=tokio::spawn(host.drive(Cancellation::default()));let rt=tokio::spawn(recipient.drive(Cancellation::default()));
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3),ht).await.unwrap().unwrap(),Err(AccessError::Unsupported));
+        let _=tokio::time::timeout(Duration::from_secs(3),rt).await.unwrap().unwrap();assert!(hh.snapshot().unwrap().agreement.is_none());assert_ne!(rh.snapshot().unwrap().phase,AccessPhase::Active);
     }
 
     #[cfg(feature="forward-server")]

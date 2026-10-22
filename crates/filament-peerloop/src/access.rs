@@ -481,6 +481,7 @@ impl AgreementEngine {
         {
             use std::os::fd::AsRawFd;
             use std::os::unix::fs::OpenOptionsExt;
+            if host.delegated_access_for(&peer.0).is_some(){return Err(AccessError::Unsupported);}
             if !crate::l2::is_l2_sid(sid) { return Err(AccessError::InvalidSpec); }
             let now=host.now_secs();
             let (folder,cancel,lifetime)=self.admit_folder(id,revision,peer,resource,now)?;
@@ -505,6 +506,8 @@ impl AgreementEngine {
                 // including when its owner's future is externally aborted.
                 let _pin=&root_pin;
                 let now=gate_host.now_secs();
+                if gate_host.delegated_access_for(&peer.0).is_some(){return Err(AccessError::Unsupported.to_string());}
+                if gate_host.live_session_cut(Some(&peer.0)).is_some(){return Err(AccessError::Ended.to_string());}
                 if gate_cancel.is_cancelled() { return Err(AccessError::Ended.to_string()); }
                 let state=weak.upgrade().ok_or_else(||AccessError::Ended.to_string())?;
                 let mut state=state.lock().map_err(|_|AccessError::Poisoned.to_string())?;
@@ -569,6 +572,7 @@ impl AgreementEngine {
         { let _ = (id, revision, peer, resource, sid, mux, now); Err(AccessError::Unsupported) }
         #[cfg(feature = "forward-server")]
         {
+            if mux.access_delegated_principal(&peer.0){return Err(AccessError::Unsupported);}
             if !crate::l2::is_l2_sid(sid) { return Err(AccessError::InvalidSpec); }
             let (service, cancel, lifetime) = self.admit_tcp(id, revision, peer, resource, now)?;
             struct Finish(Cancellation);
@@ -585,7 +589,7 @@ impl AgreementEngine {
             let result = tokio::select! {
                 biased;
                 _ = deadline => Err(AccessError::Expired),
-                outcome = cancel.run(mux.clone().dial_and_serve(sid, service.target.ip().to_string(), service.target.port(), rx, None)) => match outcome {
+                outcome = cancel.run(mux.clone().dial_and_serve(sid, service.target.ip().to_string(), service.target.port(), rx, Some(peer.0))) => match outcome {
                     DriverOutcome::Cancelled => Err(AccessError::Ended),
                     // Dial success/failure is reported by the existing mux's
                     // l2-open-ack/l2-close, never invented as an endpoint here.
@@ -612,6 +616,7 @@ impl AgreementEngine {
         { let _ = (id, revision, peer, resource, stream, host); Err(AccessError::Unsupported) }
         #[cfg(feature = "forward-server")]
         {
+            if host.delegated_access_for(&peer.0).is_some(){return Err(AccessError::Unsupported);}
             let (service, cancel, lifetime) = self.admit_tcp(id, revision, peer, resource, host.now_secs())?;
             // Cleanup cancellation also reclaims a completed operation's bounded slot.
             struct Finish(Cancellation);
