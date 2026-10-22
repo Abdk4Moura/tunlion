@@ -35,7 +35,10 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: cargo test (linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The suite now includes the non-default `l3` library tests (556) plus the
+    # CLI integration binary; a cold-cache run crossed the old 25m bound while
+    # still compiling, not failing. Keep headroom for the real gate.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: Check Unix installer syntax
