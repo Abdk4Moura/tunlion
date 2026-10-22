@@ -241,3 +241,58 @@ opens through standing shell admission. Windows has no standard token or ConPTY
 agreement backend; the authoritative primary role store/consent migration remains
 unimplemented. Process-tree termination is the existing PTY `end`/child-kill
 behavior, not a new tree-kill mechanism.
+
+## Windows folder serving and owned-download checkpoint
+
+Source adds a Windows `AgreementEngine::serve_folder` arm and a Windows
+`download_output::OwnedDownload` arm. The endpoint admission, per-request gate,
+revoke/cancel, expiry and SID cleanup are the existing agreement semantics; the
+platform difference is the pin. Windows opens the host-selected root once with
+`FILE_OPEN_REPARSE_POINT`, refuses a junction/symlink/reparse root, verifies the
+following open reports the same volume serial/file index, and serves every
+request by opening each component relative to the retained directory HANDLE.
+There is no path join and no unchecked fallback. Read-only and read-write modes
+use the accepted `FolderMode`; `ReadLink` stays refused because the Windows caps
+do not advertise symlinks.
+
+Downloads remain caller-selected: an existing directory plus one plain name.
+Windows creates a private staging file relative to the pinned directory and
+renames the OPEN HANDLE with `replace_if_exists = 0`, so existing names are
+never clobbered and concurrent publishers receive `name-1`, `name-2`, ... .
+Publication is atomic on one volume. Windows cannot guarantee directory-entry
+durability, so `PublishedDownload::durable` is false when the best-effort
+directory flush is unavailable; a real post-commit flush error returns
+`DurabilityUnknown(path)`.
+
+Refs (no merge/deploy): exact validated source commit
+`e121b2ff520e8e409bbc9dfb1d3dab12c7e7edb9` (documentation-only commits follow).
+Windows validation ran on the leased `windows-devloop` run `39873516584` at CI
+head `da9dba8e` (source parent `e121b2ff`):
+
+```text
+cargo test -p filament-peerloop --lib mount_proto::tests -- --test-threads=2
+cargo test -p filament-peerloop --lib access::tests -- --test-threads=2
+cargo test -p filament-peerloop --lib download_output::tests -- --test-threads=2
+```
+
+`DEVRESULT ok code=0 secs=173 head=da9dba8e`: **45 mount_protocol tests**,
+**12 access tests** and **4 owned-download tests** passed. New coverage includes
+Windows pinned-root reparse/parent escape refusal, root-path substitution
+survival, handle-relative write/rename/truncate/delete, directory listing from
+an open HANDLE, no-clobber publication against an existing name, binary/empty
+byte integrity, cancellation/drop cleanup, and an authenticated agreement
+folder read/End/abort fixture. The lease was stopped after the result.
+
+Host Linux checks ran on the reusable worker (`ci-worker-dovm`, shared
+`build.lock`) in job `core-win-folder-linux-final-20261022e` against the same
+source: **15 access tests**, **36 mount_protocol tests** and **5 Linux
+owned-download tests** passed; reduced dispatch and default peerloop library
+checks passed. No local build/test/formatter was run.
+
+Boundaries: this is still a library protocol endpoint, not a WinFsp mount, a
+recipient download UI, a two-machine CLI flow, or an OS-level folder activation.
+Windows reports no symlink support and refuses reparse entries rather than
+following in-share links. Directory-entry durability is not claimed on Windows.
+The existing upper-directory ACL and the host-selected canonical root remain the
+operator's responsibility; a reparse point above the selected root is resolved
+by the host's canonicalisation before the pin.

@@ -1,8 +1,11 @@
 # Folder adapter handoff
 
-Validated host code: exact `8f8d66e5`, remote core08. This is a **Linux library
-protocol endpoint**, not a delivered recipient download UI, mounted filesystem,
-Windows endpoint, or whole-product end-to-end result.
+Validated host code: Linux slice exact `8f8d66e5`, remote core08. The Windows
+folder-serving and owned-download slice is exact `e121b2ff`; see
+[access-agreement-validation.md](access-agreement-validation.md). Both are
+**library protocol endpoints**, not a delivered recipient download UI, mounted
+filesystem, or whole-product end-to-end result. Windows serves the same protocol
+over retained HANDLEs; it does not claim a WinFsp mount.
 
 ## Dependencies
 
