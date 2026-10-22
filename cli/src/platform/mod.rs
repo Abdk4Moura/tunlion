@@ -3490,6 +3490,45 @@ pub enum Escalate {
     Kill,
 }
 
+/// Where a sibling process asks the daemon to stop on a platform without
+/// SIGTERM or a unix control socket. The daemon consumes it (see
+/// `daemon_stop::stop_requested`).
+pub(crate) fn daemon_stop_request_path() -> PathBuf {
+    Paths::config_path("down.request")
+}
+
+/// Ask the daemon with `pid` to stop.
+///
+/// Unix sends SIGTERM (the existing, tested path). Windows has no SIGTERM and
+/// no unix control socket, so this writes a PID-scoped stop request that the
+/// daemon's own loop reads and exits through its normal cleanup. This is a
+/// real daemon-control path, not an external `taskkill` on a pid.
+pub fn request_daemon_stop(pid: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let status = command("kill")
+            .arg(pid.to_string())
+            .status()
+            .map_err(|e| format!("could not run kill: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("`kill` failed ({status})"))
+        }
+    }
+    #[cfg(windows)]
+    {
+        let path = daemon_stop_request_path();
+        SecretFile::write_str(&path, &format!("{pid}\n"))
+            .map_err(|e| format!("could not write the stop request {}: {e}", path.display()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Err("cannot ask a daemon to stop on this platform".to_string())
+    }
+}
+
 #[cfg(unix)]
 pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
     let sig = match how {
@@ -4115,5 +4154,39 @@ pub async fn l3_state_over_control() -> Option<serde_json::Value> {
     #[cfg(not(unix))]
     {
         None
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_stop_request_tests {
+    /// The Windows `down` path writes a PID-scoped stop request for the daemon
+    /// loop to consume. This proves the real implementation (not `taskkill`)
+    /// produces the exact file the reader looks for, on Windows CI.
+    #[test]
+    fn windows_stop_request_is_a_pid_scoped_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunlion-win-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let pid = std::process::id();
+        super::request_daemon_stop(pid).expect("write the stop request");
+        let path = super::daemon_stop_request_path();
+        let raw = std::fs::read_to_string(&path).expect("stop request exists");
+        assert_eq!(raw.trim().parse::<u32>().ok(), Some(pid));
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

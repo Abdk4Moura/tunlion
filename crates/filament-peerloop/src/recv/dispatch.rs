@@ -2063,6 +2063,13 @@ async fn recv_run(
     let receive_started = Instant::now();
 
     loop {
+        // A portable stop request (Windows has no SIGTERM and no unix control
+        // socket). The host writes it for this PID; the daemon exits through the
+        // SAME cleanup path it uses for a signal, within one loop tick.
+        if daemon && host.stop_requested() {
+            log.say("tunlion: stop requested; shutting down");
+            return Ok(());
+        }
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Reap completed blocking writers every iteration: the handles are
         // owned until their write lands, but a long-lived daemon must not keep

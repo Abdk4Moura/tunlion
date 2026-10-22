@@ -4254,33 +4254,6 @@ fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// `down` printed "stopped" and deleted the pidfile even when `kill` failed (a
-// daemon started with sudo), hiding a running daemon from status and reset.
-// The kill result now decides: failure is reported and the pidfile kept.
-#[test]
-fn down_reports_a_failed_kill_instead_of_stopped() {
-    // A real failing exit status, portably: libtest rejects an unknown flag.
-    let failed = crate::platform::command(std::env::current_exe().unwrap())
-        .arg("--definitely-not-a-libtest-flag")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(!failed.success());
-    let why = kill_failure(4242, &failed).expect("a failed kill is reported");
-    assert!(why.contains("pid 4242"), "{why}");
-    assert!(why.contains("still running"), "{why}");
-    assert!(why.contains("pidfile is kept"), "{why}");
-    assert!(!why.contains("stopped (pid"), "{why}");
-    let ok = crate::platform::command(std::env::current_exe().unwrap())
-        .args(["--list", "--exact", "no-such-test-name"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(ok.success());
-    assert!(kill_failure(4242, &ok).is_none());
-}
 // --- Windows reparse-point hardening tests (#43) ---
 // The resume/open tests use a file symlink to prove that the write cannot be
 // redirected outside the download directory. The create test remains a

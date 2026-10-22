@@ -229,14 +229,18 @@ pub enum BindOutcome {
 /// a listener. The EXACT binding must be present: an old listener on the same
 /// port (a replaced target) is not this request's proof.
 pub fn classify_bind(state: &BoundState, want: &Binding, l3_ready: bool) -> BindOutcome {
+    // LIVE ENDPOINT FIRST. A stale bound record (a previous daemon incarnation,
+    // or a listener from before L3 went away) must never turn a saved-only
+    // request into success. `ready` is the daemon's own proof that bind/dial can
+    // work; the record alone is history.
+    if !l3_ready {
+        return BindOutcome::NoEndpoint;
+    }
     if state.bindings.get(&want.port) == Some(want) {
         return BindOutcome::Bound;
     }
     if let Some(why) = state.errors.get(&want.port) {
         return BindOutcome::Failed(why.clone());
-    }
-    if !l3_ready {
-        return BindOutcome::NoEndpoint;
     }
     BindOutcome::TimedOut
 }
@@ -523,6 +527,13 @@ mod tests {
             errors: Default::default(),
         };
         assert_eq!(classify_bind(&bound, &want, true), BindOutcome::Bound);
+        // A bound RECORD is not enough when the endpoint is gone: this is the
+        // Windows saved-but-NOT-bound case, and it must be a failure.
+        assert_eq!(
+            classify_bind(&bound, &want, false),
+            BindOutcome::NoEndpoint,
+            "a stale bind record must never mask a down L3 endpoint"
+        );
         let refused = BoundState {
             ports: vec![],
             bindings: Default::default(),

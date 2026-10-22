@@ -1498,18 +1498,6 @@ fn load_delegation(path: &std::path::Path) -> Result<crate::ephemeral::Invitatio
 
 
 
-/// The refusal for a `kill` that did not succeed, or None when it did.
-fn kill_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
-    if status.success() {
-        return None;
-    }
-    Some(format!(
-        "could not stop the daemon (pid {pid}): `kill` failed ({status}), so it is still running. \
-         It is probably owned by another user, for example started with sudo; stop it as that user \
-         (`sudo tunlion down`). The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
-    ))
-}
-
 fn down_cmd() -> Result<()> {
     // The pidfile names the daemon; a daemon whose pidfile is gone (an older
     // `down` deleted it while the process lived on) is still found through the
@@ -1527,12 +1515,16 @@ fn down_cmd() -> Result<()> {
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
             if !stop_managed_service(pid) {
-                let status = crate::platform::command("kill").arg(pid.to_string()).status()?;
-                // A failed kill leaves the daemon running. Saying "stopped" and
-                // deleting the pidfile would hide it from `status` and `reset`
-                // while it keeps serving, so keep the pidfile and say why.
-                if let Some(why) = kill_failure(pid, &status) {
-                    bail!("{why}");
+                // Platform control, not a shell command guess: SIGTERM on unix;
+                // on Windows a PID-scoped request the daemon loop consumes and
+                // exits through its normal cleanup. A failure leaves the daemon
+                // running, so keep the pidfile and say why instead of printing
+                // "stopped" over a live process.
+                if let Err(why) = crate::platform::request_daemon_stop(pid) {
+                    bail!(
+                        "could not stop the daemon (pid {pid}): {why}, so it is still running. \
+                         The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
+                    );
                 }
             }
             // Stopped means GONE. A suspended daemon cannot act on SIGTERM and a

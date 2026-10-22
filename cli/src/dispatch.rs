@@ -606,9 +606,18 @@ pub(crate) async fn async_main() -> Result<()> {
             if out.is_ok() {
                 if let Err(e) = crate::ssh_ca::ensure_ca_key(&crate::settings::config_dir()).await
                 {
-                    crate::ui::say(&format!(
-                        "ssh CA not provisioned ({e}); `shell --ssh` signing will refuse until ssh-keygen succeeds (re-run init)"
-                    ));
+                    // The CA is an optional nicety. A non-interactive init (a
+                    // script, a CI box, a phone) must not print a cosmetic
+                    // "ssh-keygen program not found" warning after succeeding;
+                    // keep it as a debug line and let `shell --ssh` fail closed
+                    // with the real reason if anyone asks for a certificate.
+                    if ui_caps.interactive {
+                        crate::ui::say(&format!(
+                            "ssh CA not provisioned ({e}); `shell --ssh` signing will refuse until ssh-keygen succeeds (re-run init)"
+                        ));
+                    } else {
+                        crate::ui::debug(&format!("ssh CA not provisioned ({e})"));
+                    }
                 }
             }
             out

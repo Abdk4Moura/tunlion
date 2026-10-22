@@ -121,6 +121,20 @@ pub(crate) fn await_exit(pid: u32, exe: Option<&Path>) -> Result<Stopped> {
     )
 }
 
+/// Did this daemon receive a stop request? The request names a PID, so a
+/// marker left by an older process is ignored. Consumed on match: one request
+/// stops one daemon.
+pub(crate) fn stop_requested() -> bool {
+    let path = platform::daemon_stop_request_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else { return false };
+    let requested = raw.trim().parse::<u32>().ok();
+    if requested != Some(std::process::id()) {
+        return false;
+    }
+    let _ = std::fs::remove_file(&path);
+    true
+}
+
 fn marker_path() -> PathBuf {
     platform::Paths::config_path("down.marker")
 }
@@ -277,6 +291,41 @@ mod tests {
         assert_eq!(Stopped::Asked.note(), "");
         assert!(Stopped::Resumed.note().contains("resumed"));
         assert!(Stopped::Killed.note().contains("SIGKILL"));
+    }
+
+    struct ConfigDir(Option<std::ffi::OsString>, PathBuf);
+    impl Drop for ConfigDir {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                    None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    /// The Windows stop path is a PID-scoped request file the daemon consumes.
+    /// This runs everywhere (the reader is portable), so the exact logic that
+    /// replaces `taskkill` is tested on every runner.
+    #[test]
+    fn a_stop_request_is_pid_scoped_and_consumed_once() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-stop-req-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let _restore = ConfigDir(previous, dir);
+
+        let path = platform::daemon_stop_request_path();
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        assert!(stop_requested(), "our pid must be accepted");
+        assert!(!stop_requested(), "one request stops one daemon");
+
+        std::fs::write(&path, "424242\n").unwrap();
+        assert!(!stop_requested(), "another pid is not ours");
     }
 
     /// A pid with no process behind it is gone, whatever executable we expected.
