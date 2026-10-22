@@ -27,6 +27,9 @@ Run `tunlion add` in a terminal and choose **Temporary access**:
   library's scoped mount adapter is integrated and tested.
 - Add explicit TCP ports or IP:port targets. A bare port means loopback. There
   is no implicit discovery scan or invented service list.
+- Add an interactive shell scope. The host row toggles `spec.shell`; review states
+  that it is a real terminal on this machine's existing nonroot account, with no
+  resume/reattach. The recipient reviews the same shell line before accepting.
 - Select services with arrows, Space and Enter. IDs are indices, never labels
   split on commas. Review the complete scope once or cancel without mutation.
 - Create a real one-claim code through the existing signaling and shared PAKE
@@ -50,16 +53,23 @@ multi-resource narrowing, revision, expiry and decline scenarios need their own
 real CLI tests, not just the shared engine fixtures.
 
 Until-ended is the default; claim expiry is separate. Background persistence,
-shell, device networking, mount-ready paths and `.mesh` DNS are not offered as
-working features. Full transport-loss resume is currently explicitly unavailable;
-the adapter does not create a replacement claim or permanent contact. The current
+device networking, mount-ready paths and `.mesh` DNS are not offered as working
+features. Full transport-loss resume is currently explicitly unavailable; the
+adapter does not create a replacement claim or permanent contact. The current
 foreground implementation cleans up the host agreement on exit, including a
 fatal transport error. This reconnect limitation is an unfinished requirement,
 not a substitute for same-identity agreement resume.
 
-The shell command remains outward-only, using its existing known-device path.
-Temporary-shell code entry is on hold until the bounded, conflicting #566 input
-safety dependency can be composed safely. No second credential parser is added.
+The interactive shell is served by `AgreementEngine::serve_pty` with the exact
+accepted revision and proven peer; the host adapter composes the CLI's existing
+`CliExecProcess` and `CliPty` into `ShellRuntime` and never enters standing shell
+admission. `serve_pty` re-checks `spec.shell`, resolves/revalidates
+`StandardLocalAccount`, and refuses root/service identity, UID changes and account
+switching. The recipient terminal forwards input/output over the agreement Mux,
+sends `pty-resize`, and detaches locally with Ctrl-]. End, a removing revision,
+expiry or drop ends the host PTY, forgets its session record and releases the mux
+stream/resizer. Sessions are one-shot: resume/reattach is refused. This is Unix
+only; no Windows shell/PTY support is claimed.
 
 ## Identity and lifecycle boundaries
 
@@ -90,11 +100,21 @@ cargo test -p filament-cli --test pty_flows temporary_access_cancel_and_failed_c
 CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p filament-cli \
   --test pty_flows temporary_service_pairing_uses_real_transport_and_end_closes_the_socket \
   -- --nocapture
+CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p filament-cli \
+  --test pty_flows temporary_shell_pty_io_resize_and_end_teardown_are_scoped_and_never_use_standing_shell \
+  -- --nocapture
+CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p filament-cli \
+  --test pty_flows removing_shell_from_the_live_scope_ends_the_remote_pty_without_a_standing_session \
+  -- --nocapture
+CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p filament-cli \
+  --test pty_flows temporary_shell_expiry_tears_down_the_pty_and_the_agreement \
+  -- --nocapture
 cargo test -p filament-cli --bin tunlion shell_gate::tests
 ```
 
-The real PTY test drives two isolated CLI processes through signaling, PAKE,
-authenticated scope review, TCP echo and End, asserting socket closure and no
-standing records. It must not be reported green until it actually runs. Save the
-complete worker log durably before lease retirement. Windows validation is also
-pending the coordinated windows-devloop lane; no local cross-compile is permitted.
+The real PTY tests drive two isolated CLI processes through signaling, PAKE,
+authenticated scope review, a real remote shell, resize, End/removal/expiry and
+no-standing-record assertions. They must not be reported green until they
+actually run. Save the complete worker log durably before lease retirement.
+Windows validation is also pending the coordinated windows-devloop lane; no local
+cross-compile is permitted.

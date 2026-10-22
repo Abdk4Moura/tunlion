@@ -152,11 +152,17 @@ owns one.
 
 Main at `27d7bfea` contains real feature-gated PTY/exec/mount/forward servers;
 `tunlion-core` deliberately composes a reduced receive/transfer profile. Neither
-fact means those endpoints are ready for temporary agreements. The CLI adapter
-must branch before every ordinary pair enrollment/contact write, preserve real
-PAKE code allocation, own inline review and cancellation, and route scoped opens
-through the shared engine. This document does not claim that adapter is delivered
-by the library commits alone.
+fact means those endpoints are ready for temporary agreements. The CLI foreground
+adapter is integrated on `integration/access-shell-cli`: it branches before every
+ordinary pair enrollment/contact write, preserves real PAKE code allocation, owns
+inline review and cancellation, and routes scoped opens through the shared
+engine. Its host composition is
+`ShellRuntime::new(CliExecProcess, log).with_pty(CliPty)`; `CliPty` uses the
+existing platform PTY implementation and never enters standing shell admission.
+The host basket and recipient terminal flow, plus the real remote PTY, resize,
+End, removal and expiry checks, are recorded in
+[access-agreement-validation.md](access-agreement-validation.md). That adapter is
+foreground-only: no daemon/background handoff or Windows support is claimed.
 
 Primary-device incoming-shell consent also needs an authoritative local role
 representation migration. Existing `DeviceCert`/principal kinds model owner,
