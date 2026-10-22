@@ -785,6 +785,24 @@ mod async_client_tests {
     }
 
     #[tokio::test]
+    async fn unsolicited_future_id_is_rejected_and_cannot_supply_next_requests_bytes() {
+        let (mut client,mut requests,incoming)=client(FolderMode::ReadOnly);
+        let cancel=Cancellation::default();
+        let serving=async {
+            let id=request_id(&requests.recv().await.unwrap());
+            incoming.send(Some(Bytes::from(response(id+1,b"forged next reply")))).await.unwrap();
+        };
+        let (read,())=tokio::join!(client.read_binary(1,0,32,Duration::from_secs(2),&cancel),serving);
+        assert!(read.unwrap_err().to_string().contains("future mount response"));
+        let serving=async {
+            let id=request_id(&requests.recv().await.unwrap());
+            incoming.send(Some(Bytes::from(response(id,b"actual reply")))).await.unwrap();
+        };
+        let (read,())=tokio::join!(client.read_binary(1,0,32,Duration::from_secs(2),&cancel),serving);
+        assert_eq!(&read.unwrap()[..],b"actual reply");
+    }
+
+    #[tokio::test]
     async fn cancellation_and_timeout_retire_ids_and_do_not_emit_precancelled_requests() {
         let (mut client,mut requests,incoming)=client(FolderMode::ReadOnly);
         let cancel=Cancellation::default();cancel.cancel();
