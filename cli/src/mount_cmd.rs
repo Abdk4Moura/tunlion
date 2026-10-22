@@ -139,6 +139,11 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ("overlay.announce-seq", "overlay announce sequence"),
     ("device.id", "install id"),
     ("devices.json", "paired-device store (device certs)"),
+    // A failed/duplicated write leaves the previous store as `.bak`. Reset must
+    // remove it too, or a "clean slate" still carries a device store that a
+    // later `up` or a hand-rolled `cp` can resurrect (the Windows join report).
+    ("devices.json.bak", "previous paired-device store (backup)"),
+    ("join.pending.json", "unfinished join commit journal"),
     (
         crate::fleet_support::KEY_REVOCATIONS_FILE,
         "revoked device keys (forgotten certificate holders)",
@@ -158,6 +163,10 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     (
         crate::invite_burn::USED_INVITATIONS_FILE,
         "used invitations (one-use counts)",
+    ),
+    (
+        "used-invitations.json.bak",
+        "previous used-invitation store (backup)",
     ),
     ("ssh_ca_issued.json", "ssh certificate issuance log"),
     ("ssh_ca_serial", "ssh certificate serial counter"),

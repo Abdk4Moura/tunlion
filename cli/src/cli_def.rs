@@ -139,7 +139,9 @@ pub(crate) struct Cli {
     /// relay. Conflicts with --relay (which forces relay).
     #[arg(long, global = true, conflicts_with = "relay")]
     pub(crate) no_relay: bool,
-    /// Display name shown to peers (default: config file, then your platform username@hostname)
+    /// DISPLAY name shown to peers for this process only. It does not change
+    /// the persisted mesh name (`tunlion set name <name>` does); `addr --json`
+    /// reports both as `displayName` and `meshName`.
     #[arg(long, global = true)]
     pub(crate) name_as: Option<String>,
     /// Verbose output: -v shows resilience internals (stalls, repairs,
@@ -1069,7 +1071,9 @@ pub(crate) enum RequestsAction {
 /// secret is the identity, the name is yours to fix when you mislabel one.
 #[derive(Subcommand)]
 pub(crate) enum DevicesAction {
-    /// Forget a device: deletes the secret; it can no longer find you
+    /// Forget a device: deletes the secret; it can no longer find you.
+    /// From a script or CI, pass the global -y/--yes or it refuses at the
+    /// confirmation prompt.
     Forget { name: String },
     /// Rename your local alias (the other side is unaffected)
     Rename { old: String, new: String },

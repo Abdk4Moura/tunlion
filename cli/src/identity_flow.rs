@@ -887,6 +887,32 @@ pub(crate) async fn join_cmd(
     // Invitation material already read (the guided accept prompt).
     material: Option<Zeroizing<String>>,
 ) -> Result<()> {
+    // A join the owner accepted is already the truth. If the process died (or
+    // an I/O error hit) between the acknowledgement and the local writes, finish
+    // it here instead of sending a second enrollment request. The journal names
+    // the key, so a key that changed in between is refused with a repair path.
+    if let Some(name) = crate::join_state::JoinState::current().resume()? {
+        if caps.json {
+            crate::outln!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "verb": "join",
+                    "joined": true,
+                    "alreadyEnrolled": true,
+                    "receipt": "pending-journal",
+                    "name": name,
+                }))?
+            );
+        } else {
+            ui::say(&format!(
+                "{} completed a join the owner had already accepted; no second request was sent (joined as '{name}')",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+            ));
+        }
+        return Ok(());
+    }
+    crate::join_state::preflight_join()?;
     if let Some(existing) = identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
         bail!("{}", join_refusal_with_identity(&existing.fingerprint()));
     }

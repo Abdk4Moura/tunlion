@@ -219,6 +219,24 @@ impl EnrollmentService {
                     .burn_auth_key_at(&enroll_pub, &ak.reuse, now_secs())
                 {
                     self.log.debug(&format!("enroll response burn failed: {e}"));
+                    // A RETRY OF AN ENROLLMENT THE OWNER ALREADY COMMITTED is
+                    // not a refusal. The invitation was burned, the device
+                    // record was written and the certificate was sent; the
+                    // joining side may have lost the acknowledgement to a
+                    // dropped link, or its local store write may have failed.
+                    // Denying that retry told automation "this invitation has
+                    // already been used" while the fleet already held the
+                    // device, and left one machine with a key the other had
+                    // certified. Answer with the SAME receipt instead, and
+                    // never consume a second use.
+                    if self
+                        .reissue_enrolment_receipt(
+                            conn, &pid, &owner_key, device_pub, enroll_pub, &ak,
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     let msg = e.to_string();
                     let reason = if msg.contains("already used") {
                         "already used"
@@ -387,6 +405,70 @@ impl EnrollmentService {
         }
     }
 
+    /// Re-send the acknowledgement for an enrollment this owner already
+    /// committed, when a retry arrives after the invitation's use was burned.
+    ///
+    /// Safe because the retry proved possession of BOTH keys again (the caller
+    /// runs `EnrollmentPayload::verify` before this), the durable use count is
+    /// for this enrollment key, and the stored device record names exactly this
+    /// device key. A different device key, a different invitation, renewed
+    /// bounds or a revoked record all fall through to the ordinary refusal.
+    async fn reissue_enrolment_receipt(
+        &self,
+        conn: &mut Conn,
+        pid: &str,
+        owner_key: &UserKey,
+        device_pub: [u8; 32],
+        enroll_pub: [u8; 32],
+        ak: &filament_cap::ephemeral::AuthKey,
+    ) -> bool {
+        let Some(t) = conn.transport_of(pid) else {
+            return false;
+        };
+        let key_id = hex::encode(enroll_pub);
+        if self.store.invitation_uses(&key_id, now_secs()).unwrap_or(0) == 0 {
+            return false;
+        }
+        let Some(record) = self.store.devices_find_by_device_pub(&device_pub) else {
+            return false;
+        };
+        let Some((name, secret, cert)) =
+            receipt_from_record(&record, ak, device_pub, owner_key.public_key_bytes())
+        else {
+            return false;
+        };
+        let Ok((_, mut ack)) =
+            self.build_enrolment(owner_key, device_pub, &ak.caps, ak.expires, true)
+        else {
+            return false;
+        };
+        // The stored certificate is what the fleet certified; re-sending a
+        // freshly minted one would change the receipt's substance.
+        ack["device_cert"] = cert.to_json();
+        ack["type"] = json!("identity-auth-key-enroll-ack");
+        ack["name"] = json!(name);
+        ack["owner_name"] = json!(self.display_name);
+        ack["secret"] = json!(secret);
+        ack["device_pub"] = json!(hex::encode(device_pub));
+        ack["max_offline"] = json!(ak.max_offline);
+        ack["receipt"] = json!(true);
+        let _ = t.send_control(&ack).await;
+        self.log.say(&format!(
+            "  {} re-sent the join receipt for {name} (already enrolled; the invitation was not used again)",
+            self.log.paint(Tone::Ok, self.log.glyph_ok())
+        ));
+        if let Some(link) = conn.link_mut(pid) {
+            link.verified_name = Some(name);
+            link.admit_delegated(
+                owner_key.public_key_bytes(),
+                device_pub,
+                ak.expires,
+                ak.caps.clone(),
+            );
+        }
+        true
+    }
+
     fn build_enrolment(
         &self,
         owner_key: &UserKey,
@@ -465,6 +547,58 @@ pub fn enrollment_refusal(prior: &Value) -> Option<String> {
     })
 }
 
+/// Validate that a stored record is exactly the enrollment these signed bounds
+/// describe, and return `(name, secret, certificate)` for an idempotent receipt.
+///
+/// Pure, so the rule is testable without a transport. Every mismatch is a
+/// reason NOT to reissue: a different device key, a different owner, a renewed
+/// certificate, a different ceiling/offline budget, a revoked record, or an
+/// ephemeral invitation (which never leaves a record) all fail closed.
+pub fn receipt_from_record(
+    record: &Value,
+    ak: &filament_cap::ephemeral::AuthKey,
+    device_pub: [u8; 32],
+    owner_pub: [u8; 32],
+) -> Option<(String, String, DeviceCert)> {
+    if ak.ephemeral {
+        return None;
+    }
+    if enrollment_refusal(record).is_some() {
+        return None;
+    }
+    let cert = DeviceCert::from_json(&record["deviceCert"])?;
+    if cert.device_pub != device_pub
+        || cert.user_pub != owner_pub
+        || cert.expires != ak.expires
+        || cert.verify(now_secs()).is_err()
+    {
+        return None;
+    }
+    if record["principalKind"].as_str() != Some("delegated") {
+        return None;
+    }
+    if record["caps"].as_array().map(|caps| {
+        caps.iter()
+            .filter_map(|c| c.as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    }) != Some(ak.caps.clone())
+    {
+        return None;
+    }
+    if let Some(stored) = record["principalMaxOffline"].as_u64() {
+        if stored != ak.max_offline {
+            return None;
+        }
+    }
+    let name = record["name"].as_str()?.to_string();
+    let secret = record["secret"].as_str()?.to_string();
+    if hex::decode(&secret).map(|b| b.len()).ok() != Some(32) {
+        return None;
+    }
+    Some((name, secret, cert))
+}
+
 fn capability_summary(caps: &[String]) -> String {
     caps.iter()
         .map(|cap| match cap.as_str() {
@@ -488,6 +622,89 @@ mod tests {
             .contains("devices restore"));
         let lapsed = json!({"principalState": PRINCIPAL_STATE_LAPSED});
         assert!(enrollment_refusal(&lapsed).is_none());
+    }
+
+    fn auth_key_for(caps: &[&str], ttl: u64) -> filament_cap::ephemeral::AuthKey {
+        use filament_cap::ephemeral::{Invitation, Reuse};
+        let owner_seed = [9u8; 32];
+        let owner = ring::signature::Ed25519KeyPair::from_seed_unchecked(&owner_seed).unwrap();
+        let inv = Invitation::mint(
+            &owner,
+            [5u8; 32],
+            caps.iter().map(|c| c.to_string()).collect(),
+            now_secs() + ttl,
+            600,
+            Reuse::Once,
+            false,
+            "owner".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        let user = filament_id::UserKey::from_seed(&owner_seed).unwrap();
+        inv.to_auth_key(&user.public_key_bytes())
+    }
+
+    fn delegated_record(
+        owner: &filament_id::UserKey,
+        device_pub: [u8; 32],
+        expires: u64,
+        caps: &[&str],
+        max_offline: u64,
+    ) -> Value {
+        // Certify from a fixed issued time so `expires` is exact, not "now+ttl
+        // rounded to whenever this second ticked".
+        let issued = expires.saturating_sub(3600);
+        let cert = DeviceCert::certify(owner, device_pub, issued, 3600).unwrap();
+        json!({
+            "name": "joined-device",
+            "secret": "11".repeat(32),
+            "deviceCert": cert.to_json(),
+            "caps": caps,
+            "principalKind": "delegated",
+            "principalMaxOffline": max_offline,
+        })
+    }
+
+    #[test]
+    fn an_already_enrolled_retry_gets_the_same_receipt() {
+        let owner = filament_id::UserKey::from_seed(&[9u8; 32]).unwrap();
+        let device_pub = [7u8; 32];
+        let ak = auth_key_for(&["transfer"], 3600);
+        let record = delegated_record(&owner, device_pub, ak.expires, &["transfer"], ak.max_offline);
+        let stored = DeviceCert::from_json(&record["deviceCert"]).unwrap();
+        assert_eq!(stored.expires, ak.expires);
+        assert_eq!(stored.user_pub, owner.public_key_bytes());
+        assert!(stored.verify(now_secs()).is_ok());
+        assert_eq!(record["principalMaxOffline"].as_u64(), Some(ak.max_offline));
+        assert_eq!(record["caps"], json!(["transfer"]));
+        assert_eq!(ak.caps, vec!["transfer".to_string()]);
+        let (name, secret, cert) =
+            receipt_from_record(&record, &ak, device_pub, owner.public_key_bytes())
+                .expect("the committed record is exactly this enrollment");
+        assert_eq!(name, "joined-device");
+        assert_eq!(secret, "11".repeat(32));
+        assert_eq!(cert.device_pub, device_pub);
+        assert_eq!(cert.expires, ak.expires);
+    }
+
+    #[test]
+    fn a_receipt_is_refused_for_a_different_device_key_or_bounds() {
+        let owner = filament_id::UserKey::from_seed(&[9u8; 32]).unwrap();
+        let device_pub = [7u8; 32];
+        let ak = auth_key_for(&["transfer"], 3600);
+        let record = delegated_record(&owner, device_pub, ak.expires, &["transfer"], ak.max_offline);
+        // A different device key must not inherit this receipt.
+        assert!(receipt_from_record(&record, &ak, [8u8; 32], owner.public_key_bytes()).is_none());
+        // A revoked record is refused.
+        let mut revoked = record.clone();
+        revoked["principalState"] = json!("revoked");
+        assert!(receipt_from_record(&revoked, &ak, device_pub, owner.public_key_bytes()).is_none());
+        // A different ceiling is refused (the new invitation is not this one).
+        let wider = auth_key_for(&["transfer", "shell"], 3600);
+        assert!(receipt_from_record(&record, &wider, device_pub, owner.public_key_bytes()).is_none());
+        // A different owner key is refused.
+        let other_owner = filament_id::UserKey::from_seed(&[4u8; 32]).unwrap();
+        assert!(receipt_from_record(&record, &ak, device_pub, other_owner.public_key_bytes()).is_none());
     }
 
     #[test]

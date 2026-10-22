@@ -58,9 +58,6 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
             "this device already holds an identity key; join only from a clean Tunlion identity"
         );
     }
-    if local_device_cert_path().exists() {
-        bail!("this device already holds a joined certificate; refusing to overwrite it");
-    }
     let assigned_name = v["name"]
         .as_str()
         .ok_or_else(|| anyhow!("join acknowledgement omitted the device name"))?;
@@ -106,8 +103,16 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         .ok_or_else(|| anyhow!("join acknowledgement omitted the owner certificate"))?;
     let overlay_pub = crate::overlay::overlay_pubkey_bytes()?;
     let fp = crate::ephemeral::issuer_fingerprint(&owner_cert.user_pub);
-    if local_cert.device_pub != overlay_pub
-        || crate::ephemeral::issuer_fingerprint(&local_cert.user_pub) != inv.issuer_fp
+    if local_cert.device_pub != overlay_pub {
+        bail!(
+            "the owner certified overlay key {}, but this device now holds {}. The join would create \
+             an identity the fleet cannot reach. Repair: `tunlion down -y`, then `tunlion reset -y`, \
+             then join again with a fresh invitation from the owner.",
+            hex::encode(local_cert.device_pub),
+            hex::encode(overlay_pub)
+        );
+    }
+    if crate::ephemeral::issuer_fingerprint(&local_cert.user_pub) != inv.issuer_fp
         || local_cert.expires != expires
         || local_cert.verify(identity::now_secs()).is_err()
     {
@@ -116,13 +121,25 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
     if fp != inv.issuer_fp || owner_cert.verify(identity::now_secs()).is_err() {
         bail!("join acknowledgement carried an invalid owner certificate");
     }
-    let cert_path = local_device_cert_path();
-    crate::platform::SecretFile::write_str(
-        &cert_path,
-        &serde_json::to_string_pretty(
-            &json!({ "name": assigned_name, "cert": local_cert.to_json() }),
-        )?,
-    )?;
+    // A certificate already on disk is only acceptable when it is the SAME
+    // certificate this acknowledgement carries (the owner re-sent a receipt
+    // after a partial local commit). A different key is a hard refusal: two
+    // identities cannot both be this device.
+    if let Ok(raw) = std::fs::read_to_string(local_device_cert_path()) {
+        if let Ok(record) = serde_json::from_str::<Value>(&raw) {
+            if let Some(existing) = identity::DeviceCert::from_json(&record["cert"]) {
+                if existing.device_pub != local_cert.device_pub {
+                    bail!(
+                        "this device already holds a joined certificate for overlay key {}, but the \
+                         owner sent a receipt for {}. Refusing to overwrite it. Run `tunlion reset -y` \
+                         and join again with a fresh invitation.",
+                        hex::encode(existing.device_pub),
+                        hex::encode(local_cert.device_pub)
+                    );
+                }
+            }
+        }
+    }
     let transfer_caps = vec!["transfer".to_string()];
     // The invitation names the fleet, but the name is presentation: it must
     // not re-key a DIFFERENT fleet already recorded under it (stale join, or
@@ -131,10 +148,17 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
     // owner's identity). Only a record pinned to the owner's own device key
     // is updated in place; anything else gets a new, suffixed record. See
     // devices_store::place_joined_owner.
-    crate::devices_store::devices_store_joined_owner(
+    //
+    // `accept` journals the validated acknowledgement, then writes devices.json
+    // and the certificate LAST. A failure leaves enough state to finish, never
+    // a certificate without a store.
+    let name = crate::join_state::JoinState::current().accept(
+        assigned_name,
+        overlay_pub,
+        &local_cert,
         owner_name,
-        secret,
         &owner_cert,
+        secret,
         &transfer_caps,
         identity::IntroScope::Device.to_byte(),
     )?;
@@ -190,8 +214,7 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
             ui::debug(&format!("stored {n} owner-signed capability op(s)"));
         }
     }
-    config_set("name", assigned_name)?;
-    Ok(assigned_name.to_string())
+    Ok(name)
 }
 
 pub(crate) async fn enroll_cmd(
@@ -205,6 +228,11 @@ pub(crate) async fn enroll_cmd(
     use base64::Engine;
     let enroll_seed = inv.enroll_private_key;
     let device_pub = crate::overlay::overlay_pubkey_bytes()?;
+    // Pin the key BEFORE the owner can certify it. If the process dies after
+    // this, the next join/up can tell "same key, resume" from "a different
+    // key, this enrollment can never be completed".
+    let join_state = crate::join_state::JoinState::current();
+    join_state.begin(device_pub, &inv.owner_name, &inv.issuer_fp)?;
 
     if !json_output {
         ui::say(&format!(
@@ -263,11 +291,25 @@ pub(crate) async fn enroll_cmd(
 
     let started = Instant::now();
     let enroll_deadline = Duration::from_secs(60);
+    // An "already used" answer is AMBIGUOUS: the owner may have committed this
+    // enrollment and the acknowledgement may have been lost. Ask once for the
+    // idempotent receipt before treating it as a refusal, and never report
+    // failure while an ack can still arrive.
+    let mut receipt_retries = 0u8;
+    let mut receipt_deadline: Option<Instant> = None;
 
     loop {
         let elapsed = started.elapsed();
         if elapsed >= enroll_deadline {
             return Err(enrollment_timeout(enroll_deadline.as_secs()));
+        }
+        if receipt_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!(
+                "the owner reported this invitation as already used, but did not re-send the join \
+                 receipt within 10s. If that owner already enrolled this device, run join again with \
+                 the same invitation after updating the owner; if this device's overlay key changed, \
+                 run `tunlion reset -y` and join again with a fresh invitation."
+            );
         }
 
         let slice = Duration::from_secs(2).min(enroll_deadline.saturating_sub(elapsed));
@@ -434,6 +476,7 @@ pub(crate) async fn enroll_cmd(
                     }
                 }
                 Some("identity-auth-key-enroll-ack") => {
+                    let receipt = v["receipt"].as_bool().unwrap_or(false);
                     let name = persist_join_ack(&v, &inv)?;
                     if json_output {
                         println!(
@@ -442,6 +485,8 @@ pub(crate) async fn enroll_cmd(
                                 "ok": true,
                                 "verb": "join",
                                 "joined": true,
+                                "alreadyEnrolled": receipt,
+                                "receipt": if receipt { "reissued" } else { "new" },
                                 "name": name,
                                 "devicePub": hex::encode(device_pub),
                                 "ceiling": inv.caps,
@@ -449,6 +494,13 @@ pub(crate) async fn enroll_cmd(
                                 "persistsAcrossReconnect": true,
                             }))?
                         );
+                    } else if receipt {
+                        ui::say(&format!(
+                            "{} already enrolled as '{}': the owner re-sent the join receipt, and the invitation was not used again (device_pub: {})",
+                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            name,
+                            hex::encode(device_pub)
+                        ));
                     } else {
                         ui::say(&format!(
                             "{} joined as '{}' with a persisted ceiling (device_pub: {})",
@@ -473,8 +525,41 @@ pub(crate) async fn enroll_cmd(
                     // server sends a specific fact (already used / use limit
                     // reached / rate-limited) instead of a generic denial.
                     let reason = v["reason"].as_str().unwrap_or("unknown");
+                    if matches!(reason, "already used" | "use limit reached")
+                        && receipt_retries == 0
+                    {
+                        receipt_retries += 1;
+                        receipt_deadline = Some(Instant::now() + Duration::from_secs(10));
+                        ui::debug(&format!(
+                            "owner answered '{reason}'; asking once for an idempotent receipt"
+                        ));
+                        // Re-send the SAME request. On an owner that already
+                        // committed this device, the response is the stored
+                        // receipt (and no second use is consumed); on an owner
+                        // that did not, the answer is the same refusal.
+                        if let Some(t) = conn.transport_of(&pid) {
+                            crate::ephemeral::register_enrollment(
+                                pid.clone(),
+                                enroll_seed,
+                                device_pub,
+                                inv.clone(),
+                            );
+                            let _ = t
+                                .send_control(&json!({
+                                    "type": "identity-auth-key-enroll-request",
+                                    "auth_key_v2": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                        .encode(inv.to_payload()),
+                                    "device_pub": hex::encode(device_pub),
+                                }))
+                                .await;
+                            continue;
+                        }
+                    }
                     bail!(match reason {
-                        "already used" => "this invitation has already been used".to_string(),
+                        "already used" => "this invitation has already been used, and the owner did \
+                            not re-send a join receipt. If the owner already enrolled this device, \
+                            run `tunlion join` again after updating the owner; otherwise ask the \
+                            owner for a fresh invitation.".to_string(),
                         "use limit reached" =>
                             "this invitation has reached its use limit".to_string(),
                         _ => format!("enrollment denied: {reason}"),

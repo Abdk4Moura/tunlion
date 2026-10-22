@@ -146,6 +146,7 @@ on:
       - 'cli/tests/signaling-freeze-gates.sh'
       - 'cli/tests/config-scope-gates.sh'
       - 'cli/tests/identity-relink-gates.sh'
+      - 'cli/tests/join-state-gates.sh'
       - 'cli/tests/scripting-contract-gates.sh'
       - 'cli/tests/net-blockers-gates.sh'
       - 'cli/tests/daemon-path-gates.sh'
@@ -281,6 +282,8 @@ jobs:
             [cli/tests/signaling-freeze-gates.sh]=5
             [cli/tests/config-scope-gates.sh]=4
             [cli/tests/identity-relink-gates.sh]=3
+            # 10: J1 J2 J2b J3 J4 J5 J6 J7 J8 J9 (fix/join-atomic-idempotent).
+            [cli/tests/join-state-gates.sh]=10
             [cli/tests/scripting-contract-gates.sh]=11
             [cli/tests/net-blockers-gates.sh]=14
             [cli/tests/daemon-path-gates.sh]=7
@@ -338,6 +341,7 @@ jobs:
                    cli/tests/signaling-freeze-gates.sh \
                    cli/tests/config-scope-gates.sh \
                    cli/tests/identity-relink-gates.sh \
+                   cli/tests/join-state-gates.sh \
                    cli/tests/scripting-contract-gates.sh \
                    cli/tests/net-blockers-gates.sh \
                    cli/tests/daemon-path-gates.sh \

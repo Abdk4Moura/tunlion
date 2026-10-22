@@ -168,6 +168,28 @@ pub(crate) async fn up_cmd(
         install_system: install_system_flag,
     } = mode;
 
+    // Finish an accepted join whose local writes were interrupted, and refuse a
+    // key/certificate mismatch BEFORE the daemon serves. A daemon that presents
+    // a key the fleet never certified looks reachable and is not: name the
+    // repair instead of letting the first peer fail with a transport error.
+    if let Some(name) = crate::join_state::prepare_up()? {
+        ui::say(&format!(
+            "  {} completed a join the owner had already accepted (joined as '{name}')",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok())
+        ));
+    }
+    if let Some(asked) = daemon.name_as.as_deref() {
+        let configured = crate::config_get("name").unwrap_or_else(crate::default_display_name);
+        if asked != configured {
+            ui::say(&format!(
+                "  {} --name-as changes the DISPLAY name for this process only; the mesh name stays '{}'. To persist it, run `tunlion set name {}`.",
+                ui::paint(ui::Tone::Dim, "note:"),
+                filament_peerloop::mesh::sanitize_host(&configured),
+                asked
+            ));
+        }
+    }
+
     // TAILSCALE-SHAPED ONBOARDING. `up` with a key is one command: join if this
     // machine has no identity yet, then serve. The key is read from a file (or
     // stdin), or from the environment, never from argv. Without a key this is a

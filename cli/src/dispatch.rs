@@ -901,9 +901,18 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             } else {
                 // Show this machine's address.
+                //
+                // DISPLAY vs MESH. `--name-as`/TUNLION_NAME changes the name
+                // peers see in a running process, but the `.mesh` identity is
+                // derived from the persisted `name` setting. They used to be
+                // conflated: `up --name-as dgmfa-repro` still printed the old
+                // mesh name here. Expose both, and never let the transport
+                // readout hide a certificate/key mismatch.
+                crate::join_state::check_for_readout()?;
                 let id = overlay::load_identity()?;
-                let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
-                let mesh_name = l3::sanitize_host(&my_name);
+                let display_name = crate::display_name();
+                let configured = config_get("name").unwrap_or_else(crate::default_display_name);
+                let mesh_name = l3::sanitize_host(&configured);
                 let l3_status = crate::l3_state::current().await;
                 if json_output {
                     crate::outln!(
@@ -911,7 +920,12 @@ pub(crate) async fn async_main() -> Result<()> {
                         serde_json::to_string_pretty(&json!({
                             "ok": true,
                             "verb": "addr",
+                            // `name` is the MESH label and stays for scripts.
                             "name": mesh_name,
+                            "meshName": mesh_name,
+                            // What peers see for this process. `--name-as` is
+                            // display-only; it does not rename the mesh.
+                            "displayName": display_name,
                             "overlayV6": id.addr().to_string(),
                             "overlayV4": id.addr_v4().to_string(),
                             "mesh": format!("{mesh_name}.mesh"),
@@ -934,6 +948,11 @@ pub(crate) async fn async_main() -> Result<()> {
                     crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
                     crate::outln!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
                     crate::outln!("  mesh:     {mesh_name}.mesh");
+                    if display_name != configured {
+                        ui::say(&format!(
+                            "  display:  {display_name} (display only; the mesh name is '{mesh_name}'. Persist it with `tunlion set name {display_name}`)"
+                        ));
+                    }
                     if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
                         ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
                     }
