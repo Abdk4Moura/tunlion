@@ -1,5 +1,8 @@
 name: win-agreement-local
 on:
+  push:
+    branches:
+      - ci/win-agreement-folder-*
   workflow_dispatch: {}
 permissions:
   contents: read
