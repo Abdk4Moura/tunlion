@@ -1104,10 +1104,17 @@ mod tests {
         ProvenPeer(key.public_key().as_ref().try_into().unwrap(), None)
     }
     fn spec() -> AccessSpec {
+        // `AccessSpec::validate` requires absolute paths; a bare `/docs` is not
+        // absolute on Windows, so the fixture uses the platform's root spelling.
+        let (docs, work) = if cfg!(windows) {
+            (PathBuf::from(r"C:\docs"), PathBuf::from(r"C:\work"))
+        } else {
+            (PathBuf::from("/docs"), PathBuf::from("/work"))
+        };
         AccessSpec {
             folders: vec![
-                FolderAccess { id: "docs".into(), path: PathBuf::from("/docs"), mode: FolderMode::ReadOnly },
-                FolderAccess { id: "work".into(), path: PathBuf::from("/work"), mode: FolderMode::ReadWrite },
+                FolderAccess { id: "docs".into(), path: docs, mode: FolderMode::ReadOnly },
+                FolderAccess { id: "work".into(), path: work, mode: FolderMode::ReadWrite },
             ],
             services: vec![
                 ServiceAccess { id: "web".into(), target: "127.0.0.1:8080".parse().unwrap(), protocol: ServiceProtocol::Tcp },
