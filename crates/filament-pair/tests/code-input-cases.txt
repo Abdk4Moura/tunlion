@@ -1,0 +1,8 @@
+# Code-only boundary fixtures: input|canonical output (all <=48).
+Brave Otter 3141|brave-otter-3141
+---BRAVE___otter!!!3141---|brave-otter-3141
+brave@@@otter###3141|brave-otter-3141
+café otter 3141|caf-otter-3141
+İotter___brave-3141|i-otter-brave-3141
+🦦brave🦦otter🦦3141🦦|brave-otter-3141
+  brave   otter  3141  |brave-otter-3141
