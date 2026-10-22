@@ -51,7 +51,9 @@ impl Stopped {
         match self {
             Stopped::Asked => "",
             Stopped::Resumed => "; it was suspended (SIGSTOP), so it was resumed to let it exit",
-            Stopped::Killed => "; it did not exit within 10s of SIGTERM, so it was killed (SIGKILL)",
+            Stopped::Killed => {
+                "; it did not exit within 10s, so it was force-terminated"
+            }
         }
     }
 }
@@ -100,19 +102,23 @@ pub(crate) fn await_exit(pid: u32, exe: Option<&Path>) -> Result<Stopped> {
     if wait_gone(pid, exe, TERM_GRACE) {
         return Ok(politely);
     }
-    if let Err(e) = platform::escalate(pid, Escalate::Kill) {
-        if still_ours(pid, exe) {
-            bail!(
-                "the daemon (pid {pid}) did not exit within {}s of SIGTERM, and SIGKILL failed ({e}); it is still running. The pidfile is kept.",
-                TERM_GRACE.as_secs()
-            );
+    // Forced termination only if this is STILL the exact daemon we recorded:
+    // never kill a stranger that reused the pid.
+    if still_ours(pid, exe) {
+        if let Err(e) = platform::escalate(pid, Escalate::Kill) {
+            if still_ours(pid, exe) {
+                bail!(
+                    "the daemon (pid {pid}) did not exit within {}s, and force-termination failed ({e}); it is still running. The pidfile is kept.",
+                    TERM_GRACE.as_secs()
+                );
+            }
         }
     }
     if wait_gone(pid, exe, KILL_GRACE) {
         return Ok(Stopped::Killed);
     }
     bail!(
-        "the daemon (pid {pid}) is still running {}s after SIGKILL{}. The pidfile is kept so `tunlion status` still sees it.",
+        "the daemon (pid {pid}) is still running {}s after force-termination{}. The pidfile is kept so `tunlion status` still sees it.",
         KILL_GRACE.as_secs(),
         match platform::process_stopped(pid) {
             Some(true) => " (it is stopped by a debugger or tracer)",
@@ -127,12 +133,30 @@ pub(crate) fn await_exit(pid: u32, exe: Option<&Path>) -> Result<Stopped> {
 pub(crate) fn stop_requested() -> bool {
     let path = platform::daemon_stop_request_path();
     let Ok(raw) = std::fs::read_to_string(&path) else { return false };
-    let requested = raw.trim().parse::<u32>().ok();
-    if requested != Some(std::process::id()) {
+    let mut lines = raw.lines();
+    let requested = lines.next().and_then(|s| s.trim().parse::<u32>().ok());
+    let token = lines.next().map(|s| s.trim().to_string());
+    let my_pid = std::process::id();
+    if requested != Some(my_pid) {
+        // Another instance's request (or a malformed one) is not ours. Leave a
+        // foreign pid alone; a startup clear handles leftovers.
+        return false;
+    }
+    let mine = platform::process_start_token(my_pid);
+    if token.is_none() || token != mine {
+        // Same pid, different process incarnation: a recycled Windows pid.
+        // Refuse it and remove the stale request.
+        let _ = std::fs::remove_file(&path);
         return false;
     }
     let _ = std::fs::remove_file(&path);
     true
+}
+
+/// Remove a stop request left by a previous incarnation, before this daemon
+/// starts serving. Called once at startup.
+pub(crate) fn clear_stop_request() {
+    let _ = std::fs::remove_file(platform::daemon_stop_request_path());
 }
 
 fn marker_path() -> PathBuf {
@@ -290,7 +314,7 @@ mod tests {
     fn stop_notes_say_what_was_done() {
         assert_eq!(Stopped::Asked.note(), "");
         assert!(Stopped::Resumed.note().contains("resumed"));
-        assert!(Stopped::Killed.note().contains("SIGKILL"));
+        assert!(Stopped::Killed.note().contains("force-terminated"));
     }
 
     struct ConfigDir(Option<std::ffi::OsString>, PathBuf);
@@ -320,11 +344,18 @@ mod tests {
         let _restore = ConfigDir(previous, dir);
 
         let path = platform::daemon_stop_request_path();
-        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
-        assert!(stop_requested(), "our pid must be accepted");
+        let my_pid = std::process::id();
+        let token = platform::process_start_token(my_pid).unwrap_or_default();
+        std::fs::write(&path, format!("{my_pid}\n{token}\n")).unwrap();
+        assert!(stop_requested(), "our pid+incarnation must be accepted");
         assert!(!stop_requested(), "one request stops one daemon");
 
-        std::fs::write(&path, "424242\n").unwrap();
+        // Same PID, different process start token: a recycled Windows pid.
+        std::fs::write(&path, format!("{my_pid}\n{token}-other\n")).unwrap();
+        assert!(!stop_requested(), "a recycled pid must be refused");
+        assert!(!path.exists(), "the stale request is removed");
+
+        std::fs::write(&path, "424242\n1\n").unwrap();
         assert!(!stop_requested(), "another pid is not ours");
     }
 

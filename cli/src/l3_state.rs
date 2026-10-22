@@ -15,6 +15,17 @@ use std::path::PathBuf;
 
 use filament_peerloop::mesh::L3Status;
 
+/// How long a `ready` file record stays trustworthy without a refresh. The
+/// daemon rewrites it about once a second while its endpoint is live.
+const READY_MAX_AGE_SECS: u64 = 6;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// `{config_dir}/l3-state.json`.
 pub fn state_path() -> PathBuf {
     crate::settings::config_dir().join("l3-state.json")
@@ -28,6 +39,10 @@ pub fn write(status: &L3Status) {
         _ => return,
     };
     v.insert("pid".into(), json!(std::process::id()));
+    // A freshness stamp, so a daemon that stops refreshing (wedged, killed)
+    // cannot leave a `ready` record that readers still trust. The daemon loop
+    // rewrites this every ~1s while the endpoint is live.
+    v.insert("updatedAt".into(), json!(now_secs()));
     if let Err(e) =
         crate::platform::SecretFile::write_str(&state_path(), &Value::Object(v).to_string())
     {
@@ -71,8 +86,21 @@ pub fn read_file_for(daemon: Option<u32>) -> Value {
             |_| json!({"state":"down","mode":"none","reason":"no L3 endpoint reported"}),
         );
     }
+    let state = v["state"].as_str().unwrap_or("down");
+    if state == "ready" {
+        let fresh = v["updatedAt"]
+            .as_u64()
+            .is_some_and(|at| now_secs().saturating_sub(at) <= READY_MAX_AGE_SECS);
+        if !fresh {
+            return serde_json::to_value(L3Status::down(
+                "none",
+                "the daemon stopped refreshing its L3 state; the endpoint is not known to be live",
+            ))
+            .unwrap_or_else(|_| json!({"state":"down","mode":"none","reason":"stale L3 state"}));
+        }
+    }
     json!({
-        "state": v["state"].as_str().unwrap_or("down"),
+        "state": state,
         "mode": v["mode"].as_str().unwrap_or("none"),
         "reason": v.get("reason").cloned().unwrap_or(Value::Null),
     })
@@ -135,6 +163,36 @@ mod tests {
         let down = serde_json::to_value(L3Status::down("none", "boom")).unwrap();
         assert_eq!(down["reason"], "boom");
         assert!(not_ready_note(&down).unwrap().contains("boom"));
+    }
+
+    /// A matching PID never makes a stale `ready` record live. The daemon must
+    /// keep refreshing it; this is the regression for the reviewer's scenario.
+    #[test]
+    fn a_stale_ready_record_is_down_and_not_ready() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-l3-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let pid = std::process::id();
+        let stale = json!({
+            "pid": pid,
+            "state": "ready",
+            "mode": "userspace",
+            "updatedAt": 1,
+        });
+        std::fs::write(state_path(), stale.to_string()).unwrap();
+        let v = read_file_for(Some(pid));
+        assert_eq!(v["state"], "down", "stale ready must read as down: {v}");
+        assert!(v["reason"].as_str().unwrap().contains("stopped refreshing"));
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

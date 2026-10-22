@@ -1048,7 +1048,32 @@ pub fn process_start_token(pid: u32) -> Option<String> {
         let rest = &stat[stat.rfind(')')? + 1..];
         rest.split_whitespace().nth(19).map(str::to_string)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(windows)]
+    {
+        unsafe {
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+                fn GetProcessTimes(
+                    h: isize,
+                    creation: *mut u64,
+                    exit: *mut u64,
+                    kernel: *mut u64,
+                    user: *mut u64,
+                ) -> i32;
+                fn CloseHandle(h: isize) -> i32;
+            }
+            const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 {
+                return None;
+            }
+            let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+            let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+            CloseHandle(h);
+            (ok != 0).then(|| creation.to_string())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
     {
         let _ = pid;
         None
@@ -3519,7 +3544,10 @@ pub fn request_daemon_stop(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
         let path = daemon_stop_request_path();
-        SecretFile::write_str(&path, &format!("{pid}\n"))
+        let token = process_start_token(pid).ok_or_else(|| {
+            format!("cannot read the daemon's start time (pid {pid}); refusing an unsafe stop")
+        })?;
+        SecretFile::write_str(&path, &format!("{pid}\n{token}\n"))
             .map_err(|e| format!("could not write the stop request {}: {e}", path.display()))
     }
     #[cfg(not(any(unix, windows)))]
@@ -3546,17 +3574,31 @@ pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
 pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
     match how {
         Escalate::Continue => Ok(()),
-        Escalate::Kill => {
-            let st = crate::platform::command("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()?;
-            if st.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(format!("taskkill exited {st}")))
+        // Native forced termination, not a spawned `taskkill`. The caller checks
+        // that this PID is still the daemon it recorded before reaching here.
+        Escalate::Kill => unsafe {
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+                fn TerminateProcess(h: isize, code: u32) -> i32;
+                fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+                fn CloseHandle(h: isize) -> i32;
             }
+            const PROCESS_TERMINATE: u32 = 0x0001;
+            const SYNCHRONIZE: u32 = 0x0010_0000;
+            let h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid);
+            if h == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if TerminateProcess(h, 1) == 0 {
+                let e = std::io::Error::last_os_error();
+                CloseHandle(h);
+                return Err(e);
+            }
+            // Bounded wait so `await_exit` observes the exit promptly instead of
+            // spinning for its whole grace window.
+            WaitForSingleObject(h, 5000);
+            CloseHandle(h);
+            Ok(())
         }
     }
 }

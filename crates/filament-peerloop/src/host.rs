@@ -327,6 +327,9 @@ pub trait HostServices: Send + Sync + 'static {
     fn stop_requested(&self) -> bool {
         false
     }
+    /// Remove a stop request left by a previous daemon incarnation. Called once
+    /// at daemon startup, before it serves.
+    fn clear_stop_request(&self) {}
     /// The owner user key, when this machine holds one. A joined device holds
     /// no user signing key, so this is `None` there.
     fn user_key(&self) -> Option<UserKey> {

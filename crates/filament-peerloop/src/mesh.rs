@@ -223,7 +223,14 @@ pub trait MeshTunnel: Send + Sync + 'static {
     /// This node's v4 overlay address, when dual-stack is on.
     fn my_addr_v4(&self) -> Option<Ipv4Addr>;
     /// Is the endpoint the userspace netstack (no kernel TUN, no host firewall)?
-    fn is_userspace(&self) -> bool;
+    fn is_userspace(&self) -> bool;    /// Is the packet endpoint itself still alive? A run-time failure (the TUN
+    /// read loop ended, the netstack poll task died) must be able to downgrade
+    /// a previously published `ready`; the default is honest for hosts that
+    /// cannot tell.
+    fn l3_live(&self) -> bool {
+        true
+    }
+
     /// This node's identity addrs, when it has a signing identity.
     fn identity_addrs(&self) -> Option<(Ipv6Addr, Ipv4Addr)>;
     /// Record `name` -> overlay addresses for MagicDNS and refresh the host file.
