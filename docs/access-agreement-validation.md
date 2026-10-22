@@ -54,7 +54,8 @@ resolved only documentation table text; no folder or End behavior was dropped.
 
 ## Remote evidence
 
-Final source: see the lane handoff SHA. Full logs are under
+Integration code commit: `8ce36c95` (`feat(cli): integrate agreement-scoped
+temporary shell and PTY`). Full logs are under
 `/root/pairing-ux/evidence/access-shell-cli-20261022/`; remote job directories
 are under `/home/runner/work/_temp/tunlion-work/jobs/` with the names below.
 
@@ -68,6 +69,8 @@ are under `/home/runner/work/_temp/tunlion-work/jobs/` with the names below.
 | `access-shell-cli-regress-20261022i` | service End, service revisions, folder download, draft cancel | 4/4 pass |
 | `access-shell-cli-core-20261022j` | core shell/PTY/admit/account suites, reduced/default/Core checks, `shell_gate::tests`, print ratchet | 15 access, 7 access-session, 23 standing PTY, 15 admission, 2 account, 1 Core; all checks pass |
 | `access-shell-cli-features-20261022k` | CLI check without `pty-server`; CLI check without `exec-server`; `access_bootstrap`; spawn ratchet | pass |
+| `access-shell-cli-final-20261022m` | exact-tree rerun: unit suites, shell gate, Core/reduced checks, ratchets, 7 temporary real-transport cells | all pass |
+| `access-shell-cli-final-remove-20261022n` | exact-tree rerun of live shell removal | pass, 8.22s |
 
 The real cells use two isolated CLI processes on one Linux worker, the actual
 signaling/PAKE path, an authenticated scope review, and a real remote PTY. They
