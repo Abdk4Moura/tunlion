@@ -162,6 +162,7 @@ pub enum Inbound {
 /// previously inlined (the live session, our element, derived K, the sent-flags)
 /// so both `pair` and the transfer path drive it identically.
 pub struct Ceremony {
+    confirmed_fingerprints: Option<(String, String)>,
     temporary: Option<(TemporaryBinding, TemporaryRole)>,
     /// The agreed capability set (relayed in the confirm payload) and its
     /// canonical form (fed to the MAC).
@@ -260,6 +261,7 @@ impl Ceremony {
         let caps_canon = filament_pair::canonical_caps(&caps);
         let (state, msg) = filament_pair::start(password.as_bytes(), nameplate.as_bytes());
         Ceremony {
+            confirmed_fingerprints: None,
             temporary: None,
             caps,
             caps_canon,
@@ -290,6 +292,15 @@ impl Ceremony {
     pub fn temporary_binding(&self) -> Option<&TemporaryBinding> {
         self.temporary.as_ref().map(|(binding, _)| binding)
     }
+
+    /// Used by the embedding handoff to pin this completed ceremony to the
+    /// exact existing transport link. No caller-supplied trusted flag suffices.
+    pub fn confirmed_temporary_transport(&self, mine: &str, theirs: &str) -> bool {
+        self.temporary.is_some() && self.secret.is_some() && self.aborted.is_none() && self.sent_confirm
+            && self.confirmed_fingerprints.as_ref().is_some_and(|(a,b)|a==mine && b==theirs)
+    }
+
+    pub fn temporary_role(&self) -> Option<TemporaryRole> { self.temporary.as_ref().map(|(_,role)|*role) }
 
     fn decorate(&self, mut payload: Value) -> Value {
         if let Some((binding, role)) = &self.temporary {
@@ -382,6 +393,7 @@ impl Ceremony {
         self.msg = msg;
         self.k = None;
         self.secret = None;
+        self.confirmed_fingerprints = None;
         self.aborted = None;
         self.sent_msg = false;
         self.sent_confirm = false;
@@ -398,6 +410,7 @@ impl Ceremony {
         self.scope = scope;
         self.k = None;
         self.secret = None;
+        self.confirmed_fingerprints = None;
         self.aborted = None;
         self.sent_msg = false;
         self.sent_confirm = false;
@@ -568,6 +581,7 @@ impl Ceremony {
                     &recv_mac,
                 ) {
                     self.secret = Some(filament_pair::secret_from_k(&k));
+                    self.confirmed_fingerprints = Some((my_fp.to_string(), their_fp.to_string()));
                     Inbound::Consumed
                 } else {
                     self.aborted = Some("key confirmation failed".to_string());

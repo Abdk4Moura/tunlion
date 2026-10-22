@@ -59,6 +59,8 @@
 
 mod adoption;
 pub mod access;
+#[cfg(feature = "dispatch")]
+pub mod access_session;
 pub mod conn;
 pub mod consent;
 pub mod control;

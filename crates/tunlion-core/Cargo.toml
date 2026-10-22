@@ -25,6 +25,9 @@ cli = ["uniffi/cli", "uniffi/cargo-metadata"]
 # Desktop/full composition only. The Android reduced profile leaves this off so
 # mesh, overlay and fleet code are absent from the shipped graph.
 fleet = ["filament-peerloop/fleet", "filament-peerloop/mesh"]
+# Explicit embedding endpoint composition. The default reduced profile continues
+# to refuse service/folder activation instead of claiming unavailable backends.
+access-endpoints = ["filament-peerloop/forward-server", "filament-peerloop/mount-server"]
 
 [dependencies]
 filament-id = { path = "../filament-id", version = "0.1.2" }
