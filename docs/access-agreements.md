@@ -4,6 +4,15 @@ Implementation entry points: `filament_peerloop::access` and
 `filament_peerloop::send::ceremony`. This is a bounded library slice, not a claim
 that all CLI invitations, platform endpoints, or background operation are ready.
 
+**Validated library checkpoint:** exact-tree remote core08 at `8f8d66e5` passed
+Linux `serve_folder` / per-request mount admission and raw transport control-limit
+tests plus reduced/default/Core checks. The Windows folder-serving and
+owned-download slice is exact `e121b2ff`; it passed Windows `mount_proto`,
+`access` and `download_output` suites plus Linux host checks. Neither checkpoint
+proves FUSE/WinFsp mount activation, and only the folder/End side is claimed for
+Windows. The validated boundary and exact jobs are in
+[access-agreement-validation.md](access-agreement-validation.md).
+
 ## One engine, existing transport
 
 `AccessSpec` composes multiple absolute folder paths with explicit RO/RW modes,
@@ -47,19 +56,25 @@ accepted spec, not a peer-supplied hostname/port, selects the exact target.
 The Mux's actual `l2-open-ack` / `l2-close` is the activation result; returning
 from a serving task is not proof that an endpoint became available.
 
-On Linux with the `mount-server` feature, an accepted folder opens through
-`serve_folder` on the same authenticated Mux. The host pins its canonical root
-descriptor before `mount-open-ack`; renaming or substituting the offered path
-does not redirect a live share. The recipient may browse a listed directory,
-read a bounded raw-byte preview, and download one regular file. A download's
-local destination directory and filename are chosen by the recipient, never by
-the peer. The CLI writes private exclusive staging, requires exactly the
+On Linux and Windows with the `mount-server` feature, an accepted folder opens
+through `serve_folder` on the same authenticated Mux. Linux pins its canonical
+root descriptor; Windows pins the host-selected root through a retained `WinRoot`
+HANDLE, refuses a junction/symlink/reparse root, and serves every request relative
+to open directory HANDLEs. Renaming or substituting the offered path does not
+redirect a live share. The recipient may browse a listed directory, read a
+bounded raw-byte preview, and download one regular file. A download's local
+destination directory and filename are chosen by the recipient, never by the
+peer. On Linux the CLI writes private exclusive staging, requires exactly the
 declared byte count (and the negotiated read limit per request), links the open
 inode with no-clobber semantics only after the remote `Release` succeeds, and
-reports `DurabilityUnknown` when the final directory fsync fails. Cancellation,
-revocation or a short read leaves no destination name and removes private
-staging. This is a protocol endpoint, not an OS mount or `.mesh` DNS claim; the
-UI says so and adds no mount/route.
+reports `DurabilityUnknown` when the final directory fsync fails. On Windows the
+CLI creates staging relative to the pinned directory HANDLE and renames the open
+HANDLE with `replace_if_exists = 0`; publication is atomic on one volume, an
+existing name is never replaced, and `PublishedDownload::durable` is false when
+the best-effort directory flush is unavailable. Cancellation, revocation or a
+short read leaves no destination name and removes private staging. This is a
+protocol endpoint, not an OS mount or `.mesh` DNS claim; the UI says so and adds
+no mount/route.
 
 ## Lifecycle guarantees and limits
 
@@ -97,10 +112,11 @@ UI says so and adds no mount/route.
 | --- | --- |
 | Exact TCP service | Real existing L2 Mux / HostServices connector integration; `forward-server` feature and a working host connector required |
 | UDP service | Typed review only; operation returns `Unsupported` |
-| Folder browse/read/download | Linux `mount-server`: real authenticated `serve_folder`; recipient browse, byte-preserving preview and caller-destination no-clobber download. No OS mount or DNS |
-| Folder RO/RW protocol serving | Engine enforces the accepted mode via accepted canonical root, pinned directory descriptor and the existing confined filesystem protocol; other platforms return `Unsupported` |
+| Folder browse/read/download | Linux and Windows `mount-server`: real authenticated `serve_folder`; recipient browse, byte-preserving preview and caller-destination no-clobber download. No OS mount or DNS. Windows uses retained HANDLEs and does not claim directory-entry durability |
+| Folder RO/RW protocol serving | Linux and Windows `mount-server` profiles use the accepted canonical root and per-request agreement admission. Linux pins a directory descriptor; Windows pins the host-selected root with a retained HANDLE and serves every request relative to it (reparse points/junctions are refused, never joined from a path). Other platforms return `Unsupported` |
 | Shell (exec-class) | Unix only: accepted `spec.shell` + exact revision/peer is re-checked by the engine before the existing exec server spawns; the account is the CLI's existing nonroot login account via `StandardLocalExecProcess`, with no account switching, no daemon/SYSTEM fallback and no elevation. Windows returns `Unsupported` until a standard token backend exists |
 | PTY / interactive terminal | Unix only: accepted `spec.shell` + exact revision/peer admitted through the same engine check, then the existing `PtyBackend`/`PtySession` seam (interactive login argv, real terminal IO, resize, process teardown). One-shot: no resume/reattach. Windows returns `Unsupported`. SSH remains typed review only |
+| Recipient folder download / local mount | The CLI download action is integrated on `integration/access-shell-cli` and gated by real `download_output::OwnedDownload` support: Linux and Windows publish atomically without clobbering, Windows does not claim directory-entry durability. No successful local mount path is promised |
 | Device networking / subnet | Typed separately; no agreement-aware packet policy integration; unavailable |
 | Background/restart | Unavailable; no durable handoff acknowledgement |
 | Owned/delegated relationship creation | Unavailable; temporary engine does not manufacture ownership or delegated ceilings |
@@ -159,10 +175,12 @@ inline review and cancellation, and routes scoped opens through the shared
 engine. Its host composition is
 `ShellRuntime::new(CliExecProcess, log).with_pty(CliPty)`; `CliPty` uses the
 existing platform PTY implementation and never enters standing shell admission.
-The host basket and recipient terminal flow, plus the real remote PTY, resize,
-End, removal and expiry checks, are recorded in
+The host basket, recipient terminal flow and folder browse/read/download actions,
+plus the real remote PTY, resize, End, removal and expiry checks, are recorded in
 [access-agreement-validation.md](access-agreement-validation.md). That adapter is
-foreground-only: no daemon/background handoff or Windows support is claimed.
+foreground-only: no daemon/background handoff is claimed, and Windows shell/PTY
+support is not claimed. Windows folder protocol serving and caller-destination
+download come from the validated `e121b2ff` slice.
 
 Primary-device incoming-shell consent also needs an authoritative local role
 representation migration. Existing `DeviceCert`/principal kinds model owner,

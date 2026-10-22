@@ -2394,6 +2394,20 @@ impl InstallSource {
 mod tests {
     use super::*;
 
+    /// The UI must offer Download exactly where the pinned publisher exists.
+    /// Linux and Windows both do; a reduced build without `mount-server` or a
+    /// platform without a publisher must not advertise an action it cannot finish.
+    #[test]
+    fn folder_download_capability_matches_the_publisher_platforms() {
+        let expected = cfg!(feature = "mount-server")
+            && (cfg!(target_os = "linux") || cfg!(target_os = "windows"));
+        assert_eq!(super::folder_download_supported(), expected);
+        #[cfg(all(target_os = "windows", feature = "mount-server"))]
+        assert!(super::folder_download_supported(), "Windows must expose the validated download publisher");
+        #[cfg(all(target_os = "linux", feature = "mount-server"))]
+        assert!(super::folder_download_supported(), "Linux must expose the validated download publisher");
+    }
+
     // The record is in place before the child runs any of the program: the
     // child itself checks for what `record` wrote, so a record that landed
     // after the program started would fail the run. Repeated, because the
@@ -2978,10 +2992,12 @@ mod tests {
 }
 
 /// Whether this build can publish a downloaded folder file. Browse and preview
-/// are protocol-level everywhere; the pinned no-clobber publication primitive
-/// is Linux-only today, so the folder UI must not offer what cannot finish.
+/// are protocol-level everywhere; download publication needs the `mount-server`
+/// feature and a pinned no-clobber publisher. Linux and Windows both provide one
+/// (`download_output::OwnedDownload`); Windows publishes through a retained
+/// directory HANDLE and does not claim directory-entry durability.
 pub fn folder_download_supported() -> bool {
-    cfg!(all(target_os = "linux", feature = "mount-server"))
+    cfg!(all(any(target_os = "linux", target_os = "windows"), feature = "mount-server"))
 }
 
 /// Policy routing for exit nodes, kept behind the platform adapter so the rest

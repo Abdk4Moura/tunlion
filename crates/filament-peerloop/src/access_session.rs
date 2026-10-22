@@ -728,8 +728,13 @@ mod tests {
         let mut pipe=rh.open_folder(1,"docs".into()).await.unwrap();
         let mut client=MountClient::from_mux_v2_with_mode(pipe.transport.clone(),pipe.sid,pipe.stream.take().unwrap(),pipe.folder_caps.take().unwrap(),FolderMode::ReadOnly);
         let opened=client.call(MountOp::Open{path:path_encode(std::path::Path::new("file")),flags:libc::O_RDONLY}).await.unwrap();let MountResult::Ok(opened)=opened.result else{panic!("open failed")};let fh=opened["fh"].as_u64().unwrap();
-        let mut bytes=Vec::new();let cancel=Cancellation::default();loop{let read=client.read_binary(fh,bytes.len()as u64,32768,Duration::from_secs(2),&cancel).await.unwrap();if read.is_empty(){break;}bytes.extend_from_slice(&read);}assert_eq!(bytes,expected);
+        let destination=Fixture::new();let digest=ring::digest::digest(&ring::digest::SHA256,&expected);let digest:[u8;32]=digest.as_ref().try_into().unwrap();
+        let mut output=crate::download_output::OwnedDownload::create(&destination.0,"download",expected.len()as u64,100000,Some(digest)).await.unwrap();
+        let mut bytes=Vec::new();let cancel=Cancellation::default();loop{let read=client.read_binary(fh,bytes.len()as u64,32768,Duration::from_secs(2),&cancel).await.unwrap();if read.is_empty(){break;}output.write_chunk(&read,&cancel).await.unwrap();bytes.extend_from_slice(&read);}assert_eq!(bytes,expected);
+        let published=output.finish(&cancel).await.unwrap();assert_eq!(std::fs::read(published.path).unwrap(),expected);
+        let mut unpublished=crate::download_output::OwnedDownload::create(&destination.0,"revoked",expected.len()as u64,100000,None).await.unwrap();unpublished.write_chunk(&expected,&cancel).await.unwrap();
         hh.end().await.unwrap();let _=ht.await.unwrap();let _=rt.await.unwrap();assert!(client.read_binary(fh,0,1,Duration::from_secs(2),&cancel).await.is_err());
+        let revoked=Cancellation::default();revoked.cancel();assert!(matches!(unpublished.finish(&revoked).await,Err(crate::download_output::OutputError::Cancelled)));assert!(!destination.0.join("revoked").exists());
     }
 
     #[cfg(all(unix, feature="exec-server"))]

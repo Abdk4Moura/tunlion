@@ -475,4 +475,17 @@ mod protocol_tests {
         assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
         assert!(!destination.join("big.bin").exists());
     }
+
+    /// Windows-specific recipient contract: the validated publisher exists, so
+    /// the CLI advertises Download, and no peer-facing relative path can turn
+    /// into a drive, UNC or backslash path.
+    #[cfg(all(target_os = "windows", feature = "mount-server"))]
+    #[test]
+    fn windows_download_is_offered_and_peer_paths_cannot_become_local_paths() {
+        assert!(crate::platform::folder_download_supported());
+        for path in [r"C:\secret", r"\\server\share", r"sub\file.bin", "C:/secret", "file:stream"] {
+            assert!(relative_path(path).is_err(), "accepted Windows-looking path {path:?}");
+        }
+        assert!(relative_path("sub/file.bin").is_ok());
+    }
 }
