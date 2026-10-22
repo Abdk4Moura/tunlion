@@ -848,6 +848,118 @@ fn ending_while_a_revised_scope_is_being_reviewed_cancels_the_review_and_closes_
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint_without_fake_mounts() {
+    use sha2::Digest;
+    let Some(backend) = backend() else { return; };
+    let (mut host, exe) = fresh_term("temporary-folder-host");
+    let (mut recipient, _) = fresh_term("temporary-folder-recipient");
+    let host_dir = std::env::temp_dir().join(format!("tunlion-pty-temporary-folder-host-{}", std::process::id()));
+    let share = host_dir.join("share");
+    std::fs::create_dir(&share).unwrap();
+    let binary = (0..65549).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    std::fs::write(share.join("binary.bin"), &binary).unwrap();
+    std::fs::write(share.join("empty.bin"), []).unwrap();
+    std::fs::write(host_dir.join("outside.bin"), b"outside-secret-payload").unwrap();
+    std::os::unix::fs::symlink(host_dir.join("outside.bin"), share.join("evil-link")).unwrap();
+
+    host.send(&format!("\"{exe}\" --server {} add\r", backend.url));
+    assert!(host.wait_for("Temporary access", 30), "{}", tail(&host.text()));
+    host.send("\x1b[B\r");
+    assert!(host.wait_for("Folders (0)", 20), "{}", tail(&host.text()));
+    host.send("\r");
+    assert!(host.wait_for("Add folder", 20), "{}", tail(&host.text()));
+    host.send("\r");
+    assert!(host.wait_for("folder path:", 20), "{}", tail(&host.text()));
+    host.send("share\r");
+    assert!(host.wait_for("read-only", 20), "{}", tail(&host.text()));
+    let at = host.text().len();
+    host.send("\x1b[A\r");
+    assert!(host.wait_for_from(at, "Folders (1)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\x1b[B\r");
+    assert!(host.wait_for("SHARE THIS SCOPE?", 20), "{}", tail(&host.text()));
+    host.send("\r");
+    assert!(host.wait_for("on the other device:", 60), "{}", tail(&host.text()));
+    let screen = host.text();
+    let code = screen.split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'))
+        .find(|token| token.rsplit_once('-').is_some_and(|(words, number)| words.contains('-') && number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit())))
+        .unwrap().to_ascii_lowercase();
+    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(!recipient.text().contains("Folder endpoint ready"));
+    recipient.send("\r");
+    assert!(recipient.wait_for("FOLDERS · endpoint checked on use", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    let at = recipient.text().len();
+    recipient.send("\r");
+    assert!(recipient.wait_for_from(at, "FOLDER ACTION", 20), "{}", tail(&recipient.text()));
+    recipient.send("\r");
+    assert!(recipient.wait_for_from(at, "relative path", 20), "{}", tail(&recipient.text()));
+    recipient.send(".\r");
+    assert!(recipient.wait_for_from(at, "Folder entries (3)", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.text()[at..].contains("binary.bin"));
+    assert!(recipient.text()[at..].contains("empty.bin"));
+    assert!(recipient.text()[at..].contains("Folder endpoint ready · folder-0 · read-only"));
+
+    for (name, count, total, expected) in [
+        ("binary.bin", 4096, binary.len(), hex::encode(sha2::Sha256::digest(&binary[..4096]))),
+        ("empty.bin", 0, 0, hex::encode(sha2::Sha256::digest([]))),
+    ] {
+        let at = recipient.text().len();
+        recipient.send("\r");
+        assert!(recipient.wait_for_from(at, "FOLDER ACTION", 20), "{}", tail(&recipient.text()));
+        recipient.send("\x1b[B\r");
+        assert!(recipient.wait_for_from(at, "relative path", 20), "{}", tail(&recipient.text()));
+        recipient.send(&format!("{name}\r"));
+        assert!(recipient.wait_for_from(at, &format!("Read preview: {count} of {total} bytes · SHA-256 {expected}"), 30),
+            "byte-preserving read failed:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    }
+    let recipient_dir = std::env::temp_dir().join(format!("tunlion-pty-temporary-folder-recipient-{}", std::process::id()));
+    assert!(!recipient_dir.join("binary.bin").exists(), "preview fabricated a downloaded local file");
+    std::fs::write(recipient_dir.join("binary.bin"), b"preserve-existing-file").unwrap();
+    for (remote, saved, expected) in [("binary.bin", "binary.bin-1", binary.as_slice()), ("empty.bin", "empty.bin", &[][..])] {
+        let at = recipient.text().len();
+        recipient.send("\r");
+        assert!(recipient.wait_for_from(at, "FOLDER ACTION", 20), "{}", tail(&recipient.text()));
+        recipient.send("\x1b[B\x1b[B\r");
+        assert!(recipient.wait_for_from(at, "relative path", 20), "{}", tail(&recipient.text()));
+        recipient.send(&format!("{remote}\r"));
+        assert!(recipient.wait_for_from(at, "existing local destination directory", 20), "{}", tail(&recipient.text()));
+        recipient.send(".\r");
+        assert!(recipient.wait_for_from(at, "local filename", 20), "{}", tail(&recipient.text()));
+        assert!(!recipient.text()[at..].contains("Download complete"), "download reported complete before destination confirmation");
+        recipient.send("\r");
+        let published = recipient_dir.join(saved);
+        assert!(recipient.wait_for_from(at, &format!("Download complete: {}", published.display()), 30),
+            "owned publication failed:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+        assert_eq!(std::fs::read(&published).unwrap(), expected, "download lost or changed binary bytes");
+        assert!(recipient.text()[at..].contains(&hex::encode(sha2::Sha256::digest(expected))));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&published).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert_eq!(std::fs::read(recipient_dir.join("binary.bin")).unwrap(), b"preserve-existing-file", "download overwrote an existing destination");
+    assert!(!std::fs::read_dir(&recipient_dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".tunlion-download-")), "successful download left private staging");
+    let at = recipient.text().len();
+    recipient.send("\r");
+    assert!(recipient.wait_for_from(at, "FOLDER ACTION", 20), "{}", tail(&recipient.text()));
+    recipient.send("\x1b[B\r");
+    assert!(recipient.wait_for_from(at, "relative path", 20), "{}", tail(&recipient.text()));
+    recipient.send("evil-link\r");
+    assert!(recipient.wait_for_from(at, "Folder unavailable:", 30), "{}", tail(&recipient.text()));
+    assert!(!recipient.text().contains("outside-secret-payload"));
+    assert!(!recipient.text().contains("Mounted at"));
+    assert!(!recipient.text().contains("mount ready"));
+    let at = recipient.text().len();
+    assert!(host.wait_for("RUNNING ACCESS", 20));
+    host.send("\x1b[A\r");
+    assert!(recipient.wait_for_from(at, "Temporary access ended", 15), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(host.wait_for("peer acknowledged", 15), "{}", tail(&host.text()));
+    for dir in [&host_dir, &recipient_dir] {
+        for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] { assert!(!dir.join(file).exists(), "folder access wrote standing state: {file}"); }
+    }
+    eprintln!("REAL FOLDER DOWNLOAD PASS: authenticated RO browse, binary/empty reads and exact private no-clobber publication, symlink escape refused, acknowledged End; no mount claim");
+}
+
 /// A fresh scratch dir for one cell.
 #[cfg(unix)]
 fn scratch(label: &str) -> std::path::PathBuf {

@@ -26,7 +26,7 @@ impl Draft {
             bail!("that folder is already selected");
         }
         let mut spec = self.spec.clone();
-        spec.folders.push(FolderAccess { id: format!("folder-{}", self.next_id), path, mode: FolderMode::ReadOnly });
+        spec.folders.push(FolderAccess::canonical(format!("folder-{}", self.next_id), path, FolderMode::ReadOnly)?);
         spec.validate()?;
         self.spec = spec;
         self.next_id += 1;
@@ -81,7 +81,7 @@ pub(crate) fn review_offer(snapshot: &AgreementSnapshot, stop: &AtomicBool) -> R
     let draft = Draft { spec: snapshot.spec.clone(), next_id: 0 };
     for line in draft.review_with_lifetime(snapshot.lifetime)? { eprintln!("  {}", terminal_label(&line)); }
     if !snapshot.spec.folders.is_empty() {
-        eprintln!("  Folder Open/mount/Download: unavailable in this build.");
+        eprintln!("  Folder browse/read checks the host endpoint; download support is platform-specific. No OS mount or DNS is implied.");
     }
     if snapshot.spec.shell || snapshot.spec.device_network {
         bail!("this build cannot activate the offered shell/device networking scope");
@@ -142,7 +142,7 @@ pub(crate) fn spawn_host_controls(
     });
 }
 
-fn live_pick(title: &str, labels: &[String], stop: &AtomicBool) -> Result<Option<usize>> {
+pub(crate) fn live_pick(title: &str, labels: &[String], stop: &AtomicBool) -> Result<Option<usize>> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     crossterm::terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -177,7 +177,7 @@ fn live_pick(title: &str, labels: &[String], stop: &AtomicBool) -> Result<Option
     }
 }
 
-fn live_line(prompt: &str, stop: &AtomicBool) -> Result<Option<String>> {
+pub(crate) fn live_line(prompt: &str, stop: &AtomicBool) -> Result<Option<String>> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     crossterm::terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -372,7 +372,7 @@ fn edit_services(draft: &mut Draft) -> Result<()> {
 pub(crate) fn temporary_access() -> Result<AccessSpec> {
     let mut draft = Draft::default();
     eprintln!("  Temporary access · until ended · foreground only.");
-    eprintln!("  Folder endpoints are unavailable in this build; TCP services are supported.");
+    eprintln!("  TCP services and supported host folder browse/read · no OS mount or DNS setup.");
     loop {
         // Unsupported shell/network/expiry/background controls are not offered.
         match pick("TEMPORARY ACCESS", vec![format!("Folders ({})", draft.spec.folders.len()),

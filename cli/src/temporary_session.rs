@@ -33,6 +33,8 @@ pub(crate) struct Session {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     endpoints: Vec<Endpoint>,
     pending_opens: PendingOpens,
+    folder_controls: Option<crate::folder_access::Controls>,
+    folder_jobs: Vec<FolderJob>,
     controls: Option<mpsc::Receiver<AgreementSnapshot>>,
     stop_controls: Arc<AtomicBool>,
     review_cancel: Arc<AtomicBool>,
@@ -60,6 +62,7 @@ impl Session {
             engine: None, review: None, snapshot: None, sent_proof: false, mux: None,
             pending: Vec::new(), active: false, established: false, ended: false, proof_deadline: None, end_exchange: crate::access_end::Exchange::default(),
             tasks: Vec::new(), endpoints: Vec::new(), pending_opens: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())), controls: None,
+            folder_controls: None, folder_jobs: Vec::new(),
             stop_controls: Arc::new(AtomicBool::new(false)), review_cancel: Arc::new(AtomicBool::new(false)),
             review_thread: None, review_result: None }
     }
@@ -157,6 +160,25 @@ impl Session {
                 self.snapshot = Some(snapshot);
             }
         }
+        if self.active {
+            while let Some(request) = self.folder_controls.as_mut().and_then(|controls| controls.try_request()) {
+                let snapshot = self.snapshot.as_ref().ok_or_else(|| anyhow!("folder scope unavailable"))?;
+                if !snapshot.spec.folders.contains(&request.folder) || self.folder_jobs.len() >= 4 {
+                    let _ = request.reply.send(Err("folder scope is no longer available or operation capacity reached".into()));
+                    continue;
+                }
+                let (snapshot, mux, pending) = (snapshot.clone(), mux.clone(), self.pending_opens.clone());
+                let folder = request.folder.clone();
+                let cancel = filament_peerloop::driver::Cancellation::default();
+                let stopped = cancel.clone();
+                let task = tokio::spawn(async move {
+                    let result = read_folder(&snapshot, &request, mux, pending, &stopped).await.map_err(|error| error.to_string());
+                    let _ = request.reply.send(result);
+                });
+                self.folder_jobs.push(FolderJob { folder, cancel, task });
+            }
+        }
+        self.folder_jobs.retain(|job| !job.task.is_finished());
         self.tasks.retain(|task| !task.is_finished());
         Ok(false)
     }
@@ -164,7 +186,7 @@ impl Session {
     pub(crate) async fn control(&mut self, ceremony: &Ceremony, conn: &crate::conn::Conn, pid: &str, payload: Value) -> Result<()> {
         bound_control(&payload)?;
         let kind = payload["type"].as_str().unwrap_or("");
-        if !kind.starts_with("access-") && !matches!(kind, "l2-open-ack" | "l2-close") {
+        if !kind.starts_with("access-") && !matches!(kind, "l2-open-ack" | "l2-close" | "mount-open-ack" | "mount-cap-ack") {
             bail!("temporary access refused an unsupported control; no standing grant exists");
         }
         if ceremony.secret().is_none() {
@@ -213,6 +235,8 @@ impl Session {
                     Some(previous) => previous.review_revision(snapshot, signature, crate::identity::now_secs())?,
                     None => ceremony.review_temporary_offer(snapshot, signature, local, crate::identity::now_secs())?,
                 };
+                self.folder_controls = None;
+                self.folder_jobs.retain(|job| review.snapshot().spec.folders.contains(&job.folder));
                 self.endpoints.retain(|endpoint| review.snapshot().spec.services.contains(&endpoint.service));
                 // Pause only new local opens while the new signed scope is
                 // reviewed. Retained active streams survive a narrowing.
@@ -272,8 +296,8 @@ impl Session {
                 self.established = true;
                 eprintln!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime));
                 reconcile_services(&mut self.endpoints, snapshot, mux.clone(), self.pending_opens.clone()).await?;
-                for folder in &snapshot.spec.folders {
-                    eprintln!("  Folder {}: unavailable (scoped folder endpoint is not integrated).", crate::access_ui::terminal_label(&folder.id));
+                if !snapshot.spec.folders.is_empty() {
+                    self.folder_controls = Some(crate::folder_access::Controls::start(snapshot));
                 }
             }
             "access-open" if self.role == TemporaryRole::Host => {
@@ -292,20 +316,34 @@ impl Session {
                 let revision = payload["revision"].as_u64().ok_or_else(|| anyhow!("missing temporary revision"))?;
                 let resource = payload["resource"].as_str().filter(|id| id.len() <= 128)
                     .ok_or_else(|| anyhow!("invalid temporary resource ID"))?.to_string();
+                let folder = match payload["kind"].as_str() {
+                    None | Some("tcp") => false,
+                    Some("folder") => true,
+                    _ => bail!("unsupported temporary resource kind"),
+                };
                 let engine = self.engine.as_ref().unwrap().clone();
                 let peer = self.peer.ok_or_else(|| anyhow!("peer proof unavailable"))?;
                 self.tasks.push(tokio::spawn(async move {
-                    if let Err(error) = engine.serve_forward(&id, revision, peer, &resource, sid, mux.clone(), crate::identity::now_secs()).await {
+                    let result = if folder {
+                        engine.serve_folder(&id, revision, peer, &resource, sid, mux.clone(), crate::host_impl::cli_host()).await
+                    } else {
+                        engine.serve_forward(&id, revision, peer, &resource, sid, mux.clone(), crate::identity::now_secs()).await
+                    };
+                    if let Err(error) = result {
                         let _ = mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;
                     }
                 }));
             }
-            "l2-open-ack" => {
+            "l2-open-ack" | "mount-open-ack" => {
                 if self.role == TemporaryRole::Recipient {
                     if let (Some(snapshot), Some(sid)) = (self.snapshot.as_ref(), filament_peerloop::l2::wire_sid(&payload)) {
                         complete_open_ack(&mux, &self.pending_opens, snapshot, self.active, sid, &payload).await;
                     }
                 }
+            }
+            "mount-cap-ack" if self.role == TemporaryRole::Host => {
+                // Protocol acknowledgement only. The engine selected the exact
+                // root/mode and already owns the same-Mux serving task.
             }
             "l2-close" => {
                 if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) { mux.on_close(sid, payload["err"].as_str()).await; }
@@ -331,6 +369,8 @@ impl Session {
     pub(crate) async fn shutdown(&mut self) {
         self.stop_controls.store(true, Ordering::Release);
         self.stop_review();
+        self.folder_controls = None;
+        self.folder_jobs.clear();
         if let Some(engine) = &self.engine { let _ = engine.end(&self.binding.offer_id, crate::identity::now_secs()); }
         self.endpoints.clear();
         if let Some(mux) = &self.mux { mux.shutdown_all().await; }
@@ -385,6 +425,8 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.stop_controls.store(true, Ordering::Release);
         self.stop_review();
+        self.folder_controls = None;
+        self.folder_jobs.clear();
         let _ = crossterm::terminal::disable_raw_mode();
         if let Some(engine) = &self.engine { let _ = engine.end(&self.binding.offer_id, crate::identity::now_secs()); }
         for task in &self.tasks { task.abort(); }
@@ -426,8 +468,17 @@ struct Endpoint {
 }
 impl Drop for Endpoint { fn drop(&mut self) { self.task.abort(); } }
 
+struct FolderJob {
+    folder: filament_peerloop::access::FolderAccess,
+    cancel: filament_peerloop::driver::Cancellation,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for FolderJob { fn drop(&mut self) { self.cancel.cancel(); self.task.abort(); } }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenKind { Tcp, Folder }
 #[derive(Clone)]
-struct PendingOpen { generation: u64, revision: u64, resource: String }
+struct PendingOpen { generation: u64, revision: u64, resource: String, kind: OpenKind }
 type PendingOpens = Arc<tokio::sync::Mutex<BTreeMap<u32, PendingOpen>>>;
 
 // A timed-out/aborted open cannot leave its waiter or SID available for a late
@@ -440,7 +491,10 @@ impl Drop for OpenRegistration {
             let mut entries = pending.lock().await;
             if entries.get(&sid).is_some_and(|entry| entry.generation == generation) { entries.remove(&sid); }
             drop(entries);
-            mux.drop_stream_if(sid, generation).await;
+            if mux.stream_generation(sid).await == Some(generation) {
+                mux.drop_stream_if(sid, generation).await;
+                let _ = mux.transport().send_control(&json!({"type":"l2-close","sid":sid})).await;
+            }
         });
     }
 }
@@ -451,13 +505,48 @@ async fn complete_open_ack(mux: &Arc<Mux>, pending: &PendingOpens, snapshot: &Ag
         || !filament_peerloop::l2::is_l2_sid(sid) { return false; }
     let mut entries = pending.lock().await;
     let Some(open) = entries.get(&sid) else { return false; };
-    if open.revision != snapshot.revision || !snapshot.spec.services.iter().any(|service| service.id == open.resource)
+    let in_scope = match open.kind {
+        OpenKind::Tcp => payload["type"].as_str() == Some("l2-open-ack") && snapshot.spec.services.iter().any(|service| service.id == open.resource),
+        OpenKind::Folder => payload["type"].as_str() == Some("mount-open-ack") && snapshot.spec.folders.iter().any(|folder| folder.id == open.resource),
+    };
+    if open.revision != snapshot.revision || !in_scope
         || mux.stream_generation(sid).await != Some(open.generation) { return false; }
     entries.remove(&sid);
     let Some(waiter) = mux.take_open_ack(sid).await else { return false; };
     // Unlike warm-forward probing, this path waits on an explicit oneshot, not
     // a pipe liveness marker. No marker or duplicate ack reaches user TCP data.
     waiter.send(OpenOutcome::Opened(payload.clone())).is_ok()
+}
+
+async fn read_folder(snapshot: &AgreementSnapshot, request: &crate::folder_access::Request,
+    mux: Arc<Mux>, pending: PendingOpens, cancel: &filament_peerloop::driver::Cancellation) -> Result<crate::folder_access::Output> {
+    let operation = async {
+        let sid = mux.alloc_sid();
+        let (pipe, generation) = mux.register_access_stream(sid).await.ok_or_else(|| anyhow!("folder stream capacity reached"))?;
+        let _registration = OpenRegistration { mux: mux.clone(), pending: pending.clone(), sid, generation };
+        pending.lock().await.insert(sid, PendingOpen { generation, revision: snapshot.revision, resource: request.folder.id.clone(), kind: OpenKind::Folder });
+        let ack = mux.arm_open_ack(sid).await;
+        mux.transport().send_control(&json!({"type":"access-open","v":1,"id":snapshot.id,
+            "revision":snapshot.revision,"resource":request.folder.id,"kind":"folder","sid":sid})).await?;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), ack).await
+            .map_err(|_| anyhow!("folder endpoint activation timed out"))?.map_err(|_| anyhow!("folder activation channel closed"))?;
+        let frame = match outcome {
+            OpenOutcome::Opened(frame) => frame,
+            OpenOutcome::Refused(reason) => bail!("folder endpoint refused: {}", crate::access_ui::terminal_label(&reason)),
+            OpenOutcome::ClosedWithoutAck => bail!("folder endpoint closed without activation"),
+        };
+        let caps = filament_peerloop::mount_proto::parse_mount_caps(frame["caps"].clone())?;
+        if caps.protocol_version < 2 || caps.max_read_size == 0 { bail!("folder byte-preserving read is unavailable on this endpoint"); }
+        let read_limit = caps.max_read_size.min(filament_peerloop::mount_proto::DEFAULT_MOUNT_MAX_SIZE);
+        mux.transport().send_control(&json!({"type":"mount-cap-ack","sid":sid,"binary_frames":true})).await?;
+        let mut client = filament_peerloop::mount_proto::MountClient::from_mux_v2_with_mode(
+            mux.transport(), sid, pipe, caps, request.folder.mode.clone());
+        crate::folder_access::perform(&mut client, request, cancel, read_limit).await
+    };
+    match cancel.run(operation).await {
+        filament_peerloop::driver::DriverOutcome::Returned(result) => result,
+        filament_peerloop::driver::DriverOutcome::Cancelled => bail!("folder operation cancelled; no local file was published"),
+    }
 }
 
 async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementSnapshot, mux: Arc<Mux>, pending: PendingOpens) -> Result<()> {
@@ -493,7 +582,7 @@ async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementS
                             let sid = mux.alloc_sid();
                             let Some((pipe, generation)) = mux.register_access_stream(sid).await else { return; };
                             let _registration = OpenRegistration { mux: mux.clone(), pending: pending.clone(), sid, generation };
-                            pending.lock().await.insert(sid, PendingOpen { generation, revision, resource: resource.clone() });
+                            pending.lock().await.insert(sid, PendingOpen { generation, revision, resource: resource.clone(), kind: OpenKind::Tcp });
                             let ack = mux.arm_open_ack(sid).await;
                             if mux.transport().send_control(&json!({"type":"access-open","v":1,"id":id,"revision":revision,"resource":resource,"sid":sid})).await.is_err() {
                                 mux.drop_stream(sid).await;
@@ -592,7 +681,7 @@ mod tests {
         let sid = mux.alloc_sid();
         let (mut pipe, generation) = mux.register_access_stream(sid).await.unwrap();
         let ack = mux.arm_open_ack(sid).await;
-        pending.lock().await.insert(sid, PendingOpen { generation, revision: 1, resource: "service-0".into() });
+        pending.lock().await.insert(sid, PendingOpen { generation, revision: 1, resource: "service-0".into(), kind: OpenKind::Tcp });
         let payload = json!({"type":"l2-open-ack","sid":sid});
         assert!(!complete_open_ack(&mux, &pending, &snapshot, false, sid, &payload).await, "inactive agreement acknowledged");
         assert!(complete_open_ack(&mux, &pending, &snapshot, true, sid, &payload).await);
@@ -608,7 +697,7 @@ mod tests {
         let sid = mux.alloc_sid();
         let (_pipe, generation) = mux.register_access_stream(sid).await.unwrap();
         let ack = mux.arm_open_ack(sid).await;
-        pending.lock().await.insert(sid, PendingOpen { generation, revision: 1, resource: "service-0".into() });
+        pending.lock().await.insert(sid, PendingOpen { generation, revision: 1, resource: "service-0".into(), kind: OpenKind::Tcp });
         mux.on_close(sid, Some("target refused")).await;
         assert!(matches!(ack.await.unwrap(), OpenOutcome::Refused(reason) if reason == "target refused"));
         let payload = json!({"type":"l2-open-ack","sid":sid});
