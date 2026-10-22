@@ -19,6 +19,7 @@
 //! `fleet` feature. See `docs/engine-driver.md` and `docs/android-ffi.md`.
 
 mod host;
+pub mod access;
 
 uniffi::setup_scaffolding!();
 
@@ -431,6 +432,7 @@ fn map_send_failure(failure: SendFailure) -> CoreError {
 /// A core opened on one config directory. The directory is the app's private
 /// files dir on Android. This type does not read `TUNLION_CONFIG_DIR`.
 pub struct Core {
+    access_observer: Mutex<Option<filament_peerloop::access_session::AccessObserver>>,
     dir: PathBuf,
     /// The same-root `up.lock` election this Core holds while an engine is
     /// running. `None` before the first start and after a joined stop.
@@ -667,6 +669,7 @@ impl Core {
         fs::create_dir_all(&dir).map_err(io_err)?;
         set_private_dir(&dir)?;
         Ok(Core {
+            access_observer: Mutex::new(None),
             dir,
             lease: Mutex::new(None),
             engine: Mutex::new(EngineSlot::None),
