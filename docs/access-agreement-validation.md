@@ -139,33 +139,34 @@ the same cancellation, and a `ShellCleanup` guard releases both stream ids if th
 embedding future is aborted. PTY/interactive `tty:true` remains refused by the
 existing exec server, and Windows remains `Unsupported`.
 
-Refs (no merge/deploy): the final exact commit is reported in the lane handoff.
-The pre-final source checkpoints ran on the reusable Linux worker
-(`ci-worker-dovm`, shared `build.lock`) as jobs
-`core-access-shell-20261022-02` and `core-access-shell-20261022-03`; job 03
-tested the source that produced this section and exited 0:
+Refs (no merge/deploy): exact validated source commit
+`7af5516abf1ca8bc07f766d69cc601a0ee21984f`. The reusable Linux worker
+(`ci-worker-dovm`, shared `build.lock`) ran jobs
+`core-access-shell-20261022-02`, `-03` and the exact-tree `-04`, all exit 0:
 
 ```sh
 cargo test -p filament-peerloop --lib access::tests -- --test-threads=2
 cargo test -p filament-peerloop --lib access_session::tests -- --test-threads=2
+cargo test -p tunlion-core --lib access::tests -- --test-threads=2
 cargo check -p filament-peerloop --no-default-features --features dispatch
 cargo check -p filament-peerloop --lib
 cargo check -p tunlion-core --lib
 ```
 
-Results: **14 access tests** (including new
-`shell_scope_is_the_accepted_revision_and_peer_not_a_caller_flag` and
-`shell_endpoint::shell_serving_checks_the_agreement_before_it_resolves_or_spawns`)
-and **6 access-session tests** (including
-`shell_contract::shell_open_uses_the_accepted_agreement_standard_account_and_end_tears_down`)
-passed; reduced dispatch, default peerloop library and tunlion-core library
-checks passed. The shell fixture ran as the worker's real nonroot account and
-inspected the exact spawn argv/env (`hello world` kept as one argument, `SECRET`
-filtered, no account-switch call).
+Results on `7af5516a`: **14 access tests**, **6 access-session tests** and
+**1 tunlion-core access test** passed; reduced dispatch, default peerloop
+library and tunlion-core library checks passed. The new tests include
+`shell_scope_is_the_accepted_revision_and_peer_not_a_caller_flag`,
+`shell_endpoint::shell_serving_checks_the_agreement_before_it_resolves_or_spawns`,
+and
+`shell_contract::shell_open_uses_the_accepted_agreement_standard_account_and_end_tears_down`.
+The shell fixture ran as the worker's real nonroot account and inspected the
+exact spawn argv/env (`hello world` kept as one argument, `SECRET` filtered, no
+account-switch call).
 
 Local durable log:
-`/root/pairing-ux/evidence/access-checkpoint-20261022/core-shell-03.log`.
-Remote job directory: `/home/runner/work/_temp/tunlion-work/jobs/core-access-shell-20261022-03`.
+`/root/pairing-ux/evidence/access-checkpoint-20261022/core-shell-04.log`.
+Remote job directory: `/home/runner/work/_temp/tunlion-work/jobs/core-access-shell-20261022-04`.
 No local build/test/formatter was run.
 
 Remaining gaps: PTY/interactive shell (agreement admission around the existing
