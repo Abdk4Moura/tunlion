@@ -516,8 +516,10 @@ impl AgreementEngine {
 
     /// Serve one agreement-scoped shell-class exec over the EXISTING L2 Mux and
     /// the existing `exec_server` state machine. The accepted `spec.shell` is
-    /// the only grant: there is no standing shell gate bypass, no primary-role
-    /// store and no per-caller acceptance boolean.
+    /// the agreement authority. Ordinary shell admission (the standing
+    /// grant/ceiling gate and the PTY/SSH paths) is not replaced or relaxed:
+    /// this endpoint is reachable only from the temporary agreement dispatch,
+    /// and there is no primary-role store or per-caller acceptance boolean.
     ///
     /// Unix only. The process mechanism is wrapped in
     /// [`crate::shell::standard_account::StandardLocalExecProcess`] before any
