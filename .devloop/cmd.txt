@@ -1,1 +1,1 @@
-cargo test -p tunlion-core --lib --locked && cargo test -p filament-peerloop --lib --locked && cargo check -p tunlion-core --all-targets --locked
+cargo test -p filament-peerloop --lib mount_proto::tests -- --test-threads=2 && cargo test -p filament-peerloop --lib access::tests -- --test-threads=2 && cargo test -p filament-peerloop --lib download_output::tests -- --test-threads=2
