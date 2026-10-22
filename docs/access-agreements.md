@@ -4,6 +4,12 @@ Implementation entry points: `filament_peerloop::access` and
 `filament_peerloop::send::ceremony`. This is a bounded library slice, not a claim
 that all CLI invitations, platform endpoints, or background operation are ready.
 
+**Paused checkpoint:** subsequent `serve_folder` / per-request mount admission
+and raw transport control-limit edits are source-only and unvalidated. Do not
+enable folder capability from these commits until remote compile/tests pass.
+The validated boundary and exact jobs are in
+[access-agreement-validation.md](access-agreement-validation.md).
+
 ## One engine, existing transport
 
 `AccessSpec` composes multiple absolute folder paths with explicit RO/RW modes,
