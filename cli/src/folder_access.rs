@@ -24,13 +24,21 @@ pub(crate) struct Request {
     pub(crate) reply: std::sync::mpsc::SyncSender<std::result::Result<Output, String>>,
 }
 
+/// One recipient-side request from the blocking terminal menu. Folder work is
+/// bounded reads over the scoped endpoint; a terminal request hands stdin to
+/// the async PTY bridge and does not read the keyboard itself while it runs.
+pub(crate) enum Control {
+    Folder(Request),
+    Terminal { reply: std::sync::mpsc::SyncSender<std::result::Result<(), String>> },
+}
+
 pub(crate) struct Controls {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    requests: tokio::sync::mpsc::Receiver<Request>,
+    requests: tokio::sync::mpsc::Receiver<Control>,
 }
 impl Controls {
-    pub(crate) fn start(snapshot: &AgreementSnapshot) -> Self {
+    pub(crate) fn start(snapshot: &AgreementSnapshot, shell: bool) -> Self {
         let folders = snapshot.spec.folders.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
@@ -40,9 +48,29 @@ impl Controls {
                 while !stopped.load(Ordering::Acquire) {
                     let mut labels = folders.iter().map(|folder| format!("{} · {}", folder.id,
                         if folder.mode == filament_peerloop::access::FolderMode::ReadOnly { "read-only" } else { "read/write" })).collect::<Vec<_>>();
-                    labels.push("Close folder browser".into());
-                    let Some(selected) = crate::access_ui::live_pick("FOLDERS · endpoint checked on use", &labels, &stopped)? else { break; };
-                    let Some(folder) = folders.get(selected) else { break; };
+                    let shell_row = if shell {
+                        labels.push("Open shared terminal".into());
+                        Some(labels.len() - 1)
+                    } else { None };
+                    labels.push("Close browser".into());
+                    let prompt = if folders.is_empty() && shell { "SHELL · shared terminal" } else { "FOLDERS · endpoint checked on use" };
+                    let Some(selected) = crate::access_ui::live_pick(prompt, &labels, &stopped)? else { return Ok(()); };
+                    if shell_row == Some(selected) {
+                        let (reply, response) = std::sync::mpsc::sync_channel(1);
+                        if tx.blocking_send(Control::Terminal { reply }).is_err() { return Ok(()); }
+                        loop {
+                            if stopped.load(Ordering::Acquire) { return Ok(()); }
+                            match response.recv_timeout(Duration::from_millis(100)) {
+                                Ok(Ok(())) => break,
+                                Ok(Err(error)) => { ui::say(&format!("  Shared terminal unavailable: {}", crate::access_ui::terminal_label(&error))); break; }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+                                Err(_) => return Ok(()),
+                            }
+                        }
+                        continue;
+                    }
+                    if selected >= labels.len() - 1 { return Ok(()); } // Close browser.
+                    let Some(folder) = folders.get(selected) else { return Ok(()); };
                     let mut actions = vec!["Browse folder".into(), "Read file preview".into()];
                     if crate::platform::folder_download_supported() {
                         actions.push("Download file (up to 1 GiB)".into());
@@ -69,7 +97,7 @@ impl Controls {
                         }
                     };
                     let (reply, response) = std::sync::mpsc::sync_channel(1);
-                    if tx.blocking_send(Request { folder: folder.clone(), relative, operation, reply }).is_err() { break; }
+                    if tx.blocking_send(Control::Folder(Request { folder: folder.clone(), relative, operation, reply })).is_err() { break; }
                     loop {
                         if stopped.load(Ordering::Acquire) { return Ok(()); }
                         match response.recv_timeout(Duration::from_millis(100)) {
@@ -82,11 +110,11 @@ impl Controls {
                 }
                 Ok(())
             })();
-            if let Err(error) = result { ui::critical(&format!("  Folder browser unavailable: {}", crate::access_ui::terminal_label(&error.to_string()))); }
+            if let Err(error) = result { ui::critical(&format!("  Folder/terminal controls unavailable: {}", crate::access_ui::terminal_label(&error.to_string()))); }
         });
         Self { stop, thread: Some(thread), requests }
     }
-    pub(crate) fn try_request(&mut self) -> Option<Request> { self.requests.try_recv().ok() }
+    pub(crate) fn try_request(&mut self) -> Option<Control> { self.requests.try_recv().ok() }
 }
 impl Drop for Controls {
     fn drop(&mut self) {

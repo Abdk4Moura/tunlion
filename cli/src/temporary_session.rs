@@ -35,6 +35,11 @@ pub(crate) struct Session {
     pending_opens: PendingOpens,
     folder_controls: Option<crate::folder_access::Controls>,
     folder_jobs: Vec<FolderJob>,
+    terminal: Option<crate::terminal_access::TerminalJob>,
+    /// The host's existing process/PTY primitives, composed once for this
+    /// temporary session. `None` means this build/platform cannot serve a
+    /// shell, and the endpoint refuses instead of advertising it.
+    shell: Option<filament_peerloop::access_session::ShellRuntime>,
     controls: Option<mpsc::Receiver<AgreementSnapshot>>,
     stop_controls: Arc<AtomicBool>,
     review_cancel: Arc<AtomicBool>,
@@ -52,6 +57,7 @@ impl Session {
         session.host_spec = Some(spec);
         session.claim_expires = claim_expires;
         session.engine = Some(Arc::new(AgreementEngine::new(local, crate::devices_load().into_iter().map(|(name, _)| name))));
+        session.shell = shell_runtime();
         Ok(session)
     }
 
@@ -62,7 +68,7 @@ impl Session {
             engine: None, review: None, snapshot: None, sent_proof: false, mux: None,
             pending: Vec::new(), active: false, established: false, ended: false, proof_deadline: None, end_exchange: crate::access_end::Exchange::default(),
             tasks: Vec::new(), endpoints: Vec::new(), pending_opens: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())), controls: None,
-            folder_controls: None, folder_jobs: Vec::new(),
+            folder_controls: None, folder_jobs: Vec::new(), terminal: None, shell: None,
             stop_controls: Arc::new(AtomicBool::new(false)), review_cancel: Arc::new(AtomicBool::new(false)),
             review_thread: None, review_result: None }
     }
@@ -74,7 +80,8 @@ impl Session {
     pub(crate) fn is_active(&self) -> bool { self.established && !self.ended }
 
     pub(crate) fn poll_interval(&self) -> std::time::Duration {
-        if self.end_exchange.is_ending() { std::time::Duration::from_millis(100) }
+        if self.terminal.is_some() { crate::terminal_access::POLL_ACTIVE }
+        else if self.end_exchange.is_ending() { std::time::Duration::from_millis(100) }
         else { std::time::Duration::from_secs(2) }
     }
 
@@ -161,22 +168,40 @@ impl Session {
             }
         }
         if self.active {
-            while let Some(request) = self.folder_controls.as_mut().and_then(|controls| controls.try_request()) {
-                let snapshot = self.snapshot.as_ref().ok_or_else(|| anyhow!("folder scope unavailable"))?;
-                if !snapshot.spec.folders.contains(&request.folder) || self.folder_jobs.len() >= 4 {
-                    let _ = request.reply.send(Err("folder scope is no longer available or operation capacity reached".into()));
-                    continue;
+            while let Some(control) = self.folder_controls.as_mut().and_then(|controls| controls.try_request()) {
+                match control {
+                    crate::folder_access::Control::Folder(request) => {
+                        let snapshot = self.snapshot.as_ref().ok_or_else(|| anyhow!("folder scope unavailable"))?;
+                        if !snapshot.spec.folders.contains(&request.folder) || self.folder_jobs.len() >= 4 {
+                            let _ = request.reply.send(Err("folder scope is no longer available or operation capacity reached".into()));
+                            continue;
+                        }
+                        let (snapshot, mux, pending) = (snapshot.clone(), mux.clone(), self.pending_opens.clone());
+                        let folder = request.folder.clone();
+                        let cancel = filament_peerloop::driver::Cancellation::default();
+                        let stopped = cancel.clone();
+                        let task = tokio::spawn(async move {
+                            let result = read_folder(&snapshot, &request, mux, pending, &stopped).await.map_err(|error| error.to_string());
+                            let _ = request.reply.send(result);
+                        });
+                        self.folder_jobs.push(FolderJob { folder, cancel, task });
+                    }
+                    crate::folder_access::Control::Terminal { reply } => {
+                        if self.terminal.is_some() {
+                            let _ = reply.send(Err("a shared terminal is already open".into()));
+                            continue;
+                        }
+                        let snapshot = self.snapshot.clone().ok_or_else(|| anyhow!("terminal scope unavailable"))?;
+                        match crate::terminal_access::TerminalJob::begin(mux.clone(), &snapshot).await {
+                            Ok(mut job) => { job.set_reply(reply); self.terminal = Some(job); },
+                            Err(error) => { let _ = reply.send(Err(error.to_string())); },
+                        }
+                    }
                 }
-                let (snapshot, mux, pending) = (snapshot.clone(), mux.clone(), self.pending_opens.clone());
-                let folder = request.folder.clone();
-                let cancel = filament_peerloop::driver::Cancellation::default();
-                let stopped = cancel.clone();
-                let task = tokio::spawn(async move {
-                    let result = read_folder(&snapshot, &request, mux, pending, &stopped).await.map_err(|error| error.to_string());
-                    let _ = request.reply.send(result);
-                });
-                self.folder_jobs.push(FolderJob { folder, cancel, task });
             }
+        }
+        if let Some(job) = self.terminal.as_mut() {
+            if job.poll().await.is_some() { self.terminal = None; }
         }
         self.folder_jobs.retain(|job| !job.task.is_finished());
         self.tasks.retain(|task| !task.is_finished());
@@ -236,6 +261,7 @@ impl Session {
                     None => ceremony.review_temporary_offer(snapshot, signature, local, crate::identity::now_secs())?,
                 };
                 self.folder_controls = None;
+                if !review.snapshot().spec.shell { self.terminal = None; }
                 self.folder_jobs.retain(|job| review.snapshot().spec.folders.contains(&job.folder));
                 self.endpoints.retain(|endpoint| review.snapshot().spec.services.contains(&endpoint.service));
                 // Pause only new local opens while the new signed scope is
@@ -296,8 +322,9 @@ impl Session {
                 self.established = true;
                 crate::ui::say(&format!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime)));
                 reconcile_services(&mut self.endpoints, snapshot, mux.clone(), self.pending_opens.clone()).await?;
-                if !snapshot.spec.folders.is_empty() {
-                    self.folder_controls = Some(crate::folder_access::Controls::start(snapshot));
+                let shell = snapshot.spec.shell;
+                if !snapshot.spec.folders.is_empty() || shell {
+                    self.folder_controls = Some(crate::folder_access::Controls::start(snapshot, shell));
                 }
             }
             "access-open" if self.role == TemporaryRole::Host => {
@@ -314,25 +341,76 @@ impl Session {
                 let id = payload["id"].as_str().filter(|id| *id == self.binding.offer_id)
                     .ok_or_else(|| anyhow!("wrong temporary agreement"))?.to_string();
                 let revision = payload["revision"].as_u64().ok_or_else(|| anyhow!("missing temporary revision"))?;
-                let resource = payload["resource"].as_str().filter(|id| id.len() <= 128)
-                    .ok_or_else(|| anyhow!("invalid temporary resource ID"))?.to_string();
-                let folder = match payload["kind"].as_str() {
-                    None | Some("tcp") => false,
-                    Some("folder") => true,
-                    _ => bail!("unsupported temporary resource kind"),
-                };
                 let engine = self.engine.as_ref().unwrap().clone();
                 let peer = self.peer.ok_or_else(|| anyhow!("peer proof unavailable"))?;
-                self.tasks.push(tokio::spawn(async move {
-                    let result = if folder {
-                        engine.serve_folder(&id, revision, peer, &resource, sid, mux.clone(), crate::host_impl::cli_host()).await
-                    } else {
-                        engine.serve_forward(&id, revision, peer, &resource, sid, mux.clone(), crate::identity::now_secs()).await
-                    };
-                    if let Err(error) = result {
-                        let _ = mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;
+                match payload["kind"].as_str().unwrap_or("tcp") {
+                    "pty" => {
+                        if payload["resume"].as_bool().unwrap_or(false) || payload["resume_from"].is_u64() {
+                            mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"temporary pty does not support resume"})).await?;
+                            return Ok(());
+                        }
+                        let Some(runtime) = self.shell.clone() else {
+                            mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"pty is not available in this build"})).await?;
+                            return Ok(());
+                        };
+                        let Some(backend) = runtime.pty.clone() else {
+                            mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"pty is not available in this build"})).await?;
+                            return Ok(());
+                        };
+                        let request = filament_peerloop::shell::admit::parse_pty_open_fields(&payload);
+                        self.tasks.push(tokio::spawn(async move {
+                            let result = engine.serve_pty(&id, revision, peer, sid, request,
+                                mux.clone(), crate::host_impl::cli_host(), backend).await;
+                            if let Err(error) = result {
+                                let _ = mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;
+                            }
+                        }));
                     }
-                }));
+                    "shell" => {
+                        #[cfg(feature = "exec-server")]
+                        {
+                            let Some(runtime) = self.shell.clone() else {
+                                mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"exec shell is not available in this build"})).await?;
+                                return Ok(());
+                            };
+                            let Some(process) = runtime.process.clone() else {
+                                mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"exec shell is not available in this build"})).await?;
+                                return Ok(());
+                            };
+                            let request = filament_peerloop::shell::exec::parse_exec_open(&payload)
+                                .ok_or_else(|| anyhow!("invalid temporary shell request"))?;
+                            self.tasks.push(tokio::spawn(async move {
+                                let result = engine.serve_shell(&id, revision, peer, sid, request,
+                                    mux.clone(), crate::host_impl::cli_host(), process, runtime.log).await;
+                                if let Err(error) = result {
+                                    let _ = mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;
+                                }
+                            }));
+                        }
+                        #[cfg(not(feature = "exec-server"))]
+                        {
+                            mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"exec shell is not available in this build"})).await?;
+                        }
+                    }
+                    kind @ ("tcp" | "folder") => {
+                        let resource = payload["resource"].as_str().filter(|id| id.len() <= 128)
+                            .ok_or_else(|| anyhow!("invalid temporary resource ID"))?.to_string();
+                        let folder = kind == "folder";
+                        self.tasks.push(tokio::spawn(async move {
+                            let result = if folder {
+                                engine.serve_folder(&id, revision, peer, &resource, sid, mux.clone(), crate::host_impl::cli_host()).await
+                            } else {
+                                engine.serve_forward(&id, revision, peer, &resource, sid, mux.clone(), crate::identity::now_secs()).await
+                            };
+                            if let Err(error) = result {
+                                let _ = mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;
+                            }
+                        }));
+                    }
+                    _ => {
+                        mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"unsupported temporary resource kind"})).await?;
+                    }
+                }
             }
             "l2-open-ack" | "mount-open-ack" => {
                 if self.role == TemporaryRole::Recipient {
@@ -344,6 +422,42 @@ impl Session {
             "mount-cap-ack" if self.role == TemporaryRole::Host => {
                 // Protocol acknowledgement only. The engine selected the exact
                 // root/mode and already owns the same-Mux serving task.
+            }
+            "pty-open-ack" if self.role == TemporaryRole::Recipient => {
+                if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) {
+                    if self.terminal.as_ref().is_some_and(|job| job.sid() == sid) {
+                        if let Some(waiter) = mux.take_open_ack(sid).await {
+                            let _ = waiter.send(OpenOutcome::Opened(payload.clone()));
+                        }
+                    }
+                }
+            }
+            "pty-resize" if self.role == TemporaryRole::Host => {
+                if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) {
+                    let cols = payload["cols"].as_u64().unwrap_or(80) as u16;
+                    let rows = payload["rows"].as_u64().unwrap_or(24) as u16;
+                    mux.resize_pty(sid, cols, rows).await;
+                }
+            }
+            "exec-open-ack" if self.role == TemporaryRole::Recipient => {
+                // This adapter opens the interactive terminal form only; an
+                // exec-class initiator open is not offered by this UI.
+            }
+            "exec-close" | "exec-alive-ack" if self.role == TemporaryRole::Recipient => {
+                if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) {
+                    mux.on_exec_initiator_frame(sid, payload.clone()).await;
+                }
+            }
+            "exec-alive" | "exec-signal" if self.role == TemporaryRole::Host => {
+                // A host serving the exec-class form gets the existing
+                // heartbeat/signal path over this same authenticated Mux.
+                if let (Some(sid), Some(message)) = (filament_peerloop::l2::wire_sid(&payload),
+                    filament_peerloop::l2::mux::ExecCtl::from_frame(&payload)) {
+                    let live = mux.exec_control(sid, message).await;
+                    if live && message == filament_peerloop::l2::mux::ExecCtl::Alive {
+                        let _ = mux.transport().send_control(&json!({"type":"exec-alive-ack","sid":sid})).await;
+                    }
+                }
             }
             "l2-close" => {
                 if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) { mux.on_close(sid, payload["err"].as_str()).await; }
@@ -373,6 +487,7 @@ impl Session {
     pub(crate) async fn shutdown(&mut self) {
         self.stop_controls.store(true, Ordering::Release);
         self.stop_review();
+        self.terminal = None;
         self.folder_controls = None;
         self.folder_jobs.clear();
         if let Some(engine) = &self.engine { let _ = engine.end(&self.binding.offer_id, crate::identity::now_secs()); }
@@ -425,10 +540,38 @@ impl Session {
     }
 }
 
+/// Compose the CLI's existing process primitive and platform PTY backend for
+/// agreement-scoped shell serving. The PTY half is `CliPty` — the same backend
+/// the standing receive loop uses — but this instance owns a fresh session map
+/// for this foreground temporary agreement. The host match arm below calls
+/// `AgreementEngine::serve_pty`/`serve_shell` directly, with the accepted
+/// revision and proven peer; it never enters standing shell admission.
+#[cfg(all(unix, feature = "pty-server"))]
+fn shell_runtime() -> Option<filament_peerloop::access_session::ShellRuntime> {
+    use filament_peerloop::access_session::ShellRuntime;
+    use filament_peerloop::recv::servers::shell::PtyBackend;
+    let log: Arc<dyn filament_peerloop::host::LogSink> =
+        Arc::new(filament_peerloop::host::NoLog);
+    let sessions = crate::l2::PtySessions::new();
+    let pty = Arc::new(crate::recv_ports::CliPty { sessions }) as Arc<dyn PtyBackend>;
+    #[cfg(feature = "exec-server")]
+    {
+        Some(ShellRuntime::new(Arc::new(crate::exec_recv::CliExecProcess), log).with_pty(pty))
+    }
+    #[cfg(not(feature = "exec-server"))]
+    {
+        Some(ShellRuntime::pty_only(pty, log))
+    }
+}
+
+#[cfg(not(all(unix, feature = "pty-server")))]
+fn shell_runtime() -> Option<filament_peerloop::access_session::ShellRuntime> { None }
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop_controls.store(true, Ordering::Release);
         self.stop_review();
+        self.terminal = None;
         self.folder_controls = None;
         self.folder_jobs.clear();
         let _ = crossterm::terminal::disable_raw_mode();
@@ -440,7 +583,9 @@ impl Drop for Session {
 
 fn supported_control(kind: &str) -> bool {
     kind.starts_with("access-")
-        || matches!(kind, "l2-open-ack" | "l2-close" | "mount-open-ack" | "mount-cap-ack" | "ping" | "pong")
+        || matches!(kind, "l2-open-ack" | "l2-close" | "mount-open-ack" | "mount-cap-ack"
+            | "pty-open-ack" | "pty-resize" | "exec-open-ack" | "exec-close"
+            | "exec-alive" | "exec-alive-ack" | "exec-signal" | "ping" | "pong")
 }
 
 fn version(payload: &Value) -> Result<()> {
@@ -660,7 +805,8 @@ mod tests {
 
     #[test]
     fn liveness_and_scoped_acks_are_the_only_non_access_controls() {
-        for kind in ["access-open", "access-active", "l2-open-ack", "l2-close", "mount-open-ack", "mount-cap-ack", "ping", "pong"] {
+        for kind in ["access-open", "access-active", "l2-open-ack", "l2-close", "mount-open-ack", "mount-cap-ack",
+            "pty-open-ack", "pty-resize", "exec-open-ack", "exec-close", "exec-alive", "exec-alive-ack", "exec-signal", "ping", "pong"] {
             assert!(supported_control(kind), "{kind}");
         }
         for kind in ["", "l2-open", "mount-open", "pty-open", "exec-open", "pake-msg", "enrol-offer"] {

@@ -114,6 +114,12 @@ impl Term {
         self.writer.flush().expect("flush");
     }
 
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self._master
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .expect("resize");
+    }
+
     /// Wait for `needle`, returning false on timeout rather than panicking, so
     /// a caller can report what it did see. A bare unwrap here would turn "the
     /// picker never drew" into a stack trace that hides the actual screen.
@@ -680,6 +686,26 @@ fn offer_temporary_services(host: &mut Term, exe: &str, server: &str, targets: &
 }
 
 #[cfg(unix)]
+fn offer_temporary_shell(host: &mut Term, exe: &str, server: &str) -> String {
+    host.send(&format!("\"{exe}\" --server {server} add\r"));
+    assert!(host.wait_for("Temporary access", 30), "{}", tail(&host.text()));
+    host.send("\x1b[B\r"); // Choose temporary access.
+    assert!(host.wait_for("Folders (0)", 20), "{}", tail(&host.text()));
+    // Main rows: Folders, Services, Review, Shell, Cancel.
+    host.send("\x1b[B\x1b[B\x1b[B\r");
+    assert!(host.wait_for("Shell: on (interactive terminal)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\x1b[B\r"); // Review / create code.
+    assert!(host.wait_for("SHARE THIS SCOPE?", 20), "{}", tail(&host.text()));
+    assert!(host.text().contains("interactive terminal on this machine's existing account"), "{}", tail(&host.text()));
+    host.send("\r");
+    assert!(host.wait_for("on the other device:", 60), "host never created a real code:\n{}", tail(&host.text()));
+    host.text().split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'))
+        .find(|token| token.rsplit_once('-').is_some_and(|(words, number)|
+            !words.is_empty() && words.contains('-') && number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit())))
+        .expect("actual PAKE code").to_ascii_lowercase()
+}
+
+#[cfg(unix)]
 fn temporary_endpoint(recipient: &Term, resource: &str) -> std::net::SocketAddr {
     recipient.text().split(&format!("Local service {resource} at ")).nth(1)
         .and_then(|rest| rest.split_whitespace().next()).and_then(|text| text.parse().ok())
@@ -974,6 +1000,146 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
         for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] { assert!(!dir.join(file).exists(), "folder access wrote standing state: {file}"); }
     }
     eprintln!("REAL FOLDER DOWNLOAD PASS: authenticated RO browse, binary/empty reads and exact private no-clobber publication, symlink escape refused, acknowledged End; no mount claim");
+}
+
+/// A fresh scratch dir for one cell.
+#[cfg(unix)]
+#[test]
+fn temporary_shell_pty_io_resize_and_end_teardown_are_scoped_and_never_use_standing_shell() {
+    let Some(backend) = backend() else { return; };
+    let (mut host, exe) = fresh_term("temporary-shell-host");
+    let (mut recipient, _) = fresh_term("temporary-shell-recipient");
+    let code = offer_temporary_shell(&mut host, &exe, &backend.url);
+    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.text().contains("interactive terminal on this machine's existing account"), "shell scope was not offered:\n{}", tail(&recipient.text()));
+    assert!(!recipient.text().contains("Local service"), "a service listener appeared for a shell-only scope");
+    recipient.send("\r");
+    assert!(recipient.wait_for("SHELL · shared terminal", 60), "recipient shell menu missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    let at = recipient.text().len();
+    recipient.send("\r");
+    assert!(recipient.wait_for_from(at, "Shared terminal · host accepted revision", 30), "terminal did not activate:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    let at = recipient.text().len();
+    recipient.send("echo REMOTE_PTY_$((6*7))\r");
+    assert!(recipient.wait_for_from(at, "REMOTE_PTY_42", 30), "remote shell did not execute:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    recipient.resize(120, 40);
+    thread::sleep(Duration::from_millis(600));
+    let at = recipient.text().len();
+    recipient.send("stty size\r");
+    assert!(recipient.wait_for_from(at, "40 120", 20), "resize did not reach the remote pty:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(host.wait_for("RUNNING ACCESS", 30), "{}", tail(&host.text()));
+    host.send("\x1b[A\r"); // End access.
+    assert!(recipient.wait_for("Shared terminal ended", 30), "end did not tear down the terminal:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(host.wait_for("peer acknowledged", 20), "host did not receive the End receipt:\n{}", tail(&host.text()));
+    for label in ["temporary-shell-host", "temporary-shell-recipient"] {
+        let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+        assert!(dir.join("overlay.ed25519").exists(), "confirmed temporary mutation did not persist the internal key");
+        for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json", "capabilities.json", "up.pid"] {
+            assert!(!dir.join(file).exists(), "temporary shell wrote standing state: {file}");
+        }
+    }
+    eprintln!("REAL TEMPORARY SHELL PASS: PAKE -> accepted shell scope -> remote PTY I/O -> resize -> End teardown; no standing records");
+}
+
+#[cfg(unix)]
+#[test]
+fn removing_shell_from_the_live_scope_ends_the_remote_pty_without_a_standing_session() {
+    let Some(backend) = backend() else { return; };
+    let (mut host, exe) = fresh_term("temporary-shell-remove-host");
+    let (mut recipient, _) = fresh_term("temporary-shell-remove-recipient");
+    // A service remains in the revised scope: an empty scope is invalid, and
+    // this also proves removal does not disturb an unrelated resource.
+    host.send(&format!("\"{exe}\" --server {} add\r", backend.url));
+    assert!(host.wait_for("Temporary access", 30), "{}", tail(&host.text()));
+    host.send("\x1b[B\r");
+    assert!(host.wait_for("Folders (0)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\x1b[B\x1b[B\r"); // Shell on.
+    assert!(host.wait_for("Shell: on (interactive terminal)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\r"); // Services.
+    assert!(host.wait_for("Add port", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\r");
+    assert!(host.wait_for("port or IP:port:", 20), "{}", tail(&host.text()));
+    host.send("3000\r");
+    assert!(host.wait_for("Choose services (1)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[A\r"); // Continue.
+    assert!(host.wait_for("Services (1)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\x1b[B\r"); // Review.
+    assert!(host.wait_for("SHARE THIS SCOPE?", 20), "{}", tail(&host.text()));
+    assert!(host.text().contains("interactive terminal on this machine's existing account"));
+    host.send("\r");
+    assert!(host.wait_for("on the other device:", 60), "{}", tail(&host.text()));
+    let code = host.text().split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'))
+        .find(|token| token.rsplit_once('-').is_some_and(|(words, number)|
+            !words.is_empty() && words.contains('-') && number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit())))
+        .expect("actual PAKE code").to_ascii_lowercase();
+    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "{}", tail(&recipient.text()));
+    recipient.send("\r");
+    assert!(recipient.wait_for("SHELL · shared terminal", 60), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for("Local service service-0 at ", 60), "{}", tail(&recipient.text()));
+    recipient.send("\r");
+    assert!(recipient.wait_for("Shared terminal · host accepted revision", 30), "{}", tail(&recipient.text()));
+    assert!(host.wait_for("RUNNING ACCESS", 30), "{}", tail(&host.text()));
+    let at = host.text().len();
+    host.send("\r"); // Change access.
+    assert!(host.wait_for_from(at, "CHANGE ACCESS", 20), "{}", tail(&host.text()));
+    let at = host.text().len();
+    host.send("\x1b[B\x1b[B\x1b[B\r"); // Service row, Add folder, Add port, then Shell: on.
+    assert!(host.wait_for_from(at, "Shell: off", 20), "{}", tail(&host.text()));
+    host.send("\x1b[A\x1b[A\r"); // Review change (immediately before Cancel).
+    assert!(host.wait_for_from(at, "APPLY CHANGE?", 20), "{}", tail(&host.text()));
+    let at = recipient.text().len();
+    host.send("\r");
+    assert!(recipient.wait_for_from(at, "Shared terminal ended", 30), "removal did not end the PTY:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(at, "ACCEPT THIS SCOPE?", 30), "narrowed revision was not reviewed:\n{}", tail(&recipient.text()));
+    assert!(!recipient.text()[at..].contains("interactive terminal"), "removed shell still advertised:\n{}", tail(&recipient.text()));
+    recipient.send("\r");
+    assert!(recipient.wait_for_from(at, "Temporary access active", 30), "{}", tail(&recipient.text()));
+    let active_at = at + recipient.text()[at..].find("Temporary access active").expect("activation marker");
+    recipient.settle(300, 2);
+    assert!(!recipient.text()[active_at..].contains("Open shared terminal"), "shell menu returned after shell removal");
+    assert!(host.wait_for("RUNNING ACCESS", 30), "{}", tail(&host.text()));
+    host.send("\x1b[A\r");
+    assert!(host.wait_for("peer acknowledged", 20), "{}", tail(&host.text()));
+    for label in ["temporary-shell-remove-host", "temporary-shell-remove-recipient"] {
+        let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+        for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json", "exec.groups"] {
+            assert!(!dir.join(file).exists(), "removed temporary shell left standing state: {file}");
+        }
+    }
+    eprintln!("REAL TEMPORARY SHELL REMOVAL PASS: live PTY ended by signed revision narrowing; no standing session or contact");
+}
+
+#[cfg(unix)]
+#[test]
+fn temporary_shell_expiry_tears_down_the_pty_and_the_agreement() {
+    let Some(backend) = backend() else { return; };
+    let (mut host, exe) = fresh_term("temporary-shell-expiry-host");
+    let (mut recipient, _) = fresh_term("temporary-shell-expiry-recipient");
+    let code = offer_temporary_shell(&mut host, &exe, &backend.url);
+    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "{}", tail(&recipient.text()));
+    recipient.send("\r");
+    assert!(recipient.wait_for("SHELL · shared terminal", 60), "{}", tail(&recipient.text()));
+    recipient.send("\r");
+    assert!(recipient.wait_for("Shared terminal · host accepted revision", 30), "{}", tail(&recipient.text()));
+    let at = recipient.text().len();
+    recipient.send("echo EXPIRY_ALIVE\r");
+    assert!(recipient.wait_for_from(at, "EXPIRY_ALIVE", 20), "{}", tail(&recipient.text()));
+    assert!(host.wait_for("RUNNING ACCESS", 30), "{}", tail(&host.text()));
+    host.send("\x1b[B\r"); // Set expiry.
+    assert!(host.wait_for("expiry (30m / 2h; blank = until ended):", 20), "{}", tail(&host.text()));
+    let at = recipient.text().len();
+    host.send("1s\r");
+    assert!(recipient.wait_for_from(at, "Shared terminal ended", 20), "expiry did not end the PTY:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(host.wait_for("peer acknowledged", 25), "expiry did not close the agreement:\n{}", tail(&host.text()));
+    for label in ["temporary-shell-expiry-host", "temporary-shell-expiry-recipient"] {
+        let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+        for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json", "exec.groups"] {
+            assert!(!dir.join(file).exists(), "expired temporary shell left standing state: {file}");
+        }
+    }
+    eprintln!("REAL TEMPORARY SHELL EXPIRY PASS: 1s lifetime closed the remote PTY and the agreement; no standing records");
 }
 
 /// A fresh scratch dir for one cell.

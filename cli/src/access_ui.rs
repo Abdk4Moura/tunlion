@@ -53,8 +53,8 @@ impl Draft {
 
     fn review_with_lifetime(&self, lifetime: Lifetime) -> Result<Vec<String>> {
         self.spec.validate()?;
-        if self.spec.folders.is_empty() && self.spec.services.is_empty() {
-            bail!("choose at least one folder or service");
+        if self.spec.folders.is_empty() && self.spec.services.is_empty() && !self.spec.shell {
+            bail!("choose at least one folder, service, or shell");
         }
         let mut lines = vec![format!("Temporary access · {} · foreground only", lifetime_label(lifetime))];
         lines.extend(self.spec.folders.iter().map(|folder| format!(
@@ -62,7 +62,11 @@ impl Draft {
             if folder.mode == FolderMode::ReadWrite { "read/write" } else { "read-only" }
         )));
         lines.extend(self.spec.services.iter().map(|service| format!("Service {} · TCP", service.target)));
-        lines.push("Shell off · device networking off · no subnet access".into());
+        lines.push(if self.spec.shell {
+            "Shell · interactive terminal on this machine's existing account · no resume/reattach".into()
+        } else {
+            "Shell off · device networking off · no subnet access".into()
+        });
         lines.push("No permanent contact. Sharing stops when the host exits.".into());
         Ok(lines)
     }
@@ -84,8 +88,14 @@ pub(crate) fn review_offer(snapshot: &AgreementSnapshot, stop: &AtomicBool) -> R
     if !snapshot.spec.folders.is_empty() {
         ui::say("  Folder browse/read checks the host endpoint; download support is platform-specific. No OS mount or DNS is implied.");
     }
-    if snapshot.spec.shell || snapshot.spec.device_network {
-        bail!("this build cannot activate the offered shell/device networking scope");
+    if snapshot.spec.shell {
+        #[cfg(all(unix, feature = "pty-server"))]
+        ui::say("  Shell opens a real interactive terminal on the host's existing nonroot account; one session, no resume.");
+        #[cfg(not(all(unix, feature = "pty-server")))]
+        bail!("this build cannot activate the offered interactive shell scope");
+    }
+    if snapshot.spec.device_network {
+        bail!("this build cannot activate the offered device networking scope");
     }
     match live_pick("ACCEPT THIS SCOPE?", &["Accept temporary access".into(), "Decline".into()], stop)? {
         Some(0) if !stop.load(Ordering::Acquire) => Ok(()),
@@ -210,7 +220,9 @@ fn edit_live(spec: &AccessSpec, lifetime: Lifetime, stop: &AtomicBool) -> Result
             folder.path.display(), if folder.mode == FolderMode::ReadOnly { "read-only" } else { "read/write" })).collect::<Vec<_>>();
         labels.extend(draft.spec.services.iter().map(|service| format!("Service {}", service.target)));
         let resources = labels.len();
-        labels.extend(["Add folder".into(), "Add port".into(), "Review change".into(), "Cancel".into()]);
+        labels.extend(["Add folder".into(), "Add port".into()]);
+        labels.push(format!("Shell: {}", if draft.spec.shell { "on (interactive terminal)" } else { "off" }));
+        labels.extend(["Review change".into(), "Cancel".into()]);
         let Some(selected) = live_pick("CHANGE ACCESS", &labels, stop)? else { return Ok(None); };
         if selected < draft.spec.folders.len() {
             match live_pick("FOLDER ACCESS", &["Read-only".into(), "Read/write".into(), "Remove".into()], stop)? {
@@ -229,7 +241,8 @@ fn edit_live(spec: &AccessSpec, lifetime: Lifetime, stop: &AtomicBool) -> Result
             1 => if let Some(port) = live_line("port or IP:port: ", stop)? {
                 if let Err(error) = draft.add_service(&port) { ui::say(&format!("  {error}")); }
             },
-            2 => {
+            2 => draft.spec.shell = !draft.spec.shell,
+            3 => {
                 let lines = match draft.review_with_lifetime(lifetime) { Ok(lines) => lines, Err(error) => { ui::say(&format!("  {error}")); continue; } };
                 for line in lines { ui::say(&format!("  {}", terminal_label(&line))); }
                 if live_pick("APPLY CHANGE?", &["Apply".into(), "Keep editing".into()], stop)? == Some(0) { return Ok(Some(draft.spec)); }
@@ -373,11 +386,13 @@ fn edit_services(draft: &mut Draft) -> Result<()> {
 pub(crate) fn temporary_access() -> Result<AccessSpec> {
     let mut draft = Draft::default();
     ui::say("  Temporary access · until ended · foreground only.");
-    ui::say("  TCP services and supported host folder browse/read · no OS mount or DNS setup.");
+    ui::say("  TCP services, supported host folder browse/read, and an interactive shell · no OS mount or DNS setup.");
     loop {
-        // Unsupported shell/network/expiry/background controls are not offered.
+        // Unsupported device networking, expiry and background controls are not offered.
         match pick("TEMPORARY ACCESS", vec![format!("Folders ({})", draft.spec.folders.len()),
-            format!("Services ({})", draft.spec.services.len()), "Review / create code".into(), "Cancel".into()])? {
+            format!("Services ({})", draft.spec.services.len()), "Review / create code".into(),
+            format!("Shell: {}", if draft.spec.shell { "on (interactive terminal)" } else { "off" }),
+            "Cancel".into()])? {
             0 => edit_folders(&mut draft)?,
             1 => edit_services(&mut draft)?,
             2 => {
@@ -394,9 +409,13 @@ pub(crate) fn temporary_access() -> Result<AccessSpec> {
                 // Only the confirmed mutation crosses into the shared ceremony.
                 #[cfg(feature = "forward-server")]
                 { return Ok(draft.spec); }
-                #[cfg(not(feature = "forward-server"))]
-                bail!("temporary access unavailable: this build has no scoped service endpoint; no code was created and no access was granted");
+                #[cfg(all(not(feature = "forward-server"), unix, feature = "pty-server"))]
+                { if draft.spec.shell { return Ok(draft.spec); } }
+                #[cfg(not(any(feature = "forward-server", all(unix, feature = "pty-server"))))]
+                { let _ = draft; }
+                bail!("temporary access unavailable: this build has no scoped endpoint for the chosen resources; no code was created and no access was granted");
             }
+            3 => draft.spec.shell = !draft.spec.shell,
             _ => return Err(crate::cancelled()),
         }
     }
@@ -475,5 +494,18 @@ mod tests {
         let review = draft.review_with_lifetime(Lifetime::ExpiresAt(1234)).unwrap();
         assert!(review[0].contains("expires at 1234"));
         assert!(!review[0].contains("until ended"));
+    }
+
+    #[test]
+    fn shell_is_a_first_class_basket_entry_and_review_states_its_boundary() {
+        let mut draft = Draft::default();
+        assert!(draft.review().is_err(), "an empty basket has nothing to share");
+        draft.spec.shell = true;
+        let review = draft.review().unwrap();
+        assert!(review.iter().any(|line| line.contains("interactive terminal")));
+        assert!(review.iter().any(|line| line.contains("no resume/reattach")));
+        assert!(!review.iter().any(|line| line.contains("Shell off")));
+        draft.spec.shell = false;
+        assert!(draft.review().is_err(), "shell removed leaves no resource");
     }
 }
