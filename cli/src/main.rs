@@ -102,6 +102,8 @@ mod enrollment;
 mod membership;
 /// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
+mod access_ui;
+mod temporary_session;
 #[cfg(test)]
 use pair_cmd::invitation_not_a_code_msg;
 /// `tunlion up` / `tunlion logs`.

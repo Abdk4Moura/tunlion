@@ -240,7 +240,8 @@ fn tail(s: &str) -> String {
         }
         out
     };
-    let start = stripped.len().saturating_sub(2500);
+    let mut start = stripped.len().saturating_sub(2500);
+    while !stripped.is_char_boundary(start) { start += 1; }
     stripped[start..].to_string()
 }
 
@@ -294,7 +295,7 @@ fn the_menu_accept_entry_takes_a_code_and_joins_with_it() {
     );
     let screen = t.text();
     assert!(!screen.contains("Pair with a code I was given"), "the old offering entry is back:\n{}", tail(&screen));
-    // Entry 0 is "Set up this first device"; the accept entry is next.
+    // Entry 0 offers add/temporary access; the accept entry is next.
     t.send("\u{1b}[B");
     t.settle(300, 3);
     t.send("\r");
@@ -325,6 +326,8 @@ fn a_code_typed_into_add_is_accepted_not_reminted() {
     let (mut t, exe) = fresh_term("add-code");
     let before = t.text().len();
     t.send(&format!("\"{exe}\" --server http://127.0.0.1:9 add\r"));
+    assert!(t.wait_for_from(before, "Connect a remembered device", 30), "add menu missing:\n{}", tail(&t.text()));
+    t.send("\r");
     assert!(
         t.wait_for_from(before, "press Enter for a generated pair", 30),
         "add never opened its word entry; screen:\n{}",
@@ -345,6 +348,63 @@ fn a_code_typed_into_add_is_accepted_not_reminted() {
     );
     assert!(!t.text()[at..].contains("comic-otter-1950-"), "a second code was minted:\n{}", tail(&t.text()));
     t.send("\u{3}");
+}
+
+// Temporary drafting runs before pairing, key generation, and any network use.
+#[cfg(unix)]
+#[test]
+fn temporary_access_cancel_and_failed_connect_do_not_remember_device() {
+    for activate in [false, true] {
+        let label = if activate { "access-unavailable" } else { "access-cancel" };
+        let (mut t, exe) = fresh_term(label);
+        t.send(&format!("\"{exe}\" --server http://127.0.0.1:9 add\r"));
+        assert!(t.wait_for("Temporary access", 20), "{}", tail(&t.text()));
+        t.send("\x1b[B\r");
+        assert!(t.wait_for("Folders (0)", 20), "{}", tail(&t.text()));
+        // Add the current temporary folder, read-only by default.
+        t.send("\r");
+        assert!(t.wait_for("Add folder", 20), "{}", tail(&t.text()));
+        t.send("\r");
+        assert!(t.wait_for("folder path:", 20), "{}", tail(&t.text()));
+        t.send(".\r");
+        assert!(t.wait_for("read-only", 20), "{}", tail(&t.text()));
+        let at = t.text().len();
+        t.send("\x1b[A\r"); // Continue (wrap to last row).
+        assert!(t.wait_for_from(at, "Folders (1)", 20), "{}", tail(&t.text()));
+        t.send("\x1b[B\r"); // Services.
+        assert!(t.wait_for("Add port", 20), "{}", tail(&t.text()));
+        t.send("\x1b[B\r");
+        assert!(t.wait_for("port or IP:port:", 20), "{}", tail(&t.text()));
+        t.send("3000\r");
+        assert!(t.wait_for("Choose services (1)", 20), "{}", tail(&t.text()));
+        // Exercise the actual inline multi-select, not just menu navigation.
+        t.send("\r");
+        assert!(t.wait_for("Space toggle", 20), "{}", tail(&t.text()));
+        let at = t.text().len();
+        t.send("  \r"); // Toggle off, on, then continue.
+        assert!(t.wait_for_from(at, "Choose services (1)", 20), "{}", tail(&t.text()));
+        let at = t.text().len();
+        t.send("\x1b[A\r"); // Services Continue.
+        assert!(t.wait_for_from(at, "Services (1)", 20), "{}", tail(&t.text()));
+        t.send("\x1b[B\x1b[B\r"); // One final scope review.
+        assert!(t.wait_for("SHARE THIS SCOPE?", 20), "{}", tail(&t.text()));
+        assert!(t.text().contains("until ended"));
+        assert!(t.text().contains("Service 127.0.0.1:3000"));
+        let at = t.text().len();
+        t.send(if activate { "\r" } else { "\x1b[A\r" });
+        assert!(t.wait_for_from(at, &format!("{MARK}> "), 20), "{}", tail(&t.text()));
+        let screen = t.text();
+        assert!(!screen.contains("pair-create"));
+        assert!(!screen.contains("Code:"));
+        assert!(!screen.contains("\x1b[?1049h"), "temporary access used alternate screen");
+        assert!(!screen.contains("mutually remembered"));
+        assert!(!screen.contains("Temporary access active"));
+        let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+        for entry in ["identity.ed25519", "identity/device-cert.json", "devices.json", "capabilities.json"] {
+            assert!(!dir.join(entry).exists(), "drafting wrote {entry}");
+        }
+        if !activate { assert!(!dir.join("overlay.ed25519").exists(), "cancel created transport keys"); }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +459,9 @@ fn backend() -> Option<Backend> {
         .expect("free port");
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../backend");
     let python = std::env::var("TUNLION_TEST_VENV").unwrap_or_else(|_| "python3".to_string());
+    let log_path = std::env::temp_dir().join(format!("tunlion-pty-backend-{}-{port}.log", std::process::id()));
+    let log = std::fs::File::create(&log_path).expect("backend diagnostic log");
+    eprintln!("PTY backend log: {}", log_path.display());
     let spawned = std::process::Command::new(&python)
         .arg("app.py")
         .current_dir(&dir)
@@ -409,8 +472,8 @@ fn backend() -> Option<Backend> {
         .env("FIL_PING_TIMEOUT", "120")
         .env("FIL_PING_INTERVAL", "25")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log.try_clone().expect("backend stdout log")))
+        .stderr(std::process::Stdio::from(log))
         .spawn();
     let mut child = match spawned {
         Ok(c) => c,
@@ -426,7 +489,8 @@ fn backend() -> Option<Backend> {
             return Some(Backend { child, url: format!("http://127.0.0.1:{port}") });
         }
         if let Ok(Some(st)) = child.try_wait() {
-            assert!(std::env::var_os("CI").is_none(), "the backend exited ({st}); CI must run it for the receive pty cells");
+            let diagnostic = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(std::env::var_os("CI").is_none(), "the backend exited ({st}); CI must run it for the receive pty cells\n{}\n{diagnostic}", log_path.display());
             eprintln!("SKIP: the backend exited ({st}); install its Python deps to run these cells");
             return None;
         }
@@ -434,6 +498,101 @@ fn backend() -> Option<Backend> {
     }
     let _ = child.kill();
     panic!("the backend never answered /api/health on port {port}");
+}
+
+/// Two real CLI processes, existing signaling/PAKE/DataChannel and scoped Mux.
+/// No installed daemon, production account, permanent contact or mock invitation.
+#[cfg(unix)]
+#[test]
+fn temporary_service_pairing_uses_real_transport_and_end_closes_the_socket() {
+    let Some(backend) = backend() else { return; };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let echo = thread::spawn(move || {
+        while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+                    let mut data = [0; 1024];
+                    while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                        match socket.read(&mut data) {
+                            Ok(0) => break,
+                            Ok(n) => { if socket.write_all(&data[..n]).is_err() { break; } }
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+    });
+    struct StopEcho(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopEcho { fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); } }
+    let echo_guard = StopEcho(stop);
+    let (mut host, exe) = fresh_term("temporary-live-host");
+    let (mut recipient, _) = fresh_term("temporary-live-recipient");
+    host.send(&format!("\"{exe}\" --server {} add\r", backend.url));
+    assert!(host.wait_for("Temporary access", 30), "{}", tail(&host.text()));
+    host.send("\x1b[B\r");
+    assert!(host.wait_for("Folders (0)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\r");
+    assert!(host.wait_for("Add port", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\r");
+    assert!(host.wait_for("port or IP:port:", 20), "{}", tail(&host.text()));
+    host.send(&format!("{target}\r"));
+    assert!(host.wait_for("Choose services (1)", 20), "{}", tail(&host.text()));
+    let at = host.text().len();
+    host.send("\x1b[A\r");
+    assert!(host.wait_for_from(at, "Services (1)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\x1b[B\r");
+    assert!(host.wait_for("SHARE THIS SCOPE?", 20), "{}", tail(&host.text()));
+    host.send("\r");
+    assert!(host.wait_for("on the other device:", 60), "host never created a real code:\n{}", tail(&host.text()));
+    let screen = host.text();
+    let code = screen.split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'))
+        .find(|token| token.rsplit_once('-').is_some_and(|(words, number)|
+            !words.is_empty() && words.contains('-') && number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit())))
+        .expect("real host pairing code").to_ascii_lowercase();
+    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "authenticated scope review missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(!recipient.text().contains("Local service"), "listener activated before acceptance");
+    recipient.send("\r");
+    assert!(recipient.wait_for("Local service service-0 at ", 60), "real endpoint missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(host.wait_for("RUNNING ACCESS", 30), "{}", tail(&host.text()));
+    let text = recipient.text();
+    let address = text.split("Local service service-0 at ").nth(1).unwrap().split_whitespace().next().unwrap();
+    let mut socket = std::net::TcpStream::connect(address).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    socket.write_all(b"temporary-service-real-payload").unwrap();
+    let mut reply = [0; 30];
+    let expected = b"temporary-service-real-payload";
+    socket.read_exact(&mut reply[..expected.len()]).unwrap();
+    assert_eq!(&reply[..expected.len()], expected);
+    let at = host.text().len();
+    host.send("\x1b[A\r"); // End access, without a shell/daemon/config operation.
+    assert!(recipient.wait_for("Temporary access ended", 30), "end did not reach recipient:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    let mut byte = [0];
+    match socket.read(&mut byte) {
+        Ok(0) => {},
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) => {},
+        outcome => panic!("revocation did not close the active service socket: {outcome:?}"),
+    }
+    assert!(host.wait_for_from(at, &format!("{MARK}> "), 30), "host did not exit:\n{}", tail(&host.text()));
+    for label in ["temporary-live-host", "temporary-live-recipient"] {
+        let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+        assert!(dir.join("overlay.ed25519").exists(), "confirmed mutation did not persist the internal device key");
+        for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json", "capabilities.json", "up.pid"] {
+            assert!(!dir.join(file).exists(), "temporary access wrote standing state: {file}");
+        }
+    }
+    eprintln!("REAL TEMPORARY E2E PASS: PAKE -> authenticated scope -> explicit accept -> TCP echo -> End -> socket closed; no permanent records");
+    drop(echo_guard);
+    echo.join().unwrap();
 }
 
 /// A fresh scratch dir for one cell.

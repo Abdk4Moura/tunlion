@@ -61,7 +61,7 @@ pub(crate) fn first_screen_actions(
         ]
     } else if device_count == 0 {
         vec![
-            ("Set up this first device", "init"),
+            ("Connect a device or share temporary access", "add"),
             // #209: there are TWO ways to be brought into an identity. `add`
             // mints a pairing code claimed with `add <code>`; `add --for` mints
             // a bounded invitation claimed with `join`. This menu offered only
@@ -86,7 +86,7 @@ pub(crate) fn first_screen_actions(
             ("Send something", "send"),
             ("Receive something", "receive"),
             ("See every device", "devices"),
-            ("Create an identity for this device", "init"),
+            ("Connect a device or share temporary access", "add"),
             ACCEPT_ENTRY, // #209, as above
         ]
     }

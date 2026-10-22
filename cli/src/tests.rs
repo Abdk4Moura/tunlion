@@ -3073,9 +3073,10 @@ fn printed_hints_name_verbs_that_exist() {
 /// code, which has peers and no identity of its own.
 #[test]
 fn the_first_screen_menu_does_not_contradict_its_own_header() {
-    // Genuinely nothing here: the friendly first-run wording is true.
+    // First use starts from an action, not an identity/setup wizard.
     let fresh = first_screen_actions(false, false, 0);
-    assert!(fresh.iter().any(|(l, _)| l.contains("first device")));
+    assert!(fresh.iter().any(|(_, action)| *action == "add"));
+    assert!(!fresh.iter().any(|(_, action)| *action == "init"));
 
     // Peers but no identity. "first device" is false with a device count
     // printed directly above it.
@@ -3091,8 +3092,8 @@ fn the_first_screen_menu_does_not_contradict_its_own_header() {
             "a machine with peers must be offered `{verb}`: {paired:?}"
         );
     }
-    // Setting up an identity stays available, just not as a lie about order.
-    assert!(paired.iter().any(|(_, a)| *a == "init"));
+    assert!(paired.iter().any(|(_, action)| *action == "add"));
+    assert!(!paired.iter().any(|(_, action)| *action == "init"));
 
     // The owner and joined menus are unaffected by device count.
     assert_eq!(
