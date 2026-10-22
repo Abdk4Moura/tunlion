@@ -44,8 +44,9 @@ impl Controls {
                     let Some(selected) = crate::access_ui::live_pick("FOLDERS · endpoint checked on use", &labels, &stopped)? else { break; };
                     let Some(folder) = folders.get(selected) else { break; };
                     let mut actions = vec!["Browse folder".into(), "Read file preview".into()];
-                    #[cfg(all(target_os = "linux", feature = "mount-server"))]
-                    actions.push("Download file (up to 1 GiB)".into());
+                    if crate::platform::folder_download_supported() {
+                        actions.push("Download file (up to 1 GiB)".into());
+                    }
                     actions.push("Back".into());
                     let Some(action) = crate::access_ui::live_pick("FOLDER ACTION", &actions, &stopped)? else { continue; };
                     if action == actions.len() - 1 { continue; }
@@ -202,7 +203,7 @@ mod tests {
 // Transport stands in for the authenticated L2 stream, so these tests exercise
 // the exact request sequence, byte counts, publication point and private
 // staging without a network, a mount, or a peer.
-#[cfg(all(test, target_os = "linux", feature = "mount-server"))]
+#[cfg(all(test, feature = "mount-server"))]
 mod protocol_tests {
     use super::*;
     use filament_peerloop::access::FolderMode;
@@ -212,7 +213,6 @@ mod protocol_tests {
     };
     use filament_transport::net::Transport;
     use serde_json::{Value, json};
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use tokio::sync::mpsc;
 
@@ -315,6 +315,7 @@ mod protocol_tests {
 
     #[tokio::test]
     async fn browse_binary_empty_preview_download_round_trip_and_no_clobber() {
+        if !crate::platform::folder_download_supported() { return; }
         use sha2::Digest;
         let scratch = Scratch::new();
         let destination = scratch.0.join("downloads");
@@ -384,7 +385,8 @@ mod protocol_tests {
         assert_eq!(published.sha256.as_slice(), expected.as_slice());
         assert_eq!(std::fs::read(&published.path).unwrap(), binary);
         assert_eq!(std::fs::read(destination.join("binary.bin")).unwrap(), b"preserve-existing");
-        assert_eq!(std::fs::metadata(&published.path).unwrap().permissions().mode() & 0o777, 0o600);
+        // Owner-only staging is asserted by download_output's core test; the
+        // portable metadata API here cannot express POSIX mode bits.
         assert_eq!(staging_entries(&destination), 0, "successful publish left private staging");
 
         // Empty download publishes an exact zero-byte file.
@@ -401,6 +403,7 @@ mod protocol_tests {
 
     #[tokio::test]
     async fn symlink_and_short_reads_are_refused_before_any_local_publication() {
+        if !crate::platform::folder_download_supported() { return; }
         let scratch = Scratch::new();
         let destination = scratch.0.join("downloads");
         std::fs::create_dir(&destination).unwrap();
@@ -426,6 +429,7 @@ mod protocol_tests {
 
     #[tokio::test]
     async fn cancellation_during_read_leaves_no_name_or_private_staging() {
+        if !crate::platform::folder_download_supported() { return; }
         let scratch = Scratch::new();
         let destination = scratch.0.join("downloads");
         std::fs::create_dir(&destination).unwrap();

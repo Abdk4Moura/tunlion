@@ -2977,6 +2977,13 @@ mod tests {
     }
 }
 
+/// Whether this build can publish a downloaded folder file. Browse and preview
+/// are protocol-level everywhere; the pinned no-clobber publication primitive
+/// is Linux-only today, so the folder UI must not offer what cannot finish.
+pub fn folder_download_supported() -> bool {
+    cfg!(all(target_os = "linux", feature = "mount-server"))
+}
+
 /// Policy routing for exit nodes, kept behind the platform adapter so the rest
 /// of the tree stays free of `cfg(target_os)`.
 ///
