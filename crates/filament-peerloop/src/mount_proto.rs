@@ -678,6 +678,20 @@ pub struct MountServerConfig {
 /// `mount-open` control message arrives. Reads requests from the mux pipe and
 /// writes responses via `transport.send_frame`.
 pub fn spawn_mount_server(cfg: MountServerConfig) -> tokio::task::JoinHandle<()> {
+    spawn_mount_server_with_admission(cfg, None)
+}
+
+/// Agreement admission is checked before EVERY filesystem request, including
+/// buffered requests, independently of the existing standing-trust recheck
+/// cadence. The callback must return after admission, without retaining a lock
+/// across filesystem/network work. A request admitted before revocation may
+/// complete; completed writes/data cannot be rolled back.
+pub type MountRequestAdmission = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+pub fn spawn_mount_server_with_admission(
+    cfg: MountServerConfig,
+    admission: Option<MountRequestAdmission>,
+) -> tokio::task::JoinHandle<()> {
     let MountServerConfig {
         root,
         transport,
@@ -745,6 +759,18 @@ pub fn spawn_mount_server(cfg: MountServerConfig) -> tokio::task::JoinHandle<()>
                         continue;
                     }
                 };
+                if let Some(reason) = admission.as_ref().and_then(|gate| gate().err()) {
+                    let resp = MountResponse {
+                        id: req.id, bin: None,
+                        result: MountResult::Err(MountError { code: EACCES, msg: reason.clone() }),
+                    };
+                    let mut header = serde_json::to_vec(&resp).unwrap_or_default();
+                    header.push(b'\n');
+                    let payload = if v2 { encode_frame(&header,None) } else { header };
+                    let _ = transport.send_frame(sid,0,&payload).await;
+                    let _ = transport.send_control(&serde_json::json!({"type":"l2-close","sid":sid,"err":reason})).await;
+                    return;
+                }
                 // Re-ask the gate, rate-limited by the shared interval helper so a
                 // read-heavy mount does not re-read the device store per operation
                 // (#235).
