@@ -25,6 +25,7 @@ use crate::local_request;
 use crate::parse_duration_secs;
 use crate::pidfile;
 use crate::request_entries;
+use crate::transfer_requests;
 use crate::ui;
 use crate::up_log;
 use anyhow::{Result, anyhow};
@@ -583,6 +584,11 @@ pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
                     None => ui::say("  daemon not running; no pending request state"),
                 },
             }
+            // Durable file offers are read from their own locked store, so they
+            // are shown even when the daemon is not running. Access output above
+            // is unchanged.
+            transfer_requests::say_section(false)?;
+            crate::retained_send_cmd::say_section(false)?;
         }
         Some(RequestsAction::List { all: true }) => {
             let reply = crate::ctl::try_list_pending().await;
@@ -592,6 +598,8 @@ pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
                 ))),
                 None => ui::say("  daemon not running; no request state"),
             }
+            transfer_requests::say_section(true)?;
+            crate::retained_send_cmd::say_section(true)?;
         }
         Some(RequestsAction::Approve {
             id,
@@ -661,6 +669,12 @@ pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
                 }
                 None => return Err(request_reply_missing(id, "deny")),
             }
+        }
+        Some(RequestsAction::Accept { id, to, rev }) => {
+            transfer_requests::accept(id, to.as_deref(), rev)?;
+        }
+        Some(RequestsAction::Decline { id, rev }) => {
+            transfer_requests::decline(id, rev)?;
         }
     }
     Ok(())

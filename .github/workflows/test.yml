@@ -355,6 +355,49 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The durable offer path needs a real backend, real enrollment and process
+  # restarts. It is wired here (not left as a manual script) so the receipt,
+  # decline, offline-retry and revocation assertions cannot rot silently.
+  durable-requests-e2e:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    name: durable requests E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Fall back to uncached builds if the cache backend is down
+        shell: bash
+        run: |
+          if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
+            echo "::warning::sccache unavailable; building without it"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      - name: Build isolated test-hooks binary
+        run: cargo build -p filament-cli --bin tunlion --features test-hooks
+      - name: Run durable request E2E
+        run: |
+          python3 runner/durable-requests-e2e.py \
+            --bin target/debug/tunlion \
+            --evidence "$RUNNER_TEMP/durable-requests-e2e" \
+            --fault-hooks
+
   # Interactive flows through a real pty, including ConPTY on Windows.
   #
   # Manual dispatch and non-gating on purpose. These cells currently include the

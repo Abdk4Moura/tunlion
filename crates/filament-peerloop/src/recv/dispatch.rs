@@ -7295,6 +7295,31 @@ async fn recv_run(
                     // peer). Used to verify-on-completion + drive the delivery-ack.
                     let offer_full = v["full"].as_str().map(|s| s.to_string());
                     let is_resume = v["resume"].as_bool().unwrap_or(false);
+                    // Durable offers opt in with an explicit stable request id.
+                    // The legacy transfer id is NOT a durable identity: an offer
+                    // without `request` must keep the legacy path unchanged.
+                    let durable_marker = daemon
+                        && v["request"].as_str().is_some_and(|id| !id.is_empty());
+                    // Durable admission requires possession proof, and shadow
+                    // mode deliberately skips the legacy challenge for ordinary
+                    // transfers. Ask now, before the bounded offer hold, or the
+                    // hold would expire without ever sending a challenge.
+                    if durable_marker
+                        && conn
+                            .link(&pid)
+                            .is_none_or(|link| link.identity_binding != cap::BindingStrength::Proven)
+                    {
+                        ports
+                            .identity
+                            .issue_proven_challenge_and_hold(
+                                &conn,
+                                &pid,
+                                &t,
+                                &st.pending_proven,
+                                &mut identity_nonces,
+                            )
+                            .await;
+                    }
 
                     // A pinned receive refuses unverifiable legacy offers and
                     // content with a different advertised digest before writing
@@ -7329,8 +7354,8 @@ async fn recv_run(
                         }
                     }
 
-                    let part_path = dir.join(format!("{name}.part"));
-                    let meta_path = dir.join(format!("{name}.part.meta"));
+                    let mut part_path = dir.join(format!("{name}.part"));
+                    let mut meta_path = dir.join(format!("{name}.part.meta"));
                     // C7: a partial counts only if size matches AND the
                     // content head matches (when both sides have one).
                     let mut offset = 0u64;
@@ -7358,6 +7383,19 @@ async fn recv_run(
                             }
                             _ => {}
                         }
+                    }
+
+                    // A durable offer binds an exact file path. Stdout has no
+                    // path to bind, and admitting it would create a Delivering
+                    // request that can never be completed.
+                    if durable_marker && to_stdout {
+                        let sent = t.send_control(&protocol::refuse_msg(
+                            &id,
+                            "durable_requires_destination",
+                            "durable transfers need a file destination, not stdout",
+                        )).await;
+                        peer_step(daemon, &pid, "durable stdout refusal", sent, log.as_ref())?;
+                        continue;
                     }
 
                     // #30 GAP 2 / #161: hold the offer while identity resolution
@@ -7409,8 +7447,17 @@ async fn recv_run(
                             .unwrap_or((false, false, false));
                         let challenge_in_flight =
                             st.pending_proven.lock().unwrap().contains_key(&pid);
+                        let durable_hold = durable_marker && !proven;
                         let code_hold = recv_code_path && !proven && !idev_known;
-                        let hold = if code_hold {
+                        let hold = if durable_hold {
+                            // Durable admission requires Proven. Hold even when
+                            // the link is not Ready yet, but always on the same
+                            // bounded deadline so a pre-proof offer cannot spin.
+                            let deadline = *recv_identity_hold
+                                .entry(pid.clone())
+                                .or_insert_with(std::time::Instant::now);
+                            deadline.elapsed() < RECV_IDENTITY_HOLD_DEADLINE
+                        } else if code_hold {
                             if !link_ready {
                                 // Transport still establishing (the direct-blocked
                                 // fallback brings WebRTC up AFTER PAKE, and the
@@ -7451,6 +7498,58 @@ async fn recv_run(
                         // the next iteration, not a 0.8.0 change.
                     }
 
+                    // Daemon transfers use exact, durable offers rather than a
+                    // standing transfer grant or an ephemeral stdin answer.
+                    // One-shot code receives retain their explicit code consent.
+                    let mut durable_permit = None;
+                    if durable_marker {
+                        use crate::recv::request_delivery::{admit, Admission};
+                        match admit(&mut conn, &pid, &v, &dir) {
+                            Ok(Admission::Waiting(request)) => {
+                                let mut pending = protocol::pending_msg(&id);
+                                pending["durable"] = json!(true);
+                                pending["request_id"] = json!(format!("transfer:{}", request.id));
+                                pending["retry_after"] = json!(30);
+                                pending["manifest"] = json!(request.manifest.digest);
+                                let sent = t.send_control(&pending).await;
+                                peer_step(daemon, &pid, "durable offer pending", sent, log.as_ref())?;
+                                continue;
+                            }
+                            Ok(Admission::Denied) => {
+                                let sent = t.send_control(&protocol::decline_msg(&id)).await;
+                                peer_step(daemon, &pid, "durable offer declined", sent, log.as_ref())?;
+                                continue;
+                            }
+                            Ok(Admission::Delivered) => {
+                                let sent = t.send_control(&protocol::delivery_ack_msg(&id, sid)).await;
+                                peer_step(daemon, &pid, "durable delivery receipt", sent, log.as_ref())?;
+                                continue;
+                            }
+                            Ok(Admission::Receive(permit)) => {
+                                part_path = permit.staged_path();
+                                meta_path = permit.staged_meta_path();
+                                offset = 0;
+                                prior_full = None;
+                                if let Some(meta) = PartMeta::load(&meta_path) {
+                                    let prior = std::fs::symlink_metadata(&part_path).ok()
+                                        .filter(|metadata| metadata.file_type().is_file())
+                                        .map(|metadata| metadata.len()).unwrap_or(0);
+                                    if meta.size == size && prior <= size && meta.full == offer_full {
+                                        offset = prior;
+                                        prior_full = meta.full;
+                                    }
+                                }
+                                durable_permit = Some(permit);
+                            }
+                            Err(error) => {
+                                log.say(&format!("  refused transfer offer: {error}"));
+                                let sent = t.send_control(&protocol::refuse_msg(&id, "request_denied", &error.to_string())).await;
+                                peer_step(daemon, &pid, "durable offer refusal", sent, log.as_ref())?;
+                                continue;
+                            }
+                        }
+                    }
+
                     // C14/C22: consent. -y accepts everything; a resume of a
                     // partial we already said yes to auto-accepts; a verified
                     // device auto-accepts; otherwise the question joins the
@@ -7481,7 +7580,7 @@ async fn recv_run(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under TUNLION_CAP_AUTHORITATIVE.
                     let authoritative = host.cap_authoritative();
-                    let (ok, xfer_deny_reason, xfer_gate) = {
+                    let (gate_ok, xfer_deny_reason, xfer_gate) = {
                         let az = crate::shell_gate::peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let store = host.cap_store();
@@ -7559,7 +7658,9 @@ async fn recv_run(
                     };
                     // Under authoritative, a capability Deny hard-declines
                     // immediately: no prompt, skip the accept path entirely.
-                    if let Some(reason) = cap::transfer_gate_decision(&xfer_gate, authoritative) {
+                    let ok = gate_ok || durable_permit.is_some();
+                    if let Some(reason) = cap::transfer_gate_decision(&xfer_gate, authoritative)
+                        .filter(|_| durable_permit.is_none()) {
                         log.say(&log.paint(
                             Tone::Dim,
                             &format!("  declined {name} from {sender_name} ({reason})",),
@@ -7667,7 +7768,7 @@ async fn recv_run(
                     // declining (a decline would mark the SENDER's transfer done
                     // and abort the recovery). A genuinely FLOWING duplicate still
                     // wins as before.
-                    let want_part = dir.join(format!("{name}.part"));
+                    let want_part = part_path.clone();
                     if !to_stdout {
                         let dup_keys: Vec<(String, u32)> = st
                             .by_sid
@@ -7738,6 +7839,7 @@ async fn recv_run(
                             st.by_sid.insert(
                                 (pid.clone(), sid),
                                 IncomingFile {
+                                    durable: None,
                                     id: id.clone(),
                                     name,
                                     size,
@@ -7909,6 +8011,9 @@ async fn recv_run(
                                 // refuses, a read-only or unwritable folder). This used
                                 // to be a debug line and a silent `continue`, so the
                                 // sender re-offered forever. Say why, to both ends.
+                                if let Some(permit) = &durable_permit {
+                                    let _ = permit.fail(host.as_ref());
+                                }
                                 crate::recv::discard_partial(&part_path);
                                 let (token, msg) = crate::recv::files::storage_refusal(
                                     host.storage_failure(&e),
@@ -7955,6 +8060,7 @@ async fn recv_run(
                     st.by_sid.insert(
                         (pid.clone(), sid),
                         IncomingFile {
+                            durable: durable_permit,
                             id: id.clone(),
                             name,
                             size,
@@ -8010,15 +8116,23 @@ async fn recv_run(
                     // land first and flush it out of the table), so the partial
                     // is also found by the name it was offered under.
                     let mut names: Vec<String> = Vec::new();
+                    let mut had_durable = false;
                     for k in keys {
                         if let Some(inc) = st.by_sid.remove(&k) {
+                            if inc.durable.is_some() {
+                                had_durable = true;
+                            }
+                            if let Some(permit) = &inc.durable {
+                                let _ = permit.fail(host.as_ref());
+                            }
                             if !to_stdout {
                                 remove_part(inc.part_path.as_path());
                             }
                             names.push(inc.name.clone());
                         }
                     }
-                    if names.is_empty() && !to_stdout {
+                    let cancel_durable = v["request"].as_str().is_some_and(|id| !id.is_empty());
+                    if names.is_empty() && !to_stdout && !had_durable && !cancel_durable {
                         if let Some(raw) = v["name"].as_str() {
                             let name = filament_transfer::safe_incoming_name(raw);
                             let part = dir.join(format!("{name}.part"));
@@ -8570,6 +8684,8 @@ async fn recv_run(
                     inc.inflight.fetch_add(1, Ordering::SeqCst);
                     let file = Arc::clone(&inc.file);
                     let stdout_sink = inc.stdout.clone();
+                    let durable = inc.durable.clone();
+                    let write_host = host.clone();
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
                     let completion = Arc::clone(&inc.completion);
@@ -8604,10 +8720,13 @@ async fn recv_run(
                         // byte-writing primitive. The primitive returns the fact
                         // now and the decision to report it lives out here.
                         // `-o -` writes in order instead: stdout may be a pipe.
-                        let wrote = match &stdout_sink {
+                        let authority = durable.as_ref().map(|permit| permit.check_if_due(write_host.as_ref()))
+                            .transpose().map_err(|error| std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied, error.to_string()));
+                        let wrote = authority.and_then(|_| match &stdout_sink {
                             Some(sink) => crate::recv::stdout_put(sink, pos, &data),
                             None => filament_transfer::pwrite_at(&file, &data, pos),
-                        };
+                        });
                         if let Err(e) = &wrote {
                             // Write failed: do NOT record coverage (leaves the gap),
                             // and record WHY, once. A full disk or a filesystem gone
@@ -9320,6 +9439,11 @@ fn refuse_failed_write(
     log: &dyn LogSink,
     host: &dyn HostServices,
 ) -> (String, &'static str, String) {
+    if let Some(permit) = &inc.durable {
+        if let Err(error) = permit.fail(host) {
+            log.debug(&format!("could not record failed transfer request: {error}"));
+        }
+    }
     let need = inc
         .size
         .saturating_sub(inc.received.load(Ordering::Relaxed));

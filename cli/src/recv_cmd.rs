@@ -89,6 +89,8 @@ pub(crate) async fn recv_cmd(
         delivery: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let remember_stored = env.remember_stored.clone();
+    let retry_stop = stop.clone();
+    let retry_task = daemon.then(|| tokio::spawn(crate::retained_send_cmd::retry_loop(retry_stop.clone())));
     let engine = Engine::start(stop.clone(), move |stop, readiness| async move {
         let cli = Arc::new(crate::recv_ports::CliRecv::new(engine_log.clone()));
         let ports = RecvPorts::new(
@@ -130,7 +132,12 @@ pub(crate) async fn recv_cmd(
         )
         .await
     });
-    let outcome = match engine.wait().await {
+    let engine_result = engine.wait().await;
+    retry_stop.cancel();
+    if let Some(task) = retry_task {
+        let _ = task.await;
+    }
+    let outcome = match engine_result {
         Ok(outcome) => outcome,
         Err(error) => {
             signals.stop().await;
