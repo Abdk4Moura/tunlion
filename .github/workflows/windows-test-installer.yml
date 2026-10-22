@@ -1,0 +1,49 @@
+name: windows-test-installer
+
+on:
+  push:
+    branches: [win-test-installer]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download access test binary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 39843406807 -R ${{ github.repository }} -n tunlion-x86_64-pc-windows-msvc -D access
+      - name: Download shell test binary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 39843428578 -R ${{ github.repository }} -n tunlion-x86_64-pc-windows-msvc -D shell
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Stage files
+        shell: pwsh
+        run: |
+          $stage = "packaging/windows-test/stage"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item access/tunlion.exe "$stage/tunlion.exe" -Force
+          Copy-Item shell/tunlion.exe "$stage/tunlion-shell.exe" -Force
+          Copy-Item packaging/windows-test/README.md "$stage/README.md" -Force
+          Copy-Item packaging/windows-test/*.ps1 "$stage/"
+      - name: Package
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          & $iscc.Source "packaging/windows-test/tunlion-test.iss"
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: TunlionTestKitSetup
+          path: packaging/windows-test/Output/TunlionTestKitSetup.exe
