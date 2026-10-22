@@ -1827,6 +1827,7 @@ async fn recv_run(
     // Refresh the published L3 state every second: a stalled/removed endpoint
     // must downgrade `ready`, and a live one must keep the file fresh enough
     // for `expose --list`/`status` to trust it.
+    #[cfg(feature = "mesh")]
     let mut last_l3_tick = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
@@ -3567,6 +3568,7 @@ async fn recv_run(
             }
         }
 
+        #[cfg(feature = "mesh")]
         if daemon && last_l3_tick.elapsed() >= Duration::from_secs(1) {
             last_l3_tick = Instant::now();
             if let Some(m) = l3.as_ref() {
