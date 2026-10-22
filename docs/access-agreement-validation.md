@@ -136,8 +136,9 @@ revision, proven peer and `spec.shell`; the process mechanism is wrapped in
 to the existing `shell::exec_server` state machine on the accepted agreement's
 own `Mux`/transport. End, removing revisions and dropped/aborted sessions latch
 the same cancellation, and a `ShellCleanup` guard releases both stream ids if the
-embedding future is aborted. PTY/interactive `tty:true` remains refused by the
-existing exec server, and Windows remains `Unsupported`.
+embedding future is aborted. Exec-class `tty:true` remains refused by the
+existing exec server (interactive PTY is its own endpoint below), and Windows
+remains `Unsupported`.
 
 Refs (no merge/deploy): exact validated source commit
 `0c5a685290ce8e5d2fc299115500fc4cd526af48` (feature commit `7af5516a`, followed
@@ -171,9 +172,72 @@ Local durable log:
 Remote job directory: `/home/runner/work/_temp/tunlion-work/jobs/core-access-shell-20261022-05`.
 No local build/test/formatter was run.
 
-Remaining gaps: PTY/interactive shell (agreement admission around the existing
-PTY server lives in the CLI adapter and is not changed here); `tunlion-core`'s
-reduced profile still refuses to draft a shell offer because it has no embedded
-`ExecProcess` backend, so the host composition must come from the CLI/daemon
-adapter lane; Windows has no standard token backend; the authoritative primary
-role store/consent migration described above remains unimplemented.
+Remaining gaps from that checkpoint: `tunlion-core`'s reduced profile still
+refuses to draft a shell offer because it has no embedded process/PTY backend, so
+the host composition must come from the CLI/daemon adapter lane; Windows has no
+standard token backend; the authoritative primary role store/consent migration
+described above remains unimplemented. Interactive PTY support is recorded in the
+next section.
+
+## Agreement-scoped interactive PTY checkpoint
+
+Source adds `AgreementEngine::serve_pty`, initiator-side
+`AccessHandle::open_pty`/`AccessPty`/`PtyRequest`, and a shared host seam
+`recv::servers::shell::attach_pty`. The standing `pty-open` endpoint and the
+agreement endpoint now use that ONE seam for reservation, PTY stream/owner
+registration, the resize channel, `pty-open-ack`, spawn, pumps and natural-end
+cleanup; PTY field sanitization is shared via
+`shell::admit::parse_pty_open_fields`. Agreement admission is the same engine
+check as exec shell (exact accepted revision, exact proven peer, live state and
+`spec.shell`) and runs before any backend effect. `StandardLocalAccount` (the
+account half of `StandardLocalExecProcess`) is resolved before streams/argv and
+revalidated immediately before spawn; root/service identity, UID changes and
+account switching are refused. PTY sessions are one-shot: `resume`/`resume_from`
+is refused, so reconnect cannot revive a terminal agreement.
+
+End, a removing revision, expiry, stream close or a dropped/aborted serving
+future calls the host's `PtySession::end` (the existing PTY teardown kills the
+shell and closes the PTY), forgets the host session record and releases the mux
+stream/resizer. `PtySessionGuard` covers abnormal future exit. The fixture
+accepts real stream input, returns PTY output, applies `pty-resize`, and observes
+the session end on agreement End; it also asserts no device/cap store writes.
+
+Refs (no merge/deploy): exact validated source commit
+`119e8d48d382f29ca6db3525f073f81e3ce03aad` (feature commit; the validation-record
+commit follows and changes docs only). Job `core-access-pty-20261022-05` on the
+reusable Linux worker (`ci-worker-dovm`, shared `build.lock`) exited 0:
+
+```sh
+cargo test -p filament-peerloop --lib access::tests -- --test-threads=2
+cargo test -p filament-peerloop --lib access_session::tests -- --test-threads=2
+cargo test -p filament-peerloop --lib recv::servers::shell::tests -- --test-threads=2
+cargo test -p filament-peerloop --lib shell::admit::tests -- --test-threads=2
+cargo test -p filament-peerloop --lib shell::standard_account::tests -- --test-threads=2
+cargo test -p tunlion-core --lib access::tests -- --test-threads=2
+cargo check -p filament-peerloop --no-default-features --features dispatch
+cargo check -p filament-peerloop --lib
+cargo check -p tunlion-core --lib
+```
+
+Results on `119e8d48`: **15 access tests**, **7 access-session tests**, **23
+standing PTY tests**, **15 PTY admission tests**, **2 standard-account tests**,
+and **1 tunlion-core access test** passed; reduced dispatch, default peerloop
+library and tunlion-core library checks passed. New coverage includes
+`access::tests::shell_endpoint::pty_serving_checks_the_agreement_before_it_reaches_the_backend`
+and
+`access_session::tests::pty_contract::interactive_pty_is_agreement_scoped_and_end_kills_the_session`;
+the existing standing PTY suite (including ack/cap/collision/reattach/teardown
+ordering) stayed green after the shared-seam refactor.
+
+Local durable log:
+`/root/pairing-ux/evidence/access-checkpoint-20261022/core-pty-05.log`.
+Remote job directory: `/home/runner/work/_temp/tunlion-work/jobs/core-access-pty-20261022-05`.
+No local build/test/formatter was run.
+
+Remaining gaps: the real `PtyBackend`/`PtySession` implementation still lives in
+the CLI adapter lane (`CliPty`), so `tunlion-core` continues to refuse drafting a
+shell offer; the CLI/daemon adapter must compose it and must not route temporary
+opens through standing shell admission. Windows has no standard token or ConPTY
+agreement backend; the authoritative primary role store/consent migration remains
+unimplemented. Process-tree termination is the existing PTY `end`/child-kill
+behavior, not a new tree-kill mechanism.
