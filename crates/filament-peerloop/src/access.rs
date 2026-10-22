@@ -997,6 +997,92 @@ mod tests {
             assert!(frames.try_recv().is_err());
             assert_eq!(e.snapshot(&s.id,10).unwrap().state,AgreementState::Ended);
         }
+
+        #[cfg(feature="dispatch")]
+        #[tokio::test]
+        async fn authenticated_folder_async_reads_preserve_binary_bytes_over_same_mux_and_revoke() {
+            use crate::send::ceremony::{Ceremony,Inbound,TemporaryBinding,TemporaryRole};
+            use crate::mount_proto::{MountClient,path_encode,parse_mount_caps,DEFAULT_MOUNT_MAX_SIZE};
+            use crate::driver::Cancellation;
+            struct Bridge {
+                peer:std::sync::Mutex<std::sync::Weak<crate::l2::Mux>>,
+                controls:mpsc::UnboundedSender<Value>,
+            }
+            #[async_trait::async_trait]
+            impl filament_transport::net::Transport for Bridge {
+                async fn send_control(&self,v:&Value)->anyhow::Result<()> {
+                    let _=self.controls.send(v.clone());
+                    if v["type"]=="l2-close" {
+                        let peer=self.peer.lock().unwrap().upgrade();
+                        if let (Some(peer),Some(sid))=(peer,crate::l2::wire_sid(v)) { peer.on_close(sid,v["err"].as_str()).await; }
+                    }Ok(())
+                }
+                async fn send_frame(&self,sid:u32,_:u64,payload:&[u8])->anyhow::Result<()> {
+                    let peer=self.peer.lock().unwrap().upgrade().ok_or_else(||anyhow::anyhow!("peer mux closed"))?;
+                    peer.on_frame(sid,bytes::Bytes::copy_from_slice(payload)).await;Ok(())
+                }
+                async fn flush(&self)->anyhow::Result<()> {Ok(())}
+                fn max_payload(&self)->usize{65536}
+                fn is_dead(&self)->bool{false}
+                fn is_alive(&self)->bool{true}
+                fn as_any(&self)->&dyn std::any::Any{self}
+            }
+            let fixture=Fixture::new();
+            let expected:Vec<u8>=(0..DEFAULT_MOUNT_MAX_SIZE as usize*2+13).map(|n|(n%256)as u8).collect();
+            std::fs::write(fixture.0.join("binary"),&expected).unwrap();std::fs::write(fixture.0.join("empty"),b"").unwrap();
+            let hostkey=key();let hostpub=peer(&hostkey).public_key();let recipient=key();let recipientpub=peer(&recipient).public_key();
+            let e=Arc::new(AgreementEngine::new(hostpub,Vec::new()));
+            let scope=AccessSpec{folders:vec![FolderAccess::canonical("folder".into(),&fixture.0,FolderMode::ReadOnly).unwrap()],..AccessSpec::default()};
+            let binding=TemporaryBinding::new(hostpub,&scope,Lifetime::UntilEnded,50).unwrap();
+            let mut hostcer=Ceremony::new_temporary("folder fixture words","1234",binding.clone(),TemporaryRole::Host);
+            let mut recipientcer=Ceremony::new_temporary("folder fixture words","1234",binding.clone(),TemporaryRole::Recipient);
+            let hm=hostcer.msg_payload();let rm=recipientcer.msg_payload();hostcer.on_signal(&rm,None);recipientcer.on_signal(&hm,None);
+            let hc=hostcer.take_confirm_payload("host-fp","recipient-fp").unwrap();let rc=recipientcer.take_confirm_payload("recipient-fp","host-fp").unwrap();
+            assert!(matches!(hostcer.on_signal(&rc,Some(("host-fp","recipient-fp"))),Inbound::Consumed));
+            assert!(matches!(recipientcer.on_signal(&hc,Some(("recipient-fp","host-fp"))),Inbound::Consumed));
+            let msg=recipientcer.temporary_possession_message(recipientpub,hostpub).unwrap();
+            let proven=hostcer.authenticate_temporary_peer(hostpub,recipientpub,recipient.sign(&msg).as_ref().try_into().unwrap()).unwrap();
+            let s=e.offer_bound(proven,&binding,"folder-host",scope,Lifetime::UntilEnded,50,10).unwrap();
+            let host_signature=hostkey.sign(&e.review_message(&s.id,1,10).unwrap()).as_ref().try_into().unwrap();
+            let review=recipientcer.review_temporary_offer(s.clone(),host_signature,recipientpub,10).unwrap();
+            e.accept(&s.id,1,proven,recipient.sign(&review.acceptance_message().unwrap()).as_ref().try_into().unwrap(),10).unwrap();
+
+            let (control_tx,mut controls)=mpsc::unbounded_channel();
+            let ht=Arc::new(Bridge{peer:std::sync::Mutex::new(std::sync::Weak::new()),controls:control_tx.clone()});
+            let rt=Arc::new(Bridge{peer:std::sync::Mutex::new(std::sync::Weak::new()),controls:control_tx});
+            let hmux=crate::l2::Mux::new(ht.clone(),Arc::new(crate::host::NoHost));let rmux=crate::l2::Mux::new(rt.clone(),Arc::new(crate::host::NoHost));
+            *ht.peer.lock().unwrap()=Arc::downgrade(&rmux);*rt.peer.lock().unwrap()=Arc::downgrade(&hmux);
+            let unrelated=crate::l2::L2_SID_BASE|50;let _unrelated_rx=rmux.register_stream(unrelated).await.unwrap();
+            let sid=crate::l2::L2_SID_BASE|51;let sid2=crate::l2::L2_SID_BASE|52;
+            let mut tasks=Vec::new();let mut clients=Vec::new();
+            for sid in [sid,sid2] {
+                let rx=rmux.register_stream(sid).await.unwrap();
+                let engine=e.clone();let id=s.id.clone();let mux=hmux.clone();
+                tasks.push(tokio::spawn(async move{engine.serve_folder(&id,1,proven,"folder",sid,mux,Arc::new(crate::host::NoHost)).await}));
+                let ack=tokio::time::timeout(std::time::Duration::from_secs(2),controls.recv()).await.unwrap().unwrap();
+                assert_eq!(ack["type"],"mount-open-ack");assert_eq!(ack["sid"],sid);
+                let caps=parse_mount_caps(ack["caps"].clone()).unwrap();
+                clients.push(MountClient::from_mux_v2_with_mode(rt.clone(),sid,rx,caps,review.snapshot().spec.folders[0].mode.clone()));
+            }
+            let mut second=clients.pop().unwrap();let mut first=clients.pop().unwrap();
+            let open=|path:&str|MountOp::Open{path:path_encode(std::path::Path::new(path)),flags:libc::O_RDONLY};
+            let opened=first.call(open("binary")).await.unwrap();let MountResult::Ok(opened)=opened.result else{panic!("open failed")};let fh=opened["fh"].as_u64().unwrap();
+            let opened2=second.call(open("binary")).await.unwrap();let MountResult::Ok(opened2)=opened2.result else{panic!("second open failed")};let fh2=opened2["fh"].as_u64().unwrap();
+            let stop=Cancellation::default();let timeout=std::time::Duration::from_secs(2);
+            let (a,b)=tokio::join!(first.read_binary(fh,0,32,timeout,&stop),second.read_binary(fh2,20,32,timeout,&stop));
+            assert_eq!(&a.unwrap()[..],&expected[..32]);assert_eq!(&b.unwrap()[..],&expected[20..52]);
+            let mut received=Vec::new();
+            loop {let chunk=first.read_binary(fh,received.len()as u64,DEFAULT_MOUNT_MAX_SIZE,timeout,&stop).await.unwrap();if chunk.is_empty(){break;}received.extend_from_slice(&chunk);}
+            assert_eq!(received,expected);
+            let empty=first.call(open("empty")).await.unwrap();let MountResult::Ok(empty)=empty.result else{panic!("empty open failed")};
+            assert!(first.read_binary(empty["fh"].as_u64().unwrap(),0,DEFAULT_MOUNT_MAX_SIZE,timeout,&stop).await.unwrap().is_empty());
+            assert!(first.call(MountOp::Truncate{path:path_encode(std::path::Path::new("binary")),size:0}).await.is_err());
+            first.call(MountOp::Release{fh}).await.unwrap();
+            e.end(&s.id,10).unwrap();for task in tasks{assert_eq!(task.await.unwrap(),Err(AccessError::Ended));}
+            assert!(second.read_binary(fh2,0,1,timeout,&stop).await.is_err());
+            assert!(rmux.has_stream(unrelated).await);rmux.drop_stream(unrelated).await;
+            assert_eq!(std::fs::read(fixture.0.join("binary")).unwrap(),expected);
+        }
     }
 
     #[cfg(all(feature = "forward-server", feature = "dispatch"))]

@@ -416,45 +416,116 @@ impl MountClient {
         c
     }
 
-    /// Send a request and await its response (async).
+    /// Explicit local restriction from the authenticated accepted folder mode.
+    /// This does not replace server enforcement or grant writable access.
+    pub fn from_mux_v2_with_mode(
+        transport: Arc<dyn Transport>, sid: u32, rx: mpsc::Receiver<PipeItem>,
+        caps: MountCaps, mode: crate::access::FolderMode,
+    ) -> Self {
+        let mut client = Self::from_mux_v2(transport, sid, rx, caps);
+        client.set_read_only(mode == crate::access::FolderMode::ReadOnly);
+        if client.read_only { client.caps.max_write_size = 0; }
+        client
+    }
+
+    /// Metadata-only compatibility wrapper. For v2 file contents use
+    /// `read_binary` or `call_binary`, which preserve the binary suffix.
     pub async fn call(&mut self, op: MountOp) -> Result<MountResponse> {
+        self.call_binary(op, None).await.map(|(response, _)| response)
+    }
+
+    /// Async byte-preserving request with a total request deadline. Dropping
+    /// this future retires its already allocated ID; a late response can never
+    /// satisfy a later call. No blocking thread/runtime bridge is needed.
+    pub async fn call_binary(&mut self, op: MountOp, data: Option<&[u8]>)
+        -> Result<(MountResponse, Option<Bytes>)> {
+        self.call_binary_with_cancel(op, data, MOUNT_CALL_TIMEOUT, &crate::driver::Cancellation::default()).await
+    }
+
+    pub async fn call_binary_with_cancel(&mut self, op: MountOp, data: Option<&[u8]>,
+        timeout: std::time::Duration, cancel: &crate::driver::Cancellation)
+        -> Result<(MountResponse, Option<Bytes>)> {
         self.refuse_local_write(&op)?;
-        let id = self.next_id;
-        self.next_id += 1;
-        let req = MountRequest { id, bin: None, op };
-        let mut payload = serde_json::to_vec(&req)?;
-        payload.push(b'\n');
-        self.tx.send(payload).ok();
+        anyhow::ensure!(!timeout.is_zero(), "mount operation timeout must be positive");
+        if let MountOp::Read { size, .. } = &op {
+            anyhow::ensure!(*size <= self.caps.max_read_size.min(DEFAULT_MOUNT_MAX_SIZE), "mount read exceeds negotiated limit");
+        }
+        match (&op, data) {
+            (MountOp::Write { size, .. }, Some(bytes)) => {
+                anyhow::ensure!(self.binary_frames, "binary mount write requires protocol v2");
+                anyhow::ensure!(bytes.len() == *size as usize && bytes.len() <= self.caps.max_write_size.min(DEFAULT_MOUNT_MAX_SIZE) as usize,
+                    "mount write exceeds negotiated limit or size mismatch");
+            }
+            (MountOp::Write { .. }, None) => anyhow::bail!("mount write missing data"),
+            (_, Some(_)) => anyhow::bail!("only mount writes carry request data"),
+            _ => {}
+        }
+        let request = async {
+            let id = self.next_id;
+            self.next_id = self.next_id.checked_add(1).ok_or_else(|| anyhow::anyhow!("mount request IDs exhausted"))?;
+            let req = MountRequest { id, bin: data.map(|_| true), op };
+            let mut header = serde_json::to_vec(&req)?;
+            anyhow::ensure!(header.len() <= MAX_HEADER_LEN, "mount request header exceeds limit");
+            header.push(b'\n');
+            let payload = encode_frame(&header, data);
+            self.tx.send(payload).map_err(|_| anyhow::anyhow!("mount channel closed"))?;
+            self.receive_async_response(id).await
+        };
+        match cancel.run(tokio::time::timeout(timeout, request)).await {
+            crate::driver::DriverOutcome::Cancelled => anyhow::bail!("mount operation cancelled"),
+            crate::driver::DriverOutcome::Returned(Err(_)) => anyhow::bail!("mount operation timed out"),
+            crate::driver::DriverOutcome::Returned(Ok(result)) => result,
+        }
+    }
+
+    /// Protocol-v2 read contents, validating the declared byte count as well as
+    /// negotiated bounds. Empty content is a successful zero-byte read, not a
+    /// missing payload or fabricated success after a channel failure.
+    pub async fn read_binary(&mut self, fh: u64, offset: u64, size: u32,
+        timeout: std::time::Duration, cancel: &crate::driver::Cancellation) -> Result<Bytes> {
+        anyhow::ensure!(self.binary_frames, "binary mount read requires protocol v2");
+        let (response, data) = self.call_binary_with_cancel(MountOp::Read { fh, offset, size }, None, timeout, cancel).await?;
+        match response.result {
+            MountResult::Err(error) => anyhow::bail!("mount read refused ({}): {}", error.code, error.msg),
+            MountResult::Ok(value) => {
+                let data = data.ok_or_else(|| anyhow::anyhow!("mount read omitted binary content"))?;
+                anyhow::ensure!(value["n"].as_u64() == Some(data.len() as u64) && data.len() <= size as usize,
+                    "mount read byte count mismatch");
+                Ok(data)
+            }
+        }
+    }
+
+    async fn receive_async_response(&mut self, id: u64) -> Result<(MountResponse, Option<Bytes>)> {
         loop {
-            if self.binary_frames {
-                let parsed = if let Some((hdr, _bin, consumed)) = decode_frame_with_len(&self.buf) {
-                    let resp: MountResponse = serde_json::from_slice(hdr)?;
-                    Some((resp, consumed))
-                } else {
-                    None
-                };
-                if let Some((resp, consumed)) = parsed {
-                    let frame_bytes: Vec<u8> = self.buf.drain(..consumed).collect();
-                    if resp.id == id { return Ok(resp); }
-                    self.buf.splice(0..0, frame_bytes);
-                    continue;
+            if let Some(nl) = self.buf.iter().position(|&byte| byte == b'\n') {
+                anyhow::ensure!(nl <= MAX_HEADER_LEN, "mount response header exceeds limit");
+                let response: MountResponse = serde_json::from_slice(&self.buf[..nl])?;
+                let parsed = if self.binary_frames && response.bin == Some(true) {
+                    if self.buf.len() >= nl + 5 {
+                        let len = u32::from_le_bytes(self.buf[nl+1..nl+5].try_into().expect("four bytes")) as usize;
+                        anyhow::ensure!(len <= MAX_FRAME_DATA_LEN, "mount response data exceeds limit");
+                        let end = nl + 5 + len;
+                        if self.buf.len() >= end { Some((end,Some(Bytes::copy_from_slice(&self.buf[nl+5..end])))) } else { None }
+                    } else { None }
+                } else { Some((nl+1,None)) };
+                if let Some((consumed,data)) = parsed {
+                    self.buf.drain(..consumed);
+                    // &mut self permits one outstanding request. Lower IDs are
+                    // retired requests, not messages to reinsert and spin on.
+                    if response.id < id { continue; }
+                    anyhow::ensure!(response.id == id, "unsolicited future mount response");
+                    return Ok((response,data));
                 }
             } else {
-                if let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-                    let line = self.buf.drain(..nl).collect::<Vec<_>>();
-                    if !self.buf.is_empty() && self.buf[0] == b'\n' {
-                        self.buf.remove(0);
-                    }
-                    let resp: MountResponse = serde_json::from_slice(&line)?;
-                    if resp.id == id {
-                        return Ok(resp);
-                    }
-                    self.buf.splice(0..0, line);
-                    continue;
-                }
+                anyhow::ensure!(self.buf.len() <= MAX_HEADER_LEN, "unterminated mount response header");
             }
             match self.rx.recv().await {
-                Some(bytes) => self.buf.extend_from_slice(&bytes),
+                Some(bytes) => {
+                    anyhow::ensure!(self.buf.len().saturating_add(bytes.len()) <= MAX_HEADER_LEN + 1 + 4 + MAX_FRAME_DATA_LEN,
+                        "mount response buffer exceeds limit");
+                    self.buf.extend_from_slice(&bytes);
+                }
                 None => anyhow::bail!("mount channel closed"),
             }
         }
@@ -506,9 +577,9 @@ impl MountClient {
                     None
                 };
                 if let Some((resp, bin_data, consumed)) = parsed {
-                    let frame_bytes: Vec<u8> = self.buf.drain(..consumed).collect();
+                    self.buf.drain(..consumed);
                     if resp.id == id { return Ok((resp, bin_data)); }
-                    self.buf.splice(0..0, frame_bytes);
+                    anyhow::ensure!(resp.id < id, "unsolicited future mount response");
                     continue;
                 }
             } else {
@@ -517,7 +588,7 @@ impl MountClient {
                     if !self.buf.is_empty() && self.buf[0] == b'\n' { self.buf.remove(0); }
                     let resp: MountResponse = serde_json::from_slice(&line)?;
                     if resp.id == id { return Ok((resp, None)); }
-                    self.buf.splice(0..0, line);
+                    anyhow::ensure!(resp.id < id, "unsolicited future mount response");
                     continue;
                 }
             }
@@ -645,6 +716,119 @@ pub fn path_decode(encoded: &str) -> Result<PathBuf, MountError> {
     {
         let s = String::from_utf8_lossy(&bytes).into_owned();
         Ok(PathBuf::from(s))
+    }
+}
+
+#[cfg(test)]
+mod async_client_tests {
+    use super::*;
+    use crate::access::FolderMode;
+    use crate::driver::Cancellation;
+    use std::path::Path;
+    use std::time::Duration;
+
+    struct Requests(mpsc::UnboundedSender<Vec<u8>>);
+    #[async_trait::async_trait]
+    impl Transport for Requests {
+        async fn send_control(&self,_:&Value)->Result<()> { Ok(()) }
+        async fn send_frame(&self,_:u32,_:u64,payload:&[u8])->Result<()> { self.0.send(payload.to_vec()).map_err(|_|anyhow::anyhow!("request receiver closed")) }
+        async fn flush(&self)->Result<()> { Ok(()) }
+        fn max_payload(&self)->usize { 65536 }
+        fn is_dead(&self)->bool { false }
+        fn is_alive(&self)->bool { true }
+        fn as_any(&self)->&dyn std::any::Any { self }
+    }
+    fn client(mode:FolderMode)->(MountClient,mpsc::UnboundedReceiver<Vec<u8>>,mpsc::Sender<PipeItem>) {
+        let (requests,rx)=mpsc::unbounded_channel();let (incoming,stream)=mpsc::channel(16);
+        (MountClient::from_mux_v2_with_mode(Arc::new(Requests(requests)),1,stream,MountCaps::default(),mode),rx,incoming)
+    }
+    fn response(id:u64,data:&[u8])->Vec<u8> {
+        let r=MountResponse{id,bin:Some(true),result:MountResult::Ok(serde_json::json!({"n":data.len()}))};
+        let mut header=serde_json::to_vec(&r).unwrap();header.push(b'\n');encode_frame(&header,Some(data))
+    }
+    fn request_id(bytes:&[u8])->u64 { serde_json::from_slice::<MountRequest>(decode_frame(bytes).0).unwrap().id }
+
+    #[tokio::test]
+    async fn byte_preserving_async_reads_include_empty_binary_and_full_chunks() {
+        let (mut client,mut requests,incoming)=client(FolderMode::ReadOnly);
+        let cancel=Cancellation::default();
+        for len in [0,7,DEFAULT_MOUNT_MAX_SIZE as usize] {
+            let expected:Vec<_>=(0..len).map(|n|(n%256)as u8).collect();
+            let answer=expected.clone();
+            let serving=async {
+                let request=requests.recv().await.unwrap();let id=request_id(&request);
+                // Deliberately split binary length prefixes and include every
+                // byte value, including newline and zero, in the content.
+                for chunk in response(id,&answer).chunks(7) { incoming.send(Some(Bytes::copy_from_slice(chunk))).await.unwrap(); }
+            };
+            let reading=client.read_binary(4,0,len as u32,Duration::from_secs(2),&cancel);
+            let (read,())=tokio::join!(reading,serving);assert_eq!(&read.unwrap()[..],expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_request_late_response_cannot_spin_or_satisfy_next_request() {
+        let (mut client,mut requests,incoming)=client(FolderMode::ReadOnly);
+        let first={
+            let mut call=Box::pin(client.call_binary(MountOp::GetAttr{path:path_encode(Path::new("old"))},None));
+            let request=tokio::select! { result=&mut call=>panic!("unexpected completion: {result:?}"),request=requests.recv()=>request.unwrap() };
+            let id=request_id(&request);drop(call);id
+        };
+        let serving=async {
+            let next=request_id(&requests.recv().await.unwrap());assert!(next>first);
+            let mut batch=response(first,b"stale bytes");batch.extend(response(next,b"fresh\0bytes\n"));
+            incoming.send(Some(Bytes::from(batch))).await.unwrap();
+        };
+        let cancel=Cancellation::default();
+        let (read,())=tokio::join!(client.read_binary(1,0,32,Duration::from_secs(2),&cancel),serving);
+        assert_eq!(&read.unwrap()[..],b"fresh\0bytes\n");
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_timeout_retire_ids_and_do_not_emit_precancelled_requests() {
+        let (mut client,mut requests,incoming)=client(FolderMode::ReadOnly);
+        let cancel=Cancellation::default();cancel.cancel();
+        assert!(client.read_binary(1,0,1,Duration::from_secs(1),&cancel).await.unwrap_err().to_string().contains("cancelled"));
+        assert!(requests.try_recv().is_err());
+        let cancel=Cancellation::default();let stop=cancel.clone();
+        let (result,first)=tokio::join!(client.read_binary(1,0,8,Duration::from_secs(1),&cancel),async {
+            let id=request_id(&requests.recv().await.unwrap());stop.cancel();id
+        });
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        let live=Cancellation::default();
+        assert!(client.read_binary(1,0,8,Duration::from_millis(10),&live).await.unwrap_err().to_string().contains("timed out"));
+        let second=request_id(&requests.recv().await.unwrap());assert!(second>first);
+        let serving=async {
+            let next=request_id(&requests.recv().await.unwrap());
+            let mut batch=response(first,b"cancel");batch.extend(response(second,b"timeout"));batch.extend(response(next,b"ok"));
+            incoming.send(Some(Bytes::from(batch))).await.unwrap();
+        };
+        let (read,())=tokio::join!(client.read_binary(1,0,8,Duration::from_secs(2),&live),serving);
+        assert_eq!(&read.unwrap()[..],b"ok");
+    }
+
+    #[tokio::test]
+    async fn accepted_readonly_and_negotiated_limits_reject_without_sending() {
+        let (mut client,mut requests,_incoming)=client(FolderMode::ReadOnly);
+        assert_eq!(client.caps.max_write_size,0);
+        assert!(client.call(MountOp::Open{path:path_encode(Path::new("file")),flags:O_RDWR}).await.is_err());
+        assert!(client.call_binary(MountOp::Read{fh:1,offset:0,size:DEFAULT_MOUNT_MAX_SIZE+1},None).await.is_err());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_close_or_false_byte_count_is_not_empty_read_success() {
+        let (mut client,mut requests,incoming)=client(FolderMode::ReadOnly);
+        let cancel=Cancellation::default();
+        let serving=async {
+            let id=request_id(&requests.recv().await.unwrap());
+            let mut header=serde_json::to_vec(&MountResponse{id,bin:Some(true),result:MountResult::Ok(serde_json::json!({"n":10}))}).unwrap();header.push(b'\n');
+            incoming.send(Some(Bytes::from(encode_frame(&header,Some(b"short"))))).await.unwrap();
+        };
+        let (read,())=tokio::join!(client.read_binary(1,0,20,Duration::from_secs(2),&cancel),serving);
+        assert!(read.unwrap_err().to_string().contains("byte count"));
+        drop(incoming);
+        assert!(client.read_binary(1,0,20,Duration::from_secs(2),&cancel).await.is_err());
     }
 }
 
