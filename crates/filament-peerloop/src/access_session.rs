@@ -20,6 +20,77 @@ use crate::send::ceremony::{Ceremony,TemporaryBinding,TemporaryRole};
 pub enum AccessInbound { Control(Value), Frame{sid:u32,data:Bytes}, Disconnected }
 pub fn access_channel() -> (mpsc::Sender<AccessInbound>,mpsc::Receiver<AccessInbound>) { mpsc::channel(32) }
 
+/// The exact argv/cwd/env/liveness of one agreement-scoped shell-class exec.
+/// This is the existing `exec-open` vocabulary, not a second shell protocol.
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub struct ShellRequest {
+    pub argv:Vec<String>,
+    pub cwd:Option<std::path::PathBuf>,
+    pub env:Vec<(String,String)>,
+    pub alive_ms:Option<u64>,
+}
+
+/// The host's existing process primitive plus log sink, supplied by an
+/// embedder that can serve shell-class exec. The access endpoint itself never
+/// invents a process backend; without this runtime a shell open is refused.
+#[derive(Clone)]
+pub struct ShellRuntime {
+    pub process:Arc<dyn crate::shell::exec::ExecProcess>,
+    pub log:Arc<dyn crate::host::LogSink>,
+}
+impl ShellRuntime {
+    pub fn new(process:Arc<dyn crate::shell::exec::ExecProcess>, log:Arc<dyn crate::host::LogSink>) -> Self {
+        Self { process, log }
+    }
+}
+
+/// One live agreement-scoped shell/exec session on the initiator side.
+///
+/// Bytes written with [`write`](Self::write) ride `sid`; stdout arrives on
+/// `stdout`, stderr on `err_sid` through `stderr`. `control` carries the
+/// existing `exec-close`/`exec-alive-ack` frames. Dropping this handle closes
+/// only its own two stream ids; End/removal on the host tears down the process.
+pub struct AccessShell {
+    pub sid:u32,
+    pub err_sid:u32,
+    pub transport:Arc<dyn filament_transport::net::Transport>,
+    pub stdout:Option<mpsc::Receiver<crate::l2::PipeItem>>,
+    pub stderr:Option<mpsc::Receiver<crate::l2::PipeItem>>,
+    pub control:Option<mpsc::Receiver<Value>>,
+    mux:Arc<Mux>,generation:u64,err_generation:u64,
+}
+impl AccessShell {
+    /// Send stdin bytes on the existing exec stdin stream.
+    pub async fn write(&self,bytes:&[u8])->Result<(),AccessError>{
+        self.transport.send_frame(self.sid,0,bytes).await.map_err(|_|AccessError::Unavailable)
+    }
+    /// Signal stdin EOF using the existing empty-frame convention.
+    pub async fn eof(&self)->Result<(),AccessError>{
+        self.transport.send_frame(self.sid,0,&[]).await.map_err(|_|AccessError::Unavailable)
+    }
+    /// Forward the user's signal on the existing exec control channel.
+    pub async fn signal(&self,signal:&str)->Result<(),AccessError>{
+        self.transport.send_control(&json!({"type":"exec-signal","sid":self.sid,"signal":signal})).await.map_err(|_|AccessError::Unavailable)
+    }
+    /// Keepalive; only needed when the open announced `alive_ms`.
+    pub async fn alive(&self)->Result<(),AccessError>{
+        self.transport.send_control(&json!({"type":"exec-alive","sid":self.sid})).await.map_err(|_|AccessError::Unavailable)
+    }
+}
+impl Drop for AccessShell {
+    fn drop(&mut self){
+        if let Ok(rt)=tokio::runtime::Handle::try_current(){
+            let mux=self.mux.clone();let sid=self.sid;let err_sid=self.err_sid;
+            let generation=self.generation;let err_generation=self.err_generation;
+            rt.spawn(async move{
+                mux.drop_stream_if(sid,generation).await;
+                mux.drop_stream_if(err_sid,err_generation).await;
+                let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid})).await;
+            });
+        }
+    }
+}
+
 pub struct AuthenticatedAccessConnection {
     ceremony:Ceremony,
     transport:Arc<dyn filament_transport::net::Transport>,
@@ -58,7 +129,8 @@ impl AccessObserver {
 }
 type Reply=oneshot::Sender<Result<AgreementSnapshot,AccessError>>;
 type OpenReply=oneshot::Sender<Result<AccessPipe,AccessError>>;
-enum Command { Accept(u64,Reply),Update(u64,AccessSpec,Lifetime,Reply),End(Reply),Open(u64,String,bool,OpenReply) }
+type ShellReply=oneshot::Sender<Result<AccessShell,AccessError>>;
+enum Command { Accept(u64,Reply),Update(u64,AccessSpec,Lifetime,Reply),End(Reply),Open(u64,String,bool,OpenReply),OpenShell(u64,ShellRequest,ShellReply) }
 /// Own this pipe for the entire operation. Dropping it closes only its own SID.
 pub struct AccessPipe {
     pub sid:u32,pub transport:Arc<dyn filament_transport::net::Transport>,
@@ -68,6 +140,13 @@ pub struct AccessPipe {
 }
 impl Drop for AccessPipe{fn drop(&mut self){if let Ok(rt)=tokio::runtime::Handle::try_current(){let mux=self.mux.clone();let sid=self.sid;let generation=self.generation;rt.spawn(async move{mux.drop_stream_if(sid,generation).await;let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid})).await;});}}}
 struct PendingOpen { reply:OpenReply,stream:mpsc::Receiver<crate::l2::PipeItem>,generation:u64,folder:bool }
+struct PendingShell {
+    reply:ShellReply,
+    stdout:mpsc::Receiver<crate::l2::PipeItem>,
+    stderr:mpsc::Receiver<crate::l2::PipeItem>,
+    control:mpsc::Receiver<Value>,
+    err_sid:u32,generation:u64,err_generation:u64,
+}
 struct Client { tx:mpsc::Sender<Command>,stop:Cancellation,observer:AccessObserver }
 impl Drop for Client {fn drop(&mut self){self.stop.cancel();}}
 #[derive(Clone)]
@@ -92,6 +171,13 @@ impl AccessHandle {
     }
     pub async fn open_service(&self,revision:u64,resource:String)->Result<AccessPipe,AccessError>{self.open(revision,resource,false).await}
     pub async fn open_folder(&self,revision:u64,resource:String)->Result<AccessPipe,AccessError>{self.open(revision,resource,true).await}
+    /// Open the accepted agreement's shell resource through the existing exec
+    /// protocol. The host re-checks agreement/revision/peer/shell scope itself;
+    /// this call passing `revision` is not an authorization claim.
+    pub async fn open_shell(&self,revision:u64,request:ShellRequest)->Result<AccessShell,AccessError>{
+        let(tx,rx)=oneshot::channel();self.0.tx.send(Command::OpenShell(revision,request,tx)).await.map_err(|_|AccessError::Ended)?;
+        tokio::time::timeout(Duration::from_secs(10),rx).await.map_err(|_|AccessError::Unavailable)?.map_err(|_|AccessError::Ended)?
+    }
     async fn open(&self,revision:u64,resource:String,folder:bool)->Result<AccessPipe,AccessError>{
         let(tx,rx)=oneshot::channel();self.0.tx.send(Command::Open(revision,resource,folder,tx)).await.map_err(|_|AccessError::Ended)?;
         tokio::time::timeout(Duration::from_secs(10),rx).await.map_err(|_|AccessError::Unavailable)?.map_err(|_|AccessError::Ended)?
@@ -105,9 +191,17 @@ pub struct AccessDispatch {
     engine:Option<Arc<AgreementEngine>>,peer:Option<ProvenPeer>,review:Option<AuthenticatedReview>,snapshot:Option<AgreementSnapshot>,
     mux:Arc<Mux>,tasks:tokio::task::JoinSet<()>,ending:bool,
     pending_accept:Option<(u64,Reply)>,pending_opens:std::collections::BTreeMap<u32,PendingOpen>,
+    pending_shells:std::collections::BTreeMap<u32,PendingShell>,shell:Option<ShellRuntime>,
 }
 impl AccessDispatch {
     pub fn new(connection:AuthenticatedAccessConnection,key:OverlayKey,host:Arc<dyn HostServices>,draft:Option<AccessOfferDraft>,names:Vec<String>)->Result<(Self,AccessHandle),AccessError>{
+        Self::new_with_shell(connection,key,host,draft,names,None)
+    }
+    /// Same session, with the embedder's existing process primitive available
+    /// for agreement-scoped shell serving. A host that offers `spec.shell` must
+    /// supply this; otherwise the offer fails closed instead of advertising an
+    /// endpoint it cannot serve.
+    pub fn new_with_shell(connection:AuthenticatedAccessConnection,key:OverlayKey,host:Arc<dyn HostServices>,draft:Option<AccessOfferDraft>,names:Vec<String>,shell:Option<ShellRuntime>)->Result<(Self,AccessHandle),AccessError>{
         let local=key.public_key_bytes().map_err(|_|AccessError::Unavailable)?;
         let binding=connection.ceremony.temporary_binding().ok_or(AccessError::InvalidProof)?;
         let role=connection.ceremony.temporary_role().ok_or(AccessError::InvalidProof)?;
@@ -116,12 +210,16 @@ impl AccessDispatch {
             (None,TemporaryRole::Recipient) if binding.host_peer!=local=>{},
             _=>return Err(AccessError::InvalidProof),
         }
+        if draft.as_ref().is_some_and(|d|d.spec.shell)&&shell.is_none(){return Err(AccessError::Unsupported);}
+        // No standard token backend exists off Unix; do not advertise shell.
+        #[cfg(not(unix))]
+        if draft.as_ref().is_some_and(|d|d.spec.shell){return Err(AccessError::Unsupported);}
         let observer=AccessObserver(Arc::new(Mutex::new(Observed{view:AccessView{phase:AccessPhase::Authenticating,agreement:None,peer_acknowledged_end:false,failure:None},sequence:0,events:VecDeque::new()})));
         let (tx,commands)=mpsc::channel(8);let stop=Cancellation::default();
         let handle=AccessHandle(Arc::new(Client{tx,stop:stop.clone(),observer:observer.clone()}));
         let engine=draft.as_ref().map(|_|Arc::new(AgreementEngine::new(local,names)));
         let mux=Mux::new(connection.transport.clone(),host.clone());
-        Ok((Self{connection,key,host,draft,commands,stop,observer,engine,peer:None,review:None,snapshot:None,mux,tasks:tokio::task::JoinSet::new(),ending:false,pending_accept:None,pending_opens:std::collections::BTreeMap::new()},handle))
+        Ok((Self{connection,key,host,draft,commands,stop,observer,engine,peer:None,review:None,snapshot:None,mux,tasks:tokio::task::JoinSet::new(),ending:false,pending_accept:None,pending_opens:std::collections::BTreeMap::new(),pending_shells:std::collections::BTreeMap::new(),shell},handle))
     }
     fn view(&self,phase:AccessPhase,ack:bool,failure:Option<String>){self.observer.publish(AccessView{phase,agreement:self.snapshot.clone(),peer_acknowledged_end:ack,failure});}
     async fn send(&self,payload:Value)->Result<(),AccessError>{
@@ -138,6 +236,7 @@ impl AccessDispatch {
         self.tasks.shutdown().await;self.mux.shutdown_all().await;
         if let Some((_,reply))=self.pending_accept.take(){let _=reply.send(Err(AccessError::Ended));}
         for(_,pending)in std::mem::take(&mut self.pending_opens){let _=pending.reply.send(Err(AccessError::Ended));}
+        for(_,pending)in std::mem::take(&mut self.pending_shells){let _=pending.reply.send(Err(AccessError::Ended));}
         if let Some(s)=&mut self.snapshot{if !matches!(s.state,AgreementState::Ended|AgreementState::Expired|AgreementState::Declined){s.state=AgreementState::Ended;s.accepted_revision=None;}}
     }
     pub async fn drive(mut self,core_stop:Cancellation)->Result<(),AccessError>{
@@ -182,6 +281,10 @@ impl AccessDispatch {
                         let result=self.begin_open(revision,&resource,folder).await;
                         match result{Ok((sid,stream,generation))=>{self.pending_opens.insert(sid,PendingOpen{reply,stream,generation,folder});},Err(error)=>{let _=reply.send(Err(error));}}
                     },
+                    Some(Command::OpenShell(revision,request,reply))=>{
+                        let result=self.begin_shell(revision,&request).await;
+                        match result{Ok((sid,err_sid,stdout,stderr,control,generation,err_generation))=>{self.pending_shells.insert(sid,PendingShell{reply,stdout,stderr,control,err_sid,generation,err_generation});},Err(error)=>{let _=reply.send(Err(error));}}
+                    },
                     Some(Command::Update(revision,spec,lifetime,reply))=>{
                         let result=if self.ending{Err(AccessError::Ended)}else if let (Some(engine),Some(s))=(&self.engine,&self.snapshot){engine.revise(&s.id,revision,spec,lifetime,self.host.now_secs())}else{Err(AccessError::Unsupported)};
                         if let Ok(s)=&result{self.snapshot=Some(s.clone());self.send_review().await?;self.view(AccessPhase::AwaitingAcceptance,false,None);}
@@ -198,6 +301,8 @@ impl AccessDispatch {
                     if self.peer.is_some_and(|peer|self.host.delegated_access_for(&peer.public_key()).is_some()){return Err(AccessError::Unsupported);}
                     let abandoned:Vec<_>=self.pending_opens.iter().filter(|(_,open)|open.reply.is_closed()).map(|(sid,_)|*sid).collect();
                     for sid in abandoned{if let Some(open)=self.pending_opens.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;let _=self.send(json!({"type":"l2-close","sid":sid})).await;}}
+                    let abandoned_shells:Vec<_>=self.pending_shells.iter().filter(|(_,open)|open.reply.is_closed()).map(|(sid,_)|*sid).collect();
+                    for sid in abandoned_shells{if let Some(open)=self.pending_shells.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;self.mux.drop_stream_if(open.err_sid,open.err_generation).await;let _=self.send(json!({"type":"l2-close","sid":sid})).await;}}
                     if self.pending_accept.as_ref().is_some_and(|(_,reply)|reply.is_closed()){return Err(AccessError::Unavailable);}
                     if end_deadline.is_some_and(|at|tokio::time::Instant::now()>=at){return Ok(());}
                     if self.snapshot.is_none() && tokio::time::Instant::now()>=proof_deadline{return Err(AccessError::Expired);}
@@ -226,10 +331,39 @@ impl AccessDispatch {
         if let Err(error)=self.send(json!({"type":"access-open","v":1,"id":s.id,"revision":revision,"resource":resource,"sid":sid,"kind":if folder{"folder"}else{"tcp"}})).await{self.mux.drop_stream_if(sid,generation).await;return Err(error);}
         Ok((sid,stream,generation))
     }
+    async fn begin_shell(&self,revision:u64,request:&ShellRequest)->Result<(u32,u32,mpsc::Receiver<crate::l2::PipeItem>,mpsc::Receiver<crate::l2::PipeItem>,mpsc::Receiver<Value>,u64,u64),AccessError>{
+        if self.ending{return Err(AccessError::Ended);}if self.engine.is_some(){return Err(AccessError::Unsupported);}
+        let s=self.snapshot.as_ref().ok_or(AccessError::NotAccepted)?;
+        if s.state!=AgreementState::Active || s.accepted_revision!=Some(revision){return Err(AccessError::NotAccepted);}
+        if s.revision!=revision{return Err(AccessError::StaleRevision);}
+        if !s.spec.shell{return Err(AccessError::InvalidSpec);}
+        if self.pending_opens.len()+self.pending_shells.len()>=crate::l2::MAX_STREAMS_PER_LINK{return Err(AccessError::Capacity);}
+        let sid=self.mux.alloc_sid();let err_sid=self.mux.alloc_sid();
+        if sid==err_sid{return Err(AccessError::Unavailable);}
+        let mut frame=json!({"type":"access-open","v":1,"id":s.id,"revision":revision,"sid":sid,"kind":"shell","err_sid":err_sid,"argv":request.argv.clone()});
+        if let Some(cwd)=&request.cwd{let Some(cwd)=cwd.to_str()else{return Err(AccessError::InvalidSpec);};frame["cwd"]=json!(cwd);}
+        if !request.env.is_empty(){frame["env"]=json!(request.env.iter().map(|(k,v)|format!("{k}={v}")).collect::<Vec<_>>());}
+        if let Some(alive)=request.alive_ms{frame["alive_ms"]=json!(alive);}
+        // Apply the ONE existing exec frame bounds/policy before anything is
+        // registered or sent; the host parses the same vocabulary again.
+        crate::shell::exec::parse_exec_open(&frame).ok_or(AccessError::InvalidSpec)?;
+        let (stdout,generation)=self.mux.register_access_stream(sid).await.ok_or(AccessError::Capacity)?;
+        let (stderr,err_generation)=match self.mux.register_access_stream(err_sid).await{
+            Some(stream)=>stream,
+            None=>{self.mux.drop_stream_if(sid,generation).await;return Err(AccessError::Capacity);}
+        };
+        let control=self.mux.register_exec_initiator(sid).await;
+        if let Err(error)=self.send(frame).await{
+            self.mux.drop_stream_if(sid,generation).await;
+            self.mux.drop_stream_if(err_sid,err_generation).await;
+            return Err(error);
+        }
+        Ok((sid,err_sid,stdout,stderr,control,generation,err_generation))
+    }
     async fn control(&mut self,payload:Value)->Result<bool,AccessError>{
         if serde_json::to_vec(&payload).map_err(|_|AccessError::InvalidSpec)?.len()>128*1024{return Err(AccessError::Capacity);}
         let kind=payload["type"].as_str().ok_or(AccessError::InvalidSpec)?;
-        if kind=="l2-close"{if let Some(sid)=crate::l2::wire_sid(&payload){self.mux.on_close(sid,payload["err"].as_str()).await;if let Some(open)=self.pending_opens.remove(&sid){let _=open.reply.send(Err(AccessError::Unavailable));}}return Ok(false);}
+        if kind=="l2-close"{if let Some(sid)=crate::l2::wire_sid(&payload){self.mux.on_close(sid,payload["err"].as_str()).await;if let Some(open)=self.pending_opens.remove(&sid){let _=open.reply.send(Err(AccessError::Unavailable));}if let Some(open)=self.pending_shells.remove(&sid){self.mux.drop_stream_if(sid,open.generation).await;self.mux.drop_stream_if(open.err_sid,open.err_generation).await;let _=open.reply.send(Err(AccessError::Unavailable));}}return Ok(false);}
         if matches!(kind,"l2-open-ack"|"mount-open-ack"){
             let sid=crate::l2::wire_sid(&payload).ok_or(AccessError::InvalidSpec)?;
             if let Some(open)=self.pending_opens.remove(&sid){
@@ -241,6 +375,35 @@ impl AccessDispatch {
                 let pipe=AccessPipe{sid,transport:self.mux.transport(),stream:Some(open.stream),mux:self.mux.clone(),generation:open.generation,#[cfg(feature="mount-server")]folder_caps};
                 let _=open.reply.send(Ok(pipe));
             }return Ok(false);
+        }
+        // An agreement shell open completes on the EXISTING exec-open-ack (the
+        // exec server announces stdout=sid and the initiator's stderr sid).
+        if kind=="exec-open-ack"{
+            let sid=crate::l2::wire_sid(&payload).ok_or(AccessError::InvalidSpec)?;
+            if let Some(open)=self.pending_shells.remove(&sid){
+                let ack_err=payload["err"].as_u64().and_then(|v|u32::try_from(v).ok());
+                if ack_err!=Some(open.err_sid){
+                    self.mux.drop_stream_if(sid,open.generation).await;
+                    self.mux.drop_stream_if(open.err_sid,open.err_generation).await;
+                    let _=open.reply.send(Err(AccessError::InvalidSpec));
+                }else{
+                    let shell=AccessShell{sid,err_sid:open.err_sid,transport:self.mux.transport(),stdout:Some(open.stdout),stderr:Some(open.stderr),control:Some(open.control),mux:self.mux.clone(),generation:open.generation,err_generation:open.err_generation};
+                    let _=open.reply.send(Ok(shell));
+                }
+            }return Ok(false);
+        }
+        if matches!(kind,"exec-close"|"exec-alive-ack"){
+            if let Some(sid)=crate::l2::wire_sid(&payload){self.mux.on_exec_initiator_frame(sid,payload.clone()).await;}
+            return Ok(false);
+        }
+        // Initiator heartbeats/signals reach only a live exec session on THIS
+        // peer's mux; the answer goes back on the same authenticated link.
+        if matches!(kind,"exec-alive"|"exec-signal"){
+            if let (Some(sid),Some(msg))=(crate::l2::wire_sid(&payload),crate::l2::mux::ExecCtl::from_frame(&payload)){
+                let live=self.mux.exec_control(sid,msg).await;
+                if live&&msg==crate::l2::mux::ExecCtl::Alive{let _=self.send(json!({"type":"exec-alive-ack","sid":sid})).await;}
+            }
+            return Ok(false);
         }
         if payload["v"].as_u64()!=Some(1){return Err(AccessError::Unsupported);}
         let local=self.key.public_key_bytes().map_err(|_|AccessError::Unavailable)?;
@@ -286,11 +449,32 @@ impl AccessDispatch {
             "access-open" if self.engine.is_some() && !self.ending=>{
                 if self.host.delegated_access_for(&peer.public_key()).is_some(){return Err(AccessError::Unsupported);}
                 let revision=payload["revision"].as_u64().ok_or(AccessError::InvalidSpec)?;let sid=crate::l2::wire_sid(&payload).ok_or(AccessError::InvalidSpec)?;
-                let resource=payload["resource"].as_str().filter(|id|id.len()<=128).ok_or(AccessError::InvalidSpec)?.to_string();
                 if self.tasks.len()>=crate::l2::MAX_STREAMS_PER_LINK{return Err(AccessError::Capacity);}
-                let folder=payload["kind"].as_str()==Some("folder");let engine=self.engine.as_ref().ok_or(AccessError::Unsupported)?.clone();
+                let engine=self.engine.as_ref().ok_or(AccessError::Unsupported)?.clone();
                 let id=current.id.clone();let mux=self.mux.clone();let host=self.host.clone();
-                self.tasks.spawn(async move{let result=if folder{engine.serve_folder(&id,revision,peer,&resource,sid,mux.clone(),host).await}else{engine.serve_forward(&id,revision,peer,&resource,sid,mux.clone(),host.now_secs()).await};if let Err(error)=result{let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;}});
+                match payload["kind"].as_str().unwrap_or("tcp"){
+                    "shell"=>{
+                        #[cfg(feature="exec-server")]
+                        {
+                            let Some(runtime)=self.shell.clone()else{
+                                let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"shell is not available in this build"})).await;
+                                return Ok(false);
+                            };
+                            let request=crate::shell::exec::parse_exec_open(&payload).ok_or(AccessError::InvalidSpec)?;
+                            self.tasks.spawn(async move{let result=engine.serve_shell(&id,revision,peer,sid,request,mux.clone(),host,runtime.process,runtime.log).await;if let Err(error)=result{let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;}});
+                        }
+                        #[cfg(not(feature="exec-server"))]
+                        {
+                            let _=(engine,id,revision,peer,host);
+                            let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":"exec receive is not available in this build"})).await;
+                        }
+                    }
+                    kind=>{
+                        let folder=kind=="folder";
+                        let resource=payload["resource"].as_str().filter(|id|id.len()<=128).ok_or(AccessError::InvalidSpec)?.to_string();
+                        self.tasks.spawn(async move{let result=if folder{engine.serve_folder(&id,revision,peer,&resource,sid,mux.clone(),host).await}else{engine.serve_forward(&id,revision,peer,&resource,sid,mux.clone(),host.now_secs()).await};if let Err(error)=result{let _=mux.transport().send_control(&json!({"type":"l2-close","sid":sid,"err":error.to_string()})).await;}});
+                    }
+                }
             },
             _=>return Err(AccessError::Unsupported),
         }Ok(false)
@@ -330,6 +514,9 @@ mod tests {
         async fn connect_local_stream(&self,h:&str,p:u16)->std::io::Result<tokio::net::TcpStream>{tokio::net::TcpStream::connect((h,p)).await}
     }
     fn pair(spec:AccessSpec)->(Fixture,AccessDispatch,AccessHandle,AccessDispatch,AccessHandle){
+        pair_with(spec,None)
+    }
+    fn pair_with(spec:AccessSpec,shell:Option<ShellRuntime>)->(Fixture,AccessDispatch,AccessHandle,AccessDispatch,AccessHandle){
         let fixture=Fixture::new();let hostkey=OverlayKey::new(fixture.0.join("host.ed25519"));let recipientkey=OverlayKey::new(fixture.0.join("recipient.ed25519"));
         let hostpub=hostkey.public_key_bytes().unwrap();let _=recipientkey.public_key_bytes().unwrap();
         let binding=TemporaryBinding::new(hostpub,&spec,Lifetime::UntilEnded,50).unwrap();
@@ -346,7 +533,7 @@ mod tests {
         let host_connection=AuthenticatedAccessConnection{ceremony:host,transport:Arc::new(Port(rtx)),incoming:hrx};
         let recipient_connection=AuthenticatedAccessConnection{ceremony:recipient,transport:Arc::new(Port(htx)),incoming:rrx};
         let draft=AccessOfferDraft{binding,spec,lifetime:Lifetime::UntilEnded,claim_expires_at:50,label:"existing-device".into()};
-        let(host,hh)=AccessDispatch::new(host_connection,hostkey,Arc::new(Host::default()),Some(draft),vec![]).unwrap();
+        let(host,hh)=AccessDispatch::new_with_shell(host_connection,hostkey,Arc::new(Host::default()),Some(draft),vec![],shell).unwrap();
         let(recipient,rh)=AccessDispatch::new(recipient_connection,recipientkey,Arc::new(NoHost),None,vec![]).unwrap();
         (fixture,host,hh,recipient,rh)
     }
@@ -417,5 +604,82 @@ mod tests {
         let mut unpublished=crate::download_output::OwnedDownload::create(&destination.0,"revoked",expected.len()as u64,100000,None).await.unwrap();unpublished.write_chunk(&expected,&cancel).await.unwrap();
         hh.end().await.unwrap();let _=ht.await.unwrap();let _=rt.await.unwrap();assert!(client.read_binary(fh,0,1,Duration::from_secs(2),&cancel).await.is_err());
         let revoked=Cancellation::default();revoked.cancel();assert!(matches!(unpublished.finish(&revoked).await,Err(crate::download_output::OutputError::Cancelled)));assert!(!destination.0.join("revoked").exists());
+    }
+
+    #[cfg(all(unix, feature="exec-server"))]
+    mod shell_contract {
+        use super::*;
+        use std::pin::Pin;
+        use std::task::{Context,Poll};
+        use tokio::io::{AsyncRead,ReadBuf};
+        use crate::shell::exec::{ExecChild,ExecExit,ExecProcess,ExecSpawnSpec,ExecUserContext};
+
+        struct BytesReader{bytes:Vec<u8>,at:usize}
+        impl AsyncRead for BytesReader{
+            fn poll_read(mut self:Pin<&mut Self>,_:&mut Context<'_>,buf:&mut ReadBuf<'_>)->Poll<std::io::Result<()>>{
+                if self.at>=self.bytes.len(){return Poll::Ready(Ok(()));}
+                let n=(self.bytes.len()-self.at).min(buf.remaining());let start=self.at;
+                buf.put_slice(&self.bytes[start..start+n]);self.at+=n;Poll::Ready(Ok(()))
+            }
+        }
+        /// Lives until the agreement tears it down, so stdin/control paths are
+        /// observable instead of racing an immediate exit.
+        struct ShellChild{stdin:Option<Box<dyn tokio::io::AsyncWrite+Unpin+Send>>,stdout:Option<Box<dyn AsyncRead+Unpin+Send>>,stderr:Option<Box<dyn AsyncRead+Unpin+Send>>}
+        #[async_trait::async_trait]
+        impl ExecChild for ShellChild{
+            fn take_stdin(&mut self)->Option<Box<dyn tokio::io::AsyncWrite+Unpin+Send>>{self.stdin.take()}
+            fn take_stdout(&mut self)->Option<Box<dyn AsyncRead+Unpin+Send>>{self.stdout.take()}
+            fn take_stderr(&mut self)->Option<Box<dyn AsyncRead+Unpin+Send>>{self.stderr.take()}
+            async fn wait(&mut self)->std::io::Result<ExecExit>{std::future::pending::<()>().await;unreachable!()}
+            fn try_wait(&mut self)->std::io::Result<Option<ExecExit>>{Ok(None)}
+            fn start_kill(&mut self){}
+            fn signal_group(&self,_:crate::l2::mux::TreeSignal)->bool{true}
+            fn group_alive(&self)->bool{true}
+        }
+        /// Records the exact spawn request the existing server builds; the
+        /// wrapper must never switch accounts, so `user_drop_argv` is a panic.
+        struct ShellProcess{spawned:Arc<Mutex<Option<ExecSpawnSpec>>>}
+        impl ExecProcess for ShellProcess{
+            fn resolve_program(&self,program:&str)->Option<std::path::PathBuf>{Some(std::path::PathBuf::from(program))}
+            fn daemon_environment(&self)->Vec<(String,String)>{vec![("TERM".into(),"xterm".into()),("SECRET".into(),"nope".into())]}
+            fn user_context(&self,_:Option<&str>)->Result<ExecUserContext,String>{Err("the standard-account wrapper must own the identity".into())}
+            fn user_drop_argv(&self,_:&std::path::Path,_:&[String],_:&str)->Result<Vec<String>,String>{panic!("temporary shell must never perform an account switch")}
+            fn spawn(&self,spec:ExecSpawnSpec)->Result<Box<dyn ExecChild>,String>{
+                *self.spawned.lock().unwrap()=Some(spec);
+                Ok(Box::new(ShellChild{stdin:Some(Box::new(tokio::io::sink())),stdout:Some(Box::new(BytesReader{bytes:b"shell output\n".to_vec(),at:0})),stderr:Some(Box::new(BytesReader{bytes:b"shell stderr\n".to_vec(),at:0}))}))
+            }
+        }
+
+        #[tokio::test]
+        async fn shell_open_uses_the_accepted_agreement_standard_account_and_end_tears_down(){
+            if unsafe{libc::geteuid()}==0{return;}
+            let process=Arc::new(ShellProcess{spawned:Arc::new(Mutex::new(None))});
+            let runtime=ShellRuntime::new(process.clone(),Arc::new(crate::host::NoLog));
+            let spec=AccessSpec{shell:true,..AccessSpec::default()};
+            let(_fixture,host,hh,recipient,rh)=pair_with(spec,Some(runtime));
+            let ht=tokio::spawn(host.drive(Cancellation::default()));let rt=tokio::spawn(recipient.drive(Cancellation::default()));
+            phase(&rh,AccessPhase::Review).await;
+            let early=rh.open_shell(1,ShellRequest{argv:vec!["/bin/echo".into()],cwd:None,env:vec![],alive_ms:None}).await;
+            assert_eq!(early.err(),Some(AccessError::NotAccepted),"acceptance is not a caller flag");
+            rh.accept(1).await.unwrap();
+            let mut shell=rh.open_shell(1,ShellRequest{argv:vec!["/bin/echo".into(),"hello world".into()],cwd:None,env:vec![("FOO".into(),"bar".into())],alive_ms:None}).await.unwrap();
+            let stdout=tokio::time::timeout(Duration::from_secs(3),shell.stdout.as_mut().unwrap().recv()).await.unwrap().unwrap().unwrap();
+            assert_eq!(&stdout[..],b"shell output\n");
+            let stderr=tokio::time::timeout(Duration::from_secs(3),shell.stderr.as_mut().unwrap().recv()).await.unwrap().unwrap().unwrap();
+            assert_eq!(&stderr[..],b"shell stderr\n");
+            shell.write(b"typed input").await.unwrap();
+            shell.alive().await.unwrap();
+            let spawned=loop{if let Some(spec)=process.spawned.lock().unwrap().clone(){break spec;}tokio::task::yield_now().await;};
+            assert_eq!(spawned.program,std::path::PathBuf::from("/bin/echo"));
+            assert_eq!(spawned.args,vec!["hello world".to_string()],"argv is spawned exactly");
+            assert_eq!(spawned.env.iter().find(|(k,_)|k=="FOO").map(|(_,v)|v.as_str()),Some("bar"));
+            assert!(!spawned.env.iter().any(|(k,_)|k=="SECRET"),"the daemon environment is filtered");
+            assert_eq!(hh.end().await.unwrap().state,AgreementState::Ended);
+            let _=tokio::time::timeout(Duration::from_secs(3),ht).await.unwrap().unwrap();
+            let _=tokio::time::timeout(Duration::from_secs(3),rt).await.unwrap().unwrap();
+            let closed=tokio::time::timeout(Duration::from_secs(3),async{loop{match shell.stdout.as_mut().unwrap().recv().await{None|Some(None)=>return,Some(Some(_))=>panic!("unexpected bytes after end")}}}).await;
+            assert!(closed.is_ok(),"end closes the shell stream");
+            assert_eq!(rh.snapshot().unwrap().phase,AccessPhase::Ended);
+        }
     }
 }

@@ -194,10 +194,14 @@ impl fmt::Display for AccessError {
 impl std::error::Error for AccessError {}
 
 #[derive(Clone, PartialEq, Eq)]
-enum ResourceAccess { Service(ServiceAccess), Folder(FolderAccess) }
+enum ResourceAccess { Service(ServiceAccess), Folder(FolderAccess), Shell }
 impl ResourceAccess {
     fn retained_by(&self, spec: &AccessSpec) -> bool {
-        match self { Self::Service(s) => spec.services.contains(s), Self::Folder(f) => spec.folders.contains(f) }
+        match self {
+            Self::Service(s) => spec.services.contains(s),
+            Self::Folder(f) => spec.folders.contains(f),
+            Self::Shell => spec.shell,
+        }
     }
 }
 struct Operation { resource: ResourceAccess, cancel: Cancellation }
@@ -212,6 +216,27 @@ impl Drop for StreamCleanup {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let mux=self.mux.clone(); let sid=self.sid; let generation=self.generation;
             runtime.spawn(async move { mux.drop_stream_if(sid,generation).await; });
+        }
+    }
+}
+/// The shell session owns TWO stream ids (stdin/stdout and stderr). An aborted
+/// embedding future must release both without touching a newer generation.
+#[cfg(feature = "exec-server")]
+struct ShellCleanup {
+    mux: Arc<crate::l2::Mux>, sid: u32, err_sid: u32,
+    generation: u64, err_generation: u64, armed: bool,
+}
+#[cfg(feature = "exec-server")]
+impl Drop for ShellCleanup {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let mux=self.mux.clone(); let (sid,err_sid)=(self.sid,self.err_sid);
+            let (generation,err_generation)=(self.generation,self.err_generation);
+            runtime.spawn(async move {
+                mux.drop_stream_if(sid,generation).await;
+                mux.drop_stream_if(err_sid,err_generation).await;
+            });
         }
     }
 }
@@ -466,6 +491,132 @@ impl AgreementEngine {
         let cancel = Cancellation::default();
         a.operations.push(Operation { resource:ResourceAccess::Folder(folder.clone()),cancel:cancel.clone() });
         Ok((folder,cancel,a.snapshot.lifetime))
+    }
+
+    /// Admission for the agreement's shell resource. This is the authority the
+    /// endpoint uses -- an accepted boolean from the caller is never enough. It
+    /// requires the exact accepted revision and the exact proven peer, a live
+    /// non-terminal agreement, and `spec.shell`. The returned cancellation is
+    /// held by the serving session and is latched by end/removal/drop.
+    fn admit_shell(&self, id: &str, revision: u64, peer: ProvenPeer, now: u64)
+        -> Result<(Cancellation, Lifetime), AccessError> {
+        let mut state = self.state.lock().map_err(|_| AccessError::Poisoned)?;
+        state.expire(now);
+        let a = state.agreements.get_mut(id).ok_or(AccessError::NotFound)?;
+        check_revision(&a.snapshot, revision)?;
+        if a.snapshot.peer != peer.0 { return Err(AccessError::WrongPeer); }
+        if a.snapshot.accepted_revision != Some(revision) { return Err(AccessError::NotAccepted); }
+        if !a.snapshot.spec.shell { return Err(AccessError::InvalidSpec); }
+        a.operations.retain(|op| !op.cancel.is_cancelled());
+        if a.operations.len() >= MAX_OPERATIONS { return Err(AccessError::Capacity); }
+        let cancel = Cancellation::default();
+        a.operations.push(Operation { resource: ResourceAccess::Shell, cancel: cancel.clone() });
+        Ok((cancel, a.snapshot.lifetime))
+    }
+
+    /// Serve one agreement-scoped shell-class exec over the EXISTING L2 Mux and
+    /// the existing `exec_server` state machine. The accepted `spec.shell` is
+    /// the only grant: there is no standing shell gate bypass, no primary-role
+    /// store and no per-caller acceptance boolean.
+    ///
+    /// Unix only. The process mechanism is wrapped in
+    /// [`crate::shell::standard_account::StandardLocalExecProcess`] before any
+    /// stream is registered or argv is resolved, so the child runs as this
+    /// daemon's existing nonroot login account. A root/service identity, a
+    /// changed UID or a caller-requested account switch refuses the open; there
+    /// is no daemon-identity, SYSTEM-token or elevation fallback. Windows keeps
+    /// returning `Unsupported` until a standard token backend exists.
+    ///
+    /// `request` is the already-parsed `exec-open` vocabulary (`argv`, `cwd`,
+    /// `env`, `alive_ms`); `sid` is stdin/stdout and `request.err_sid` is
+    /// stderr, matching the existing exec protocol. End/removal/drop cancels the
+    /// returned session and drops the `ExecChild`, whose host contract ends the
+    /// process tree. This is exec-class serving, not a PTY.
+    #[cfg(feature = "exec-server")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_shell(&self, id: &str, revision: u64, peer: ProvenPeer, sid: u32,
+        request: crate::shell::exec::ExecOpen, mux: Arc<crate::l2::Mux>,
+        host: Arc<dyn HostServices>, process: Arc<dyn crate::shell::exec::ExecProcess>,
+        log: Arc<dyn crate::host::LogSink>) -> Result<(), AccessError> {
+        #[cfg(not(unix))]
+        { let _ = (id, revision, peer, sid, request, mux, host, process, log); Err(AccessError::Unsupported) }
+        #[cfg(unix)]
+        {
+            use crate::shell::standard_account::{ShellAccountError, StandardLocalExecProcess};
+            if host.delegated_access_for(&peer.0).is_some() { return Err(AccessError::Unsupported); }
+            let err_sid = request.err_sid;
+            if !crate::l2::is_l2_sid(sid) || !crate::l2::is_l2_sid(err_sid)
+                || err_sid == sid {
+                return Err(AccessError::InvalidSpec);
+            }
+            let now = host.now_secs();
+            let (cancel, lifetime) = self.admit_shell(id, revision, peer, now)?;
+            struct Finish(Cancellation);
+            impl Drop for Finish { fn drop(&mut self) { self.0.cancel(); } }
+            let _finish = Finish(cancel.clone());
+            // Resolve the existing account BEFORE argv/stream work. The wrapper
+            // revalidates at spawn, immediately before the existing primitive.
+            let process: Arc<dyn crate::shell::exec::ExecProcess> = Arc::new(
+                StandardLocalExecProcess::new(process).map_err(|error| match error {
+                    ShellAccountError::Unsupported => AccessError::Unsupported,
+                    ShellAccountError::IdentityChanged => AccessError::Ended,
+                    ShellAccountError::PrivilegedService | ShellAccountError::Unavailable
+                        => AccessError::Unavailable,
+                })?,
+            );
+            let (stdout, generation) = mux.register_access_stream(sid).await
+                .ok_or(AccessError::Capacity)?;
+            let (stderr, err_generation) = match mux.register_access_stream(err_sid).await {
+                Some(stream) => stream,
+                None => {
+                    mux.drop_stream_if(sid, generation).await;
+                    return Err(AccessError::Capacity);
+                }
+            };
+            let mut cleanup = ShellCleanup { mux: mux.clone(), sid, err_sid, generation,
+                err_generation, armed: true };
+            // The receiver is claimed to reserve the sid collision-safely; the
+            // existing exec server pumps stderr onto it through the transport.
+            let _stderr = stderr;
+            let exec_ctl = mux.register_exec_ctl(sid).await;
+            let authority = crate::shell::exec_server::ExecSessionAuthz {
+                dev_name: None,
+                idev: None,
+                policy_allows: false,
+                admitted_via_ceiling: false,
+            };
+            let serving = crate::shell::exec_server::serve_exec(
+                mux.transport(), mux.clone(), sid, request, stdout, exec_ctl,
+                authority,
+                // Never an account switch, never a daemon fallback.
+                None, process, host, log,
+            );
+            let deadline = async {
+                match lifetime {
+                    Lifetime::UntilEnded => std::future::pending::<()>().await,
+                    Lifetime::ExpiresAt(at) => tokio::time::sleep(std::time::Duration::from_secs(at.saturating_sub(now))).await,
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                _ = deadline => Err(AccessError::Expired),
+                outcome = cancel.run(serving) => match outcome {
+                    DriverOutcome::Cancelled => Err(AccessError::Ended),
+                    DriverOutcome::Returned(()) => Ok(()),
+                },
+            };
+            mux.drop_stream_if(sid, generation).await;
+            mux.drop_stream_if(err_sid, err_generation).await;
+            cleanup.armed = false;
+            if let Err(reason) = &result {
+                for stream in [sid, err_sid] {
+                    let _ = mux.transport().send_control(
+                        &serde_json::json!({"type":"l2-close","sid":stream,"err":reason.to_string()}),
+                    ).await;
+                }
+            }
+            result
+        }
     }
 
     /// Serve the existing confined filesystem protocol for an accepted folder.
@@ -772,6 +923,102 @@ mod tests {
         accept(&e, &revision, &k, 1000);
         e.end(&indefinite.id, 1001).unwrap();
         assert_eq!(e.admit_tcp(&indefinite.id, 2, peer(&k), "web", 1002).err(), Some(AccessError::Ended));
+    }
+
+    #[test]
+    fn shell_scope_is_the_accepted_revision_and_peer_not_a_caller_flag() {
+        let e = engine(); let k = key(); let other = key(); let p = peer(&k);
+        let s = offer(&e, p);
+        assert_eq!(e.admit_shell(&s.id, 1, p, 10).err(), Some(AccessError::NotAccepted));
+        let active = accept(&e, &s, &k, 10);
+        assert_eq!(active.accepted_revision, Some(1));
+        assert_eq!(e.admit_shell(&s.id, 1, peer(&other), 10).err(), Some(AccessError::WrongPeer));
+        assert_eq!(e.admit_shell(&s.id, 2, p, 10).err(), Some(AccessError::StaleRevision));
+        let (cancel, _) = e.admit_shell(&s.id, 1, p, 10).unwrap();
+        assert!(!cancel.is_cancelled());
+        let mut no_shell = spec(); no_shell.shell = false;
+        let narrowed = e.revise(&s.id, 1, no_shell, Lifetime::UntilEnded, 10).unwrap();
+        assert_eq!(narrowed.accepted_revision, Some(2));
+        assert!(cancel.is_cancelled(), "removal tears down the admitted shell operation");
+        assert_eq!(e.admit_shell(&s.id, 2, p, 10).err(), Some(AccessError::InvalidSpec));
+        assert_eq!(e.admit_shell(&s.id, 1, p, 10).err(), Some(AccessError::StaleRevision));
+        e.end(&s.id, 10).unwrap();
+        assert_eq!(e.admit_shell(&s.id, 2, p, 10).err(), Some(AccessError::Ended));
+    }
+
+    #[cfg(all(unix, feature = "exec-server"))]
+    mod shell_endpoint {
+        use super::*;
+        use crate::shell::exec::{ExecChild, ExecProcess, ExecSpawnSpec, ExecUserContext};
+        use serde_json::Value;
+
+        struct Host;
+        #[async_trait::async_trait]
+        impl HostServices for Host {
+            fn now_secs(&self) -> u64 { 10 }
+            fn settings_get_str(&self, _: &str) -> Option<String> { None }
+            fn devices_load(&self) -> Vec<(String, String)> { vec![] }
+            fn is_self_uid(&self, _: &str, _: Option<&str>) -> bool { false }
+            fn rejoin_unwarned(&self) -> std::time::Duration { std::time::Duration::ZERO }
+            fn relay_banner(&self) -> String { String::new() }
+            fn relay_forbidden(&self) -> bool { false }
+            fn channel_of(&self, _: &str) -> String { String::new() }
+            fn roster_snapshot_json(&self) -> Option<String> { None }
+            fn fleet_rv_present(&self) -> bool { false }
+        }
+
+        struct NullTransport;
+        #[async_trait::async_trait]
+        impl filament_transport::net::Transport for NullTransport {
+            async fn send_control(&self, _: &Value) -> anyhow::Result<()> { Ok(()) }
+            async fn send_frame(&self, _: u32, _: u64, _: &[u8]) -> anyhow::Result<()> { Ok(()) }
+            async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+            fn max_payload(&self) -> usize { 65536 }
+            fn is_dead(&self) -> bool { false }
+            fn is_alive(&self) -> bool { true }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+
+        /// Proves the endpoint never reaches program resolution, the account
+        /// mechanism, or the existing spawn primitive while the agreement is
+        /// not accepted for this exact peer/revision.
+        struct NeverProcess;
+        impl ExecProcess for NeverProcess {
+            fn resolve_program(&self, _: &str) -> Option<PathBuf> { panic!("resolved before admission") }
+            fn daemon_environment(&self) -> Vec<(String, String)> { panic!("environment read before admission") }
+            fn user_context(&self, _: Option<&str>) -> Result<ExecUserContext, String> { panic!("account resolved before admission") }
+            fn user_drop_argv(&self, _: &std::path::Path, _: &[String], _: &str) -> Result<Vec<String>, String> { panic!("account drop before admission") }
+            fn spawn(&self, _: ExecSpawnSpec) -> Result<Box<dyn ExecChild>, String> { panic!("spawned before admission") }
+        }
+
+        fn request() -> crate::shell::exec::ExecOpen {
+            crate::shell::exec::ExecOpen {
+                argv: vec!["/bin/true".into()],
+                cwd: None, env: vec![], tty: false,
+                err_sid: crate::l2::L2_SID_BASE | 62, alive_ms: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn shell_serving_checks_the_agreement_before_it_resolves_or_spawns() {
+            let e = engine(); let k = key(); let other = key(); let p = peer(&k);
+            let s = offer(&e, p);
+            let mux = crate::l2::Mux::new(Arc::new(NullTransport), Arc::new(Host));
+            let sid = crate::l2::L2_SID_BASE | 61;
+            let result = e.serve_shell(&s.id, 1, p, sid, request(), mux.clone(),
+                Arc::new(Host), Arc::new(NeverProcess), Arc::new(crate::host::NoLog)).await;
+            assert_eq!(result, Err(AccessError::NotAccepted));
+            assert!(!mux.has_stream(sid).await);
+
+            accept(&e, &s, &k, 10);
+            let result = e.serve_shell(&s.id, 1, peer(&other), sid, request(), mux.clone(),
+                Arc::new(Host), Arc::new(NeverProcess), Arc::new(crate::host::NoLog)).await;
+            assert_eq!(result, Err(AccessError::WrongPeer));
+            let result = e.serve_shell(&s.id, 2, p, sid, request(), mux.clone(),
+                Arc::new(Host), Arc::new(NeverProcess), Arc::new(crate::host::NoLog)).await;
+            assert_eq!(result, Err(AccessError::StaleRevision));
+            assert!(!mux.has_stream(sid).await);
+        }
     }
 
     #[test]

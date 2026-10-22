@@ -91,11 +91,41 @@ from a serving task is not proof that an endpoint became available.
 | Exact TCP service | Real existing L2 Mux / HostServices connector integration; `forward-server` feature and a working host connector required |
 | UDP service | Typed review only; operation returns `Unsupported` |
 | Folder RO/RW protocol serving | Linux `mount-server` profile uses accepted canonical root, pinned directory descriptor, existing confined filesystem protocol and per-request agreement admission; other platforms return `Unsupported` |
+| Shell (exec-class) | Unix only: accepted `spec.shell` + exact revision/peer is re-checked by the engine before the existing exec server spawns; the account is the daemon's existing nonroot login account via `StandardLocalExecProcess`, with no account switching, no daemon/SYSTEM fallback and no elevation. Windows returns `Unsupported` until a standard token backend exists |
+| PTY / interactive terminal | Unavailable through this engine; the existing exec server still refuses `tty:true`. SSH remains typed review only |
 | Recipient folder download / local mount | Client activation/UI not integrated here; no successful local mount path is promised |
-| Shell, PTY, exec, SSH | Typed review only; existing shared shell gate remains authoritative; unavailable through this engine |
 | Device networking / subnet | Typed separately; no agreement-aware packet policy integration; unavailable |
 | Background/restart | Unavailable; no durable handoff acknowledgement |
 | Owned/delegated relationship creation | Unavailable; temporary engine does not manufacture ownership or delegated ceilings |
+
+### Agreement-scoped shell (exec-class)
+
+`AccessHandle::open_shell` sends the existing exec vocabulary (`argv`, `cwd`,
+`env`, `alive_ms`) in an `access-open` with `kind: "shell"`, on the accepted
+revision's own Mux/transport. The host endpoint (`AgreementEngine::serve_shell`)
+re-checks the agreement, exact revision, proven peer and `spec.shell` **before**
+registering streams or resolving a program; the caller's revision or an
+`accepted` boolean is not authority. It then delegates to the existing
+`shell::exec_server` state machine and its stdout/stderr/heartbeat/cancellation
+paths, so no second shell or transport loop exists here.
+
+On Unix the process mechanism is wrapped in `StandardLocalExecProcess`: the
+account is the daemon's existing nonroot login account read from the password
+database, revalidated immediately before spawn. Account switching is refused, as
+is root/effective-UID mismatch; there is no daemon-identity, SYSTEM-token or
+elevation fallback. Windows keeps returning `Unsupported` until a standard token
+backend exists. This is exec-class serving, not a PTY: `tty: true` is still
+refused.
+
+The shell session is an operation in the agreement. End, a removing revision, or
+dropping the engine latches its cancellation and drops the owned `ExecChild`
+(the host contract ends the process tree); reconnect cannot revive a terminal
+agreement. An acceptor must pass `ShellRuntime` to `AccessDispatch::new_with_shell`;
+a `spec.shell` offer without that backend fails closed instead of advertising an
+endpoint it cannot serve. The reduced `tunlion-core` profile still has no embedded
+process backend, so it continues to refuse drafting a shell offer even though the
+library/driver API and initiator-side `open_shell` are available to a host adapter
+that owns one.
 
 Main at `27d7bfea` contains real feature-gated PTY/exec/mount/forward servers;
 `tunlion-core` deliberately composes a reduced receive/transfer profile. Neither

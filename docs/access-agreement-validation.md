@@ -125,3 +125,52 @@ validated all three against the exact recorded tree:
 Unimplemented platform resources, background handoff, complete reconnect after
 room loss, ownership/primary migration and CLI integration boundaries are listed
 in [access-agreements.md](access-agreements.md).
+
+## Temporary shell endpoint checkpoint
+
+Source adds `AgreementEngine::serve_shell` and the initiator-side
+`AccessHandle::open_shell`/`AccessShell`/`ShellRequest` plus
+`AccessDispatch::new_with_shell`. The host admission re-checks the exact accepted
+revision, proven peer and `spec.shell`; the process mechanism is wrapped in
+`StandardLocalExecProcess` before streams or argv resolution; serving delegates
+to the existing `shell::exec_server` state machine on the accepted agreement's
+own `Mux`/transport. End, removing revisions and dropped/aborted sessions latch
+the same cancellation, and a `ShellCleanup` guard releases both stream ids if the
+embedding future is aborted. PTY/interactive `tty:true` remains refused by the
+existing exec server, and Windows remains `Unsupported`.
+
+Refs (no merge/deploy): the final exact commit is reported in the lane handoff.
+The pre-final source checkpoints ran on the reusable Linux worker
+(`ci-worker-dovm`, shared `build.lock`) as jobs
+`core-access-shell-20261022-02` and `core-access-shell-20261022-03`; job 03
+tested the source that produced this section and exited 0:
+
+```sh
+cargo test -p filament-peerloop --lib access::tests -- --test-threads=2
+cargo test -p filament-peerloop --lib access_session::tests -- --test-threads=2
+cargo check -p filament-peerloop --no-default-features --features dispatch
+cargo check -p filament-peerloop --lib
+cargo check -p tunlion-core --lib
+```
+
+Results: **14 access tests** (including new
+`shell_scope_is_the_accepted_revision_and_peer_not_a_caller_flag` and
+`shell_endpoint::shell_serving_checks_the_agreement_before_it_resolves_or_spawns`)
+and **6 access-session tests** (including
+`shell_contract::shell_open_uses_the_accepted_agreement_standard_account_and_end_tears_down`)
+passed; reduced dispatch, default peerloop library and tunlion-core library
+checks passed. The shell fixture ran as the worker's real nonroot account and
+inspected the exact spawn argv/env (`hello world` kept as one argument, `SECRET`
+filtered, no account-switch call).
+
+Local durable log:
+`/root/pairing-ux/evidence/access-checkpoint-20261022/core-shell-03.log`.
+Remote job directory: `/home/runner/work/_temp/tunlion-work/jobs/core-access-shell-20261022-03`.
+No local build/test/formatter was run.
+
+Remaining gaps: PTY/interactive shell (agreement admission around the existing
+PTY server lives in the CLI adapter and is not changed here); `tunlion-core`'s
+reduced profile still refuses to draft a shell offer because it has no embedded
+`ExecProcess` backend, so the host composition must come from the CLI/daemon
+adapter lane; Windows has no standard token backend; the authoritative primary
+role store/consent migration described above remains unimplemented.

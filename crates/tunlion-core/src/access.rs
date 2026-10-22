@@ -8,7 +8,7 @@ use filament_peerloop::access_session::AccessDispatch;
 use filament_peerloop::recv::store::{DeviceStore,OverlayKey};
 
 pub use filament_peerloop::access::{AccessSpec,AgreementSnapshot,FolderAccess,FolderMode,Lifetime,Relationship,ServiceAccess,ServiceProtocol};
-pub use filament_peerloop::access_session::{access_channel,AccessHandle,AccessInbound,AccessObserver,AccessOfferDraft,AccessPhase,AccessPipe,AccessSessionEvent,AccessSessionEvents,AccessView,AuthenticatedAccessConnection};
+pub use filament_peerloop::access_session::{access_channel,AccessHandle,AccessInbound,AccessObserver,AccessOfferDraft,AccessPhase,AccessPipe,AccessSessionEvent,AccessSessionEvents,AccessShell,AccessView,AuthenticatedAccessConnection,ShellRequest};
 
 #[derive(Debug,thiserror::Error)]
 pub enum AccessApiError {
