@@ -452,6 +452,7 @@ impl HostServices for CoreHost {
         Err("this core profile serves no control socket".to_string())
     }
 
+    #[cfg(not(feature = "access-endpoints"))]
     async fn connect_local_stream(
         &self,
         _host: &str,
