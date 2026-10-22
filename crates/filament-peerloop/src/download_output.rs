@@ -14,6 +14,26 @@
 //! flush fails for an I/O reason after the rename committed.
 use std::path::{Path,PathBuf};
 use crate::driver::Cancellation;
+
+/// `GetFinalPathNameByHandleW` returns a verbatim `\\?\` path. Download callers
+/// receive the ordinary Win32 spelling of the same file, not the NT prefix.
+#[cfg(all(target_os="windows",feature="mount-server"))]
+fn display_path(path:&Path)->PathBuf{
+    use std::os::windows::ffi::{OsStrExt,OsStringExt};
+    let wide:Vec<u16>=path.as_os_str().encode_wide().collect();
+    const VERBATIM:[u16;4]=[92,92,63,92];
+    if wide.starts_with(&VERBATIM){
+        let rest=&wide[4..];
+        const UNC:[u16;4]=[85,78,67,92];
+        if rest.starts_with(&UNC){
+            let mut out=vec![92,92];
+            out.extend_from_slice(&rest[4..]);
+            return PathBuf::from(std::ffi::OsString::from_wide(&out));
+        }
+        return PathBuf::from(std::ffi::OsString::from_wide(rest));
+    }
+    path.to_path_buf()
+}
 #[derive(Debug)]
 pub enum OutputError { Unsupported,InvalidName,Limit,SizeMismatch,DigestMismatch,Cancelled,Failed,Io(std::io::ErrorKind),DurabilityUnknown(PathBuf) }
 impl std::fmt::Display for OutputError{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"download output: {self:?}")}}
@@ -162,7 +182,7 @@ impl OwnedDownload {
                 crate::driver::DriverOutcome::Returned(result)=>result?,
             }
             if cancel.is_cancelled(){return Err(OutputError::Cancelled);}
-            let root=self.root.final_path().map_err(OutputError::from)?;
+            let root=display_path(&self.root.final_path().map_err(OutputError::from)?);
             for suffix in 0..1024u32{
                 let candidate=if suffix==0{self.name.clone()}else{format!("{}-{suffix}",self.name)};
                 match self.root.rename_staged_no_clobber(&self.parent,OsStr::new(&self.staging),OsStr::new(&candidate),&self.raw){

@@ -1769,6 +1769,11 @@ mod win_at {
     /// handle cannot rename, replace or delete it. That is what makes the
     /// retained root/parent/staging handles stable for the whole receive.
     const SHARE_RW: u32 = WinFs::FILE_SHARE_READ | WinFs::FILE_SHARE_WRITE;
+    /// Mount data handles (never the root/parent pins) share delete so the
+    /// existing filesystem semantics of rename/unlink-while-open stay close to
+    /// Linux. The retained directory chain still has no delete share, which is
+    /// what prevents replacing a traversed ancestor or the root itself.
+    const SHARE_MOUNT: u32 = SHARE_RW | WinFs::FILE_SHARE_DELETE;
     /// `FILE_ADD_FILE`/`FILE_DELETE_CHILD` are what a handle-relative create
     /// and replace need on the pinned parent, not just list/read.
     const DIR_ACCESS: u32 = WinFs::FILE_LIST_DIRECTORY
@@ -2132,7 +2137,7 @@ mod win_at {
             WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
             OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
             0,
-            SHARE_RW,
+            SHARE_MOUNT,
         )?;
         meta_of(child.as_raw_handle() as HANDLE)
     }
@@ -2176,6 +2181,12 @@ mod win_at {
                 let record =
                     unsafe { &*(buf.as_ptr().add(offset) as *const FileIdBothDirInfo) };
                 let units_len = record.file_name_length as usize / 2;
+                if offset + 104 + units_len * 2 > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Windows directory listing record exceeds the returned buffer",
+                    ));
+                }
                 if units_len > 0 {
                     let name = std::ffi::OsString::from_wide(unsafe {
                         std::slice::from_raw_parts(record.file_name.as_ptr(), units_len)
@@ -2360,7 +2371,7 @@ mod win_at {
                     DIR_READ_ACCESS
                 },
             )?;
-            let handle = nt_open(
+            let handle = nt_open_with_share(
                 parent.handle(),
                 &name,
                 disposition,
@@ -2371,6 +2382,7 @@ mod win_at {
                 } else {
                     0
                 },
+                SHARE_MOUNT,
             )?;
             let meta = meta_of(handle.as_raw_handle() as HANDLE)?;
             if meta.is_symlink {
@@ -2397,13 +2409,14 @@ mod win_at {
                 return meta_of(self.handle.as_raw_handle() as HANDLE);
             }
             let (parent, name) = self.parent_and_name(rel, DIR_READ_ACCESS)?;
-            let handle = nt_open(
+            let handle = nt_open_with_share(
                 parent.handle(),
                 &name,
                 FILE_OPEN,
                 WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
                 OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
                 0,
+                SHARE_MOUNT,
             )?;
             meta_of(handle.as_raw_handle() as HANDLE)
         }
@@ -2423,13 +2436,14 @@ mod win_at {
 
         pub(crate) fn unlink_rel(&self, rel: &Path) -> io::Result<()> {
             let (parent, name) = self.parent_and_name(rel, DIR_ACCESS)?;
-            let file = nt_open(
+            let file = nt_open_with_share(
                 parent.handle(),
                 &name,
                 FILE_OPEN,
                 WinFs::DELETE | WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
                 OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
                 0,
+                SHARE_MOUNT,
             )?;
             let meta = meta_of(file.as_raw_handle() as HANDLE)?;
             if meta.is_dir {
@@ -2445,13 +2459,14 @@ mod win_at {
 
         pub(crate) fn rmdir_rel(&self, rel: &Path) -> io::Result<()> {
             let (parent, name) = self.parent_and_name(rel, DIR_ACCESS)?;
-            let dir = nt_open(
+            let dir = nt_open_with_share(
                 parent.handle(),
                 &name,
                 FILE_OPEN,
                 WinFs::DELETE | WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
                 FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
                 0,
+                SHARE_MOUNT,
             )?;
             let meta = meta_of(dir.as_raw_handle() as HANDLE)?;
             if meta.is_symlink {
@@ -2464,13 +2479,14 @@ mod win_at {
 
         pub(crate) fn truncate_rel(&self, rel: &Path, size: u64) -> io::Result<()> {
             let (parent, name) = self.parent_and_name(rel, DIR_ACCESS)?;
-            let file = nt_open(
+            let file = nt_open_with_share(
                 parent.handle(),
                 &name,
                 FILE_OPEN,
                 GENERIC_WRITE | WinFs::SYNCHRONIZE,
                 OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
                 0,
+                SHARE_MOUNT,
             )?;
             let meta = meta_of(file.as_raw_handle() as HANDLE)?;
             if meta.is_dir {
@@ -2486,13 +2502,14 @@ mod win_at {
 
         pub(crate) fn rename_rel(&self, from: &Path, to: &Path) -> io::Result<()> {
             let (from_parent, from_name) = self.parent_and_name(from, DIR_ACCESS)?;
-            let source = File::from(nt_open(
+            let source = File::from(nt_open_with_share(
                 from_parent.handle(),
                 &from_name,
                 FILE_OPEN,
                 WinFs::DELETE | WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
                 OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
                 0,
+                SHARE_MOUNT,
             )?);
             let meta = meta_of(source.as_raw_handle() as HANDLE)?;
             if meta.is_symlink {
@@ -2904,7 +2921,7 @@ mod win_at {
                 MountOp::Open { path, flags } => {
                     check_open_count(open_files.len())?;
                     let rel = path_decode(path)?;
-                    let write = flags & O_ACCMODE != 0;
+                    let write = *flags & O_ACCMODE != 0;
                     if write && read_only {
                         return Err(MountError {
                             code: EROFS,

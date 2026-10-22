@@ -1660,6 +1660,18 @@ mod tests {
             assert!(junction(target,link),"required Windows coverage: mklink /J is unavailable");
         }
 
+        #[test]
+        fn folder_canonical_refuses_a_junction_root() {
+            let fixture=Fixture::new();
+            let outside=fixture.0.join("outside");std::fs::create_dir(&outside).unwrap();
+            let link=fixture.0.join("link");
+            require_junction(&outside,&link);
+            assert_eq!(
+                FolderAccess::canonical("folder".into(),&link,FolderMode::ReadOnly).unwrap_err(),
+                AccessError::InvalidSpec
+            );
+        }
+
         struct Capture {
             controls:mpsc::UnboundedSender<Value>,frames:mpsc::UnboundedSender<Vec<u8>>,
         }
