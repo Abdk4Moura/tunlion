@@ -90,10 +90,10 @@ from a serving task is not proof that an endpoint became available.
 | --- | --- |
 | Exact TCP service | Real existing L2 Mux / HostServices connector integration; `forward-server` feature and a working host connector required |
 | UDP service | Typed review only; operation returns `Unsupported` |
-| Folder RO/RW protocol serving | Linux `mount-server` profile uses accepted canonical root, pinned directory descriptor, existing confined filesystem protocol and per-request agreement admission; other platforms return `Unsupported` |
+| Folder RO/RW protocol serving | Linux and Windows `mount-server` profiles use the accepted canonical root and per-request agreement admission. Linux pins a directory descriptor; Windows pins the host-selected root with a retained HANDLE and serves every request relative to it (reparse points/junctions are refused, never joined from a path). Other platforms return `Unsupported` |
 | Shell (exec-class) | Unix only: accepted `spec.shell` + exact revision/peer is re-checked by the engine before the existing exec server spawns; the account is the daemon's existing nonroot login account via `StandardLocalExecProcess`, with no account switching, no daemon/SYSTEM fallback and no elevation. Windows returns `Unsupported` until a standard token backend exists |
 | PTY / interactive terminal | Unix only: accepted `spec.shell` + exact revision/peer admitted through the same engine check, then the existing `PtyBackend`/`PtySession` seam (interactive login argv, real terminal IO, resize, process teardown). One-shot: no resume/reattach. Windows returns `Unsupported`. SSH remains typed review only |
-| Recipient folder download / local mount | Client activation/UI not integrated here; no successful local mount path is promised |
+| Recipient folder download / local mount | Client activation/UI is not integrated here; no successful local mount path is promised. The core `download_output::OwnedDownload` publisher is pinned and no-clobber on Linux and Windows (atomic same-directory publish; Windows does not claim directory-entry durability) |
 | Device networking / subnet | Typed separately; no agreement-aware packet policy integration; unavailable |
 | Background/restart | Unavailable; no durable handoff acknowledgement |
 | Owned/delegated relationship creation | Unavailable; temporary engine does not manufacture ownership or delegated ceilings |

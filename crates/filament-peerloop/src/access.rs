@@ -36,7 +36,20 @@ impl FolderAccess {
     /// Resolve the actual host-selected directory before authenticating review.
     /// The peer never supplies a replacement root at endpoint activation.
     pub fn canonical(id: String, path: impl AsRef<std::path::Path>, mode: FolderMode) -> Result<Self, AccessError> {
-        let path = path.as_ref().canonicalize().map_err(|_| AccessError::Unavailable)?;
+        let path = path.as_ref();
+        // A host-selected Windows root must be a real directory, not a
+        // junction/symlink/reparse alias. canonicalize() would follow it; the
+        // agreement pins the actual entry, so refuse the alias up front.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            let meta = std::fs::symlink_metadata(path).map_err(|_| AccessError::Unavailable)?;
+            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(AccessError::InvalidSpec);
+            }
+        }
+        let path = path.canonicalize().map_err(|_| AccessError::Unavailable)?;
         if !path.is_dir() { return Err(AccessError::InvalidSpec); }
         Ok(Self { id, path, mode })
     }
@@ -511,7 +524,7 @@ impl AgreementEngine {
         Ok((service, cancel, a.snapshot.lifetime))
     }
 
-    #[cfg(all(feature = "mount-server", target_os = "linux"))]
+    #[cfg(all(feature = "mount-server", any(target_os = "linux", target_os = "windows")))]
     fn admit_folder(&self, id: &str, revision: u64, peer: ProvenPeer, resource: &str, now: u64)
         -> Result<(FolderAccess, Cancellation, Lifetime), AccessError> {
         let mut state = self.state.lock().map_err(|_| AccessError::Poisoned)?;
@@ -774,7 +787,7 @@ impl AgreementEngine {
     /// protocol endpoint, NOT a claim that FUSE/WinFsp has mounted a local path.
     pub async fn serve_folder(&self, id: &str, revision: u64, peer: ProvenPeer, resource: &str,
         sid: u32, mux: Arc<crate::l2::Mux>, host: Arc<dyn HostServices>) -> Result<(), AccessError> {
-        #[cfg(not(all(feature = "mount-server", target_os = "linux")))]
+        #[cfg(not(all(feature = "mount-server", any(target_os = "linux", target_os = "windows"))))]
         { let _=(id,revision,peer,resource,sid,mux,host); Err(AccessError::Unsupported) }
         #[cfg(all(feature = "mount-server", target_os = "linux"))]
         {
@@ -844,6 +857,94 @@ impl AgreementEngine {
                 let result=(&mut task.0).await;
                 joined=true;
                 result.map_err(|_|AccessError::Unavailable)
+            };
+            let result=tokio::select! {
+                biased;
+                _=deadline=>Err(AccessError::Expired),
+                outcome=cancel.run(serving)=>match outcome {
+                    DriverOutcome::Cancelled=>Err(AccessError::Ended),
+                    DriverOutcome::Returned(result)=>result,
+                }
+            };
+            if !joined { task.0.abort(); let _=(&mut task.0).await; }
+            mux.drop_stream_if(sid,generation).await; cleanup.armed=false;
+            let reason=result.as_ref().err().map(ToString::to_string);
+            let _=mux.transport().send_control(&serde_json::json!({"type":"l2-close","sid":sid,"err":reason})).await;
+            result
+        }
+
+        #[cfg(all(feature = "mount-server", target_os = "windows"))]
+        {
+            if host.delegated_access_for(&peer.0).is_some(){return Err(AccessError::Unsupported);}
+            if !crate::l2::is_l2_sid(sid) { return Err(AccessError::InvalidSpec); }
+            let now=host.now_secs();
+            let (folder,cancel,lifetime)=self.admit_folder(id,revision,peer,resource,now)?;
+            struct Finish(Cancellation);
+            impl Drop for Finish { fn drop(&mut self) { self.0.cancel(); } }
+            let _finish=Finish(cancel.clone());
+            // Re-check the accepted root is still canonical, then pin its
+            // HANDLE before the acknowledgement. A junction/symlink root is
+            // refused by the pin; a root swapped after acceptance cannot
+            // redirect the share because the HANDLE, not the path, is served.
+            if folder.path.canonicalize().map_err(|_| AccessError::Unavailable)? != folder.path {
+                return Err(AccessError::InvalidSpec);
+            }
+            let root=Arc::new(crate::mount_proto::WinRoot::pin_host_path(
+                &folder.path, folder.mode==FolderMode::ReadWrite,
+            ).map_err(|error| if error.kind()==std::io::ErrorKind::Unsupported {
+                AccessError::Unsupported
+            } else {
+                AccessError::Unavailable
+            })?);
+            let (rx,generation)=mux.register_access_stream(sid).await.ok_or(AccessError::Capacity)?;
+            let mut cleanup=StreamCleanup { mux:mux.clone(),sid,generation,armed:true };
+            let weak=Arc::downgrade(&self.state); let agreement_id=id.to_string();
+            let gate_host=host.clone(); let gate_cancel=cancel.clone();
+            let selected=ResourceAccess::Folder(folder.clone());
+            let gate: crate::mount_proto::MountRequestAdmission=Arc::new(move || {
+                // The retained root Arc keeps the pinned tree alive for the
+                // server's whole life; aborting this owner drops the task and
+                // with it the pin.
+                let now=gate_host.now_secs();
+                if gate_host.delegated_access_for(&peer.0).is_some(){return Err(AccessError::Unsupported.to_string());}
+                if gate_host.live_session_cut(Some(&peer.0)).is_some(){return Err(AccessError::Ended.to_string());}
+                if gate_cancel.is_cancelled() { return Err(AccessError::Ended.to_string()); }
+                let state=weak.upgrade().ok_or_else(||AccessError::Ended.to_string())?;
+                let mut state=state.lock().map_err(|_|AccessError::Poisoned.to_string())?;
+                state.expire(now);
+                let a=state.agreements.get(&agreement_id).ok_or_else(||AccessError::NotFound.to_string())?;
+                if gate_cancel.is_cancelled() || a.snapshot.state!=AgreementState::Active
+                    || a.snapshot.accepted_revision!=Some(a.snapshot.revision) || !selected.retained_by(&a.snapshot.spec) {
+                    return Err(AccessError::Ended.to_string());
+                }
+                // Admission linearization point. The mutex is released before
+                // filesystem/network work; an admitted write may finish during
+                // revoke and is not rolled back.
+                Ok(())
+            });
+            let mut caps=crate::mount_proto::mount_caps_for_root(&folder.path);
+            let read_only=folder.mode==FolderMode::ReadOnly;
+            if read_only { caps.max_write_size=0; }
+            let task=crate::mount_proto::spawn_mount_server_windows_pinned(crate::mount_proto::MountServerConfig {
+                root:folder.path.clone(),transport:mux.transport(),sid,stream:rx,protocol_version:caps.protocol_version,
+                read_only,device_pub:None,host,log:Arc::new(crate::host::NoLog),
+            },root,Some(gate));
+            struct OwnedTask(tokio::task::JoinHandle<()>);
+            impl Drop for OwnedTask { fn drop(&mut self) { self.0.abort(); } }
+            let mut task=OwnedTask(task);
+            let deadline=async {
+                match lifetime {
+                    Lifetime::UntilEnded=>std::future::pending::<()>().await,
+                    Lifetime::ExpiresAt(at)=>tokio::time::sleep(std::time::Duration::from_secs(at.saturating_sub(now))).await,
+                }
+            };
+            let mut joined=false;
+            let serving=async {
+                mux.transport().send_control(&serde_json::json!({"type":"mount-open-ack","sid":sid,"caps":caps})).await
+                    .map_err(|_| AccessError::Unavailable)?;
+                let result=(&mut task.0).await;
+                joined=true;
+                result.map_err(|_| AccessError::Unavailable)
             };
             let result=tokio::select! {
                 biased;
@@ -1526,6 +1627,151 @@ mod tests {
             assert_eq!(std::fs::read(fixture.0.join("binary")).unwrap(),expected);
         }
     }
+
+    #[cfg(all(feature="mount-server",target_os="windows"))]
+    mod windows_folders {
+        use super::*;
+        use crate::mount_proto::{MountOp,MountRequest,MountResponse,MountResult};
+        use serde_json::Value;
+        use tokio::sync::mpsc;
+
+        const O_RDONLY:i32=0;
+        const O_RDWR:i32=2;
+
+        struct Fixture(PathBuf);
+        impl Fixture {
+            fn new() -> Self {
+                let mut random=[0;16];getrandom::getrandom(&mut random).unwrap();
+                let path=std::env::temp_dir().join(format!("access-folders-win-{}",hex::encode(random)));
+                std::fs::create_dir(&path).unwrap(); Self(path)
+            }
+        }
+        impl Drop for Fixture { fn drop(&mut self) { let _=std::fs::remove_dir_all(&self.0); } }
+
+        fn junction(target:&std::path::Path,link:&std::path::Path)->bool {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW:u32=0x0800_0000;
+            std::process::Command::new("cmd")
+                .creation_flags(CREATE_NO_WINDOW)
+                .arg("/C").arg("mklink").arg("/J").arg(link).arg(target)
+                .status().map(|s|s.success()).unwrap_or(false)
+        }
+        fn require_junction(target:&std::path::Path,link:&std::path::Path) {
+            assert!(junction(target,link),"required Windows coverage: mklink /J is unavailable");
+        }
+
+        struct Capture {
+            controls:mpsc::UnboundedSender<Value>,frames:mpsc::UnboundedSender<Vec<u8>>,
+        }
+        #[async_trait::async_trait]
+        impl filament_transport::net::Transport for Capture {
+            async fn send_control(&self,msg:&Value)->anyhow::Result<()> { let _=self.controls.send(msg.clone());Ok(()) }
+            async fn send_frame(&self,_:u32,_:u64,payload:&[u8])->anyhow::Result<()> {
+                let _=self.frames.send(payload.to_vec());Ok(())
+            }
+            async fn flush(&self)->anyhow::Result<()> { Ok(()) }
+            fn max_payload(&self)->usize { 65536 }
+            fn is_dead(&self)->bool { false }
+            fn is_alive(&self)->bool { true }
+            fn as_any(&self)->&dyn std::any::Any { self }
+        }
+        fn transport()->(Arc<Capture>,mpsc::UnboundedReceiver<Value>,mpsc::UnboundedReceiver<Vec<u8>>) {
+            let (controls,cr)=mpsc::unbounded_channel();let (frames,fr)=mpsc::unbounded_channel();
+            (Arc::new(Capture{controls,frames}),cr,fr)
+        }
+        fn wire_op(mut op:MountOp)->MountOp {
+            let encode=|path:&mut String|{*path=crate::mount_proto::path_encode(std::path::Path::new(path));};
+            match &mut op {
+                MountOp::GetAttr{path}|MountOp::ReadLink{path}|MountOp::Open{path,..}|MountOp::Create{path,..}
+                |MountOp::Unlink{path}|MountOp::MkDir{path,..}|MountOp::RmDir{path}|MountOp::Truncate{path,..}=>encode(path),
+                MountOp::Rename{from,to}=>{encode(from);encode(to);},
+                _=>{},
+            }op
+        }
+        async fn request(mux:&crate::l2::Mux,sid:u32,frames:&mut mpsc::UnboundedReceiver<Vec<u8>>,id:u64,op:MountOp)->MountResponse {
+            request_data(mux,sid,frames,id,op).await.0
+        }
+        async fn request_data(mux:&crate::l2::Mux,sid:u32,frames:&mut mpsc::UnboundedReceiver<Vec<u8>>,id:u64,op:MountOp)->(MountResponse,Option<Vec<u8>>) {
+            let mut header=serde_json::to_vec(&MountRequest{id,bin:None,op:wire_op(op)}).unwrap();header.push(b'\n');
+            mux.on_frame(sid,bytes::Bytes::from(header)).await;
+            let response=tokio::time::timeout(std::time::Duration::from_secs(2),frames.recv()).await.unwrap().unwrap();
+            let (header,data)=crate::mount_proto::decode_frame(&response);
+            (serde_json::from_slice(header).unwrap(),data.map(|data|data.to_vec()))
+        }
+        fn agreement(e:&AgreementEngine,key:&Ed25519KeyPair,root:&std::path::Path,mode:FolderMode)->AgreementSnapshot {
+            let spec=AccessSpec{folders:vec![FolderAccess::canonical("folder".into(),root,mode).unwrap()],..AccessSpec::default()};
+            let s=e.offer(peer(key),"folder-host",spec,Lifetime::UntilEnded,50,10).unwrap();accept(e,&s,key,10);s
+        }
+
+        #[tokio::test]
+        async fn folder_readonly_confines_root_substitution_and_end_closes_only_its_sid() {
+            let fixture=Fixture::new();let root=fixture.0.join("root");std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("original"),b"private data").unwrap();
+            let outside=fixture.0.join("outside");std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("secret"),b"outside secret").unwrap();
+            require_junction(&outside,&root.join("escape"));
+            let e=Arc::new(engine());let k=key();let s=agreement(&e,&k,&root,FolderMode::ReadOnly);
+            let (t,mut controls,mut frames)=transport();let mux=crate::l2::Mux::new(t,Arc::new(crate::host::NoHost));
+            let sid=crate::l2::L2_SID_BASE|61;
+            let serving={let e=e.clone();let id=s.id.clone();let mux=mux.clone();let p=peer(&k);
+                tokio::spawn(async move{e.serve_folder(&id,1,p,"folder",sid,mux,Arc::new(crate::host::NoHost)).await})};
+            let ack=tokio::time::timeout(std::time::Duration::from_secs(2),controls.recv()).await.unwrap().unwrap();
+            assert_eq!(ack["type"],"mount-open-ack");assert_eq!(ack["caps"]["max_write_size"],0);
+            assert!(matches!(request(&mux,sid,&mut frames,1,MountOp::GetAttr{path:"original".into()}).await.result,MountResult::Ok(_)));
+            let opened=request(&mux,sid,&mut frames,11,MountOp::Open{path:"original".into(),flags:O_RDONLY}).await;
+            let MountResult::Ok(opened)=opened.result else {panic!("read-only file open failed")};
+            let (_,data)=request_data(&mux,sid,&mut frames,12,MountOp::Read{fh:opened["fh"].as_u64().unwrap(),offset:0,size:32}).await;
+            assert_eq!(data.unwrap(),b"private data");
+            for (id,op) in [
+                (2,MountOp::Truncate{path:"original".into(),size:0}),
+                (3,MountOp::Rename{from:"original".into(),to:"changed".into()}),
+                (4,MountOp::Open{path:"escape/secret".into(),flags:O_RDONLY}),
+                (5,MountOp::Open{path:"../outside/secret".into(),flags:O_RDONLY}),
+            ] { assert!(matches!(request(&mux,sid,&mut frames,id,op).await.result,MountResult::Err(_))); }
+            assert_eq!(std::fs::read(root.join("original")).unwrap(),b"private data");
+            assert_eq!(std::fs::read(outside.join("secret")).unwrap(),b"outside secret");
+            let moved=fixture.0.join("moved");
+            if std::fs::rename(&root,&moved).is_ok() {
+                std::fs::create_dir(&root).unwrap();
+                std::fs::write(root.join("replacement-only"),b"wrong root").unwrap();
+                assert!(matches!(request(&mux,sid,&mut frames,6,MountOp::GetAttr{path:"original".into()}).await.result,MountResult::Ok(_)));
+                assert!(matches!(request(&mux,sid,&mut frames,7,MountOp::GetAttr{path:"replacement-only".into()}).await.result,MountResult::Err(_)));
+            } else {
+                assert!(root.is_dir()&&!moved.exists());
+                assert!(matches!(request(&mux,sid,&mut frames,6,MountOp::GetAttr{path:"original".into()}).await.result,MountResult::Ok(_)));
+            }
+            let other=crate::l2::L2_SID_BASE|62;let _other_rx=mux.register_stream(other).await.unwrap();
+            e.end(&s.id,10).unwrap();assert_eq!(serving.await.unwrap(),Err(AccessError::Ended));
+            assert!(!mux.has_stream(sid).await);assert!(mux.has_stream(other).await);mux.drop_stream(other).await;
+        }
+
+        #[tokio::test]
+        async fn folder_writable_operations_work_and_abort_reaps_task() {
+            let fixture=Fixture::new();let root=fixture.0.join("root");std::fs::create_dir(&root).unwrap();
+            let e=Arc::new(engine());let k=key();let s=agreement(&e,&k,&root,FolderMode::ReadWrite);
+            let (t,mut controls,mut frames)=transport();let mux=crate::l2::Mux::new(t,Arc::new(crate::host::NoHost));
+            let sid=crate::l2::L2_SID_BASE|63;
+            let serving={let e=e.clone();let id=s.id.clone();let mux=mux.clone();let p=peer(&k);
+                tokio::spawn(async move{e.serve_folder(&id,1,p,"folder",sid,mux,Arc::new(crate::host::NoHost)).await})};
+            assert_eq!(controls.recv().await.unwrap()["type"],"mount-open-ack");
+            let created=request(&mux,sid,&mut frames,1,MountOp::Create{path:"created".into(),mode:0o600,flags:O_RDWR}).await;
+            let MountResult::Ok(created)=created.result else{panic!("writable create failed")};
+            let mut header=serde_json::to_vec(&MountRequest{id:11,bin:Some(true),op:MountOp::Write{fh:created["fh"].as_u64().unwrap(),offset:0,size:7}}).unwrap();header.push(b'\n');
+            mux.on_frame(sid,bytes::Bytes::from(crate::mount_proto::encode_frame(&header,Some(b"written")))).await;
+            let response=frames.recv().await.unwrap();
+            let response:MountResponse=serde_json::from_slice(crate::mount_proto::decode_frame(&response).0).unwrap();
+            assert!(matches!(response.result,MountResult::Ok(_)));
+            assert_eq!(std::fs::read(root.join("created")).unwrap(),b"written");
+            assert!(matches!(request(&mux,sid,&mut frames,2,MountOp::Rename{from:"created".into(),to:"renamed".into()}).await.result,MountResult::Ok(_)));
+            assert!(root.join("renamed").exists());
+            assert!(matches!(request(&mux,sid,&mut frames,3,MountOp::Rename{from:"renamed".into(),to:"../escape".into()}).await.result,MountResult::Err(_)));
+            assert!(!fixture.0.join("escape").exists());
+            serving.abort();assert!(serving.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(std::time::Duration::from_secs(2),async{while mux.has_stream(sid).await{tokio::task::yield_now().await;}}).await.unwrap();
+            assert!(root.join("renamed").exists());
+        }
+    }
+
 
     #[cfg(all(feature = "forward-server", feature = "dispatch"))]
     #[tokio::test]

@@ -894,8 +894,69 @@ pub fn spawn_mount_server_with_admission(
     cfg: MountServerConfig,
     admission: Option<MountRequestAdmission>,
 ) -> tokio::task::JoinHandle<()> {
+    #[cfg(windows)]
+    {
+        // The standing mount path has no pre-pinned root object, so pin the
+        // canonical, host-confined root here before any request is served. On
+        // failure this is a close, never an unchecked path-join fallback.
+        match crate::mount_proto::WinRoot::pin_host_path(&cfg.root, !cfg.read_only) {
+            Ok(root) => spawn_mount_server_root(
+                cfg,
+                MountRoot::Windows(Arc::new(root)),
+                admission,
+            ),
+            Err(error) => {
+                let transport = cfg.transport.clone();
+                let sid = cfg.sid;
+                tokio::spawn(async move {
+                    let _ = transport
+                        .send_control(&serde_json::json!({
+                            "type": "l2-close",
+                            "sid": sid,
+                            "err": format!("windows pinned mount root refused: {error}"),
+                        }))
+                        .await;
+                })
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let root = MountRoot::Path(cfg.root.clone());
+        spawn_mount_server_root(cfg, root, admission)
+    }
+}
+
+/// The root a mount server resolves every request against. Linux keeps the
+/// existing `/proc/self/fd/<dirfd>` path (the directory was pinned by the
+/// caller). Windows uses the retained HANDLE tree instead; there is no
+/// path-based Windows variant.
+enum MountRoot {
+    #[cfg(not(windows))]
+    Path(PathBuf),
+    #[cfg(windows)]
+    Windows(Arc<WinRoot>),
+}
+
+/// Windows agreement folder serving: the caller pin the host-selected root
+/// BEFORE it acknowledges, then hands that pin here. This function is the only
+/// way to reach the Windows request handlers, and it does not reopen a path.
+#[cfg(windows)]
+pub(crate) fn spawn_mount_server_windows_pinned(
+    cfg: MountServerConfig,
+    root: Arc<WinRoot>,
+    admission: Option<MountRequestAdmission>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_mount_server_root(cfg, MountRoot::Windows(root), admission)
+}
+
+fn spawn_mount_server_root(
+    cfg: MountServerConfig,
+    root: MountRoot,
+    admission: Option<MountRequestAdmission>,
+) -> tokio::task::JoinHandle<()> {
     let MountServerConfig {
-        root,
+        root: _configured_root,
         transport,
         sid,
         stream: mut rx,
@@ -1016,8 +1077,16 @@ pub fn spawn_mount_server_with_admission(
                         .await;
                     return;
                 }
-                let (resp_body, resp_data) =
-                    handle_mount_request(&root, &mut open_files, &mut next_fh, &req, bin.as_deref(), v2, read_only).await;
+                let (resp_body, resp_data) = match &root {
+                    #[cfg(not(windows))]
+                    MountRoot::Path(path) => {
+                        handle_mount_request(path, &mut open_files, &mut next_fh, &req, bin.as_deref(), v2, read_only).await
+                    }
+                    #[cfg(windows)]
+                    MountRoot::Windows(win) => {
+                        win_at::handle_mount_request_windows(win, &mut open_files, &mut next_fh, &req, bin.as_deref(), v2, read_only)
+                    }
+                };
                 let mut resp_json = serde_json::to_vec(&resp_body).unwrap_or_default();
                 resp_json.push(b'\n');
                 let payload = if v2 {
@@ -1600,7 +1669,7 @@ mod win_at {
     use std::ffi::{c_void, OsStr};
     use std::fs::File;
     use std::io;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Component, Path, PathBuf};
     use windows_sys::Win32::Foundation::{
@@ -1667,6 +1736,23 @@ mod win_at {
         fn RtlNtStatusToDosError(status: i32) -> u32;
     }
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            file: HANDLE,
+            information_class: i32,
+            information: *const c_void,
+            size: u32,
+        ) -> i32;
+        fn FlushFileBuffers(file: HANDLE) -> i32;
+        fn GetFileInformationByHandleEx(
+            file: HANDLE,
+            information_class: i32,
+            information: *mut c_void,
+            size: u32,
+        ) -> i32;
+    }
+
     const OBJ_CASE_INSENSITIVE: u32 = 0x40;
     const FILE_DIRECTORY_FILE: u32 = 0x1;
     const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
@@ -1689,6 +1775,13 @@ mod win_at {
         | WinFs::FILE_TRAVERSE
         | WinFs::FILE_ADD_FILE
         | WinFs::FILE_DELETE_CHILD
+        | WinFs::FILE_READ_ATTRIBUTES
+        | WinFs::SYNCHRONIZE;
+    /// Traversal/listing only. A read-only agreement must be servable from a
+    /// directory ACL that grants no create/delete rights, so it never asks for
+    /// `FILE_ADD_FILE`/`FILE_DELETE_CHILD`.
+    const DIR_READ_ACCESS: u32 = WinFs::FILE_LIST_DIRECTORY
+        | WinFs::FILE_TRAVERSE
         | WinFs::FILE_READ_ATTRIBUTES
         | WinFs::SYNCHRONIZE;
     const OPEN_REPARSE: u32 = WinFs::FILE_FLAG_OPEN_REPARSE_POINT;
@@ -1746,6 +1839,13 @@ mod win_at {
         Ok(wide)
     }
 
+    /// Validate one caller-selected output name with the same Windows rules the
+    /// pinned path primitives enforce. `download_output` uses this before it
+    /// creates anything, so a peer-style `..`/ADS/device name never reaches NT.
+    pub(super) fn validate_component(name: &str) -> io::Result<()> {
+        units(OsStr::new(name)).map(|_| ())
+    }
+
     fn attributes(handle: HANDLE) -> io::Result<u32> {
         let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         let ok = unsafe { WinFs::GetFileInformationByHandle(handle, &mut info) };
@@ -1792,6 +1892,29 @@ mod win_at {
         file_attributes: u32,
         share_access: u32,
     ) -> io::Result<OwnedHandle> {
+        nt_open_raw(
+            parent.as_raw_handle() as HANDLE,
+            name,
+            disposition,
+            access,
+            options,
+            file_attributes,
+            share_access,
+        )
+    }
+
+    /// Same open, relative to a raw directory HANDLE. The mount data path uses
+    /// this so a directory already opened beneath the pinned root is the
+    /// traversal parent; a path is never reopened.
+    fn nt_open_raw(
+        parent: HANDLE,
+        name: &[u16],
+        disposition: u32,
+        access: u32,
+        options: u32,
+        file_attributes: u32,
+        share_access: u32,
+    ) -> io::Result<OwnedHandle> {
         let byte_len = (name.len() * 2) as u16;
         let mut unicode = UnicodeString {
             length: byte_len,
@@ -1800,7 +1923,7 @@ mod win_at {
         };
         let mut attrs = ObjectAttributes {
             length: std::mem::size_of::<ObjectAttributes>() as u32,
-            root_directory: parent.as_raw_handle() as HANDLE,
+            root_directory: parent,
             object_name: &mut unicode,
             attributes: OBJ_CASE_INSENSITIVE,
             security_descriptor: std::ptr::null_mut(),
@@ -1834,6 +1957,14 @@ mod win_at {
     }
 
     fn open_root_handle(root: &Path, open_reparse: bool) -> io::Result<OwnedHandle> {
+        open_root_handle_with_access(root, open_reparse, DIR_ACCESS)
+    }
+
+    fn open_root_handle_with_access(
+        root: &Path,
+        open_reparse: bool,
+        access: u32,
+    ) -> io::Result<OwnedHandle> {
         let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
         wide.push(0);
         let mut flags = WinFs::FILE_FLAG_BACKUP_SEMANTICS;
@@ -1843,7 +1974,7 @@ mod win_at {
         let handle = unsafe {
             WinFs::CreateFileW(
                 wide.as_ptr(),
-                DIR_ACCESS,
+                access,
                 SHARE_RW,
                 std::ptr::null(),
                 WinFs::OPEN_EXISTING,
@@ -1881,6 +2012,188 @@ mod win_at {
         ensure_stable_id(file_id(handle)?)
     }
 
+    fn filetime_unix(ft: i64) -> u64 {
+        let ticks = ft.max(0) as u64;
+        ticks
+            .saturating_sub(116_444_736_000_000_000)
+            .saturating_div(10_000_000)
+    }
+
+    /// Metadata read from the HANDLE itself, never from a path. A reparse entry
+    /// is reported as a link (lstat semantics) rather than followed; every
+    /// operation that would FOLLOW it refuses before touching its target.
+    fn meta_of(handle: HANDLE) -> io::Result<crate::fs_at::AtMeta> {
+        let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { WinFs::GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let is_link = info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        let is_dir = info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_DIRECTORY != 0;
+        let size = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
+        let ino = ((info.dwVolumeSerialNumber as u64) << 32)
+            ^ (((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64);
+        let mode = if is_link {
+            0o120777
+        } else if is_dir {
+            0o40755
+        } else {
+            0o100644
+        };
+        Ok(crate::fs_at::AtMeta {
+            ino,
+            size: if is_dir { 0 } else { size },
+            mode,
+            mtime: filetime_unix(
+                ((info.ftLastWriteTime.dwHighDateTime as i64) << 32)
+                    | info.ftLastWriteTime.dwLowDateTime as i64,
+            ),
+            is_dir,
+            is_symlink: is_link,
+        })
+    }
+
+    fn delete_handle(handle: &OwnedHandle) -> io::Result<()> {
+        #[repr(C)]
+        struct FileDispositionInfo {
+            delete_file: u8,
+        }
+        let disposition = FileDispositionInfo { delete_file: 1 };
+        if unsafe {
+            SetFileInformationByHandle(
+                handle.as_raw_handle() as HANDLE,
+                4, // FileDispositionInfo
+                (&disposition as *const FileDispositionInfo).cast(),
+                std::mem::size_of::<FileDispositionInfo>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn truncate_handle(file: &File, size: u64) -> io::Result<()> {
+        #[repr(C)]
+        struct FileEndOfFileInfo {
+            end_of_file: i64,
+        }
+        let info = FileEndOfFileInfo {
+            end_of_file: size.min(i64::MAX as u64) as i64,
+        };
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                6, // FileEndOfFileInfo
+                (&info as *const FileEndOfFileInfo).cast(),
+                std::mem::size_of::<FileEndOfFileInfo>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn flush_handle(file: &File) -> io::Result<()> {
+        if unsafe { FlushFileBuffers(file.as_raw_handle() as HANDLE) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `FILE_ID_BOTH_DIR_INFO` prefix, enough to walk `NextEntryOffset` and read
+    /// `FileName`. The layout is the Windows SDK's; the trailing name is
+    /// variable-length and read out of the returned buffer.
+    #[repr(C)]
+    struct FileIdBothDirInfo {
+        next_entry_offset: u32,
+        file_index: u32,
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        end_of_file: i64,
+        allocation_size: i64,
+        file_attributes: u32,
+        file_name_length: u32,
+        ea_size: u32,
+        short_name_length: i8,
+        short_name: [u16; 12],
+        file_id: i64,
+        file_name: [u16; 1],
+    }
+
+    fn stat_child(parent: HANDLE, name: &OsStr) -> io::Result<crate::fs_at::AtMeta> {
+        let name = units(name)?;
+        let child = nt_open_raw(
+            parent,
+            &name,
+            FILE_OPEN,
+            WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
+            OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+            0,
+            SHARE_RW,
+        )?;
+        meta_of(child.as_raw_handle() as HANDLE)
+    }
+
+    /// List an already-open directory HANDLE. Entries are read from that same
+    /// HANDLE and their metadata is opened relative to it, so a directory
+    /// swapped on disk after the open cannot redirect the listing.
+    pub(super) fn list_open_dir(dir: &File) -> io::Result<Vec<(std::ffi::OsString, Option<crate::fs_at::AtMeta>)>> {
+        let parent = dir.as_raw_handle() as HANDLE;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut restart = true;
+        loop {
+            let class = if restart {
+                11 // FileIdBothDirectoryRestartInfo
+            } else {
+                10 // FileIdBothDirectoryInfo
+            };
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    parent,
+                    class,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                )
+            };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(18) {
+                    // ERROR_NO_MORE_FILES
+                    break;
+                }
+                return Err(error);
+            }
+            restart = false;
+            let mut offset = 0usize;
+            loop {
+                if offset + std::mem::size_of::<FileIdBothDirInfo>() > buf.len() {
+                    break;
+                }
+                let record =
+                    unsafe { &*(buf.as_ptr().add(offset) as *const FileIdBothDirInfo) };
+                let units_len = record.file_name_length as usize / 2;
+                if units_len > 0 {
+                    let name = std::ffi::OsString::from_wide(unsafe {
+                        std::slice::from_raw_parts(record.file_name.as_ptr(), units_len)
+                    });
+                    if name != "." && name != ".." {
+                        let meta = stat_child(parent, &name).ok();
+                        out.push((name, meta));
+                    }
+                }
+                if record.next_entry_offset == 0 {
+                    break;
+                }
+                offset += record.next_entry_offset as usize;
+            }
+        }
+        Ok(out)
+    }
+
     /// The admitted root, opened ONCE and retained for the whole receive.
     ///
     /// Every later create/open/rename is relative to this HANDLE; the path is
@@ -1894,6 +2207,7 @@ mod win_at {
     pub(crate) struct WinRoot {
         handle: OwnedHandle,
         _id: (u32, u32, u32),
+        writable: bool,
     }
 
     /// All directory HANDLEs from the pinned root down to the staging parent.
@@ -1933,7 +2247,7 @@ mod win_at {
                 }
             }
             let id = stable_id(current.as_raw_handle() as HANDLE)?;
-            let win = Self { handle: current, _id: id };
+            let win = Self { handle: current, _id: id, writable: true };
             let path = win.final_path()?;
             Ok((win, path))
         }
@@ -1957,10 +2271,256 @@ mod win_at {
                     "Windows sync root changed while pinning; refusing the receive",
                 ));
             }
-            Ok(Self { handle, _id: id })
+            Ok(Self { handle, _id: id, writable: true })
         }
 
-        fn final_path(&self) -> io::Result<PathBuf> {
+        /// Production pin for a HOST-SELECTED absolute directory. Unlike the
+        /// test-only `open`, this is the entry the agreement folder endpoint
+        /// uses: the host already canonicalised the path and the peer cannot
+        /// replace it. The final component is opened with
+        /// `FILE_OPEN_REPARSE_POINT` (a junction/symlink is refused, never
+        /// followed), then a following open must report the same stable
+        /// identity so a swap between canonicalisation and pinning is refused.
+        pub(crate) fn pin_host_path(root: &Path, writable: bool) -> io::Result<Self> {
+            let access = if writable { DIR_ACCESS } else { DIR_READ_ACCESS };
+            let handle = open_root_handle_with_access(root, true, access)?;
+            let id = stable_id(handle.as_raw_handle() as HANDLE)?;
+            let follow = open_root_handle_with_access(root, false, access)?;
+            let follow_id = stable_id(follow.as_raw_handle() as HANDLE)?;
+            if follow_id != id {
+                return Err(denied(
+                    "Windows root changed while pinning; refusing the share",
+                ));
+            }
+            Ok(Self { handle, _id: id, writable })
+        }
+
+        /// Walk an existing relative directory chain beneath the pinned root
+        /// WITHOUT creating anything. Every component is opened relative to the
+        /// previous HANDLE with `FILE_OPEN_REPARSE_POINT` and refused if it is a
+        /// reparse point, so `..`-free traversal cannot be redirected.
+        fn parent_and_name(
+            &self,
+            rel: &Path,
+            dir_access: u32,
+        ) -> io::Result<(PinnedParent, Vec<u16>)> {
+            let mut names: Vec<&OsStr> = Vec::new();
+            for component in rel.components() {
+                match component {
+                    Component::Normal(name) => names.push(name),
+                    Component::CurDir => {}
+                    _ => {
+                        return Err(denied(
+                            "Windows share path component escapes the pinned root",
+                        ))
+                    }
+                }
+            }
+            let last = names.pop().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Windows share path is empty")
+            })?;
+            let mut chain = vec![self.handle.try_clone()?];
+            for name in names {
+                let name = units(name)?;
+                let next = open_existing_dir(
+                    chain.last().expect("chain is non-empty"),
+                    &name,
+                    dir_access,
+                )?;
+                chain.push(next);
+            }
+            Ok((PinnedParent { chain }, units(last)?))
+        }
+
+        /// Open one path relative to the pinned root. `rel` is never joined to
+        /// a path string. The final HANDLE is checked for reparse/type after
+        /// the open; a link is refused rather than followed.
+        pub(crate) fn open_rel(
+            &self,
+            rel: &Path,
+            access: u32,
+            disposition: u32,
+            writable: bool,
+        ) -> io::Result<(File, crate::fs_at::AtMeta)> {
+            if rel.as_os_str().is_empty() {
+                if writable {
+                    return Err(denied(
+                        "refusing to open the Windows share root for writing",
+                    ));
+                }
+                let clone = self.handle.try_clone()?;
+                let meta = meta_of(clone.as_raw_handle() as HANDLE)?;
+                return Ok((File::from(clone), meta));
+            }
+            let (parent, name) = self.parent_and_name(
+                rel,
+                if self.writable || writable || disposition != FILE_OPEN {
+                    DIR_ACCESS
+                } else {
+                    DIR_READ_ACCESS
+                },
+            )?;
+            let handle = nt_open(
+                parent.handle(),
+                &name,
+                disposition,
+                access,
+                OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                if disposition == FILE_CREATE {
+                    FILE_ATTRIBUTE_NORMAL
+                } else {
+                    0
+                },
+            )?;
+            let meta = meta_of(handle.as_raw_handle() as HANDLE)?;
+            if meta.is_symlink {
+                return Err(denied(
+                    "refusing Windows share path: the final name is a junction/symlink (reparse point)",
+                ));
+            }
+            Ok((File::from(handle), meta))
+        }
+
+        /// lstat a relative path. A reparse entry is reported, never followed.
+        #[cfg(test)]
+        pub fn read_file(&self, rel: &Path) -> io::Result<(File, crate::fs_at::AtMeta)> {
+            self.open_rel(rel, ACCESS_READ, FILE_OPEN, false)
+        }
+
+        #[cfg(test)]
+        pub fn create_file(&self, rel: &Path) -> io::Result<(File, crate::fs_at::AtMeta)> {
+            self.open_rel(rel, ACCESS_READ_WRITE, FILE_CREATE, true)
+        }
+
+        pub(crate) fn stat_rel(&self, rel: &Path) -> io::Result<crate::fs_at::AtMeta> {
+            if rel.as_os_str().is_empty() {
+                return meta_of(self.handle.as_raw_handle() as HANDLE);
+            }
+            let (parent, name) = self.parent_and_name(rel, DIR_READ_ACCESS)?;
+            let handle = nt_open(
+                parent.handle(),
+                &name,
+                FILE_OPEN,
+                WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
+                OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+            )?;
+            meta_of(handle.as_raw_handle() as HANDLE)
+        }
+
+        pub(crate) fn mkdir_rel(&self, rel: &Path) -> io::Result<()> {
+            let (parent, name) = self.parent_and_name(rel, DIR_ACCESS)?;
+            let child = nt_open(
+                parent.handle(),
+                &name,
+                FILE_CREATE,
+                DIR_ACCESS,
+                FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                WinFs::FILE_ATTRIBUTE_DIRECTORY,
+            )?;
+            check_dir(child).map(|_| ())
+        }
+
+        pub(crate) fn unlink_rel(&self, rel: &Path) -> io::Result<()> {
+            let (parent, name) = self.parent_and_name(rel, DIR_ACCESS)?;
+            let file = nt_open(
+                parent.handle(),
+                &name,
+                FILE_OPEN,
+                WinFs::DELETE | WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
+                OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+            )?;
+            let meta = meta_of(file.as_raw_handle() as HANDLE)?;
+            if meta.is_dir {
+                return Err(denied("Windows share unlink target is a directory"));
+            }
+            if meta.is_symlink {
+                return Err(denied(
+                    "refusing Windows share unlink: the final name is a reparse point",
+                ));
+            }
+            delete_handle(&file)
+        }
+
+        pub(crate) fn rmdir_rel(&self, rel: &Path) -> io::Result<()> {
+            let (parent, name) = self.parent_and_name(rel, DIR_ACCESS)?;
+            let dir = nt_open(
+                parent.handle(),
+                &name,
+                FILE_OPEN,
+                WinFs::DELETE | WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
+                FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+            )?;
+            let meta = meta_of(dir.as_raw_handle() as HANDLE)?;
+            if meta.is_symlink {
+                return Err(denied(
+                    "refusing Windows share rmdir: the final name is a reparse point",
+                ));
+            }
+            delete_handle(&dir)
+        }
+
+        pub(crate) fn truncate_rel(&self, rel: &Path, size: u64) -> io::Result<()> {
+            let (parent, name) = self.parent_and_name(rel, DIR_ACCESS)?;
+            let file = nt_open(
+                parent.handle(),
+                &name,
+                FILE_OPEN,
+                GENERIC_WRITE | WinFs::SYNCHRONIZE,
+                OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+            )?;
+            let meta = meta_of(file.as_raw_handle() as HANDLE)?;
+            if meta.is_dir {
+                return Err(denied("Windows share truncate target is a directory"));
+            }
+            if meta.is_symlink {
+                return Err(denied(
+                    "refusing Windows share truncate: the final name is a reparse point",
+                ));
+            }
+            truncate_handle(&File::from(file), size)
+        }
+
+        pub(crate) fn rename_rel(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let (from_parent, from_name) = self.parent_and_name(from, DIR_ACCESS)?;
+            let source = File::from(nt_open(
+                from_parent.handle(),
+                &from_name,
+                FILE_OPEN,
+                WinFs::DELETE | WinFs::FILE_READ_ATTRIBUTES | WinFs::SYNCHRONIZE,
+                OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+            )?);
+            let meta = meta_of(source.as_raw_handle() as HANDLE)?;
+            if meta.is_symlink {
+                return Err(denied(
+                    "refusing Windows share rename: the source is a reparse point",
+                ));
+            }
+            let (to_parent, to_name) = self.parent_and_name(to, DIR_ACCESS)?;
+            rename_handle_impl(to_parent.handle(), &to_name, &source, 1)
+        }
+
+        /// Best-effort directory flush. Windows has no guaranteed
+        /// directory-entry durability primitive: `FlushFileBuffers` on a
+        /// directory HANDLE is documented for files and commonly returns
+        /// INVALID_FUNCTION/ACCESS_DENIED. Those mean "not durable", not a
+        /// failure; any other error is a real I/O failure.
+        pub(crate) fn flush_root(&self) -> io::Result<bool> {
+            if unsafe { FlushFileBuffers(self.handle.as_raw_handle() as HANDLE) } != 0 {
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(1) | Some(5) | Some(6) | Some(87) => Ok(false),
+                _ => Err(error),
+            }
+        }
+
+        pub(crate) fn final_path(&self) -> io::Result<PathBuf> {
             use std::os::windows::ffi::OsStringExt;
             let mut buf = vec![0u16; 512];
             loop {
@@ -2055,6 +2615,31 @@ mod win_at {
             to_name: &OsStr,
             source: &File,
         ) -> io::Result<()> {
+            self.staged_rename(parent, from_name, to_name, source, 1)
+        }
+
+        /// Same pinned-parent commit, but refuses to replace an existing
+        /// destination entry. A collision surfaces as `AlreadyExists`, which is
+        /// what lets the owned-download publisher choose a new name without a
+        /// check-then-rename race.
+        pub(crate) fn rename_staged_no_clobber(
+            &self,
+            parent: &PinnedParent,
+            from_name: &OsStr,
+            to_name: &OsStr,
+            source: &File,
+        ) -> io::Result<()> {
+            self.staged_rename(parent, from_name, to_name, source, 0)
+        }
+
+        fn staged_rename(
+            &self,
+            parent: &PinnedParent,
+            from_name: &OsStr,
+            to_name: &OsStr,
+            source: &File,
+            replace_if_exists: u8,
+        ) -> io::Result<()> {
             let from = units(from_name)?;
             let to = units(to_name)?;
             // The identity open is transient and only reads attributes. It
@@ -2079,7 +2664,7 @@ mod win_at {
                 ));
             }
             drop(named);
-            rename_handle(parent.handle(), &to, source)
+            rename_handle_impl(parent.handle(), &to, source, replace_if_exists)
         }
     }
 
@@ -2094,6 +2679,22 @@ mod win_at {
             return Err(denied("Windows sync path parent is not a directory"));
         }
         Ok(child)
+    }
+
+    fn open_existing_dir(
+        parent: &OwnedHandle,
+        name: &[u16],
+        access: u32,
+    ) -> io::Result<OwnedHandle> {
+        let child = nt_open(
+            parent,
+            name,
+            FILE_OPEN,
+            access,
+            FILE_DIRECTORY_FILE | OPEN_REPARSE | FILE_SYNCHRONOUS_IO_NONALERT,
+            0,
+        )?;
+        check_dir(child)
     }
 
     fn open_or_create_dir(parent: &OwnedHandle, name: &[u16]) -> io::Result<OwnedHandle> {
@@ -2149,10 +2750,11 @@ mod win_at {
         }
     }
 
-    fn rename_handle(
+    fn rename_handle_impl(
         parent: &OwnedHandle,
         to_name: &[u16],
         source: &File,
+        replace_if_exists: u8,
     ) -> io::Result<()> {
         let name_bytes = to_name.len() * 2;
         let offset = std::mem::offset_of!(FileRenameInfo, file_name);
@@ -2162,7 +2764,7 @@ mod win_at {
         let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
         let info = buffer.as_mut_ptr() as *mut FileRenameInfo;
         unsafe {
-            (*info).replace_if_exists = 1;
+            (*info).replace_if_exists = replace_if_exists;
             (*info).root_directory = parent.as_raw_handle() as HANDLE;
             (*info).file_name_length = name_bytes as u32;
             std::ptr::copy_nonoverlapping(
@@ -2190,6 +2792,261 @@ mod win_at {
         }
         Ok(())
     }
+
+    // ---------------------------------------------------- mount data path --
+
+    const O_ACCMODE: i32 = 0o3;
+    const O_CREAT: i32 = 0o100;
+    const O_EXCL: i32 = 0o200;
+    const O_TRUNC: i32 = 0o1000;
+
+    fn mount_error(error: io::Error) -> super::MountError {
+        super::MountError {
+            code: error.raw_os_error().unwrap_or(super::EIO),
+            msg: error.to_string(),
+        }
+    }
+
+    fn open_mode(flags: i32) -> (u32, u32) {
+        let write = flags & O_ACCMODE != 0;
+        let access = if write {
+            GENERIC_READ | GENERIC_WRITE | WinFs::DELETE | WinFs::SYNCHRONIZE
+        } else {
+            ACCESS_READ
+        };
+        let create = flags & O_CREAT != 0;
+        let exclusive = flags & O_EXCL != 0;
+        let truncate = flags & O_TRUNC != 0;
+        let disposition = if create && exclusive {
+            FILE_CREATE
+        } else if create && truncate {
+            5 // FILE_OVERWRITE_IF
+        } else if create {
+            3 // FILE_OPEN_IF
+        } else if truncate {
+            4 // FILE_OVERWRITE
+        } else {
+            FILE_OPEN
+        };
+        (access, disposition)
+    }
+
+    /// Serve the existing mount protocol for a Windows agreement folder. Every
+    /// request is resolved relative to the retained root HANDLE and every
+    /// directory component is opened with `FILE_OPEN_REPARSE_POINT`; there is
+    /// no path join and no follow-the-link fallback. The caller has already
+    /// applied the agreement admission gate and read-only decision.
+    pub(super) fn handle_mount_request_windows(
+        win: &WinRoot,
+        open_files: &mut std::collections::HashMap<u64, (File, PathBuf)>,
+        next_fh: &mut u64,
+        req: &super::MountRequest,
+        write_data: Option<&[u8]>,
+        v2: bool,
+        read_only: bool,
+    ) -> (super::MountResponse, Option<Vec<u8>>) {
+        use super::{
+            do_read, do_write, file_stat, open_mutates, path_decode, path_encode, DirEntry,
+            FileStat, MountError, MountOp, MountResponse, MountResult, EACCES, EBADF, EINVAL,
+            EMFILE, EROFS, MAX_OPEN_FILES_PER_STREAM,
+        };
+
+        if read_only {
+            let mutating = match &req.op {
+                MountOp::Write { .. }
+                | MountOp::Create { .. }
+                | MountOp::Unlink { .. }
+                | MountOp::MkDir { .. }
+                | MountOp::RmDir { .. }
+                | MountOp::Rename { .. }
+                | MountOp::Truncate { .. } => true,
+                MountOp::Open { flags, .. } => open_mutates(*flags),
+                _ => false,
+            };
+            if mutating {
+                return (
+                    MountResponse {
+                        id: req.id,
+                        bin: None,
+                        result: MountResult::Err(MountError {
+                            code: EROFS,
+                            msg: "read-only fleet share".into(),
+                        }),
+                    },
+                    None,
+                );
+            }
+        }
+
+        fn check_open_count(len: usize) -> Result<(), MountError> {
+            if len >= MAX_OPEN_FILES_PER_STREAM {
+                Err(MountError {
+                    code: EMFILE,
+                    msg: format!(
+                        "too many open files on this mount (max {MAX_OPEN_FILES_PER_STREAM})"
+                    ),
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        let result: Result<(serde_json::Value, Option<Vec<u8>>), MountError> = (|| {
+            match &req.op {
+                MountOp::GetAttr { path } => {
+                    let rel = path_decode(path)?;
+                    let meta = win.stat_rel(&rel).map_err(mount_error)?;
+                    Ok((
+                        serde_json::to_value(file_stat(&meta)).unwrap_or_default(),
+                        None,
+                    ))
+                }
+                MountOp::Open { path, flags } => {
+                    check_open_count(open_files.len())?;
+                    let rel = path_decode(path)?;
+                    let write = flags & O_ACCMODE != 0;
+                    if write && read_only {
+                        return Err(MountError {
+                            code: EROFS,
+                            msg: "read-only fleet share".into(),
+                        });
+                    }
+                    let (access, disposition) = open_mode(*flags);
+                    let (file, meta) = win
+                        .open_rel(&rel, access, disposition, write)
+                        .map_err(mount_error)?;
+                    if write && meta.is_dir {
+                        return Err(MountError {
+                            code: EACCES,
+                            msg: "refusing to open a directory for writing".into(),
+                        });
+                    }
+                    let fh = *next_fh;
+                    *next_fh += 1;
+                    open_files.insert(fh, (file, rel));
+                    Ok((serde_json::json!({ "fh": fh }), None))
+                }
+                MountOp::Read { fh, offset, size } => match do_read(open_files, *fh, *offset, *size)
+                {
+                    Ok((value, bytes)) => Ok((value, if v2 { Some(bytes) } else { None })),
+                    Err(error) => Err(error),
+                },
+                MountOp::Write { fh, offset, .. } => {
+                    let Some(data) = write_data else {
+                        return Err(MountError {
+                            code: EINVAL,
+                            msg: "Write missing data payload".into(),
+                        });
+                    };
+                    do_write(open_files, *fh, *offset, data)
+                        .map(|value| (value, None))
+                }
+                MountOp::ReadDir { fh, .. } => {
+                    let (dir, _) = open_files.get(fh).ok_or(MountError {
+                        code: EBADF,
+                        msg: "bad fh".into(),
+                    })?;
+                    let entries = list_open_dir(dir).map_err(mount_error)?;
+                    let entries: Vec<DirEntry> = entries
+                        .into_iter()
+                        .map(|(name, meta)| DirEntry {
+                            name: path_encode(Path::new(&name)),
+                            stat: match meta {
+                                Some(meta) => file_stat(&meta),
+                                None => FileStat {
+                                    ino: 0,
+                                    size: 0,
+                                    mode: 0,
+                                    uid: 0,
+                                    gid: 0,
+                                    mtime: 0,
+                                    nlink: 0,
+                                    blocks: 0,
+                                    blksize: 4096,
+                                    kind: None,
+                                },
+                            },
+                        })
+                        .collect();
+                    Ok((serde_json::to_value(entries).unwrap_or_default(), None))
+                }
+                MountOp::Release { fh } => {
+                    open_files.remove(fh);
+                    Ok((serde_json::Value::Null, None))
+                }
+                MountOp::Create { path, .. } => {
+                    check_open_count(open_files.len())?;
+                    let rel = path_decode(path)?;
+                    let (file, _) = win
+                        .open_rel(
+                            &rel,
+                            GENERIC_READ | GENERIC_WRITE | WinFs::DELETE | WinFs::SYNCHRONIZE,
+                            FILE_CREATE,
+                            true,
+                        )
+                        .map_err(mount_error)?;
+                    let fh = *next_fh;
+                    *next_fh += 1;
+                    open_files.insert(fh, (file, rel));
+                    Ok((serde_json::json!({ "fh": fh }), None))
+                }
+                MountOp::Unlink { path } => {
+                    win.unlink_rel(&path_decode(path)?).map_err(mount_error)?;
+                    Ok((serde_json::Value::Null, None))
+                }
+                MountOp::MkDir { path, .. } => {
+                    win.mkdir_rel(&path_decode(path)?).map_err(mount_error)?;
+                    Ok((serde_json::Value::Null, None))
+                }
+                MountOp::RmDir { path } => {
+                    win.rmdir_rel(&path_decode(path)?).map_err(mount_error)?;
+                    Ok((serde_json::Value::Null, None))
+                }
+                MountOp::Rename { from, to } => {
+                    win.rename_rel(&path_decode(from)?, &path_decode(to)?)
+                        .map_err(mount_error)?;
+                    Ok((serde_json::Value::Null, None))
+                }
+                MountOp::Truncate { path, size } => {
+                    win.truncate_rel(&path_decode(path)?, *size)
+                        .map_err(mount_error)?;
+                    Ok((serde_json::Value::Null, None))
+                }
+                MountOp::FSync { fh, .. } => {
+                    let (file, _) = open_files.get(fh).ok_or(MountError {
+                        code: EBADF,
+                        msg: "bad fh".into(),
+                    })?;
+                    flush_handle(file).map_err(mount_error)?;
+                    Ok((serde_json::Value::Null, None))
+                }
+                MountOp::ReadLink { .. } => Err(MountError {
+                    code: EINVAL,
+                    msg: "symbolic links are not supported by the Windows folder endpoint"
+                        .into(),
+                }),
+            }
+        })();
+
+        match result {
+            Ok((value, data)) => (
+                MountResponse {
+                    id: req.id,
+                    bin: if data.is_some() { Some(true) } else { None },
+                    result: MountResult::Ok(value),
+                },
+                data,
+            ),
+            Err(error) => (
+                MountResponse {
+                    id: req.id,
+                    bin: None,
+                    result: MountResult::Err(error),
+                },
+                None,
+            ),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2200,6 +3057,11 @@ pub(crate) fn windows_ensure_stable_id(id: (u32, u32, u32)) -> std::io::Result<(
 #[cfg(windows)]
 pub(crate) fn windows_unsupported_error(code: i32) -> std::io::Error {
     win_at::unsupported(std::io::Error::from_raw_os_error(code))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_validate_component(name: &str) -> bool {
+    win_at::validate_component(name).is_ok()
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3650,6 +4512,172 @@ mod tests {
             assert!(error.to_string().contains("stable file identity"));
         }
         windows_ensure_stable_id((7, 1, 2)).expect("a real identity is accepted");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pinned_folder_refuses_reparse_escape_and_parent_traversal() {
+        let root = win_tmp();
+        let outside = win_tmp();
+        std::fs::write(outside.join("secret"), b"outside secret").unwrap();
+        require_junction(&outside, &root.join("escape"));
+        std::fs::write(root.join("inside"), b"inside bytes").unwrap();
+        let win = WinRoot::pin_host_path(&root, false).expect("pin the host-selected root");
+
+        let (mut file, _) = win.read_file(std::path::Path::new("inside")).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        assert_eq!(bytes, b"inside bytes");
+
+        for escape in [
+            std::path::Path::new("escape/secret"),
+            std::path::Path::new("../outside"),
+            std::path::Path::new("inside/child"),
+        ] {
+            let error = win
+                .read_file(escape)
+                .expect_err("a junction or non-directory traversal is refused");
+            assert!(
+                error.raw_os_error().is_some(),
+                "{escape:?}: {error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(outside.join("secret")).unwrap(),
+            b"outside secret"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pinned_folder_survives_root_substitution() {
+        let outer = win_tmp();
+        let root = outer.join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("original"), b"private data").unwrap();
+        let win = WinRoot::pin_host_path(&root, false).unwrap();
+
+        let moved = outer.join("moved");
+        match std::fs::rename(&root, &moved) {
+            Ok(()) => {
+                // The path changed; the retained root HANDLE did not.
+                let (mut file, _) = win.read_file(std::path::Path::new("original")).unwrap();
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+                assert_eq!(bytes, b"private data");
+                let replacement = outer.join("replacement");
+                std::fs::create_dir(&replacement).unwrap();
+                std::fs::write(replacement.join("replacement-only"), b"wrong root").unwrap();
+                assert!(win.stat_rel(std::path::Path::new("replacement-only")).is_err());
+                let _ = std::fs::remove_dir_all(&moved);
+                let _ = std::fs::remove_dir_all(&replacement);
+            }
+            Err(error) => {
+                // The open HANDLE blocks replacing the root path. Refusal is
+                // the guarantee; the pin must still read the original tree.
+                assert!(error.raw_os_error().is_some(), "root rename refused: {error}");
+                let (mut file, _) = win.read_file(std::path::Path::new("original")).unwrap();
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+                assert_eq!(bytes, b"private data");
+                assert!(root.is_dir());
+                assert!(!moved.exists());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_no_clobber_publish_refuses_an_existing_name() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let root = win_tmp();
+        std::fs::write(root.join("file"), b"existing").unwrap();
+        let win = WinRoot::pin_host_path(&root, true).unwrap();
+        let parent = win.ensure_parent(std::path::Path::new("")).unwrap();
+        let mut staging = win
+            .create_staging(&parent, OsStr::new(".tunlion-download-test.part"))
+            .unwrap();
+        staging.write_all(b"new content").unwrap();
+        staging.sync_all().unwrap();
+        let error = win
+            .rename_staged_no_clobber(
+                &parent,
+                OsStr::new(".tunlion-download-test.part"),
+                OsStr::new("file"),
+                &staging,
+            )
+            .expect_err("an existing destination must never be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"existing");
+        win.rename_staged_no_clobber(
+            &parent,
+            OsStr::new(".tunlion-download-test.part"),
+            OsStr::new("file-1"),
+            &staging,
+        )
+        .expect("a free name publishes");
+        assert_eq!(std::fs::read(root.join("file-1")).unwrap(), b"new content");
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"existing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_folder_write_rename_truncate_delete_are_handle_relative() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let root = win_tmp();
+        let win = WinRoot::pin_host_path(&root, true).unwrap();
+        win.mkdir_rel(std::path::Path::new("sub")).unwrap();
+        let (mut created, _) = win.create_file(std::path::Path::new("sub/file")).unwrap();
+        created.write_all(b"written").unwrap();
+        created.sync_all().unwrap();
+        drop(created);
+        win.truncate_rel(std::path::Path::new("sub/file"), 3).unwrap();
+        let (mut file, _) = win.read_file(std::path::Path::new("sub/file")).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"wri");
+        file.seek(SeekFrom::Start(0)).unwrap();
+        drop(file);
+        win.rename_rel(std::path::Path::new("sub/file"), std::path::Path::new("sub/renamed"))
+            .unwrap();
+        assert!(root.join("sub/renamed").exists());
+        assert!(!root.join("sub/file").exists());
+        win.unlink_rel(std::path::Path::new("sub/renamed")).unwrap();
+        assert!(!root.join("sub/renamed").exists());
+        win.rmdir_rel(std::path::Path::new("sub")).unwrap();
+        assert!(!root.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_folder_listing_reads_entries_from_the_open_directory() {
+        use super::win_at::list_open_dir;
+        let root = win_tmp();
+        std::fs::write(root.join("a"), b"1").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let outside = win_tmp();
+        require_junction(&outside, &root.join("ln"));
+        let win = WinRoot::pin_host_path(&root, false).unwrap();
+        let (dir, _) = win.read_file(std::path::Path::new("")).unwrap();
+        let mut entries = list_open_dir(&dir).unwrap();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let names: Vec<_> = entries
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a", "ln", "sub"]);
+        assert!(entries[1].1.unwrap().is_symlink);
+        assert!(entries[2].1.unwrap().is_dir);
+        assert_eq!(entries[0].1.unwrap().size, 1);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
 }

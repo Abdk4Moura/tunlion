@@ -49,11 +49,22 @@ this method with that sealed context and the **same shared per-peer Mux** that
 routes subsequent chunks/close frames. Do not fall back to generic standing
 mount or shell admission.
 
-The host requires Linux plus `mount-server`. It pins a directory descriptor,
-registers a bounded same-generation Mux stream, and sends the existing
-`mount-open-ack { sid, caps }` only after root/registration/server setup. The
-existing mount protocol serves requests with its existing path protections and
-server-enforced RO/RW decision. No OS mount is performed.
+The host requires Linux or Windows plus `mount-server`. It pins the
+host-selected root before acknowledgement, registers a bounded same-generation
+Mux stream, and sends the existing `mount-open-ack { sid, caps }` only after
+root/registration/server setup. The existing mount protocol serves requests with
+its existing path protections and server-enforced RO/RW decision. No OS mount is
+performed.
+
+Linux pins a directory descriptor and serves the existing confined path
+protocol. Windows pins the root through the retained `WinRoot` HANDLE: the final
+root component is opened with `FILE_OPEN_REPARSE_POINT` and refused if it is a
+junction/symlink/reparse point, a following open must report the same volume
+serial/file identity, and every request opens each component relative to the
+previous directory HANDLE. There is no path join and no unchecked fallback. A
+root renamed or substituted after acknowledgement does not redirect the live
+share. `ReadLink` is refused because the Windows endpoint does not advertise
+symlink support.
 
 Every filesystem request, including requests already buffered on the server,
 rechecks the agreement's effective accepted scope under the engine mutex. The
@@ -79,6 +90,18 @@ native relative paths, then `MountOp::{GetAttr, Open, Read, Release}`. Bound eac
 read by negotiated caps and the existing protocol payload limit. Constrain local
 download destination creation, filenames, collisions and partial-file publication
 using the existing safe receive storage helpers, not peer-provided absolute paths.
+
+`download_output::OwnedDownload` is the owned publisher for that seam. It takes
+a caller-selected existing directory and one plain name; peers never supply an
+absolute destination. Linux links the pinned open inode into place with
+no-clobber `linkat`. Windows creates the staging file relative to the pinned
+directory HANDLE and renames that open HANDLE with `replace_if_exists = 0`, so
+an existing name is never replaced and concurrent publishers get distinct
+`name-1`, `name-2`, ... results. Publication is atomic on one volume. Windows
+has no guaranteed directory-entry durability primitive, so a successful
+publication reports `durable = false` when the best-effort directory flush is
+unavailable; a real flush I/O failure after commit returns
+`DurabilityUnknown(path)` rather than success.
 
 Important current client limitations:
 
