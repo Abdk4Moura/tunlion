@@ -268,7 +268,7 @@ mod tests{
 /// a real pinned directory. Reparse/junction substitution is refused by the pin,
 /// and the no-clobber rename is what makes existing names safe.
 #[cfg(all(test,target_os="windows",feature="mount-server"))]
-mod windows_tests{
+mod tests{
     use super::*;
     struct Root(PathBuf);
     impl Root{
