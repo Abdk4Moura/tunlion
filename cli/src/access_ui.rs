@@ -1,6 +1,7 @@
 //! Temporary-access terminal adapter. Drafting is local and side-effect free:
 //! it never creates keys, contacts, grants, listeners, or sample invitations.
 use anyhow::{Result, bail};
+use crate::ui;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use filament_peerloop::access::{AccessSpec, AgreementEngine, AgreementSnapshot, AgreementState, FolderAccess, FolderMode, Lifetime, ServiceAccess, ServiceProtocol};
@@ -76,12 +77,12 @@ pub(crate) fn lifetime_label(lifetime: Lifetime) -> String {
 
 /// Only a caller holding the shared engine's authenticated review may call this.
 pub(crate) fn review_offer(snapshot: &AgreementSnapshot, stop: &AtomicBool) -> Result<()> {
-    eprintln!("  Authenticated temporary offer · peer {}", hex::encode(&snapshot.host_peer[..6]));
-    eprintln!("  {} · revision {} · {}", terminal_label(&snapshot.name), snapshot.revision, lifetime_label(snapshot.lifetime));
+    ui::say(&format!("  Authenticated temporary offer · peer {}", hex::encode(&snapshot.host_peer[..6])));
+    ui::say(&format!("  {} · revision {} · {}", terminal_label(&snapshot.name), snapshot.revision, lifetime_label(snapshot.lifetime)));
     let draft = Draft { spec: snapshot.spec.clone(), next_id: 0 };
-    for line in draft.review_with_lifetime(snapshot.lifetime)? { eprintln!("  {}", terminal_label(&line)); }
+    for line in draft.review_with_lifetime(snapshot.lifetime)? { ui::say(&format!("  {}", terminal_label(&line))); }
     if !snapshot.spec.folders.is_empty() {
-        eprintln!("  Folder browse/read checks the host endpoint; download support is platform-specific. No OS mount or DNS is implied.");
+        ui::say("  Folder browse/read checks the host endpoint; download support is platform-specific. No OS mount or DNS is implied.");
     }
     if snapshot.spec.shell || snapshot.spec.device_network {
         bail!("this build cannot activate the offered shell/device networking scope");
@@ -105,7 +106,7 @@ pub(crate) fn spawn_host_controls(
             while !stop.load(Ordering::Acquire) {
                 let snapshot = engine.snapshot(&id, crate::identity::now_secs())?;
                 if matches!(snapshot.state, AgreementState::Ended | AgreementState::Expired | AgreementState::Declined) { return Ok(()); }
-                eprintln!("  {} · revision {} · {}", terminal_label(&snapshot.name), snapshot.revision, lifetime_label(snapshot.lifetime));
+                ui::say(&format!("  {} · revision {} · {}", terminal_label(&snapshot.name), snapshot.revision, lifetime_label(snapshot.lifetime)));
                 let choice = live_pick("RUNNING ACCESS", &["Change access".into(), "Set expiry".into(), "End access".into()], &stop)?;
                 let Some(choice) = choice else {
                     if !stop.load(Ordering::Acquire) {
@@ -123,7 +124,7 @@ pub(crate) fn spawn_host_controls(
                         let lifetime = if raw.trim().is_empty() { Lifetime::UntilEnded } else {
                             match crate::file_io::parse_mint_ttl(raw.trim()) {
                                 Ok(ttl) if ttl > 0 => Lifetime::ExpiresAt(crate::identity::now_secs().saturating_add(ttl)),
-                                _ => { eprintln!("  Invalid expiry. Nothing changed."); continue; }
+                                _ => { ui::say("  Invalid expiry. Nothing changed."); continue; }
                             }
                         };
                         engine.revise(&id, snapshot.revision, snapshot.spec, lifetime, crate::identity::now_secs())?
@@ -136,7 +137,7 @@ pub(crate) fn spawn_host_controls(
             Ok(())
         })();
         if let Err(error) = result {
-            eprintln!("  Access controls failed: {error}");
+            ui::critical(&format!("  Access controls failed: {error}"));
             if let Ok(snapshot) = engine.end(&id, crate::identity::now_secs()) { let _ = updates.blocking_send(snapshot); }
         }
     });
@@ -223,14 +224,14 @@ fn edit_live(spec: &AccessSpec, lifetime: Lifetime, stop: &AtomicBool) -> Result
         if selected < resources { draft.spec.services.remove(selected - draft.spec.folders.len()); continue; }
         match selected - resources {
             0 => if let Some(path) = live_line("folder path: ", stop)? {
-                if let Err(error) = draft.add_folder(&path) { eprintln!("  {error}"); }
+                if let Err(error) = draft.add_folder(&path) { ui::say(&format!("  {error}")); }
             },
             1 => if let Some(port) = live_line("port or IP:port: ", stop)? {
-                if let Err(error) = draft.add_service(&port) { eprintln!("  {error}"); }
+                if let Err(error) = draft.add_service(&port) { ui::say(&format!("  {error}")); }
             },
             2 => {
-                let lines = match draft.review_with_lifetime(lifetime) { Ok(lines) => lines, Err(error) => { eprintln!("  {error}"); continue; } };
-                for line in lines { eprintln!("  {}", terminal_label(&line)); }
+                let lines = match draft.review_with_lifetime(lifetime) { Ok(lines) => lines, Err(error) => { ui::say(&format!("  {error}")); continue; } };
+                for line in lines { ui::say(&format!("  {}", terminal_label(&line))); }
                 if live_pick("APPLY CHANGE?", &["Apply".into(), "Keep editing".into()], stop)? == Some(0) { return Ok(Some(draft.spec)); }
             }
             _ => return Ok(None),
@@ -333,7 +334,7 @@ fn edit_folders(draft: &mut Draft) -> Result<()> {
         let selected = pick("FOLDERS", labels)?;
         if selected == draft.spec.folders.len() {
             let input = crate::prompt_line("  folder path: ")?;
-            if let Err(error) = draft.add_folder(&input) { eprintln!("  {error}"); }
+            if let Err(error) = draft.add_folder(&input) { ui::say(&format!("  {error}")); }
             continue;
         }
         if selected > draft.spec.folders.len() { return Ok(()); }
@@ -352,7 +353,7 @@ fn edit_services(draft: &mut Draft) -> Result<()> {
             "Add port".into(), "Continue".into()])?;
         match action {
             0 => {
-                if draft.spec.services.is_empty() { eprintln!("  No services added. Choose Add port."); continue; }
+                if draft.spec.services.is_empty() { ui::say("  No services added. Choose Add port."); continue; }
                 let labels = draft.spec.services.iter().map(|service| service.target.to_string()).collect::<Vec<_>>();
                 if let Some(indices) = checklist("SERVICES", &labels, vec![true; labels.len()])? {
                     draft.spec.services = indices.into_iter().map(|i| draft.spec.services[i].clone()).collect();
@@ -360,7 +361,7 @@ fn edit_services(draft: &mut Draft) -> Result<()> {
             }
             1 => {
                 let input = crate::prompt_line("  port or IP:port: ")?;
-                if let Err(error) = draft.add_service(&input) { eprintln!("  {error}"); }
+                if let Err(error) = draft.add_service(&input) { ui::say(&format!("  {error}")); }
             }
             _ => return Ok(()),
         }
@@ -371,8 +372,8 @@ fn edit_services(draft: &mut Draft) -> Result<()> {
 /// are available. Do not route a temporary offer through permanent `pair_cmd`.
 pub(crate) fn temporary_access() -> Result<AccessSpec> {
     let mut draft = Draft::default();
-    eprintln!("  Temporary access · until ended · foreground only.");
-    eprintln!("  TCP services and supported host folder browse/read · no OS mount or DNS setup.");
+    ui::say("  Temporary access · until ended · foreground only.");
+    ui::say("  TCP services and supported host folder browse/read · no OS mount or DNS setup.");
     loop {
         // Unsupported shell/network/expiry/background controls are not offered.
         match pick("TEMPORARY ACCESS", vec![format!("Folders ({})", draft.spec.folders.len()),
@@ -382,9 +383,9 @@ pub(crate) fn temporary_access() -> Result<AccessSpec> {
             2 => {
                 let review = match draft.review() {
                     Ok(review) => review,
-                    Err(error) => { eprintln!("  {error}"); continue; }
+                    Err(error) => { ui::say(&format!("  {error}")); continue; }
                 };
-                for line in review { eprintln!("  {}", terminal_label(&line)); }
+                for line in review { ui::say(&format!("  {}", terminal_label(&line))); }
                 match pick("SHARE THIS SCOPE?", vec!["Create code".into(), "Change access".into(), "Cancel".into()])? {
                     1 => continue,
                     2 => return Err(crate::cancelled()),

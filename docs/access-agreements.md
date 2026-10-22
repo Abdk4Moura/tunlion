@@ -47,6 +47,20 @@ accepted spec, not a peer-supplied hostname/port, selects the exact target.
 The Mux's actual `l2-open-ack` / `l2-close` is the activation result; returning
 from a serving task is not proof that an endpoint became available.
 
+On Linux with the `mount-server` feature, an accepted folder opens through
+`serve_folder` on the same authenticated Mux. The host pins its canonical root
+descriptor before `mount-open-ack`; renaming or substituting the offered path
+does not redirect a live share. The recipient may browse a listed directory,
+read a bounded raw-byte preview, and download one regular file. A download's
+local destination directory and filename are chosen by the recipient, never by
+the peer. The CLI writes private exclusive staging, requires exactly the
+declared byte count (and the negotiated read limit per request), links the open
+inode with no-clobber semantics only after the remote `Release` succeeds, and
+reports `DurabilityUnknown` when the final directory fsync fails. Cancellation,
+revocation or a short read leaves no destination name and removes private
+staging. This is a protocol endpoint, not an OS mount or `.mesh` DNS claim; the
+UI says so and adds no mount/route.
+
 ## Lifecycle guarantees and limits
 
 - Acceptance signs a domain-separated exact agreement/revision, both peer keys,
@@ -83,7 +97,8 @@ from a serving task is not proof that an endpoint became available.
 | --- | --- |
 | Exact TCP service | Real existing L2 Mux / HostServices connector integration; `forward-server` feature and a working host connector required |
 | UDP service | Typed review only; operation returns `Unsupported` |
-| Folder download/mount, RO/RW serving | Typed review only; existing mount servers not agreement-integrated; unavailable |
+| Folder browse/read/download | Linux `mount-server`: real authenticated `serve_folder`; recipient browse, byte-preserving preview and caller-destination no-clobber download. No OS mount or DNS |
+| Folder RO/RW serving | Engine enforces the accepted mode; this CLI drafts read-only folder shares and offers no write action |
 | Shell, PTY, exec, SSH | Typed review only; existing shared shell gate remains authoritative; unavailable through this engine |
 | Device networking / subnet | Typed separately; no agreement-aware packet policy integration; unavailable |
 | Background/restart | Unavailable; no durable handoff acknowledgement |

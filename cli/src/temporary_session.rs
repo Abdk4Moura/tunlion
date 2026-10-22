@@ -118,7 +118,7 @@ impl Session {
             if let Err(error) = decision {
                 let decline = json!({"type":"access-decline","v":1,
                     "id":review.snapshot().id,"revision":review.snapshot().revision});
-                eprintln!("  Temporary access declined: {}", crate::access_ui::terminal_label(&error.to_string()));
+                crate::ui::say(&format!("  Temporary access declined: {}", crate::access_ui::terminal_label(&error.to_string())));
                 self.shutdown().await;
                 mux.transport().send_control(&decline).await?;
                 drain_final_control(&mux).await;
@@ -128,7 +128,7 @@ impl Session {
             let signature = crate::overlay::overlay_sign_possession(&review.acceptance_message()?)?;
             mux.transport().send_control(&json!({"type":"access-accept","v":1,
                 "id":review.snapshot().id,"revision":review.snapshot().revision,"signature":hex::encode(signature)})).await?;
-            eprintln!("  Waiting for the host to activate this exact scope.");
+            crate::ui::say("  Waiting for the host to activate this exact scope.");
         }
         if self.role == TemporaryRole::Host && self.peer.is_some() && self.snapshot.is_none() {
             let engine = self.engine.as_ref().unwrap();
@@ -145,7 +145,7 @@ impl Session {
                 if matches!(snapshot.state, AgreementState::Ended | AgreementState::Expired | AgreementState::Declined) {
                     self.shutdown().await;
                     self.end_exchange.begin_local(std::time::Instant::now());
-                    eprintln!("  Temporary access ended here; waiting for peer acknowledgement.");
+                    crate::ui::say("  Temporary access ended here; waiting for peer acknowledgement.");
                     return Ok(self.advance_end().await);
                 }
             }
@@ -186,8 +186,8 @@ impl Session {
     pub(crate) async fn control(&mut self, ceremony: &Ceremony, conn: &crate::conn::Conn, pid: &str, payload: Value) -> Result<()> {
         bound_control(&payload)?;
         let kind = payload["type"].as_str().unwrap_or("");
-        if !kind.starts_with("access-") && !matches!(kind, "l2-open-ack" | "l2-close" | "mount-open-ack" | "mount-cap-ack") {
-            bail!("temporary access refused an unsupported control; no standing grant exists");
+        if !supported_control(kind) {
+            bail!("temporary access refused an unsupported control ({}); no standing grant exists", crate::access_ui::terminal_label(kind));
         }
         if ceremony.secret().is_none() {
             if self.pending.len() >= 4 { bail!("too many temporary controls before proof"); }
@@ -276,7 +276,7 @@ impl Session {
                 self.active = true;
                 self.established = true;
                 self.snapshot = Some(snapshot.clone());
-                eprintln!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime));
+                crate::ui::say(&format!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime)));
                 if self.controls.is_none() {
                     let (tx, rx) = mpsc::channel(4);
                     self.controls = Some(rx);
@@ -294,7 +294,7 @@ impl Session {
                 snapshot.accepted_revision = Some(snapshot.revision);
                 self.active = true;
                 self.established = true;
-                eprintln!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime));
+                crate::ui::say(&format!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime)));
                 reconcile_services(&mut self.endpoints, snapshot, mux.clone(), self.pending_opens.clone()).await?;
                 if !snapshot.spec.folders.is_empty() {
                     self.folder_controls = Some(crate::folder_access::Controls::start(snapshot));
@@ -348,6 +348,10 @@ impl Session {
             "l2-close" => {
                 if let Some(sid) = filament_peerloop::l2::wire_sid(&payload) { mux.on_close(sid, payload["err"].as_str()).await; }
             }
+            // Transport liveness probe (see Conn::link_alive). It carries no
+            // grant and is never answered with authority; ignoring it keeps a
+            // long foreground folder/read session from being torn down.
+            "ping" | "pong" => {}
             "access-decline" if self.role == TemporaryRole::Host => {
                 version(&payload)?;
                 if payload["id"].as_str() != Some(self.binding.offer_id.as_str()) { bail!("wrong temporary agreement"); }
@@ -355,7 +359,7 @@ impl Session {
                 self.engine.as_ref().unwrap().decline(&self.binding.offer_id, revision, crate::identity::now_secs())?;
                 self.shutdown().await;
                 self.ended = true;
-                eprintln!("  Temporary access declined by the other device.");
+                crate::ui::say("  Temporary access declined by the other device.");
             }
             _ => bail!("temporary access control is unavailable or invalid"),
         }
@@ -406,10 +410,10 @@ impl Session {
         }
         self.ended = true;
         match outcome {
-            crate::access_end::Outcome::PeerAcknowledged => eprintln!("  Temporary access ended · peer acknowledged."),
-            crate::access_end::Outcome::Confirmed => eprintln!("  Temporary access ended by the host."),
-            crate::access_end::Outcome::TimedOut => eprintln!("  Temporary access ended here; peer acknowledgement unavailable."),
-            crate::access_end::Outcome::Disconnected => eprintln!("  Temporary access ended here; peer disconnected before final receipt."),
+            crate::access_end::Outcome::PeerAcknowledged => crate::ui::critical("  Temporary access ended · peer acknowledged."),
+            crate::access_end::Outcome::Confirmed => crate::ui::critical("  Temporary access ended by the host."),
+            crate::access_end::Outcome::TimedOut => crate::ui::critical("  Temporary access ended here; peer acknowledgement unavailable."),
+            crate::access_end::Outcome::Disconnected => crate::ui::critical("  Temporary access ended here; peer disconnected before final receipt."),
         }
         true
     }
@@ -432,6 +436,11 @@ impl Drop for Session {
         for task in &self.tasks { task.abort(); }
         self.endpoints.clear();
     }
+}
+
+fn supported_control(kind: &str) -> bool {
+    kind.starts_with("access-")
+        || matches!(kind, "l2-open-ack" | "l2-close" | "mount-open-ack" | "mount-cap-ack" | "ping" | "pong")
 }
 
 fn version(payload: &Value) -> Result<()> {
@@ -555,15 +564,15 @@ async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementS
     for service in &snapshot.spec.services {
         if endpoints.iter().any(|endpoint| endpoint.service == *service) { continue; }
         if service.protocol != filament_peerloop::access::ServiceProtocol::Tcp {
-            eprintln!("  Service {}: unavailable (unsupported protocol).", crate::access_ui::terminal_label(&service.id));
+            crate::ui::say(&format!("  Service {}: unavailable (unsupported protocol).", crate::access_ui::terminal_label(&service.id)));
             continue;
         }
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
-            Err(error) => { eprintln!("  Service {}: unavailable ({error}).", crate::access_ui::terminal_label(&service.id)); continue; }
+            Err(error) => { crate::ui::say(&format!("  Service {}: unavailable ({error}).", crate::access_ui::terminal_label(&service.id))); continue; }
         };
         let address = listener.local_addr()?;
-        eprintln!("  Local service {} at {address} -> {}", crate::access_ui::terminal_label(&service.id), service.target);
+        crate::ui::say(&format!("  Local service {} at {address} -> {}", crate::access_ui::terminal_label(&service.id), service.target));
         let id = snapshot.id.clone();
         let (revision_tx, revision_rx) = tokio::sync::watch::channel(Some(snapshot.revision));
         let resource = service.id.clone();
@@ -596,7 +605,7 @@ async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementS
                                         Ok(Ok(OpenOutcome::ClosedWithoutAck)) => "host closed without activation".into(),
                                         _ => "host did not acknowledge activation".into(),
                                     };
-                                    eprintln!("  Temporary service unavailable: {}", crate::access_ui::terminal_label(&reason));
+                                    crate::ui::say(&format!("  Temporary service unavailable: {}", crate::access_ui::terminal_label(&reason)));
                                     mux.drop_stream(sid).await;
                                 }
                             }
@@ -648,6 +657,16 @@ fn bound_snapshot(snapshot: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn liveness_and_scoped_acks_are_the_only_non_access_controls() {
+        for kind in ["access-open", "access-active", "l2-open-ack", "l2-close", "mount-open-ack", "mount-cap-ack", "ping", "pong"] {
+            assert!(supported_control(kind), "{kind}");
+        }
+        for kind in ["", "l2-open", "mount-open", "pty-open", "exec-open", "pake-msg", "enrol-offer"] {
+            assert!(!supported_control(kind), "{kind}");
+        }
+    }
 
     struct AckTransport;
     #[async_trait::async_trait]
