@@ -18,6 +18,7 @@ import { makeTheme, terminalTheme, systemMode, FONT_SANS, FONT_MONO } from './th
 import { pakeReady, previewCustomCode } from '../lib/pairing.js'
 import { randomDeviceName } from '../lib/identity.js'
 import { mintNameplate } from '../lib/words.js'
+import { deviceRowKey, devicesDedupe } from '../lib/devices.js'
 import { oneRowPerDevice } from '../net/app/peerRows.js'
 
 // Relay honesty (transport-resilience P1, §3.5). Relay (TURN) is still
@@ -762,7 +763,10 @@ export default function Tunlion(props) {
   const TT = terminalTheme()
   const peers = oneRowPerDevice(state.peers || [])
   const transfers = state.transfers || []
-  const knownDevices = state.knownDevices || []
+  // Defensive dedupe: older builds could persist two records for one petname.
+  // The storage layer migrates on load; this keeps an injected/stale state from
+  // rendering duplicate rows while the migration lands.
+  const knownDevices = devicesDedupe(state.knownDevices || [])
   const localName = state.deviceName || state.me?.name || ''
   const connectedNames = peers.filter((p) => p.status === 'ready').map(peerName)
   const onToggleTheme = ui.onToggleTheme
@@ -1090,7 +1094,7 @@ export default function Tunlion(props) {
     const caps = live && live.shell && !stored.includes('shell') ? [...stored, 'shell'] : stored
     const what = caps.map((c) => (c === 'transfer' ? 'files' : c)).join(', ')
     return (
-      <div key={d.name} data-testid="device-row" role="button" tabIndex={0} className="tl-focus"
+      <div key={deviceRowKey(d)} data-testid="device-row" role="button" tabIndex={0} className="tl-focus"
         aria-label={`${d.name}, ${online ? 'online' : 'offline'}`}
         onClick={() => openSheet(peerForSheet, null)}
         onKeyDown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); openSheet(peerForSheet, null) } }}
