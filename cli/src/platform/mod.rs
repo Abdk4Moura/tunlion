@@ -4221,7 +4221,13 @@ mod windows_stop_request_tests {
         super::request_daemon_stop(pid).expect("write the stop request");
         let path = super::daemon_stop_request_path();
         let raw = std::fs::read_to_string(&path).expect("stop request exists");
-        assert_eq!(raw.trim().parse::<u32>().ok(), Some(pid));
+        let mut lines = raw.lines();
+        assert_eq!(lines.next().and_then(|s| s.trim().parse::<u32>().ok()), Some(pid));
+        assert_eq!(
+            lines.next().map(str::to_string),
+            super::process_start_token(pid),
+            "the request names this process incarnation, not just the pid"
+        );
         let _ = std::fs::remove_file(&path);
         unsafe {
             match old {
