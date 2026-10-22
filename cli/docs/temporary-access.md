@@ -1,10 +1,14 @@
 # Foreground temporary access adapter
 
-**Integration checkpoint, not a validated release.** The Rust implementation
-below is present, but the latest tree still needs remote compilation/regressions
-and the real two-process signaling test. The previous network test failed because
-the worker had no Python backend dependencies. Missing dependencies were a hard
-failure (`CI=1`), not a skipped green test.
+**Linux service vertical slice verified, not a complete product release.** Exact
+tested code `81919a30` passed remote job `ux-access-ack-81919a30-20261022b`: four
+session/ack tests, the real two-process signaling/PAKE/review/TCP-echo/End test,
+and two shell-gate regressions. The test asserts socket closure and no permanent
+records. Full raw log:
+`/root/pairing-ux/evidence/access-checkpoint-20261022/ux-ack-81919a30-20261022b.log`.
+This uses two isolated processes on one Linux worker, not two physical devices or
+Windows. Earlier missing-backend and activation-ack failures were hard failures,
+then repaired; they were never reclassified as success.
 
 ## Implemented code paths
 
@@ -33,8 +37,9 @@ The engine, not peer-supplied targets, chooses the exact socket. The host's inli
 Change access / Set expiry / End controls operate on engine snapshots. Signed
 revisions are reviewed on the recipient; narrowing removes affected listeners,
 and unchanged service identities retain their streams. End cancels serving and
-closes the recipient endpoints. These live paths require the remote test below
-before they may be described as working end to end.
+closes the recipient endpoints. Basic service use and End are verified; additional
+multi-resource narrowing, revision, expiry and decline scenarios need their own
+real CLI tests, not just the shared engine fixtures.
 
 Until-ended is the default; claim expiry is separate. Background persistence,
 shell, device networking, mount-ready paths and `.mesh` DNS are not offered as

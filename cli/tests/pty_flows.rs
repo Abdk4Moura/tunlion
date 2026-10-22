@@ -598,6 +598,205 @@ fn temporary_service_pairing_uses_real_transport_and_end_closes_the_socket() {
     echo.join().unwrap();
 }
 
+#[cfg(unix)]
+struct EchoService {
+    address: std::net::SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl EchoService {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            let mut streams = Vec::new();
+            while !worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let stop = worker_stop.clone();
+                        streams.push(thread::spawn(move || {
+                            socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+                            let mut data = [0;1024];
+                            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                                match socket.read(&mut data) {
+                                    Ok(0) => break,
+                                    Ok(n) => if socket.write_all(&data[..n]).is_err() { break; },
+                                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {},
+                                    Err(_) => break,
+                                }
+                            }
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(10)),
+                    Err(_) => break,
+                }
+            }
+            for stream in streams { stream.join().unwrap(); }
+        });
+        Self { address, stop, worker: Some(worker) }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoService {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
+}
+
+#[cfg(unix)]
+fn offer_temporary_services(host: &mut Term, exe: &str, server: &str, targets: &[std::net::SocketAddr]) -> String {
+    host.send(&format!("\"{exe}\" --server {server} add\r"));
+    assert!(host.wait_for("Temporary access", 30), "{}", tail(&host.text()));
+    host.send("\x1b[B\r");
+    assert!(host.wait_for("Folders (0)", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\r");
+    assert!(host.wait_for("Add port", 20), "{}", tail(&host.text()));
+    for (index, target) in targets.iter().enumerate() {
+        let at = host.text().len();
+        host.send("\x1b[B\r");
+        assert!(host.wait_for_from(at, "port or IP:port:", 20), "{}", tail(&host.text()));
+        host.send(&format!("{target}\r"));
+        assert!(host.wait_for_from(at, &format!("Choose services ({})", index + 1), 20), "{}", tail(&host.text()));
+    }
+    let at = host.text().len();
+    host.send("\x1b[A\r");
+    assert!(host.wait_for_from(at, &format!("Services ({})", targets.len()), 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\x1b[B\r");
+    assert!(host.wait_for("SHARE THIS SCOPE?", 20), "{}", tail(&host.text()));
+    host.send("\r");
+    assert!(host.wait_for("on the other device:", 60), "{}", tail(&host.text()));
+    host.text().split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'))
+        .find(|token| token.rsplit_once('-').is_some_and(|(words, number)|
+            !words.is_empty() && words.contains('-') && number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit())))
+        .expect("actual PAKE code").to_ascii_lowercase()
+}
+
+#[cfg(unix)]
+fn temporary_endpoint(recipient: &Term, resource: &str) -> std::net::SocketAddr {
+    recipient.text().split(&format!("Local service {resource} at ")).nth(1)
+        .and_then(|rest| rest.split_whitespace().next()).and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("missing activated {resource}:\n{}", tail(&recipient.text())))
+}
+
+#[cfg(unix)]
+fn assert_echo(socket: &mut std::net::TcpStream, text: &[u8], host: &Term, recipient: &Term) {
+    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    socket.write_all(text).unwrap_or_else(|error| panic!("service write failed: {error}\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text())));
+    let mut reply = vec![0;text.len()];
+    socket.read_exact(&mut reply).unwrap_or_else(|error| panic!("service read failed: {error}\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text())));
+    assert_eq!(reply, text);
+}
+
+#[cfg(unix)]
+#[test]
+fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acceptance_for_additions() {
+    let Some(backend) = backend() else { return; };
+    let first = EchoService::start();
+    let retained = EchoService::start();
+    let (mut host, exe) = fresh_term("temporary-revision-host");
+    let (mut recipient, _) = fresh_term("temporary-revision-recipient");
+    let code = offer_temporary_services(&mut host, &exe, &backend.url, &[first.address, retained.address]);
+    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(!recipient.text().contains("Local service"));
+    recipient.send("\r");
+    assert!(recipient.wait_for("Local service service-1 at ", 60), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(host.wait_for("RUNNING ACCESS", 30), "{}", tail(&host.text()));
+    let removed_address = temporary_endpoint(&recipient, "service-0");
+    let retained_address = temporary_endpoint(&recipient, "service-1");
+    let mut removed_socket = std::net::TcpStream::connect(removed_address).unwrap();
+    let mut retained_socket = std::net::TcpStream::connect(retained_address).unwrap();
+    assert_echo(&mut removed_socket, b"first-port", &host, &recipient);
+    assert_echo(&mut retained_socket, b"second-port", &host, &recipient);
+
+    // Remove service-0 through the actual host controls; keep service-1 live.
+    let host_at = host.text().len();
+    let recipient_at = recipient.text().len();
+    host.send("\r");
+    assert!(host.wait_for_from(host_at, "CHANGE ACCESS", 20), "{}", tail(&host.text()));
+    let at = host.text().len();
+    host.send("\r"); // Remove first service row.
+    assert!(host.wait_for_from(at, "Review change", 20), "{}", tail(&host.text()));
+    host.send("\x1b[A\x1b[A\r"); // Review, immediately before Cancel.
+    assert!(host.wait_for_from(at, "APPLY CHANGE?", 20), "{}", tail(&host.text()));
+    host.send("\r");
+    assert!(recipient.wait_for_from(recipient_at, "revision 2", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "ACCEPT THIS SCOPE?", 20), "{}", tail(&recipient.text()));
+    assert_echo(&mut retained_socket, b"same-live-stream-during-narrowing-review", &host, &recipient);
+    removed_socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut byte = [0];
+    match removed_socket.read(&mut byte) {
+        Ok(0) => {},
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) => {},
+        result => panic!("removed stream remained usable: {result:?}\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text())),
+    }
+    assert!(std::net::TcpStream::connect(removed_address).is_err(), "removed resource still has a local listener");
+    let at = recipient.text().len();
+    recipient.send("\r");
+    assert!(recipient.wait_for_from(at, "Temporary access active", 30), "{}", tail(&recipient.text()));
+    assert_eq!(temporary_endpoint(&recipient, "service-1"), retained_address, "unchanged resource moved endpoint");
+    assert_echo(&mut retained_socket, b"same-live-stream-after-narrowing", &host, &recipient);
+
+    // Add the first port back as a NEW resource revision, without a new code.
+    let at = host.text().len();
+    host.send("\r");
+    assert!(host.wait_for_from(at, "CHANGE ACCESS", 20), "{}", tail(&host.text()));
+    host.send("\x1b[B\x1b[B\r"); // Add port after retained row and Add folder.
+    assert!(host.wait_for_from(at, "port or IP:port:", 20), "{}", tail(&host.text()));
+    host.send(&format!("{}\r", first.address));
+    let recipient_at = recipient.text().len();
+    let at = host.text().len();
+    host.send("\x1b[A\x1b[A\r");
+    assert!(host.wait_for_from(at, "APPLY CHANGE?", 20), "{}", tail(&host.text()));
+    host.send("\r");
+    assert!(recipient.wait_for_from(recipient_at, "revision 3", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "ACCEPT THIS SCOPE?", 20), "{}", tail(&recipient.text()));
+    assert!(!recipient.text()[recipient_at..].contains("Local service service-2"), "addition activated without recipient acceptance");
+    recipient.send("\r");
+    assert!(recipient.wait_for_from(recipient_at, "Local service service-2 at ", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    let mut added_socket = std::net::TcpStream::connect(temporary_endpoint(&recipient, "service-2")).unwrap();
+    assert_echo(&mut added_socket, b"accepted-added-resource", &host, &recipient);
+    let mut new_retained_socket = std::net::TcpStream::connect(retained_address).unwrap();
+    assert_echo(&mut new_retained_socket, b"retained-resource-new-revision", &host, &recipient);
+    let at = recipient.text().len();
+    host.send("\x1b[A\r");
+    assert!(recipient.wait_for_from(at, "Temporary access ended", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    for label in ["temporary-revision-host", "temporary-revision-recipient"] {
+        let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+        for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] { assert!(!dir.join(file).exists(), "temporary revision wrote {file}"); }
+    }
+    eprintln!("REAL MULTI-SERVICE REVISION PASS: both ports used; removal closes one while retained stream lives; addition waits for signed review acceptance; End received");
+}
+
+#[cfg(unix)]
+#[test]
+fn declining_a_temporary_service_offer_never_activates_a_listener_or_contact() {
+    let Some(backend) = backend() else { return; };
+    let service = EchoService::start();
+    let (mut host, exe) = fresh_term("temporary-decline-host");
+    let (mut recipient, _) = fresh_term("temporary-decline-recipient");
+    let code = offer_temporary_services(&mut host, &exe, &backend.url, &[service.address]);
+    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    let at = recipient.text().len();
+    recipient.send("\x1b[B\r");
+    assert!(recipient.wait_for_from(at, &format!("{MARK}> "), 30), "{}", tail(&recipient.text()));
+    assert!(host.wait_for("Temporary access declined", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(!recipient.text().contains("Local service"));
+    assert!(!recipient.text().contains("Temporary access active"));
+    for label in ["temporary-decline-host", "temporary-decline-recipient"] {
+        let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+        for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] { assert!(!dir.join(file).exists(), "decline wrote {file}"); }
+    }
+}
+
 /// A fresh scratch dir for one cell.
 #[cfg(unix)]
 fn scratch(label: &str) -> std::path::PathBuf {
