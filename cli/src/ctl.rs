@@ -65,7 +65,7 @@ pub use filament_peerloop::control::send_reply;
 pub use imp::{
     daemon_present, daemon_responds, forward_probe, serve_at, try_approve_request,
     try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
-    try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
+    try_l3_state, try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
     try_revocation_sync, try_unmount, try_wake,
 };
@@ -389,6 +389,24 @@ mod imp {
             .ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
         (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
+    /// Ask the running daemon for its LIVE L3 state. Returns the `l3` object
+    /// (`{"state":"ready|starting|down","mode":"kernel|userspace|none",
+    /// "reason":...}`) or `None` when no daemon answered, so the caller falls
+    /// back to the daemon's state file rather than inventing "ready".
+    pub async fn try_l3_state() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut line = serde_json::to_vec(&json!({ "op": "l3-state" })).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_millis(1500), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then(|| v["l3"].clone())
     }
 
     /// Wake the running daemon so it re-runs its arm gate immediately (see
@@ -784,6 +802,7 @@ mod imp {
                         ReqKind::Reconfigure { key }
                     }
                     Some("reload-expose") => ReqKind::ReloadExpose,
+                    Some("l3-state") => ReqKind::L3State,
                     Some("wake") => ReqKind::Wake,
                     Some("revocation-sync") => ReqKind::RevocationSync,
                     Some("reload") => ReqKind::Reload,

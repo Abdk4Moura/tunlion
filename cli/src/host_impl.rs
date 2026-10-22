@@ -225,6 +225,12 @@ impl HostServices for CliHost {
         let mesh = crate::l3::L3::start(cidr, mtu, identity, mode).map_err(|e| e.to_string())?;
         Ok(mesh)
     }
+    #[cfg(l3)]
+    fn l3_state_report(&self, status_json: &str) {
+        if let Ok(status) = serde_json::from_str::<filament_peerloop::mesh::L3Status>(status_json) {
+            crate::l3_state::write(&status);
+        }
+    }
     fn ssh_host_pubkeys(&self) -> Vec<String> {
         crate::sshkeys::host_pubkeys()
     }

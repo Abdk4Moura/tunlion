@@ -79,6 +79,11 @@ pub enum ReqKind {
     /// `{"ok":true,"live":true,"count":<n>}` where `n` is the number of ports
     /// now bound; `live:false` if L3 is not up in the daemon.
     ReloadExpose,
+    /// Report the daemon's LIVE L3 state (`ready`/`starting`/`down`, mode and
+    /// reason) without changing anything. Answered INLINE. A sibling `addr`
+    /// or `expose` asks this so it never treats a derived address as usable
+    /// when the endpoint never bound.
+    L3State,
     /// A no-op that exists to WAKE the daemon loop. The mint sends it right
     /// after writing armed.json so the per-iteration arm gate subscribes the
     /// enrollment channel NOW, instead of on the loop's next idle tick. That
