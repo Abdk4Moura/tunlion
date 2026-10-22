@@ -66,6 +66,7 @@ pub mod consent;
 pub mod control;
 pub mod daemon_ctl;
 pub mod driver;
+pub mod download_output;
 pub mod exec_frame;
 #[cfg(feature = "mount-server")]
 pub mod fs_at;
