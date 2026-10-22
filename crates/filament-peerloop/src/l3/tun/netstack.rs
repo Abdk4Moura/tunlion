@@ -856,7 +856,7 @@ fn rand_seed() -> Result<u64> {
 }
 
 #[async_trait::async_trait]
-impl crate::tun::TunDevice for NetstackTun {
+impl crate::l3::tun::TunDevice for NetstackTun {
     fn name(&self) -> &str {
         &self.name
     }
@@ -886,7 +886,7 @@ impl crate::tun::TunDevice for NetstackTun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tun::TunDevice;
+    use crate::l3::tun::TunDevice;
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv4Packet, Ipv4Repr,

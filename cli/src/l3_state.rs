@@ -10,7 +10,7 @@
 //! carries its PID: a state file left by a dead daemon is never trusted, the
 //! same rule `expose-bound.json` already uses.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 use filament_peerloop::mesh::L3Status;
@@ -28,7 +28,8 @@ pub fn write(status: &L3Status) {
         _ => return,
     };
     v.insert("pid".into(), json!(std::process::id()));
-    if let Err(e) = crate::platform::SecretFile::write_str(&state_path(), &Value::Object(v).to_string())
+    if let Err(e) =
+        crate::platform::SecretFile::write_str(&state_path(), &Value::Object(v).to_string())
     {
         crate::ui::debug(&format!("tunlion: could not record the L3 state: {e}"));
     }
@@ -46,7 +47,9 @@ pub fn no_daemon() -> Value {
 /// Read the daemon's published state, verifying the PID still belongs to THIS
 /// config's daemon. Missing/mismatched/corrupt is `down`, never `ready`.
 pub fn read_file_for(daemon: Option<u32>) -> Value {
-    let Some(pid) = daemon else { return no_daemon() };
+    let Some(pid) = daemon else {
+        return no_daemon();
+    };
     let Some(v) = std::fs::read_to_string(state_path())
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -55,14 +58,18 @@ pub fn read_file_for(daemon: Option<u32>) -> Value {
             "none",
             "the daemon has not reported an L3 endpoint yet",
         ))
-        .unwrap_or_else(|_| json!({"state":"down","mode":"none","reason":"no L3 endpoint reported"}));
+        .unwrap_or_else(
+            |_| json!({"state":"down","mode":"none","reason":"no L3 endpoint reported"}),
+        );
     };
     if v["pid"].as_u64() != Some(u64::from(pid)) {
         return serde_json::to_value(L3Status::down(
             "none",
             "the daemon has not reported an L3 endpoint yet",
         ))
-        .unwrap_or_else(|_| json!({"state":"down","mode":"none","reason":"no L3 endpoint reported"}));
+        .unwrap_or_else(
+            |_| json!({"state":"down","mode":"none","reason":"no L3 endpoint reported"}),
+        );
     }
     json!({
         "state": v["state"].as_str().unwrap_or("down"),
@@ -135,6 +142,11 @@ mod tests {
         let v = read_file_for(None);
         assert_eq!(v["state"], "down");
         assert_eq!(v["mode"], "none");
-        assert!(v["reason"].as_str().unwrap().contains("no running tunlion daemon"));
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no running tunlion daemon")
+        );
     }
 }

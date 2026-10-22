@@ -31,7 +31,7 @@ impl KernelTun {
 }
 
 #[async_trait::async_trait]
-impl crate::tun::TunDevice for KernelTun {
+impl crate::l3::tun::TunDevice for KernelTun {
     fn name(&self) -> &str {
         KernelTun::name(self)
     }

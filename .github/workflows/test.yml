@@ -150,6 +150,24 @@ jobs:
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
           CC: sccache cc
           CXX: sccache c++
+      # `l3` is NOT a default peerloop feature, so the crate loop above compiles
+      # and tests the library WITHOUT the overlay plane. Run the L3 suite
+      # explicitly: userspace netstack bind/dial with no TUN, verified-peer
+      # resolution through PeerLink, kernel-start honesty and the moved route /
+      # exit-route tests. This is the exact-head gate for the library API.
+      - name: L3 overlay library (feature l3, no TUN)
+        run: cargo test --release -p filament-peerloop --features l3
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+          CC: sccache cc
+          CXX: sccache c++
+      # The CLI's no-endpoint expose/addr answers are a separate integration
+      # test binary. `cargo test` in cli/ runs it too, but naming it here makes
+      # the exact-head gate explicit and keeps it from silently filtering out.
+      - name: L3 CLI state (no-endpoint expose/addr)
+        run: cargo test --release -p filament-cli --test l3_state_cli
+
       # The loop above is hand-maintained on purpose (its own comment says so),
       # and that is how two crates fell out of it: filament-transport (23 tests,
       # including the #312 T2 pair) and authkeys-managed (4) were absent, so 27
