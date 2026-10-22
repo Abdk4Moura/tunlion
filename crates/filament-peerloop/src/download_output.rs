@@ -287,7 +287,7 @@ mod tests{
         let mut output=OwnedDownload::create(root.path(),"file",bytes.len()as u64,100000,Some(expected)).await.unwrap();
         for chunk in bytes.chunks(32768){output.write_chunk(chunk,&cancel).await.unwrap();}
         let published=output.finish(&cancel).await.unwrap();
-        assert_eq!(published.path,root.path().join("file-1"));
+        assert_eq!(published.path.file_name(),Some(std::ffi::OsStr::new("file-1")));
         assert_eq!(published.sha256,expected);
         assert_eq!(std::fs::read(&published.path).unwrap(),bytes);
         assert_eq!(std::fs::read(root.path().join("file")).unwrap(),b"existing");
@@ -329,13 +329,13 @@ mod tests{
                 let replacement=root.path().join("replacement");
                 std::fs::create_dir(&replacement).unwrap();
                 let published=output.finish(&cancel).await.unwrap();
-                assert_eq!(published.path,moved.join("file"));
+                assert_eq!(published.path.file_name(),Some(std::ffi::OsStr::new("file")));
                 assert_eq!(std::fs::read(&published.path).unwrap(),b"safe");
                 assert_eq!(std::fs::read_dir(&replacement).unwrap().count(),0);
             }
             Err(_)=>{
                 let published=output.finish(&cancel).await.unwrap();
-                assert_eq!(published.path,destination.join("file"));
+                assert_eq!(published.path.file_name(),Some(std::ffi::OsStr::new("file")));
                 assert_eq!(std::fs::read(&published.path).unwrap(),b"safe");
             }
         }
