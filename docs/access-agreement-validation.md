@@ -140,9 +140,11 @@ embedding future is aborted. PTY/interactive `tty:true` remains refused by the
 existing exec server, and Windows remains `Unsupported`.
 
 Refs (no merge/deploy): exact validated source commit
-`7af5516abf1ca8bc07f766d69cc601a0ee21984f`. The reusable Linux worker
+`0c5a685290ce8e5d2fc299115500fc4cd526af48` (feature commit `7af5516a`, followed
+by validation-record and comment/docs commits). The reusable Linux worker
 (`ci-worker-dovm`, shared `build.lock`) ran jobs
-`core-access-shell-20261022-02`, `-03` and the exact-tree `-04`, all exit 0:
+`core-access-shell-20261022-02` through `-05`, all exit 0; `-04` and the final
+`-05` ran the exact tree named here:
 
 ```sh
 cargo test -p filament-peerloop --lib access::tests -- --test-threads=2
@@ -153,7 +155,7 @@ cargo check -p filament-peerloop --lib
 cargo check -p tunlion-core --lib
 ```
 
-Results on `7af5516a`: **14 access tests**, **6 access-session tests** and
+Results on `0c5a6852`: **14 access tests**, **6 access-session tests** and
 **1 tunlion-core access test** passed; reduced dispatch, default peerloop
 library and tunlion-core library checks passed. The new tests include
 `shell_scope_is_the_accepted_revision_and_peer_not_a_caller_flag`,
@@ -165,8 +167,8 @@ exact spawn argv/env (`hello world` kept as one argument, `SECRET` filtered, no
 account-switch call).
 
 Local durable log:
-`/root/pairing-ux/evidence/access-checkpoint-20261022/core-shell-04.log`.
-Remote job directory: `/home/runner/work/_temp/tunlion-work/jobs/core-access-shell-20261022-04`.
+`/root/pairing-ux/evidence/access-checkpoint-20261022/core-shell-05.log`.
+Remote job directory: `/home/runner/work/_temp/tunlion-work/jobs/core-access-shell-20261022-05`.
 No local build/test/formatter was run.
 
 Remaining gaps: PTY/interactive shell (agreement admission around the existing
