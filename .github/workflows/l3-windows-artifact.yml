@@ -1,0 +1,99 @@
+# Build a prebuilt Windows release zip for the L3 overlay library branch.
+#
+# This is an ARTIFACT build, not a release: no tag, no GitHub release, no
+# production daemon. It produces tunlion.exe, wintun.dll, VERSION.txt and
+# SHA256SUMS so a Windows box with no Rust/MSVC toolchain can run the repro.
+name: l3-windows-artifact
+
+on:
+  push:
+    branches: ["ci/windows-l3-artifact"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # The repo's CI path policy requires every cargo/rustup job to be gated by
+  # the shared classifier, so a browser-only push skips it.
+  changes:
+    uses: ./.github/workflows/changes.yml
+
+  build:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build (release, MSVC, static CRT)
+        shell: pwsh
+        working-directory: cli
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:TUNLION_BUILD_SHA = "${{ github.sha }}".Substring(0,7)
+          $env:TUNLION_BUILD_DATE = (Get-Date -AsUTC -Format "yyyy-MM-dd")
+          $env:RUSTFLAGS = "$env:RUSTFLAGS -C target-feature=+crt-static"
+          cargo build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+
+      - name: Package with wintun + VERSION + SHA256SUMS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          # Workspace builds land in the repo-root target/, not cli/target/.
+          Copy-Item "target/$target/release/tunlion.exe" out/
+
+          # Same pinned, signature-verified Wintun the release workflow ships.
+          $expected = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          $actual = (Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "wintun.zip SHA256 mismatch: got $actual" }
+          Expand-Archive -Path wintun.zip -DestinationPath wintun-extract -Force
+          $dll = "wintun-extract/wintun/bin/amd64/wintun.dll"
+          $sig = Get-AuthenticodeSignature $dll
+          if ($sig.Status -ne "Valid") { throw "wintun.dll Authenticode not Valid: $($sig.Status)" }
+          if ($sig.SignerCertificate.Subject -notmatch "WireGuard LLC") {
+            throw "wintun.dll not signed by WireGuard LLC: $($sig.SignerCertificate.Subject)"
+          }
+          Copy-Item $dll out/
+
+          $version = (& "out/tunlion.exe" --version | Out-String).Trim()
+          @(
+            "commit=${{ github.sha }}",
+            "version=$version",
+            "target=$target",
+            "profile=release",
+            "features=default (mesh,l3,mount-server,mount-daemon,forward-server,exec-server,pty-server,ssh-sign,ssh-bootstrap,ssh-server,dispatch,fleet)",
+            "built=$(Get-Date -AsUTC -Format o)"
+          ) | Set-Content -Encoding utf8 out/VERSION.txt
+
+          Get-ChildItem out -File | Where-Object { $_.Name -ne "SHA256SUMS" } | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content -Encoding ascii out/SHA256SUMS
+
+          $zip = "tunlion-$target-l3-${{ github.sha }}.zip"
+          Compress-Archive -Path "out/*" -DestinationPath $zip
+          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "ZIP=$zip" | Out-File -Append $env:GITHUB_ENV
+          "ZIP_SHA256=$zipHash" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "ZIP $zip sha256=$zipHash"
+          Get-Content out/VERSION.txt
+          Get-Content out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+          retention-days: 7

@@ -15,6 +15,42 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::{WINTUN_DLL_ABSENT, WINTUN_NOT_ELEVATED};
 
+/// Is this process running with an elevated token? (Same query the CLI's
+/// platform layer used; kept here so the backend is self-contained.)
+fn process_is_elevated() -> bool {
+    unsafe {
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn OpenProcessToken(h: isize, access: u32, tok: *mut isize) -> i32;
+            fn GetTokenInformation(
+                tok: isize,
+                cls: u32,
+                buf: *mut u8,
+                len: u32,
+                ret: *mut u32,
+            ) -> i32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_ELEVATION: u32 = 20;
+        let mut tok: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) == 0 {
+            return false;
+        }
+        let mut elevated: u32 = 0;
+        let mut ret: u32 = 0;
+        let ok = GetTokenInformation(
+            tok,
+            TOKEN_ELEVATION,
+            &mut elevated as *mut u32 as *mut u8,
+            std::mem::size_of::<u32>() as u32,
+            &mut ret,
+        );
+        CloseHandle(tok);
+        ok != 0 && elevated != 0
+    }
+}
+
 /// A Wintun adapter session plus the async plumbing. Dropping it shuts the session
 /// down (unblocking the reader thread) and removes the adapter.
 pub struct KernelTun {
@@ -37,7 +73,7 @@ impl KernelTun {
         // failure is "Failed to create adapter" / "WintunStartSession failed".
         // The token state is therefore the only reliable separator between the
         // not-elevated case and a genuinely unrelated adapter error.
-        let elevated = crate::platform::process_is_elevated();
+        let elevated = process_is_elevated();
         let adapter = wintun::Adapter::open(&wintun, name)
             .or_else(|_| wintun::Adapter::create(&wintun, name, "Tunlion", None))
             .map_err(|e| {
@@ -112,7 +148,7 @@ impl KernelTun {
 // Expose the Wintun device through the overlay's device seam (fully-qualified
 // inherent calls: no ambiguity with the trait methods, no accidental recursion).
 #[async_trait::async_trait]
-impl crate::tun::TunDevice for KernelTun {
+impl crate::l3::tun::TunDevice for KernelTun {
     fn name(&self) -> &str {
         KernelTun::name(self)
     }
@@ -191,7 +227,7 @@ fn split_cidr(cidr: &str) -> (String, String) {
 /// identical route ("already exists") is treated as success.
 pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     let proto = if cidr.contains(':') { "ipv6" } else { "ipv4" };
-    let out = crate::platform::command("netsh")
+    let out = crate::l3::command("netsh")
         .args(["interface", proto, "add", "route", cidr, &format!("interface={dev}")])
         .output()
         .context("exec netsh")?;
@@ -216,7 +252,7 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
 /// into a stream of failures.
 pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
     let proto = if cidr.contains(':') { "ipv6" } else { "ipv4" };
-    let out = crate::platform::command("netsh")
+    let out = crate::l3::command("netsh")
         .args(["interface", proto, "delete", "route", cidr, &format!("interface={dev}")])
         .output()
         .context("exec netsh delete route")?;
@@ -275,7 +311,7 @@ pub fn l3_blocker() -> Option<String> {
 pub fn ensure_hosts_writable() {}
 
 fn netsh(args: &[&str]) -> Result<()> {
-    let out = crate::platform::command("netsh").args(args).output().context("exec netsh")?;
+    let out = crate::l3::command("netsh").args(args).output().context("exec netsh")?;
     if !out.status.success() {
         let msg = format!(
             "{}{}",
@@ -290,7 +326,7 @@ fn netsh(args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tun::{classify_wintun_failure, WintunFailure};
+    use crate::l3::tun::{classify_wintun_failure, WintunFailure};
 
     /// The backend has to emit the marker the cross-platform classifier keys
     /// on. Wintun gives no Win32 detail, so the token state is the signal.
