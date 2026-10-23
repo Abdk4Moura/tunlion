@@ -4304,6 +4304,8 @@ mod windows_stop_request_tests {
     /// produces the exact file the reader looks for, on Windows CI.
     #[test]
     fn windows_stop_request_is_a_pid_scoped_file() {
+        // TUNLION_CONFIG_DIR is process-global; other tests repoint it.
+        let _guard = crate::tests::lock_test_config();
         let dir = std::env::temp_dir().join(format!(
             "tunlion-win-stop-{}-{}",
             std::process::id(),
