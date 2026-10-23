@@ -3643,6 +3643,7 @@ pub fn request_daemon_stop(pid: u32) -> Result<String, String> {
         })?;
         with_daemon_stop_request_lock(|path| {
             SecretFile::write_str(path, &format!("{pid}\n{token}\n{nonce}\n"))
+                .map(|()| nonce.clone())
                 .map_err(|e| format!("could not write the stop request {}: {e}", path.display()))
         })
         .unwrap_or_else(|| Err("timed out locking the stop-request file".to_string()))
