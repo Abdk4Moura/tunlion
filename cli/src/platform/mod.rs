@@ -4,7 +4,7 @@ pub(crate) mod recv_signals;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Shell invocation now lives in the peer-loop crate (a process rule with no
 /// host opinion); this path re-exports it so existing callers keep resolving.
@@ -21,6 +21,53 @@ use filament_peerloop::shell::ShellHost;
 /// All paths honor `TUNLION_CONFIG_DIR` as an override (hermetic tests,
 /// custom deployments).
 pub struct Paths;
+
+/// Read a state file only if it is a regular file, without following a final
+/// symlink. `Ok(None)` means absent.
+///
+/// The open and the fstat are on the SAME handle, so a swap between a checked
+/// path and the read cannot redirect us; `symlink_metadata` + `read_to_string`
+/// can. On Windows the handle is opened on the reparse point itself and its
+/// file type decides, because `FILE_FLAG_OPEN_REPARSE_POINT` is the portable
+/// fail-closed equivalent of `O_NOFOLLOW`.
+pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            anyhow::bail!("{} is a symlink; refusing to follow it", path.display())
+        }
+        Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+    };
+    let meta = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        anyhow::bail!(
+            "{} is a symlink or not a regular file; refusing to read it",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(Some(bytes))
+}
 
 /// Resolve a Unix account record through the reentrant password API. `None`
 /// asks for the daemon's effective uid; a named account is looked up exactly.

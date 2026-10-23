@@ -350,6 +350,19 @@ for shape in '[]|no owner record' '[1]|non-object record' '[{}]|without a name' 
   fi
 done
 
+# A structurally valid certificate with a bad signature is not a credential.
+cp "$DG/devices.json" "$DSHAPE/devices.json"
+"$PYV" - "$DSHAPE/devices.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p))
+sig=d[0]["deviceCert"]["sig"]; d[0]["deviceCert"]["sig"]=("00" if not sig.startswith("00") else "01")+sig[2:]
+json.dump(d, open(p,"w"))
+PY
+timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12b.out" 2>"$WORK/j12b.err"
+if [ $? = 0 ] || ! grep -q "invalid or expired device certificate" "$WORK/j12b.out" "$WORK/j12b.err"; then
+  echo "bad-signature store cert was accepted"; cat "$WORK/j12b.out" "$WORK/j12b.err"; J12_BAD=1
+fi
+
 # Symlinks are refused rather than followed, for each file the readout opens.
 cp "$DG/devices.json" "$DSHAPE/real-store.json"
 rm -f "$DSHAPE/devices.json"
@@ -375,8 +388,30 @@ if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12s.out" "$WORK/j12s.err"; then
 fi
 rm -f "$DSHAPE/join.pending.json"
 
+# A symlinked owner key must not make a joined certificate look like an owner
+# and skip the owner-record check.
+printf '[]' >"$DSHAPE/devices.json"
+rm -f "$DSHAPE/identity.ed25519"
+ln -s no-such-owner-key "$DSHAPE/identity.ed25519"
+timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12o.out" 2>"$WORK/j12o.err"
+if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12o.out" "$WORK/j12o.err"; then
+  echo "identity.ed25519 symlink made a joined device look like an owner"
+  cat "$WORK/j12o.out" "$WORK/j12o.err"; J12_BAD=1
+fi
+rm -f "$DSHAPE/identity.ed25519"
+
+# The overlay key is opened through the same no-follow handle.
+mv "$DSHAPE/overlay.ed25519" "$DSHAPE/real-overlay.ed25519"
+ln -s real-overlay.ed25519 "$DSHAPE/overlay.ed25519"
+timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12o.out" 2>"$WORK/j12o.err"
+if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12o.out" "$WORK/j12o.err"; then
+  echo "overlay.ed25519 symlink was followed"
+  cat "$WORK/j12o.out" "$WORK/j12o.err"; J12_BAD=1
+fi
+rm -f "$DSHAPE/overlay.ed25519"
+
 if [ "$J12_BAD" = 0 ]; then
-  ok "J12: malformed records and symlinked store/cert/journal are all refused"
+  ok "J12: malformed records, bad certs and symlinked store/cert/journal/keys are refused"
 else
   bad "J12: a malformed or symlinked join state was accepted"
 fi

@@ -192,17 +192,24 @@ impl OverlayKey {
     /// must not mint an identity as a side effect of looking; `public_key_bytes`
     /// deliberately does generate, and joining relies on that.
     pub fn existing_public_key_bytes(&self) -> Result<Option<[u8; 32]>> {
-        use ring::signature::KeyPair;
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).context("read overlay key"),
         };
-        let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(&bytes)
+        Self::public_key_bytes_from_pkcs8(&bytes).map(Some)
+    }
+
+    /// Parse an already-read PKCS8 overlay key. A caller that must avoid
+    /// following a symlink reads the bytes through a no-follow handle and uses
+    /// this, rather than re-opening the path.
+    pub fn public_key_bytes_from_pkcs8(bytes: &[u8]) -> Result<[u8; 32]> {
+        use ring::signature::KeyPair;
+        let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(bytes)
             .map_err(|_| anyhow::anyhow!("overlay key is corrupt"))?;
         let mut out = [0u8; 32];
         out.copy_from_slice(keypair.public_key().as_ref());
-        Ok(Some(out))
+        Ok(out)
     }
 
     pub fn sign(&self, msg: &[u8]) -> Result<[u8; 64]> {

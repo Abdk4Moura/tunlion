@@ -128,17 +128,25 @@ impl UserKey {
             store.read(&path)
                 .with_context(|| format!("read user identity from {}", path.display()))?,
         );
-        let keypair = if let Some(seed) = pkcs8.strip_prefix(RECOVERY_SEED_PREFIX) {
+        Ok(Some(Self::from_encoded(&pkcs8)?))
+    }
+
+    /// Parse the bytes stored at `identity.ed25519` (PKCS8 or the recoverable
+    /// seed form). Callers that must read the file through a no-follow handle
+    /// use this so a corrupt owner key is still rejected, not treated as
+    /// "no owner".
+    pub fn from_encoded(encoded: &[u8]) -> Result<Self> {
+        let keypair = if let Some(seed) = encoded.strip_prefix(RECOVERY_SEED_PREFIX) {
             if seed.len() != 32 {
                 bail!("recoverable user identity seed is corrupt");
             }
             Ed25519KeyPair::from_seed_unchecked(seed)
                 .map_err(|_| anyhow!("user identity key is corrupt"))?
         } else {
-            Ed25519KeyPair::from_pkcs8(&pkcs8)
+            Ed25519KeyPair::from_pkcs8(encoded)
                 .map_err(|_| anyhow!("user identity key is corrupt"))?
         };
-        Ok(Some(UserKey { keypair }))
+        Ok(UserKey { keypair })
     }
 
     pub fn restore(store: &dyn KeyStore, phrase: &str) -> Result<Self> {
