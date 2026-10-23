@@ -182,7 +182,9 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: gate suite (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # The suite now includes the Windows-follow-up gates plus slower cold fixtures;
+    # two exact-head runs reached 40m while still progressing. Keep headroom.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

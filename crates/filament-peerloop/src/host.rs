@@ -321,6 +321,12 @@ pub trait HostServices: Send + Sync + 'static {
             Some(_) => self.settings_get_bool(key),
         }
     }
+    /// Has a sibling asked this daemon to stop? A platform without SIGTERM or
+    /// a unix control socket (Windows) writes a PID-scoped request that the
+    /// daemon loop consumes; the default is "no request".
+    fn stop_requested(&self) -> bool {
+        false
+    }
     /// The owner user key, when this machine holds one. A joined device holds
     /// no user signing key, so this is `None` there.
     fn user_key(&self) -> Option<UserKey> {

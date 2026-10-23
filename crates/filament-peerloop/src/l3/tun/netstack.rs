@@ -313,6 +313,12 @@ pub struct NetstackTun {
 }
 
 impl NetstackTun {
+    /// Is the poll task that owns the stack still running? A finished task means
+    /// the endpoint is gone, and a published `ready` must be downgraded.
+    pub fn is_alive(&self) -> bool {
+        !self._poll.is_finished()
+    }
+
     /// Bring up the userspace stack for `cidr` (this node's overlay `<addr>/prefix`;
     /// crypto mode passes a `/128`). IPv6 only. Needs NO privilege.
     pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<NetstackTun> {

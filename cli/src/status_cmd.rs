@@ -166,10 +166,12 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
     let proxy = proxy_if_serving(responding, crate::proxy_state::current());
     if json {
         let pid = pid_alive;
-        // `bound` is what the daemon actually serves, read from its own record;
-        // `exposed` alone used to list configured ports that the daemon had
-        // refused to bind.
-        let bound = expose::bound_ports(serving_pid(pid_alive, responding));
+        // `bound` is what the daemon actually serves, read from its own record
+        // AND the live endpoint. The record alone is history: a matching PID
+        // with L3 down was reported as serving by both outputs.
+        let bound = expose::bound_state(serving_pid(pid_alive, responding));
+        let l3 = crate::l3_state::current().await;
+        let l3_ready = crate::l3_state::is_ready(&l3);
         let exposed: Vec<Value> = expose::load()
             .iter()
             .map(|b| {
@@ -177,7 +179,7 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
                     "port": b.port,
                     "target": b.target,
                     "peers": b.peers.clone().unwrap_or_default(),
-                    "bound": bound.contains(&b.port),
+                    "bound": expose::bound_now(&bound, b, l3_ready),
                 })
             })
             .collect();
@@ -291,15 +293,19 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
     }
     let exposed = expose::load();
     if !exposed.is_empty() {
-        let bound = expose::bound_ports(serving_pid(pid_alive, responding));
+        let bound = expose::bound_state(serving_pid(pid_alive, responding));
+        let l3 = crate::l3_state::current().await;
+        let l3_ready = crate::l3_state::is_ready(&l3);
         ui::say(&ui::paint(ui::Tone::Dim, "  exposed on .mesh:"));
         for b in exposed {
             let scope = match &b.peers {
                 Some(p) if !p.is_empty() => p.join(","),
                 _ => "any".into(),
             };
-            let state = if bound.contains(&b.port) {
+            let state = if expose::bound_now(&bound, &b, l3_ready) {
                 String::new()
+            } else if !l3_ready {
+                ui::paint(ui::Tone::Warn, "  NOT bound (no live L3 endpoint)")
             } else {
                 ui::paint(ui::Tone::Warn, "  NOT bound (configured only)")
             };

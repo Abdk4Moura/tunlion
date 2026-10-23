@@ -1048,7 +1048,82 @@ pub fn process_start_token(pid: u32) -> Option<String> {
         let rest = &stat[stat.rfind(')')? + 1..];
         rest.split_whitespace().nth(19).map(str::to_string)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(windows)]
+    {
+        unsafe {
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+                fn GetProcessTimes(
+                    h: isize,
+                    creation: *mut u64,
+                    exit: *mut u64,
+                    kernel: *mut u64,
+                    user: *mut u64,
+                ) -> i32;
+                fn CloseHandle(h: isize) -> i32;
+            }
+            const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 {
+                return None;
+            }
+            let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+            let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+            CloseHandle(h);
+            (ok != 0).then(|| creation.to_string())
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // proc_pidinfo(PROC_PIDTBSDINFO) has the kernel's microsecond start
+        // time, so this is both cheap enough for a 100ms poll and distinguishes
+        // a same-second pid replacement (unlike `ps -o lstart=`).
+        #[repr(C)]
+        struct ProcBsdInfo {
+            pbi_flags: u32,
+            pbi_status: u32,
+            pbi_xstatus: u32,
+            pbi_pid: u32,
+            pbi_ppid: u32,
+            pbi_uid: u32,
+            pbi_gid: u32,
+            pbi_ruid: u32,
+            pbi_rgid: u32,
+            pbi_svuid: u32,
+            pbi_svgid: u32,
+            rfu_1: u32,
+            pbi_comm: [u8; 16],
+            pbi_name: [u8; 32],
+            pbi_nfiles: u32,
+            pbi_pgid: u32,
+            pbi_pjobc: u32,
+            e_tdev: u32,
+            e_tpgid: u32,
+            pbi_nice: i32,
+            pbi_start_tvsec: u64,
+            pbi_start_tvusec: u64,
+        }
+        unsafe extern "C" {
+            fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
+        }
+        const PROC_PIDTBSDINFO: i32 = 3;
+        let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+        let want = std::mem::size_of::<ProcBsdInfo>() as i32;
+        let got = unsafe {
+            proc_pidinfo(
+                pid as i32,
+                PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut ProcBsdInfo as *mut u8,
+                want,
+            )
+        };
+        if got != want {
+            return None;
+        }
+        Some(format!("{}.{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows, target_os = "macos")))]
     {
         let _ = pid;
         None
@@ -3490,6 +3565,155 @@ pub enum Escalate {
     Kill,
 }
 
+/// Where a sibling process asks the daemon to stop on a platform without
+/// SIGTERM or a unix control socket. The daemon consumes it (see
+/// `daemon_stop::stop_requested`).
+pub(crate) fn daemon_stop_request_path() -> PathBuf {
+    Paths::config_path("down.request")
+}
+
+/// Ask the daemon with `pid` to stop.
+///
+/// Unix sends SIGTERM (the existing, tested path). Windows has no SIGTERM and
+/// no unix control socket, so this writes a PID-scoped stop request that the
+/// daemon's own loop reads and exits through its normal cleanup. This is a
+/// real daemon-control path, not an external `taskkill` on a pid.
+/// Lock serializing reads/writes of the `down.request` file. A separate lock
+/// from the daemon election: a down must be able to write while a daemon holds
+/// `up.lock`.
+pub(crate) fn daemon_stop_request_lock_path() -> PathBuf {
+    Paths::config_path("down.request.lock")
+}
+
+/// Run `f` with the request-file lock held. Bounded wait (a stale holder is
+/// impossible: the kernel drops the lock on exit), then None.
+pub(crate) fn with_daemon_stop_request_lock<T>(
+    f: impl FnOnce(&Path) -> T,
+) -> Option<T> {
+    for _ in 0..100 {
+        match InstanceLock::try_acquire(&daemon_stop_request_lock_path()) {
+            Ok(Some(_lock)) => return Some(f(&daemon_stop_request_path())),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn request_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        nanos,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[cfg(windows)]
+fn replace_request_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+    let tmp: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // MoveFileExW with REPLACE_EXISTING performs a single filesystem rename:
+    // if replacement fails, the destination remains intact. It also handles a
+    // destination that does not exist yet.
+    if unsafe { MoveFileExW(tmp.as_ptr(), path.as_ptr(), MOVEFILE_REPLACE_EXISTING) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_request_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
+/// Write the request file, removing it if any step fails after the file
+/// landed (SecretFile writes the bytes, then restricts permissions; a failure
+/// in the second step must not leave a live request behind).
+fn write_request_file<F>(
+    path: &Path,
+    content: &str,
+    tag: &str,
+    write: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path, &str) -> std::io::Result<()>,
+{
+    // Never write the live request path directly: a failed write/restrict step
+    // must not delete or truncate a request another down already wrote. Write a
+    // unique temp file, then atomically rename it into place.
+    let file = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "down.request".to_string());
+    let tmp = path.with_file_name(format!(".{file}.tmp.{}.{}", std::process::id(), tag));
+    let result = write(&tmp, content).and_then(|()| replace_request_file(&tmp, path));
+    if let Err(e) = result {
+        // Only OUR temp is removed; a pre-existing live request is untouched.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "could not write the stop request {}: {e}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Ask the daemon with `pid` to stop. Returns a per-request nonce so the
+/// requester can clear exactly its own pending request.
+///
+/// Unix sends SIGTERM (the existing, tested path). Windows has no SIGTERM and
+/// no unix control socket, so this writes a PID+token+nonce stop request that
+/// the daemon's own loop reads and exits through its normal cleanup. This is a
+/// real daemon-control path, not an external `taskkill` on a pid.
+pub fn request_daemon_stop(pid: u32) -> Result<Option<String>, String> {
+    let nonce = request_nonce();
+    #[cfg(unix)]
+    {
+        let status = command("kill")
+            .arg(pid.to_string())
+            .status()
+            .map_err(|e| format!("could not run kill: {e}"))?;
+        if status.success() {
+            Ok(Some(nonce))
+        } else {
+            Err(format!("`kill` failed ({status})"))
+        }
+    }
+    #[cfg(windows)]
+    {
+        let token = process_start_token(pid).ok_or_else(|| {
+            format!("cannot read the daemon's start time (pid {pid}); refusing an unsafe stop")
+        })?;
+        match with_daemon_stop_request_lock(|path| {
+            write_request_file(path, &format!("{pid}\n{token}\n{nonce}\n"), &nonce, |p, c| {
+                SecretFile::write_str(p, c)
+            })
+            .map(|()| nonce.clone())
+        }) {
+            // Lock timeout: do not block `down`; proceed to the token-verified
+            // await_exit/force path without a request file.
+            None => Ok(None),
+            Some(result) => result.map(Some),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Err("cannot ask a daemon to stop on this platform".to_string())
+    }
+}
+
 #[cfg(unix)]
 pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
     let sig = match how {
@@ -3507,17 +3731,31 @@ pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
 pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
     match how {
         Escalate::Continue => Ok(()),
-        Escalate::Kill => {
-            let st = crate::platform::command("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()?;
-            if st.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(format!("taskkill exited {st}")))
+        // Native forced termination, not a spawned `taskkill`. The caller checks
+        // that this PID is still the daemon it recorded before reaching here.
+        Escalate::Kill => unsafe {
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+                fn TerminateProcess(h: isize, code: u32) -> i32;
+                fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+                fn CloseHandle(h: isize) -> i32;
             }
+            const PROCESS_TERMINATE: u32 = 0x0001;
+            const SYNCHRONIZE: u32 = 0x0010_0000;
+            let h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid);
+            if h == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if TerminateProcess(h, 1) == 0 {
+                let e = std::io::Error::last_os_error();
+                CloseHandle(h);
+                return Err(e);
+            }
+            // Bounded wait so `await_exit` observes the exit promptly instead of
+            // spinning for its whole grace window.
+            WaitForSingleObject(h, 5000);
+            CloseHandle(h);
+            Ok(())
         }
     }
 }
@@ -4115,5 +4353,166 @@ pub async fn l3_state_over_control() -> Option<serde_json::Value> {
     #[cfg(not(unix))]
     {
         None
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_stop_request_tests {
+    /// The Windows `down` path writes a PID-scoped stop request for the daemon
+    /// loop to consume. This proves the real implementation (not `taskkill`)
+    /// produces the exact file the reader looks for, on Windows CI.
+    #[test]
+    fn windows_stop_request_is_a_pid_scoped_file() {
+        // TUNLION_CONFIG_DIR is process-global; other tests repoint it.
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!(
+            "tunlion-win-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let pid = std::process::id();
+        let nonce = super::request_daemon_stop(pid)
+            .expect("write the stop request")
+            .expect("request lock was free");
+        let path = super::daemon_stop_request_path();
+        let raw = std::fs::read_to_string(&path).expect("stop request exists");
+        let mut lines = raw.lines();
+        assert_eq!(lines.next().and_then(|s| s.trim().parse::<u32>().ok()), Some(pid));
+        assert_eq!(
+            lines.next().map(str::to_string),
+            super::process_start_token(pid),
+            "the request names this process incarnation, not just the pid"
+        );
+        assert_eq!(lines.next().map(str::to_string), Some(nonce), "and its unique nonce");
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A live target plus a held request lock must return Ok(None) (proceed to
+    /// await_exit/force), not an error that makes down bail.
+    #[test]
+    fn a_held_request_lock_falls_back_without_a_request() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-win-stop-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let held = super::InstanceLock::try_acquire(&super::daemon_stop_request_lock_path())
+            .unwrap()
+            .expect("hold the request lock");
+        let out = super::request_daemon_stop(std::process::id()).expect("lock timeout is not an error");
+        assert!(out.is_none(), "no request can be written; proceed to await_exit");
+        assert!(!super::daemon_stop_request_path().exists());
+        drop(held);
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod request_write_tests {
+    /// SecretFile writes bytes then restricts permissions. If the restriction
+    /// step fails, the request file has already landed; the helper must remove
+    /// it so a daemon does not consume a request `down` reported as failed.
+    #[test]
+    fn a_post_write_failure_removes_the_landed_request() {
+        let dir = std::env::temp_dir().join(format!("tunlion-req-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("down.request");
+        let res = super::write_request_file(&path, "content", "tag", |p, c| {
+            std::fs::write(p, c)?;
+            Err(std::io::Error::other("simulated permission step failure"))
+        });
+        assert!(res.is_err());
+        assert!(!path.exists(), "a failed write must not leave a live request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_write_preserves_a_pre_existing_request() {
+        let dir = std::env::temp_dir().join(format!("tunlion-req-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("down.request");
+        std::fs::write(&path, "old-request").unwrap();
+        let res = super::write_request_file(&path, "new-request", "tag", |p, c| {
+            std::fs::write(p, c)?;
+            Err(std::io::Error::other("simulated post-write failure"))
+        });
+        assert!(res.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "old-request",
+            "a failed write must not delete another down's live request"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows must preserve a live request if the native atomic replacement
+    /// fails. Opening the destination without FILE_SHARE_DELETE makes the
+    /// replacement fail deterministically with a sharing violation.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_windows_replacement_preserves_the_existing_request_and_nonce() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, GENERIC_READ, OPEN_EXISTING,
+        };
+
+        let dir = std::env::temp_dir().join(format!("tunlion-req-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("down.request");
+        let old_request = "481\nstart-token\nprior-live-nonce\n";
+        std::fs::write(&path, old_request).unwrap();
+
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let held = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+        assert_ne!(held, INVALID_HANDLE_VALUE, "hold the destination against replacement");
+
+        let result = super::write_request_file(&path, "482\nnew-token\nnew-nonce\n", "tag", |p, c| {
+            std::fs::write(p, c)
+        });
+        assert!(result.is_err(), "replacement must fail while deletion is denied");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old_request);
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".tmp.")),
+            "the failed replacement must clean up its own temp file"
+        );
+
+        unsafe { CloseHandle(held) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1768,7 +1768,7 @@ async fn recv_run(
         None
     };
     #[cfg(feature = "mesh")]
-    let l3_status_json = serde_json::to_value(&l3_status)
+    let mut l3_status_json = serde_json::to_value(&l3_status)
         .unwrap_or_else(|_| json!({"state": "down", "mode": "none", "reason": "L3 state unavailable"}));
     #[cfg(feature = "mesh")]
     if let Ok(text) = serde_json::to_string(&l3_status) {
@@ -1824,6 +1824,11 @@ async fn recv_run(
     // believe it. Reconcile on a short tick wherever an L3 endpoint exists, and
     // let expose-bound.json be the truth the CLI waits for.
     let mut last_expose_tick = Instant::now();
+    // Refresh the published L3 state every second: a stalled/removed endpoint
+    // must downgrade `ready`, and a live one must keep the file fresh enough
+    // for `expose --list`/`status` to trust it.
+    #[cfg(feature = "mesh")]
+    let mut last_l3_tick = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
@@ -2063,6 +2068,13 @@ async fn recv_run(
     let receive_started = Instant::now();
 
     loop {
+        // A portable stop request (Windows has no SIGTERM and no unix control
+        // socket). The host writes it for this PID; the daemon exits through the
+        // SAME cleanup path it uses for a signal, within one loop tick.
+        if daemon && host.stop_requested() {
+            log.say("tunlion: stop requested; shutting down");
+            return Ok(());
+        }
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Reap completed blocking writers every iteration: the handles are
         // owned until their write lands, but a long-lived daemon must not keep
@@ -3552,6 +3564,24 @@ async fn recv_run(
             }
         }
 
+        #[cfg(feature = "mesh")]
+        if daemon && last_l3_tick.elapsed() >= Duration::from_secs(1) {
+            last_l3_tick = Instant::now();
+            if let Some(m) = l3.as_ref() {
+                if l3_status.is_ready() && !m.l3_live() {
+                    l3_status = L3Status::down(
+                        l3_mode_word(m.is_userspace()),
+                        "the L3 endpoint stopped after it was reported ready",
+                    );
+                    l3_status_json = serde_json::to_value(&l3_status).unwrap_or_else(|_| {
+                        json!({"state": "down", "mode": "none", "reason": "L3 endpoint lost"})
+                    });
+                }
+                if let Ok(text) = serde_json::to_string(&l3_status) {
+                    host.l3_state_report(&text);
+                }
+            }
+        }
         if daemon && l3.is_some() && last_expose_tick.elapsed() >= Duration::from_secs(1) {
             last_expose_tick = Instant::now();
             ports.servers.reload_expose().await;

@@ -342,16 +342,33 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
 /// no home directory anywhere (HOME unset and none in the password database)
 /// there is no right default, so init refuses, before any key is written, and
 /// says how to choose one. `home_known` is `Paths::home_dir_known().is_some()`.
-pub(crate) fn resolve_init_inbox(flag: Option<PathBuf>, home_known: bool) -> Result<PathBuf> {
+pub(crate) fn resolve_init_inbox(
+    flag: Option<PathBuf>,
+    home_known: bool,
+    config_fallback: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let absolute = |p: PathBuf| -> Result<PathBuf> {
+        if p.is_absolute() {
+            Ok(p)
+        } else {
+            Ok(std::env::current_dir()
+                .context("cannot resolve the relative --inbox: the current directory is unreadable")?
+                .join(p))
+        }
+    };
     match flag {
-        Some(p) if p.is_absolute() => Ok(p),
-        Some(p) => Ok(std::env::current_dir()
-            .context("cannot resolve the relative --inbox: the current directory is unreadable")?
-            .join(p)),
-        None if home_known => Ok(default_drop_dir()),
-        None => Err(anyhow::anyhow!(
-            "cannot choose an inbox: HOME is not set and the password database has no home directory for this user. Set HOME, or pass an absolute path with --inbox <dir>",
-        )),
+        Some(p) => absolute(p),
+        None if home_known && config_fallback.is_none() => Ok(default_drop_dir()),
+        // No HOME: an explicit TUNLION_CONFIG_DIR is a complete, absolute
+        // location already owned by this invocation, so the inbox belongs
+        // under it. This is what makes `TUNLION_CONFIG_DIR=... env -u HOME
+        // tunlion init --name ...` work non-interactively.
+        None => match config_fallback {
+            Some(dir) => Ok(absolute(dir)?.join("inbox")),
+            None => Err(anyhow::anyhow!(
+                "cannot choose an inbox: HOME is not set and the password database has no home directory for this user. Set HOME, set TUNLION_CONFIG_DIR, or pass an absolute path with --inbox <dir>",
+            )),
+        },
     }
 }
 
@@ -487,7 +504,18 @@ pub(crate) async fn init_experience(
         }
         None => bail!("non-interactive init requires --name <device>"),
     };
-    let inbox = resolve_init_inbox(inbox, crate::platform::Paths::home_dir_known().is_some())?;
+    // An explicit config dir is the fallback ONLY when HOME is unset. A user
+    // who has HOME but chooses a custom config dir keeps ~/Tunlion.
+    let config_fallback = if std::env::var_os("HOME").is_none() {
+        std::env::var_os("TUNLION_CONFIG_DIR").map(PathBuf::from)
+    } else {
+        None
+    };
+    let inbox = resolve_init_inbox(
+        inbox,
+        crate::platform::Paths::home_dir_known().is_some(),
+        config_fallback,
+    )?;
     let pending = identity::PendingIdentity::generate()?;
     let phrase = Zeroizing::new(pending.mnemonic().to_string());
     let words = pending.mnemonic().words().collect::<Vec<_>>();
@@ -1270,15 +1298,21 @@ mod inbox_tests {
     #[test]
     fn init_never_persists_a_relative_inbox() {
         let abs = std::env::temp_dir().join("inbox-abs");
-        assert_eq!(resolve_init_inbox(Some(abs.clone()), false).unwrap(), abs);
-        let rel = resolve_init_inbox(Some(PathBuf::from("Tunlion")), false).unwrap();
+        assert_eq!(resolve_init_inbox(Some(abs.clone()), false, None).unwrap(), abs);
+        let rel = resolve_init_inbox(Some(PathBuf::from("Tunlion")), false, None).unwrap();
         assert!(rel.is_absolute(), "{rel:?}");
         assert_eq!(rel, std::env::current_dir().unwrap().join("Tunlion"));
-        let err = resolve_init_inbox(None, false).unwrap_err().to_string();
+        let err = resolve_init_inbox(None, false, None).unwrap_err().to_string();
         assert!(err.contains("HOME is not set") && err.contains("--inbox"), "{err}");
+        let cfg = std::env::temp_dir().join("cfg-fallback");
+        assert_eq!(
+            resolve_init_inbox(None, false, Some(cfg.clone())).unwrap(),
+            cfg.join("inbox"),
+            "an explicit config dir is the no-HOME default"
+        );
         let _guard = crate::tests::lock_test_config();
         if crate::platform::Paths::home_dir_known().is_some() {
-            assert!(resolve_init_inbox(None, true).unwrap().is_absolute());
+            assert!(resolve_init_inbox(None, true, None).unwrap().is_absolute());
         }
     }
 }

@@ -126,6 +126,9 @@ impl HostServices for CliHost {
     fn settings_get_bool_for(&self, key: &str, peer: Option<&str>) -> bool {
         crate::settings::get_bool(key, peer)
     }
+    fn stop_requested(&self) -> bool {
+        crate::daemon_stop::stop_requested()
+    }
     fn create_private_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
         crate::platform::create_private_dir_all(dir)
     }
