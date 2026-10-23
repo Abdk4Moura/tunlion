@@ -93,8 +93,7 @@ end;
 procedure NormalizeUserPath();
 var
   Path, Item, Clean: string;
-  Parts: TArrayOfString;
-  I: Integer;
+  P: Integer;
   Seen: TStringList;
   Dir: string;
 begin
@@ -110,10 +109,21 @@ begin
   try
     Seen.CaseSensitive := False;
     Clean := '';
-    Parts := SplitString(Path, ';');
-    for I := 0 to GetArrayLength(Parts) - 1 do
+    // Manual split: Inno's Pascal Script has no SplitString helper.
+    while Path <> '' do
     begin
-      Item := Trim(Parts[I]);
+      P := Pos(';', Path);
+      if P = 0 then
+      begin
+        Item := Path;
+        Path := '';
+      end
+      else
+      begin
+        Item := Copy(Path, 1, P - 1);
+        Path := Copy(Path, P + 1, Length(Path));
+      end;
+      Item := Trim(Item);
       if (Item <> '') and (Seen.IndexOf(Item) < 0) then
       begin
         Seen.Add(Item);
