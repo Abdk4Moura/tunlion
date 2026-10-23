@@ -80,14 +80,32 @@ impl JoinState {
         DeviceStore::open(&self.root)
     }
 
-    pub(crate) fn pending(&self) -> Option<Value> {
-        let raw = std::fs::read_to_string(self.pending_path()).ok()?;
-        serde_json::from_str(&raw).ok()
-    }
-
-    pub(crate) fn local_cert_record(&self) -> Option<Value> {
-        let raw = std::fs::read_to_string(self.local_cert_path()).ok()?;
-        serde_json::from_str(&raw).ok()
+    pub(crate) fn pending(&self) -> Result<Option<Value>> {
+        let path = self.pending_path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "join.pending.json at {} is a symlink; refusing to follow it. Repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation.",
+                path.display()
+            ),
+            Ok(meta) if !meta.is_file() => bail!(
+                "join.pending.json at {} is not a regular file; repair: `tunlion down -y`, \
+                 then `tunlion reset -y`, then join again with a fresh invitation.",
+                path.display()
+            ),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context("inspect join.pending.json"),
+        }
+        let raw = std::fs::read_to_string(&path).context("read join.pending.json")?;
+        let value = serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "join.pending.json at {} cannot be parsed ({e}); repair: `tunlion down -y`, \
+                 then `tunlion reset -y`, then join again with a fresh invitation.",
+                path.display()
+            )
+        })?;
+        Ok(Some(value))
     }
 
     /// The local certificate, read strictly. Absent is `Ok(None)`; present but
@@ -95,18 +113,28 @@ impl JoinState {
     /// as "no certificate" made `up`/`addr` fail open on a corrupt identity.
     fn read_local_cert(&self) -> Result<Option<DeviceCert>> {
         let path = self.local_cert_path();
-        let raw =
-            match std::fs::read_to_string(&path) {
-                Ok(raw) => raw,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(e).with_context(|| {
-                    format!(
-                        "cannot read this device's certificate at {}; repair: `tunlion down -y`, \
-                         then `tunlion reset -y`, then join again with a fresh invitation",
-                        path.display()
-                    )
-                }),
-            };
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "this device's certificate path {} is a symlink; refusing to follow it. Repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                path.display()
+            ),
+            Ok(meta) if !meta.is_file() => bail!(
+                "this device's certificate path {} is not a regular file; repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                path.display()
+            ),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context("inspect this device's certificate"),
+        }
+        let raw = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "cannot read this device's certificate at {}; repair: `tunlion down -y`, \
+                 then `tunlion reset -y`, then join again with a fresh invitation",
+                path.display()
+            )
+        })?;
         let record: Value = serde_json::from_str(&raw).with_context(|| {
             format!(
                 "this device's certificate record at {} cannot be parsed; repair: \
@@ -181,7 +209,7 @@ impl JoinState {
         owner_name: &str,
         issuer_fp: &[u8],
     ) -> Result<()> {
-        if let Some(pending) = self.pending() {
+        if let Some(pending) = self.pending()? {
             let pinned = pending["devicePub"].as_str().unwrap_or_default();
             if !pinned.is_empty() && pinned != hex::encode(device_pub) {
                 bail!(
@@ -217,14 +245,15 @@ impl JoinState {
         caps: &[String],
         scope: u8,
     ) -> Result<String> {
-        let pending = self.pending().unwrap_or_else(|| {
-            json!({
+        let pending = match self.pending()? {
+            Some(pending) => pending,
+            None => json!({
                 "version": 1,
                 "devicePub": hex::encode(device_pub),
                 "ownerName": owner_name,
                 "startedAt": crate::identity::now_secs(),
-            })
-        });
+            }),
+        };
         let mut pending = pending;
         pending["devicePub"] = json!(hex::encode(device_pub));
         pending["ownerName"] = json!(owner_name);
@@ -246,7 +275,7 @@ impl JoinState {
     /// means the identity is now committed; `None` means the journal exists but
     /// the owner has not accepted (no certificate in it yet).
     pub(crate) fn resume(&self) -> Result<Option<String>> {
-        let Some(pending) = self.pending() else {
+        let Some(pending) = self.pending()? else {
             return Ok(None);
         };
         if pending.get("accepted").is_none() {
@@ -256,7 +285,7 @@ impl JoinState {
     }
 
     fn apply_pending(&self) -> Result<String> {
-        let pending = self.pending().ok_or_else(|| {
+        let pending = self.pending()?.ok_or_else(|| {
             anyhow::anyhow!("join.pending.json disappeared before it could be applied")
         })?;
         let accepted = pending
@@ -292,6 +321,15 @@ impl JoinState {
         let cert = DeviceCert::from_json(&local["cert"]).ok_or_else(|| {
             anyhow::anyhow!("join.pending.json carries an invalid local certificate")
         })?;
+        // The journal is untrusted input until verified. Resuming used to write
+        // an expired or bad-signature certificate and report success, while the
+        // next `up`/`addr` refused it.
+        cert.verify(crate::identity::now_secs()).map_err(|e| {
+            anyhow::anyhow!(
+                "join.pending.json carries a local certificate that is not valid ({e}); repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation"
+            )
+        })?;
         if cert.device_pub != device_pub {
             bail!(
                 "join.pending.json's certificate names a different device key; refusing to commit it. \
@@ -301,6 +339,15 @@ impl JoinState {
         let owner_cert = DeviceCert::from_json(&accepted["ownerCert"]).ok_or_else(|| {
             anyhow::anyhow!("join.pending.json carries an invalid owner certificate")
         })?;
+        owner_cert
+            .verify(crate::identity::now_secs())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "join.pending.json carries an owner certificate that is not valid ({e}); \
+                     repair: `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh \
+                     invitation from the owner"
+                )
+            })?;
         let name = accepted["name"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("join.pending.json has no device name"))?;
@@ -341,7 +388,7 @@ impl JoinState {
     /// transport-looking "unreachable".
     pub(crate) fn check_key_binding(&self) -> Result<()> {
         let overlay = self.overlay_pub();
-        if let Some(pending) = self.pending() {
+        if let Some(pending) = self.pending()? {
             if let Some(pinned) = pending["devicePub"].as_str() {
                 if !pinned.is_empty() {
                     match overlay {
@@ -392,7 +439,12 @@ impl JoinState {
     /// start on top of a corrupt store.
     fn read_store_records(&self) -> Result<Option<Vec<Value>>> {
         let devices = self.devices_path();
-        match std::fs::metadata(&devices) {
+        match std::fs::symlink_metadata(&devices) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "this device's store at {} is a symlink; refusing to follow it. Repair: \
+                 `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
+                devices.display()
+            ),
             Ok(meta) if meta.is_file() => {}
             Ok(_) => bail!(
                 "this device's store at {} is not a regular file; repair: `tunlion down -y`, \
@@ -443,14 +495,49 @@ impl JoinState {
                     devices.display()
                 );
             }
-            if let Some(secret) = obj.get("secret").and_then(Value::as_str) {
-                if hex::decode(secret).map(|b| b.len()).ok() != Some(32) {
-                    bail!(
-                        "this device's store at {} has an invalid pair secret at index {index}; repair: \
-                         `tunlion down -y`, then `tunlion reset -y`, then join again with a fresh invitation",
-                        devices.display()
-                    );
+            let has_secret = match obj.get("secret") {
+                None => false,
+                Some(secret) => {
+                    let Some(secret) = secret.as_str() else {
+                        bail!(
+                            "this device's store at {} has a non-string pair secret at index {index}; \
+                             repair: `tunlion down -y`, then `tunlion reset -y`, then join again with a \
+                             fresh invitation",
+                            devices.display()
+                        );
+                    };
+                    if hex::decode(secret).map(|b| b.len()).ok() != Some(32) {
+                        bail!(
+                            "this device's store at {} has an invalid pair secret at index {index}; \
+                             repair: `tunlion down -y`, then `tunlion reset -y`, then join again with a \
+                             fresh invitation",
+                            devices.display()
+                        );
+                    }
+                    true
                 }
+            };
+            let has_cert = match obj.get("deviceCert") {
+                None => false,
+                Some(cert) => {
+                    if DeviceCert::from_json(cert).is_none() {
+                        bail!(
+                            "this device's store at {} has an invalid device certificate at index \
+                             {index}; repair: `tunlion down -y`, then `tunlion reset -y`, then join \
+                             again with a fresh invitation",
+                            devices.display()
+                        );
+                    }
+                    true
+                }
+            };
+            if !has_secret && !has_cert {
+                bail!(
+                    "this device's store at {} has a record with no usable credential at index \
+                     {index}; repair: `tunlion down -y`, then `tunlion reset -y`, then join again \
+                     with a fresh invitation",
+                    devices.display()
+                );
             }
         }
         Ok(Some(records))
@@ -524,7 +611,7 @@ impl JoinState {
     /// acknowledgement is still sitting in the journal: the certificate (the
     /// identity) has not been committed yet.
     pub(crate) fn check_pending_accepted_not_committed(&self) -> Result<()> {
-        let Some(pending) = self.pending() else {
+        let Some(pending) = self.pending()? else {
             return Ok(());
         };
         if pending.get("accepted").is_some() && self.read_local_cert()?.is_none() {
@@ -542,7 +629,7 @@ impl JoinState {
     /// owner may have certified it, so a reset before checking would make the
     /// mismatch worse.
     pub(crate) fn check_pending_for_up(&self) -> Result<()> {
-        let Some(pending) = self.pending() else {
+        let Some(pending) = self.pending()? else {
             return Ok(());
         };
         if pending.get("accepted").is_some() {
@@ -692,7 +779,7 @@ mod tests {
         assert_eq!(name, "joined");
         assert!(root.join(DEVICES_FILE).exists());
         assert!(root.join("identity/device-cert.json").exists());
-        assert!(state.pending().is_none());
+        assert!(state.pending().unwrap().is_none());
         // A second resume is a no-op, not a second write.
         assert_eq!(state.resume().unwrap(), None);
         let _ = std::fs::remove_dir_all(&root);
@@ -899,6 +986,137 @@ mod tests {
             .to_string();
         assert!(err.contains("expired"), "{err}");
         assert!(err.contains("tunlion reset"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_record_with_no_credential_or_a_non_string_secret_is_refused() {
+        let root = temp("credential-shape");
+        write_overlay(&root);
+        let overlay = JoinState::at(&root).overlay_pub().unwrap();
+        let cert = cert_for(3, overlay, 3600);
+        crate::platform::SecretFile::write_str(
+            &root.join("identity/device-cert.json"),
+            &json!({"name": "joined", "cert": cert.to_json()}).to_string(),
+        )
+        .unwrap();
+        let state = JoinState::at(&root);
+        for (label, record, needle) in [
+            (
+                "non-string secret",
+                json!([{"name": "x", "secret": 123}]),
+                "non-string pair secret",
+            ),
+            (
+                "null secret",
+                json!([{"name": "x", "secret": null}]),
+                "non-string pair secret",
+            ),
+            ("name only", json!([{"name": "x"}]), "no usable credential"),
+            (
+                "invalid cert",
+                json!([{"name": "x", "deviceCert": {}}]),
+                "invalid device certificate",
+            ),
+        ] {
+            write_store(&root, record);
+            let err = state.check_complete_join().unwrap_err().to_string();
+            assert!(err.contains(needle), "{label}: {err}");
+        }
+        // A valid owner plus an extra malformed record is still a malformed store.
+        let owner_cert = cert_for(3, [9u8; 32], 3600);
+        write_store(
+            &root,
+            json!([
+                {"name": "owner", "secret": "11".repeat(32), "deviceCert": owner_cert.to_json()},
+                {"name": "extra"}
+            ]),
+        );
+        let err = state.check_complete_join().unwrap_err().to_string();
+        assert!(err.contains("no usable credential"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_store_or_certificate_is_refused() {
+        let root = temp("symlink");
+        write_overlay(&root);
+        let overlay = JoinState::at(&root).overlay_pub().unwrap();
+        let cert = cert_for(3, overlay, 3600);
+        let cert_path = root.join("identity/device-cert.json");
+        crate::platform::SecretFile::write_str(
+            &cert_path,
+            &json!({"name": "joined", "cert": cert.to_json()}).to_string(),
+        )
+        .unwrap();
+        let real_store = root.join("real-devices.json");
+        write_store(&root, json!([]));
+        std::fs::rename(root.join(DEVICES_FILE), &real_store).unwrap();
+        std::os::unix::fs::symlink(&real_store, root.join(DEVICES_FILE)).unwrap();
+        let err = JoinState::at(&root)
+            .check_complete_join()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+
+        std::fs::remove_file(root.join(DEVICES_FILE)).unwrap();
+        let real_cert = root.join("real-cert.json");
+        std::fs::rename(&cert_path, &real_cert).unwrap();
+        std::os::unix::fs::symlink(&real_cert, &cert_path).unwrap();
+        let err = JoinState::at(&root)
+            .check_key_binding()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resuming_an_expired_or_bad_signature_journal_is_refused() {
+        let root = temp("resume-invalid");
+        write_overlay(&root);
+        let state = JoinState::at(&root);
+        let overlay = state.overlay_pub().unwrap();
+        let user = crate::identity::UserKey::from_seed(&[3u8; 32]).unwrap();
+        let owner_cert = cert_for(3, [9u8; 32], 3600);
+        let now = crate::identity::now_secs();
+        let expired = DeviceCert::certify(&user, overlay, now.saturating_sub(7200), 3600).unwrap();
+        let mut bad = DeviceCert::certify(&user, overlay, now, 3600).unwrap();
+        bad.sig[0] ^= 0xFF;
+        for (label, local_cert, needle) in [
+            ("expired", expired, "expired"),
+            ("bad signature", bad, "not valid"),
+        ] {
+            crate::platform::SecretFile::write_str(
+                &root.join(PENDING_FILE),
+                &json!({
+                    "version": 1,
+                    "devicePub": hex::encode(overlay),
+                    "ownerName": "owner",
+                    "startedAt": 1,
+                    "accepted": {
+                        "name": "joined",
+                        "localCert": {"name": "joined", "cert": local_cert.to_json()},
+                        "ownerCert": owner_cert.to_json(),
+                        "secret": "11".repeat(32),
+                        "caps": ["transfer"],
+                        "scope": 1
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let err = state.resume().unwrap_err().to_string();
+            assert!(err.contains(needle), "{label}: {err}");
+            assert!(
+                !root.join(DEVICES_FILE).exists(),
+                "{label}: store must not be written"
+            );
+            assert!(
+                !root.join("identity/device-cert.json").exists(),
+                "{label}: certificate must not be written"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

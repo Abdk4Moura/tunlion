@@ -36,10 +36,14 @@ the GitHub release notes.
   identity yet, and no paired devices" while the owner held the device. The next
   `join` or `up` now finishes the journal; a certificate whose overlay key no
   longer matches, a certificate whose signature is invalid or has expired, a
-  corrupt certificate record, a non-file/unparseable `devices.json`, a record
-  without a name, a joined store without the owner record the certificate names,
-  or an accepted journal with no certificate is refused with the reset/rejoin
-  path instead of presenting an address the fleet never certified. `reset` also removes the journal and the `devices.json.bak` a
+  corrupt certificate record, a non-file/unparseable/symlinked `devices.json`,
+  a record without a name or usable credential (a string 32-byte secret or a
+  valid device certificate), a joined store without the owner record the
+  certificate names, or an accepted journal with no certificate is refused with
+  the reset/rejoin path instead of presenting an address the fleet never
+  certified. Resuming an accepted journal now verifies the local and owner
+  certificates before writing them, so a bad-signature or expired journal cannot
+  report a successful join. `reset` also removes the journal and the `devices.json.bak` a
   half-write leaves behind.
 - `addr --json` now reports `displayName` and `meshName` separately (and keeps
   `name`/`mesh` as the mesh label). `--name-as` is documented and printed as a

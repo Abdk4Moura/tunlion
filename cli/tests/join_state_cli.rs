@@ -347,3 +347,37 @@ fn addr_refuses_a_certificate_with_a_bad_signature() {
     assert!(text.contains("tunlion reset"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Store records need a usable credential: a 32-byte secret or a valid device
+/// certificate. Present-but-non-string secrets and name-only records are not
+/// "unknown fields" to skip; they are a malformed store.
+#[test]
+fn addr_refuses_store_records_without_a_usable_credential() {
+    let dir = scratch("store-credentials");
+    init(&dir, "alpha");
+    let store = dir.join("devices.json");
+    for (body, needle) in [
+        (r#"[{"name":"x"}]"#, "no usable credential"),
+        (r#"[{"name":"x","secret":123}]"#, "non-string pair secret"),
+        (r#"[{"name":"x","secret":null}]"#, "non-string pair secret"),
+        (
+            r#"[{"name":"x","deviceCert":{}}]"#,
+            "invalid device certificate",
+        ),
+    ] {
+        std::fs::write(&store, body).unwrap();
+        let out = run(&dir, &["addr", "--json"]);
+        assert!(
+            !out.status.success(),
+            "addr accepted malformed store {body}"
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.contains(needle), "{body}: {text}");
+        assert!(text.contains("tunlion reset"), "{body}: {text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

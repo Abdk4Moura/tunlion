@@ -24,7 +24,10 @@
 #       display-only and does not rename the mesh
 #   J9  the human `addr` readout says --name-as is display-only
 #   J10 a corrupt certificate is refused by `addr`, not treated as "no identity"
-#   J11 a multi-use invitation retry is a receipt: one use, same secret/cert
+#   J11a a bounded multi-use retry is a receipt: one use, same identity
+#   J11b a forever-use retry is a receipt: one use, same secret
+#   J11c a different device key on the same invitation consumes a new use
+#   J11d different signed bounds for the same device consume a new use
 #   J12 a joined store must hold its owner record, not just any JSON array
 #
 # Hermetic localhost fixture. TUNLION_BIN points at the built binary.
@@ -199,50 +202,144 @@ else
   bad "J10: a corrupt certificate was treated as no identity (rc=$RC10)"
 fi
 
-say "J11: a multi-use invitation retry is a receipt, not a second use"
-DM="$WORK/multi"; mkdir -p "$DM"
-"${O_ENV[@]}" "$BIN" --server "$SERVER" add --for mreuse --reuse 5 --out "$WORK/multi-inv.txt" --yes   >"$WORK/j11-add.log" 2>&1 || { cat "$WORK/j11-add.log"; fixture_die "J11 setup: could not mint a multi-use invitation"; }
-timeout 90 env TUNLION_CONFIG_DIR="$DM" "$BIN" --server "$SERVER" join --invite-file "$WORK/multi-inv.txt"   --name mreuse --no-interactive >"$WORK/j11a.out" 2>&1
-RC11A=$?
-uses_now() {
+say "J11: use accounting on retries and on genuinely different claims"
+# Strict per-invitation accounting. Missing/unparseable evidence is a setup
+# failure, never a pass: -1 used to be compared to -1.
+used_keys() {
   "$PYV" - "$DA/used-invitations.json" <<'PY'
 import json,sys
-try: d=json.load(open(sys.argv[1]))
-except Exception: print(-1); raise SystemExit
-print(sum(int(e.get("uses",0)) for e in d))
+d=json.load(open(sys.argv[1]))
+for e in d: print(e["keyId"])
 PY
 }
-secret_now() {
-  "$PYV" - "$DM/devices.json" <<'PY'
+uses_for() {
+  "$PYV" - "$DA/used-invitations.json" "$1" <<'PY'
 import json,sys
-try: d=json.load(open(sys.argv[1]))
-except Exception: print(""); raise SystemExit
+d=json.load(open(sys.argv[1]))
+for e in d:
+    if e.get("keyId")==sys.argv[2]:
+        print(int(e.get("uses",-1))); raise SystemExit(0)
+raise SystemExit(3)
+PY
+}
+join_once() {  # invite dir name outfile
+  timeout 90 env TUNLION_CONFIG_DIR="$2" "$BIN" --server "$SERVER" join \
+    --invite-file "$1" --name "$3" --no-interactive --json >"$4" 2>"$4.err"
+}
+new_key_since() {  # before-file
+  used_keys | grep -vxF -f "$1" | head -1
+}
+key_before() {
+  : >"$WORK/keys.before"
+  if [ -e "$DA/used-invitations.json" ]; then
+    used_keys >"$WORK/keys.before" \
+      || fixture_die "J11: used-invitations.json exists but cannot be read/parsed"
+  fi
+}
+
+DM="$WORK/multi"; mkdir -p "$DM"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" add --for mreuse --reuse 5 --out "$WORK/multi-inv.txt" --yes \
+  >"$WORK/j11-add.log" 2>&1 || { cat "$WORK/j11-add.log"; fixture_die "J11 setup: could not mint a multi-use invitation"; }
+
+say "J11a: a bounded multi-use retry re-sends the receipt, one use"
+key_before
+join_once "$WORK/multi-inv.txt" "$DM" mreuse "$WORK/j11a.out"; RC11A=$?
+KEY_A=$(new_key_since "$WORK/keys.before") || fixture_die "J11a: the first join recorded no invitation use"
+USES_A1=$(uses_for "$KEY_A") || fixture_die "J11a: the invitation use entry is missing"
+SECRET1=$("$PYV" - "$DM/devices.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
 print(next((r.get("secret","") for r in d if r.get("secret")), ""))
 PY
-}
-USES1=$(uses_now)
-SECRET1=$(secret_now)
+)
 CERT1=$(sha256sum "$DM/identity/device-cert.json" | cut -d' ' -f1)
 rm -f "$DM/identity/device-cert.json" "$DM/devices.json"
-timeout 90 env TUNLION_CONFIG_DIR="$DM" "$BIN" --server "$SERVER" join --invite-file "$WORK/multi-inv.txt"   --name mreuse --no-interactive --json >"$WORK/j11b.out" 2>"$WORK/j11b.err"
-RC11B=$?
-USES2=$(uses_now)
-SECRET2=$(secret_now)
+join_once "$WORK/multi-inv.txt" "$DM" mreuse "$WORK/j11b.out"; RC11B=$?
+USES_A2=$(uses_for "$KEY_A") || fixture_die "J11a: the invitation use entry disappeared"
+SECRET2=$("$PYV" - "$DM/devices.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((r.get("secret","") for r in d if r.get("secret")), ""))
+PY
+)
 CERT2=$(sha256sum "$DM/identity/device-cert.json" | cut -d' ' -f1)
-if [ "$RC11A" = 0 ] && [ "$RC11B" = 0 ] && [ "$USES1" = "$USES2" ] \
+if [ "$RC11A" = 0 ] && [ "$RC11B" = 0 ] && [ "$USES_A1" = 1 ] && [ "$USES_A2" = 1 ] \
    && [ -n "$SECRET1" ] && [ "$SECRET1" = "$SECRET2" ] && [ "$CERT1" = "$CERT2" ] \
    && grep -q '"alreadyEnrolled": true' "$WORK/j11b.out"; then
-  ok "J11: the retry re-sent the receipt without consuming a second use or rotating the secret"
+  ok "J11a: one use recorded; retry kept the same certificate and secret"
 else
-  echo "rcA=$RC11A rcB=$RC11B uses=$USES1->$USES2 secret1='${SECRET1:0:8}' secret2='${SECRET2:0:8}' secretStable=$([ "$SECRET1" = "$SECRET2" ] && echo yes || echo no)"
-  cat "$WORK/j11a.out" "$WORK/j11b.out" "$WORK/j11b.err"
-  bad "J11: a multi-use retry consumed another use or rotated the enrollment"
+  echo "rc=$RC11A/$RC11B uses=$USES_A1->$USES_A2 secret=$([ "$SECRET1" = "$SECRET2" ] && echo same || echo changed)"
+  cat "$WORK/j11b.out" "$WORK/j11b.err"
+  bad "J11a: a bounded multi-use retry did not prove one use and a stable identity"
+fi
+
+say "J11b: a forever-use retry re-sends the receipt, one use"
+DMF="$WORK/multi-forever"; mkdir -p "$DMF"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" add --for mforever --reuse forever \
+  --out "$WORK/forever-inv.txt" --yes >"$WORK/j11f-add.log" 2>&1 \
+  || { cat "$WORK/j11f-add.log"; fixture_die "J11b setup: could not mint a forever invitation"; }
+key_before
+join_once "$WORK/forever-inv.txt" "$DMF" mforever "$WORK/j11f1.out"; RC11F1=$?
+KEY_F=$(new_key_since "$WORK/keys.before") || fixture_die "J11b: the forever join recorded no use"
+USES_F1=$(uses_for "$KEY_F") || fixture_die "J11b: the forever use entry is missing"
+SECRET_F1=$("$PYV" - "$DMF/devices.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((r.get("secret","") for r in d if r.get("secret")), ""))
+PY
+)
+rm -f "$DMF/identity/device-cert.json" "$DMF/devices.json"
+join_once "$WORK/forever-inv.txt" "$DMF" mforever "$WORK/j11f2.out"; RC11F2=$?
+USES_F2=$(uses_for "$KEY_F") || fixture_die "J11b: the forever use entry disappeared"
+SECRET_F2=$("$PYV" - "$DMF/devices.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((r.get("secret","") for r in d if r.get("secret")), ""))
+PY
+)
+if [ "$RC11F1" = 0 ] && [ "$RC11F2" = 0 ] && [ "$USES_F1" = 1 ] && [ "$USES_F2" = 1 ] \
+   && [ -n "$SECRET_F1" ] && [ "$SECRET_F1" = "$SECRET_F2" ] \
+   && grep -q '"alreadyEnrolled": true' "$WORK/j11f2.out"; then
+  ok "J11b: forever retry kept one use and the same secret"
+else
+  echo "rc=$RC11F1/$RC11F2 uses=$USES_F1->$USES_F2 secret=$([ "$SECRET_F1" = "$SECRET_F2" ] && echo same || echo changed)"
+  cat "$WORK/j11f2.out" "$WORK/j11f2.err"
+  bad "J11b: a forever-use retry did not prove one use and a stable secret"
+fi
+
+say "J11c: a DIFFERENT device key on the same invitation consumes a new use"
+DM2="$WORK/multi-second"; mkdir -p "$DM2"
+join_once "$WORK/multi-inv.txt" "$DM2" mreuse-second "$WORK/j11c.out"; RC11C=$?
+USES_C=$(uses_for "$KEY_A") || fixture_die "J11c: the bounded invitation use entry is missing"
+if [ "$RC11C" = 0 ] && [ "$USES_C" = 2 ] \
+   && ! grep -q '"alreadyEnrolled": true' "$WORK/j11c.out"; then
+  ok "J11c: a different device consumed exactly one additional use and was not treated as a retry"
+else
+  echo "rc=$RC11C uses=$USES_C"; cat "$WORK/j11c.out" "$WORK/j11c.err"
+  bad "J11c: a different device key was treated as a retry or did not consume a use"
+fi
+
+say "J11d: DIFFERENT signed bounds for the same device take the ordinary claim path"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" add --for mreuse --reuse 5 --allow transfer \
+  --out "$WORK/bounds-inv.txt" --yes >"$WORK/j11d-add.log" 2>&1 \
+  || { cat "$WORK/j11d-add.log"; fixture_die "J11d setup: could not mint the different-bounds invitation"; }
+key_before
+rm -f "$DM/identity/device-cert.json" "$DM/devices.json"
+join_once "$WORK/bounds-inv.txt" "$DM" mreuse "$WORK/j11d.out"; RC11D=$?
+KEY_D=$(new_key_since "$WORK/keys.before") || fixture_die "J11d: the different-bounds join recorded no use"
+USES_D=$(uses_for "$KEY_D") || fixture_die "J11d: the different-bounds use entry is missing"
+if [ "$RC11D" = 0 ] && [ "$USES_D" = 1 ] \
+   && ! grep -q '"alreadyEnrolled": true' "$WORK/j11d.out"; then
+  ok "J11d: different signed bounds consumed a new use instead of reusing the old receipt"
+else
+  echo "rc=$RC11D uses=$USES_D"; cat "$WORK/j11d.out" "$WORK/j11d.err"
+  bad "J11d: different signed bounds were treated as the same enrollment"
 fi
 
 say "J12: a joined store needs its owner record, not merely parseable JSON"
 DSHAPE="$WORK/store-shape"; cp -a "$DG" "$DSHAPE"
 J12_BAD=0
-for shape in '[]|no owner record' '[1]|non-object record' '[{}]|without a name' '{garbage|cannot be parsed'; do
+for shape in '[]|no owner record' '[1]|non-object record' '[{}]|without a name'              '[{"name":"x"}]|no usable credential'              '[{"name":"x","secret":123}]|non-string pair secret'              '{garbage|cannot be parsed'; do
   body=${shape%%|*}; needle=${shape#*|}
   printf '%s' "$body" >"$DSHAPE/devices.json"
   timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12.out" 2>"$WORK/j12.err"
