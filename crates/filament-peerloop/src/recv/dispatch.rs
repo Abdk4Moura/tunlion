@@ -2066,10 +2066,6 @@ async fn recv_run(
     // The deadline starts when the loop starts, not when the process did: the
     // caller asked "wait N seconds for a sender", not "be ready in N seconds".
     let receive_started = Instant::now();
-    if daemon {
-        // A stop request left by an older incarnation must not stop this one.
-        host.clear_stop_request();
-    }
 
     loop {
         // A portable stop request (Windows has no SIGTERM and no unix control

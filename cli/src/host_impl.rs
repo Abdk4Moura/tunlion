@@ -129,9 +129,6 @@ impl HostServices for CliHost {
     fn stop_requested(&self) -> bool {
         crate::daemon_stop::stop_requested()
     }
-    fn clear_stop_request(&self) {
-        crate::daemon_stop::clear_stop_request()
-    }
     fn create_private_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
         crate::platform::create_private_dir_all(dir)
     }

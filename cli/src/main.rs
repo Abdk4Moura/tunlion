@@ -1534,10 +1534,27 @@ fn down_cmd() -> Result<()> {
             // busy one may take a moment; "stopped" used to be printed 6 ms
             // after the signal while the process lived on, holding the lock the
             // next `up` then lost to. Wait (bounded), resume, then kill.
-            let how = daemon_stop::await_exit(pid, exe.as_deref(), start.as_deref())?;
-            let _ = std::fs::remove_file(pidfile());
+            let (how, replaced) =
+                daemon_stop::await_exit(pid, exe.as_deref(), start.as_deref())?;
+            // Only delete a pidfile that still names the daemon we stopped. A
+            // replacement (a service manager restart, or a same-pid new
+            // incarnation) may have written its own file in the meantime; that
+            // file is not ours to remove.
+            let still_names_stopped =
+                daemon_stop::pidfile_names_stopped(&pidfile(), pid, start.as_deref());
+            let had_pidfile = pidfile().exists();
+            if !replaced && still_names_stopped {
+                let _ = std::fs::remove_file(pidfile());
+            }
+            let extra = if replaced {
+                "; another process now holds that pid, so its pidfile was left untouched"
+            } else if had_pidfile && !still_names_stopped {
+                "; the pidfile no longer names this daemon, so it was left untouched"
+            } else {
+                ""
+            };
             ui::say(&format!(
-                "  {} stopped (pid {pid}){}",
+                "  {} stopped (pid {pid}){}{extra}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                 how.note()
             ));
