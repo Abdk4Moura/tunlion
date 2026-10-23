@@ -1075,18 +1075,53 @@ pub fn process_start_token(pid: u32) -> Option<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        // macOS has no /proc. `ps` asks the kernel for the recorded start time;
-        // second granularity, but still an incarnation differentiator for a
-        // same-pid replacement.
-        let out = command("ps")
-            .args(["-o", "lstart=", "-p", &pid.to_string()])
-            .output()
-            .ok()?;
-        if !out.status.success() {
+        // proc_pidinfo(PROC_PIDTBSDINFO) has the kernel's microsecond start
+        // time, so this is both cheap enough for a 100ms poll and distinguishes
+        // a same-second pid replacement (unlike `ps -o lstart=`).
+        #[repr(C)]
+        struct ProcBsdInfo {
+            pbi_flags: u32,
+            pbi_status: u32,
+            pbi_xstatus: u32,
+            pbi_pid: u32,
+            pbi_ppid: u32,
+            pbi_uid: u32,
+            pbi_gid: u32,
+            pbi_ruid: u32,
+            pbi_rgid: u32,
+            pbi_svuid: u32,
+            pbi_svgid: u32,
+            rfu_1: u32,
+            pbi_comm: [u8; 16],
+            pbi_name: [u8; 32],
+            pbi_nfiles: u32,
+            pbi_pgid: u32,
+            pbi_pjobc: u32,
+            e_tdev: u32,
+            e_tpgid: u32,
+            pbi_nice: i32,
+            pbi_start_tvsec: u64,
+            pbi_start_tvusec: u64,
+        }
+        unsafe extern "C" {
+            fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
+        }
+        const PROC_PIDTBSDINFO: i32 = 3;
+        let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+        let want = std::mem::size_of::<ProcBsdInfo>() as i32;
+        let got = unsafe {
+            proc_pidinfo(
+                pid as i32,
+                PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut ProcBsdInfo as *mut u8,
+                want,
+            )
+        };
+        if got != want {
             return None;
         }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!s.is_empty()).then_some(s)
+        Some(format!("{}.{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", windows, target_os = "macos")))]
     {
@@ -3543,7 +3578,52 @@ pub(crate) fn daemon_stop_request_path() -> PathBuf {
 /// no unix control socket, so this writes a PID-scoped stop request that the
 /// daemon's own loop reads and exits through its normal cleanup. This is a
 /// real daemon-control path, not an external `taskkill` on a pid.
-pub fn request_daemon_stop(pid: u32) -> Result<(), String> {
+/// Lock serializing reads/writes of the `down.request` file. A separate lock
+/// from the daemon election: a down must be able to write while a daemon holds
+/// `up.lock`.
+pub(crate) fn daemon_stop_request_lock_path() -> PathBuf {
+    Paths::config_path("down.request.lock")
+}
+
+/// Run `f` with the request-file lock held. Bounded wait (a stale holder is
+/// impossible: the kernel drops the lock on exit), then None.
+pub(crate) fn with_daemon_stop_request_lock<T>(
+    f: impl FnOnce(&Path) -> T,
+) -> Option<T> {
+    for _ in 0..100 {
+        match InstanceLock::try_acquire(&daemon_stop_request_lock_path()) {
+            Ok(Some(_lock)) => return Some(f(&daemon_stop_request_path())),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn request_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        nanos,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Ask the daemon with `pid` to stop. Returns a per-request nonce so the
+/// requester can clear exactly its own pending request.
+///
+/// Unix sends SIGTERM (the existing, tested path). Windows has no SIGTERM and
+/// no unix control socket, so this writes a PID+token+nonce stop request that
+/// the daemon's own loop reads and exits through its normal cleanup. This is a
+/// real daemon-control path, not an external `taskkill` on a pid.
+pub fn request_daemon_stop(pid: u32) -> Result<String, String> {
+    let nonce = request_nonce();
     #[cfg(unix)]
     {
         let status = command("kill")
@@ -3551,19 +3631,21 @@ pub fn request_daemon_stop(pid: u32) -> Result<(), String> {
             .status()
             .map_err(|e| format!("could not run kill: {e}"))?;
         if status.success() {
-            Ok(())
+            Ok(nonce)
         } else {
             Err(format!("`kill` failed ({status})"))
         }
     }
     #[cfg(windows)]
     {
-        let path = daemon_stop_request_path();
         let token = process_start_token(pid).ok_or_else(|| {
             format!("cannot read the daemon's start time (pid {pid}); refusing an unsafe stop")
         })?;
-        SecretFile::write_str(&path, &format!("{pid}\n{token}\n"))
-            .map_err(|e| format!("could not write the stop request {}: {e}", path.display()))
+        with_daemon_stop_request_lock(|path| {
+            SecretFile::write_str(path, &format!("{pid}\n{token}\n{nonce}\n"))
+                .map_err(|e| format!("could not write the stop request {}: {e}", path.display()))
+        })
+        .unwrap_or_else(|| Err("timed out locking the stop-request file".to_string()))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -4233,7 +4315,7 @@ mod windows_stop_request_tests {
         let old = std::env::var_os("TUNLION_CONFIG_DIR");
         unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let pid = std::process::id();
-        super::request_daemon_stop(pid).expect("write the stop request");
+        let nonce = super::request_daemon_stop(pid).expect("write the stop request");
         let path = super::daemon_stop_request_path();
         let raw = std::fs::read_to_string(&path).expect("stop request exists");
         let mut lines = raw.lines();
@@ -4243,6 +4325,7 @@ mod windows_stop_request_tests {
             super::process_start_token(pid),
             "the request names this process incarnation, not just the pid"
         );
+        assert_eq!(lines.next().map(str::to_string), Some(nonce), "and its unique nonce");
         let _ = std::fs::remove_file(&path);
         unsafe {
             match old {

@@ -1517,19 +1517,22 @@ fn down_cmd() -> Result<()> {
             // through the manager first, and only fall back to a bare kill
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
-            if !stop_managed_service(pid) {
+            let request_nonce = if !stop_managed_service(pid) {
                 // Platform control, not a shell command guess: SIGTERM on unix;
-                // on Windows a PID-scoped request the daemon loop consumes and
-                // exits through its normal cleanup. A failure leaves the daemon
-                // running, so keep the pidfile and say why instead of printing
-                // "stopped" over a live process.
-                if let Err(why) = crate::platform::request_daemon_stop(pid) {
-                    bail!(
+                // on Windows a pid+token+nonce request the daemon loop consumes
+                // and exits through its normal cleanup. A failure leaves the
+                // daemon running, so keep the pidfile and say why instead of
+                // printing "stopped" over a live process.
+                match crate::platform::request_daemon_stop(pid) {
+                    Ok(nonce) => Some(nonce),
+                    Err(why) => bail!(
                         "could not stop the daemon (pid {pid}): {why}, so it is still running. \
                          The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
-                    );
+                    ),
                 }
-            }
+            } else {
+                None
+            };
             // Stopped means GONE. A suspended daemon cannot act on SIGTERM and a
             // busy one may take a moment; "stopped" used to be printed 6 ms
             // after the signal while the process lived on, holding the lock the
@@ -1537,25 +1540,34 @@ fn down_cmd() -> Result<()> {
             let exit_result = daemon_stop::await_exit(pid, exe.as_deref(), start.as_deref());
             // Whatever happened, this down's request is no longer actionable.
             // (The daemon consumes it on match; this covers timeout/error.)
-            daemon_stop::clear_stop_request_for(pid, start.as_deref());
+            daemon_stop::clear_stop_request_for(pid, start.as_deref(), request_nonce.as_deref());
             let (how, replaced) = exit_result?;
             // Only delete a pidfile that still names the daemon we stopped,
             // under the same instance lock `up` holds before write_pidfile, so
             // a replacement cannot write between the check and the remove.
-            let had_pidfile = pidfile().exists();
-            let removed = !replaced
-                && daemon_stop::remove_pidfile_if_stopped(
+            let removal = if replaced {
+                daemon_stop::PidfileRemoval::NotOurs
+            } else {
+                daemon_stop::remove_pidfile_if_stopped(
                     &pidfile(),
                     &platform::Paths::config_path("up.lock"),
                     pid,
                     start.as_deref(),
-                );
+                )
+            };
             let extra = if replaced {
                 "; another process now holds that pid, so its pidfile was left untouched"
-            } else if had_pidfile && !removed {
-                "; the pidfile no longer names this daemon, so it was left untouched"
             } else {
-                ""
+                match removal {
+                    daemon_stop::PidfileRemoval::LockHeld => {
+                        "; another daemon is starting (election lock held), so the pidfile was left untouched"
+                    }
+                    daemon_stop::PidfileRemoval::NotOurs => {
+                        "; the pidfile no longer names this daemon, so it was left untouched"
+                    }
+                    daemon_stop::PidfileRemoval::Removed
+                    | daemon_stop::PidfileRemoval::Missing => "",
+                }
             };
             ui::say(&format!(
                 "  {} stopped (pid {pid}){}{extra}",
