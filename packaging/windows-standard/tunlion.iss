@@ -70,7 +70,7 @@ begin
   try
     Seen.CaseSensitive := False;
     Clean := '';
-    Parts := SplitString(PathValue, ';');
+    Parts := StringSplit(PathValue, [';'], stExcludeEmpty);
     for I := 0 to GetArrayLength(Parts) - 1 do begin
       Item := Trim(Parts[I]);
       if (Item <> '') and (Seen.IndexOf(Item) < 0) then begin
