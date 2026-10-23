@@ -1,1 +1,1 @@
-pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .devloop\win-combined.ps1
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .devloop\win-installer-compile.ps1
