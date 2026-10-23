@@ -3615,6 +3615,28 @@ fn request_nonce() -> String {
     )
 }
 
+#[cfg(windows)]
+fn replace_request_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+    let tmp: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // MoveFileExW with REPLACE_EXISTING performs a single filesystem rename:
+    // if replacement fails, the destination remains intact. It also handles a
+    // destination that does not exist yet.
+    if unsafe { MoveFileExW(tmp.as_ptr(), path.as_ptr(), MOVEFILE_REPLACE_EXISTING) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_request_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
 /// Write the request file, removing it if any step fails after the file
 /// landed (SecretFile writes the bytes, then restricts permissions; a failure
 /// in the second step must not leave a live request behind).
@@ -3635,17 +3657,7 @@ where
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "down.request".to_string());
     let tmp = path.with_file_name(format!(".{file}.tmp.{}.{}", std::process::id(), tag));
-    let result = write(&tmp, content).and_then(|()| {
-        // std::fs::rename does not replace an existing destination on Windows.
-        // The request lock serializes writers, so remove-then-rename is safe
-        // and still leaves a pre-existing request untouched if the write above
-        // failed.
-        #[cfg(windows)]
-        {
-            let _ = std::fs::remove_file(path);
-        }
-        std::fs::rename(&tmp, path)
-    });
+    let result = write(&tmp, content).and_then(|()| replace_request_file(&tmp, path));
     if let Err(e) = result {
         // Only OUR temp is removed; a pre-existing live request is untouched.
         let _ = std::fs::remove_file(&tmp);
@@ -4452,6 +4464,55 @@ mod request_write_tests {
             "old-request",
             "a failed write must not delete another down's live request"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows must preserve a live request if the native atomic replacement
+    /// fails. Opening the destination without FILE_SHARE_DELETE makes the
+    /// replacement fail deterministically with a sharing violation.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_windows_replacement_preserves_the_existing_request_and_nonce() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, GENERIC_READ, OPEN_EXISTING,
+        };
+
+        let dir = std::env::temp_dir().join(format!("tunlion-req-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("down.request");
+        let old_request = "481\nstart-token\nprior-live-nonce\n";
+        std::fs::write(&path, old_request).unwrap();
+
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let held = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+        assert_ne!(held, INVALID_HANDLE_VALUE, "hold the destination against replacement");
+
+        let result = super::write_request_file(&path, "482\nnew-token\nnew-nonce\n", "tag", |p, c| {
+            std::fs::write(p, c)
+        });
+        assert!(result.is_err(), "replacement must fail while deletion is denied");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old_request);
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".tmp.")),
+            "the failed replacement must clean up its own temp file"
+        );
+
+        unsafe { CloseHandle(held) };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
