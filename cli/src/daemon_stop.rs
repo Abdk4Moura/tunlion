@@ -346,6 +346,10 @@ pub(crate) fn stop_requested() -> bool {
 /// nonce. Two concurrent downs have different nonces, so one cannot delete the
 /// other's pending request.
 pub(crate) fn clear_stop_request_for(pid: u32, token: Option<&str>, nonce: Option<&str>) {
+    // A fallback down (request lock was held, so it wrote NO request) must not
+    // clear a concurrent down's valid request. No nonce means "I did not write
+    // one", not "match any".
+    let Some(nonce) = nonce else { return };
     platform::with_daemon_stop_request_lock(|path| {
         let Ok(raw) = std::fs::read_to_string(path) else { return };
         let mut lines = raw.lines();
@@ -354,7 +358,7 @@ pub(crate) fn clear_stop_request_for(pid: u32, token: Option<&str>, nonce: Optio
         let req_nonce = lines.next().map(|s| s.trim().to_string());
         if req_pid == Some(pid)
             && (token.is_none() || req_token.as_deref() == token)
-            && (nonce.is_none() || req_nonce.as_deref() == nonce)
+            && req_nonce.as_deref() == Some(nonce)
         {
             let _ = std::fs::remove_file(path);
         }
@@ -639,6 +643,27 @@ mod tests {
             assert!(pidfile_names_stopped(&p, std::process::id(), Some(&t)));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fallback_down_with_no_nonce_never_clears_a_concurrent_request() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-stop-nononce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let _restore = ConfigDir(previous, dir);
+
+        let pid = std::process::id();
+        let token = platform::process_start_token(pid).unwrap_or_default();
+        let path = platform::daemon_stop_request_path();
+        std::fs::write(&path, format!("{pid}\n{token}\nother-down\n")).unwrap();
+        clear_stop_request_for(pid, Some(&token), None);
+        assert!(
+            path.exists(),
+            "no nonce means this down wrote nothing, so it must clear nothing"
+        );
     }
 
     #[test]

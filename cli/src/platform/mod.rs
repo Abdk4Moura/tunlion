@@ -3618,17 +3618,43 @@ fn request_nonce() -> String {
 /// Write the request file, removing it if any step fails after the file
 /// landed (SecretFile writes the bytes, then restricts permissions; a failure
 /// in the second step must not leave a live request behind).
-fn write_request_file<F>(path: &Path, content: &str, write: F) -> Result<(), String>
+fn write_request_file<F>(
+    path: &Path,
+    content: &str,
+    tag: &str,
+    write: F,
+) -> Result<(), String>
 where
     F: FnOnce(&Path, &str) -> std::io::Result<()>,
 {
-    match write(path, content) {
-        Ok(()) => Ok(()),
-        Err(e) => {
+    // Never write the live request path directly: a failed write/restrict step
+    // must not delete or truncate a request another down already wrote. Write a
+    // unique temp file, then atomically rename it into place.
+    let file = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "down.request".to_string());
+    let tmp = path.with_file_name(format!(".{file}.tmp.{}.{}", std::process::id(), tag));
+    let result = write(&tmp, content).and_then(|()| {
+        // std::fs::rename does not replace an existing destination on Windows.
+        // The request lock serializes writers, so remove-then-rename is safe
+        // and still leaves a pre-existing request untouched if the write above
+        // failed.
+        #[cfg(windows)]
+        {
             let _ = std::fs::remove_file(path);
-            Err(format!("could not write the stop request {}: {e}", path.display()))
         }
+        std::fs::rename(&tmp, path)
+    });
+    if let Err(e) = result {
+        // Only OUR temp is removed; a pre-existing live request is untouched.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "could not write the stop request {}: {e}",
+            path.display()
+        ));
     }
+    Ok(())
 }
 
 /// Ask the daemon with `pid` to stop. Returns a per-request nonce so the
@@ -3658,7 +3684,7 @@ pub fn request_daemon_stop(pid: u32) -> Result<Option<String>, String> {
             format!("cannot read the daemon's start time (pid {pid}); refusing an unsafe stop")
         })?;
         match with_daemon_stop_request_lock(|path| {
-            write_request_file(path, &format!("{pid}\n{token}\n{nonce}\n"), |p, c| {
+            write_request_file(path, &format!("{pid}\n{token}\n{nonce}\n"), &nonce, |p, c| {
                 SecretFile::write_str(p, c)
             })
             .map(|()| nonce.clone())
@@ -4400,12 +4426,32 @@ mod request_write_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("down.request");
-        let res = super::write_request_file(&path, "content", |p, c| {
+        let res = super::write_request_file(&path, "content", "tag", |p, c| {
             std::fs::write(p, c)?;
             Err(std::io::Error::other("simulated permission step failure"))
         });
         assert!(res.is_err());
         assert!(!path.exists(), "a failed write must not leave a live request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_write_preserves_a_pre_existing_request() {
+        let dir = std::env::temp_dir().join(format!("tunlion-req-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("down.request");
+        std::fs::write(&path, "old-request").unwrap();
+        let res = super::write_request_file(&path, "new-request", "tag", |p, c| {
+            std::fs::write(p, c)?;
+            Err(std::io::Error::other("simulated post-write failure"))
+        });
+        assert!(res.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "old-request",
+            "a failed write must not delete another down's live request"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
