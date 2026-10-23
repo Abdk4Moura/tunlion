@@ -11,19 +11,28 @@ permissions:
 jobs:
   installer:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - name: Download access test binary
+      - name: Checkout access integration source
+        uses: actions/checkout@v4
+        with:
+          ref: integration/access-shell-cli
+          path: access-src
+      - name: Checkout Windows shell source
+        uses: actions/checkout@v4
+        with:
+          ref: work/windows-shell-plane
+          path: shell-src
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build access temporary-access binary
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh run download 39843406807 -R ${{ github.repository }} -n tunlion-x86_64-pc-windows-msvc -D access
-      - name: Download shell test binary
+        working-directory: access-src
+        run: cargo build --locked --release -p filament-cli --bin tunlion
+      - name: Build Windows shell-relay binary
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh run download 39843428578 -R ${{ github.repository }} -n tunlion-x86_64-pc-windows-msvc -D shell
+        working-directory: shell-src
+        run: cargo build --locked --release -p filament-cli --bin tunlion
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
@@ -32,8 +41,8 @@ jobs:
         run: |
           $stage = "packaging/windows-test/stage"
           New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item access/tunlion.exe "$stage/tunlion.exe" -Force
-          Copy-Item shell/tunlion.exe "$stage/tunlion-shell.exe" -Force
+          Copy-Item access-src/target/release/tunlion.exe "$stage/tunlion.exe" -Force
+          Copy-Item shell-src/target/release/tunlion.exe "$stage/tunlion-shell.exe" -Force
           Copy-Item packaging/windows-test/README.md "$stage/README.md" -Force
           Copy-Item packaging/windows-test/*.ps1 "$stage/"
       - name: Package

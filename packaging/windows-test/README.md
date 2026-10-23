@@ -4,7 +4,9 @@ This installs **test binaries only** under your local AppData. It does not
 replace or configure a production Tunlion installation.
 
 - `tunlion.exe`: temporary TCP service slice from access commit `04740fff`.
-  Folder sharing, temporary shell, device networking and `.mesh` DNS are not
+  Folder sharing and temporary shell are included for Windows where the host
+  endpoint is available. Windows folder two-process CLI behavior is unit-tested,
+  not yet end-to-end validated. Device networking and `.mesh` DNS are not
   implemented in this binary.
 - `tunlion-shell.exe`: separate Windows shell-relay branch `d02e64a4`. It is not
   integrated with temporary access. Its `--i-know` semantics are still under
