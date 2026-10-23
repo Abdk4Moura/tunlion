@@ -1,1 +1,1 @@
-cargo check -p filament-cli --all-targets --locked && cargo test -p filament-cli --bin tunlion win_pty::tests --locked && cargo build -p filament-cli --bin tunlion --locked && powershell -NoProfile -ExecutionPolicy Bypass -File .devloop\win-startup-smoke.ps1
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .devloop\win-combined.ps1

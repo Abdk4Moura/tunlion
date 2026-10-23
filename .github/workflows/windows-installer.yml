@@ -1,0 +1,208 @@
+name: windows-installer
+
+# Build the combined Windows tunlion.exe and package the STANDARD per-user
+# installer (%LOCALAPPDATA%\Programs\Tunlion). One Windows job, not the Test
+# matrix and not the full test.yml loop.
+#
+# The job also proves the install contract on the ephemeral runner:
+#   - a prior tunlion.exe in the target directory is upgraded in place
+#   - only tunlion.exe is installed; no test-kit payload or branding
+#   - the user Path gets exactly one new entry and loses it on uninstall
+#   - the Start Menu shortcut and the Add/Remove Programs entry are created
+#   - a sentinel identity/config in %APPDATA%\tunlion survives install AND
+#     uninstall (the installer never touches the data directory)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch/ref to build
+        required: true
+        default: integration/windows-combined
+      version:
+        description: Optional app version override (otherwise from tunlion --version)
+        required: false
+        default: ""
+
+concurrency:
+  group: windows-installer-${{ inputs.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the combined binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release -p filament-cli --bin tunlion
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify tunlion --version (also builds the whole Clap tree)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = & .\target\release\tunlion.exe --version 2>&1 | Out-String
+          Write-Host $out.Trim()
+          if ($LASTEXITCODE -ne 0) { throw "tunlion --version exited $LASTEXITCODE" }
+          if ($out -match 'overflowed its stack') { throw "startup stack overflow" }
+          if ($out -notmatch 'tunlion\s+\d+\.\d+\.\d+') { throw "unexpected version output" }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and
+              -not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Stage the single payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = 'packaging/windows-installer/stage'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item 'target/release/tunlion.exe' "$stage/tunlion.exe" -Force
+          # Prove the payload is only the combined binary.
+          $files = Get-ChildItem $stage -File
+          if ($files.Count -ne 1 -or $files[0].Name -ne 'tunlion.exe') {
+            throw "stage must contain only tunlion.exe, got: $($files.Name -join ', ')"
+          }
+
+      - name: Compile the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ inputs.version }}'
+          if (-not $version) {
+            $text = (& .\target\release\tunlion.exe --version | Out-String)
+            if ($text -match 'tunlion\s+(\d+\.\d+\.\d+)') { $version = $Matches[1] } else { throw "cannot read version" }
+          }
+          Write-Host "installer version: $version"
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' }
+          & $iscc "/DAppVersion=$version" 'packaging/windows-installer/tunlion.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC exited $LASTEXITCODE" }
+
+      - name: Record size and sha256
+        id: artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = 'packaging/windows-installer/Output/TunlionSetup.exe'
+          if (-not (Test-Path $setup)) { throw "installer not produced" }
+          $sha = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item $setup).Length
+          "$sha  TunlionSetup.exe" | Out-File 'packaging/windows-installer/Output/SHA256SUMS' -Encoding ascii
+          "ref=${{ inputs.ref }}" | Out-File 'packaging/windows-installer/Output/build-info.txt' -Encoding utf8
+          "sha256=$sha" | Out-File 'packaging/windows-installer/Output/build-info.txt' -Append -Encoding utf8
+          "bytes=$size" | Out-File 'packaging/windows-installer/Output/build-info.txt' -Append -Encoding utf8
+          "installer_sha256=$sha" >> $env:GITHUB_OUTPUT
+          "installer_bytes=$size" >> $env:GITHUB_OUTPUT
+          Write-Host "installer: $setup"
+          Write-Host "sha256: $sha"
+          Write-Host "bytes: $size"
+
+      - name: Upload installer artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TunlionSetup-win64
+          path: |
+            packaging/windows-installer/Output/TunlionSetup.exe
+            packaging/windows-installer/Output/SHA256SUMS
+            packaging/windows-installer/Output/build-info.txt
+          if-no-files-found: error
+
+      - name: Install contract smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Resolve-Path 'packaging/windows-installer/Output/TunlionSetup.exe').Path
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Tunlion'
+          $exe = Join-Path $installDir 'tunlion.exe'
+          $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Tunlion.lnk'
+          $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+
+          # A user's real data lives elsewhere; put sentinels there and never
+          # let install/uninstall touch them.
+          $cfg = Join-Path $env:APPDATA 'tunlion'
+          New-Item -ItemType Directory -Force $cfg | Out-Null
+          $sentinelConfig = Join-Path $cfg 'config'
+          $sentinelIdentity = Join-Path $cfg 'identity.ed25519'
+          Set-Content -Path $sentinelConfig -Value 'sentinel-config-must-survive' -NoNewline
+          Set-Content -Path $sentinelIdentity -Value 'sentinel-identity-must-survive' -NoNewline
+          $hashConfig = (Get-FileHash $sentinelConfig -Algorithm SHA256).Hash
+          $hashIdentity = (Get-FileHash $sentinelIdentity -Algorithm SHA256).Hash
+
+          # Simulate an existing per-user install: the installer must upgrade it.
+          New-Item -ItemType Directory -Force $installDir | Out-Null
+          Set-Content -Path $exe -Value 'stale prior tunlion.exe' -NoNewline
+
+          $before = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $proc = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+            "/LOG=$env:RUNNER_TEMP\install.log")
+          if ($proc.ExitCode -ne 0) { throw "installer exited $($proc.ExitCode)" }
+
+          if (-not (Test-Path $exe)) { throw "tunlion.exe was not installed" }
+          if ((Get-Item $exe).Length -lt 1MB) { throw "a stale tunlion.exe was not upgraded" }
+          $version = (& $exe --version | Out-String)
+          Write-Host $version.Trim()
+          if ($version -notmatch 'tunlion\s+\d+\.\d+\.\d+') { throw "installed binary does not run" }
+
+          $after = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (($after -split ';') -notcontains $installDir) { throw "install dir missing from user Path" }
+          if (-not (Test-Path $shortcut)) { throw "Start Menu shortcut missing" }
+
+          $entry = Get-ItemProperty $uninstallKey | Where-Object { $_.DisplayName -eq 'Tunlion' }
+          if (-not $entry) { throw "no Add/Remove Programs entry named Tunlion" }
+          if ($entry.DisplayName -match 'Test|Kit') { throw "test-kit branding leaked into the app entry" }
+
+          if ((Get-FileHash $sentinelConfig -Algorithm SHA256).Hash -ne $hashConfig) { throw "install changed config" }
+          if ((Get-FileHash $sentinelIdentity -Algorithm SHA256).Hash -ne $hashIdentity) { throw "install changed identity" }
+
+          # Uninstall: files/PATH/entry go, config/identity stay.
+          $uninstaller = ($entry.UninstallString -replace '^"([^"]+)".*$', '$1')
+          if (-not (Test-Path $uninstaller)) { throw "uninstaller missing: $uninstaller" }
+          $up = Start-Process -FilePath $uninstaller -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+          if ($up.ExitCode -ne 0) { throw "uninstaller exited $($up.ExitCode)" }
+
+          if (Test-Path $exe) { throw "tunlion.exe survived uninstall" }
+          if (Test-Path $shortcut) { throw "Start Menu shortcut survived uninstall" }
+          $gone = Get-ItemProperty $uninstallKey | Where-Object { $_.DisplayName -eq 'Tunlion' }
+          if ($gone) { throw "Add/Remove Programs entry survived uninstall" }
+          $finalPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (($finalPath -split ';') -contains $installDir) { throw "install dir survived uninstall in user Path" }
+          if ((Get-FileHash $sentinelConfig -Algorithm SHA256).Hash -ne $hashConfig) { throw "uninstall changed config" }
+          if ((Get-FileHash $sentinelIdentity -Algorithm SHA256).Hash -ne $hashIdentity) { throw "uninstall changed identity" }
+
+          Write-Host "install contract: PASS (upgrade, PATH, shortcut, uninstall entry, config preserved)"
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          $setup = 'packaging/windows-installer/Output/TunlionSetup.exe'
+          if (Test-Path $setup) {
+            $sha = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+            $size = (Get-Item $setup).Length
+            "### TunlionSetup.exe" >> $env:GITHUB_STEP_SUMMARY
+            "ref: ``${{ inputs.ref }}``" >> $env:GITHUB_STEP_SUMMARY
+            "sha256: ``$sha``" >> $env:GITHUB_STEP_SUMMARY
+            "bytes: ``$size``" >> $env:GITHUB_STEP_SUMMARY
+          }

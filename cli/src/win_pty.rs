@@ -11,6 +11,11 @@
 //! has no linked token; that path needs S4U and is refused, never silently run
 //! as SYSTEM.
 
+// The policy enum and the portable stubs exist for the Windows implementation
+// and its tests. On other platforms they are intentionally unreferenced; mark
+// that as expected instead of regressing the warning ratchet.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use anyhow::{Result, bail};
 #[cfg(not(windows))]
 use std::io::{Read, Write};
