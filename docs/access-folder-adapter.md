@@ -143,6 +143,8 @@ They do not replace these recipient/CLI/platform tests.
 
 On `integration/access-shell-cli` the recipient adapter is integrated for the
 CLI on both Linux and Windows (`folder_access::perform` + `platform::
-folder_download_supported`). Windows-specific recipient tests must still be run
-on a real Windows host; until then the Windows CLI E2E boundary is compiled and
-protocol-tested but not claimed as a two-process end-to-end pass.
+folder_download_supported`). Linux runs the real two-process folder E2E. Windows
+runs the compiled CLI, recipient protocol/publication tests and the core Windows
+suite, but the interactive two-process CLI E2E is not validated: on the leased
+runner the interactive `tunlion` process overflowed its stack on ConPTY before
+the menu. Treat the Windows CLI folder flow as protocol-tested, not end-to-end.

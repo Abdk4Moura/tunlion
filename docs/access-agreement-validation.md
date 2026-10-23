@@ -140,6 +140,61 @@ is not claimed on Windows. The existing upper-directory ACL and the host-selecte
 canonical root remain the operator's responsibility; a reparse point above the
 selected root is resolved by the host's canonicalisation before the pin.
 
+## Integrated CLI folder lane (Linux + Windows)
+
+Merge commit `88eee3f0` integrates the validated Windows folder endpoint
+(`fb9a01f0`, validated source `e121b2ff`) into the shell CLI lane at base
+`1d286207`. Only the folder/CLI adapter changed: `platform::folder_download_supported`
+now reports true on Windows when `mount-server` is built (the pinned
+`OwnedDownload` publisher exists there), while browse and preview remain
+protocol-level. Unix shell/PTY serving and its admission path are unchanged; the
+Windows shell arm stays `Unsupported` and was not edited.
+
+Integration commits: `39d86bcd` adds the platform capability test, the
+Windows-specific recipient path test, and platform-neutral publication-name
+assertions; `07244821` reverts the attempted Windows two-process E2E (its tree
+is byte-identical to `39d86bcd` for the lane).
+
+Linux host checks on exact head `39d86bcd` (reusable worker `ci-worker-dovm`,
+shared `build.lock`, job-local Python venv, `CI=1`):
+
+| Job | Suites | Result |
+| --- | --- | --- |
+| `access-shell-folder-check-20261022a` | `cargo check -p filament-cli --bin tunlion` | pass |
+| `access-shell-folder-final-unit-39d86bcd` | CLI `access_ui` 7, `temporary_session` 5, `folder_access::protocol_tests` 3, platform capability 1; peerloop `access` 15, `mount_proto` 36, `download_output` 5, `access_session` 7 | 79 passed, 0 failed |
+| `access-shell-folder-e2e-20261022d` (88eee3f0) and `access-shell-folder-e2e-72d64255` | `pty_flows` temporary cells incl. real folder browse/binary+empty read/download/no-clobber/symlink escape/End | 7/7 pass, 59.15s |
+| `access-shell-folder-regress-20261022g` | live shell removal by signed narrowing; End during revised review | 2/2 pass |
+| `access-shell-folder-feat-20261022f` | peerloop reduced/default; CLI without `pty-server`; CLI without `exec-server` | 4/4 pass |
+
+Windows validation used the coordinated leased `windows-devloop` (not
+`test.yml`) on run `39875620887`, CI head `761b038a` (code tree `39d86bcd` plus
+`.devloop/cmd.txt` only), `DEVRESULT ok code=0 secs=338`:
+
+- CLI `tunlion` and `filament-peerloop` Windows compile pass.
+- `mount_proto` 45, `access` 12 (including `windows_folders` junction-root,
+  substitution/End, and RW/abort cells), `download_output` 4, `access_session`
+  4.
+- CLI `folder_access::protocol_tests` 4 (including
+  `windows_download_is_offered_and_peer_paths_cannot_become_local_paths`),
+  platform capability 1, `access_ui` 7, `temporary_session` 5.
+- All 82 tests passed; 0 failed. The lease was stopped after the result.
+
+Windows two-process CLI E2E is **not** validated. Two attempts were made on the
+same leased runner with a job-local venv and `CI=1`; neither is reported green:
+
+- `39876983973`: PowerShell parsed `"tunlion.exe" --server ...` as an
+  expression (`Unexpected token 'server'`). Added the PowerShell call operator.
+- `39878237001`: with `& "tunlion.exe" --server ... add`, the interactive
+  `tunlion` process on ConPTY printed `thread 'main' has overflowed its stack`
+  before the temporary-access menu appeared. A non-interactive diagnostic
+  (`--version`, and `add` with stdin closed) exited 0, so this is the
+  interactive Windows terminal path, not folder protocol admission.
+
+The folder E2E therefore stays `#[cfg(target_os = "linux")]`. Windows coverage
+is the compiled CLI, recipient protocol/publication tests and the Windows core
+suite above. Do not claim a two-process Windows CLI folder pass, a WinFsp mount,
+or Windows shell/PTY support. The Windows branch/worktree was not modified.
+
 ## Remaining gaps
 
 - The foreground CLI is the validated adapter. `tunlion-core`'s reduced profile
