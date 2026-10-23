@@ -1,7 +1,9 @@
 $ErrorActionPreference = 'Stop'
 $test = 'platform::request_write_tests::a_failed_windows_replacement_preserves_the_existing_request_and_nonce'
-$output = @(& cargo test --locked -p filament-cli --bin tunlion $test -- --exact 2>&1)
+$log = Join-Path $env:RUNNER_TEMP 'request-regression.log'
+& cmd.exe /d /c "cargo test --locked -p filament-cli --bin tunlion $test -- --exact > `"$log`" 2>&1"
 $code = $LASTEXITCODE
+$output = @(Get-Content -LiteralPath $log)
 $output | ForEach-Object { Write-Host $_ }
 if ($code -ne 0) { throw "cargo test failed: $code" }
 $text = $output -join "`n"
