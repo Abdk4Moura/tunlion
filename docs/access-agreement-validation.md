@@ -155,20 +155,23 @@ Windows-specific recipient path test, and platform-neutral publication-name
 assertions; `07244821` reverts the attempted Windows two-process E2E (its tree
 is byte-identical to `39d86bcd` for the lane).
 
-Linux host checks on exact head `39d86bcd` (reusable worker `ci-worker-dovm`,
-shared `build.lock`, job-local Python venv, `CI=1`):
+Linux host checks on exact source head `39d86bcd` and again on final head
+`1b85f18c` (reusable worker `ci-worker-dovm`, shared `build.lock`, job-local
+Python venv, `CI=1`):
 
 | Job | Suites | Result |
 | --- | --- | --- |
 | `access-shell-folder-check-20261022a` | `cargo check -p filament-cli --bin tunlion` | pass |
-| `access-shell-folder-final-unit-39d86bcd` | CLI `access_ui` 7, `temporary_session` 5, `folder_access::protocol_tests` 3, platform capability 1; peerloop `access` 15, `mount_proto` 36, `download_output` 5, `access_session` 7 | 79 passed, 0 failed |
-| `access-shell-folder-e2e-20261022d` (88eee3f0) and `access-shell-folder-e2e-72d64255` | `pty_flows` temporary cells incl. real folder browse/binary+empty read/download/no-clobber/symlink escape/End | 7/7 pass, 59.15s |
+| `access-shell-folder-final-unit-39d86bcd`, `access-shell-folder-final-1b85f18c` | CLI `access_ui` 7, `temporary_session` 5, `folder_access::protocol_tests` 3, platform capability 1; peerloop `access` 15, `mount_proto` 36, `download_output` 5, `access_session` 7 | 79 passed, 0 failed |
+| `access-shell-folder-e2e-20261022d` (88eee3f0) and `access-shell-folder-e2e-72d64255` (tree identical to `39d86bcd`) | `pty_flows` temporary cells incl. real folder browse/binary+empty read/download/no-clobber/symlink escape/End | 7/7 pass, 59.15s |
 | `access-shell-folder-regress-20261022g` | live shell removal by signed narrowing; End during revised review | 2/2 pass |
 | `access-shell-folder-feat-20261022f` | peerloop reduced/default; CLI without `pty-server`; CLI without `exec-server` | 4/4 pass |
 
 Windows validation used the coordinated leased `windows-devloop` (not
-`test.yml`) on run `39875620887`, CI head `761b038a` (code tree `39d86bcd` plus
-`.devloop/cmd.txt` only), `DEVRESULT ok code=0 secs=338`:
+`test.yml`) on runs `39875620887` (CI head `761b038a`, code tree `39d86bcd` plus
+`.devloop/cmd.txt` only, `DEVRESULT ok code=0 secs=338`) and `39879582114`
+(exact final head `7b48beac` = `1b85f18c` plus `.devloop/cmd.txt`,
+`DEVRESULT ok code=0 secs=365`):
 
 - CLI `tunlion` and `filament-peerloop` Windows compile pass.
 - `mount_proto` 45, `access` 12 (including `windows_folders` junction-root,
