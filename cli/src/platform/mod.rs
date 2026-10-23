@@ -73,7 +73,7 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -180,10 +180,18 @@ fn unix_read_beneath(root: &Path, relative: &Path) -> Result<Option<Vec<u8>>> {
         let last = i + 1 == components.len();
         let c_name = CString::new(name.as_bytes())
             .map_err(|_| anyhow::anyhow!("{} contains a NUL byte", name.to_string_lossy()))?;
+        // O_NONBLOCK on the FINAL component is load-bearing: opening a FIFO
+        // read-only otherwise waits for a writer, so `addr`/`up`/`join` hang
+        // instead of reporting "not a regular file". The fstat below rejects
+        // it; a regular file is unaffected.
         let flags = libc::O_RDONLY
             | libc::O_CLOEXEC
             | libc::O_NOFOLLOW
-            | if last { 0 } else { libc::O_DIRECTORY };
+            | if last {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
         let fd = unsafe { libc::openat(dirs.last().unwrap().as_raw_fd(), c_name.as_ptr(), flags) };
         if fd < 0 {
             let e = std::io::Error::last_os_error();
@@ -4375,6 +4383,36 @@ mod nofollow_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_no_follow_rejects_a_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = temp("fifo");
+        let fifo = root.join("devices.json");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = mpsc::channel();
+        let thread_root = root.clone();
+        std::thread::spawn(move || {
+            let result = read_regular_nofollow_beneath(&thread_root, Path::new("devices.json"))
+                .map(|value| value.map(|bytes| bytes.len()));
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Err(e)) => {
+                assert!(e.to_string().contains("not a regular file"), "{e}");
+            }
+            Ok(Ok(value)) => panic!("a FIFO was read as a regular file: {value:?}"),
+            Err(_) => panic!("opening a FIFO blocked; O_NONBLOCK is missing"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

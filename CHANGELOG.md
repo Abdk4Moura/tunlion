@@ -46,7 +46,9 @@ the GitHub release notes.
   expired journal cannot report a successful join. The owner key and overlay
   key are read through the same no-follow handle, every component below the
   config root is walked with `openat`+`O_NOFOLLOW` on Unix (a symlinked
-  `identity/` cannot redirect the certificate read), and an owner key is only
+  `identity/` cannot redirect the certificate read; the final open is
+  `O_NONBLOCK` so a FIFO is reported as "not a regular file" instead of
+  blocking `addr`/`up`/`join`), and an owner key is only
   treated as this certificate's owner when its public key matches the
   certificate's `userPub`. A valid owner key for a different user no longer
   turns a joined certificate into an owner device. `reset` also removes the journal and the `devices.json.bak` a
