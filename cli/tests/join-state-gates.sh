@@ -349,10 +349,36 @@ for shape in '[]|no owner record' '[1]|non-object record' '[{}]|without a name' 
     J12_BAD=1
   fi
 done
+
+# Symlinks are refused rather than followed, for each file the readout opens.
+cp "$DG/devices.json" "$DSHAPE/real-store.json"
+rm -f "$DSHAPE/devices.json"
+ln -s real-store.json "$DSHAPE/devices.json"
+timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12s.out" 2>"$WORK/j12s.err"
+if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12s.out" "$WORK/j12s.err"; then
+  echo "devices.json symlink was followed"; cat "$WORK/j12s.out" "$WORK/j12s.err"; J12_BAD=1
+fi
+rm -f "$DSHAPE/devices.json"; cp "$DG/devices.json" "$DSHAPE/devices.json"
+
+mv "$DSHAPE/identity/device-cert.json" "$DSHAPE/real-cert.json"
+ln -s ../real-cert.json "$DSHAPE/identity/device-cert.json"
+timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12s.out" 2>"$WORK/j12s.err"
+if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12s.out" "$WORK/j12s.err"; then
+  echo "device-cert.json symlink was followed"; cat "$WORK/j12s.out" "$WORK/j12s.err"; J12_BAD=1
+fi
+rm -f "$DSHAPE/identity/device-cert.json"; mv "$DSHAPE/real-cert.json" "$DSHAPE/identity/device-cert.json"
+
+ln -s /dev/null "$DSHAPE/join.pending.json"
+timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12s.out" 2>"$WORK/j12s.err"
+if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12s.out" "$WORK/j12s.err"; then
+  echo "join.pending.json symlink was followed"; cat "$WORK/j12s.out" "$WORK/j12s.err"; J12_BAD=1
+fi
+rm -f "$DSHAPE/join.pending.json"
+
 if [ "$J12_BAD" = 0 ]; then
-  ok "J12: empty, scalar, nameless and unparseable joined stores are all refused"
+  ok "J12: malformed records and symlinked store/cert/journal are all refused"
 else
-  bad "J12: a joined store with no owner record was accepted"
+  bad "J12: a malformed or symlinked join state was accepted"
 fi
 
 say "J7: reset removes the half-join journal and backup"

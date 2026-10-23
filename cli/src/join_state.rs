@@ -1036,41 +1036,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_symlinked_store_or_certificate_is_refused() {
-        let root = temp("symlink");
-        write_overlay(&root);
-        let overlay = JoinState::at(&root).overlay_pub().unwrap();
-        let cert = cert_for(3, overlay, 3600);
-        let cert_path = root.join("identity/device-cert.json");
-        crate::platform::SecretFile::write_str(
-            &cert_path,
-            &json!({"name": "joined", "cert": cert.to_json()}).to_string(),
-        )
-        .unwrap();
-        let real_store = root.join("real-devices.json");
-        write_store(&root, json!([]));
-        std::fs::rename(root.join(DEVICES_FILE), &real_store).unwrap();
-        std::os::unix::fs::symlink(&real_store, root.join(DEVICES_FILE)).unwrap();
-        let err = JoinState::at(&root)
-            .check_complete_join()
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlink"), "{err}");
-
-        std::fs::remove_file(root.join(DEVICES_FILE)).unwrap();
-        let real_cert = root.join("real-cert.json");
-        std::fs::rename(&cert_path, &real_cert).unwrap();
-        std::os::unix::fs::symlink(&real_cert, &cert_path).unwrap();
-        let err = JoinState::at(&root)
-            .check_key_binding()
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlink"), "{err}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     #[test]
     fn resuming_an_expired_or_bad_signature_journal_is_refused() {
         let root = temp("resume-invalid");
