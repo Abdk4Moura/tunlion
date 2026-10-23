@@ -1,1 +1,1 @@
-cargo test -p tunlion-core --lib --locked && cargo test -p filament-peerloop --lib --locked && cargo check -p tunlion-core --all-targets --locked
+cargo check -p filament-cli --all-targets --locked && cargo test -p filament-cli --bin tunlion win_pty::tests --locked && cargo build -p filament-cli --bin tunlion --locked && powershell -NoProfile -ExecutionPolicy Bypass -File .devloop\win-startup-smoke.ps1
