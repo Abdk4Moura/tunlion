@@ -1,0 +1,62 @@
+name: windows-standard-installer
+
+on:
+  push:
+    branches: [win-test-installer]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout installer packaging
+        uses: actions/checkout@v4
+      - name: Checkout combined source
+        uses: actions/checkout@v4
+        with:
+          ref: integration/windows-combined
+          path: src
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build combined binary
+        shell: pwsh
+        working-directory: src
+        run: cargo build --locked --release -p filament-cli --bin tunlion
+      - name: Fetch and verify wintun
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expected = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          if ((Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower() -ne $expected) { throw "wintun checksum mismatch" }
+          Expand-Archive -Path wintun.zip -DestinationPath wintun-extract
+          $dll = "wintun-extract/wintun/bin/amd64/wintun.dll"
+          $sig = Get-AuthenticodeSignature $dll
+          if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "WireGuard LLC") { throw "wintun signature invalid" }
+          Copy-Item $dll "packaging/windows-standard/wintun.dll" -Force
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Stage files
+        shell: pwsh
+        run: |
+          $stage = "packaging/windows-standard/stage"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item src/target/release/tunlion.exe "$stage/tunlion.exe" -Force
+          Copy-Item packaging/windows-standard/wintun.dll "$stage/wintun.dll" -Force
+          Copy-Item packaging/windows/tl.cmd "$stage/tl.cmd" -Force
+      - name: Package
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          & $iscc.Source "packaging/windows-standard/tunlion.iss"
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: TunlionSetup
+          path: packaging/windows-standard/Output/TunlionSetup.exe
