@@ -32,6 +32,23 @@ pub struct Paths;
 /// fail-closed equivalent of `O_NOFOLLOW`.
 pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
+    // Message-level precheck only. The authoritative check is the fstat on the
+    // no-follow handle below; this makes a directory/symlink report its real
+    // shape on Windows, where opening a directory fails as "access denied".
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!("{} is a symlink; refusing to follow it", path.display())
+        }
+        Ok(meta) if !meta.file_type().is_file() => {
+            anyhow::bail!(
+                "{} is not a regular file; refusing to read it",
+                path.display()
+            )
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
