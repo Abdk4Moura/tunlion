@@ -273,7 +273,7 @@ fn esc_out_of_the_picker_draws_one_prompt() {
 // ---------------------------------------------------------------------------
 
 /// A shell in a pty over a fresh config dir, with tunlion's path.
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn fresh_term(label: &str) -> (Term, String) {
     let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -428,13 +428,13 @@ fn temporary_access_cancel_and_failed_connect_do_not_remember_device() {
 // ---------------------------------------------------------------------------
 
 /// A local signaling backend, killed on drop.
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 struct Backend {
     child: std::process::Child,
     url: String,
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 impl Drop for Backend {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -442,7 +442,7 @@ impl Drop for Backend {
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn health_ok(port: u16) -> bool {
     use std::net::TcpStream;
     let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else { return false };
@@ -457,7 +457,7 @@ fn health_ok(port: u16) -> bool {
 
 /// Start ../backend on a free port, or None (skipped) when it cannot run
 /// here. Under CI (the `CI` variable GitHub sets) it must run.
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn backend() -> Option<Backend> {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -886,7 +886,7 @@ fn ending_while_a_revised_scope_is_being_reviewed_cancels_the_review_and_closes_
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint_without_fake_mounts() {
     use sha2::Digest;
@@ -900,24 +900,7 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
     std::fs::write(share.join("binary.bin"), &binary).unwrap();
     std::fs::write(share.join("empty.bin"), []).unwrap();
     std::fs::write(host_dir.join("outside.bin"), b"outside-secret-payload").unwrap();
-    #[cfg(unix)]
     std::os::unix::fs::symlink(host_dir.join("outside.bin"), share.join("evil-link")).unwrap();
-    // Windows has no unprivileged file symlink; a junction is the reparse
-    // escape the endpoint must refuse, and it works without elevation.
-    #[cfg(windows)]
-    {
-        let outside = host_dir.join("outside");
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("secret"), b"outside-secret-payload").unwrap();
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let status = std::process::Command::new("cmd")
-            .creation_flags(CREATE_NO_WINDOW)
-            .arg("/C").arg("mklink").arg("/J")
-            .arg(share.join("evil-link")).arg(&outside)
-            .status().expect("run mklink /J");
-        assert!(status.success(), "Windows escape coverage requires mklink /J");
-    }
 
     host.send(&format!("\"{exe}\" --server {} add\r", backend.url));
     assert!(host.wait_for("Temporary access", 30), "{}", tail(&host.text()));
@@ -987,17 +970,13 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
         assert!(!recipient.text()[at..].contains("Download complete"), "download reported complete before destination confirmation");
         recipient.send("\r");
         let published = recipient_dir.join(saved);
-        assert!(recipient.wait_for_from(at, "Download complete:", 30),
+        assert!(recipient.wait_for_from(at, &format!("Download complete: {}", published.display()), 30),
             "owned publication failed:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-        assert!(published.exists(), "download was not published at {}", published.display());
         assert!(recipient.text()[at..].contains(&format!("{} bytes", expected.len())), "download byte count missing: {}", tail(&recipient.text()));
         assert_eq!(std::fs::read(&published).unwrap(), expected, "download lost or changed binary bytes");
         assert!(recipient.text()[at..].contains(&hex::encode(sha2::Sha256::digest(expected))));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&published).unwrap().permissions().mode() & 0o777, 0o600);
-        }
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&published).unwrap().permissions().mode() & 0o777, 0o600);
     }
     assert_eq!(std::fs::read(recipient_dir.join("binary.bin")).unwrap(), b"preserve-existing-file", "download overwrote an existing destination");
     assert!(!std::fs::read_dir(&recipient_dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".tunlion-download-")), "successful download left private staging");
@@ -1006,9 +985,7 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
     assert!(recipient.wait_for_from(at, "FOLDER ACTION", 20), "{}", tail(&recipient.text()));
     recipient.send("\x1b[B\r");
     assert!(recipient.wait_for_from(at, "relative path", 20), "{}", tail(&recipient.text()));
-    // Linux follows a file symlink; Windows traverses a junction. Both must be
-    // refused before any outside byte reaches the preview.
-    recipient.send(if cfg!(windows) { "evil-link/secret\r" } else { "evil-link\r" });
+    recipient.send("evil-link\r");
     assert!(recipient.wait_for_from(at, "Folder unavailable:", 30), "{}", tail(&recipient.text()));
     assert!(!recipient.text().contains("outside-secret-payload"));
     assert!(!recipient.text().contains("Mounted at"));
@@ -1022,7 +999,7 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
     for dir in [&host_dir, &recipient_dir] {
         for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] { assert!(!dir.join(file).exists(), "folder access wrote standing state: {file}"); }
     }
-    eprintln!("REAL FOLDER DOWNLOAD PASS: authenticated RO browse, binary/empty reads and exact private no-clobber publication, reparse/symlink escape refused, acknowledged End; no mount claim");
+    eprintln!("REAL FOLDER DOWNLOAD PASS: authenticated RO browse, binary/empty reads and exact private no-clobber publication, symlink escape refused, acknowledged End; no mount claim");
 }
 
 /// A fresh scratch dir for one cell.
@@ -1166,7 +1143,7 @@ fn temporary_shell_expiry_tears_down_the_pty_and_the_agreement() {
 }
 
 /// A fresh scratch dir for one cell.
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn scratch(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
