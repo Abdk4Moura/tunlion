@@ -19,6 +19,6 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 webpki-roots = "0.26.11"
 
 [dev-dependencies]
-rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
 # Server-side local websocket fixtures only; production stays connect-only.
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
