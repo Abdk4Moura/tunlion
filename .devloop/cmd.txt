@@ -1,1 +1,1 @@
-cargo test -p tunlion-core --lib --locked && cargo test -p filament-peerloop --lib --locked && cargo check -p tunlion-core --all-targets --locked
+powershell -NoProfile -ExecutionPolicy Bypass -File .devloop\request-regression.ps1
