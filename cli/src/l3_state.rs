@@ -18,6 +18,8 @@ use filament_peerloop::mesh::L3Status;
 /// How long a `ready` file record stays trustworthy without a refresh. The
 /// daemon rewrites it about once a second while its endpoint is live.
 const READY_MAX_AGE_SECS: u64 = 6;
+/// Future timestamps beyond this are treated as stale, not as "age zero".
+const CLOCK_SKEW_SECS: u64 = 2;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -88,9 +90,17 @@ pub fn read_file_for(daemon: Option<u32>) -> Value {
     }
     let state = v["state"].as_str().unwrap_or("down");
     if state == "ready" {
-        let fresh = v["updatedAt"]
-            .as_u64()
-            .is_some_and(|at| now_secs().saturating_sub(at) <= READY_MAX_AGE_SECS);
+        let now = now_secs();
+        // checked_sub: a FUTURE timestamp is not a fresh one. Saturating
+        // subtraction made now+3600 look like age 0 and trusted stale ready
+        // forever. Allow only a tiny clock-skew tolerance.
+        let fresh = match v["updatedAt"].as_u64() {
+            Some(at) => match now.checked_sub(at) {
+                Some(age) => age <= READY_MAX_AGE_SECS,
+                None => at.saturating_sub(now) <= CLOCK_SKEW_SECS,
+            },
+            None => false,
+        };
         if !fresh {
             return serde_json::to_value(L3Status::down(
                 "none",
@@ -163,6 +173,35 @@ mod tests {
         let down = serde_json::to_value(L3Status::down("none", "boom")).unwrap();
         assert_eq!(down["reason"], "boom");
         assert!(not_ready_note(&down).unwrap().contains("boom"));
+    }
+
+    /// A future updatedAt must not defeat the freshness check.
+    #[test]
+    fn a_future_updated_at_is_stale_ready() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-l3-future-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let pid = std::process::id();
+        let now = now_secs();
+        let future = json!({
+            "pid": pid,
+            "state": "ready",
+            "mode": "userspace",
+            "updatedAt": now + 3600,
+        });
+        std::fs::write(state_path(), future.to_string()).unwrap();
+        let v = read_file_for(Some(pid));
+        assert_eq!(v["state"], "down", "future ready must read as down: {v}");
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A matching PID never makes a stale `ready` record live. The daemon must

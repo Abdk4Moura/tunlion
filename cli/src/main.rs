@@ -1507,6 +1507,9 @@ fn down_cmd() -> Result<()> {
             // Taken BEFORE signalling, so the wait below can tell this daemon
             // from an unrelated process that later reuses its pid.
             let exe = platform::process_exe_path(pid);
+            // Capture the process incarnation BEFORE signalling: a pid that is
+            // reused by another tunlion must never be force-terminated.
+            let start = platform::process_start_token(pid);
             daemon_stop::mark_down(pid);
             // #191: a managed service restarts a killed process. systemd's
             // Restart=always reacts to an UNEXPECTED exit; a manual
@@ -1531,7 +1534,7 @@ fn down_cmd() -> Result<()> {
             // busy one may take a moment; "stopped" used to be printed 6 ms
             // after the signal while the process lived on, holding the lock the
             // next `up` then lost to. Wait (bounded), resume, then kill.
-            let how = daemon_stop::await_exit(pid, exe.as_deref())?;
+            let how = daemon_stop::await_exit(pid, exe.as_deref(), start.as_deref())?;
             let _ = std::fs::remove_file(pidfile());
             ui::say(&format!(
                 "  {} stopped (pid {pid}){}",

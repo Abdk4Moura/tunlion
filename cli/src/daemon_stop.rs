@@ -66,9 +66,18 @@ impl Stopped {
 /// cannot be read, and treating that as "gone" would print "stopped" over a
 /// live daemon, the exact false success this module exists to remove. The
 /// executable is compared only when both sides can be read.
-fn still_ours(pid: u32, exe: Option<&Path>) -> bool {
+fn still_ours(pid: u32, exe: Option<&Path>, start: Option<&str>) -> bool {
     if !platform::process_exists(pid) {
         return false;
+    }
+    // A pid is not an identity. When we recorded the process start token, a
+    // different incarnation that reused the pid is NOT ours (and must never be
+    // force-terminated).
+    if let Some(want) = start {
+        match platform::process_start_token(pid) {
+            Some(live) if live == want => {}
+            _ => return false,
+        }
     }
     match (platform::process_exe_path(pid), exe) {
         (Some(live), Some(exe)) => crate::same_executable(&live, exe),
@@ -76,10 +85,10 @@ fn still_ours(pid: u32, exe: Option<&Path>) -> bool {
     }
 }
 
-fn wait_gone(pid: u32, exe: Option<&Path>, within: Duration) -> bool {
+fn wait_gone(pid: u32, exe: Option<&Path>, start: Option<&str>, within: Duration) -> bool {
     let until = Instant::now() + within;
     loop {
-        if !still_ours(pid, exe) {
+        if !still_ours(pid, exe, start) {
             return true;
         }
         if Instant::now() >= until {
@@ -92,21 +101,21 @@ fn wait_gone(pid: u32, exe: Option<&Path>, within: Duration) -> bool {
 /// After SIGTERM (or a service-manager stop) went to `pid`: make sure it exits,
 /// and only return Ok once it has. Resumes it first if it is stopped, kills it
 /// after [`TERM_GRACE`], and errors if even SIGKILL does not end it.
-pub(crate) fn await_exit(pid: u32, exe: Option<&Path>) -> Result<Stopped> {
+pub(crate) fn await_exit(pid: u32, exe: Option<&Path>, start: Option<&str>) -> Result<Stopped> {
     let was_stopped = platform::process_stopped(pid) == Some(true);
     // Always resume: a stopped process cannot act on the SIGTERM it was sent,
     // and SIGCONT to a running one is harmless. Platforms that cannot tell us
     // whether it was stopped still get it resumed.
     let _ = platform::escalate(pid, Escalate::Continue);
     let politely = if was_stopped { Stopped::Resumed } else { Stopped::Asked };
-    if wait_gone(pid, exe, TERM_GRACE) {
+    if wait_gone(pid, exe, start, TERM_GRACE) {
         return Ok(politely);
     }
     // Forced termination only if this is STILL the exact daemon we recorded:
     // never kill a stranger that reused the pid.
-    if still_ours(pid, exe) {
+    if still_ours(pid, exe, start) {
         if let Err(e) = platform::escalate(pid, Escalate::Kill) {
-            if still_ours(pid, exe) {
+            if still_ours(pid, exe, start) {
                 bail!(
                     "the daemon (pid {pid}) did not exit within {}s, and force-termination failed ({e}); it is still running. The pidfile is kept.",
                     TERM_GRACE.as_secs()
@@ -114,7 +123,7 @@ pub(crate) fn await_exit(pid: u32, exe: Option<&Path>) -> Result<Stopped> {
             }
         }
     }
-    if wait_gone(pid, exe, KILL_GRACE) {
+    if wait_gone(pid, exe, start, KILL_GRACE) {
         return Ok(Stopped::Killed);
     }
     bail!(
@@ -154,9 +163,21 @@ pub(crate) fn stop_requested() -> bool {
 }
 
 /// Remove a stop request left by a previous incarnation, before this daemon
-/// starts serving. Called once at startup.
+/// starts serving. A request for THIS pid AND this process start token is kept:
+/// `down` can legitimately arrive between the pidfile appearing and the loop
+/// reading requests, and clearing it would turn a clean stop into a timeout
+/// kill.
 pub(crate) fn clear_stop_request() {
-    let _ = std::fs::remove_file(platform::daemon_stop_request_path());
+    let path = platform::daemon_stop_request_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else { return };
+    let mut lines = raw.lines();
+    let pid = lines.next().and_then(|s| s.trim().parse::<u32>().ok());
+    let token = lines.next().map(|s| s.trim().to_string());
+    let my_pid = std::process::id();
+    if pid == Some(my_pid) && token == platform::process_start_token(my_pid) {
+        return; // a legitimate request for this incarnation
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 fn marker_path() -> PathBuf {
@@ -215,7 +236,7 @@ pub(crate) fn classify(
 /// winner that has just taken the lock to record itself.
 pub(crate) fn lock_holder(lock_path: &Path) -> Holder {
     let exe = std::env::current_exe().ok();
-    let ours = |pid: u32| still_ours(pid, exe.as_deref());
+    let ours = |pid: u32| still_ours(pid, exe.as_deref(), None);
     let stopped = |pid: u32| platform::process_stopped(pid) == Some(true);
     let mut last = Holder::Unknown;
     for _ in 0..20 {
@@ -236,7 +257,7 @@ pub(crate) fn lock_holder(lock_path: &Path) -> Holder {
 pub(crate) fn orphaned_lock_holder() -> Option<u32> {
     let lock_path = platform::Paths::config_path("up.lock");
     let exe = std::env::current_exe().ok();
-    holder_pid(&lock_path).filter(|p| still_ours(*p, exe.as_deref()))
+    holder_pid(&lock_path).filter(|p| still_ours(*p, exe.as_deref(), None))
 }
 
 /// The pid holding the election lock at `lock_path`, read without taking it.
@@ -359,11 +380,51 @@ mod tests {
         assert!(!stop_requested(), "another pid is not ours");
     }
 
+    /// The forced path must require the recorded process incarnation, not only
+    /// the executable path: a recycled pid running the same tunlion binary is
+    /// a different process.
+    #[test]
+    fn a_reused_pid_is_not_ours_even_with_the_same_executable() {
+        let pid = std::process::id();
+        if let Some(token) = platform::process_start_token(pid) {
+            assert!(still_ours(pid, None, Some(&token)), "this incarnation is ours");
+            assert!(
+                !still_ours(pid, None, Some("0")),
+                "same pid, different start token must never be ours"
+            );
+        }
+    }
+
+    /// A `down` that lands in the startup window is legitimate: clearing must
+    /// keep a request for this pid AND this start token, and drop only a stale
+    /// one.
+    #[test]
+    fn startup_clear_keeps_a_request_for_this_incarnation() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-stop-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let _restore = ConfigDir(previous, dir);
+
+        let path = platform::daemon_stop_request_path();
+        let my_pid = std::process::id();
+        let token = platform::process_start_token(my_pid).unwrap_or_default();
+        std::fs::write(&path, format!("{my_pid}\n{token}\n")).unwrap();
+        clear_stop_request();
+        assert!(path.exists(), "startup must not drop a valid down request");
+
+        std::fs::write(&path, format!("{my_pid}\n{token}-old\n")).unwrap();
+        clear_stop_request();
+        assert!(!path.exists(), "a previous incarnation's request is stale");
+    }
+
     /// A pid with no process behind it is gone, whatever executable we expected.
     #[test]
     fn a_dead_pid_is_not_ours() {
         // pid_max on Linux is at most 2^22; this one cannot exist.
-        assert!(!still_ours(u32::MAX - 1, None));
-        assert!(wait_gone(u32::MAX - 1, None, Duration::from_millis(1)));
+        assert!(!still_ours(u32::MAX - 1, None, None));
+        assert!(wait_gone(u32::MAX - 1, None, None, Duration::from_millis(1)));
     }
 }
