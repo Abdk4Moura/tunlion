@@ -18,7 +18,7 @@ jobs:
       - name: Checkout combined source
         uses: actions/checkout@v4
         with:
-          ref: integration/windows-combined
+          ref: d7d62d379035edaaf5c54ef712bf5e905b7bd87c
           path: src
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -50,12 +50,18 @@ jobs:
           Copy-Item packaging/windows-standard/wintun.dll "$stage/wintun.dll" -Force
           Copy-Item packaging/windows/tl.cmd "$stage/tl.cmd" -Force
           Copy-Item packaging/windows-standard/preflight.ps1 "$stage/preflight.ps1" -Force
+      - name: Preserve packaging inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tunlion-packaging-inputs
+          path: packaging/windows-standard/stage/
       - name: Package
         shell: pwsh
         run: |
-          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
           if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
-          & $iscc.Source "packaging/windows-standard/tunlion.iss"
+          & $iscc "packaging/windows-standard/tunlion.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:

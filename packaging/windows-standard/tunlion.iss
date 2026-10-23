@@ -6,7 +6,7 @@ AppId={{B8F4E4C2-9D6A-4B1E-8C7F-6D3A2E1B9C40}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
-DefaultDirName={userprofile}\bin
+DefaultDirName={%USERPROFILE}\bin
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -35,14 +35,17 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; Value
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code: Integer;
-  PidText: String;
+  PidText: AnsiString;
 begin
   NeedsRestart := False;
   ExtractTemporaryFile('preflight.ps1');
-  Exec('powershell.exe', '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\preflight.ps1') + '" -Out "' + ExpandConstant('{tmp}\tunlion-pids.txt') + '"', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  if not Exec('powershell.exe', '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\preflight.ps1') + '" -Out "' + ExpandConstant('{tmp}\tunlion-pids.txt') + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) then begin
+    Result := 'Cannot check running Tunlion processes. Installation stopped; no files were replaced.';
+    exit;
+  end;
   if Code <> 0 then begin
     if LoadStringFromFile(ExpandConstant('{tmp}\tunlion-pids.txt'), PidText) then
-      Result := PidText
+      Result := Utf8Decode(PidText)
     else
       Result := 'Cannot replace tunlion.exe: it is still running. Stop every Tunlion config with tunlion down --yes, then rerun.';
   end else

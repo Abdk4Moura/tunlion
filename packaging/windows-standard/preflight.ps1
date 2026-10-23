@@ -1,5 +1,10 @@
 param([string]$Out)
-$procs = @(Get-CimInstance Win32_Process -Filter "Name='tunlion.exe'" -ErrorAction SilentlyContinue)
+try {
+  $procs = @(Get-CimInstance Win32_Process -Filter "Name='tunlion.exe'" -ErrorAction Stop)
+} catch {
+  Set-Content -LiteralPath $Out -Value "Cannot check running Tunlion processes. Installation stopped; no files were replaced." -Encoding UTF8
+  exit 2
+}
 $lines = New-Object System.Collections.Generic.List[string]
 if ($procs.Count -gt 0) {
   $pids = ($procs | ForEach-Object { $_.ProcessId }) -join ', '
