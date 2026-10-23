@@ -161,7 +161,9 @@ jobs:
           # let install/uninstall touch them.
           $cfg = Join-Path $env:APPDATA 'tunlion'
           New-Item -ItemType Directory -Force $cfg | Out-Null
-          $sentinelConfig = Join-Path $cfg 'config'
+          # `config` is a DIRECTORY in the CLI's layout; put the sentinel inside.
+          New-Item -ItemType Directory -Force (Join-Path $cfg 'config') | Out-Null
+          $sentinelConfig = Join-Path $cfg 'config\sentinel-settings'
           $sentinelIdentity = Join-Path $cfg 'identity.ed25519'
           Set-Content -Path $sentinelConfig -Value 'sentinel-config-must-survive' -NoNewline
           Set-Content -Path $sentinelIdentity -Value 'sentinel-identity-must-survive' -NoNewline
@@ -192,9 +194,27 @@ jobs:
 
             $after = [Environment]::GetEnvironmentVariable('Path', 'User')
             $entries = @($after -split ';' | Where-Object { $_ -ne '' })
-            $matches = @($entries | Where-Object { $_ -eq $installDir })
-            if ($matches.Count -ne 1) { throw "install dir appears $($matches.Count) times in user Path" }
+            $hits = @($entries | Where-Object { $_ -eq $installDir })
+            if ($hits.Count -ne 1) { throw "install dir appears $($hits.Count) times in user Path" }
             if (-not (Test-Path $shortcut)) { throw 'Start Menu shortcut missing' }
+
+            # The installed release binary must draw its interactive entry point
+            # without the old 1 MB startup-stack overflow. Use a hermetic empty
+            # config dir so the sentinels above are not parsed as an identity.
+            $menuCfg = Join-Path $env:RUNNER_TEMP 'tunlion-menu-cfg'
+            New-Item -ItemType Directory -Force $menuCfg | Out-Null
+            $oldCfg = $env:TUNLION_CONFIG_DIR
+            $env:TUNLION_CONFIG_DIR = $menuCfg
+            try {
+              $interactive = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
+              Start-Sleep -Seconds 3
+              if ($interactive.HasExited) { throw 'installed tunlion exited before the menu' }
+              Stop-Process -Id $interactive.Id -Force
+            }
+            finally {
+              if ($null -eq $oldCfg) { Remove-Item Env:\TUNLION_CONFIG_DIR -ErrorAction SilentlyContinue }
+              else { $env:TUNLION_CONFIG_DIR = $oldCfg }
+            }
 
             $entry = Get-ItemProperty $uninstallKey | Where-Object { $_.DisplayName -eq 'Tunlion' }
             if (-not $entry) { throw 'no Add/Remove Programs entry named Tunlion' }
