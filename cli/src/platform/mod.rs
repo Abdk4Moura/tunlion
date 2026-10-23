@@ -4421,7 +4421,7 @@ mod nofollow_tests {
         // must not redirect the component walk.
         std::fs::create_dir(root.join("real-identity")).unwrap();
         std::fs::write(root.join("real-identity/device-cert.json"), b"{}").unwrap();
-        let status = std::process::Command::new("cmd")
+        let status = crate::platform::command("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(root.join("identity"))
             .arg(root.join("real-identity"))
