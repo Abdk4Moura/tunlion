@@ -283,6 +283,13 @@ fn fresh_term(label: &str) -> (Term, String) {
     (t, env!("CARGO_BIN_EXE_tunlion").to_string())
 }
 
+/// PowerShell treats a quoted executable path as an expression; it needs the
+/// call operator. Bash accepts the same command without it.
+#[cfg(any(unix, windows))]
+fn invoke(exe: &str) -> String {
+    if cfg!(windows) { format!("& \"{exe}\"") } else { format!("\"{exe}\"") }
+}
+
 /// The guided menu's accept entry takes a CODE and runs the join path. It
 /// used to be "Pair with a code I was given", which ran `add` and minted a
 /// second code from the typed one ("press enter to create comic-otter-NNNN").
@@ -919,7 +926,7 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
         assert!(status.success(), "Windows escape coverage requires mklink /J");
     }
 
-    host.send(&format!("\"{exe}\" --server {} add\r", backend.url));
+    host.send(&format!("{} --server {} add\r", invoke(&exe), backend.url));
     assert!(host.wait_for("Temporary access", 30), "{}", tail(&host.text()));
     host.send("\x1b[B\r");
     assert!(host.wait_for("Folders (0)", 20), "{}", tail(&host.text()));
@@ -940,7 +947,7 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
     let code = screen.split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'))
         .find(|token| token.rsplit_once('-').is_some_and(|(words, number)| words.contains('-') && number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit())))
         .unwrap().to_ascii_lowercase();
-    recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
+    recipient.send(&format!("{} --server {} join {code}\r", invoke(&exe), backend.url));
     assert!(recipient.wait_for("ACCEPT THIS SCOPE?", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(!recipient.text().contains("Folder endpoint ready"));
     recipient.send("\r");
