@@ -6,7 +6,6 @@
 # real ConPTY, and a Windows peerloop compile+test pass.
 
 $ErrorActionPreference = 'Stop'
-$PSNativeCommandUseErrorActionPreference = $true
 $env:CI = '1'
 
 function Step([string]$name, [scriptblock]$body) {
@@ -52,7 +51,22 @@ Step 'shell relay smoke (owner-equivalent)' {
 }
 
 Step 'shell relay smoke (standard / linked-medium plane)' {
-    & .\target\debug\tunlion.exe __win-pty-smoke --mode standard
+    # The hosted Windows runner is elevated and has no linked medium token.
+    # In that state the standard plane MUST refuse; a successful spawn there
+    # would be the privilege bug this plane exists to prevent. Accept exactly
+    # the documented refusal, and require a real relay otherwise.
+    $out = & .\target\debug\tunlion.exe __win-pty-smoke --mode standard 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    Write-Host $out.Trim()
+    if ($code -ne 0) {
+        if ($out -match 'no linked medium token' -and $out -match 'refusing') {
+            Write-Host 'standard plane refused on an elevated runner with no linked token (expected)'
+            $global:LASTEXITCODE = 0
+        }
+        else {
+            throw "standard smoke failed unexpectedly: $out"
+        }
+    }
 }
 
 Step 'cargo check peerloop (Windows all-targets)' {
