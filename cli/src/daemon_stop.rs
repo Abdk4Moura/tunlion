@@ -34,6 +34,10 @@ pub(crate) const TERM_GRACE: Duration = Duration::from_secs(10);
 /// How long to wait for the kernel to reap a SIGKILLed daemon.
 pub(crate) const KILL_GRACE: Duration = Duration::from_secs(3);
 
+/// A stop request nobody consumed is garbage after this long. Bounded so a
+/// down that timed out/force-terminated cannot leave a file forever.
+const STOP_REQUEST_TTL: Duration = Duration::from_secs(300);
+
 /// What `down` had to do beyond asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stopped {
@@ -55,6 +59,15 @@ impl Stopped {
                 "; it did not exit within 10s, so it was force-terminated"
             }
         }
+    }
+}
+
+/// Only claim `Killed` when a force attempt actually happened.
+fn stopped_after(forced: bool, politely: Stopped) -> Stopped {
+    if forced {
+        Stopped::Killed
+    } else {
+        politely
     }
 }
 
@@ -112,6 +125,19 @@ fn identity_of(pid: u32, exe: Option<&Path>, start: Option<&str>) -> Identity {
     classify_identity(exists, start, live_token.as_deref(), exe_matches)
 }
 
+/// Identity for the DESTRUCTIVE path: without a recorded start token, a live
+/// same-pid process is never assumed to be ours (Unknown), even if the
+/// executable matches. Non-destructive lock-holder checks keep exe-only
+/// semantics via [`still_ours`].
+fn identity_for_exit(pid: u32, exe: Option<&Path>, start: Option<&str>) -> Identity {
+    let id = identity_of(pid, exe, start);
+    if start.is_none() && id == Identity::Ours {
+        Identity::Unknown
+    } else {
+        id
+    }
+}
+
 fn still_ours(pid: u32, exe: Option<&Path>, start: Option<&str>) -> bool {
     identity_of(pid, exe, start) == Identity::Ours
 }
@@ -121,12 +147,12 @@ fn still_ours(pid: u32, exe: Option<&Path>, start: Option<&str>) -> bool {
 fn wait_identity(pid: u32, exe: Option<&Path>, start: Option<&str>, within: Duration) -> Identity {
     let until = Instant::now() + within;
     loop {
-        match identity_of(pid, exe, start) {
+        match identity_for_exit(pid, exe, start) {
             Identity::Ours | Identity::Unknown => {}
             other => return other,
         }
         if Instant::now() >= until {
-            return identity_of(pid, exe, start);
+            return identity_for_exit(pid, exe, start);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -155,20 +181,33 @@ pub(crate) fn await_exit(
         }
         Identity::Ours => {}
     }
+    // Without an incarnation token we cannot distinguish a same-pid replacement
+    // from the daemon, so never force-terminate on executable path alone.
+    if start.is_none() {
+        bail!(
+            "the daemon (pid {pid}) did not exit within {}s and this platform cannot provide a process start token, so force-termination cannot be made safe. The pidfile is kept.",
+            TERM_GRACE.as_secs()
+        );
+    }
     // Forced termination only if this is STILL the exact daemon we recorded.
-    if identity_of(pid, exe, start) == Identity::Ours {
-        if let Err(e) = platform::escalate(pid, Escalate::Kill) {
-            if identity_of(pid, exe, start) == Identity::Ours {
-                bail!(
-                    "the daemon (pid {pid}) did not exit within {}s, and force-termination failed ({e}); it is still running. The pidfile is kept.",
-                    TERM_GRACE.as_secs()
-                );
+    let mut forced = false;
+    if identity_for_exit(pid, exe, start) == Identity::Ours {
+        match platform::escalate(pid, Escalate::Kill) {
+            Ok(()) => forced = true,
+            Err(e) => {
+                if identity_for_exit(pid, exe, start) == Identity::Ours {
+                    bail!(
+                        "the daemon (pid {pid}) did not exit within {}s, and force-termination failed ({e}); it is still running. The pidfile is kept.",
+                        TERM_GRACE.as_secs()
+                    );
+                }
             }
         }
     }
+    let stopped = stopped_after(forced, politely);
     match wait_identity(pid, exe, start, KILL_GRACE) {
-        Identity::Gone => Ok((Stopped::Killed, false)),
-        Identity::Replaced => Ok((Stopped::Killed, true)),
+        Identity::Gone => Ok((stopped, false)),
+        Identity::Replaced => Ok((stopped, true)),
         Identity::Unknown => bail!(
             "the daemon (pid {pid}) is still running but its process start token cannot be read after force-termination. The pidfile is kept."
         ),
@@ -211,6 +250,26 @@ pub(crate) fn pidfile_names_stopped(
     }
 }
 
+/// Atomically remove the pidfile only if it still names the stopped daemon,
+/// serialized against a replacement's `up` by the same instance lock `up` takes
+/// before `write_pidfile`. Returns true only when the file was removed.
+pub(crate) fn remove_pidfile_if_stopped(
+    pidfile: &Path,
+    lock_path: &Path,
+    stopped_pid: u32,
+    stopped_start: Option<&str>,
+) -> bool {
+    // If a replacement already holds the election lock, its pidfile is not ours.
+    let Ok(Some(_lock)) = platform::InstanceLock::try_acquire(lock_path) else {
+        return false;
+    };
+    if pidfile_names_stopped(pidfile, stopped_pid, stopped_start) {
+        std::fs::remove_file(pidfile).is_ok()
+    } else {
+        false
+    }
+}
+
 /// Did this daemon receive a stop request? The request names a PID, so a
 /// marker left by an older process is ignored. Consumed on match: one request
 /// stops one daemon.
@@ -222,8 +281,18 @@ pub(crate) fn stop_requested() -> bool {
     let token = lines.next().map(|s| s.trim().to_string());
     let my_pid = std::process::id();
     if requested != Some(my_pid) {
-        // Another instance's request (or a malformed one) is not ours. Leave a
-        // foreign pid alone; a startup clear handles leftovers.
+        // A request for another pid is garbage here. Remove it when that pid is
+        // dead/malformed, or when the file itself is older than the TTL (a down
+        // that timed out before its daemon consumed it).
+        let dead = requested.map_or(true, |p| !platform::process_exists(p));
+        let stale = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STOP_REQUEST_TTL);
+        if dead || stale {
+            let _ = std::fs::remove_file(&path);
+        }
         return false;
     }
     let mine = platform::process_start_token(my_pid);
@@ -237,6 +306,20 @@ pub(crate) fn stop_requested() -> bool {
     true
 }
 
+
+/// Remove a request written for exactly this daemon incarnation. Called by
+/// `down` after it succeeds or gives up, so a timeout/force-terminate cannot
+/// leave a request behind. Never removes a request for another incarnation.
+pub(crate) fn clear_stop_request_for(pid: u32, token: Option<&str>) {
+    let path = platform::daemon_stop_request_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else { return };
+    let mut lines = raw.lines();
+    let req_pid = lines.next().and_then(|s| s.trim().parse::<u32>().ok());
+    let req_token = lines.next().map(|s| s.trim().to_string());
+    if req_pid == Some(pid) && (token.is_none() || req_token.as_deref() == token) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
 
 fn marker_path() -> PathBuf {
     platform::Paths::config_path("down.marker")
@@ -454,6 +537,27 @@ mod tests {
     }
 
     #[test]
+    fn token_absent_is_not_ours_for_the_destructive_path() {
+        assert_eq!(
+            identity_for_exit(std::process::id(), None, None),
+            Identity::Unknown,
+            "no token => never assume a live same-pid process is ours"
+        );
+        assert_eq!(
+            identity_for_exit(u32::MAX - 1, None, None),
+            Identity::Gone,
+            "a dead pid is still gone"
+        );
+    }
+
+    #[test]
+    fn killed_is_only_claimed_when_a_force_was_attempted() {
+        assert_eq!(stopped_after(false, Stopped::Asked), Stopped::Asked);
+        assert_eq!(stopped_after(false, Stopped::Resumed), Stopped::Resumed);
+        assert_eq!(stopped_after(true, Stopped::Asked), Stopped::Killed);
+    }
+
+    #[test]
     fn identity_distinguishes_gone_replaced_and_unreadable_token() {
         assert_eq!(classify_identity(false, None, None, true), Identity::Gone);
         assert_eq!(
@@ -493,6 +597,56 @@ mod tests {
             assert!(!pidfile_names_stopped(&p, std::process::id(), Some("0")));
             assert!(pidfile_names_stopped(&p, std::process::id(), Some(&t)));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_request_for_a_dead_pid_is_removed() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-stop-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let _restore = ConfigDir(previous, dir);
+
+        let path = platform::daemon_stop_request_path();
+        std::fs::write(&path, format!("{}\n0\n", u32::MAX - 1)).unwrap();
+        assert!(!stop_requested(), "a dead pid's request is not ours");
+        assert!(!path.exists(), "and it is swept away, not left forever");
+    }
+
+    /// A replacement that takes the election lock and writes its own pidfile
+    /// must not have that file removed by the old `down`.
+    #[test]
+    fn a_concurrent_replacement_pidfile_survives_remove() {
+        let dir = std::env::temp_dir().join(format!("tunlion-pidfile-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("up.pid");
+        let lock = dir.join("up.lock");
+
+        // The replacement is starting: it holds the election lock.
+        let replacement = platform::InstanceLock::try_acquire(&lock)
+            .unwrap()
+            .expect("replacement lock");
+        std::fs::write(&pidfile, "777777\n").unwrap();
+        assert!(
+            !remove_pidfile_if_stopped(&pidfile, &lock, 777777, None),
+            "old down must not remove a replacement's pidfile"
+        );
+        assert!(pidfile.exists());
+        drop(replacement);
+
+        // The lock is free and the file still names the stopped daemon: remove.
+        std::fs::write(&pidfile, format!("{}\n", u32::MAX - 1)).unwrap();
+        assert!(remove_pidfile_if_stopped(
+            &pidfile,
+            &lock,
+            u32::MAX - 1,
+            None
+        ));
+        assert!(!pidfile.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1073,7 +1073,22 @@ pub fn process_start_token(pid: u32) -> Option<String> {
             (ok != 0).then(|| creation.to_string())
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        // macOS has no /proc. `ps` asks the kernel for the recorded start time;
+        // second granularity, but still an incarnation differentiator for a
+        // same-pid replacement.
+        let out = command("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows, target_os = "macos")))]
     {
         let _ = pid;
         None
