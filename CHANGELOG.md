@@ -44,8 +44,12 @@ the GitHub release notes.
   address the fleet never certified. Resuming an accepted journal now verifies
   the local and owner certificates before writing them, so a bad-signature or
   expired journal cannot report a successful join. The owner key and overlay
-  key are read through the same no-follow handle, so a symlink cannot make a
-  joined device look like an owner. `reset` also removes the journal and the `devices.json.bak` a
+  key are read through the same no-follow handle, every component below the
+  config root is walked with `openat`+`O_NOFOLLOW` on Unix (a symlinked
+  `identity/` cannot redirect the certificate read), and an owner key is only
+  treated as this certificate's owner when its public key matches the
+  certificate's `userPub`. A valid owner key for a different user no longer
+  turns a joined certificate into an owner device. `reset` also removes the journal and the `devices.json.bak` a
   half-write leaves behind.
 - `addr --json` now reports `displayName` and `meshName` separately (and keeps
   `name`/`mesh` as the mesh label). `--name-as` is documented and printed as a

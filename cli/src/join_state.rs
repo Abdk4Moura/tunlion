@@ -99,7 +99,8 @@ impl JoinState {
     /// absence; a symlink, non-regular file, unreadable or non-UTF8 file is an
     /// error (never "empty").
     fn read_regular_bytes(&self, path: &std::path::Path, what: &str) -> Result<Option<Vec<u8>>> {
-        match crate::platform::read_regular_nofollow(path) {
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        match crate::platform::read_regular_nofollow_beneath(&self.root, relative) {
             Ok(value) => Ok(value),
             Err(e) => Err(anyhow::anyhow!(
                 "{} at {} is not usable ({e}); repair: `tunlion down -y`, then \
@@ -125,22 +126,21 @@ impl JoinState {
         Ok(Some(text))
     }
 
-    /// Is this an owner device? The owner key is read no-follow and parsed, so
-    /// a symlink or corrupt file cannot masquerade as "owner" and skip the
-    /// joined-store checks.
-    fn owner_identity_present(&self) -> Result<bool> {
+    /// This device's owner public key, if it holds one. Read no-follow and
+    /// parsed, so a symlink or corrupt file cannot masquerade as "owner".
+    fn owner_identity_pub(&self) -> Result<Option<[u8; 32]>> {
         let path = self.root.join("identity.ed25519");
         let Some(bytes) = self.read_regular_bytes(&path, "owner identity key")? else {
-            return Ok(false);
+            return Ok(None);
         };
-        crate::identity::UserKey::from_encoded(&bytes).map_err(|e| {
+        let key = crate::identity::UserKey::from_encoded(&bytes).map_err(|e| {
             anyhow::anyhow!(
                 "owner identity key at {} is corrupt ({e}); repair: `tunlion down -y`, \
                  then `tunlion reset -y`, then init or join again",
                 path.display()
             )
         })?;
-        Ok(true)
+        Ok(Some(key.public_key_bytes()))
     }
 
     fn overlay_pub_strict(&self) -> Result<Option<[u8; 32]>> {
@@ -321,7 +321,7 @@ impl JoinState {
         let accepted = pending
             .get("accepted")
             .ok_or_else(|| anyhow::anyhow!("join.pending.json has no accepted acknowledgement"))?;
-        if self.owner_identity_present()? {
+        if self.owner_identity_pub()?.is_some() {
             bail!(
                 "a join journal exists, but this device now holds an OWNER identity. Refusing to                  write a joined certificate over it. Run `tunlion reset -y` if this machine should be                  the joined device instead, then join again with a fresh invitation."
             );
@@ -598,9 +598,11 @@ impl JoinState {
         let Some(cert) = cert else {
             return Ok(());
         };
-        // An owner device legitimately has no paired devices yet. Its local
-        // certificate is still verified above.
-        if self.owner_identity_present()? {
+        // An owner device legitimately has no paired devices yet, but only when
+        // the owner key is the one THIS certificate chains to. A valid owner
+        // key for a DIFFERENT user must not turn a joined certificate into an
+        // owner device and skip the owner-record check.
+        if self.owner_identity_pub()? == Some(cert.user_pub) {
             return Ok(());
         }
         match records {
@@ -752,15 +754,53 @@ mod tests {
     }
 
     #[test]
-    fn owner_device_with_no_devices_json_is_not_a_half_join() {
-        let root = temp("owner");
+    fn an_unrelated_owner_key_does_not_skip_the_owner_record() {
+        let root = temp("unrelated-owner");
         write_overlay(&root);
+        let overlay = JoinState::at(&root).overlay_pub().unwrap();
+        // A valid owner identity for a DIFFERENT user.
         filament_id::UserKey::generate(&filament_peerloop::recv::store::RootKeyStore::new(
             root.clone(),
         ))
         .unwrap();
-        let overlay = JoinState::at(&root).overlay_pub().unwrap();
+        // A joined certificate chaining to user 3, not the generated owner.
         let cert = cert_for(3, overlay, 3600);
+        crate::platform::SecretFile::write_str(
+            &root.join("identity/device-cert.json"),
+            &json!({"name": "joined", "cert": cert.to_json()}).to_string(),
+        )
+        .unwrap();
+        write_store(&root, json!([]));
+        let err = JoinState::at(&root)
+            .check_complete_join()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no owner record"), "{err}");
+
+        // The same joined certificate IS complete once its actual owner record
+        // is present, even though an unrelated owner key is on disk.
+        let owner_cert = cert_for(3, [9u8; 32], 3600);
+        write_store(
+            &root,
+            json!([{
+                "name": "owner",
+                "secret": "11".repeat(32),
+                "deviceCert": owner_cert.to_json()
+            }]),
+        );
+        JoinState::at(&root).check_complete_join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn owner_device_with_no_devices_json_is_not_a_half_join() {
+        let root = temp("owner");
+        write_overlay(&root);
+        let owner = filament_id::UserKey::generate(
+            &filament_peerloop::recv::store::RootKeyStore::new(root.clone()),
+        )
+        .unwrap();
+        let overlay = JoinState::at(&root).overlay_pub().unwrap();
+        let cert = DeviceCert::certify(&owner, overlay, crate::identity::now_secs(), 3600).unwrap();
         crate::platform::SecretFile::write_str(
             &root.join("identity/device-cert.json"),
             &json!({"name": "owner", "cert": cert.to_json()}).to_string(),

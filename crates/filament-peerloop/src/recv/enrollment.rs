@@ -808,6 +808,18 @@ mod tests {
         assert!(
             receipt_from_record(&changed_ceiling, &ak, device_pub, owner.public_key_bytes(), false).is_none()
         );
+        // A different non-null signed offline ceiling is a different enrollment.
+        let mut changed_offline = record.clone();
+        changed_offline["principalMaxOfflineCeiling"] = json!(ak.max_offline + 1);
+        assert!(
+            receipt_from_record(&changed_offline, &ak, device_pub, owner.public_key_bytes(), false).is_none()
+        );
+        // A different signed expiry is a different enrollment.
+        let mut changed_expiry = record.clone();
+        changed_expiry["principalExpires"] = json!(ak.expires + 1);
+        assert!(
+            receipt_from_record(&changed_expiry, &ak, device_pub, owner.public_key_bytes(), false).is_none()
+        );
         // An absent signed offline ceiling is not "any budget".
         let mut no_offline_ceiling = record.clone();
         no_offline_ceiling["principalMaxOfflineCeiling"] = json!(null);

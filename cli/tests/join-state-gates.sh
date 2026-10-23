@@ -382,6 +382,15 @@ if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12s.out" "$WORK/j12s.err"; then
 fi
 rm -f "$DSHAPE/identity/device-cert.json"; mv "$DSHAPE/real-cert.json" "$DSHAPE/identity/device-cert.json"
 
+# A symlinked PARENT directory must not redirect identity/device-cert.json.
+mv "$DSHAPE/identity" "$DSHAPE/real-identity"
+ln -s real-identity "$DSHAPE/identity"
+timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12p.out" 2>"$WORK/j12p.err"
+if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12p.out" "$WORK/j12p.err"; then
+  echo "symlinked identity/ parent was followed"; cat "$WORK/j12p.out" "$WORK/j12p.err"; J12_BAD=1
+fi
+rm -f "$DSHAPE/identity"; mv "$DSHAPE/real-identity" "$DSHAPE/identity"
+
 ln -s /dev/null "$DSHAPE/join.pending.json"
 timeout 15 env TUNLION_CONFIG_DIR="$DSHAPE" "$BIN" addr --json >"$WORK/j12s.out" 2>"$WORK/j12s.err"
 if [ $? = 0 ] || ! grep -q "symlink" "$WORK/j12s.out" "$WORK/j12s.err"; then
@@ -412,7 +421,7 @@ fi
 rm -f "$DSHAPE/overlay.ed25519"
 
 if [ "$J12_BAD" = 0 ]; then
-  ok "J12: malformed records, bad certs and symlinked store/cert/journal/keys are refused"
+  ok "J12: malformed records, bad certs and symlinked files/parents/keys are refused"
 else
   bad "J12: a malformed or symlinked join state was accepted"
 fi

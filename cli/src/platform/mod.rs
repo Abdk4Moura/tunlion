@@ -22,6 +22,23 @@ use filament_peerloop::shell::ShellHost;
 /// custom deployments).
 pub struct Paths;
 
+/// A symlink OR any Windows reparse point (symlink, junction, mount point).
+/// The no-follow path must reject all of them; `is_symlink` alone is not
+/// enough for a directory junction on every Rust version.
+fn metadata_is_link(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return meta.file_type().is_symlink()
+            || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
 /// Read a state file only if it is a regular file, without following a final
 /// symlink. `Ok(None)` means absent.
 ///
@@ -36,7 +53,7 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
     // no-follow handle below; this makes a directory/symlink report its real
     // shape on Windows, where opening a directory fails as "access denied".
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
+        Ok(meta) if metadata_is_link(&meta) => {
             anyhow::bail!("{} is a symlink; refusing to follow it", path.display())
         }
         Ok(meta) if !meta.file_type().is_file() => {
@@ -76,7 +93,7 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
     let meta = file
         .metadata()
         .map_err(|e| anyhow::anyhow!("cannot inspect {}: {e}", path.display()))?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+    if metadata_is_link(&meta) || !meta.file_type().is_file() {
         anyhow::bail!(
             "{} is a symlink or not a regular file; refusing to read it",
             path.display()
@@ -86,6 +103,122 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
     file.read_to_end(&mut bytes)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
     Ok(Some(bytes))
+}
+
+pub(crate) fn read_regular_nofollow_beneath(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        return unix_read_beneath(root, relative);
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Component;
+        let mut current = root.to_path_buf();
+        let components: Vec<_> = relative
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_os_string()),
+                _ => None,
+            })
+            .collect();
+        for (i, name) in components.iter().enumerate() {
+            current.push(name);
+            let last = i + 1 == components.len();
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) if metadata_is_link(&meta) => {
+                    anyhow::bail!("{} is a symlink; refusing to follow it", current.display())
+                }
+                Ok(meta) if !last && !meta.is_dir() => {
+                    anyhow::bail!("{} is not a directory", current.display())
+                }
+                Ok(meta) if last && !meta.is_file() => {
+                    anyhow::bail!("{} is not a regular file", current.display())
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => anyhow::bail!("cannot inspect {}: {e}", current.display()),
+            }
+        }
+        return read_regular_nofollow(&root.join(relative));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, relative);
+        anyhow::bail!("no no-follow reader on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn unix_read_beneath(root: &Path, relative: &Path) -> Result<Option<Vec<u8>>> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::path::Component;
+
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)
+        .map_err(|e| anyhow::anyhow!("cannot open config directory {}: {e}", root.display()))?;
+    let mut dirs = vec![dir];
+    let components: Vec<_> = relative
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    if components.is_empty() {
+        return Ok(None);
+    }
+    for (i, name) in components.iter().enumerate() {
+        let last = i + 1 == components.len();
+        let c_name = CString::new(name.as_bytes())
+            .map_err(|_| anyhow::anyhow!("{} contains a NUL byte", name.to_string_lossy()))?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if last { 0 } else { libc::O_DIRECTORY };
+        let fd = unsafe { libc::openat(dirs.last().unwrap().as_raw_fd(), c_name.as_ptr(), flags) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::ENOENT) => return Ok(None),
+                Some(libc::ELOOP) => anyhow::bail!(
+                    "{} is a symlink; refusing to follow it",
+                    root.join(relative).display()
+                ),
+                Some(libc::ENOTDIR) => {
+                    anyhow::bail!("{} is not a regular file", root.join(relative).display())
+                }
+                _ => anyhow::bail!("cannot open {}: {e}", root.join(relative).display()),
+            }
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let meta = file
+            .metadata()
+            .map_err(|e| anyhow::anyhow!("cannot inspect {}: {e}", name.to_string_lossy()))?;
+        if last {
+            if !meta.file_type().is_file() {
+                anyhow::bail!("{} is not a regular file", root.join(relative).display());
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|e| {
+                anyhow::anyhow!("cannot read {}: {e}", root.join(relative).display())
+            })?;
+            return Ok(Some(bytes));
+        }
+        if !meta.is_dir() {
+            anyhow::bail!("{} is not a directory", name.to_string_lossy());
+        }
+        dirs.push(file);
+    }
+    Ok(None)
 }
 
 /// Resolve a Unix account record through the reentrant password API. `None`
@@ -4181,5 +4314,130 @@ pub async fn l3_state_over_control() -> Option<serde_json::Value> {
     #[cfg(not(unix))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod nofollow_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tunlion-nofollow-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_no_follow_reads_regular_files_and_refuses_links_at_any_component() {
+        let root = temp("unix");
+        std::fs::write(root.join("devices.json"), b"[]").unwrap();
+        assert_eq!(
+            read_regular_nofollow_beneath(&root, Path::new("devices.json"))
+                .unwrap()
+                .unwrap(),
+            b"[]"
+        );
+
+        // Missing is absence, not an error.
+        assert!(
+            read_regular_nofollow_beneath(&root, Path::new("missing.json"))
+                .unwrap()
+                .is_none()
+        );
+
+        // Final-component symlink.
+        std::os::unix::fs::symlink("devices.json", root.join("link.json")).unwrap();
+        let err = read_regular_nofollow_beneath(&root, Path::new("link.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+
+        // Parent-directory symlink: identity/device-cert.json is the real case.
+        std::fs::create_dir(root.join("real-identity")).unwrap();
+        std::fs::write(root.join("real-identity/device-cert.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink("real-identity", root.join("identity")).unwrap();
+        let err = read_regular_nofollow_beneath(&root, Path::new("identity/device-cert.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+
+        // A directory at the final component is not a file.
+        std::fs::create_dir(root.join("dir.json")).unwrap();
+        let err = read_regular_nofollow_beneath(&root, Path::new("dir.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_no_follow_checks_regular_files_reparse_points_and_directories() {
+        let root = temp("windows");
+        std::fs::write(root.join("devices.json"), b"[]").unwrap();
+        assert_eq!(
+            read_regular_nofollow_beneath(&root, Path::new("devices.json"))
+                .unwrap()
+                .unwrap(),
+            b"[]"
+        );
+        assert!(
+            read_regular_nofollow_beneath(&root, Path::new("missing.json"))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::create_dir(root.join("dir.json")).unwrap();
+        let err = read_regular_nofollow_beneath(&root, Path::new("dir.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        // A file symlink needs SeCreateSymbolicLinkPrivilege on many runners.
+        // When it is available, the reparse handle must refuse it; when it is
+        // not, say so instead of silently claiming reparse coverage.
+        match std::os::windows::fs::symlink_file(root.join("devices.json"), root.join("link.json"))
+        {
+            Ok(()) => {
+                let err = read_regular_nofollow_beneath(&root, Path::new("link.json"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("symlink"), "{err}");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "windows: symlink creation needs privilege on this runner; \
+                     junction coverage below is the feasible reparse test"
+                );
+            }
+            Err(e) => panic!("unexpected symlink_file error: {e}"),
+        }
+
+        // Directory junctions do not need that privilege. A parent junction
+        // must not redirect the component walk.
+        std::fs::create_dir(root.join("real-identity")).unwrap();
+        std::fs::write(root.join("real-identity/device-cert.json"), b"{}").unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("identity"))
+            .arg(root.join("real-identity"))
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                let err =
+                    read_regular_nofollow_beneath(&root, Path::new("identity/device-cert.json"))
+                        .unwrap_err()
+                        .to_string();
+                assert!(
+                    err.contains("symlink") || err.contains("not a directory"),
+                    "{err}"
+                );
+            }
+            _ => eprintln!("windows: could not create a junction; parent reparse is untested"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
