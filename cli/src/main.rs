@@ -1524,7 +1524,7 @@ fn down_cmd() -> Result<()> {
                 // daemon running, so keep the pidfile and say why instead of
                 // printing "stopped" over a live process.
                 match crate::platform::request_daemon_stop(pid) {
-                    Ok(nonce) => Some(nonce),
+                    Ok(nonce) => nonce,
                     Err(why) => bail!(
                         "could not stop the daemon (pid {pid}): {why}, so it is still running. \
                          The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
@@ -1556,17 +1556,23 @@ fn down_cmd() -> Result<()> {
                 )
             };
             let extra = if replaced {
-                "; another process now holds that pid, so its pidfile was left untouched"
+                "; another process now holds that pid, so its pidfile was left untouched".to_string()
             } else {
                 match removal {
-                    daemon_stop::PidfileRemoval::LockHeld => {
-                        "; another daemon is starting (election lock held), so the pidfile was left untouched"
+                    daemon_stop::PidfileRemoval::LockBusy => {
+                        "; another daemon process holds the election lock (running or starting), so the pidfile was left untouched".to_string()
                     }
+                    daemon_stop::PidfileRemoval::LockError(e) => format!(
+                        "; the election lock could not be checked ({e}), so the pidfile was left untouched"
+                    ),
                     daemon_stop::PidfileRemoval::NotOurs => {
-                        "; the pidfile no longer names this daemon, so it was left untouched"
+                        "; the pidfile names another daemon/incarnation, so it was left untouched".to_string()
                     }
+                    daemon_stop::PidfileRemoval::RemoveFailed(e) => format!(
+                        "; the pidfile was ours but could not be removed ({e})"
+                    ),
                     daemon_stop::PidfileRemoval::Removed
-                    | daemon_stop::PidfileRemoval::Missing => "",
+                    | daemon_stop::PidfileRemoval::Missing => String::new(),
                 }
             };
             ui::say(&format!(

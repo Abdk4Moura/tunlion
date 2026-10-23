@@ -253,12 +253,46 @@ pub(crate) fn pidfile_names_stopped(
 /// Atomically remove the pidfile only if it still names the stopped daemon,
 /// serialized against a replacement's `up` by the same instance lock `up` takes
 /// before `write_pidfile`. Returns true only when the file was removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PidfileRemoval {
     Removed,
     Missing,
-    LockHeld,
+    /// Another process (a serving daemon or a starting replacement) holds the
+    /// election lock.
+    LockBusy,
+    /// The lock could not even be opened/queried.
+    LockError(String),
+    /// The file names another pid/incarnation.
     NotOurs,
+    /// The file was ours but the unlink failed.
+    RemoveFailed(String),
+}
+
+fn remove_pidfile_with<F>(
+    pidfile: &Path,
+    lock_path: &Path,
+    stopped_pid: u32,
+    stopped_start: Option<&str>,
+    remove: F,
+) -> PidfileRemoval
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    if !pidfile.exists() {
+        return PidfileRemoval::Missing;
+    }
+    match platform::InstanceLock::try_acquire(lock_path) {
+        Ok(Some(_lock)) => {}
+        Ok(None) => return PidfileRemoval::LockBusy,
+        Err(e) => return PidfileRemoval::LockError(e.to_string()),
+    }
+    if !pidfile_names_stopped(pidfile, stopped_pid, stopped_start) {
+        return PidfileRemoval::NotOurs;
+    }
+    match remove(pidfile) {
+        Ok(()) => PidfileRemoval::Removed,
+        Err(e) => PidfileRemoval::RemoveFailed(e.to_string()),
+    }
 }
 
 pub(crate) fn remove_pidfile_if_stopped(
@@ -267,20 +301,9 @@ pub(crate) fn remove_pidfile_if_stopped(
     stopped_pid: u32,
     stopped_start: Option<&str>,
 ) -> PidfileRemoval {
-    if !pidfile.exists() {
-        return PidfileRemoval::Missing;
-    }
-    // If a replacement already holds the election lock, its pidfile is not ours.
-    let Ok(Some(_lock)) = platform::InstanceLock::try_acquire(lock_path) else {
-        return PidfileRemoval::LockHeld;
-    };
-    if pidfile_names_stopped(pidfile, stopped_pid, stopped_start)
-        && std::fs::remove_file(pidfile).is_ok()
-    {
-        PidfileRemoval::Removed
-    } else {
-        PidfileRemoval::NotOurs
-    }
+    remove_pidfile_with(pidfile, lock_path, stopped_pid, stopped_start, |p| {
+        std::fs::remove_file(p)
+    })
 }
 
 /// Did this daemon receive a stop request? Read/decide/remove under the
@@ -665,6 +688,47 @@ mod tests {
     }
 
     #[test]
+    fn pidfile_removal_outcomes_are_distinct_and_truthful() {
+        let dir = std::env::temp_dir().join(format!("tunlion-pidfile-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("up.pid");
+        let lock = dir.join("up.lock");
+        std::fs::write(&pidfile, "4242\n").unwrap();
+
+        // Busy: a live holder keeps the file.
+        let held = platform::InstanceLock::try_acquire(&lock).unwrap().expect("lock");
+        assert_eq!(
+            remove_pidfile_if_stopped(&pidfile, &lock, 4242, None),
+            PidfileRemoval::LockBusy
+        );
+        drop(held);
+
+        // Not ours: free lock, different pid.
+        assert_eq!(
+            remove_pidfile_if_stopped(&pidfile, &lock, 4243, None),
+            PidfileRemoval::NotOurs
+        );
+
+        // Ours but unlink fails: distinct from NotOurs.
+        std::fs::write(&pidfile, "4242\n").unwrap();
+        let failed = remove_pidfile_with(&pidfile, &lock, 4242, None, |_| {
+            Err(std::io::Error::other("simulated unlink failure"))
+        });
+        assert!(matches!(failed, PidfileRemoval::RemoveFailed(_)), "{failed:?}");
+        assert!(pidfile.exists(), "a failed unlink keeps the file");
+
+        // Lock open/query failure is its own outcome, not "busy".
+        let bad_lock = dir.join("not-a-dir").join("up.lock");
+        std::fs::write(dir.join("not-a-dir"), b"x").unwrap();
+        assert!(matches!(
+            remove_pidfile_if_stopped(&pidfile, &bad_lock, 4242, None),
+            PidfileRemoval::LockError(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_request_for_a_dead_pid_is_removed() {
         let _guard = crate::tests::lock_test_config();
         let dir = std::env::temp_dir().join(format!("tunlion-stop-dead-{}", std::process::id()));
@@ -697,7 +761,7 @@ mod tests {
         std::fs::write(&pidfile, "777777\n").unwrap();
         assert_eq!(
             remove_pidfile_if_stopped(&pidfile, &lock, 777777, None),
-            PidfileRemoval::LockHeld,
+            PidfileRemoval::LockBusy,
             "old down must not remove a replacement's pidfile"
         );
         assert!(pidfile.exists());

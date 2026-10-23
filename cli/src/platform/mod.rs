@@ -3615,6 +3615,22 @@ fn request_nonce() -> String {
     )
 }
 
+/// Write the request file, removing it if any step fails after the file
+/// landed (SecretFile writes the bytes, then restricts permissions; a failure
+/// in the second step must not leave a live request behind).
+fn write_request_file<F>(path: &Path, content: &str, write: F) -> Result<(), String>
+where
+    F: FnOnce(&Path, &str) -> std::io::Result<()>,
+{
+    match write(path, content) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            Err(format!("could not write the stop request {}: {e}", path.display()))
+        }
+    }
+}
+
 /// Ask the daemon with `pid` to stop. Returns a per-request nonce so the
 /// requester can clear exactly its own pending request.
 ///
@@ -3622,7 +3638,7 @@ fn request_nonce() -> String {
 /// no unix control socket, so this writes a PID+token+nonce stop request that
 /// the daemon's own loop reads and exits through its normal cleanup. This is a
 /// real daemon-control path, not an external `taskkill` on a pid.
-pub fn request_daemon_stop(pid: u32) -> Result<String, String> {
+pub fn request_daemon_stop(pid: u32) -> Result<Option<String>, String> {
     let nonce = request_nonce();
     #[cfg(unix)]
     {
@@ -3631,7 +3647,7 @@ pub fn request_daemon_stop(pid: u32) -> Result<String, String> {
             .status()
             .map_err(|e| format!("could not run kill: {e}"))?;
         if status.success() {
-            Ok(nonce)
+            Ok(Some(nonce))
         } else {
             Err(format!("`kill` failed ({status})"))
         }
@@ -3641,12 +3657,17 @@ pub fn request_daemon_stop(pid: u32) -> Result<String, String> {
         let token = process_start_token(pid).ok_or_else(|| {
             format!("cannot read the daemon's start time (pid {pid}); refusing an unsafe stop")
         })?;
-        with_daemon_stop_request_lock(|path| {
-            SecretFile::write_str(path, &format!("{pid}\n{token}\n{nonce}\n"))
-                .map(|()| nonce.clone())
-                .map_err(|e| format!("could not write the stop request {}: {e}", path.display()))
-        })
-        .unwrap_or_else(|| Err("timed out locking the stop-request file".to_string()))
+        match with_daemon_stop_request_lock(|path| {
+            write_request_file(path, &format!("{pid}\n{token}\n{nonce}\n"), |p, c| {
+                SecretFile::write_str(p, c)
+            })
+            .map(|()| nonce.clone())
+        }) {
+            // Lock timeout: do not block `down`; proceed to the token-verified
+            // await_exit/force path without a request file.
+            None => Ok(None),
+            Some(result) => result.map(Some),
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -4318,7 +4339,9 @@ mod windows_stop_request_tests {
         let old = std::env::var_os("TUNLION_CONFIG_DIR");
         unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
         let pid = std::process::id();
-        let nonce = super::request_daemon_stop(pid).expect("write the stop request");
+        let nonce = super::request_daemon_stop(pid)
+            .expect("write the stop request")
+            .expect("request lock was free");
         let path = super::daemon_stop_request_path();
         let raw = std::fs::read_to_string(&path).expect("stop request exists");
         let mut lines = raw.lines();
@@ -4336,6 +4359,53 @@ mod windows_stop_request_tests {
                 None => std::env::remove_var("TUNLION_CONFIG_DIR"),
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A live target plus a held request lock must return Ok(None) (proceed to
+    /// await_exit/force), not an error that makes down bail.
+    #[test]
+    fn a_held_request_lock_falls_back_without_a_request() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-win-stop-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let held = super::InstanceLock::try_acquire(&super::daemon_stop_request_lock_path())
+            .unwrap()
+            .expect("hold the request lock");
+        let out = super::request_daemon_stop(std::process::id()).expect("lock timeout is not an error");
+        assert!(out.is_none(), "no request can be written; proceed to await_exit");
+        assert!(!super::daemon_stop_request_path().exists());
+        drop(held);
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod request_write_tests {
+    /// SecretFile writes bytes then restricts permissions. If the restriction
+    /// step fails, the request file has already landed; the helper must remove
+    /// it so a daemon does not consume a request `down` reported as failed.
+    #[test]
+    fn a_post_write_failure_removes_the_landed_request() {
+        let dir = std::env::temp_dir().join(format!("tunlion-req-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("down.request");
+        let res = super::write_request_file(&path, "content", |p, c| {
+            std::fs::write(p, c)?;
+            Err(std::io::Error::other("simulated permission step failure"))
+        });
+        assert!(res.is_err());
+        assert!(!path.exists(), "a failed write must not leave a live request");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
