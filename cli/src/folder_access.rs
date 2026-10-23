@@ -408,7 +408,11 @@ mod protocol_tests {
         assert_eq!(staging_entries(&destination), 1, "expected exactly one private staging file");
         tx.send(Some(response(request.id, Value::Null, None))).await.unwrap();
         let Output::Downloaded(published) = task.await.unwrap().unwrap() else { panic!("download did not publish") };
-        assert_eq!(published.path, destination.join("binary.bin-1"));
+        // Windows reports the canonical Win32 spelling of the same file (the
+        // publisher strips the verbatim prefix); assert the published NAME and
+        // the no-clobber result rather than one platform's path rendering.
+        assert_eq!(published.path.file_name().and_then(|n| n.to_str()), Some("binary.bin-1"));
+        assert!(destination.join("binary.bin-1").exists());
         assert_eq!(published.bytes, binary.len() as u64);
         assert_eq!(published.sha256.as_slice(), expected.as_slice());
         assert_eq!(std::fs::read(&published.path).unwrap(), binary);
@@ -424,7 +428,8 @@ mod protocol_tests {
         open(&mut rx, &tx, &encoded("empty.bin"), 5).await;
         release(&mut rx, &tx, 5).await;
         let Output::Downloaded(published) = task.await.unwrap().unwrap() else { panic!("empty download did not publish") };
-        assert_eq!(published.path, destination.join("empty.bin"));
+        assert_eq!(published.path.file_name().and_then(|n| n.to_str()), Some("empty.bin"));
+        assert!(destination.join("empty.bin").exists());
         assert_eq!(published.bytes, 0);
         assert_eq!(std::fs::metadata(&published.path).unwrap().len(), 0);
     }
