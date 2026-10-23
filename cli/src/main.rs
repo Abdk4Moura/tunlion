@@ -1741,11 +1741,13 @@ fn verb_on_command_line() -> Option<String> {
     })
 }
 
-/// Test-hooks builds add a large Clap command tree. On a debug Windows build
-/// the default 1 MB main-thread stack overflows while merely constructing it
-/// (before any command runs), so the test build gets a larger stack. Production
-/// builds keep the normal entry point and stack.
-#[cfg(all(windows, feature = "test-hooks"))]
+/// Windows builds can exhaust the default 1 MB main-thread stack while
+/// constructing the large Clap command tree, before the command is dispatched.
+/// The observed failure was an interactive `tunlion` printing `thread 'main'
+/// has overflowed its stack` before the temporary-access menu. Run the real
+/// entry point on a bounded larger stack. This is a startup-stack fix, not a
+/// privilege/sandbox boundary.
+#[cfg(windows)]
 fn main() -> std::process::ExitCode {
     match std::thread::Builder::new()
         .name("tunlion-main".into())
@@ -1759,7 +1761,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-#[cfg(not(all(windows, feature = "test-hooks")))]
+#[cfg(not(windows))]
 fn main() -> std::process::ExitCode {
     main_inner()
 }
