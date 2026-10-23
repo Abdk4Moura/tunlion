@@ -27,7 +27,8 @@
 #   J11a a bounded multi-use retry is a receipt: one use, same identity
 #   J11b a forever-use retry is a receipt: one use, same secret
 #   J11c a different device key on the same invitation consumes a new use
-#   J11d different signed bounds for the same device consume a new use
+#   J11d a new invitation (new enrollment key) consumes a new use; same-key
+#        changed signed bounds are unit-tested in receipt validation
 #   J12 a joined store must hold its owner record, not just any JSON array
 #
 # Hermetic localhost fixture. TUNLION_BIN points at the built binary.
@@ -319,21 +320,21 @@ else
   bad "J11c: a different device key was treated as a retry or did not consume a use"
 fi
 
-say "J11d: DIFFERENT signed bounds for the same device take the ordinary claim path"
+say "J11d: a DIFFERENT invitation (new enrollment key) for the same device takes the ordinary claim path"
 "${O_ENV[@]}" "$BIN" --server "$SERVER" add --for mreuse --reuse 5 --allow transfer \
   --out "$WORK/bounds-inv.txt" --yes >"$WORK/j11d-add.log" 2>&1 \
-  || { cat "$WORK/j11d-add.log"; fixture_die "J11d setup: could not mint the different-bounds invitation"; }
+  || { cat "$WORK/j11d-add.log"; fixture_die "J11d setup: could not mint the second invitation"; }
 key_before
 rm -f "$DM/identity/device-cert.json" "$DM/devices.json"
 join_once "$WORK/bounds-inv.txt" "$DM" mreuse "$WORK/j11d.out"; RC11D=$?
-KEY_D=$(new_key_since "$WORK/keys.before") || fixture_die "J11d: the different-bounds join recorded no use"
-USES_D=$(uses_for "$KEY_D") || fixture_die "J11d: the different-bounds use entry is missing"
+KEY_D=$(new_key_since "$WORK/keys.before") || fixture_die "J11d: the second-invitation join recorded no use"
+USES_D=$(uses_for "$KEY_D") || fixture_die "J11d: the second-invitation use entry is missing"
 if [ "$RC11D" = 0 ] && [ "$USES_D" = 1 ] \
    && ! grep -q '"alreadyEnrolled": true' "$WORK/j11d.out"; then
-  ok "J11d: different signed bounds consumed a new use instead of reusing the old receipt"
+  ok "J11d: a new enrollment key consumed a new use instead of reusing the old receipt (same-key bounds are unit-tested)"
 else
   echo "rc=$RC11D uses=$USES_D"; cat "$WORK/j11d.out" "$WORK/j11d.err"
-  bad "J11d: different signed bounds were treated as the same enrollment"
+  bad "J11d: a new enrollment key was treated as the same enrollment"
 fi
 
 say "J12: a joined store needs its owner record, not merely parseable JSON"
