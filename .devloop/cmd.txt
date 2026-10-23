@@ -1,1 +1,1 @@
-cargo test -p tunlion-core --lib --locked && cargo test -p filament-peerloop --lib --locked && cargo check -p tunlion-core --all-targets --locked
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .devloop\win-combined.ps1
