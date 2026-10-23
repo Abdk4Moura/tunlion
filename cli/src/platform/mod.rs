@@ -4,7 +4,7 @@ pub(crate) mod recv_signals;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Shell invocation now lives in the peer-loop crate (a process rule with no
 /// host opinion); this path re-exports it so existing callers keep resolving.
@@ -47,7 +47,9 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
         }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+        Err(e) => {
+            anyhow::bail!("cannot inspect {}: {e}", path.display());
+        }
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -69,11 +71,11 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
             anyhow::bail!("{} is a symlink; refusing to follow it", path.display())
         }
-        Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+        Err(e) => anyhow::bail!("cannot open {}: {e}", path.display()),
     };
     let meta = file
         .metadata()
-        .with_context(|| format!("inspect {}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("cannot inspect {}: {e}", path.display()))?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         anyhow::bail!(
             "{} is a symlink or not a regular file; refusing to read it",
@@ -82,7 +84,7 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
-        .with_context(|| format!("read {}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
     Ok(Some(bytes))
 }
 
