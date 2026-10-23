@@ -187,6 +187,31 @@ impl OverlayKey {
         Ok(out)
     }
 
+    /// The public key already on disk, WITHOUT generating one when the file is
+    /// absent. Read-only checks (does this certificate name the key we hold?)
+    /// must not mint an identity as a side effect of looking; `public_key_bytes`
+    /// deliberately does generate, and joining relies on that.
+    pub fn existing_public_key_bytes(&self) -> Result<Option<[u8; 32]>> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context("read overlay key"),
+        };
+        Self::public_key_bytes_from_pkcs8(&bytes).map(Some)
+    }
+
+    /// Parse an already-read PKCS8 overlay key. A caller that must avoid
+    /// following a symlink reads the bytes through a no-follow handle and uses
+    /// this, rather than re-opening the path.
+    pub fn public_key_bytes_from_pkcs8(bytes: &[u8]) -> Result<[u8; 32]> {
+        use ring::signature::KeyPair;
+        let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(bytes)
+            .map_err(|_| anyhow::anyhow!("overlay key is corrupt"))?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(keypair.public_key().as_ref());
+        Ok(out)
+    }
+
     pub fn sign(&self, msg: &[u8]) -> Result<[u8; 64]> {
         let keypair = self.keypair()?;
         let mut out = [0u8; 64];
@@ -1168,6 +1193,22 @@ impl DeviceStore {
         )
     }
 
+    /// How many uses the durable store records for `key_id`, as of `now`.
+    ///
+    /// `None` means the file is absent, unreadable, unparseable, or the entry
+    /// is not there: the caller must treat that as "not provably used". This is
+    /// a READ used only to decide whether a re-sent acknowledgement is the same
+    /// enrollment; admission still goes through `record_invitation_use`.
+    pub fn invitation_uses(&self, key_id: &str, now: u64) -> Option<u64> {
+        let raw = std::fs::read_to_string(self.root.join(USED_INVITATIONS_FILE)).ok()?;
+        let entries = parse_invitation_uses(&raw).ok()?;
+        entries
+            .iter()
+            .find(|e| e["keyId"].as_str() == Some(key_id))
+            .filter(|e| e["expires"].as_u64().map_or(true, |x| x > now))
+            .and_then(|e| e["uses"].as_u64())
+    }
+
     /// What to re-invite an expired delegated device with: the ceiling it was
     /// admitted with and the lifetime its invitation granted. Pure over the
     /// record, so the refusal text and the re-invitation cannot drift.
@@ -2145,6 +2186,30 @@ mod store_guards {
         let error = store.devices_remove("alpha").unwrap_err();
         assert!(error.downcast_ref::<CorruptStore>().is_some());
         assert_eq!(std::fs::read(&p).unwrap(), garbage);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_key_in_the_revocation_list_is_revoked_and_damage_fails_closed() {
+        let root = unique("revoked-keys");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        let device = [0xABu8; 32];
+        let key = hex::encode(device);
+        // Absent list: not revoked.
+        assert!(!store.device_key_revoked(&device, now_secs()));
+        std::fs::write(
+            store.key_revocations_path(),
+            json!([{ "devicePub": key, "certExpires": now_secs() + 3600 }]).to_string(),
+        )
+        .unwrap();
+        assert!(
+            store.device_key_revoked(&device, now_secs()),
+            "the separate revoked-keys list must revoke even without a record marker"
+        );
+        // An unreadable/damaged list must read as revoked, never as "nothing".
+        std::fs::write(store.key_revocations_path(), b"{garbage").unwrap();
+        assert!(store.device_key_revoked(&device, now_secs()));
         let _ = std::fs::remove_dir_all(&root);
     }
 

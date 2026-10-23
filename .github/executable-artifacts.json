@@ -163,6 +163,17 @@
       ]
     },
     {
+      "path": "cli/tests/join-state-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/join-state-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/scripting-contract-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/scripting-contract-gates.sh",

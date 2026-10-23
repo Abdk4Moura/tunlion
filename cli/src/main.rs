@@ -163,6 +163,7 @@ pub(crate) use fleet_support::{apply_reconfigure, ensure_self_genesis_header, fl
 pub(crate) use fleet_support::fleet_certificate_warning_for;
 /// Identity creation, joining and the state behind them.
 mod identity_flow;
+mod join_state;
 pub(crate) use identity_flow::{init_experience, join_cmd, local_device_cert, open_enrollment};
 #[cfg(test)]
 pub(crate) use identity_flow::principal_from_records;

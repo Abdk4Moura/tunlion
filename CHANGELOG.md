@@ -17,6 +17,46 @@ the GitHub release notes.
 
 ### Fixed
 
+- **A join the owner already certified reports success, exactly once.** A
+  retried enrollment used to burn the single-use invitation, certify the
+  device, then answer the retry with "this invitation has already been used";
+  automation saw a failure while the fleet gained a device. The owner now
+  re-sends the stored certificate as an idempotent receipt (same device key,
+  same persisted signed bounds, no second use) and the joining side exits 0
+  with `"receipt": "reissued"`. A retry is recognized before use accounting, so
+  `--reuse N` and `--reuse forever` invitations no longer consume another use or
+  rotate the certificate/secret; only a different device key or different signed
+  bounds takes the ordinary claim path. The receipt also runs after an owner
+  restart (the durable use count path) and refuses a key on the separate
+  revoked-keys list, even when the record still lacks a revocation marker.
+- **`join` commits the identity as one recoverable unit.** The accepted
+  acknowledgement is journaled (`join.pending.json`), then `devices.json` is
+  written, and the local certificate is written LAST. A failure used to leave a
+  certificate and an overlay key without a device store, so `up` said "no
+  identity yet, and no paired devices" while the owner held the device. The next
+  `join` or `up` now finishes the journal; a certificate whose overlay key no
+  longer matches, a certificate whose signature is invalid or has expired, a
+  corrupt certificate record, a non-file/unparseable/symlinked `devices.json`,
+  a record without a name or usable credential (a string 32-byte secret or a
+  cryptographically valid, unexpired device certificate), a joined store
+  without the owner record the certificate names, or an accepted journal with
+  no certificate is refused with the reset/rejoin path instead of presenting an
+  address the fleet never certified. Resuming an accepted journal now verifies
+  the local and owner certificates before writing them, so a bad-signature or
+  expired journal cannot report a successful join. The owner key and overlay
+  key are read through the same no-follow handle, every component below the
+  config root is walked with `openat`+`O_NOFOLLOW` on Unix (a symlinked
+  `identity/` cannot redirect the certificate read; the final open is
+  `O_NONBLOCK` so a FIFO is reported as "not a regular file" instead of
+  blocking `addr`/`up`/`join`), and an owner key is only
+  treated as this certificate's owner when its public key matches the
+  certificate's `userPub`. A valid owner key for a different user no longer
+  turns a joined certificate into an owner device. `reset` also removes the journal and the `devices.json.bak` a
+  half-write leaves behind.
+- `addr --json` now reports `displayName` and `meshName` separately (and keeps
+  `name`/`mesh` as the mesh label). `--name-as` is documented and printed as a
+  display-only override; persist a mesh rename with `tunlion set name <name>`.
+  `devices forget` documents that scripts need `-y`.
 - The web shell no longer waits out the direct-QUIC budget before connecting. A
   browser cannot answer a QUIC `transport-offer`, but the acceptor treated it
   like a CLI peer and suppressed the WebRTC offer until the direct attempt
