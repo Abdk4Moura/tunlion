@@ -20,17 +20,35 @@ WizardStyle=modern
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\tunlion.exe
 ChangesEnvironment=yes
-CloseApplications=yes
+CloseApplications=no
 RestartApplications=no
 [Files]
 Source: "stage\tunlion.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stage\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stage\tl.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "stage\preflight.ps1"; DestDir: "{tmp}"; Flags: dontcopy
 [Icons]
 Name: "{autoprograms}\{#AppName}\Tunlion"; Filename: "{app}\tunlion.exe"
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Flags: preservestringtype; Check: NeedAddPath
 [Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Code: Integer;
+  PidText: String;
+begin
+  NeedsRestart := False;
+  ExtractTemporaryFile('preflight.ps1');
+  Exec('powershell.exe', '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\preflight.ps1') + '" -Out "' + ExpandConstant('{tmp}\tunlion-pids.txt') + '"', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  if Code <> 0 then begin
+    if LoadStringFromFile(ExpandConstant('{tmp}\tunlion-pids.txt'), PidText) then
+      Result := PidText
+    else
+      Result := 'Cannot replace tunlion.exe: it is still running. Stop every Tunlion config with tunlion down --yes, then rerun.';
+  end else
+    Result := '';
+end;
+
 function NeedAddPath: Boolean;
 var
   PathValue: String;

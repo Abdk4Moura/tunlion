@@ -5,6 +5,8 @@ It installs `tunlion.exe`, `wintun.dll`, and `tl.cmd` into the existing per-user
 `%USERPROFILE%\bin`, adds that directory to PATH once, and preserves
 `%APPDATA%\tunlion\config`. It does not create or delete an identity.
 
-Close all Tunlion processes before running the installer. The current machine can
-have more than one process/config; the installer uses standard Restart Manager
-close behavior and cannot decide which scratch daemon is safe to stop.
+Before running the installer, stop every Tunlion daemon explicitly with
+`tunlion down --yes` in its own `TUNLION_CONFIG_DIR`. The installer does NOT use
+Restart Manager and does NOT kill or restart processes. If either binary is still
+running, installation must fail rather than terminate it. It leaves `up.pid` and
+the config untouched.

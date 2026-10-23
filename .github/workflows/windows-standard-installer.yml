@@ -49,6 +49,7 @@ jobs:
           Copy-Item src/target/release/tunlion.exe "$stage/tunlion.exe" -Force
           Copy-Item packaging/windows-standard/wintun.dll "$stage/wintun.dll" -Force
           Copy-Item packaging/windows/tl.cmd "$stage/tl.cmd" -Force
+          Copy-Item packaging/windows-standard/preflight.ps1 "$stage/preflight.ps1" -Force
       - name: Package
         shell: pwsh
         run: |
