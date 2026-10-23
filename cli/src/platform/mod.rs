@@ -199,7 +199,7 @@ fn unix_read_beneath(root: &Path, relative: &Path) -> Result<Option<Vec<u8>>> {
                 _ => anyhow::bail!("cannot open {}: {e}", root.join(relative).display()),
             }
         }
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let meta = file
             .metadata()
             .map_err(|e| anyhow::anyhow!("cannot inspect {}: {e}", name.to_string_lossy()))?;
