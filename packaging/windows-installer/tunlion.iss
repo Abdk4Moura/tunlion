@@ -1,17 +1,23 @@
 ; Standard per-user installer for the combined Tunlion Windows build.
 ;
-; - Installs ONE file, tunlion.exe, under %LOCALAPPDATA%\Programs\Tunlion.
-; - No administrator rights: PrivilegesRequired=lowest, HKCU only.
-; - Adds the install directory to the USER Path (preserving existing entries)
-;   and removes only that one entry on uninstall.
-; - Start Menu shortcut + an Add/Remove Programs entry with an uninstaller.
-; - Upgrades an existing tunlion.exe in the same directory in place
-;   (UsePreviousAppDir, overwrite), and never reads, writes, moves or deletes
-;   the identity/config directory (%APPDATA%\tunlion).
+; Target: the user's existing per-user bin (%USERPROFILE%\bin), which is where
+; the owner machine already runs tunlion.exe from, so an upgrade lands on the
+; binary the user PATH and the TunlionKernel task actually use. No admin, no
+; side-by-side copy under %LOCALAPPDATA%\Programs.
+;
+; - Installs the combined tunlion.exe plus its two runtime companions:
+;   the signed wintun.dll (kernel TUN) and the `tl` launcher. No test binaries,
+;   scripts, READMEs or test-kit branding.
+; - Adds the directory to the USER Path only if missing, then de-duplicates the
+;   existing Path entries (case-insensitive, first occurrence wins).
+; - Start Menu shortcut + a proper Add/Remove Programs entry and uninstaller.
+; - Upgrades an existing tunlion.exe in that directory in place.
+; - Never reads, writes, moves or deletes the identity/config directory
+;   (%APPDATA%\tunlion), and never touches the TunlionKernel scheduled task.
 ;
 ; Build with:
 ;   ISCC.exe /DAppVersion=0.9.0 tunlion.iss
-; after staging the exact combined binary at stage\tunlion.exe.
+; after staging tunlion.exe, wintun.dll and tl.cmd under stage\.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -22,14 +28,14 @@
 #define AppExeName "tunlion.exe"
 
 [Setup]
-; A DIFFERENT AppId from the test kit: this is the standard app, not a test kit.
-AppId={{B6F1A7C2-8E4D-4C1B-9F63-2D7A5E0C9B14}
+; The standard app identity (never the test kit's AppId).
+AppId={{B8F4E4C2-9D6A-4B1E-8C7F-6D3A2E1B9C40}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
 VersionInfoVersion={#AppVersion}
-DefaultDirName={localappdata}\Programs\Tunlion
+DefaultDirName={userprofile}\bin
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableDirPage=auto
@@ -54,12 +60,13 @@ ChangesEnvironment=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; The ONLY installed payload. No test binaries, scripts, READMEs or samples.
+; The combined binary and the two runtime files it needs; nothing else.
 Source: "stage\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "stage\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "stage\tl.cmd"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-; Start Menu shortcut launches the interactive entry point (the menu).
-Name: "{autoprograms}\{#AppName}.lnk"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "Tunlion"
+Name: "{autoprograms}\{#AppName}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "Tunlion"
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch Tunlion"; Flags: nowait postinstall skipifsilent
@@ -79,74 +86,52 @@ begin
   Result := Pos(';' + Uppercase(Dir) + ';', ';' + Uppercase(Path) + ';') > 0;
 end;
 
-procedure AddToUserPath();
+// Add the install directory if absent and collapse duplicate entries. The
+// owner machine already had this directory in Path (possibly twice), so the
+// installer must not append a third copy. Existing order and unrelated entries
+// are preserved.
+procedure NormalizeUserPath();
 var
-  Path, Dir: string;
-begin
-  Path := UserPath();
-  Dir := ExpandConstant('{app}');
-  if HasPathEntry(Path, Dir) then
-    exit;
-  if (Path <> '') and (Path[Length(Path)] <> ';') then
-    Path := Path + ';';
-  Path := Path + Dir;
-  RegWriteExpandStringValue(HKCU, EnvKey, 'Path', Path);
-end;
-
-function WithoutPathEntry(const Path, Dir: string): string;
-var
-  Rest, Seg: string;
-  P: Integer;
-begin
-  Rest := Path;
-  Result := '';
-  while Rest <> '' do
-  begin
-    P := Pos(';', Rest);
-    if P = 0 then
-    begin
-      Seg := Rest;
-      Rest := '';
-    end
-    else
-    begin
-      Seg := Copy(Rest, 1, P - 1);
-      Rest := Copy(Rest, P + 1, Length(Rest));
-    end;
-    if (Seg <> '') and (CompareText(Seg, Dir) <> 0) then
-    begin
-      if Result <> '' then
-        Result := Result + ';';
-      Result := Result + Seg;
-    end;
-  end;
-end;
-
-procedure RemoveFromUserPath();
-var
-  Path, Dir: string;
+  Path, Item, Clean: string;
+  Parts: TArrayOfString;
+  I: Integer;
+  Seen: TStringList;
+  Dir: string;
 begin
   Path := UserPath();
   Dir := ExpandConstant('{app}');
   if not HasPathEntry(Path, Dir) then
-    exit;
-  Path := WithoutPathEntry(Path, Dir);
-  if Path = '' then
-    RegDeleteValue(HKCU, EnvKey, 'Path')
-  else
-    RegWriteExpandStringValue(HKCU, EnvKey, 'Path', Path);
+  begin
+    if (Path <> '') and (Path[Length(Path)] <> ';') then
+      Path := Path + ';';
+    Path := Path + Dir;
+  end;
+  Seen := TStringList.Create;
+  try
+    Seen.CaseSensitive := False;
+    Clean := '';
+    Parts := SplitString(Path, ';');
+    for I := 0 to GetArrayLength(Parts) - 1 do
+    begin
+      Item := Trim(Parts[I]);
+      if (Item <> '') and (Seen.IndexOf(Item) < 0) then
+      begin
+        Seen.Add(Item);
+        if Clean <> '' then
+          Clean := Clean + ';';
+        Clean := Clean + Item;
+      end;
+    end;
+    RegWriteExpandStringValue(HKCU, EnvKey, 'Path', Clean);
+  finally
+    Seen.Free;
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
-    AddToUserPath();
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-begin
-  if CurUninstallStep = usUninstall then
-    RemoveFromUserPath();
+    NormalizeUserPath();
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -156,9 +141,9 @@ begin
   Result := True;
   if CurPageID = wpSelectDir then
   begin
-    // The config/identity directory must not be the install directory: the
-    // uninstaller removes installed files and must never be able to remove a
-    // user's keys.
+    // The config/identity directory must never become the install directory:
+    // the uninstaller removes installed files and must not be able to remove
+    // a user's keys.
     DataDir := ExpandConstant('{userappdata}\tunlion');
     if CompareText(WizardDirValue, DataDir) = 0 then
     begin
