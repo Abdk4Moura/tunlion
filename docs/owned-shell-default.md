@@ -80,20 +80,26 @@ S4U shell-plane work is separate). No new commands. No prompt per connection.
   `add --for device` default). Changeable at mint time: `--allow transfer,mount`,
   the invitation picker's "Files and folders only", and a hint on the code
   screen. Person and runner ceilings never include shell by default.
-- Local acceptance gates BOTH no-grant paths for shell
-  (`shell_gate::shell_gate_classes`): the owned class AND the ceiling path. A
-  signed shell ceiling alone never authorizes a shell on a device that has not
-  accepted owned shells. Delegated principals keep their ceiling path (gated the
-  same way) and never ride the owned class.
-- Live sessions admitted through either path end on the next recheck tick when
-  acceptance is withdrawn or the ceiling narrows.
+- For the owner's OWN (non-delegated) devices, local acceptance gates BOTH
+  no-grant paths for shell (`shell_gate::shell_gate_classes`): the owned class
+  AND the ceiling path. A signed shell ceiling alone never runs a shell on a
+  device that has not accepted owned shells.
+- Clarification (review, after MESH-INTENT): the toggle is own-device scoped.
+  Delegated/invited principals keep their signed auth-key ceiling path exactly as
+  before (signed caps, expiry, revocation, deny), are unaffected by the toggle,
+  and never ride the owned class; explicit grants are untouched. Test:
+  `the_toggle_never_alters_delegated_authority`.
+- Live sessions admitted as the owner's own device (owned class or signed
+  ceiling) end on the next recheck tick when acceptance is withdrawn or the
+  ceiling narrows; delegated sessions keep their existing ceiling/revoke checks.
 
 ## Proposed semantics for Q2-Q4
 
 **Q2, shadow vs authoritative.** The owned class is a scoped default, so it
-decides in BOTH modes, exactly like transfer/mount scoped defaults. The ceiling
-path stays authoritative-only for its decision, as today. Both are gated on local
-acceptance. Rationale: the owned class is strictly narrower than the ceiling path
+decides in BOTH modes, exactly like transfer/mount scoped defaults. The signed
+ceiling path stays authoritative-only for its decision, as today. For own
+devices both are gated on local acceptance; delegated ceiling behaviour is
+unchanged. Rationale: the owned class is strictly narrower than the ceiling path
 (same owner + Proven + not revoked/denied/expired + not delegated + signed shell
 ceiling + local acceptance), and the owner chose it as the default posture.
 Test: policy-site cell per guard (capability.rs) + `shell_gate_classes` matrix.

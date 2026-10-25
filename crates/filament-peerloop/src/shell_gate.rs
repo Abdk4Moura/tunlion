@@ -287,9 +287,15 @@ impl ShellGateInputs {
     /// policy behind it. A live session admitted this way must end as soon as
     /// this device stops accepting owned shells; every other population keeps
     /// the authority it was admitted under.
+    ///
+    /// For a non-delegated device this covers BOTH no-grant ways in (the owned
+    /// class and the signed ceiling), since local acceptance gates both for
+    /// the owner's own devices. A delegated principal is never in it: the
+    /// toggle does not touch delegated authority (review clarification).
     pub fn admitted_via_owned_shell(&self) -> bool {
-        self.scoped_default
+        (self.scoped_default || self.ceiling_covers)
             && self.action == filament_cap::capability::CAP_SHELL
+            && self.ak_caps.is_none()
             && !self.has_grant
             && !self.store_allows
             && !self.policy_allows
@@ -308,14 +314,17 @@ pub fn owned_shell_class(action: &str, delegated: bool, accepted_here: bool, cei
 }
 
 /// The two no-grant classes the gate receives, `(scoped_default,
-/// ceiling_covers)`, with local acceptance applied to BOTH for shell: a signed
-/// ceiling alone never authorizes a shell on a device that has not accepted
-/// owned shells. Other actions pass the ceiling through untouched and are not
+/// ceiling_covers)`. For the owner's OWN (non-delegated) devices, local
+/// `own-devices-shell` acceptance gates BOTH for shell: a signed ceiling alone
+/// never runs a shell on a device that has not accepted owned shells. For a
+/// DELEGATED principal the toggle changes nothing: its signed auth-key ceiling
+/// behaves exactly as before (review clarification; MESH-INTENT: delegated
+/// devices remain bounded by signed authority). Other actions pass the ceiling through untouched and are not
 /// scoped defaults here (the forward path sets its own expose-list bound).
 pub fn shell_gate_classes(action: &str, delegated: bool, accepted_here: bool, raw_ceiling: bool) -> (bool, bool) {
     let is_shell = action == filament_cap::capability::CAP_SHELL;
     let scoped = owned_shell_class(action, delegated, accepted_here, raw_ceiling);
-    let ceiling = raw_ceiling && (!is_shell || accepted_here);
+    let ceiling = raw_ceiling && (!is_shell || delegated || accepted_here);
     (scoped, ceiling)
 }
 
@@ -340,15 +349,24 @@ mod owned_shell_tests {
     }
 
     #[test]
-    fn local_acceptance_gates_the_ceiling_path_for_shell_too() {
-        // ceiling signed with shell, device NOT accepting: neither path may authorize
+    fn local_acceptance_gates_an_own_devices_ceiling_path_for_shell_too() {
+        // own device, shell ceiling signed, device NOT accepting: neither path
         assert_eq!(shell_gate_classes(CAP_SHELL, false, false, true), (false, false));
-        assert_eq!(shell_gate_classes(CAP_SHELL, true, false, true), (false, false), "delegated with a shell ceiling, not accepted");
-        // accepted: own device rides both; delegated keeps its ceiling path only
+        // own device, accepted: both paths
         assert_eq!(shell_gate_classes(CAP_SHELL, false, true, true), (true, true));
-        assert_eq!(shell_gate_classes(CAP_SHELL, true, true, true), (false, true));
         // no signed shell ceiling: nothing, accepted or not
         assert_eq!(shell_gate_classes(CAP_SHELL, false, true, false), (false, false));
+        assert_eq!(shell_gate_classes(CAP_SHELL, false, false, false), (false, false));
+    }
+
+    #[test]
+    fn the_toggle_never_alters_delegated_authority() {
+        for accepted in [false, true] {
+            // the delegated signed-ceiling path is identical with the toggle on or off
+            assert_eq!(shell_gate_classes(CAP_SHELL, true, accepted, true), (false, true), "accepted={accepted}");
+            // a missing signed shell cap still denies, toggle or not
+            assert_eq!(shell_gate_classes(CAP_SHELL, true, accepted, false), (false, false), "accepted={accepted}");
+        }
         // other actions: ceiling untouched, never a scoped default here
         assert_eq!(shell_gate_classes(CAP_TRANSFER, false, false, true), (false, true));
         assert_eq!(shell_gate_classes(CAP_MOUNT, false, true, false), (false, false));

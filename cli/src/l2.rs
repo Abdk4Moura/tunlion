@@ -535,9 +535,7 @@ pub async fn spawn_pty_session(
                         crate::capability::CAP_SHELL,
                     );
                     let accepted = crate::host_impl::owned_shell_accepted_now();
-                    // A shell ceiling counts only while this device accepts owned
-                    // shells (review ruling F1(a)).
-                    let ceiling_gone = admitted_via_ceiling && (!shell_ceiling || !accepted);
+                    let ceiling_gone = admitted_via_ceiling && !shell_ceiling;
                     // A lapsed deadline ends it too; unresolvable is no opinion.
                     let lapsed =
                         matches!(crate::identity_state::peer_liveness_alive(idev.as_ref()), Some(false));

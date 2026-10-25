@@ -908,12 +908,8 @@ pub async fn serve_exec(
                         || !host.ceiling_covers_action(authz.idev.as_ref(), CAP_SHELL));
                 // A ceiling narrowed under a ceiling-admitted session ends
                 // it (re-read fresh; grant-admitted sessions ignore this).
-                // A shell ceiling counts only while this device accepts owned
-                // shells (review ruling F1(a)), so withdrawing acceptance ends a
-                // ceiling-admitted session too.
                 let ceiling_gone = authz.admitted_via_ceiling
-                    && (!host.ceiling_covers_action(authz.idev.as_ref(), CAP_SHELL)
-                        || !host.owned_shell_accepted());
+                    && !host.ceiling_covers_action(authz.idev.as_ref(), CAP_SHELL);
                 // A lapsed deadline (cert expiry, absolute stop, offline
                 // budget) ends it too; unresolvable identity is no opinion.
                 let lapsed = matches!(host.peer_liveness_alive(authz.idev.as_ref()), Some(false));
