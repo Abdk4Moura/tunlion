@@ -247,7 +247,7 @@ pub fn gather_shell_gate_inputs(
     let store = host.cap_store();
     let now = host.now_secs();
     let outcome = authorize_in(&store, "self", action, idev, iusr, ak_caps, now);
-    let ceiling_covers = host.ceiling_covers_action(idev, action);
+    let raw_ceiling = host.ceiling_covers_action(idev, action);
     let (own_user, has_grant) = fleet_inputs_in(&store, "self", action, idev, iusr, ak_caps, now);
     // Owned-device shell (docs/owned-shell-default.md): when this device
     // accepts owned shells, the shell action joins the SCOPE-DEFAULT class for
@@ -255,7 +255,11 @@ pub fn gather_shell_gate_inputs(
     // auto-trust decides it (same owner, Proven, not revoked, not denied, not
     // expired). A delegated principal (auth-key ceiling present) never gets it:
     // its signed ceiling stays the whole of its authority.
-    let scoped_default = owned_shell_class(action, ak_caps.is_some(), host.owned_shell_accepted());
+    // Review ruling F1(a): the owner-signed enrolment ceiling is a HARD ceiling
+    // for shell, and local acceptance gates BOTH ways a shell can be
+    // authorized without a grant: the owned class and the ceiling path.
+    let (scoped_default, ceiling_covers) =
+        shell_gate_classes(action, ak_caps.is_some(), host.owned_shell_accepted(), raw_ceiling);
     let inputs = ShellGateInputs {
         trusted,
         denied,
@@ -294,134 +298,59 @@ impl ShellGateInputs {
 
 /// Is this open in the owned-device shell class? Pure, so the matrix pins it.
 /// Only the shell action, only a non-delegated principal, only when this device
-/// accepts owned shells. The same-owner / Proven / revocation / deny / expiry
-/// conditions are NOT checked here: the policy site applies them to every
-/// scoped default, and checking them twice in two places is how they drift.
-pub fn owned_shell_class(action: &str, delegated: bool, accepted_here: bool) -> bool {
-    action == filament_cap::capability::CAP_SHELL && !delegated && accepted_here
+/// accepts owned shells, and only when the owner-signed enrolment ceiling
+/// covers shell (review ruling F1(a): pairing never exceeds what was signed).
+/// The same-owner / Proven / revocation / deny / expiry conditions are NOT
+/// checked here: the policy site applies them to every scoped default, and
+/// checking them twice in two places is how they drift.
+pub fn owned_shell_class(action: &str, delegated: bool, accepted_here: bool, ceiling_covers: bool) -> bool {
+    action == filament_cap::capability::CAP_SHELL && !delegated && accepted_here && ceiling_covers
 }
 
-/// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
-/// identity is Proven and whose local name came from that proven key. The RULE
-/// itself lives in `crate::host` (written once, shared with the peer loop);
-/// this is the enum-shaped wrapper so the callers and tests here keep their
-/// signatures.
-pub fn fleet_link_proven(
-    kind: &PrincipalKind,
-    binding: BindingStrength,
-    has_device_pub: bool,
-    has_verified_name: bool,
-) -> bool {
-    crate::host::fleet_link_proven(
-        matches!(kind, PrincipalKind::FleetDevice),
-        binding == BindingStrength::Proven,
-        has_device_pub,
-        has_verified_name,
-    )
-}
-
-/// Shared verdict core: legacy folds trust the same way for both paths, then
-/// the capability verdict decides alone. Returns the engine's cap reason
-/// when it names one; each call site applies its own fallback wording for
-/// the reason-less case (pty and exec historically differ there, preserved).
-fn decide(
-    inputs: &ShellGateInputs,
-    host: &dyn HostServices,
-) -> Result<(), Option<String>> {
-    decide_with_legacy(
-        inputs,
-        inputs.trusted && !inputs.denied && (inputs.policy_allows || inputs.store_allows),
-        host,
-    )
-}
-
-/// Verdict core with a caller-supplied legacy fold. exec/pty/ssh-sign use
-/// the shell fold above; the forward path passes its own blanket fold
-/// (blanket L2 mode admits trusted peers with no shell policy behind it,
-/// which the shell fold cannot express -- dropping it would newly deny
-/// default setups in shadow). Same engine, same inputs otherwise.
-fn decide_with_legacy(
-    inputs: &ShellGateInputs,
-    legacy_ok: bool,
-    host: &dyn HostServices,
-) -> Result<(), Option<String>> {
-    // Two auto-trust classes travel separately: `scoped_default` (mode
-    // independent, pre-existing) and `ceiling_covers` (authoritative-only
-    // for the decision; counted as would-allow in shadow so the ceiling
-    // population is not mistaken for breakage).
-    let granted = host.cap_gate_effective(CapGate {
-        legacy_allowed: legacy_ok,
-        outcome: &inputs.outcome,
-        action: inputs.action.as_str(),
-        resource: "self",
-        device_pub: inputs.idev.as_ref(),
-        user_pub: inputs.iusr.as_ref(),
-        binding: inputs.binding,
-        cert_expires: inputs.expires,
-        auth_key_caps: inputs.ak_caps.as_deref(),
-        own_user_pub: inputs.own_user.as_ref(),
-        scoped_in_bounds: inputs.scoped_default,
-        has_explicit_grant: inputs.has_grant,
-        cert_revoked: inputs.cert_revoked,
-        denied: inputs.denied,
-        ceiling_authorizes: inputs.ceiling_covers,
-    });
-    match granted {
-        GateDecision::Allow => Ok(()),
-        GateDecision::Deny { cap_reason } => Err(cap_reason),
-    }
-}
-
-/// Exec-open's entry point: delegates to the shared core (no local logic).
-pub fn exec_gate_decision(
-    inputs: &ShellGateInputs,
-    host: &dyn HostServices,
-) -> Result<(), Option<String>> {
-    decide(inputs, host)
-}
-
-/// Pty-open's entry point: delegates to the shared core (no local logic).
-pub fn pty_gate_decision(
-    inputs: &ShellGateInputs,
-    host: &dyn HostServices,
-) -> Result<(), Option<String>> {
-    decide(inputs, host)
-}
-
-/// Forward-open's entry point: same shared core, but the caller supplies
-/// the legacy fold (see above) and overrides `ceiling_covers` with its
-/// expose.json bound before calling. A forward --stdio to an exposed sshd
-/// is shell-equivalent in reach.
-pub fn forward_gate_decision(
-    inputs: &ShellGateInputs,
-    legacy_ok: bool,
-    host: &dyn HostServices,
-) -> Result<(), Option<String>> {
-    decide_with_legacy(inputs, legacy_ok, host)
-}
-
-/// SSH-sign's entry point: the certificate signer asks the same gate before
-/// signing (a cert is B's statement about A, so the shell grant gates it
-/// like any shell-class open). Delegates to the shared core (no local logic).
-pub fn ssh_gate_decision(
-    inputs: &ShellGateInputs,
-    host: &dyn HostServices,
-) -> Result<(), Option<String>> {
-    decide(inputs, host)
+/// The two no-grant classes the gate receives, `(scoped_default,
+/// ceiling_covers)`, with local acceptance applied to BOTH for shell: a signed
+/// ceiling alone never authorizes a shell on a device that has not accepted
+/// owned shells. Other actions pass the ceiling through untouched and are not
+/// scoped defaults here (the forward path sets its own expose-list bound).
+pub fn shell_gate_classes(action: &str, delegated: bool, accepted_here: bool, raw_ceiling: bool) -> (bool, bool) {
+    let is_shell = action == filament_cap::capability::CAP_SHELL;
+    let scoped = owned_shell_class(action, delegated, accepted_here, raw_ceiling);
+    let ceiling = raw_ceiling && (!is_shell || accepted_here);
+    (scoped, ceiling)
 }
 
 #[cfg(test)]
 mod owned_shell_tests {
-    use super::owned_shell_class;
+    use super::{owned_shell_class, shell_gate_classes};
     use filament_cap::capability::{CAP_MOUNT, CAP_SHELL, CAP_TRANSFER};
 
     #[test]
-    fn only_a_non_delegated_shell_on_an_accepting_device_is_in_the_class() {
-        assert!(owned_shell_class(CAP_SHELL, false, true));
-        assert!(!owned_shell_class(CAP_SHELL, false, false), "a device that has not accepted owned shells");
-        assert!(!owned_shell_class(CAP_SHELL, true, true), "a delegated principal keeps only its ceiling");
+    fn own_device_shell_needs_acceptance_and_a_signed_shell_ceiling() {
+        // positive: own device, accepted here, ceiling signed with shell
+        assert!(owned_shell_class(CAP_SHELL, false, true, true));
+        // negative: no signed shell in the enrolment ceiling
+        assert!(!owned_shell_class(CAP_SHELL, false, true, false), "pairing must not exceed the signed ceiling");
+        // negative: this device has not accepted owned shells
+        assert!(!owned_shell_class(CAP_SHELL, false, false, true), "a signed ceiling alone is not acceptance");
+        // negative: delegated principals keep only their signed caps
+        assert!(!owned_shell_class(CAP_SHELL, true, true, true), "a delegated principal never rides the owned class");
         for other in [CAP_TRANSFER, CAP_MOUNT, "route", "exec"] {
-            assert!(!owned_shell_class(other, false, true), "{other} must not ride the owned-shell class");
+            assert!(!owned_shell_class(other, false, true, true), "{other} must not ride the owned-shell class");
         }
+    }
+
+    #[test]
+    fn local_acceptance_gates_the_ceiling_path_for_shell_too() {
+        // ceiling signed with shell, device NOT accepting: neither path may authorize
+        assert_eq!(shell_gate_classes(CAP_SHELL, false, false, true), (false, false));
+        assert_eq!(shell_gate_classes(CAP_SHELL, true, false, true), (false, false), "delegated with a shell ceiling, not accepted");
+        // accepted: own device rides both; delegated keeps its ceiling path only
+        assert_eq!(shell_gate_classes(CAP_SHELL, false, true, true), (true, true));
+        assert_eq!(shell_gate_classes(CAP_SHELL, true, true, true), (false, true));
+        // no signed shell ceiling: nothing, accepted or not
+        assert_eq!(shell_gate_classes(CAP_SHELL, false, true, false), (false, false));
+        // other actions: ceiling untouched, never a scoped default here
+        assert_eq!(shell_gate_classes(CAP_TRANSFER, false, false, true), (false, true));
+        assert_eq!(shell_gate_classes(CAP_MOUNT, false, true, false), (false, false));
     }
 }

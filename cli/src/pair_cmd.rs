@@ -195,12 +195,15 @@ pub(crate) fn invitation_not_a_code_msg() -> String {
         .to_string()
 }
 
-/// The default enrolment ceiling for a device added over a spoken code when
-/// `--allow` was not given: the same transfer+mount the invitation path gives a
-/// device. Shell is owner-equivalent and stays a deliberate `--allow ...shell`,
-/// because pairing alone never yields a shell.
+/// The default enrolment ceiling for ONE OF YOUR OWN devices added over a
+/// spoken code when `--allow` was not given: the same ceiling the invitation
+/// path gives a device. It includes shell (docs/owned-shell-default.md): your
+/// own devices may open shells on each other, as the owner signed here.
+/// Signing it is necessary, never sufficient: a shell still needs the target
+/// device's local `own-devices-shell` acceptance (a primary opts in once).
+/// Someone else's device and runners never get shell by default.
 pub(crate) fn default_device_ceiling() -> Vec<String> {
-    vec!["transfer".to_string(), "mount".to_string()]
+    vec!["transfer".to_string(), "mount".to_string(), "shell".to_string()]
 }
 
 /// `--expires` for the spoken-code path, parsed and bounded exactly like the
@@ -307,6 +310,9 @@ pub(crate) async fn pair_cmd(
     // alternative on the code screen instead, where it is relevant.
     quick: bool,
 ) -> Result<()> {
+    // Captured before `posture` is consumed: whether the own-device default
+    // ceiling (which signs shell) applies, for the code screen's hint.
+    let default_posture = posture.is_empty();
     if code.is_none() && word.is_none() && !interactive_allowed() {
         let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
         eprintln!("{message}");
@@ -1114,6 +1120,14 @@ pub(crate) async fn pair_cmd(
                     ui::Tone::Dim,
                     "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)",
                 ));
+                // Own-device enrolment signs shell by default; say so where the
+                // choice can still change, and how (docs/owned-shell-default.md).
+                if internal && default_posture {
+                    ui::say(&ui::paint(
+                        ui::Tone::Dim,
+                        "  includes a terminal between your devices; to leave it out: tunlion add --for device --allow transfer,mount",
+                    ));
+                }
             }
             Ev::PairCode(v) => {
                 // v1 server (shouldn't happen for a v2 create, but be safe): a
@@ -1647,14 +1661,14 @@ pub(crate) async fn pair_cmd(
 mod promise_tests {
     use super::*;
 
-    // `add <device>` over a spoken code: --allow omitted must mean the
-    // documented transfer+mount, never shell ("pairing alone never yields a
-    // shell", `grant` help).
+    // `add <device>` over a spoken code: --allow omitted signs the own-device
+    // ceiling, which includes shell by the owner's policy
+    // (docs/owned-shell-default.md). Signing is necessary, not sufficient: the
+    // gate still requires the target's local acceptance (shell_gate tests).
     #[test]
-    fn code_path_default_ceiling_has_no_shell() {
+    fn code_path_default_ceiling_signs_own_device_shell() {
         let caps = default_device_ceiling();
-        assert_eq!(caps, vec!["transfer", "mount"]);
-        assert!(!caps.iter().any(|c| c == "shell"));
+        assert_eq!(caps, vec!["transfer", "mount", "shell"]);
     }
 
     // --expires reaches the enrolment, parsed and bounded like `add --out`.
@@ -1691,7 +1705,9 @@ mod promise_tests {
             );
             argv
         };
-        let caps = default_device_ceiling();
+        // A device enrolled WITHOUT shell (an explicit `--allow transfer,mount`):
+        // the hint must still name the way to a terminal.
+        let caps = vec!["transfer".to_string(), "mount".to_string()];
 
         // An owner's own device: no ceiling binds it, so `grant` proceeds and
         // the hint says exactly that command.

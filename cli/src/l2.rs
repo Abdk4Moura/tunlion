@@ -530,18 +530,21 @@ pub async fn spawn_pty_session(
                     // surfaces a nonzero exit rather than a clean one (#223).
                     // A ceiling narrowed under a ceiling-admitted session ends
                     // it the same way (re-read fresh; never cached at open).
-                    let ceiling_gone = admitted_via_ceiling
-                        && !crate::identity_state::ceiling_covers_action(
-                            idev.as_ref(),
-                            crate::capability::CAP_SHELL,
-                        );
+                    let shell_ceiling = crate::identity_state::ceiling_covers_action(
+                        idev.as_ref(),
+                        crate::capability::CAP_SHELL,
+                    );
+                    let accepted = crate::host_impl::owned_shell_accepted_now();
+                    // A shell ceiling counts only while this device accepts owned
+                    // shells (review ruling F1(a)).
+                    let ceiling_gone = admitted_via_ceiling && (!shell_ceiling || !accepted);
                     // A lapsed deadline ends it too; unresolvable is no opinion.
                     let lapsed =
                         matches!(crate::identity_state::peer_liveness_alive(idev.as_ref()), Some(false));
                     let cut = crate::identity_state::live_session_cut(idev.as_ref());
                     // This device stopped accepting owned shells: an
                     // owned-admitted session ends like a revocation.
-                    let owned_gone = admitted_via_owned_shell && !crate::host_impl::owned_shell_accepted_now();
+                    let owned_gone = admitted_via_owned_shell && (!accepted || !shell_ceiling);
                     if cut.is_some() || ceiling_gone || owned_gone || lapsed {
                         let reason = match cut {
                             Some(c) => c.reason_for(idev.as_ref()),

@@ -727,8 +727,9 @@ pub(crate) enum Cmd {
         json: bool,
     },
     /// Grant a known device a capability (deny-by-default). `shell` permits
-    /// seamless `tunlion shell --ssh` into THIS machine, a separate consent from
-    /// file transfer; pairing alone never yields a shell.
+    /// seamless `tunlion shell --ssh` into THIS machine. Your own devices get it
+    /// without a grant where `own-devices-shell` accepts them (a primary opts in
+    /// once); for anyone else pairing alone never yields a shell.
     ///
     /// `tunlion grant <device> <capability>`, or `tunlion grant --tag <tag>
     /// <capability>` to grant every device carrying that tag.

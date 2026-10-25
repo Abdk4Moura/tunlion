@@ -130,21 +130,26 @@ pub(crate) async fn add_for_cmd(
     // --allow, and only interactively. A person gets transfer and is not asked,
     // because owner-equivalent access to a stranger should stay a deliberate
     // flag rather than a menu item one keypress away.
-    let mut interactive_shell = false;
-    // Prefixes pulled out of `--allow route:<cidr>`; empty for every other kind
-    // of invitation, which keeps those tokens byte-identical v2.
-    let mut route_prefixes: Vec<String> = Vec::new();
+    // Your own device signs shell by DEFAULT (docs/owned-shell-default.md), and
+    // the default stays changeable at mint time: `--allow transfer,mount`, or
+    // the second answer here. The target's own-devices-shell acceptance is
+    // still the consent that lets a shell run; this only decides what is signed.
+    let mut without_shell = false;
     if allow.is_empty() && kind == "device" && caps.interactive {
         let choices = vec![
-            "Send files, and mount my folders".to_string(),
-            "...and open a terminal here  (OWNER-EQUIVALENT)".to_string(),
+            "Files, folders and a terminal  (your devices)".to_string(),
+            "Files and folders only".to_string(),
         ];
         match codeentry::pick("WHAT THIS DEVICE MAY DO", &choices)? {
-            Some(1) => interactive_shell = true,
+            Some(1) => without_shell = true,
             Some(_) => {}
             None => return Err(cancelled()),
         }
     }
+    // Prefixes pulled out of `--allow route:<cidr>`; empty for every other kind
+    // of invitation, which keeps those tokens byte-identical v2.
+    let mut route_prefixes: Vec<String> = Vec::new();
+
     let default_ttl = if kind == "device" { "30d" } else { "1h" };
     // INTERACTIVE PARITY FOR A RUNNER. The flags answer three questions --
     // --reuse (how many boxes), --expires (how long each), --allow (what each
@@ -186,9 +191,9 @@ pub(crate) async fn add_for_cmd(
             // --allow, deliberately, the same as for anyone else.
             vec!["transfer".to_string()]
         } else if kind == "device" {
-            let mut c = vec!["transfer".to_string(), "mount".to_string()];
-            if interactive_shell {
-                c.push("shell".to_string());
+            let mut c = crate::pair_cmd::default_device_ceiling();
+            if without_shell {
+                c.retain(|cap| cap != "shell");
             }
             c
         } else {

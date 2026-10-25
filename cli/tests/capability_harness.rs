@@ -410,6 +410,19 @@ fn spawn_daemon_inner(
     name: &str,
     config_dir: &Path,
 ) -> (Child, Arc<Mutex<Vec<String>>>) {
+    spawn_daemon_with(bin, server, name, config_dir, true)
+}
+
+/// `blanket_shell = false` starts the daemon WITHOUT `up --shell`, so the only
+/// way a shell can be admitted is the capability gate itself: what the
+/// owned-device shell cell must observe (docs/owned-shell-default.md).
+fn spawn_daemon_with(
+    bin: &Path,
+    server: &str,
+    name: &str,
+    config_dir: &Path,
+    blanket_shell: bool,
+) -> (Child, Arc<Mutex<Vec<String>>>) {
     std::fs::create_dir_all(config_dir).expect("create config dir");
     let stderr_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let log_clone = stderr_log.clone();
@@ -426,10 +439,9 @@ fn spawn_daemon_inner(
         .env("TUNLION_NAME", name)
         .arg("up")
         .arg("--userspace")
-        .arg("--shell")
         // This hermetic harness deliberately exercises the owner-equivalent shell
         // path. Its config dir and paired peers are throwaway test state.
-        .arg("--i-know")
+        .args(if blanket_shell { &["--shell", "--i-know"][..] } else { &[][..] })
         .arg("--server")
         .arg(server)
         // NO `--relay` HERE. It means "force TURN relay": the ICE transport
@@ -2410,7 +2422,7 @@ fn clean_joiner_dir(h: &Harness, name: &str) -> PathBuf {
 }
 
 /// `add --for device` and `add --for person` mint different SIGNED ceilings:
-/// device carries transfer+mount, person carries transfer only. The difference
+/// device carries transfer+mount+shell, person carries transfer only. The difference
 /// lives in the signed auth-key caps, which is exactly what the delegated-
 /// ceiling gate (`cap_gate_effective`'s `action in auth_key_caps` check) enforces
 /// at serve time. So the difference is enforced, not just displayed: a
@@ -2468,8 +2480,9 @@ fn add_for_device_and_person_carry_different_caps() {
     device_caps.sort();
     assert_eq!(
         device_caps,
-        vec!["mount".to_string(), "transfer".to_string()],
-        "device invitation must carry transfer+mount in the SIGNED ceiling"
+        vec!["mount".to_string(), "shell".to_string(), "transfer".to_string()],
+        "an own-device invitation signs transfer+mount+shell (docs/owned-shell-default.md); \
+         the shell still needs the target's local acceptance"
     );
     let person_caps = parse(&person_file).caps;
     assert_eq!(
@@ -2757,4 +2770,159 @@ fn join_does_not_change_the_capability_store() {
          joiner store: {}",
         std::fs::read_to_string(&joiner_caps).unwrap_or_default()
     );
+}
+
+/// Enrol B as one of A's OWN devices over a spoken code (`add --for device`),
+/// so A is the primary (it holds the owner key) and B a member whose
+/// owner-signed ceiling includes shell by default.
+fn own_device_enrol(bin: &Path, server: &str, a_dir: &Path, b_dir: &Path, word: &str) {
+    let mut create = Command::new(bin);
+    create
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_CONFIG_DIR", a_dir)
+        .env("TUNLION_NAME", "test-a")
+        .args(["--server", server, "--yes", "add", "--for", "device", "--name", "test-b", "--word", word]);
+    let create_proc = spawn_captured(create).expect("own-device add spawn");
+    let word_lower = word.to_lowercase();
+    let started = Instant::now();
+    let code = loop {
+        let (stdout, stderr) = create_proc.snapshot();
+        let text = format!("{stdout}\n{stderr}");
+        let lower = text.to_lowercase();
+        if let Some(start) = lower.find(&word_lower) {
+            if let Some(tok) = text[start..]
+                .split_whitespace()
+                .find(|w| w.to_lowercase().contains(&word_lower) && w.split('-').count() >= 4)
+            {
+                break tok.to_lowercase();
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(60), "own-device add did not mint a code within 60s");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut claim = Command::new(bin);
+    claim
+        .env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_CONFIG_DIR", b_dir)
+        .env("TUNLION_NAME", "test-b")
+        .args(["--server", server, "--yes", "join", &code]);
+    let claim_out = spawn_captured(claim).expect("join spawn").wait_until(Duration::from_secs(90));
+    let create_out = create_proc.wait_until(Duration::from_secs(90));
+    assert!(
+        matches!(create_out.outcome, ChildOutcome::ExitedSuccess(_)),
+        "own-device add failed: {}\n{}",
+        create_out.stdout,
+        create_out.stderr
+    );
+    assert!(
+        matches!(claim_out.outcome, ChildOutcome::ExitedSuccess(_)),
+        "own-device join failed: {}\n{}",
+        claim_out.stdout,
+        claim_out.stderr
+    );
+}
+
+/// `tunlion shell <peer> -- echo <nonce>` from `dir`, bounded.
+fn shell_echo(bin: &Path, server: &str, dir: &Path, peer: &str, nonce: &str) -> CapturedChild {
+    let mut cmd = Command::new(bin);
+    cmd.env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", "1")
+        .env("TUNLION_CONFIG_DIR", dir)
+        .args(["--server", server, "shell", peer, "--", "echo", nonce]);
+    run_captured(cmd, Duration::from_secs(60))
+}
+
+fn set_own_devices_shell(bin: &Path, dir: &Path, value: &str) {
+    let out = Command::new(bin)
+        .env("TUNLION_CONFIG_DIR", dir)
+        .args(["set", "own-devices-shell", value])
+        .output()
+        .expect("set own-devices-shell");
+    assert!(out.status.success(), "set own-devices-shell {value}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+fn echoed(out: &CapturedChild, nonce: &str) -> bool {
+    out.stdout.contains(nonce) || out.stderr.contains(nonce)
+}
+
+/// docs/owned-shell-default.md, end to end with two real daemons that run
+/// WITHOUT `up --shell`: no blanket policy and no per-device grant, so every
+/// admitted shell below came through the owned-device class.
+///   1. primary -> member: allowed (a member accepts its owner's devices).
+///   2. member -> primary: refused until the primary opts in once.
+///   3. primary opts in: allowed.
+///   4. member opts out: refused.
+///   5. opting out ENDS a live shell from the owner's device.
+#[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "cold establish not yet verified on this platform")]
+fn owned_device_shell_member_default_primary_opt_in_and_opt_out_ends_live() {
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+    own_device_enrol(&bin, &server, &h.a_dir, &h.b_dir, &format!("ownshell-mesh-p{:x}", std::process::id()));
+
+    let (child_a, log_a) = spawn_daemon_with(&bin, &server, "test-a", &h.a_dir, false);
+    let (child_b, log_b) = spawn_daemon_with(&bin, &server, "test-b", &h.b_dir, false);
+    h.daemon_a = Some(child_a);
+    h.daemon_b = Some(child_b);
+    h.daemon_a_log = log_a;
+    h.daemon_b_log = log_b;
+    let discovered = wait_for_line(&h.daemon_a_log, "known device 'test-b' appeared", Duration::from_secs(45))
+        || wait_for_line(&h.daemon_b_log, "known device 'test-a' appeared", Duration::from_secs(5));
+    assert!(discovered, "the enrolled devices never found each other");
+
+    let n1 = format!("OWNED-1-{}", std::process::id());
+    let out = shell_echo(&bin, &server, &h.a_dir, "test-b", &n1);
+    assert!(echoed(&out, &n1), "primary -> member must be allowed with no grant:\n{}\n{}", out.stdout, out.stderr);
+
+    let n2 = format!("OWNED-2-{}", std::process::id());
+    let out = shell_echo(&bin, &server, &h.b_dir, "test-a", &n2);
+    assert!(!echoed(&out, &n2), "member -> primary must be refused before the primary opts in:\n{}\n{}", out.stdout, out.stderr);
+    assert!(!matches!(out.outcome, ChildOutcome::ExitedSuccess(_)), "a refused shell must not exit 0");
+
+    set_own_devices_shell(&bin, &h.a_dir, "on");
+    let n3 = format!("OWNED-3-{}", std::process::id());
+    let out = shell_echo(&bin, &server, &h.b_dir, "test-a", &n3);
+    assert!(echoed(&out, &n3), "member -> primary must be allowed after the opt-in:\n{}\n{}", out.stdout, out.stderr);
+
+    set_own_devices_shell(&bin, &h.b_dir, "off");
+    let n4 = format!("OWNED-4-{}", std::process::id());
+    let out = shell_echo(&bin, &server, &h.a_dir, "test-b", &n4);
+    assert!(!echoed(&out, &n4), "a member that switched owned shells off must refuse:\n{}\n{}", out.stdout, out.stderr);
+
+    // 5. A live shell ends when the target stops accepting owned shells.
+    set_own_devices_shell(&bin, &h.b_dir, "auto");
+    let start = format!("OWNED-LIVE-{}", std::process::id());
+    let mut live = Command::new(&bin);
+    live.env("TUNLION_CAP_AUTHORITATIVE", "0")
+        .env("TUNLION_L3_USERSPACE", "1")
+        .env("TUNLION_DIRECT_LOOPBACK_ONLY", "1")
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "shell", "test-b", "--", "sh", "-c", &format!("echo {start}; sleep 120")]);
+    let live = spawn_captured(live).expect("live shell spawn");
+    let began = Instant::now();
+    loop {
+        let (stdout, stderr) = live.snapshot();
+        if stdout.contains(&start) || stderr.contains(&start) {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "the live owned shell never started:\n{stdout}\n{stderr}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    set_own_devices_shell(&bin, &h.b_dir, "off");
+    let ended = live.wait_until(Duration::from_secs(30));
+    assert!(
+        !matches!(ended.outcome, ChildOutcome::TimedOut),
+        "opting out must END the live owned shell, not leave it running:\n{}\n{}",
+        ended.stdout,
+        ended.stderr
+    );
+    assert!(
+        !matches!(ended.outcome, ChildOutcome::ExitedSuccess(_)),
+        "an opt-out teardown must surface as a non-success exit:\n{}\n{}",
+        ended.stdout,
+        ended.stderr
+    );
+    eprintln!("OWNED SHELL E2E PASS: member default allow, primary refuse -> opt-in allow, member opt-out refuse, opt-out ended a live shell");
 }
