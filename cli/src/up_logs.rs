@@ -18,7 +18,7 @@ use crate::{
     service_manager_for_pid, settings, shell_grant_names, shell_root_note, sshkeys, subnet_forward,
     ui, write_pidfile,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -145,6 +145,89 @@ pub(crate) struct UpMode {
     pub(crate) install_system: bool,
 }
 
+/// The Windows shell plane's two startup variables. `win_pty::ShellPrivilege`
+/// reads `TUNLION_SHELL_PRIVILEGE` (`owner-equivalent`, anything else =
+/// standard) and `win_pty::spawn` reads `TUNLION_SHELL_OWNER_ACK` (`1`).
+pub(crate) const SHELL_PRIVILEGE_ENV: &str = "TUNLION_SHELL_PRIVILEGE";
+pub(crate) const SHELL_OWNER_ACK_ENV: &str = "TUNLION_SHELL_OWNER_ACK";
+
+/// What `up` must put in the daemon's environment, from the flags the daemon
+/// will run with. `None` means REMOVE the variable.
+///
+/// Derived from the flags and not from the current environment: an
+/// owner-equivalent ACK is a choice made by THIS invocation, and a daemon must
+/// not inherit one from whatever terminal (or parent `up`) started it. `--i-know`
+/// alone is not enough either: without `--shell`/`--shell-only` the policy stays
+/// `Granted` (only devices explicitly granted shell are served), so it never
+/// claims owner-equivalence.
+pub(crate) fn shell_privilege_env(
+    shell_enabled: bool,
+    i_know: bool,
+) -> [(&'static str, Option<&'static str>); 2] {
+    if shell_enabled && i_know {
+        [
+            (SHELL_PRIVILEGE_ENV, Some("owner-equivalent")),
+            (SHELL_OWNER_ACK_ENV, Some("1")),
+        ]
+    } else {
+        [
+            (SHELL_PRIVILEGE_ENV, Some("standard")),
+            (SHELL_OWNER_ACK_ENV, None),
+        ]
+    }
+}
+
+/// Apply [`shell_privilege_env`] to this process before the daemon can spawn a
+/// shell. The daemon usually IS this process (`up` runs `recv_cmd` in-body).
+/// The two paths that start another one -- `--detach` (a child via
+/// `spawn_detached`, which inherits this environment) and the Windows logon
+/// autostart (an HKCU Run entry that re-runs the same argv) -- either inherit
+/// it or re-derive it from the forwarded `--i-know`.
+fn apply_shell_privilege_env(shell_enabled: bool, i_know: bool) {
+    for (key, value) in shell_privilege_env(shell_enabled, i_know) {
+        // SAFETY: this runs at the top of `up`, before the daemon is spawned or
+        // starts serving, and `up` writes no other environment variable. (The
+        // tokio runtime's worker threads already exist, so a library calling
+        // `getenv` from another thread at this instant would still race; nothing
+        // on the `up` path does. `set_var` is unsafe for exactly that reason in
+        // edition 2024.)
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// The Windows half of the startup shell gate.
+///
+/// `--shell-user` is NOT implemented on Windows (no S4U, no
+/// `CreateProcessWithLogonW`), and it used to only warn and then serve the
+/// shell as this process's account, which is the opposite of what was asked.
+/// It is a refusal now, with OR without `--shell`: a daemon without `--shell`
+/// still serves devices that were explicitly granted shell (`Granted` policy +
+/// a grant turns L2 on), and those sessions would silently run as this account
+/// while the flag named another one.
+///
+/// `--shell` without `--i-know` is the STANDARD plane, not an error: the PTY
+/// uses the linked medium token when the daemon is elevated, and
+/// `win_pty::spawn` refuses when there is no such token. `--i-know` is what
+/// selects owner-equivalence (see [`shell_privilege_env`]).
+pub(crate) fn windows_shell_startup_gate(shell_user: Option<&str>) -> Result<()> {
+    if let Some(user) = shell_user {
+        bail!(
+            "--shell-user {user} is not implemented on Windows. Running a shell as another \
+             account needs CreateProcessAsUser (SE_INCREASE_QUOTA_NAME / \
+             SE_ASSIGNPRIMARYTOKEN_NAME) or CreateProcessWithLogonW (the target's password); \
+             neither is wired up. Refusing rather than serving the shell as this process's \
+             account and calling it {user}. Start tunlion from {user}'s own session, or use \
+             `runas /user:{user} tunlion ...`."
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn up_cmd(
     server: &str,
@@ -195,7 +278,28 @@ pub(crate) async fn up_cmd(
     let shell_config = settings::get_str("shell-program", None);
     let can_use_user =
         platform::Paths::shell_argv(None, shell_config.as_deref(), shell_user.as_deref()).1;
-    require_shell_owner_ack(shell_enabled, shell_user.as_deref(), can_use_user, i_know)?;
+    // WINDOWS SHELL-PRIVILEGE PLANE. Set before the gate and before anything is
+    // installed or spawned, so the daemon (this process, the `--detach` child
+    // that inherits it, or the logon autostart re-running this argv) sees it at
+    // PTY-spawn time. Unix reads neither variable, so its behavior is unchanged.
+    if cfg!(windows) {
+        apply_shell_privilege_env(shell_enabled, i_know);
+        // The Windows plane replaces the owner-equivalent requirement with the
+        // linked-medium-token default: plain `--shell` is standard, `--i-know`
+        // is the explicit owner-equivalent choice, `--shell-user` is a refusal
+        // (even without `--shell`, because a granted device still gets a shell).
+        windows_shell_startup_gate(shell_user.as_deref())?;
+        // Deliberately NO linked-token probe here. `win_pty` owns token
+        // introspection (OpenProcessToken/TokenLinkedToken/DuplicateTokenEx) and
+        // exposes only the pure `check_spawn_policy`; copying it into `up` would
+        // give two answers that can drift apart. The standard plane therefore
+        // stays per-session fail-closed in `win_pty::spawn`, and the banner below
+        // says so: a LocalSystem service (no linked token) starts but serves no
+        // shell, and `--i-know` is the explicit owner-equivalent escape.
+    } else {
+        // Unix keeps the owner-equivalent gate exactly as it was.
+        require_shell_owner_ack(shell_enabled, shell_user.as_deref(), can_use_user, i_know)?;
+    }
     // Internal: re-invoked after elevation (macOS's administrator prompt). Do
     // the system-level install directly and return. This process was started
     // with the same daemon flags, so its own argv is the one to install.
@@ -225,22 +329,9 @@ pub(crate) async fn up_cmd(
         None if shell => ShellPolicy::All,
         None => ShellPolicy::Granted,
     };
-    // --shell-user is Unix-only (uses runuser). Warn early on Windows.
-    if shell_user.is_some() && cfg!(windows) {
-        ui::say(&format!(
-            "  {} --shell-user is not supported on Windows.\n\
-             \n\
-             Windows requires CreateProcessAsUser or CreateProcessWithLogonW to run\n\
-             a process as another user. CreateProcessAsUser needs SE_INCREASE_QUOTA_NAME\n\
-             and SE_ASSIGNPRIMARYTOKEN_NAME privileges (typically requires admin).\n\
-             CreateProcessWithLogonW needs the target user's credentials (username +\n\
-             password), which is a security risk if stored or passed via CLI.\n\
-             \n\
-             The PTY will run as the current user. To run as a different user,\n\
-             start tunlion from that user's session, or use 'runas /user:<name> tunlion'.",
-            ui::paint(ui::Tone::Warn, "WARNING:")
-        ));
-    }
+    // `--shell-user` on Windows was warned about here and then silently not
+    // applied ("the PTY will run as the current user"). The startup gate above
+    // refuses it instead, so there is no fallback to describe.
     if install && system {
         return install_system_service(&daemon_argv);
     }
@@ -509,26 +600,39 @@ pub(crate) async fn up_cmd(
         ShellPolicy::Granted => {}
     }
     // Shell without a dropped account is owner-equivalent at any uid. A dropped
-    // account is only safer if it cannot read TUNLION_CONFIG_DIR.
+    // account is only safer if it cannot read TUNLION_CONFIG_DIR. Windows is
+    // the exception: plain `--shell` serves the linked medium token, so it is
+    // NOT owner-equivalent and must not be described as such.
     if shell_policy.enables_l2() {
-        let warning = match shell_user.as_deref() {
-            Some(user) if can_use_user => {
+        let warning = if cfg!(windows) {
+            if i_know {
                 format!(
-                    "  note: shell PTYs run as {user}; verify this account cannot read TUNLION_CONFIG_DIR or the drop is cosmetic"
-                )
-            }
-            Some(user) => {
-                format!(
-                    "  {} --shell-user {user} is unsupported on this platform; the PTY runs as this process's user and has the owner's authority.",
-                    ui::paint(ui::Tone::Warn, "!")
-                )
-            }
-            None => {
-                format!(
-                    "  {} serving shell without --shell-user grants the peer the owner's authority because the PTY runs as this process's user and can read the config directory.{}",
+                    "  {} OWNER-EQUIVALENT shell ON (--i-know): the linked-token requirement is waived, so a peer with shell can get this account's own authority (Administrator, or SYSTEM in a service), including this process's tokens and tunlion keys",
                     ui::paint(ui::Tone::Warn, "!"),
-                    shell_root_note()
                 )
+            } else {
+                "  note: Windows shell PTYs use the linked medium token when this daemon is elevated (the current token when it is not); they never inherit the Administrator token. A LocalSystem service has no linked token, so its shell sessions are refused -- there is no S4U fallback. --i-know would serve an owner-equivalent shell instead.".to_string()
+            }
+        } else {
+            match shell_user.as_deref() {
+                Some(user) if can_use_user => {
+                    format!(
+                        "  note: shell PTYs run as {user}; verify this account cannot read TUNLION_CONFIG_DIR or the drop is cosmetic"
+                    )
+                }
+                Some(user) => {
+                    format!(
+                        "  {} --shell-user {user} is unsupported on this platform; the PTY runs as this process's user and has the owner's authority.",
+                        ui::paint(ui::Tone::Warn, "!")
+                    )
+                }
+                None => {
+                    format!(
+                        "  {} serving shell without --shell-user grants the peer the owner's authority because the PTY runs as this process's user and can read the config directory.{}",
+                        ui::paint(ui::Tone::Warn, "!"),
+                        shell_root_note()
+                    )
+                }
             }
         };
         ui::say(&warning);
@@ -1017,6 +1121,70 @@ mod already_up_tests {
         let up = cmd.split_once(" && ").unwrap().1;
         let argv: Vec<&str> = up.split_whitespace().collect();
         assert!(crate::Cli::try_parse_from(&argv).is_ok(), "does not parse: {up}");
+    }
+
+    /// The Windows privilege plane is chosen by the flags, never by the
+    /// environment the daemon happens to inherit: `--i-know` WITH `--shell` is
+    /// owner-equivalence; everything else is standard and clears a stale ACK.
+    /// `--i-know` alone leaves the policy at `Granted` -- only explicitly
+    /// granted devices get a shell, and it gets the standard plane.
+    #[test]
+    fn the_shell_privilege_plane_follows_i_know_and_only_with_shell() {
+        assert_eq!(
+            shell_privilege_env(true, true),
+            [
+                (SHELL_PRIVILEGE_ENV, Some("owner-equivalent")),
+                (SHELL_OWNER_ACK_ENV, Some("1"))
+            ]
+        );
+        for (shell_enabled, i_know) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                shell_privilege_env(shell_enabled, i_know),
+                [
+                    (SHELL_PRIVILEGE_ENV, Some("standard")),
+                    (SHELL_OWNER_ACK_ENV, None)
+                ],
+                "shell={shell_enabled} i_know={i_know} must not claim owner-equivalence"
+            );
+        }
+        // The names and values are the ones `win_pty` reads.
+        assert_eq!(SHELL_PRIVILEGE_ENV, "TUNLION_SHELL_PRIVILEGE");
+        assert_eq!(SHELL_OWNER_ACK_ENV, "TUNLION_SHELL_OWNER_ACK");
+
+        // `--i-know` is not a shell switch. On its own it must leave the shell
+        // disabled, so `up` derives shell_enabled = false above and can never
+        // hand out the owner-equivalent plane (or a shell) from it alone.
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["tunlion", "up", "--i-know"])
+            .expect("up --i-know parses");
+        let Some(crate::Cmd::Up { shell, shell_only, i_know, .. }) = cli.cmd else {
+            panic!("`up --i-know` did not parse as `up`");
+        };
+        assert!(!shell && shell_only.is_none(), "--i-know must not enable shell");
+        assert!(i_know);
+        assert_eq!(
+            shell_privilege_env(shell || shell_only.is_some(), i_know),
+            [
+                (SHELL_PRIVILEGE_ENV, Some("standard")),
+                (SHELL_OWNER_ACK_ENV, None)
+            ]
+        );
+    }
+
+    /// `--shell-user` on Windows is not implemented, so it must refuse rather
+    /// than warn and silently serve the shell as the current account. That holds
+    /// WITHOUT `--shell` too: a `Granted` daemon still serves devices that were
+    /// explicitly granted shell, and those sessions would run as the wrong
+    /// account. Plain `--shell` stays allowed (standard token plane).
+    #[test]
+    fn windows_shell_user_is_refused_instead_of_silently_ignored() {
+        let err = windows_shell_startup_gate(Some("alice"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--shell-user alice"), "{err}");
+        assert!(err.contains("not implemented"), "{err}");
+        assert!(!err.contains("CreateProcessAsUser needs"), "no S4U claim: {err}");
+        assert!(windows_shell_startup_gate(None).is_ok());
     }
 }
 

@@ -87,10 +87,7 @@ pub(crate) async fn add_for_cmd(
     out: Option<PathBuf>,
 ) -> Result<()> {
     use base64::Engine;
-    // Before any question or prompt: no identity, no invitation (exit 9).
-    if let Some(e) = crate::identity_flow::add_needs_init() {
-        return Err(e);
-    }
+    // Identity bootstrap belongs at the mint below, after validation and review.
     // The Some("") -> "ask me" normalisation now lives in resolve_for_kind, so
     // both callers get it. Doing it here as well is what let the other caller
     // look correct while it was not.

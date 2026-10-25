@@ -11,8 +11,8 @@
 #   N  `up` and `up --detach` on a device with no identity and nothing paired
 #      exit 9 and name `tunlion init`, starting nothing; a device with only a
 #      code-paired device still runs the receive-only daemon (item 5).
-#   A  `add z` on a device with no identity exits 9, names `tunlion init`, and
-#      writes no identity (it used to mint one with no recovery phrase) (item 6).
+#   A  `add z` on a fresh device bootstraps securely without a setup wizard;
+#      repeated add preserves the original identity.
 #   M  `send --remember x` to a receiver that does not remember prints one
 #      outcome: never "remembered this device as" next to "declined", and no
 #      "identity challenge NOT answered" from a sender with no identity (item 7).
@@ -77,15 +77,16 @@ else
 fi
 
 # ---------------------------------------------------------------------- A --
-say "A: add on a device with no identity exits 9 and mints nothing"
+say "A: add bootstraps once without an identity setup wizard"
 DA_="$WORK/a"; mkdir -p "$DA_"
-t "$DA_" add z >"$WORK/a1.log" 2>&1; ra=$?
+t "$DA_" add z --out "$WORK/z-first-inv.txt" --yes >"$WORK/a1.log" 2>&1; ra=$?
+cp "$DA_/identity.ed25519" "$WORK/a-identity-before" 2>/dev/null
 t "$DA_" add z --out "$WORK/z-inv.txt" --yes >"$WORK/a2.log" 2>&1; ra2=$?
 echo "## add z rc=$ra, add z --out rc=$ra2"; cat "$WORK/a1.log"
-if [ "$ra" = 9 ] && [ "$ra2" = 9 ] && grep -q "tunlion init" "$WORK/a1.log" \
-   && ! grep -q "created your identity" "$WORK/a1.log" "$WORK/a2.log" \
-   && [ ! -e "$DA_/identity.ed25519" ] && [ ! -e "$WORK/z-inv.txt" ]; then
-  ok "A: add with no identity exits 9, names tunlion init, and writes no identity or invitation"
+if [ "$ra" = 0 ] && [ "$ra2" = 0 ] \
+    && cmp -s "$DA_/identity.ed25519" "$WORK/a-identity-before" \
+    && [ -e "$WORK/z-first-inv.txt" ] && [ -e "$WORK/z-inv.txt" ]; then
+  ok "A: add bootstraps securely and repeated add preserves the identity"
 else
   bad "A add without identity (rc $ra/$ra2)"; ls -la "$DA_"; cat "$WORK/a2.log"
 fi

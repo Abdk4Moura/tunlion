@@ -1598,6 +1598,11 @@ fn reader_task(
             }
             let kind = hdr[0];
             let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+            if kind == KIND_CONTROL && len > crate::control_limits::MAX_CONTROL_BYTES {
+                dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                note_reader_exit(&peer_id, primary, "control-metadata-too-large", frames, true);
+                break;
+            }
             // Guard against an absurd length (a corrupt/hostile peer); cap well
             // above MAX_DIRECT_PAYLOAD + the 4-byte sid.
             if len > MAX_DIRECT_PAYLOAD + 64 {
@@ -1633,14 +1638,14 @@ fn reader_task(
             frames += 1;
             match kind {
                 KIND_CONTROL => {
-                    match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => {
+                    match crate::control_limits::decode_control(&body) {
+                        Some(v) => {
                             let _ = tx.send(crate::net::Ev::Control(peer_id.clone(), v));
                         }
                         // A control frame we cannot parse used to vanish here with
                         // no trace; it is a frame the peer believes it sent.
-                        Err(e) => crate::hooks::debug(&format!(
-                            "l2: control frame dropped (unparseable) peer={peer_id} err={e} frames={frames}"
+                        None => crate::hooks::debug(&format!(
+                            "l2: control frame dropped (invalid or over metadata limits) peer={peer_id} frames={frames}"
                         )),
                     }
                 }

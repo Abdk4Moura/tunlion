@@ -564,6 +564,7 @@ pub(crate) async fn async_main() -> Result<()> {
             | Cmd::Update { .. }
             | Cmd::Skill { .. }
             | Cmd::Demo { .. }
+            | Cmd::WinPtyRelay { .. }
     );
     if !exempt {
         // A verb with its own --json flag must still answer in JSON.
@@ -1198,6 +1199,20 @@ pub(crate) async fn async_main() -> Result<()> {
             via,
         } => {
             // `--reuse` only means something for a bounded invitation artifact.
+            if ui_caps.interactive && who.is_none() && name.is_none() && word.is_none()
+                && for_.is_none() && allow.is_empty() && expires.is_none()
+                && reuse.is_none() && out.is_none() && via.is_none()
+            {
+                let choices = vec!["Connect a remembered device".to_string(), "Temporary access".to_string()];
+                match codeentry::pick("ADD", &choices)? {
+                    Some(0) => {}
+                    Some(_) => {
+                        let spec = crate::access_ui::temporary_access()?;
+                        return crate::pair_cmd::temporary_cmd(&server, spec, relay).await;
+                    }
+                    None => return Err(cancelled()),
+                }
+            }
             // Parse it before any prompt or mint so a typo, 0 or an
             // unrepresentable count fails with exit 2 and nothing on disk.
             let reuse = reuse
@@ -1375,19 +1390,8 @@ pub(crate) async fn async_main() -> Result<()> {
                 let internal = kind == "device";
                 crate::pair_cmd::FOR_PERSON
                     .store(kind == "person", std::sync::atomic::Ordering::Relaxed);
-                if internal {
-                    if let Some(e) = crate::identity_flow::add_needs_init() {
-                        return Err(e);
-                    }
-                }
-                if internal && load_owner_key().is_none() {
-                    bail!(
-                        "`add --for device` enrols the other side into your mesh, which \
-                         needs this machine's owner key. Only the device you ran \
-                         `tunlion init` on holds it: run it there, or use \
-                         `--for person` to pair without enrolling."
-                    );
-                }
+                // The ceremony securely bootstraps only when it is ready to
+                // mutate. Existing/joined identities are never replaced.
                 // `--expires` is the certificate lifetime here, parsed and
                 // bounded the same way as the invitation path above. Resolved
                 // before the ceremony so a bad value fails before a code shows.
@@ -1947,6 +1951,14 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             }
         }
+        Cmd::WinPtyRelay {
+            cols,
+            rows,
+            resize,
+            argv,
+        } => crate::win_pty::relay(cols, rows, &resize, &argv),
+        #[cfg(all(windows, feature = "test-hooks"))]
+        Cmd::WinPtySmoke { mode } => crate::win_pty::smoke(&mode),
         Cmd::Netcat { peer, rport } => {
             // Hidden one-release alias for the netcat shape, now forward --stdio.
             #[cfg(not(feature = "forward-server"))]

@@ -102,6 +102,11 @@ mod enrollment;
 mod membership;
 /// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
+mod access_ui;
+mod temporary_session;
+mod access_end;
+mod folder_access;
+mod terminal_access;
 #[cfg(test)]
 use pair_cmd::invitation_not_a_code_msg;
 /// `tunlion up` / `tunlion logs`.
@@ -287,6 +292,7 @@ mod shutdown;
 mod sshd;
 mod sshkeys;
 mod local;
+mod win_pty;
 mod ui;
 mod style;
 mod fleet_ui;
@@ -1743,7 +1749,32 @@ fn verb_on_command_line() -> Option<String> {
     })
 }
 
+/// Windows debug/release builds can exhaust the default 1 MB main-thread stack
+/// while constructing the large Clap command tree, before `main` can dispatch
+/// even a harmless command. The observed failure was an interactive shell
+/// printing `thread 'main' has overflowed its stack` before the menu. Run the
+/// real entry point on a bounded larger stack. This is a startup-stack fix, not
+/// a privilege or sandbox boundary.
+#[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    match std::thread::Builder::new()
+        .name("tunlion-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(main_inner)
+    {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| std::process::ExitCode::from(1)),
+        Err(_) => main_inner(),
+    }
+}
+
+#[cfg(not(windows))]
+fn main() -> std::process::ExitCode {
+    main_inner()
+}
+
+fn main_inner() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.

@@ -222,7 +222,9 @@ mod tests {
         let status = core.status().unwrap();
         assert_eq!(status.fingerprint, None);
         assert_eq!(status.engine, crate::EngineState::NotLinked);
-        assert!(matches!(core.start(), Err(CoreError::Identity(_))));
+        std::fs::write(core.inner.config_dir().join("config"),"server\n").unwrap();
+        assert!(matches!(core.start(), Err(CoreError::Config(_))));
+        assert_eq!(core.status().unwrap().fingerprint,None);
     }
 
     #[test]
