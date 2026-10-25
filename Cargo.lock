@@ -1229,7 +1229,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
- "smoltcp",
  "socket2 0.5.10",
  "spake2",
  "tar",
@@ -1238,7 +1237,6 @@ dependencies = [
  "windows-sys 0.59.0",
  "winfsp",
  "winfsp-sys",
- "wintun",
  "zeroize",
  "zip",
 ]
@@ -1322,9 +1320,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "smoltcp",
  "tokio",
  "webrtc",
  "windows-sys 0.59.0",
+ "wintun",
 ]
 
 [[package]]

@@ -74,6 +74,8 @@ pub mod holepunch;
 pub mod host;
 pub mod identity;
 pub mod l2;
+#[cfg(feature = "l3")]
+pub mod l3;
 pub mod limits;
 pub mod link_manager;
 pub mod liveness;

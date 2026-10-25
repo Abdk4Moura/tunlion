@@ -66,11 +66,11 @@ const state = {
     { id: 'p-off', uid: 'u-off', name: 'nas', known: 'nas', status: 'failed', route: null, lastSeen: '3 h ago', shell: true },
   ],
   knownDevices: [
-    { name: 'web-vps', caps: ['transfer'], addedAt: Date.UTC(2026, 9, 1) },
-    { name: 'laptop', caps: ['transfer'], addedAt: Date.UTC(2026, 9, 2) },
-    { name: 'nas', caps: ['transfer'], addedAt: Date.UTC(2026, 9, 3) },
+    { name: 'web-vps', secret: '11'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 1) },
+    { name: 'laptop', secret: '22'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 2) },
+    { name: 'nas', secret: '33'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 3) },
     // remembered but not in the room at all
-    { name: 'old-phone', caps: ['transfer'], addedAt: Date.UTC(2026, 8, 1) },
+    { name: 'old-phone', secret: '44'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 8, 1) },
   ],
   transfers: [],
   pendingKeeps: [],

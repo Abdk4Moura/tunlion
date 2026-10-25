@@ -1380,6 +1380,72 @@ for a hold to bind to.
 - FUTURE WORK, not built: the cleaner shape is client-side (the client
   waits for a "proven" acknowledgement before sending the open), which
   would remove the server-side hold entirely.
+## L3 overlay state (`addr --json`, `devices --json`, `expose`)
+
+A derived overlay address is an identity, not a route. Every machine-readable
+command that mentions one now carries the LIVE endpoint state:
+
+```json
+"l3": {"state": "ready|down|starting", "mode": "kernel|userspace|none", "reason": "..."}
+```
+
+- `ready` is emitted only after the daemon's `MeshTunnel` endpoint exists, so
+  `dial` and `bind` can actually work. It is never inferred from a stored or
+  key-derived address.
+- `down` means no endpoint exists; `reason` is a short operator-facing cause.
+- `starting` is a transient startup state and must not be treated as `ready`.
+- `mode` distinguishes the kernel TUN/Wintun path from the userspace smoltcp
+  netstack, and `none` when there is no endpoint.
+- `addr --json` puts the object at the top level. `devices --json` puts it at
+  `data.l3` (it describes the LOCAL machine, shared by every row).
+- Text `addr` prints the address but explicitly says it is identity-only when
+  the state is not `ready`. `addr --v4` still prints the bare address, with the
+  same warning on stderr.
+- `expose <port>` exits zero only after the daemon records that exact port as
+  BOUND (the port accepts on the overlay). A saved-but-unbound request exits
+  nonzero with the bind failure or the missing-endpoint reason. `expose --list`
+  marks each port `[bound]` or `[NOT bound: ...]`.
+- The userspace path binds through the same `MeshTunnel::bind` and needs no TUN.
+- The daemon reconciles `expose.json` on a short tick even where there is no
+  unix control socket (Windows), so `expose` is verified on every platform.
+
+## `filament-peerloop::l3` — the overlay library (embedding)
+
+The CLI daemon is now a caller of this library, not the owner of a second copy.
+Enable Cargo feature `l3` (it implies `mesh`). The public API is:
+
+```rust
+use filament_peerloop::l3::{L3, L3Mode, L3Options, PeerLink};
+
+let tunnel = L3::start(cidr, mtu, Some(identity), L3Mode::Userspace)?; // no TUN
+let listener = tunnel.bind(9110).await?;       // overlay listener (kernel or netstack)
+let stream   = tunnel.dial(peer_addr, 9110).await?;
+let addr     = tunnel.addr_of("bob").await;    // verified peer only
+let verified = tunnel.is_verified_peer(src).await;
+
+let link = PeerLink::new(tunnel.clone());
+let stream = link.open_overlay("bob", 9110).await?; // resolve + verify + dial
+```
+
+- `L3::start(cidr, mtu, identity, mode)` is the whole surface an embedder needs.
+  `L3::start_with(..., L3Options)` additionally supplies advertised prefixes,
+  signaling carve-outs, a `LogSink` and the PERSISTED announce-sequence counter
+  (the CLI passes its file-backed counter; the default is in-process and honest
+  about it).
+- `L3Mode::Userspace` needs NO TUN, no CAP_NET_ADMIN and no `/dev/net/tun`; it
+  runs the in-process smoltcp netstack behind the same `bind`/`dial`. `Auto`
+  tries the kernel TUN then falls back; `Kernel` fails rather than silently
+  switching planes.
+- `PeerLink::open_overlay(name, port)` resolves a petname through the verified
+  route table, refuses an unknown/unverified name, and only then dials. It never
+  accepts a caller-asserted address.
+- The host trait boundary is unchanged: the receive loop still asks
+  `HostServices::l3_start`, and `l3_state_report` publishes the live
+  `{state,mode,reason}` record. The library never calls back into the CLI.
+- Kernel TUN backends remain per-OS (Linux `/dev/net/tun`, macOS utun, Windows
+  Wintun, Android) and are selected only in `Kernel`/`Auto`; the userspace path
+  gates on no OS device at all.
+
 ## Certify (`tunlion certify <device>` -- NeedsReview exit)
 
 A NeedsReview device has a record but no stored certificate and is trusted

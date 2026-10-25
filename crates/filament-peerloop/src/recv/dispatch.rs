@@ -23,8 +23,8 @@ use crate::l2::{self, Mux};
 use crate::limits::MAX_ATTEMPTS;
 #[cfg(feature = "mesh")]
 use crate::mesh::{
-    accept_advertised, advertised_prefixes, sanitize_host, L3Mode, RouteAcceptance, RoutePolicy,
-    IFNAME,
+    accept_advertised, advertised_prefixes, l3_mode_word, sanitize_host, L3Mode, L3Status,
+    RouteAcceptance, RoutePolicy, IFNAME,
 };
 use crate::present::{Ask, Presentation};
 use crate::recv::ceremony::{Ceremony, Inbound as PakeInbound};
@@ -1556,6 +1556,10 @@ async fn recv_run(
     // (review fix #3).
     #[cfg(feature = "mesh")]
     let mut l3_seen: HashMap<String, Announce> = HashMap::new();
+    // The live state published to siblings. `ready` is set only from the Ok arm
+    // of `l3_start`, i.e. only when there is a real endpoint to bind/dial.
+    #[cfg(feature = "mesh")]
+    let mut l3_status = L3Status::down("none", "L3 has not started");
     #[cfg(not(feature = "mesh"))]
     let l3: Option<std::sync::Arc<dyn MeshTunnel>> = None;
     #[cfg(feature = "mesh")]
@@ -1567,6 +1571,7 @@ async fn recv_run(
                         Ok(id) => (format!("{}/128", id.addr()), Some(id)),
                         Err(e) => {
                             log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
+                            l3_status = L3Status::down("none", e.to_string());
                             (String::new(), None)
                         }
                     }
@@ -1584,8 +1589,20 @@ async fn recv_run(
                         Some("userspace") => L3Mode::Userspace,
                         _ => L3Mode::Auto,
                     };
+                    // Publish `starting` BEFORE the endpoint is created. A slow
+                    // TUN/Wintun/netstack start otherwise leaves siblings reading
+                    // the old `down` (or a stale record) and calling an address
+                    // unusable. Only the Ok arm below may turn this into `ready`.
+                    l3_status = {
+                        let mut report = |text: &str| host.l3_state_report(text);
+                        l3_start_begin(mode, &mut report)
+                    };
                     match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
+                            l3_status = L3Status::ready(l3_mode_word(m.is_userspace()));
+                            if let Ok(text) = serde_json::to_string(&l3_status) {
+                                host.l3_state_report(&text);
+                            }
                             let addr = m.my_addr().map(|a| a.to_string()).unwrap_or(cidr);
 
                             // Subnet router: if this machine offers prefixes, make
@@ -1729,16 +1746,36 @@ async fn recv_run(
                         }
                         Err(e) => {
                             log.say(&log.paint(Tone::Warn, &format!("  L3 disabled: {e}")));
+                            l3_status = L3Status::down("none", e.to_string());
+                            if let Ok(text) = serde_json::to_string(&l3_status) {
+                                host.l3_state_report(&text);
+                            }
                             None
                         }
                     }
                 }
             }
-            None => None,
+            None => {
+                l3_status = L3Status::down(
+                    "none",
+                    "tun-addr is not set (run: tunlion set tun-addr auto, then tunlion up)",
+                );
+                None
+            }
         }
     } else {
+        l3_status = L3Status::down("none", "the daemon is not running");
         None
     };
+    #[cfg(feature = "mesh")]
+    let l3_status_json = serde_json::to_value(&l3_status)
+        .unwrap_or_else(|_| json!({"state": "down", "mode": "none", "reason": "L3 state unavailable"}));
+    #[cfg(feature = "mesh")]
+    if let Ok(text) = serde_json::to_string(&l3_status) {
+        host.l3_state_report(&text);
+    }
+    #[cfg(not(feature = "mesh"))]
+    let l3_status_json = json!({"state": "down", "mode": "none", "reason": "this build has no mesh feature"});
     // `tunlion expose`: once the overlay is up, bind the persisted ports on the
     // overlay address. The optional exposer lives in the host server; the loop
     // only asks it to reconcile.
@@ -1782,6 +1819,11 @@ async fn recv_run(
     let mut digest_alone = false;
     // C30 phase 3: link mini-sync, state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
+    // Cross-platform `expose` apply: the control socket is unix-only, so on
+    // Windows an `expose` in a sibling process could only write expose.json and
+    // believe it. Reconcile on a short tick wherever an L3 endpoint exists, and
+    // let expose-bound.json be the truth the CLI waits for.
+    let mut last_expose_tick = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
@@ -2179,6 +2221,10 @@ async fn recv_run(
                             // iteration, so a just-minted invitation's enrollment
                             // channel is subscribed before the joiner can arrive.
                             req.reply(&json!({ "ok": true })).await;
+                        } else if matches!(&req.kind, ReqKind::L3State) {
+                            // `addr`/`devices --json`/`expose`: report the LIVE
+                            // endpoint, never a derived address that cannot bind.
+                            req.reply(&json!({ "ok": true, "l3": l3_status_json.clone() })).await;
                         } else if matches!(&req.kind, ReqKind::ReloadExpose) {
                             // `tunlion expose`/`unexpose`: reconcile overlay
                             // listeners from expose.json. live:true only if L3 is up.
@@ -3504,6 +3550,11 @@ async fn recv_run(
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
+        }
+
+        if daemon && l3.is_some() && last_expose_tick.elapsed() >= Duration::from_secs(1) {
+            last_expose_tick = Instant::now();
+            ports.servers.reload_expose().await;
         }
 
         // C30 phase 3: state pings, each open link hears our transfer/away
@@ -9311,6 +9362,23 @@ fn note_refusal(
         report.note_refused(name, size, token, msg, class);
     }
 }
+/// Publish `starting` before the packet endpoint is created, and return the
+/// state dispatch keeps while `l3_start` runs. Split out so the ordering is
+/// testable without a TUN: the callback runs exactly once, before the caller
+/// performs its (possibly slow) start.
+#[cfg(feature = "mesh")]
+fn l3_start_begin(mode: L3Mode, report: &mut dyn FnMut(&str)) -> L3Status {
+    let mode_word = match mode {
+        L3Mode::Userspace => "userspace",
+        L3Mode::Kernel | L3Mode::Auto => "kernel",
+    };
+    let status = L3Status::starting(mode_word);
+    if let Ok(text) = serde_json::to_string(&status) {
+        report(&text);
+    }
+    status
+}
+
 #[cfg(test)]
 mod caps_reannounce_tests {
     use super::caps_reannounce;
@@ -10449,5 +10517,42 @@ mod inventory {
                 "receive-loop test {name} is missing or duplicated"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "mesh"))]
+mod l3_start_state_tests {
+    use super::*;
+
+    /// The state a sibling reads WHILE a slow start is in flight. It must be
+    /// `starting`, published before the (here simulated) slow call, not the old
+    /// `down` and not a premature `ready`.
+    #[test]
+    fn starting_is_published_before_a_slow_start_completes() {
+        let mut published: Vec<String> = Vec::new();
+        let status = l3_start_begin(L3Mode::Auto, &mut |text| published.push(text.to_string()));
+        assert_eq!(status.state, "starting");
+        assert_eq!(published.len(), 1, "exactly one starting report before the call");
+        let v: Value = serde_json::from_str(&published[0]).unwrap();
+        assert_eq!(v["state"], "starting");
+        assert_eq!(v["mode"], "kernel", "Auto is attempting the kernel plane first");
+        assert!(v.get("reason").is_none(), "starting is not a failure");
+
+        // Stand in for a slow host.l3_start: no ready/down has been published,
+        // so addr/expose still see `starting`.
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&published[0]).unwrap()["state"],
+            "starting"
+        );
+
+        // The ready transition is a LATER report, and only that one is ready.
+        let ready = L3Status::ready("userspace");
+        published.push(serde_json::to_string(&ready).unwrap());
+        assert_eq!(
+            serde_json::from_str::<Value>(published.last().unwrap()).unwrap()["state"],
+            "ready"
+        );
     }
 }

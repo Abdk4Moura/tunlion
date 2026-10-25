@@ -4171,3 +4171,17 @@ pub(crate) use recv_daemon::*;
 
 mod stdin;
 pub(crate) use stdin::spawn_stdin;
+
+/// Ask the running daemon for its live L3 state, where this platform has a
+/// control socket. Windows has no unix-domain control socket; there the
+/// PID-checked `l3-state.json` record is the truth instead.
+pub async fn l3_state_over_control() -> Option<serde_json::Value> {
+    #[cfg(unix)]
+    {
+        crate::ctl::try_l3_state().await
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}

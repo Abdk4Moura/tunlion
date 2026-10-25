@@ -36,6 +36,9 @@ default = [
     "ssh-bootstrap",
 ]
 mesh = ["dep:filament-overlay"]
+# The L3 packet plane: kernel TUN/Wintun and the userspace smoltcp netstack,
+# with the same start/dial/bind API the CLI daemon uses. Implies mesh.
+l3 = ["mesh", "dep:smoltcp", "dep:wintun"]
 # The receive dispatch loop and its host capability traits. Default-on for the
 # CLI; a reduced consumer that only wants the mechanics can omit it.
 dispatch = []
@@ -116,6 +119,8 @@ sha2 = "0.11.0"
 hex = "0.4"
 tokio = { version = "1.52.3", features = ["full"] }
 webrtc = "0.17.1"
+# Userspace L3 netstack (zero privilege, no OS device). Only with `l3`.
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"], optional = true }
 
 # The mount server's directory-relative ("*at") calls are POSIX; the non-unix
 # arm is std-only (Windows mounts go through WinFsp). Same version as the CLI.
@@ -126,6 +131,8 @@ libc = "0.2"
 # the handle's attributes, exactly as the CLI's copy did. Same pinned version and
 # features as the CLI, so the moved code compiles here unchanged.
 [target.'cfg(windows)'.dependencies]
+# Windows kernel-TUN backend (Wintun), only with the `l3` feature.
+wintun = { version = "0.5", optional = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",

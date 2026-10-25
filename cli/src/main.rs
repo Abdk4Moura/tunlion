@@ -285,6 +285,8 @@ mod tun;
 #[cfg(l3)]
 mod l3;
 #[cfg(l3)]
+mod l3_state;
+#[cfg(l3)]
 mod wg;
 mod shutdown;
 #[cfg(feature = "ssh-server")]

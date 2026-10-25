@@ -116,7 +116,7 @@ pub fn ensure_hosts_writable() {
     if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
         eprintln!("  MagicDNS names (<peer>.mesh) need write access to root-owned /etc/hosts.");
         eprintln!("  granting a per-file ACL now: {cmd}");
-        let ok = crate::platform::command("sudo")
+        let ok = crate::l3::command("sudo")
             .args(["setfacl", "-m", &format!("u:{user}:rw"), "/etc/hosts"])
             .status()
             .map(|s| s.success())
@@ -151,9 +151,9 @@ pub fn l3_grant_pending() -> Option<String> {
 /// None. Checked before any grant is offered: a container without
 /// /dev/net/tun was told to `setcap`, which cannot help there.
 pub fn l3_blocker() -> Option<String> {
-    crate::l3::kernel_overlay_blocker(
+    super::super::kernel_overlay_blocker(
         std::path::Path::new("/dev/net/tun").exists(),
-        crate::l3::ipv6_disabled(),
+        super::super::ipv6_disabled(),
     )
 }
 
@@ -175,7 +175,7 @@ pub fn ensure_net_admin_for_l3() -> bool {
         let granted = std::env::current_exe()
             .ok()
             .and_then(|exe| {
-                crate::platform::command("sudo")
+                crate::l3::command("sudo")
                     .args(["setcap", "cap_net_admin+eip"])
                     .arg(exe)
                     .status()
@@ -327,7 +327,7 @@ impl KernelTun {
 // calls (no `self.recv(..)`) so there is zero ambiguity with the trait methods and
 // no chance of accidental recursion.
 #[async_trait::async_trait]
-impl crate::tun::TunDevice for KernelTun {
+impl crate::l3::tun::TunDevice for KernelTun {
     fn name(&self) -> &str {
         KernelTun::name(self)
     }
@@ -344,7 +344,7 @@ impl crate::tun::TunDevice for KernelTun {
 /// pre-existing identical route is treated as success.
 pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     let fam = if cidr.contains(':') { "-6" } else { "-4" };
-    let out = crate::platform::command("ip")
+    let out = crate::l3::command("ip")
         .args([fam, "route", "replace", cidr, "dev", dev])
         .output()
         .context("exec ip route")?;
@@ -361,7 +361,7 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
 /// into a stream of failures.
 pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
     let fam = if cidr.contains(':') { "-6" } else { "-4" };
-    let out = crate::platform::command("ip")
+    let out = crate::l3::command("ip")
         .args([fam, "route", "del", cidr, "dev", dev])
         .output()
         .context("exec ip route del")?;
@@ -378,7 +378,7 @@ pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
 /// child `ip` inherits it. An existing identical address ("File exists") is success.
 pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
     let fam = if cidr.contains(':') { "-6" } else { "-4" };
-    let out = crate::platform::command("ip")
+    let out = crate::l3::command("ip")
         .args([fam, "addr", "add", cidr, "dev", dev])
         .output()
         .context("exec ip addr")?;
@@ -394,7 +394,7 @@ pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
 /// Run an `ip` (iproute2) command, mapping a non-zero exit to an error with the
 /// captured stderr so a misconfig is legible.
 fn ip(args: &[&str]) -> Result<()> {
-    let out = crate::platform::command("ip")
+    let out = crate::l3::command("ip")
         .args(args)
         .output()
         .context("exec ip (iproute2 not installed?)")?;

@@ -35,6 +35,66 @@ pub enum L3Mode {
     Userspace,
 }
 
+/// Machine-readable health of this node's L3 packet endpoint.
+///
+/// `state` is deliberately limited to three words so a script can gate on it:
+///
+/// - `ready`: a live [`MeshTunnel`] exists and `bind`/`dial` can work.
+/// - `starting`: the endpoint is being created (the daemon has not published a
+///   result yet). Never interchangeable with `ready`.
+/// - `down`: no live endpoint; `reason` says why in one line.
+///
+/// `mode` distinguishes `kernel` (TUN/Wintun), `userspace` (smoltcp netstack) and
+/// `none` (no endpoint). A derived overlay address is NOT evidence that either
+/// mode is live, which is the bug this type exists to make unrepresentable.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct L3Status {
+    pub state: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl L3Status {
+    /// A live endpoint that can bind and dial.
+    pub fn ready(mode: &str) -> Self {
+        Self { state: "ready".into(), mode: mode.into(), reason: None }
+    }
+
+    /// No endpoint yet, but startup is in progress.
+    pub fn starting(mode: &str) -> Self {
+        Self { state: "starting".into(), mode: mode.into(), reason: None }
+    }
+
+    /// No live endpoint. `reason` is the operator-facing cause, never empty.
+    pub fn down(mode: &str, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            state: "down".into(),
+            mode: mode.into(),
+            reason: Some(if reason.trim().is_empty() {
+                "no live L3 endpoint".to_string()
+            } else {
+                reason
+            }),
+        }
+    }
+
+    /// Is this endpoint live enough to bind/dial?
+    pub fn is_ready(&self) -> bool {
+        self.state == "ready"
+    }
+}
+
+/// The mode word for a live endpoint.
+pub fn l3_mode_word(userspace: bool) -> &'static str {
+    if userspace {
+        "userspace"
+    } else {
+        "kernel"
+    }
+}
+
 /// The prefixes this machine offers to carry, parsed from the setting.
 ///
 /// One parser for every announce path, so a route cannot be forwarded by the
@@ -205,4 +265,43 @@ pub trait MeshTunnel: Send + Sync + 'static {
     async fn is_verified_peer(&self, addr: IpAddr) -> bool;
     /// The petname recorded for a verified overlay address.
     async fn petname_of(&self, addr: IpAddr) -> Option<String>;
+}
+
+#[cfg(test)]
+mod l3_status_tests {
+    use super::*;
+
+    #[test]
+    fn three_states_serialize_with_the_documented_shape() {
+        let ready = serde_json::to_value(L3Status::ready("kernel")).unwrap();
+        assert_eq!(ready, serde_json::json!({"state":"ready","mode":"kernel"}));
+        assert!(L3Status::ready("kernel").is_ready());
+        assert_eq!(
+            serde_json::to_value(L3Status::ready("userspace")).unwrap()["mode"],
+            "userspace"
+        );
+
+        let down = serde_json::to_value(L3Status::down("none", "no /dev/net/tun")).unwrap();
+        assert_eq!(down["state"], "down");
+        assert_eq!(down["mode"], "none");
+        assert_eq!(down["reason"], "no /dev/net/tun");
+        assert!(!L3Status::down("none", "x").is_ready());
+
+        let starting = serde_json::to_value(L3Status::starting("kernel")).unwrap();
+        assert_eq!(starting["state"], "starting");
+        assert!(!L3Status::starting("kernel").is_ready());
+    }
+
+    /// A blank reason must never become an unexplained `down`.
+    #[test]
+    fn down_always_carries_a_reason() {
+        let s = L3Status::down("none", "   ");
+        assert_eq!(s.reason.as_deref(), Some("no live L3 endpoint"));
+    }
+
+    #[test]
+    fn mode_words_are_the_contract_words() {
+        assert_eq!(l3_mode_word(true), "userspace");
+        assert_eq!(l3_mode_word(false), "kernel");
+    }
 }

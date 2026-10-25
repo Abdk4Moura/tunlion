@@ -144,6 +144,16 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/peer-reload.spec.cjs
 
+      # A re-pair used to append a second known-device record for the same local
+      # petname, so both the iPad and Pixel showed two rows for one peer. Seed
+      # the broken localStorage shape, prove load migration leaves ONE online
+      # row backed by the newest secret, and Forget removes only that peer.
+      # Real Flask relay + Chromium and WebKit iPad.
+      - name: known-device dedupe
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/known-devices-dedupe.spec.cjs
+
       # The relay's generation/rename/close semantics, independent of a browser.
       - name: backend session generation
         run: python -m unittest backend.tests.test_session_generation

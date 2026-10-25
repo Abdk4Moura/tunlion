@@ -171,8 +171,15 @@ pub(crate) fn validate_grant_spec(spec: &str) -> Result<()> {
 }
 
 /// `devices --json`: the rows in the shared `--json` envelope. Pure.
-pub(crate) fn devices_json_envelope(rows: Vec<Value>) -> Value {
-    json!({ "ok": true, "verb": "devices", "schema": 2, "data": { "devices": rows } })
+pub(crate) fn devices_json_envelope(rows: Vec<Value>, l3: Value) -> Value {
+    // `data.l3` is the LOCAL endpoint's live state, shared by every row: a
+    // stored overlay address does not become reachable because it is listed.
+    json!({
+        "ok": true,
+        "verb": "devices",
+        "schema": 2,
+        "data": { "devices": rows, "l3": l3 }
+    })
 }
 
 /// The daemon's warm-link reply with only the links whose device answered a
@@ -911,6 +918,7 @@ pub(crate) async fn async_main() -> Result<()> {
                         format!("{}d ago", ago / 86400)
                     }
                 };
+                let l3_status = crate::l3_state::current().await;
                 if json_output {
                     crate::outln!(
                         "{}",
@@ -925,6 +933,7 @@ pub(crate) async fn async_main() -> Result<()> {
                             "overlayV6": stored_v6,
                             "overlayV4": stored_v4,
                             "mesh": format!("{name}.mesh"),
+                            "l3": l3_status,
                         }))?
                     );
                 } else {
@@ -938,6 +947,9 @@ pub(crate) async fn async_main() -> Result<()> {
                             .unwrap_or_default();
                         crate::outln!("  overlay:  {v6}{v4_str}");
                         crate::outln!("  mesh:     {name}.mesh");
+                        if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
+                            ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
+                        }
                         if let Some(p) = crate::proxy_state::current() {
                             ui::say(&crate::proxy_state::mesh_hint(&p));
                         }
@@ -952,6 +964,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 let id = overlay::load_identity()?;
                 let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
                 let mesh_name = l3::sanitize_host(&my_name);
+                let l3_status = crate::l3_state::current().await;
                 if json_output {
                     crate::outln!(
                         "{}",
@@ -962,14 +975,28 @@ pub(crate) async fn async_main() -> Result<()> {
                             "overlayV6": id.addr().to_string(),
                             "overlayV4": id.addr_v4().to_string(),
                             "mesh": format!("{mesh_name}.mesh"),
+                            // LIVE endpoint truth. `state:down` means the
+                            // address above is identity-only: do not dial it.
+                            "l3": l3_status,
                         }))?
                     );
                 } else if v4 {
+                    // Keep the bare address for scripts, but never let the
+                    // exit status or stderr imply it is routable.
                     crate::outln!("{}", id.addr_v4());
+                    if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
+                        // ui::say writes to stderr, so the bare address on stdout
+                        // stays machine-clean while a person still sees why it is
+                        // not routable.
+                        ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
+                    }
                 } else {
                     crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
                     crate::outln!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
                     crate::outln!("  mesh:     {mesh_name}.mesh");
+                    if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
+                        ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
+                    }
                     if let Some(p) = crate::proxy_state::current() {
                         ui::say(&crate::proxy_state::mesh_hint(&p));
                     }
@@ -1577,7 +1604,11 @@ pub(crate) async fn async_main() -> Result<()> {
                         // (docs/agent-output-audit.md section 4): the array
                         // is `data.devices`, unchanged one level down.
                         // `schema: 2`; schema 1 was the bare array.
-                        ui::json_out(&devices_json_envelope(arr));
+                        // `data.l3` makes the local endpoint's live state
+                        // explicit, so a script cannot read a stored overlay
+                        // address as a route that exists.
+                        let l3 = crate::l3_state::current().await;
+                        ui::json_out(&devices_json_envelope(arr, l3));
                     } else {
                         // "online" on this screen means what it means in
                         // --json: the device answered a liveness ping on the
@@ -2797,4 +2828,29 @@ pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
         })
         .collect();
     arr
+}
+
+#[cfg(test)]
+mod l3_envelope_tests {
+    use super::*;
+
+    /// `devices --json` must carry the live endpoint state beside the rows:
+    /// an address in a row is not evidence of a route.
+    #[test]
+    fn devices_envelope_carries_the_l3_state() {
+        let l3 = json!({"state": "down", "mode": "none", "reason": "no daemon"});
+        let v = devices_json_envelope(vec![json!({"name": "bob"})], l3.clone());
+        assert_eq!(v["verb"], "devices");
+        assert_eq!(v["schema"], 2);
+        assert_eq!(v["data"]["devices"][0]["name"], "bob");
+        assert_eq!(v["data"]["l3"], l3);
+    }
+
+    #[test]
+    fn devices_envelope_carries_ready_and_mode() {
+        let l3 = json!({"state": "ready", "mode": "userspace"});
+        let v = devices_json_envelope(vec![], l3);
+        assert_eq!(v["data"]["l3"]["state"], "ready");
+        assert_eq!(v["data"]["l3"]["mode"], "userspace");
+    }
 }

@@ -222,8 +222,24 @@ impl HostServices for CliHost {
         identity: Option<filament_overlay::Identity>,
         mode: filament_peerloop::mesh::L3Mode,
     ) -> Result<std::sync::Arc<dyn MeshTunnel>, String> {
-        let mesh = crate::l3::L3::start(cidr, mtu, identity, mode).map_err(|e| e.to_string())?;
+        // Host facts travel in, rather than the library reading CLI settings:
+        // the prefixes to advertise, the signaling addresses to carve out of an
+        // exit route, the terminal sink, and the PERSISTED announce sequence.
+        let opts = filament_peerloop::l3::L3Options {
+            advertised_prefixes: crate::l3::advertised_prefixes(),
+            signaling_addrs: crate::exit_route::signaling_addrs(),
+            log: Arc::new(CliLog),
+            next_seq: Arc::new(crate::overlay::next_announce_seq),
+        };
+        let mesh = filament_peerloop::l3::L3::start_with(cidr, mtu, identity, mode, opts)
+            .map_err(|e| e.to_string())?;
         Ok(mesh)
+    }
+    #[cfg(l3)]
+    fn l3_state_report(&self, status_json: &str) {
+        if let Ok(status) = serde_json::from_str::<filament_peerloop::mesh::L3Status>(status_json) {
+            crate::l3_state::write(&status);
+        }
     }
     fn ssh_host_pubkeys(&self) -> Vec<String> {
         crate::sshkeys::host_pubkeys()
