@@ -3478,6 +3478,18 @@ pub fn safe_unlink_staged_beneath(
     beneath_unlink(&parent, &name)
 }
 
+/// Delete the file behind this OPEN handle (never by name, so a swapped path
+/// cannot be hit).
+///
+/// GUARANTEE, by file system:
+/// - NTFS on Windows 10 1709+ (POSIX-semantics disposition): the name is gone
+///   from the directory when this returns, even if other handles to the file
+///   are still open. Same as `unlink` on Linux.
+/// - Anywhere the Ex class is refused (FAT/exFAT, older Windows, some network
+///   shares): the classic disposition only marks the file delete-pending. Its
+///   data is unreachable for new opens, but the NAME can stay listed until the
+///   last handle closes. Callers must not promise immediate name removal there;
+///   the file still disappears once every handle is dropped.
 #[cfg(windows)]
 pub(crate) fn safe_delete_open_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
