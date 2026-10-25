@@ -415,22 +415,28 @@ fn term_width() -> usize {
 
 /// Draw the list once. Returns how many lines it drew, so the caller can rewind
 /// exactly that many (never a recomputed guess).
+///
+/// The whole frame is composed in memory and written with ONE call. Written
+/// line by line, an unbuffered stderr makes every line its own console write,
+/// and on a Windows console that is slow enough to watch the menu paint itself
+/// top to bottom on every arrow press: the redraw, not the layout, is what read
+/// as heavy.
 fn render_picker(header: &str, items: &[String], sel: usize, prev: usize, hints: &[(char, &str)]) -> usize {
-    let mut err = std::io::stderr();
     let width = term_width().saturating_sub(4);
     let (first, view, above, below) = viewport_window(sel, items.len(), VIEWPORT);
+    let dim = ui::tone_code(ui::Tone::Dim);
+    let reset = ui::tone_reset();
+    let mut frame = String::with_capacity(256 + items.len() * 64);
     if prev > 0 {
-        let _ = write!(err, "\x1b[{prev}A");
+        frame.push_str(&format!("\x1b[{prev}A"));
     }
     let mut drawn = 0;
     if !header.is_empty() {
-        let _ = write!(err, "\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header));
+        frame.push_str(&format!("\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header)));
         drawn += 1;
     }
-    let dim = ui::tone_code(ui::Tone::Dim);
-    let reset = ui::tone_reset();
     if above > 0 {
-        let _ = write!(err, "\r\x1b[2K  {dim}\u{2191} {above} more{reset}\r\n");
+        frame.push_str(&format!("\r\x1b[2K  {dim}\u{2191} {above} more{reset}\r\n"));
         drawn += 1;
     }
     for (i, it) in items.iter().enumerate().skip(first).take(view) {
@@ -440,32 +446,37 @@ fn render_picker(header: &str, items: &[String], sel: usize, prev: usize, hints:
         let text = fit(it, width.saturating_sub(4));
         if i == sel {
             let c = ui::tone_code(ui::Tone::Brand);
-            let r = ui::tone_reset();
-            let _ = write!(err, "\r\x1b[2K  {c}\u{276f}{r} {digit}{c}{text}{r}\r\n");
+            frame.push_str(&format!("\r\x1b[2K  {c}\u{276f}{reset} {digit}{c}{text}{reset}\r\n"));
         } else {
-            let _ = write!(err, "\r\x1b[2K    {digit}{text}\r\n");
+            frame.push_str(&format!("\r\x1b[2K    {digit}{text}\r\n"));
         }
         drawn += 1;
     }
     if below > 0 {
-        let _ = write!(err, "\r\x1b[2K  {dim}\u{2193} {below} more{reset}\r\n");
+        frame.push_str(&format!("\r\x1b[2K  {dim}\u{2193} {below} more{reset}\r\n"));
         drawn += 1;
     }
-    let _ = write!(err, "\r\x1b[2K  {dim}{}{reset}\r\n", fit(&hint_line(items.len(), hints), width));
+    frame.push_str(&format!("\r\x1b[2K  {dim}{}{reset}\r\n", fit(&hint_line(items.len(), hints), width)));
     drawn += 1;
-    let _ = err.flush();
+    write_frame(&frame);
     drawn
+}
+
+/// One write, one flush: the unit a terminal can show without tearing.
+fn write_frame(frame: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(frame.as_bytes());
+    let _ = err.flush();
 }
 
 /// Erase what a picker drew (cursor is parked just below it) and leave the
 /// cursor at the top of that space.
 fn erase_drawn(drawn: usize) {
-    let mut err = std::io::stderr();
     if drawn > 0 {
-        let _ = write!(err, "\x1b[{drawn}A");
+        write_frame(&format!("\x1b[{drawn}A\r\x1b[J"));
+    } else {
+        write_frame("\r\x1b[J");
     }
-    let _ = write!(err, "\r\x1b[J");
-    let _ = err.flush();
 }
 
 /// The one-line record of an answered choice. Pure.
@@ -501,7 +512,11 @@ pub fn pick_opts(header: &str, items: &[String], opts: PickOpts<'_>) -> std::io:
         if stopped() {
             break Picked::Cancelled;
         }
+        let first_paint = drawn == 0;
         drawn = render_picker(header, items, sel, drawn, opts.hints);
+        if first_paint {
+            ui::timing(&format!("menu drawn: {}", if header.is_empty() { items[0].as_str() } else { header }));
+        }
         if opts.stop.is_some() {
             // Wake periodically so a flipped stop flag tears the screen down
             // without waiting for a key.
@@ -543,10 +558,8 @@ pub fn pick_opts(header: &str, items: &[String], opts: PickOpts<'_>) -> std::io:
     };
     erase_drawn(drawn);
     if let (Picked::Item(i), Collapse::Summary) = (&outcome, opts.collapse.unwrap_or(Collapse::Summary)) {
-        let mut err = std::io::stderr();
         let width = term_width().saturating_sub(4);
-        let _ = write!(err, "\r\x1b[2K  {}\r\n", ui::paint(ui::Tone::Dim, &fit(&summary_line(&items[*i]), width)));
-        let _ = err.flush();
+        write_frame(&format!("\r\x1b[2K  {}\r\n", ui::paint(ui::Tone::Dim, &fit(&summary_line(&items[*i]), width))));
     }
     Ok(outcome)
 }

@@ -1125,6 +1125,7 @@ async fn pair_with_purpose(
                 // L1-a: the server allocated our nameplate. Display the FULL code
                 // from OUR OWN local mint (the server never echoed any words).
                 let full = format!("{my_words}-{my_nameplate}");
+                ui::timing("pairing code shown");
                 ui::clipboard(&full);
                 ui::say("");
                 ui::say(&format!(
