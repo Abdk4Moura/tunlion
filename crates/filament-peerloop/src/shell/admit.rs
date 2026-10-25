@@ -371,6 +371,8 @@ mod tests {
         record_grant: AtomicBool,
         denied: AtomicBool,
         ceiling_covers: AtomicBool,
+        /// This device accepts owned shells (`own-devices-shell`).
+        owned_shell: AtomicBool,
         ceiling_for: Mutex<Option<Vec<String>>>,
         enqueues: Mutex<Vec<(String, String)>>,
         gates: Mutex<usize>,
@@ -384,6 +386,7 @@ mod tests {
                 record_grant: AtomicBool::new(false),
                 denied: AtomicBool::new(false),
                 ceiling_covers: AtomicBool::new(false),
+                owned_shell: AtomicBool::new(false),
                 ceiling_for: Mutex::new(None),
                 enqueues: Mutex::new(Vec::new()),
                 gates: Mutex::new(0),
@@ -445,6 +448,9 @@ mod tests {
         }
         fn ceiling_covers_action(&self, _device_pub: Option<&[u8; 32]>, _action: &str) -> bool {
             self.ceiling_covers.load(Ordering::Relaxed)
+        }
+        fn owned_shell_accepted(&self) -> bool {
+            self.owned_shell.load(Ordering::Relaxed)
         }
         fn enqueue_request_if_requestable(&self, peer: &str, capability: &str) {
             self.enqueues
@@ -548,6 +554,11 @@ mod tests {
     async fn pty_plan_is_device_scoped_and_sanitized() {
         let host = TestHost::new(Verdict::Allow);
         host.ceiling_covers.store(true, Ordering::Relaxed);
+        // An own device's signed shell ceiling admits only where this device
+        // accepts owned shells (docs/owned-shell-default.md, ruling F1(a)).
+        // This cell is about the plan, so the device accepts; the refusal
+        // without acceptance is pinned in shell_gate's own tests.
+        host.owned_shell.store(true, Ordering::Relaxed);
         let t = Arc::new(CaptureTransport::default());
         let (mut conn, _far) = connection(host, t, Some("phone")).await;
         let policy = ShellPolicy::Granted;
