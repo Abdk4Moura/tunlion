@@ -202,6 +202,22 @@ impl OwnedDownload {
         }
     }
 }
+impl OwnedDownload{
+    /// Refuse this download and remove its private staging, deterministically.
+    ///
+    /// `write_chunk` can return while tokio still runs the write on its
+    /// blocking pool, and that in-flight operation keeps a handle to the
+    /// staging file open. Dropped then, the delete happens with a second handle
+    /// alive; on Windows file systems without POSIX-semantics delete the name
+    /// stays listed until that handle closes, so a refused download could still
+    /// be seen. Settling the writes first means every handle is idle and the
+    /// staging is gone when this returns, on every platform.
+    pub async fn abort(mut self){
+        #[cfg(any(all(target_os="linux",feature="mount-server"),all(target_os="windows",feature="mount-server")))]
+        {use tokio::io::AsyncWriteExt;let _=self.file.flush().await;}
+        drop(self);
+    }
+}
 impl Drop for OwnedDownload{
     fn drop(&mut self){
         #[cfg(all(target_os="linux",feature="mount-server"))]
