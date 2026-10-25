@@ -493,7 +493,9 @@ fn temporary_access_cancel_and_failed_connect_do_not_remember_device() {
         assert!(!screen.contains("On the other device"));
         assert!(!screen.contains("\x1b[?1049h"), "temporary access used alternate screen");
         assert!(!screen.contains("mutually remembered"));
-        assert!(!screen.contains("Temporary access active"));
+        // No agreement may become active: the host's running status line is
+        // the activation marker on this side.
+        assert!(!screen.contains("Sharing with"), "drafting reached running access:\n{}", tail(&screen));
         let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
         for entry in ["identity.ed25519", "identity/device-cert.json", "devices.json", "capabilities.json"] {
             assert!(!dir.join(entry).exists(), "drafting wrote {entry}");
@@ -635,13 +637,13 @@ fn temporary_service_pairing_uses_real_transport_and_end_closes_the_socket() {
     composer_add_service(&mut host, &target.to_string(), 0);
     let code = composer_create_code(&mut host);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "authenticated scope review missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(!recipient.text().contains("Local service"), "listener activated before acceptance");
+    assert!(recipient.wait_for("being offered access", 90), "authenticated scope review missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(!recipient.text().contains(" is now at "), "listener activated before acceptance");
     recipient.send("\r");
-    assert!(recipient.wait_for("Local service service-0 at ", 60), "real endpoint missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for(&format!("port {} is now at ", target.port()), 60), "real endpoint missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(host.wait_for("Sharing with", 30), "{}", tail(&host.text()));
     let text = recipient.text();
-    let address = text.split("Local service service-0 at ").nth(1).unwrap().split_whitespace().next().unwrap();
+    let address = text.split(&format!("port {} is now at ", target.port())).nth(1).unwrap().split_whitespace().next().unwrap();
     let mut socket = std::net::TcpStream::connect(address).unwrap_or_else(|error| panic!(
         "temporary endpoint connect failed: {error}\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text())));
     socket.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
@@ -750,10 +752,15 @@ fn offer_temporary_shell(host: &mut Term, exe: &str, server: &str) -> String {
 }
 
 #[cfg(unix)]
-fn temporary_endpoint(recipient: &Term, resource: &str) -> std::net::SocketAddr {
-    recipient.text().split(&format!("Local service {resource} at ")).nth(1)
+fn temporary_endpoint(recipient: &Term, port: u16) -> std::net::SocketAddr {
+    // The recipient announces each activated service by the port it reaches
+    // ("port 5432 is now at 127.0.0.1:61234"). A port removed and added again
+    // is announced twice, so the LATEST announcement is the live endpoint.
+    let marker = format!("port {port} is now at ");
+    recipient.text().rsplit(marker.as_str()).next()
+        .filter(|_| recipient.text().contains(marker.as_str()))
         .and_then(|rest| rest.split_whitespace().next()).and_then(|text| text.parse().ok())
-        .unwrap_or_else(|| panic!("missing activated {resource}:\n{}", tail(&recipient.text())))
+        .unwrap_or_else(|| panic!("missing activated {marker}:\n{}", tail(&recipient.text())))
 }
 
 #[cfg(unix)]
@@ -775,13 +782,13 @@ fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acc
     let (mut recipient, _) = fresh_term("temporary-revision-recipient");
     let code = offer_temporary_services(&mut host, &exe, &backend.url, &[first.address, retained.address]);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(!recipient.text().contains("Local service"));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(!recipient.text().contains(" is now at "));
     recipient.send("\r");
-    assert!(recipient.wait_for("Local service service-1 at ", 60), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for(&format!("port {} is now at ", retained.address.port()), 60), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(host.wait_for("Sharing with", 30), "{}", tail(&host.text()));
-    let removed_address = temporary_endpoint(&recipient, "service-0");
-    let retained_address = temporary_endpoint(&recipient, "service-1");
+    let removed_address = temporary_endpoint(&recipient, first.address.port());
+    let retained_address = temporary_endpoint(&recipient, retained.address.port());
     let mut removed_socket = std::net::TcpStream::connect(removed_address).unwrap();
     let mut retained_socket = std::net::TcpStream::connect(retained_address).unwrap();
     assert_echo(&mut removed_socket, b"first-port", &host, &recipient);
@@ -794,8 +801,8 @@ fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acc
     host_open_change(&mut host);
     composer_remove_service(&mut host, 1, 2);
     host.send(ROW_FINISH); // Apply changes: this screen is the host's review.
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 20), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 20), "{}", tail(&recipient.text()));
     assert_echo(&mut retained_socket, b"same-live-stream-during-narrowing-review", &host, &recipient);
     removed_socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut byte = [0];
@@ -807,8 +814,8 @@ fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acc
     assert!(std::net::TcpStream::connect(removed_address).is_err(), "removed resource still has a local listener");
     let at = recipient.text().len();
     recipient.send("\r");
-    assert!(recipient.wait_for_from(at, "Temporary access active", 30), "{}", tail(&recipient.text()));
-    assert_eq!(temporary_endpoint(&recipient, "service-1"), retained_address, "unchanged resource moved endpoint");
+    assert!(recipient.wait_for_from(at, "\u{2713} Connected \u{b7}", 30), "{}", tail(&recipient.text()));
+    assert_eq!(temporary_endpoint(&recipient, retained.address.port()), retained_address, "unchanged resource moved endpoint");
     assert_echo(&mut retained_socket, b"same-live-stream-after-narrowing", &host, &recipient);
 
     // Add the first port back as a NEW resource revision, without a new code.
@@ -817,12 +824,14 @@ fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acc
     let recipient_at = recipient.text().len();
     let applied_at = host.text().len();
     host.send(ROW_FINISH);
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 20), "{}", tail(&recipient.text()));
-    assert!(!recipient.text()[recipient_at..].contains("Local service service-2"), "addition activated without recipient acceptance");
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 20), "{}", tail(&recipient.text()));
+    assert!(!recipient.text()[recipient_at..].contains(&format!("port {} is now at ", first.address.port())), "addition activated without recipient acceptance");
     recipient.send("\r");
-    assert!(recipient.wait_for_from(recipient_at, "Local service service-2 at ", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    let mut added_socket = std::net::TcpStream::connect(temporary_endpoint(&recipient, "service-2")).unwrap();
+    assert!(recipient.wait_for_from(recipient_at, &format!("port {} is now at ", first.address.port()), 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    let added_address = temporary_endpoint(&recipient, first.address.port());
+    assert_ne!(added_address, removed_address, "the re-added resource must be a new endpoint, not the removed one");
+    let mut added_socket = std::net::TcpStream::connect(added_address).unwrap();
     assert_echo(&mut added_socket, b"accepted-added-resource", &host, &recipient);
     let mut new_retained_socket = std::net::TcpStream::connect(retained_address).unwrap();
     assert_echo(&mut new_retained_socket, b"retained-resource-new-revision", &host, &recipient);
@@ -858,13 +867,13 @@ fn declining_a_temporary_service_offer_never_activates_a_listener_or_contact() {
     let (mut recipient, _) = fresh_term("temporary-decline-recipient");
     let code = offer_temporary_services(&mut host, &exe, &backend.url, &[service.address]);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     let at = recipient.text().len();
     recipient.send("\x1b[B\r");
     assert!(recipient.wait_for_from(at, &format!("{MARK}> "), 30), "{}", tail(&recipient.text()));
     assert!(host.wait_for("Temporary access declined", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(!recipient.text().contains("Local service"));
-    assert!(!recipient.text().contains("Temporary access active"));
+    assert!(!recipient.text().contains(" is now at "));
+    assert!(!recipient.text().contains("\u{2713} Connected \u{b7}"));
     for label in ["temporary-decline-host", "temporary-decline-recipient"] {
         let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
         for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] { assert!(!dir.join(file).exists(), "decline wrote {file}"); }
@@ -881,11 +890,11 @@ fn ending_while_a_revised_scope_is_being_reviewed_cancels_the_review_and_closes_
     let (mut recipient, _) = fresh_term("temporary-review-end-recipient");
     let code = offer_temporary_services(&mut host, &exe, &backend.url, &[original.address]);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     recipient.send("\r");
-    assert!(recipient.wait_for("Local service service-0 at ", 30), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for(&format!("port {} is now at ", original.address.port()), 30), "{}", tail(&recipient.text()));
     assert!(host.wait_for("Sharing with", 30), "{}", tail(&host.text()));
-    let address = temporary_endpoint(&recipient, "service-0");
+    let address = temporary_endpoint(&recipient, original.address.port());
     let mut socket = std::net::TcpStream::connect(address).unwrap();
     assert_echo(&mut socket, b"before-revision", &host, &recipient);
     host_open_change(&mut host);
@@ -893,21 +902,21 @@ fn ending_while_a_revised_scope_is_being_reviewed_cancels_the_review_and_closes_
     let recipient_at = recipient.text().len();
     let applied_at = host.text().len();
     host.send(ROW_FINISH);
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 20), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 20), "{}", tail(&recipient.text()));
     assert!(host.wait_for_from(applied_at, "Sharing with", 30), "{}", tail(&host.text()));
     host.settle(300, 5);
     let end_at = host.text().len();
     host.send(RUN_END); // End wins while the recipient has not accepted.
     assert!(recipient.wait_for_from(recipient_at, "Temporary access ended", 15), "End blocked behind the review:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(host.wait_for_from(end_at, "peer acknowledged", 15), "{}", tail(&host.text()));
-    assert!(!recipient.text()[recipient_at..].contains("Local service service-1"), "unaccepted resource activated");
+    assert!(!recipient.text()[recipient_at..].contains(&format!("port {} is now at ", addition.address.port())), "unaccepted resource activated");
     assert!(std::net::TcpStream::connect(address).is_err(), "End left the old listener open");
     assert!(recipient.wait_for_from(recipient_at, &format!("{MARK}> "), 15), "recipient review thread survived End:\n{}", tail(&recipient.text()));
     let after_end = recipient.text().len();
     recipient.send("\r"); // Late Enter belongs to the shell, never the cancelled review.
     recipient.settle(200, 2);
-    assert!(!recipient.text()[after_end..].contains("Temporary access active"));
+    assert!(!recipient.text()[after_end..].contains("\u{2713} Connected \u{b7}"));
     for label in ["temporary-review-end-host", "temporary-review-end-recipient"] {
         let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
         for file in ["devices.json", "identity.ed25519", "identity/device-cert.json", "armed.json"] {
@@ -941,8 +950,8 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
     host.settle(200, 3);
     let code = composer_create_code(&mut host);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(!recipient.text().contains("Folder endpoint ready"));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(!recipient.text().contains("\u{2713} Folder share \u{b7}"));
     recipient.send("\r");
     assert!(recipient.wait_for("FOLDERS · endpoint checked on use", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     let at = recipient.text().len();
@@ -954,8 +963,7 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
     assert!(recipient.wait_for_from(at, "Folder entries (3)", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(recipient.text()[at..].contains("binary.bin"));
     assert!(recipient.text()[at..].contains("empty.bin"));
-    assert!(recipient.text()[at..].contains("Folder endpoint ready"));
-    assert!(recipient.text()[at..].contains("folder-0"));
+    assert!(recipient.text()[at..].contains("\u{2713} Folder share \u{b7} read-only"));
 
     for (name, count, total, expected) in [
         ("binary.bin", 4096, binary.len(), hex::encode(sha2::Sha256::digest(&binary[..4096]))),
@@ -1028,9 +1036,9 @@ fn temporary_shell_pty_io_resize_and_end_teardown_are_scoped_and_never_use_stand
     let (mut recipient, _) = fresh_term("temporary-shell-recipient");
     let code = offer_temporary_shell(&mut host, &exe, &backend.url);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(recipient.text().contains("Open a shell on"), "shell scope was not offered:\n{}", tail(&recipient.text()));
-    assert!(!recipient.text().contains("Local service"), "a service listener appeared for a shell-only scope");
+    assert!(!recipient.text().contains(" is now at "), "a service listener appeared for a shell-only scope");
     recipient.send("\r");
     assert!(recipient.wait_for("SHELL · shared terminal", 60), "recipient shell menu missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     let at = recipient.text().len();
@@ -1076,10 +1084,10 @@ fn removing_shell_from_the_live_scope_ends_the_remote_pty_without_a_standing_ses
     let code = composer_create_code(&mut host);
     assert!(host.text()[at..].contains("Shell on this device, as your account"), "{}", tail(&host.text()));
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "{}", tail(&recipient.text()));
     recipient.send("\r");
     assert!(recipient.wait_for("SHELL · shared terminal", 60), "{}", tail(&recipient.text()));
-    assert!(recipient.wait_for("Local service service-0 at ", 60), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for("port 3000 is now at ", 60), "{}", tail(&recipient.text()));
     recipient.send("\r");
     assert!(recipient.wait_for("Shared terminal · host accepted revision", 30), "{}", tail(&recipient.text()));
     assert!(host.wait_for("Sharing with", 30), "{}", tail(&host.text()));
@@ -1091,11 +1099,11 @@ fn removing_shell_from_the_live_scope_ends_the_remote_pty_without_a_standing_ses
     let at = recipient.text().len();
     host.send(ROW_FINISH); // Apply changes.
     assert!(recipient.wait_for_from(at, "Shared terminal ended", 30), "removal did not end the PTY:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(recipient.wait_for_from(at, "is offering you access", 30), "narrowed revision was not reviewed:\n{}", tail(&recipient.text()));
+    assert!(recipient.wait_for_from(at, "being offered access", 30), "narrowed revision was not reviewed:\n{}", tail(&recipient.text()));
     assert!(!recipient.text()[at..].contains("Open a shell"), "removed shell still advertised:\n{}", tail(&recipient.text()));
     recipient.send("\r");
-    assert!(recipient.wait_for_from(at, "Temporary access active", 30), "{}", tail(&recipient.text()));
-    let active_at = at + recipient.text()[at..].find("Temporary access active").expect("activation marker");
+    assert!(recipient.wait_for_from(at, "\u{2713} Connected \u{b7}", 30), "{}", tail(&recipient.text()));
+    let active_at = at + recipient.text()[at..].find("\u{2713} Connected \u{b7}").expect("activation marker");
     recipient.settle(300, 2);
     assert!(!recipient.text()[active_at..].contains("Open shared terminal"), "shell menu returned after shell removal");
     assert!(host.wait_for("Sharing with", 30), "{}", tail(&host.text()));
@@ -1118,7 +1126,7 @@ fn temporary_shell_expiry_tears_down_the_pty_and_the_agreement() {
     let (mut recipient, _) = fresh_term("temporary-shell-expiry-recipient");
     let code = offer_temporary_shell(&mut host, &exe, &backend.url);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "{}", tail(&recipient.text()));
     recipient.send("\r");
     assert!(recipient.wait_for("SHELL · shared terminal", 60), "{}", tail(&recipient.text()));
     recipient.send("\r");

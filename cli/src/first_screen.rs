@@ -243,3 +243,52 @@ fn ignore_console_interrupts() {
         }
     }
 }
+
+/// Where the home screen's "recent" entry lives: one small file in the config
+/// dir, a convenience only (losing it loses nothing but the shortcut).
+fn recent_path() -> std::path::PathBuf {
+    crate::settings::config_dir().join("recent.json")
+}
+
+/// Remember an interactive shell into `device`, for the home screen.
+pub(crate) fn remember_shell(device: &str) {
+    let body = serde_json::json!({ "shell": device }).to_string();
+    let _ = std::fs::write(recent_path(), body);
+}
+
+/// The home screen's recent entry, as (label, argv), when the remembered device
+/// is still one of `known`. Pure over its inputs apart from the one read.
+pub(crate) fn recent_action(known: &[String]) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(recent_path()).ok()?;
+    recent_from(&raw, known)
+}
+
+/// The rule behind `recent_action`, pure: a forgotten or renamed device, or a
+/// name that is not a single word, offers nothing.
+pub(crate) fn recent_from(raw: &str, known: &[String]) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let device = value["shell"].as_str()?;
+    if device.is_empty() || device.split_whitespace().count() != 1 || !known.iter().any(|k| k == device) {
+        return None;
+    }
+    Some((format!("Shell on {device}"), format!("shell {device}")))
+}
+
+#[cfg(test)]
+mod recent_tests {
+    use super::recent_from;
+
+    #[test]
+    fn recent_shell_is_offered_only_for_a_still_known_device() {
+        let known = vec!["desk".to_string(), "pixel".to_string()];
+        assert_eq!(
+            recent_from(r#"{"shell":"desk"}"#, &known),
+            Some(("Shell on desk".to_string(), "shell desk".to_string()))
+        );
+        assert_eq!(recent_from(r#"{"shell":"gone"}"#, &known), None, "a forgotten device offers nothing");
+        assert_eq!(recent_from(r#"{"shell":"desk; rm"}"#, &known), None);
+        assert_eq!(recent_from("not json", &known), None);
+        assert_eq!(recent_from(r#"{"shell":""}"#, &known), None);
+    }
+}
+

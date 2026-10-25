@@ -277,10 +277,25 @@ pub(crate) async fn async_main() -> Result<()> {
                     argv.push("--help".into());
                 }
                 BareTarget::Send => {
-                    // `tunlion <path>` mints a one-time code so the other side can
-                    // claim it without having been paired first.
-                    argv.insert(1, "send".into());
-                    argv.push("--code".into());
+                    // `tunlion <path> <device>`: the device name is the destination,
+                    // the same way `tunlion <device>` opens a shell there. Only when
+                    // the second word is a known device and NOT also a path, so
+                    // `tunlion a.txt b.txt` stays a two-file send by code.
+                    let to_device = argv.len() == 3
+                        && !argv[2].starts_with('-')
+                        && !std::path::Path::new(&argv[2]).exists()
+                        && devices_load().iter().any(|(n, _)| *n == argv[2]);
+                    if to_device {
+                        let device = argv.remove(2);
+                        argv.insert(1, "send".into());
+                        argv.push("--to".into());
+                        argv.push(device);
+                    } else {
+                        // `tunlion <path>` mints a one-time code so the other side
+                        // can claim it without having been paired first.
+                        argv.insert(1, "send".into());
+                        argv.push("--code".into());
+                    }
                 }
                 BareTarget::Add => {
                     // L1-a unification: a `word-word-NNNN` (4-digit) code now drives
@@ -419,16 +434,24 @@ pub(crate) async fn async_main() -> Result<()> {
         // code is ready the moment they ask for one (see preconnect.rs).
         crate::preconnect::start(crate::preconnect::default_server());
         // "More…" opens a second short page in place; Esc there comes back here.
+        // The last interactive shell, if its device is still known, leads the
+        // home page: Enter repeats it.
+        let recent = crate::first_screen::recent_action(&devices_load().into_iter().map(|(n, _)| n).collect::<Vec<_>>());
         let mut on_more = false;
         let chosen = loop {
-            let (title, actions) = if on_more {
-                ("MORE".to_string(), crate::first_screen::more_actions(owner))
+            let (title, mut actions): (String, Vec<(String, String)>) = if on_more {
+                ("MORE".to_string(), crate::first_screen::more_actions(owner).into_iter().map(|(l, v)| (l.to_string(), v.to_string())).collect())
             } else {
-                (header.clone(), first_screen_actions(owner, joined, device_count))
+                (header.clone(), first_screen_actions(owner, joined, device_count).into_iter().map(|(l, v)| (l.to_string(), v.to_string())).collect())
             };
+            if !on_more {
+                if let Some(recent) = &recent {
+                    actions.insert(0, recent.clone());
+                }
+            }
             let labels = actions
                 .iter()
-                .map(|(label, _)| (*label).to_string())
+                .map(|(label, _)| label.clone())
                 .collect::<Vec<_>>();
             // The home page erases itself when it opens More, so the two pages
             // replace each other instead of stacking.
@@ -436,8 +459,8 @@ pub(crate) async fn async_main() -> Result<()> {
             match codeentry::pick_opts(&title, &labels, codeentry::PickOpts { collapse, ..Default::default() })? {
                 codeentry::Picked::Item(index) if actions[index].1 == crate::first_screen::MORE => on_more = true,
                 codeentry::Picked::Item(index) => {
-                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  {}", codeentry::summary_line(actions[index].0))));
-                    break Some(actions[index].1);
+                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  {}", codeentry::summary_line(&actions[index].0))));
+                    break Some(actions[index].1.clone());
                 }
                 _ if on_more => on_more = false,
                 _ => break None,
@@ -1746,6 +1769,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             };
             require_known_device(&peer)?;
+            // The home screen offers the last interactive shell first, so the
+            // thing you do most is one Enter away (first_screen::recent_action).
+            if ui_caps.interactive && args.is_empty() {
+                crate::first_screen::remember_shell(&peer);
+            }
             // #219: a device whose invitation ceiling excludes shell can never
             // serve one, and the denial was surfacing as a silent hang (the
             // acceptor's l2-close is only sent when the acceptor is ON). Say so
