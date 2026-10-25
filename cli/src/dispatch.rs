@@ -415,6 +415,9 @@ pub(crate) async fn async_main() -> Result<()> {
         };
         let owner = identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some();
         let joined = !owner && local_device_cert().is_some();
+        // Connect to signaling while the person reads the menu, so a pairing
+        // code is ready the moment they ask for one (see preconnect.rs).
+        crate::preconnect::start(crate::preconnect::default_server());
         // "More…" opens a second short page in place; Esc there comes back here.
         let mut on_more = false;
         let chosen = loop {

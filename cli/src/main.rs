@@ -102,6 +102,7 @@ mod enrollment;
 mod membership;
 /// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
+mod preconnect;
 mod access_ui;
 mod temporary_session;
 mod access_end;
@@ -1788,7 +1789,11 @@ fn main_inner() -> std::process::ExitCode {
     ui::exit_quietly_on_broken_pipe();
     ui::set_closed_pipe_verb(verb_on_command_line().as_deref());
     let first = std::env::args().nth(1);
-    let rt = if is_light_command(first.as_deref()) {
+    // A bare launch at a terminal is the menu, and the menu leads straight into
+    // network actions (and pre-connects signaling while it waits for a key), so
+    // it needs worker threads. Bare and non-interactive stays the light tour.
+    let menu = first.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let rt = if is_light_command(first.as_deref()) && !menu {
         tokio::runtime::Builder::new_current_thread().enable_all().build()
     } else {
         tokio::runtime::Builder::new_multi_thread().enable_all().build()

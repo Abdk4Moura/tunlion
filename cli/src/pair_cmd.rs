@@ -435,8 +435,16 @@ async fn pair_with_purpose(
     }
     let my_uid = mk_uid("p");
     let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
+    // The home screen may already have opened this connection while the
+    // person was choosing (preconnect.rs); otherwise connect now, as always.
+    let (sio, tx, mut rx) = match crate::preconnect::take(server).await {
+        Some(warm) => warm,
+        None => {
+            let (tx, rx) = mpsc::unbounded_channel::<Ev>();
+            let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
+            (sio, tx, rx)
+        }
+    };
     // Meta must exist for pairing; an unguessable solo room keeps strangers
     // out (the daemon's trick), the pair-claim moves people, not the room.
     let solo = format!("pairc-{}", fresh_secret());
