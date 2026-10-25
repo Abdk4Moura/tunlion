@@ -2860,10 +2860,17 @@ fn owned_device_shell_member_default_primary_opt_in_and_opt_out_ends_live() {
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
-    own_device_enrol(&bin, &server, &h.a_dir, &h.b_dir, &format!("ownshell-mesh-p{:x}", std::process::id()));
+    // Harness::new inits BOTH a and b as separate owners. The member must start
+    // clean (no identity of its own) so the enrolment makes it A's device.
+    let member = clean_joiner_dir(&h, "own-member");
+    own_device_enrol(&bin, &server, &h.a_dir, &member, &format!("ownshell-mesh-p{:x}", std::process::id()));
+    assert!(
+        member.join("identity").join("device-cert.json").exists(),
+        "the enrolment did not make the member A's device (no device cert)"
+    );
 
     let (child_a, log_a) = spawn_daemon_with(&bin, &server, "test-a", &h.a_dir, false);
-    let (child_b, log_b) = spawn_daemon_with(&bin, &server, "test-b", &h.b_dir, false);
+    let (child_b, log_b) = spawn_daemon_with(&bin, &server, "test-b", &member, false);
     h.daemon_a = Some(child_a);
     h.daemon_b = Some(child_b);
     h.daemon_a_log = log_a;
@@ -2873,7 +2880,7 @@ fn owned_device_shell_member_default_primary_opt_in_and_opt_out_ends_live() {
     assert!(discovered, "the enrolled devices never found each other");
 
     // Diagnostics, not assertions: the member's role decides its default.
-    for (label, dir) in [("A", &h.a_dir), ("B", &h.b_dir)] {
+    for (label, dir) in [("A", &h.a_dir), ("B", &member)] {
         let files: Vec<String> = std::fs::read_dir(dir)
             .map(|it| it.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
             .unwrap_or_default();
@@ -2896,22 +2903,22 @@ fn owned_device_shell_member_default_primary_opt_in_and_opt_out_ends_live() {
     assert!(echoed(&out, &n1), "primary -> member must be allowed with no grant:\n{}\n{}", out.stdout, out.stderr);
 
     let n2 = format!("OWNED-2-{}", std::process::id());
-    let out = shell_echo(&bin, &server, &h.b_dir, "test-a", &n2);
+    let out = shell_echo(&bin, &server, &member, "test-a", &n2);
     assert!(!echoed(&out, &n2), "member -> primary must be refused before the primary opts in:\n{}\n{}", out.stdout, out.stderr);
     assert!(!matches!(out.outcome, ChildOutcome::ExitedSuccess(_)), "a refused shell must not exit 0");
 
     set_own_devices_shell(&bin, &h.a_dir, "on");
     let n3 = format!("OWNED-3-{}", std::process::id());
-    let out = shell_echo(&bin, &server, &h.b_dir, "test-a", &n3);
+    let out = shell_echo(&bin, &server, &member, "test-a", &n3);
     assert!(echoed(&out, &n3), "member -> primary must be allowed after the opt-in:\n{}\n{}", out.stdout, out.stderr);
 
-    set_own_devices_shell(&bin, &h.b_dir, "off");
+    set_own_devices_shell(&bin, &member, "off");
     let n4 = format!("OWNED-4-{}", std::process::id());
     let out = shell_echo(&bin, &server, &h.a_dir, "test-b", &n4);
     assert!(!echoed(&out, &n4), "a member that switched owned shells off must refuse:\n{}\n{}", out.stdout, out.stderr);
 
     // 5. A live shell ends when the target stops accepting owned shells.
-    set_own_devices_shell(&bin, &h.b_dir, "auto");
+    set_own_devices_shell(&bin, &member, "auto");
     let start = format!("OWNED-LIVE-{}", std::process::id());
     let mut live = Command::new(&bin);
     live.env("TUNLION_CAP_AUTHORITATIVE", "0")
@@ -2929,7 +2936,7 @@ fn owned_device_shell_member_default_primary_opt_in_and_opt_out_ends_live() {
         assert!(began.elapsed() < Duration::from_secs(60), "the live owned shell never started:\n{stdout}\n{stderr}");
         std::thread::sleep(Duration::from_millis(50));
     }
-    set_own_devices_shell(&bin, &h.b_dir, "off");
+    set_own_devices_shell(&bin, &member, "off");
     let ended = live.wait_until(Duration::from_secs(30));
     assert!(
         !matches!(ended.outcome, ChildOutcome::TimedOut),
