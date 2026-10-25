@@ -3497,6 +3497,37 @@ pub(crate) fn safe_delete_open_file(file: &std::fs::File) -> std::io::Result<()>
         ) -> i32;
     }
 
+    // POSIX-semantics delete first: the NAME leaves the directory at once, even
+    // while another handle to the same file is still open (tokio's async clone
+    // of a staging file can close a moment later on its blocking pool). The
+    // classic disposition below only marks the file delete-pending, so its
+    // name stayed listed until the last handle closed: a just-refused partial
+    // download was still visible to a directory listing, which is what the
+    // Windows run of `symlink_and_short_reads_are_refused_before_any_local_
+    // publication` caught intermittently. NTFS since Windows 10 1709; other
+    // file systems refuse the Ex class and fall back to the classic call.
+    #[repr(C)]
+    struct FileDispositionInfoEx {
+        flags: u32,
+    }
+    const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21; // FileDispositionInfoEx
+    const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
+    const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+    let posix = FileDispositionInfoEx {
+        flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as *mut _,
+            FILE_DISPOSITION_INFO_EX_CLASS,
+            (&posix as *const FileDispositionInfoEx).cast(),
+            std::mem::size_of::<FileDispositionInfoEx>() as u32,
+        )
+    } != 0
+    {
+        return Ok(());
+    }
+
     let disposition = FileDispositionInfo { delete_file: 1 };
     if unsafe {
         SetFileInformationByHandle(
