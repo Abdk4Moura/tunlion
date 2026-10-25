@@ -239,12 +239,21 @@ pub enum Outcome {
 /// never get wrong, a leaked raw mode wedges the user's shell.
 pub struct RawGuard {
     active: bool,
+    newline: bool,
 }
 
 impl RawGuard {
     pub fn enable() -> std::io::Result<RawGuard> {
         crossterm::terminal::enable_raw_mode()?;
-        Ok(RawGuard { active: true })
+        Ok(RawGuard { active: true, newline: true })
+    }
+
+    /// For screens that erase themselves and manage their own line endings (the
+    /// picker): restore the terminal without adding a blank line, or every
+    /// answered choice would leave a gap behind it.
+    pub fn enable_inline() -> std::io::Result<RawGuard> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(RawGuard { active: true, newline: false })
     }
 }
 
@@ -257,7 +266,9 @@ impl Drop for RawGuard {
             // starts clean.
             let mut err = std::io::stderr();
             let _ = crossterm::execute!(err, crossterm::cursor::Show);
-            let _ = write!(err, "\r\n");
+            if self.newline {
+                let _ = write!(err, "\r\n");
+            }
             let _ = err.flush();
         }
     }
@@ -298,10 +309,6 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
     let _ = err.flush();
 }
 
-/// Redraw the picker list in place: a header plus one line per item, the selected
-/// one marked and colored. After the first paint the cursor is parked below the
-/// list, so subsequent paints move up `items+1` lines first. Raw mode disables
-/// newline translation, hence explicit `\r\n`.
 /// Which slice of a list a picker shows, and how much is out of sight.
 ///
 /// Split out because it is the only arithmetic in the renderer and it is the
@@ -323,127 +330,227 @@ fn viewport_window(sel: usize, len: usize, max: usize) -> (usize, usize, usize, 
 /// How many list rows a picker shows at once before it starts scrolling.
 const VIEWPORT: usize = 7;
 
-fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints: &[(char, &str)]) {
-    let mut err = std::io::stderr();
-    // Header + items + (a hint line, when there are hints). The cursor rewind
-    // must count exactly what was drawn or the redraw walks up the scrollback.
-    // A viewport, so a long list does not scroll the terminal away. The window
-    // follows the selection and the counts below say how much is out of sight:
-    // a list that silently truncates is worse than one that admits its length.
-    let (first, view, above, below) = viewport_window(sel, items.len(), VIEWPORT);
-    let drawn =
-        view + 1 + usize::from(above > 0) + usize::from(below > 0) + usize::from(!hints.is_empty());
-    if redraw {
-        let _ = write!(err, "\x1b[{drawn}A");
+// --------------------------------------------------------------------------
+// The one picker. Every interactive choice in the CLI draws through here, so a
+// flow never changes look halfway (the access screens used to have their own
+// `>` picker with different keys and hints next to this one's `❯`).
+//
+// Fluid, not stacked: while open, the list redraws in place. Once answered, the
+// list is ERASED and, by default, one dim summary line stays (`✓ Temporary
+// access`), so a session reads as a short trail of decisions instead of a wall of
+// stale menus. Number keys answer immediately; arrows + Enter still work.
+// --------------------------------------------------------------------------
+
+/// What remains on screen after a picker is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collapse {
+    /// Erase the list, leave `✓ <chosen item>`. The default for one-shot choices.
+    Summary,
+    /// Erase the list and leave nothing. For menus a flow revisits in a loop
+    /// (a composer's main screen), where a trail of summaries would pile up.
+    Erase,
+}
+
+/// Options for one picker session. `Default` is a plain one-shot choice.
+#[derive(Clone, Copy, Default)]
+pub struct PickOpts<'a> {
+    /// Extra single-key answers shown on the hint line, e.g. `('r', "refresh")`.
+    pub hints: &'a [(char, &'a str)],
+    /// `None` means Summary.
+    pub collapse: Option<Collapse>,
+    /// When set, the picker also returns `Cancelled` as soon as this flips, so a
+    /// live screen (running access) can be torn down by the session ending.
+    pub stop: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Which row starts selected (clamped), e.g. the finish row of a composer
+    /// once something is chosen, so Enter alone completes the common path.
+    pub initial: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Picked {
+    Item(usize),
+    Key(char),
+    Cancelled,
+}
+
+/// The digit that answers item `i` directly, when the list is short enough for
+/// one keystroke per item and the digit is not already a hint key. Pure.
+pub(crate) fn digit_for(i: usize, len: usize, hints: &[(char, &str)]) -> Option<char> {
+    if len > 9 || i >= len {
+        return None;
     }
-    let _ = write!(err, "\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header));
+    let d = char::from(b'1' + i as u8);
+    (!hints.iter().any(|(h, _)| *h == d)).then_some(d)
+}
+
+/// The hint line under a list, as plain text. Pure, so tests pin the wording.
+pub(crate) fn hint_line(len: usize, hints: &[(char, &str)]) -> String {
+    let mut line = String::from("\u{2191}\u{2193} move \u{b7} \u{23ce} choose");
+    if digit_for(0, len, hints).is_some() {
+        let last = len.min(9);
+        line.push_str(&if last == 1 { " \u{b7} 1 picks".to_string() } else { format!(" \u{b7} 1-{last} pick") });
+    }
+    for (k, label) in hints {
+        line.push_str(&format!(" \u{b7} {k} {label}"));
+    }
+    line.push_str(" \u{b7} esc back");
+    line
+}
+
+/// Clip a label to the terminal width so a long path never wraps: a wrapped row
+/// makes the in-place redraw rewind the wrong number of lines.
+fn fit(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if width < 8 || n <= width {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(width - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
+fn term_width() -> usize {
+    crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+}
+
+/// Draw the list once. Returns how many lines it drew, so the caller can rewind
+/// exactly that many (never a recomputed guess).
+fn render_picker(header: &str, items: &[String], sel: usize, prev: usize, hints: &[(char, &str)]) -> usize {
+    let mut err = std::io::stderr();
+    let width = term_width().saturating_sub(4);
+    let (first, view, above, below) = viewport_window(sel, items.len(), VIEWPORT);
+    if prev > 0 {
+        let _ = write!(err, "\x1b[{prev}A");
+    }
+    let mut drawn = 0;
+    if !header.is_empty() {
+        let _ = write!(err, "\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header));
+        drawn += 1;
+    }
     let dim = ui::tone_code(ui::Tone::Dim);
-    let reset0 = ui::tone_reset();
+    let reset = ui::tone_reset();
     if above > 0 {
-        let _ = write!(err, "\r\x1b[2K  {dim}\u{2191} {above} more{reset0}\r\n");
+        let _ = write!(err, "\r\x1b[2K  {dim}\u{2191} {above} more{reset}\r\n");
+        drawn += 1;
     }
     for (i, it) in items.iter().enumerate().skip(first).take(view) {
-        let (mark, c, r) = if i == sel {
-            ("\u{276f}", ui::tone_code(ui::Tone::Brand), ui::tone_reset())
+        let digit = digit_for(i, items.len(), hints)
+            .map(|d| format!("{dim}{d}{reset} "))
+            .unwrap_or_default();
+        let text = fit(it, width.saturating_sub(4));
+        if i == sel {
+            let c = ui::tone_code(ui::Tone::Brand);
+            let r = ui::tone_reset();
+            let _ = write!(err, "\r\x1b[2K  {c}\u{276f}{r} {digit}{c}{text}{r}\r\n");
         } else {
-            (" ", String::new(), "")
-        };
-        let _ = write!(err, "\r\x1b[2K  {c}{mark} {it}{r}\r\n");
+            let _ = write!(err, "\r\x1b[2K    {digit}{text}\r\n");
+        }
+        drawn += 1;
     }
     if below > 0 {
-        let _ = write!(err, "\r\x1b[2K  {dim}\u{2193} {below} more{reset0}\r\n");
+        let _ = write!(err, "\r\x1b[2K  {dim}\u{2193} {below} more{reset}\r\n");
+        drawn += 1;
     }
-    // The ambient hint line. Always-visible keybindings beat a menu ITEM for the
-    // same job: an item consumes a slot, sits in the arrow-key path, and reads as
-    // a choice with the same weight as the real ones. A hint is present without
-    // competing, and the list stays about the actual decision.
-    if !hints.is_empty() {
-        let reset = ui::tone_reset();
-        let mut line = String::from("  \u{2191}\u{2193} move \u{b7} \u{23ce} select");
-        for (k, label) in hints {
-            line.push_str(&format!(" \u{b7} {k} {label}"));
-        }
-        line.push_str(" \u{b7} esc cancel");
-        let _ = write!(err, "\r\x1b[2K{dim}{line}{reset}\r\n");
+    let _ = write!(err, "\r\x1b[2K  {dim}{}{reset}\r\n", fit(&hint_line(items.len(), hints), width));
+    drawn += 1;
+    let _ = err.flush();
+    drawn
+}
+
+/// Erase what a picker drew (cursor is parked just below it) and leave the
+/// cursor at the top of that space.
+fn erase_drawn(drawn: usize) {
+    let mut err = std::io::stderr();
+    if drawn > 0 {
+        let _ = write!(err, "\x1b[{drawn}A");
     }
+    let _ = write!(err, "\r\x1b[J");
     let _ = err.flush();
 }
 
-/// Interactive picker: Up/Down (or k/j) to move, Enter to choose, Esc/q/Ctrl-C to
-/// cancel. Returns the chosen index, or None on cancel. The terminal is ALWAYS
-/// restored (RawGuard). Callers append their own "none of these" item if they want
-/// an in-list escape hatch.
+/// The one-line record of an answered choice. Pure.
+pub(crate) fn summary_line(item: &str) -> String {
+    format!("\u{2713} {item}")
+}
+
+/// Interactive picker: arrows (or k/j) move, Enter or a number chooses, Esc/q/
+/// Ctrl-C go back. Returns the chosen index, or None on cancel. The terminal is
+/// ALWAYS restored.
 pub fn pick(header: &str, items: &[String]) -> std::io::Result<Option<usize>> {
-    match pick_with_keys(header, items, &[])? {
+    match pick_opts(header, items, PickOpts::default())? {
         Picked::Item(i) => Ok(Some(i)),
         Picked::Key(_) | Picked::Cancelled => Ok(None),
     }
 }
 
-/// What a picker returned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Picked {
-    /// An item was chosen.
-    Item(usize),
-    /// One of the caller's hint keys was pressed.
-    Key(char),
-    /// Esc, q, or Ctrl-C.
-    Cancelled,
+pub fn pick_with_keys(header: &str, items: &[String], hints: &[(char, &str)]) -> std::io::Result<Picked> {
+    pick_opts(header, items, PickOpts { hints, ..PickOpts::default() })
 }
 
-/// `pick`, plus caller-defined keys advertised on an ambient hint line.
-///
-/// The alternative is an extra ITEM ("More options..."), and an item is worse
-/// for this job: it consumes a slot, sits in the arrow-key path between real
-/// choices, and reads with the same weight as them even though it decides
-/// nothing. A key is present without competing, so the list stays about the
-/// actual decision and the escape hatch is always visible.
-///
-/// Hint keys are matched WITHOUT modifiers and after the navigation keys, so a
-/// caller cannot accidentally shadow j/k/q or Ctrl-C.
-pub fn pick_with_keys(
-    header: &str,
-    items: &[String],
-    hints: &[(char, &str)],
-) -> std::io::Result<Picked> {
+pub fn pick_opts(header: &str, items: &[String], opts: PickOpts<'_>) -> std::io::Result<Picked> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use std::sync::atomic::Ordering;
     if items.is_empty() {
         return Ok(Picked::Cancelled);
     }
-    let _guard = RawGuard::enable()?;
-    let mut sel = 0usize;
-    let mut redraw = false;
-    loop {
-        render_picker(header, items, sel, redraw, hints);
-        redraw = true;
-        let ev = event::read()?;
-        let Event::Key(k) = ev else { continue };
+    let stopped = || opts.stop.is_some_and(|s| s.load(Ordering::Acquire));
+    let _guard = RawGuard::enable_inline()?;
+    let mut sel = opts.initial.min(items.len() - 1);
+    let mut drawn = 0usize;
+    let outcome = loop {
+        if stopped() {
+            break Picked::Cancelled;
+        }
+        drawn = render_picker(header, items, sel, drawn, opts.hints);
+        if opts.stop.is_some() {
+            // Wake periodically so a flipped stop flag tears the screen down
+            // without waiting for a key.
+            let mut ready = false;
+            while !ready {
+                if stopped() {
+                    break;
+                }
+                ready = event::poll(std::time::Duration::from_millis(100))?;
+            }
+            if !ready {
+                break Picked::Cancelled;
+            }
+        }
+        let Event::Key(k) = event::read()? else { continue };
         if k.kind == KeyEventKind::Release {
             continue;
         }
         match k.code {
-            // #203: in raw mode the kernel does not synthesise SIGINT, and
-            // crossterm may deliver the lone 0x03 byte WITHOUT the CONTROL
-            // modifier. Match the raw control byte as well as the composed
-            // Ctrl-C, so the keypress dismisses the picker on every platform.
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(Picked::Cancelled),
-            KeyCode::Char('\u{3}') => return Ok(Picked::Cancelled),
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break Picked::Cancelled,
+            KeyCode::Char('\u{3}') => break Picked::Cancelled,
             KeyCode::Up | KeyCode::Char('k') => sel = if sel == 0 { items.len() - 1 } else { sel - 1 },
             KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % items.len(),
-            KeyCode::Enter => return Ok(Picked::Item(sel)),
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(Picked::Cancelled),
-            // AFTER navigation, so a hint key can never shadow j/k/q.
-            KeyCode::Char(c) if k.modifiers.is_empty()
-                && hints.iter().any(|(h, _)| *h == c) => return Ok(Picked::Key(c)),
+            KeyCode::Home => sel = 0,
+            KeyCode::End => sel = items.len() - 1,
+            KeyCode::Enter => break Picked::Item(sel),
+            KeyCode::Esc | KeyCode::Char('q') => break Picked::Cancelled,
+            KeyCode::Char(c) if k.modifiers.is_empty() && opts.hints.iter().any(|(h, _)| *h == c) => {
+                break Picked::Key(c)
+            }
+            KeyCode::Char(c) if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT => {
+                if let Some(i) = (0..items.len()).find(|&i| digit_for(i, items.len(), opts.hints) == Some(c)) {
+                    sel = i;
+                    break Picked::Item(i);
+                }
+            }
             _ => {}
         }
+    };
+    erase_drawn(drawn);
+    if let (Picked::Item(i), Collapse::Summary) = (&outcome, opts.collapse.unwrap_or(Collapse::Summary)) {
+        let mut err = std::io::stderr();
+        let width = term_width().saturating_sub(4);
+        let _ = write!(err, "\r\x1b[2K  {}\r\n", ui::paint(ui::Tone::Dim, &fit(&summary_line(&items[*i]), width)));
+        let _ = err.flush();
     }
+    Ok(outcome)
 }
 
-/// Drive the live, steered entry. Returns the user's outcome. The terminal is
-/// ALWAYS restored before returning (RawGuard). `prefill` seeds the buffer (used
-/// for the malformed-arg "fix it" path). Pass the SAME `auto_nameplate` you'll
-/// use to actually mint, so the preview is honest.
 pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std::io::Result<Outcome> {
     use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 

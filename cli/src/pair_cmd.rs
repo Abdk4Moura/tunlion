@@ -933,25 +933,25 @@ async fn pair_with_purpose(
                             ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
                         } else if same_identity_member {
                             ui::say(&format!(
-                                "  {} {} is in the same fleet as this device (same identity); paired",
+                                "  {} {} connected \u{b7} your devices",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
                         } else {
                             ui::say(&format!(
-                                "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
+                                "  {} {} connected \u{b7} remembered on both devices",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
                             if named_by_default {
                                 ui::say(&ui::paint(
                                     ui::Tone::Dim,
-                                    &format!("  remembered as '{n}'; rename it any time:  tunlion devices rename {n} <name>"),
+                                    &format!("  saved as '{n}' \u{b7} rename any time: tunlion devices rename {n} <name>"),
                                 ));
                             }
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
-                                &format!("  try: tunlion send <file> --to {n}   ·   tunlion up"),
+                                &format!("  next: tunlion send <file> --to {n}"),
                             ));
                         }
                         tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
@@ -1132,33 +1132,23 @@ async fn pair_with_purpose(
                     ui::paint(ui::Tone::Brand, &full.to_uppercase())
                 ));
                 ui::say("");
+                // The prototype's code screen: the code, where to type it, keep
+                // this open. Everything else fits on one dim line.
+                ui::say("  On the other device: tunlion join");
+                ui::say("  Enter this code there. Keep this window open.");
                 if interactive_allowed() {
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
-                        "  scan this in Tunlion, or enter the code below it",
-                    ));
                     ui::say(&ui::qr_or_text(&full, 6));
                 }
+                // The HOW question was skipped to get here in one step, so its
+                // other answer is offered here instead: the file path was once
+                // reachable only by a flag nobody was told about.
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  on the other device: type it into the web app, or `tunlion join <code>`",
-                ));
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    "  keep this window open until the other device claims it",
-                ));
-                if quick {
-                    // The HOW question was skipped to get here in one step, so
-                    // its other answer is offered here instead: the file path
-                    // was once reachable only by a flag nobody was told about.
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
-                        "  not both here? add --via file writes an invitation to claim later",
-                    ));
-                }
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)",
+                    if quick {
+                        "  works once \u{b7} 10 min \u{b7} not both here? tunlion add --via file"
+                    } else {
+                        "  works once \u{b7} 10 min \u{b7} or scan it in the Tunlion app"
+                    },
                 ));
             }
             Ev::PairCode(v) => {

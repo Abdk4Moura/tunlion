@@ -1776,6 +1776,14 @@ fn main_inner() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
+    // Before anything draws: a classic Windows console interprets escapes only
+    // once asked (see platform::enable_vt_output).
+    platform::enable_vt_output();
+    // A Start Menu launch keeps its window and comes back to the menu after an
+    // action instead of closing on the result (first_screen::maybe_run_home_loop).
+    if let Some(code) = first_screen::maybe_run_home_loop() {
+        return code;
+    }
     ui::exit_quietly_on_broken_pipe();
     ui::set_closed_pipe_verb(verb_on_command_line().as_deref());
     let first = std::env::args().nth(1);

@@ -3,7 +3,8 @@
 //! `classify_bare_token` decides what a bare `tunlion <word>` means (help, a
 //! path to send, a nameplate, `device:port`, `device.mesh`, a known device name,
 //! or nothing it recognises), and `first_screen_actions` is the list the no-args
-//! screen offers. They travel together because anyhow::{Context, Result, anyhow, bail};
+//! screen offers. They travel together because both decide what a bare launch
+//! does.
 use crate::BareTarget;
 use crate::looks_like_pake_code;
 use crate::regex_lite_code;
@@ -17,7 +18,16 @@ use crate::regex_lite_code;
 /// asks once and tells a code from an invitation from a file itself.
 pub(crate) const ACCEPT_ENTRY: (&str, &str) = ("I have a code or an invitation", "join");
 
+/// The verb of the home screen's "More…" entry: opens [`more_actions`] instead
+/// of naming a command.
+pub(crate) const MORE: &str = "more";
+
 /// What the bare `tunlion` screen offers, given what this machine actually has.
+///
+/// Start from an action, in plain words, and keep it short: the everyday
+/// actions on the screen, everything else one step away under "More…" (see
+/// [`more_actions`]). Nothing that used to be offered became unreachable; it
+/// moved. A nine-item list of verbs read as a command index, not a start.
 ///
 /// Extracted so #194 can be pinned without driving a terminal: the bug was a
 /// menu that contradicted the header printed directly above it.
@@ -30,64 +40,61 @@ pub(crate) fn first_screen_actions(
         vec![
             ("Send something", "send"),
             ("Receive something", "receive"),
-            ("Mount remote files", "mount"),
-            ("Connect a device with me now", "add"),
-            ("Invite a device or person", "add --for"),
-            // #209's shape once more, reported by the owner: `ephemeral mint`
-            // existed as a verb and this screen never offered it, so the only
-            // way to reach it was to already know it. A mint path whose claim
-            // surface never grew an entry, exactly like `join` before it.
-            //
-            // It is a THIRD thing, not a rewording of the two above. Both of
-            // those are pairing: a second party is present and consents live.
-            // An ephemeral key is for when nobody is there, a CI runner or a
-            // borrowed machine that enrols later, so it cannot be folded into
-            // either without losing what makes it different.
-            (
-                "Mint a temporary key (CI, borrowed box)",
-                "add --for runner",
-            ),
-            ("Serve in the background", "up --install"),
-            ("See every device", "devices"),
-            ("View my identity", "id"),
+            ("Connect a device or share access", "add"),
+            ("More\u{2026}", MORE),
         ]
     } else if joined {
         vec![
             ("Send something", "send"),
             ("Receive something", "receive"),
-            ("Mount remote files", "mount"),
-            ("See every device", "devices"),
-            ("View my joined identity", "id"),
+            ("See my devices", "devices"),
+            ("More\u{2026}", MORE),
         ]
     } else if device_count == 0 {
         vec![
-            ("Connect a device or share temporary access", "add"),
+            ("Connect a device or share access", "add"),
             // #209: there are TWO ways to be brought into an identity. `add`
-            // mints a pairing code claimed with `add <code>`; `add --for` mints
-            // a bounded invitation claimed with `join`. This menu offered only
-            // the second, so someone holding a pairing code, which is the path
-            // the OWNER side presents first as "Connect a device with me now",
-            // had no entry here and had to know to type it. #198's shape: two
-            // mint paths, and the claim surface grew only one of them.
+            // mints a pairing code; `add --for` mints a bounded invitation
+            // claimed with `join`. Someone holding either needs an entry here,
+            // so the one accept entry takes both (see ACCEPT_ENTRY).
             ACCEPT_ENTRY,
             ("Receive a one-time transfer", "receive"),
         ]
     } else {
         // #194: this branch is about having no IDENTITY, not about being the
-        // first device. A machine paired by code has peers in devices.json
-        // and no identity of its own, so the header counted "2 DEVICES"
-        // directly above an item reading "Set up this first device". The
-        // owner hit exactly that and called it strange, which it is.
-        //
-        // Say what is actually missing, and offer what already works: those
-        // peers are reachable right now, so hiding `send` and `devices`
-        // behind a setup step nobody needs is its own small lie.
+        // first device. A machine paired by code has peers in devices.json and
+        // no identity of its own. Offer what already works: those peers are
+        // reachable right now, so hiding `send` and `devices` behind a setup
+        // step nobody needs is its own small lie.
         vec![
             ("Send something", "send"),
             ("Receive something", "receive"),
-            ("See every device", "devices"),
-            ("Connect a device or share temporary access", "add"),
+            ("See my devices", "devices"),
+            ("Connect a device or share access", "add"),
             ACCEPT_ENTRY, // #209, as above
+        ]
+    }
+}
+
+/// The second page behind "More…": real, less frequent actions. Each one was on
+/// the first screen before and stays reachable without knowing a flag (#209:
+/// a path whose menu entry disappears is a path nobody finds).
+pub(crate) fn more_actions(owner: bool) -> Vec<(&'static str, &'static str)> {
+    if owner {
+        vec![
+            ("Open files on another device", "mount"),
+            ("See my devices", "devices"),
+            ("Invite with a file they claim later", "add --for"),
+            // An unattended runner is a THIRD thing, not pairing: nobody is there
+            // to consent live, so it gets a temporary key.
+            ("Key for a CI runner or borrowed machine", "add --for runner"),
+            ("Keep running in the background", "up --install"),
+            ("Show this device's identity", "id"),
+        ]
+    } else {
+        vec![
+            ("Open files on another device", "mount"),
+            ("Show this device's identity", "id"),
         ]
     }
 }
@@ -151,4 +158,88 @@ pub(crate) fn classify_bare_token(
         return BareTarget::Shell;
     }
     BareTarget::Unknown
+}
+
+/// Set on the child a Start Menu launch runs, so the child shows the menu once
+/// and the launcher can tell "closed the menu" from "finished an action".
+pub(crate) const HOME_CHILD_ENV: &str = "TUNLION_HOME_CHILD";
+/// Exit status of a home-menu child whose menu was closed (Esc/q) rather than
+/// answered. Outside the documented taxonomy on purpose: only the launcher
+/// below ever sees it.
+pub(crate) const HOME_CLOSED: u8 = 100;
+
+/// A Start Menu or Explorer launch gets a console window of its own, and that
+/// window closes the moment the process exits. Running one action and exiting
+/// therefore made the result vanish before it could be read, and dropped the
+/// person back at the desktop. When this process owns its console and was
+/// started with no arguments, act as a small launcher instead: run the menu in
+/// a child, then offer "back to the menu" until the person closes it.
+///
+/// Never in a shell (the shell shares the console), never when stdin is not a
+/// terminal, and `TUNLION_HOME_LOOP=0` turns it off. Returns `None` when this
+/// process should just carry on as normal.
+pub(crate) fn maybe_run_home_loop() -> Option<std::process::ExitCode> {
+    use std::io::IsTerminal;
+    if std::env::args_os().len() != 1
+        || std::env::var_os(HOME_CHILD_ENV).is_some()
+        || std::env::var("TUNLION_HOME_LOOP").is_ok_and(|v| v == "0")
+        || !std::io::stdin().is_terminal()
+        || !crate::platform::console_is_ours()
+    {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    ignore_console_interrupts();
+    loop {
+        let status = match std::process::Command::new(&exe).env(HOME_CHILD_ENV, "1").status() {
+            Ok(status) => status,
+            // Could not start the child: fall back to running in this process.
+            Err(_) => return None,
+        };
+        if status.code() == Some(i32::from(HOME_CLOSED)) {
+            return Some(std::process::ExitCode::SUCCESS);
+        }
+        let exit = std::process::ExitCode::from(status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(1));
+        crate::ui::say("");
+        crate::ui::say(&crate::ui::paint(crate::ui::Tone::Dim, "  Enter: back to the menu \u{b7} Esc: close"));
+        if !wait_back_or_close() {
+            return Some(exit);
+        }
+    }
+}
+
+/// True for Enter (back to the menu), false for Esc / q / Ctrl-C (close).
+fn wait_back_or_close() -> bool {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    let Ok(_guard) = crate::codeentry::RawGuard::enable_inline() else { return false };
+    loop {
+        let Ok(Event::Key(key)) = event::read() else { return false };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Enter => return true,
+            KeyCode::Esc | KeyCode::Char('q') => return false,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            _ => {}
+        }
+    }
+}
+
+/// The launcher shares the console with the child it runs, so Ctrl-C reaches
+/// both. The child decides what Ctrl-C means; the launcher must not die of it
+/// and take the window with it. A handler (not the inherited "ignore" flag), so
+/// the child keeps normal Ctrl-C behaviour.
+fn ignore_console_interrupts() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+        unsafe extern "system" fn handler(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
+            i32::from(kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT)
+        }
+        // SAFETY: registers a plain function pointer that touches no state.
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
 }
