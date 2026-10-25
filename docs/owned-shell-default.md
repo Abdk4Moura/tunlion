@@ -136,3 +136,21 @@ warm_one_shot_pty_reuse, warm_one_shot_pty_instant_eof) occur on clean main
 two real daemons WITHOUT `up --shell` (no blanket policy, no grant). Primary to
 member allowed; member to primary refused, then allowed after the primary opts
 in; member opt-out refuses; opt-out ends a live owned shell.
+
+## Open finding from the E2E (2026-10-25, awaiting review)
+
+The signed enrolment ceiling is recorded where the enrolment happened: the
+primary holds a ceiling for each device it enrolled. So "an own device needs a
+signed shell ceiling" works for member-into-primary, but for primary-into-member
+(and sibling member-into-member) the member holds no ceiling record for its
+peer, and the owned class can never apply ("shell not granted").
+
+Proposal, not implemented:
+1. Peer is this device's own enrolling owner (the record a member keeps of who
+   enrolled it): no ceiling needed; it is the authority that signs ceilings.
+   Local acceptance, same owner, proven possession, not revoked/denied still apply.
+2. Peer is a sibling member: its signed ceiling must cover shell, read from the
+   owner-signed fleet roster if present; if no signed ceiling is known, refuse.
+3. Delegated devices unchanged.
+E2E status: member accepts and serves (fixed); cell 1 (primary -> member) fails
+on exactly this gap. Branch head b3f78178.
