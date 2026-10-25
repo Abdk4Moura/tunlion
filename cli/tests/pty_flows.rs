@@ -637,7 +637,7 @@ fn temporary_service_pairing_uses_real_transport_and_end_closes_the_socket() {
     composer_add_service(&mut host, &target.to_string(), 0);
     let code = composer_create_code(&mut host);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "authenticated scope review missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "authenticated scope review missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(!recipient.text().contains(" is now at "), "listener activated before acceptance");
     recipient.send("\r");
     assert!(recipient.wait_for(&format!("port {} is now at ", target.port()), 60), "real endpoint missing:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
@@ -782,7 +782,7 @@ fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acc
     let (mut recipient, _) = fresh_term("temporary-revision-recipient");
     let code = offer_temporary_services(&mut host, &exe, &backend.url, &[first.address, retained.address]);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(!recipient.text().contains(" is now at "));
     recipient.send("\r");
     assert!(recipient.wait_for(&format!("port {} is now at ", retained.address.port()), 60), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
@@ -801,8 +801,8 @@ fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acc
     host_open_change(&mut host);
     composer_remove_service(&mut host, 1, 2);
     host.send(ROW_FINISH); // Apply changes: this screen is the host's review.
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 20), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 20), "{}", tail(&recipient.text()));
     assert_echo(&mut retained_socket, b"same-live-stream-during-narrowing-review", &host, &recipient);
     removed_socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut byte = [0];
@@ -824,8 +824,8 @@ fn temporary_service_revisions_remove_only_the_selected_resource_and_require_acc
     let recipient_at = recipient.text().len();
     let applied_at = host.text().len();
     host.send(ROW_FINISH);
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 20), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 20), "{}", tail(&recipient.text()));
     assert!(!recipient.text()[recipient_at..].contains(&format!("port {} is now at ", first.address.port())), "addition activated without recipient acceptance");
     recipient.send("\r");
     assert!(recipient.wait_for_from(recipient_at, &format!("port {} is now at ", first.address.port()), 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
@@ -867,7 +867,7 @@ fn declining_a_temporary_service_offer_never_activates_a_listener_or_contact() {
     let (mut recipient, _) = fresh_term("temporary-decline-recipient");
     let code = offer_temporary_services(&mut host, &exe, &backend.url, &[service.address]);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     let at = recipient.text().len();
     recipient.send("\x1b[B\r");
     assert!(recipient.wait_for_from(at, &format!("{MARK}> "), 30), "{}", tail(&recipient.text()));
@@ -890,7 +890,7 @@ fn ending_while_a_revised_scope_is_being_reviewed_cancels_the_review_and_closes_
     let (mut recipient, _) = fresh_term("temporary-review-end-recipient");
     let code = offer_temporary_services(&mut host, &exe, &backend.url, &[original.address]);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     recipient.send("\r");
     assert!(recipient.wait_for(&format!("port {} is now at ", original.address.port()), 30), "{}", tail(&recipient.text()));
     assert!(host.wait_for("Sharing with", 30), "{}", tail(&host.text()));
@@ -902,8 +902,8 @@ fn ending_while_a_revised_scope_is_being_reviewed_cancels_the_review_and_closes_
     let recipient_at = recipient.text().len();
     let applied_at = host.text().len();
     host.send(ROW_FINISH);
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(recipient.wait_for_from(recipient_at, "is offering you access", 20), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for_from(recipient_at, "being offered access", 20), "{}", tail(&recipient.text()));
     assert!(host.wait_for_from(applied_at, "Sharing with", 30), "{}", tail(&host.text()));
     host.settle(300, 5);
     let end_at = host.text().len();
@@ -950,7 +950,7 @@ fn temporary_folder_browse_binary_read_and_download_use_the_scoped_real_endpoint
     host.settle(200, 3);
     let code = composer_create_code(&mut host);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(!recipient.text().contains("\u{2713} Folder share \u{b7}"));
     recipient.send("\r");
     assert!(recipient.wait_for("FOLDERS · endpoint checked on use", 30), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
@@ -1036,7 +1036,7 @@ fn temporary_shell_pty_io_resize_and_end_teardown_are_scoped_and_never_use_stand
     let (mut recipient, _) = fresh_term("temporary-shell-recipient");
     let code = offer_temporary_shell(&mut host, &exe, &backend.url);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "HOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
     assert!(recipient.text().contains("Open a shell on"), "shell scope was not offered:\n{}", tail(&recipient.text()));
     assert!(!recipient.text().contains(" is now at "), "a service listener appeared for a shell-only scope");
     recipient.send("\r");
@@ -1084,7 +1084,7 @@ fn removing_shell_from_the_live_scope_ends_the_remote_pty_without_a_standing_ses
     let code = composer_create_code(&mut host);
     assert!(host.text()[at..].contains("Shell on this device, as your account"), "{}", tail(&host.text()));
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "{}", tail(&recipient.text()));
     recipient.send("\r");
     assert!(recipient.wait_for("SHELL · shared terminal", 60), "{}", tail(&recipient.text()));
     assert!(recipient.wait_for("port 3000 is now at ", 60), "{}", tail(&recipient.text()));
@@ -1099,7 +1099,7 @@ fn removing_shell_from_the_live_scope_ends_the_remote_pty_without_a_standing_ses
     let at = recipient.text().len();
     host.send(ROW_FINISH); // Apply changes.
     assert!(recipient.wait_for_from(at, "Shared terminal ended", 30), "removal did not end the PTY:\nHOST:\n{}\nRECIPIENT:\n{}", tail(&host.text()), tail(&recipient.text()));
-    assert!(recipient.wait_for_from(at, "is offering you access", 30), "narrowed revision was not reviewed:\n{}", tail(&recipient.text()));
+    assert!(recipient.wait_for_from(at, "being offered access", 30), "narrowed revision was not reviewed:\n{}", tail(&recipient.text()));
     assert!(!recipient.text()[at..].contains("Open a shell"), "removed shell still advertised:\n{}", tail(&recipient.text()));
     recipient.send("\r");
     assert!(recipient.wait_for_from(at, "\u{2713} Connected \u{b7}", 30), "{}", tail(&recipient.text()));
@@ -1126,7 +1126,7 @@ fn temporary_shell_expiry_tears_down_the_pty_and_the_agreement() {
     let (mut recipient, _) = fresh_term("temporary-shell-expiry-recipient");
     let code = offer_temporary_shell(&mut host, &exe, &backend.url);
     recipient.send(&format!("\"{exe}\" --server {} join {code}\r", backend.url));
-    assert!(recipient.wait_for("is offering you access", 90), "{}", tail(&recipient.text()));
+    assert!(recipient.wait_for("being offered access", 90), "{}", tail(&recipient.text()));
     recipient.send("\r");
     assert!(recipient.wait_for("SHELL · shared terminal", 60), "{}", tail(&recipient.text()));
     recipient.send("\r");
