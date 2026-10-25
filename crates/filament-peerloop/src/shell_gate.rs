@@ -341,6 +341,115 @@ pub fn shell_gate_classes(action: &str, delegated: bool, accepted_here: bool, ra
     (scoped, ceiling)
 }
 
+/// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
+/// identity is Proven and whose local name came from that proven key. The RULE
+/// itself lives in `crate::host` (written once, shared with the peer loop);
+/// this is the enum-shaped wrapper so the callers and tests here keep their
+/// signatures.
+pub fn fleet_link_proven(
+    kind: &PrincipalKind,
+    binding: BindingStrength,
+    has_device_pub: bool,
+    has_verified_name: bool,
+) -> bool {
+    crate::host::fleet_link_proven(
+        matches!(kind, PrincipalKind::FleetDevice),
+        binding == BindingStrength::Proven,
+        has_device_pub,
+        has_verified_name,
+    )
+}
+
+/// Shared verdict core: legacy folds trust the same way for both paths, then
+/// the capability verdict decides alone. Returns the engine's cap reason
+/// when it names one; each call site applies its own fallback wording for
+/// the reason-less case (pty and exec historically differ there, preserved).
+fn decide(
+    inputs: &ShellGateInputs,
+    host: &dyn HostServices,
+) -> Result<(), Option<String>> {
+    decide_with_legacy(
+        inputs,
+        inputs.trusted && !inputs.denied && (inputs.policy_allows || inputs.store_allows),
+        host,
+    )
+}
+
+/// Verdict core with a caller-supplied legacy fold. exec/pty/ssh-sign use
+/// the shell fold above; the forward path passes its own blanket fold
+/// (blanket L2 mode admits trusted peers with no shell policy behind it,
+/// which the shell fold cannot express -- dropping it would newly deny
+/// default setups in shadow). Same engine, same inputs otherwise.
+fn decide_with_legacy(
+    inputs: &ShellGateInputs,
+    legacy_ok: bool,
+    host: &dyn HostServices,
+) -> Result<(), Option<String>> {
+    // Two auto-trust classes travel separately: `scoped_default` (mode
+    // independent, pre-existing) and `ceiling_covers` (authoritative-only
+    // for the decision; counted as would-allow in shadow so the ceiling
+    // population is not mistaken for breakage).
+    let granted = host.cap_gate_effective(CapGate {
+        legacy_allowed: legacy_ok,
+        outcome: &inputs.outcome,
+        action: inputs.action.as_str(),
+        resource: "self",
+        device_pub: inputs.idev.as_ref(),
+        user_pub: inputs.iusr.as_ref(),
+        binding: inputs.binding,
+        cert_expires: inputs.expires,
+        auth_key_caps: inputs.ak_caps.as_deref(),
+        own_user_pub: inputs.own_user.as_ref(),
+        scoped_in_bounds: inputs.scoped_default,
+        has_explicit_grant: inputs.has_grant,
+        cert_revoked: inputs.cert_revoked,
+        denied: inputs.denied,
+        ceiling_authorizes: inputs.ceiling_covers,
+    });
+    match granted {
+        GateDecision::Allow => Ok(()),
+        GateDecision::Deny { cap_reason } => Err(cap_reason),
+    }
+}
+
+/// Exec-open's entry point: delegates to the shared core (no local logic).
+pub fn exec_gate_decision(
+    inputs: &ShellGateInputs,
+    host: &dyn HostServices,
+) -> Result<(), Option<String>> {
+    decide(inputs, host)
+}
+
+/// Pty-open's entry point: delegates to the shared core (no local logic).
+pub fn pty_gate_decision(
+    inputs: &ShellGateInputs,
+    host: &dyn HostServices,
+) -> Result<(), Option<String>> {
+    decide(inputs, host)
+}
+
+/// Forward-open's entry point: same shared core, but the caller supplies
+/// the legacy fold (see above) and overrides `ceiling_covers` with its
+/// expose.json bound before calling. A forward --stdio to an exposed sshd
+/// is shell-equivalent in reach.
+pub fn forward_gate_decision(
+    inputs: &ShellGateInputs,
+    legacy_ok: bool,
+    host: &dyn HostServices,
+) -> Result<(), Option<String>> {
+    decide_with_legacy(inputs, legacy_ok, host)
+}
+
+/// SSH-sign's entry point: the certificate signer asks the same gate before
+/// signing (a cert is B's statement about A, so the shell grant gates it
+/// like any shell-class open). Delegates to the shared core (no local logic).
+pub fn ssh_gate_decision(
+    inputs: &ShellGateInputs,
+    host: &dyn HostServices,
+) -> Result<(), Option<String>> {
+    decide(inputs, host)
+}
+
 #[cfg(test)]
 mod owned_shell_tests {
     use super::{owned_shell_class, shell_gate_classes};
