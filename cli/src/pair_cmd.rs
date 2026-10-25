@@ -964,6 +964,7 @@ async fn pair_with_purpose(
                         }
                         tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                         let _ = sio.disconnect().await;
+                        offer_background_after_pairing();
                         return Ok(());
                     } // close: not awaiting an enrolment answer
                 } // close identity_exchange_window else
@@ -1872,5 +1873,31 @@ mod external_notice_tests {
                 }
             }
         }
+    }
+}
+
+/// Right after a pairing is the one moment "will this device be reachable?"
+/// matters, and the answer is usually "only while this window is open": shells,
+/// sends and forwards to it need something listening, and they start cold
+/// without the background service. So ask once, here, instead of showing a
+/// check mark that fails later. Never in a script, never when a daemon already
+/// serves this config dir, and "Not now" leaves the command to type later.
+fn offer_background_after_pairing() {
+    if !interactive_allowed() || crate::daemon_alive().is_some() {
+        return;
+    }
+    ui::say("");
+    ui::say("  Keep this device reachable when this window is closed?");
+    let choices = vec!["Yes, run in the background".to_string(), "Not now".to_string()];
+    match codeentry::pick("", &choices) {
+        Ok(Some(0)) => {
+            let started = std::env::current_exe().ok().and_then(|exe| {
+                std::process::Command::new(exe).args(["up", "--install"]).status().ok()
+            });
+            if !started.is_some_and(|status| status.success()) {
+                ui::say(&ui::paint(ui::Tone::Dim, "  That did not finish. Try again with: tunlion up --install"));
+            }
+        }
+        _ => ui::say(&ui::paint(ui::Tone::Dim, "  Later: tunlion up --install")),
     }
 }

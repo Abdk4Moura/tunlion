@@ -135,8 +135,9 @@ fn show(folder: &FolderAccess, output: Output) -> Result<()> {
         ui::critical(&format!("  Download durability unknown: {} may exist; not reported complete.", crate::access_ui::terminal_label(&path.display().to_string())));
         return Ok(());
     }
-    ui::say(&format!("  Folder endpoint ready · {} · {}", crate::access_ui::terminal_label(&folder.id),
-        if folder.mode == filament_peerloop::access::FolderMode::ReadOnly { "read-only" } else { "read/write" }));
+    let name = folder.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| folder.id.clone());
+    ui::say(&format!("  \u{2713} Folder {} \u{b7} {}", crate::access_ui::terminal_label(&name),
+        if folder.mode == filament_peerloop::access::FolderMode::ReadOnly { "read-only" } else { "read & write" }));
     match output {
         Output::Listing(entries) => {
             ui::say(&format!("  Folder entries ({}):", entries.len()));

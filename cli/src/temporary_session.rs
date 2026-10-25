@@ -302,7 +302,8 @@ impl Session {
                 self.active = true;
                 self.established = true;
                 self.snapshot = Some(snapshot.clone());
-                crate::ui::say(&format!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime)));
+                // The host's running controls print "Sharing with <name>" next;
+                // a second "active" line here only repeated it.
                 if self.controls.is_none() {
                     let (tx, rx) = mpsc::channel(4);
                     self.controls = Some(rx);
@@ -320,7 +321,7 @@ impl Session {
                 snapshot.accepted_revision = Some(snapshot.revision);
                 self.active = true;
                 self.established = true;
-                crate::ui::say(&format!("  Temporary access active · {} · {}", crate::access_ui::terminal_label(&snapshot.name), crate::access_ui::lifetime_label(snapshot.lifetime)));
+                crate::ui::say(&format!("  \u{2713} Connected \u{b7} {}", crate::access_ui::lifetime_label_recipient(snapshot.lifetime)));
                 reconcile_services(&mut self.endpoints, snapshot, mux.clone(), self.pending_opens.clone()).await?;
                 let shell = snapshot.spec.shell;
                 if !snapshot.spec.folders.is_empty() || shell {
@@ -717,7 +718,7 @@ async fn reconcile_services(endpoints: &mut Vec<Endpoint>, snapshot: &AgreementS
             Err(error) => { crate::ui::say(&format!("  Service {}: unavailable ({error}).", crate::access_ui::terminal_label(&service.id))); continue; }
         };
         let address = listener.local_addr()?;
-        crate::ui::say(&format!("  Local service {} at {address} -> {}", crate::access_ui::terminal_label(&service.id), service.target));
+        crate::ui::say(&format!("  \u{2713} {} is now at {address}", crate::access_ui::service_label(&service.target)));
         let id = snapshot.id.clone();
         let (revision_tx, revision_rx) = tokio::sync::watch::channel(Some(snapshot.revision));
         let resource = service.id.clone();

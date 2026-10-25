@@ -89,7 +89,7 @@ fn mode_label(mode: &FolderMode) -> &'static str {
 }
 
 /// `3000` for the common loopback case, the full address otherwise. Pure.
-fn service_label(target: &SocketAddr) -> String {
+pub(crate) fn service_label(target: &SocketAddr) -> String {
     if target.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) { format!("port {}", target.port()) } else { target.to_string() }
 }
 
@@ -142,11 +142,32 @@ pub(crate) fn lifetime_label(lifetime: Lifetime) -> String {
     lifetime_label_at(lifetime, crate::identity::now_secs())
 }
 
+/// The same, from the RECIPIENT's side: the host is the one who ends it. Pure.
+pub(crate) fn lifetime_label_recipient_at(lifetime: Lifetime, now: u64) -> String {
+    match lifetime {
+        Lifetime::UntilEnded => "until they end it".into(),
+        other => lifetime_label_at(other, now),
+    }
+}
+
+pub(crate) fn lifetime_label_recipient(lifetime: Lifetime) -> String {
+    lifetime_label_recipient_at(lifetime, crate::identity::now_secs())
+}
+
 /// What the JOINING side sees before accepting, in the prototype's "you can"
 /// form. Pure, so tests pin the wording.
+///
+/// `snapshot.name` here is the name the HOST assigned to THIS device (labels are
+/// allocated by the side that offers), so it is shown as "you'll appear as",
+/// never as the host's name.
 fn offer_lines(snapshot: &AgreementSnapshot, now: u64) -> Vec<String> {
-    let host = terminal_label(&snapshot.name);
-    let mut lines = vec![format!("{host} is offering you access {}", lifetime_label_at(snapshot.lifetime, now)), String::new(), "You can".into()];
+    let host = "their device";
+    let mut lines = vec![
+        format!("You're being offered access {}", lifetime_label_recipient_at(snapshot.lifetime, now)),
+        format!("You'll appear there as {}", terminal_label(&snapshot.name)),
+        String::new(),
+        "You can".into(),
+    ];
     for folder in &snapshot.spec.folders {
         let name = folder.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| folder.path.display().to_string());
         let verb = if folder.mode == FolderMode::ReadWrite { "Browse, download and change files in" } else { "Browse and download files from" };
@@ -474,13 +495,15 @@ pub(crate) fn temporary_access() -> Result<AccessSpec> {
     }
     // The composer is the host's review; show what was chosen once, plainly.
     for line in draft.review()? { ui::say(&format!("  {}", terminal_label(&line))); }
-    // Only the confirmed mutation crosses into the shared ceremony.
-    #[cfg(feature = "forward-server")]
-    { return Ok(draft.spec); }
-    #[cfg(all(not(feature = "forward-server"), unix, feature = "pty-server"))]
-    { if draft.spec.shell { return Ok(draft.spec); } }
-    #[cfg(not(any(feature = "forward-server", all(unix, feature = "pty-server"))))]
-    { let _ = draft; }
+    // Only the confirmed mutation crosses into the shared ceremony, and only
+    // when this build has a scoped endpoint for what was chosen: the forward
+    // server serves every resource kind; a pty-only Unix build serves a scope
+    // that includes the shell.
+    let servable = cfg!(feature = "forward-server")
+        || (cfg!(all(unix, feature = "pty-server")) && draft.spec.shell);
+    if servable {
+        return Ok(draft.spec);
+    }
     bail!("this build cannot share those resources, so no code was created and nothing was shared");
 }
 
@@ -596,10 +619,11 @@ mod tests {
             accepted_revision: None,
         };
         let lines = offer_lines(&snapshot, 0);
-        assert_eq!(lines[0], "alex-laptop is offering you access until you end it");
+        assert_eq!(lines[0], "You're being offered access until they end it");
+        assert_eq!(lines[1], "You'll appear there as alex-laptop");
         assert!(lines.iter().any(|line| line.starts_with("  \u{2713} Browse and download files from")));
-        assert!(lines.iter().any(|line| line == "  \u{2713} Reach port 5432 on alex-laptop"));
-        assert!(lines.iter().any(|line| line == "  \u{2713} Open a shell on alex-laptop, as its owner's account"));
+        assert!(lines.iter().any(|line| line == "  \u{2713} Reach port 5432 on their device"));
+        assert!(lines.iter().any(|line| line == "  \u{2713} Open a shell on their device, as its owner's account"));
         let all = lines.join("\n");
         for jargon in ["revision", "peer", "0909", "foreground", "endpoint", "reattach"] {
             assert!(!all.contains(jargon), "offer leaks {jargon}: {all}");
