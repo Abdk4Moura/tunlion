@@ -458,7 +458,16 @@ mod protocol_tests {
         read(&mut rx, &tx, 6, 3, 2, b"").await;
         let error = task.await.unwrap().unwrap_err().to_string();
         assert!(error.contains("advertised size"), "{error}");
-        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0, "short read left a local name or staging file");
+        // Name what is left, so a platform-specific leftover is diagnosable
+        // from the failure line alone (a Windows run could not say which).
+        let left: Vec<String> = std::fs::read_dir(&destination).unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                let len = entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+                format!("{} ({len} bytes)", entry.file_name().to_string_lossy())
+            })
+            .collect();
+        assert!(left.is_empty(), "short read left a local name or staging file: {left:?}");
     }
 
     #[tokio::test]

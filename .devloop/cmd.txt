@@ -1,1 +1,1 @@
-powershell -NoProfile -ExecutionPolicy Bypass -File .devloop\fluid-validation.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .devloop\folder-diag.ps1
