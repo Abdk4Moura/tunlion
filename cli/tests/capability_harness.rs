@@ -2872,6 +2872,25 @@ fn owned_device_shell_member_default_primary_opt_in_and_opt_out_ends_live() {
         || wait_for_line(&h.daemon_b_log, "known device 'test-a' appeared", Duration::from_secs(5));
     assert!(discovered, "the enrolled devices never found each other");
 
+    // Diagnostics, not assertions: the member's role decides its default.
+    for (label, dir) in [("A", &h.a_dir), ("B", &h.b_dir)] {
+        let files: Vec<String> = std::fs::read_dir(dir)
+            .map(|it| it.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        eprintln!("owned-shell e2e: {label} config files: {files:?}");
+        let id = Command::new(&bin).env("TUNLION_CONFIG_DIR", dir).args(["id"]).output();
+        if let Ok(id) = id {
+            eprintln!("owned-shell e2e: {label} id: {}{}", String::from_utf8_lossy(&id.stdout), String::from_utf8_lossy(&id.stderr));
+        }
+    }
+    for log in [&h.daemon_a_log, &h.daemon_b_log] {
+        if let Ok(lines) = log.lock() {
+            for line in lines.iter().filter(|l| l.contains("owned shells:")) {
+                eprintln!("owned-shell e2e: {line}");
+            }
+        }
+    }
+
     let n1 = format!("OWNED-1-{}", std::process::id());
     let out = shell_echo(&bin, &server, &h.a_dir, "test-b", &n1);
     assert!(echoed(&out, &n1), "primary -> member must be allowed with no grant:\n{}\n{}", out.stdout, out.stderr);

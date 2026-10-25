@@ -54,6 +54,20 @@ pub(crate) async fn recv_cmd(
     let engine_log = log.clone();
     let engine_report = RecvReport::clone(report);
     let l2_launch = shell_policy.enables_l2() || crate::shell_support::shell_serving_wanted();
+    // Say the owned-shell posture once at start, so "why is this device not
+    // serving my shell" is answerable from the log (docs/owned-shell-default.md).
+    {
+        let primary = crate::host_impl::is_primary_after_load(
+            &crate::identity::UserKey::load(&crate::platform::PlatformKeyStore),
+        );
+        crate::ui::debug(&format!(
+            "owned shells: {} here (this device is {}; own-devices-shell={}); shell serving {}",
+            if crate::host_impl::owned_shell_accepted_now() { "accepted" } else { "not accepted" },
+            if primary { "the primary" } else { "a member" },
+            crate::settings::get_str("own-devices-shell", None).unwrap_or_else(|| "auto".into()),
+            if l2_launch { "on" } else { "off" },
+        ));
+    }
     let env = RecvEnv {
         display_name: display_name(),
         uid: mk_uid("r"),
