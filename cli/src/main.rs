@@ -102,6 +102,7 @@ mod enrollment;
 mod membership;
 /// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
+mod preconnect;
 mod access_ui;
 mod temporary_session;
 mod access_end;
@@ -1778,10 +1779,23 @@ fn main_inner() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
+    ui::mark_start();
+    // Before anything draws: a classic Windows console interprets escapes only
+    // once asked (see platform::enable_vt_output).
+    platform::enable_vt_output();
+    // A Start Menu launch keeps its window and comes back to the menu after an
+    // action instead of closing on the result (first_screen::maybe_run_home_loop).
+    if let Some(code) = first_screen::maybe_run_home_loop() {
+        return code;
+    }
     ui::exit_quietly_on_broken_pipe();
     ui::set_closed_pipe_verb(verb_on_command_line().as_deref());
     let first = std::env::args().nth(1);
-    let rt = if is_light_command(first.as_deref()) {
+    // A bare launch at a terminal is the menu, and the menu leads straight into
+    // network actions (and pre-connects signaling while it waits for a key), so
+    // it needs worker threads. Bare and non-interactive stays the light tour.
+    let menu = first.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let rt = if is_light_command(first.as_deref()) && !menu {
         tokio::runtime::Builder::new_current_thread().enable_all().build()
     } else {
         tokio::runtime::Builder::new_multi_thread().enable_all().build()

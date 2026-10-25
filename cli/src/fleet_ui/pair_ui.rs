@@ -4,40 +4,38 @@
 // PAKE spoken-words screen, inter-user per-cap/direction/expiry form, non-TTY refusal.
 
 use crate::ui::{self, Tone};
-use super::{double_rule, echo_cmd, meta};
+use super::{double_rule, meta};
 use filament_pair::words::SpokenSas;
 
-/// Render the same-person banner + fleet add.
+/// The screen shown when the other device turns out to be one of yours.
+///
+/// Plain words, in the prototype's "you can" shape, and only what the engine
+/// actually grants a same-owner device without an explicit grant (see
+/// `filament_cap::is_scoped_default_action`: transfer into the inbox and a
+/// read-only mount of the share root; shell, writes and routes stay deliberate).
+/// It is a statement, not a dialog: the pairing continues on its own, so no
+/// button-shaped text that pressing would do nothing about.
 pub fn render_same_person_banner(device_name: &str) -> String {
+    let ok = ui::paint(Tone::Ok, ui::glyph_ok());
     format!(
-        "{rule}\n{banner}\n{rule}\n\n{msg}\n\n{will}\n{wont}\n{meta}\n\n{btns}",
-        rule = ui::paint(Tone::Brand, double_rule()),
-        banner = format!("  {}  SAME PERSON  /  this is you", ui::paint(Tone::Brand, ui::glyph_fleet())),
-        msg = format!("  \"{}\" is signed by your identity. Adding it to your fleet.", device_name),
-        will = format!(
-            "  This device will:  {}",
-            ui::paint(Tone::Ok, "send/receive with your fleet / reach exposed ports / read the configured share root")
-        ),
-        wont = format!(
-            "  It will not:       {}",
-            ui::paint(Tone::Dim, "owner-equivalent shell / write to disk   (grant those later if you want)")
-        ),
-        meta = meta(&format!("{} fleet / cryptographically Proven", ui::glyph_fleet())),
-        btns = format!(
-            "        {}   {}",
-            ui::paint(Tone::Bold, "[ Add to my fleet ]"),
-            ui::paint(Tone::Dim, "[ Cancel ]")
+        "\n  {head}\n\n  {you}\n    {ok} Send each other files\n    {ok} Read your shared folder\n    {ok} Reach ports you choose to expose\n\n  {later}",
+        head = ui::paint(Tone::Bold, &format!("{device_name} is one of your devices")),
+        you = "Your devices can",
+        later = ui::paint(
+            Tone::Dim,
+            "Opening a shell or changing files needs your OK on that device first.",
         ),
     )
 }
 
-/// Render the same-person success message.
+/// The receipt once one of your own devices is connected.
 pub fn render_same_person_success(device_name: &str) -> String {
     format!(
-        "{ok} {name} joined your fleet.\n{echo}",
+        "  {ok} {name} connected \u{b7} your devices\n\n  {next}\n    tunlion send <file> --to {word}\n    tunlion devices",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
-        name = device_name,
-        echo = echo_cmd("tunlion add"),
+        name = ui::paint(Tone::Bold, device_name),
+        next = ui::paint(Tone::Dim, "Next time, from here:"),
+        word = crate::refusal::word(device_name),
     )
 }
 
@@ -224,11 +222,24 @@ mod tests {
     }
 
     #[test]
-    fn same_person_banner_fleet_glyph() {
-        let s = render_same_person_banner("pixel-7");
-        assert!(s.contains("SAME PERSON"), "must show SAME PERSON");
-        assert!(s.contains("pixel-7"), "must show device name");
-        assert!(s.contains("fleet") || s.contains("[fleet]"), "must show fleet glyph");
+    fn same_person_banner_is_plain_and_truthful() {
+        let s = ui::strip_ansi(&render_same_person_banner("pixel-7"));
+        assert!(s.contains("pixel-7 is one of your devices"), "{s}");
+        assert!(s.contains("Send each other files"), "{s}");
+        // Shell and writes are deliberate-tier: never promised by the banner.
+        assert!(!s.contains("Open a shell"), "{s}");
+        assert!(s.contains("needs your OK"), "{s}");
+        for jargon in ["SAME PERSON", "fleet", "Proven", "[ Add", "share root"] {
+            assert!(!s.contains(jargon), "banner leaks {jargon}: {s}");
+        }
+    }
+
+    #[test]
+    fn same_person_receipt_names_the_next_commands() {
+        let s = ui::strip_ansi(&render_same_person_success("desk"));
+        assert!(s.contains("desk connected"), "{s}");
+        assert!(s.contains("tunlion send <file> --to desk"), "{s}");
+        assert!(!s.contains("fleet"), "{s}");
     }
 
     #[test]
@@ -338,6 +349,6 @@ mod tests {
     fn same_person_success() {
         let s = render_same_person_success("pixel-7");
         assert!(s.contains("pixel-7"), "must show device name");
-        assert!(s.contains("joined your fleet"), "must confirm fleet join");
+        assert!(ui::strip_ansi(&s).contains("pixel-7 connected \u{b7} your devices"), "must confirm it is now one of your devices: {s}");
     }
 }

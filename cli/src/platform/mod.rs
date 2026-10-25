@@ -3188,6 +3188,51 @@ impl ConsoleModes {
     }
 }
 
+/// Let the console interpret the escape sequences the menus and colours write.
+///
+/// WINDOWS: a classic console host (a Start Menu launch on Windows 10) has VT
+/// output processing OFF until a program asks for it. Nothing asked before the
+/// first menu drew, so `\x1b[2K` and the colour codes could print as literal
+/// `←[2K` until a later crossterm call happened to switch it on. Output only:
+/// VT *input* would change how keys reach crossterm, which the pickers rely on.
+///
+/// ELSEWHERE: terminals already interpret escapes; a no-op.
+pub fn enable_vt_output() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+        for handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            if let Some(cur) = win_console_get(handle) {
+                if cur & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0 {
+                    win_console_set(handle, cur | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                }
+            }
+        }
+    }
+}
+
+/// True when this process is the only one attached to its console, which is
+/// what a Start Menu or Explorer launch looks like: the console window was made
+/// for us and closes the moment we exit. Run from cmd/PowerShell/Terminal, the
+/// shell shares the console, so the count is at least two.
+///
+/// ELSEWHERE: there is no such window to lose; always false.
+pub fn console_is_ours() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::GetConsoleProcessList;
+        let mut ids = [0u32; 4];
+        // SAFETY: writes at most `ids.len()` process ids into a valid buffer and
+        // returns how many processes share the console (0 on failure).
+        let attached = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) };
+        attached == 1
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(windows)]
 fn win_console_get(which: u32) -> Option<u32> {
     use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle};

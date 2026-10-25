@@ -435,8 +435,16 @@ async fn pair_with_purpose(
     }
     let my_uid = mk_uid("p");
     let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
+    // The home screen may already have opened this connection while the
+    // person was choosing (preconnect.rs); otherwise connect now, as always.
+    let (sio, tx, mut rx) = match crate::preconnect::take(server).await {
+        Some(warm) => warm,
+        None => {
+            let (tx, rx) = mpsc::unbounded_channel::<Ev>();
+            let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
+            (sio, tx, rx)
+        }
+    };
     // Meta must exist for pairing; an unguessable solo room keeps strangers
     // out (the daemon's trick), the pair-claim moves people, not the room.
     let solo = format!("pairc-{}", fresh_secret());
@@ -933,29 +941,30 @@ async fn pair_with_purpose(
                             ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
                         } else if same_identity_member {
                             ui::say(&format!(
-                                "  {} {} is in the same fleet as this device (same identity); paired",
+                                "  {} {} connected \u{b7} your devices",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
                         } else {
                             ui::say(&format!(
-                                "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
+                                "  {} {} connected \u{b7} remembered on both devices",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
                             if named_by_default {
                                 ui::say(&ui::paint(
                                     ui::Tone::Dim,
-                                    &format!("  remembered as '{n}'; rename it any time:  tunlion devices rename {n} <name>"),
+                                    &format!("  saved as '{n}' \u{b7} rename any time: tunlion devices rename {n} <name>"),
                                 ));
                             }
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
-                                &format!("  try: tunlion send <file> --to {n}   ·   tunlion up"),
+                                &format!("  next: tunlion send <file> --to {n}"),
                             ));
                         }
                         tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                         let _ = sio.disconnect().await;
+                        offer_background_after_pairing();
                         return Ok(());
                     } // close: not awaiting an enrolment answer
                 } // close identity_exchange_window else
@@ -1125,6 +1134,7 @@ async fn pair_with_purpose(
                 // L1-a: the server allocated our nameplate. Display the FULL code
                 // from OUR OWN local mint (the server never echoed any words).
                 let full = format!("{my_words}-{my_nameplate}");
+                ui::timing("pairing code shown");
                 ui::clipboard(&full);
                 ui::say("");
                 ui::say(&format!(
@@ -1132,33 +1142,23 @@ async fn pair_with_purpose(
                     ui::paint(ui::Tone::Brand, &full.to_uppercase())
                 ));
                 ui::say("");
+                // The prototype's code screen: the code, where to type it, keep
+                // this open. Everything else fits on one dim line.
+                ui::say("  On the other device: tunlion join");
+                ui::say("  Enter this code there. Keep this window open.");
                 if interactive_allowed() {
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
-                        "  scan this in Tunlion, or enter the code below it",
-                    ));
                     ui::say(&ui::qr_or_text(&full, 6));
                 }
+                // The HOW question was skipped to get here in one step, so its
+                // other answer is offered here instead: the file path was once
+                // reachable only by a flag nobody was told about.
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  on the other device: type it into the web app, or `tunlion join <code>`",
-                ));
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    "  keep this window open until the other device claims it",
-                ));
-                if quick {
-                    // The HOW question was skipped to get here in one step, so
-                    // its other answer is offered here instead: the file path
-                    // was once reachable only by a flag nobody was told about.
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
-                        "  not both here? add --via file writes an invitation to claim later",
-                    ));
-                }
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)",
+                    if quick {
+                        "  works once \u{b7} 10 min \u{b7} not both here? tunlion add --via file"
+                    } else {
+                        "  works once \u{b7} 10 min \u{b7} or scan it in the Tunlion app"
+                    },
                 ));
             }
             Ev::PairCode(v) => {
@@ -1873,5 +1873,31 @@ mod external_notice_tests {
                 }
             }
         }
+    }
+}
+
+/// Right after a pairing is the one moment "will this device be reachable?"
+/// matters, and the answer is usually "only while this window is open": shells,
+/// sends and forwards to it need something listening, and they start cold
+/// without the background service. So ask once, here, instead of showing a
+/// check mark that fails later. Never in a script, never when a daemon already
+/// serves this config dir, and "Not now" leaves the command to type later.
+fn offer_background_after_pairing() {
+    if !interactive_allowed() || crate::daemon_alive().is_some() {
+        return;
+    }
+    ui::say("");
+    ui::say("  Keep this device reachable when this window is closed?");
+    let choices = vec!["Yes, run in the background".to_string(), "Not now".to_string()];
+    match codeentry::pick("", &choices) {
+        Ok(Some(0)) => {
+            let started = std::env::current_exe().ok().and_then(|exe| {
+                std::process::Command::new(exe).args(["up", "--install"]).status().ok()
+            });
+            if !started.is_some_and(|status| status.success()) {
+                ui::say(&ui::paint(ui::Tone::Dim, "  That did not finish. Try again with: tunlion up --install"));
+            }
+        }
+        _ => ui::say(&ui::paint(ui::Tone::Dim, "  Later: tunlion up --install")),
     }
 }

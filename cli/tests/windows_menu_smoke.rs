@@ -8,7 +8,7 @@
 //! binary inside a ConPTY and drives the pickers the way a person does.
 //!
 //! No network, no identity: the config dir is a fresh temp directory, the first
-//! screen offers "Connect a device or share temporary access", and the draft
+//! screen offers "Connect a device or share access", and the draft
 //! menu stops before minting anything.
 
 #![cfg(windows)]
@@ -100,7 +100,7 @@ fn interactive_startup_and_temporary_access_menus_stay_up() {
         screen.text()
     );
     assert!(
-        screen.wait_for("Connect a device or share temporary access", 10),
+        screen.wait_for("Connect a device or share access", 10),
         "the fresh-device first action is missing; got:\n{}",
         screen.text()
     );
@@ -110,16 +110,16 @@ fn interactive_startup_and_temporary_access_menus_stay_up() {
         screen.text()
     );
 
-    // First action -> `add` menu, second item -> the temporary-access draft.
+    // First action -> `add` menu, third item -> the temporary-access composer.
     screen.send("\r");
     assert!(
-        screen.wait_for("Temporary access", 15),
+        screen.wait_for("Temporary access (folders", 15),
         "the add menu never offered temporary access; got:\n{}",
         screen.text()
     );
-    screen.send("\u{1b}[B\r");
+    screen.send("3");
     assert!(
-        screen.wait_for("Folders (0)", 15),
+        screen.wait_for("Folders  \u{b7} none", 15),
         "the temporary-access menu never drew; got:\n{}",
         screen.text()
     );
