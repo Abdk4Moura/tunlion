@@ -184,17 +184,27 @@ pub(crate) async fn perform(client: &mut MountClient, request: &Request, cancel:
     if let Operation::Download { directory, name } = &request.operation {
         use filament_peerloop::download_output::{OwnedDownload, OutputError};
         let mut output = OwnedDownload::create(directory, name, stat.size, MAX_DOWNLOAD_BYTES, None).await?;
-        let mut offset = 0u64;
-        while offset < stat.size {
-            let amount = (stat.size - offset).min(u64::from(read_limit)) as u32;
-            let bytes = client.read_binary(fh, offset, amount, Duration::from_secs(10), cancel).await?;
-            if bytes.is_empty() { bail!("file ended before its advertised size; no download was published"); }
-            output.write_chunk(&bytes, cancel).await?;
-            offset = offset.checked_add(bytes.len() as u64).ok_or_else(|| anyhow!("file byte count overflow"))?;
+        // Every refusal before publication goes through `abort`, so the private
+        // staging is gone when the error is reported (not whenever the last
+        // handle happens to close).
+        let transferred: Result<()> = async {
+            let mut offset = 0u64;
+            while offset < stat.size {
+                let amount = (stat.size - offset).min(u64::from(read_limit)) as u32;
+                let bytes = client.read_binary(fh, offset, amount, Duration::from_secs(10), cancel).await?;
+                if bytes.is_empty() { bail!("file ended before its advertised size; no download was published"); }
+                output.write_chunk(&bytes, cancel).await?;
+                offset = offset.checked_add(bytes.len() as u64).ok_or_else(|| anyhow!("file byte count overflow"))?;
+            }
+            // Finish the remote operation before committing local publication. A
+            // revoked/failed Release must leave only removable private staging.
+            call(client, MountOp::Release { fh }, cancel).await?;
+            Ok(())
+        }.await;
+        if let Err(error) = transferred {
+            output.abort().await;
+            return Err(error);
         }
-        // Finish the remote operation before committing local publication. A
-        // revoked/failed Release must leave only removable private staging.
-        call(client, MountOp::Release { fh }, cancel).await?;
         return match output.finish(cancel).await {
             Ok(published) => Ok(Output::Downloaded(published)),
             Err(OutputError::DurabilityUnknown(path)) => Ok(Output::DurabilityUnknown(path)),
