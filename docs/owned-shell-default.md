@@ -110,18 +110,25 @@ becomes a primary and therefore NEEDS the opt-in: the change is toward narrower.
 A load error counts as primary (never widen on a read failure). Test:
 `owned_shell_accepted_for` (settings.rs).
 
-**Q4, what outlives an opt-out.**
+**Q4, what outlives an opt-out.** RULED: a shorter certificate lifetime does not
+meet "turning it off blocks new incoming shells and terminates existing ones",
+because a signed SSH certificate keeps authenticating new sessions until it
+expires. So, until certificate revocation and SSH session teardown exist, the
+automatic own-device path does NOT apply to ssh-sign
+(`shell_gate::without_owned_device_paths`): `shell --ssh` stays grant-only for the
+owner's own devices, exactly as before the feature. Own-device shells use the
+tunlion PTY and exec paths, which the opt-out does end. Needs owner sign-off as a
+narrower guarantee. Tests: `ssh_sign_never_takes_the_owned_device_paths`.
 - New opens: refused at once (acceptance is read fresh per open).
-- Live PTY/exec admitted via the owned class or the shell ceiling: ended on the
-  next `revoke_recheck_interval` tick. E2E cell 5 asserts a live owned shell ends
-  within 30 s of `own-devices-shell off`.
+- Live PTY/exec admitted as an own device: ended on the next recheck tick.
 - Warm links: no bypass. Every pty/exec/ssh-sign open re-enters the gate.
-- SSH certificates already signed: NOT revoked by an opt-out; they stay valid to
-  their TTL (`ssh.cert_ttl`, default 1h, max 24h), because sshd trusts the CA
-  independently of the daemon. PROPOSAL: a certificate signed on the owned-class
-  path gets TTL min(ssh.cert_ttl, 10 min), so an opt-out converges within 10
-  minutes; explicitly granted certificates keep the configured TTL. Not yet
-  implemented; awaiting the ruling.
+
+**Q3 test:** `is_primary_after_load` (host_impl.rs): a key-load error fails closed
+as primary, so `auto` does not auto-accept.
+
+**Harness triage:** the same 3 harness failures (direct_blocked_falls_back,
+warm_one_shot_pty_reuse, warm_one_shot_pty_instant_eof) occur on clean main
+6e3f057d with the identical command; pre-existing, not introduced here.
 
 ## End-to-end test
 

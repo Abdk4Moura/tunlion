@@ -566,9 +566,26 @@ pub(crate) fn owner_pub_for_resources() -> Option<[u8; 32]> {
 /// key; a load error counts as primary, the narrower answer (never widen on a
 /// read failure).
 pub(crate) fn owned_shell_accepted_now() -> bool {
-    let is_primary = !matches!(
-        crate::identity::UserKey::load(&crate::platform::PlatformKeyStore),
-        Ok(None)
-    );
+    let is_primary = is_primary_after_load(&crate::identity::UserKey::load(&crate::platform::PlatformKeyStore));
     crate::settings::owned_shell_accepted(is_primary)
+}
+
+/// Primary = the owner key loaded. A load ERROR fails closed as primary, so
+/// the device needs its opt-in rather than auto-accepting (review Q3). Pure.
+pub(crate) fn is_primary_after_load<T, E>(load: &Result<Option<T>, E>) -> bool {
+    !matches!(load, Ok(None))
+}
+
+#[cfg(test)]
+mod owned_shell_role_tests {
+    use super::is_primary_after_load;
+
+    #[test]
+    fn a_key_load_error_fails_closed_as_primary() {
+        assert!(!is_primary_after_load::<(), ()>(&Ok(None)), "no owner key: a member");
+        assert!(is_primary_after_load::<(), ()>(&Ok(Some(()))), "owner key present: the primary");
+        assert!(is_primary_after_load::<(), ()>(&Err(())), "a load error must fail closed as primary");
+        // and the role feeds the rule: a failed load on `auto` never auto-accepts
+        assert!(!crate::settings::owned_shell_accepted_for("auto", is_primary_after_load::<(), ()>(&Err(()))));
+    }
 }

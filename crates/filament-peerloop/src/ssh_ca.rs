@@ -628,6 +628,12 @@ pub async fn handle_ssh_sign(
     }
     // Gate first (same function, same inputs as pty/exec): no grant, no cert.
     let (dev, inputs) = gather_shell_gate_inputs(conn, pid, shell_policy, CAP_SHELL);
+    // Review finding Q4: an SSH certificate keeps authenticating new sessions
+    // until it expires, so an `own-devices-shell` opt-out could not end what it
+    // already signed. Until certificate revocation and SSH session teardown
+    // exist, the automatic own-device path does NOT sign: ssh-sign stays
+    // grant-only for the owner's own devices, exactly as before the feature.
+    let inputs = crate::shell_gate::without_owned_device_paths(inputs);
     if let Err(cap_reason) = ssh_gate_decision(&inputs, conn.host.as_ref()) {
         // Settle-then-evaluate: the verdict above may rest on stale
         // (unproven) identity. Park for re-drive on proof when the deny

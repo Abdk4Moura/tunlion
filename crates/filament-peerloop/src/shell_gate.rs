@@ -302,6 +302,19 @@ impl ShellGateInputs {
     }
 }
 
+/// The gate inputs with the owner's-own-device no-grant paths removed, for a
+/// path whose authority cannot be withdrawn on opt-out yet (ssh-sign: a signed
+/// certificate outlives the toggle; review finding Q4). Only non-delegated
+/// shell opens change; delegated principals keep their signed-ceiling path and
+/// explicit grants are never touched, so the result is the pre-feature gate.
+pub fn without_owned_device_paths(mut inputs: ShellGateInputs) -> ShellGateInputs {
+    if inputs.action == filament_cap::capability::CAP_SHELL && inputs.ak_caps.is_none() {
+        inputs.scoped_default = false;
+        inputs.ceiling_covers = false;
+    }
+    inputs
+}
+
 /// Is this open in the owned-device shell class? Pure, so the matrix pins it.
 /// Only the shell action, only a non-delegated principal, only when this device
 /// accepts owned shells, and only when the owner-signed enrolment ceiling
@@ -357,6 +370,42 @@ mod owned_shell_tests {
         // no signed shell ceiling: nothing, accepted or not
         assert_eq!(shell_gate_classes(CAP_SHELL, false, true, false), (false, false));
         assert_eq!(shell_gate_classes(CAP_SHELL, false, false, false), (false, false));
+    }
+
+    fn inputs(action: &str, delegated: bool) -> super::ShellGateInputs {
+        super::ShellGateInputs {
+            trusted: true,
+            denied: false,
+            policy_allows: false,
+            store_allows: false,
+            outcome: filament_cap::capability::CapOutcome::Authorized,
+            idev: Some([1; 32]),
+            iusr: Some([2; 32]),
+            binding: filament_cap::capability::BindingStrength::Proven,
+            expires: None,
+            ak_caps: delegated.then(|| vec![CAP_SHELL.to_string()]),
+            own_user: Some([2; 32]),
+            has_grant: false,
+            cert_revoked: false,
+            action: action.to_string(),
+            ceiling_covers: true,
+            scoped_default: true,
+        }
+    }
+
+    #[test]
+    fn ssh_sign_never_takes_the_owned_device_paths() {
+        // Review Q4: a signed certificate outlives an opt-out, so ssh-sign is
+        // grant-only for the owner's own devices until revocation exists.
+        let own = super::without_owned_device_paths(inputs(CAP_SHELL, false));
+        assert!(!own.scoped_default && !own.ceiling_covers, "own device: no automatic ssh-sign");
+        assert!(!own.admitted_via_owned_shell());
+        // A delegated principal keeps its signed-ceiling path untouched.
+        let delegated = super::without_owned_device_paths(inputs(CAP_SHELL, true));
+        assert!(delegated.ceiling_covers, "delegated authority is not the toggle's to change");
+        // Other actions are untouched.
+        let transfer = super::without_owned_device_paths(inputs(CAP_TRANSFER, false));
+        assert!(transfer.scoped_default && transfer.ceiling_covers);
     }
 
     #[test]
