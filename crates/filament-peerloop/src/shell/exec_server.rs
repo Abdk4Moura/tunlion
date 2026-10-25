@@ -518,6 +518,9 @@ pub struct ExecSessionAuthz {
     /// than an explicit grant: a narrowed ceiling must end it on the next
     /// tick, exactly like a revocation.
     pub admitted_via_ceiling: bool,
+    /// Admitted only as the owner's own device: ends when this device stops
+    /// accepting owned shells, and is not judged by the per-device grant.
+    pub admitted_via_owned_shell: bool,
 }
 
 /// Serve one accepted exec open: spawn argv[] directly (NO shell, NO login
@@ -888,12 +891,19 @@ pub async fn serve_exec(
                 // re-check every serving loop shares.
                 let cut = host.live_session_cut(authz.idev.as_ref());
                 let grant_gone = match authz.dev_name.as_deref() {
+                    // An explicit deny always ends it. An owned-device session
+                    // was never resting on a per-device grant, so a missing one
+                    // is not a withdrawal; its own condition is below.
                     Some(n) => {
                         host.device_capability_denied(n, "shell")
-                            || !(authz.policy_allows || host.device_allows(n, "shell"))
+                            || (!authz.admitted_via_owned_shell
+                                && !(authz.policy_allows || host.device_allows(n, "shell")))
                     }
                     None => false,
                 };
+                // This device stopped accepting owned shells (switched off, or
+                // a primary withdrew its opt-in): owned-admitted sessions end.
+                let owned_gone = authz.admitted_via_owned_shell && !host.owned_shell_accepted();
                 // A ceiling narrowed under a ceiling-admitted session ends
                 // it (re-read fresh; grant-admitted sessions ignore this).
                 let ceiling_gone = authz.admitted_via_ceiling
@@ -901,7 +911,7 @@ pub async fn serve_exec(
                 // A lapsed deadline (cert expiry, absolute stop, offline
                 // budget) ends it too; unresolvable identity is no opinion.
                 let lapsed = matches!(host.peer_liveness_alive(authz.idev.as_ref()), Some(false));
-                if cut.is_some() || grant_gone || ceiling_gone || lapsed {
+                if cut.is_some() || grant_gone || ceiling_gone || owned_gone || lapsed {
                     // The close names the cause: an expiry must read as one
                     // (the initiator exits 4 and prints the re-invite), not as
                     // a revocation the owner never made.
@@ -1017,13 +1027,14 @@ pub async fn handle_exec_open(
         },
     )
     .await;
-    let (t, sid, device, device_pub, admitted_via_ceiling, req) = match admission {
+    let (t, sid, device, device_pub, admitted_via_ceiling, admitted_via_owned_shell, req) = match admission {
         ShellAdmission::Admitted {
             transport,
             sid,
             device,
             device_pub,
             admitted_via_ceiling,
+            admitted_via_owned_shell,
             plan,
         } => (
             transport,
@@ -1031,6 +1042,7 @@ pub async fn handle_exec_open(
             device,
             device_pub,
             admitted_via_ceiling,
+            admitted_via_owned_shell,
             plan,
         ),
         ShellAdmission::Ignored => return,
@@ -1134,6 +1146,7 @@ pub async fn handle_exec_open(
         idev,
         policy_allows,
         admitted_via_ceiling,
+        admitted_via_owned_shell,
     };
     let host = conn.host.clone();
     let log = conn.log.clone();
@@ -1441,6 +1454,7 @@ mod tests {
                     idev: None,
                     policy_allows: true,
                     admitted_via_ceiling: false,
+                    admitted_via_owned_shell: false,
                 },
                 shell_user.map(str::to_string),
                 process,

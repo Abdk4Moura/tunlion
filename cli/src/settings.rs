@@ -265,6 +265,17 @@ pub fn registry() -> &'static [Setting] {
             help: "Drop the ssh/web-shell PTY to this non-root account (runuser)",
         },
         Setting {
+            key: "own-devices-shell",
+            aliases: &[],
+            store: "own-devices-shell",
+            kind: Kind::Enum(&["auto", "on", "off"]),
+            default: "auto",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "Shells from your own devices without a grant: auto (yes here unless this is your primary device), on, or off",
+        },
+        Setting {
             key: "sshd-overlay",
             aliases: &[],
             store: "sshd-overlay",
@@ -609,6 +620,24 @@ fn decode_membership(s: &Setting, raw: String) -> String {
 }
 
 // -- typed convenience for behavioral consumers (up/recv/relay wiring) ------
+
+/// Does this device accept incoming shells from the owner's own devices without
+/// a per-device grant (docs/owned-shell-default.md)? `auto` means yes on a
+/// member device and no on the primary, whose one persistent opt-in is `on`.
+pub fn owned_shell_accepted(is_primary: bool) -> bool {
+    let value = find("own-devices-shell").map(|s| resolve(s, None).0).unwrap_or_default();
+    owned_shell_accepted_for(&value, is_primary)
+}
+
+/// The rule behind `owned_shell_accepted`, pure. Anything unrecognised is the
+/// safe answer for the device's role: never wider than `auto`.
+pub(crate) fn owned_shell_accepted_for(value: &str, is_primary: bool) -> bool {
+    match value.trim() {
+        "on" => true,
+        "off" => false,
+        _ => !is_primary,
+    }
+}
 
 /// Effective boolean for a Bool key, peer-aware (peer override > global > default).
 pub fn get_bool(key: &str, peer: Option<&str>) -> bool {
@@ -1882,5 +1911,18 @@ mod tests {
         assert!(parse(&["set", "prefer", "wl1", "--hard"]).is_ok());
         let cli = parse(&["set", "--reset", "--yes", "--json"]).unwrap();
         assert!(cli.yes && cli.json, "set no longer shadows the global --yes/--json");
+    }
+
+    #[test]
+    fn own_devices_shell_is_member_yes_primary_ask_and_explicit_wins() {
+        assert!(owned_shell_accepted_for("auto", false), "a member accepts its owner's devices");
+        assert!(!owned_shell_accepted_for("auto", true), "a primary needs its opt-in");
+        assert!(owned_shell_accepted_for("on", true));
+        assert!(!owned_shell_accepted_for("off", false));
+        assert!(!owned_shell_accepted_for("garbage", true), "unknown is never wider than auto");
+        assert!(owned_shell_accepted_for("", false));
+        let s = find("own-devices-shell").expect("registered");
+        assert_eq!(s.default, "auto");
+        assert!(s.daemon, "the daemon must re-read it on reconfigure");
     }
 }

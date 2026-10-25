@@ -107,6 +107,7 @@ fn gate_inputs(
     let (own_user, has_grant) = capability::cap_fleet_inputs(
         &config_dir, resource, action, idev.as_ref(), iusr.as_ref(), ak_caps.as_deref(),
     );
+    let delegated = ak_caps.is_some();
     ShellGateInputs {
         trusted: true,
         denied: device_capability_denied(name, action),
@@ -122,7 +123,15 @@ fn gate_inputs(
         has_grant,
         cert_revoked: cert_revoked_for(idev.as_ref()),
         ceiling_covers: crate::identity_state::ceiling_covers_action(idev.as_ref(), action),
-        scoped_default: capability::is_scoped_default_action(action),
+        // Same classes as the live gate, so the view never disagrees with it:
+        // the scoped defaults, plus an owned-device shell when this device
+        // accepts owned shells (docs/owned-shell-default.md).
+        scoped_default: capability::is_scoped_default_action(action)
+            || filament_peerloop::shell_gate::owned_shell_class(
+                action,
+                delegated,
+                crate::host_impl::owned_shell_accepted_now(),
+            ),
         action: action.to_string(),
     }
 }

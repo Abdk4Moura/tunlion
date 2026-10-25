@@ -332,6 +332,9 @@ impl HostServices for CliHost {
     fn ceiling_covers_action(&self, device_pub: Option<&[u8; 32]>, action: &str) -> bool {
         crate::identity_state::ceiling_covers_action(device_pub, action)
     }
+    fn owned_shell_accepted(&self) -> bool {
+        owned_shell_accepted_now()
+    }
     fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
         crate::capability::cap_gate_effective(
             gate.legacy_allowed,
@@ -555,4 +558,17 @@ pub(crate) fn dropped_no_transport(pid: &str, what: &str) {
 pub(crate) fn owner_pub_for_resources() -> Option<[u8; 32]> {
     let local_pub = crate::overlay::overlay_pubkey_bytes().ok();
     crate::devices_store::store().owner_pub_for_resources(local_pub.as_ref())
+}
+
+/// Does this device accept incoming shells from the owner's own devices right
+/// now? Read fresh on every open and every live-session tick, so switching it
+/// off takes effect without a restart. Primary = this device holds the owner
+/// key; a load error counts as primary, the narrower answer (never widen on a
+/// read failure).
+pub(crate) fn owned_shell_accepted_now() -> bool {
+    let is_primary = !matches!(
+        crate::identity::UserKey::load(&crate::platform::PlatformKeyStore),
+        Ok(None)
+    );
+    crate::settings::owned_shell_accepted(is_primary)
 }

@@ -2149,6 +2149,65 @@ mod tests {
         );
     }
 
+    /// docs/owned-shell-default.md: an owned-device shell reaches the policy
+    /// site as a scoped default (`scoped_in_bounds`), and every guard the
+    /// policy site applies to scoped defaults must still bind it. One cell per
+    /// guard, so a regression names the guard it broke.
+    #[test]
+    fn owned_device_shell_rides_the_scoped_default_with_every_guard() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let me = [0x33u8; 32];
+        let someone = [0x44u8; 32];
+        let gate = |user: &[u8; 32], binding, revoked, denied, caps: Option<&[String]>, expires| {
+            cap_gate_effective(
+                false,
+                &CapOutcome::Denied("no grant".into()),
+                CAP_SHELL,
+                "self",
+                None,
+                Some(user),
+                binding,
+                Some(expires),
+                caps,
+                Some(&me),
+                /*scoped_in_bounds: this device accepts owned shells*/ true,
+                /*has_explicit_grant*/ false,
+                revoked,
+                denied,
+                false,
+            )
+        };
+        assert!(
+            gate(&me, BindingStrength::Proven, false, false, None, u64::MAX).allowed(),
+            "own Proven device, accepted here: shell without a grant"
+        );
+        assert!(
+            !gate(&someone, BindingStrength::Proven, false, false, None, u64::MAX).allowed(),
+            "another owner's device never rides the owned class"
+        );
+        assert!(
+            !gate(&me, BindingStrength::Inferred, false, false, None, u64::MAX).allowed(),
+            "Inferred is not possession: no auto-trust"
+        );
+        assert!(
+            !gate(&me, BindingStrength::Proven, true, false, None, u64::MAX).allowed(),
+            "revoked denies absolutely"
+        );
+        assert!(
+            !gate(&me, BindingStrength::Proven, false, true, None, u64::MAX).allowed(),
+            "an explicit deny outranks auto-trust"
+        );
+        let transfer_only = vec![CAP_TRANSFER.to_string()];
+        assert!(
+            !gate(&me, BindingStrength::Proven, false, false, Some(&transfer_only), u64::MAX).allowed(),
+            "a delegated ceiling without shell denies even if a caller misclassified it"
+        );
+        assert!(
+            !gate(&me, BindingStrength::Proven, false, false, None, 1).allowed(),
+            "an expired certificate denies"
+        );
+    }
+
     #[test]
     fn fleet_gate_denies_deliberate_without_grant() {
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

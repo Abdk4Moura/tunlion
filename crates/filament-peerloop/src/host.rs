@@ -600,6 +600,16 @@ pub trait HostServices: Send + Sync + 'static {
     fn ceiling_covers_action(&self, _device_pub: Option<&[u8; 32]>, _action: &str) -> bool {
         false
     }
+    /// Does THIS device accept incoming shells from the owner's own devices
+    /// without a per-device grant (docs/owned-shell-default.md)? The host's
+    /// local decision: on a member device yes unless switched off, on the
+    /// primary only after its one persistent opt-in. It is an INPUT to the
+    /// Proven-gated same-owner auto-trust at the policy site, never an
+    /// authorization by itself. An inert host accepts none, so every host that
+    /// does not opt in keeps the grant-only shell it always had.
+    fn owned_shell_accepted(&self) -> bool {
+        false
+    }
     /// Every pending consent request this host holds, parsed from its own
     /// store. A refused action from an identified peer lands here until the
     /// owner approves or denies it.

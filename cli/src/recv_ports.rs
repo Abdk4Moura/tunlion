@@ -187,6 +187,7 @@ impl PtyBackend for CliPty {
             *guard,
             spec.device_pub,
             spec.admitted_via_ceiling,
+            spec.admitted_via_owned_shell,
         )
         .await?;
         Some(Arc::new(handle))

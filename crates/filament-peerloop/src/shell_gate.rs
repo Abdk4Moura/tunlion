@@ -206,9 +206,10 @@ pub struct ShellGateInputs {
     /// mode (shadow must decide exactly as it did before this feature).
     pub ceiling_covers: bool,
     /// The SCOPE-DEFAULT class for this open (transfer into the drop dir,
-    /// forward to an exposed port). Distinct from the ceiling: this class has
-    /// always auto-authorized same-owner Proven devices in BOTH modes.
-    /// False for the shell-class paths, which are deliberate-tier.
+    /// forward to an exposed port, and a shell from the owner's own device when
+    /// this device accepts owned shells, see `owned_shell_class`). Distinct from
+    /// the ceiling: this class auto-authorizes same-owner Proven devices in BOTH
+    /// modes, through the policy site's guards.
     pub scoped_default: bool,
 }
 
@@ -248,6 +249,13 @@ pub fn gather_shell_gate_inputs(
     let outcome = authorize_in(&store, "self", action, idev, iusr, ak_caps, now);
     let ceiling_covers = host.ceiling_covers_action(idev, action);
     let (own_user, has_grant) = fleet_inputs_in(&store, "self", action, idev, iusr, ak_caps, now);
+    // Owned-device shell (docs/owned-shell-default.md): when this device
+    // accepts owned shells, the shell action joins the SCOPE-DEFAULT class for
+    // this open, so the policy site's existing Proven-gated same-owner
+    // auto-trust decides it (same owner, Proven, not revoked, not denied, not
+    // expired). A delegated principal (auth-key ceiling present) never gets it:
+    // its signed ceiling stays the whole of its authority.
+    let scoped_default = owned_shell_class(action, ak_caps.is_some(), host.owned_shell_accepted());
     let inputs = ShellGateInputs {
         trusted,
         denied,
@@ -263,10 +271,34 @@ pub fn gather_shell_gate_inputs(
         has_grant,
         cert_revoked,
         ceiling_covers,
-        scoped_default: false,
+        scoped_default,
         action: action.to_string(),
     };
     (dev, inputs)
+}
+
+impl ShellGateInputs {
+    /// Admitted ONLY because it is the owner's own device and this device
+    /// accepts owned shells: no explicit grant, no legacy grant, no `--shell`
+    /// policy behind it. A live session admitted this way must end as soon as
+    /// this device stops accepting owned shells; every other population keeps
+    /// the authority it was admitted under.
+    pub fn admitted_via_owned_shell(&self) -> bool {
+        self.scoped_default
+            && self.action == filament_cap::capability::CAP_SHELL
+            && !self.has_grant
+            && !self.store_allows
+            && !self.policy_allows
+    }
+}
+
+/// Is this open in the owned-device shell class? Pure, so the matrix pins it.
+/// Only the shell action, only a non-delegated principal, only when this device
+/// accepts owned shells. The same-owner / Proven / revocation / deny / expiry
+/// conditions are NOT checked here: the policy site applies them to every
+/// scoped default, and checking them twice in two places is how they drift.
+pub fn owned_shell_class(action: &str, delegated: bool, accepted_here: bool) -> bool {
+    action == filament_cap::capability::CAP_SHELL && !delegated && accepted_here
 }
 
 /// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
@@ -376,4 +408,20 @@ pub fn ssh_gate_decision(
     host: &dyn HostServices,
 ) -> Result<(), Option<String>> {
     decide(inputs, host)
+}
+
+#[cfg(test)]
+mod owned_shell_tests {
+    use super::owned_shell_class;
+    use filament_cap::capability::{CAP_MOUNT, CAP_SHELL, CAP_TRANSFER};
+
+    #[test]
+    fn only_a_non_delegated_shell_on_an_accepting_device_is_in_the_class() {
+        assert!(owned_shell_class(CAP_SHELL, false, true));
+        assert!(!owned_shell_class(CAP_SHELL, false, false), "a device that has not accepted owned shells");
+        assert!(!owned_shell_class(CAP_SHELL, true, true), "a delegated principal keeps only its ceiling");
+        for other in [CAP_TRANSFER, CAP_MOUNT, "route", "exec"] {
+            assert!(!owned_shell_class(other, false, true), "{other} must not ride the owned-shell class");
+        }
+    }
 }

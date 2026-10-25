@@ -120,6 +120,7 @@ pub struct PtySpawnSpec {
     pub argv: Vec<String>,
     pub device_pub: Option<[u8; 32]>,
     pub admitted_via_ceiling: bool,
+    pub admitted_via_owned_shell: bool,
 }
 
 #[async_trait]
@@ -323,13 +324,14 @@ pub async fn open_pty(
         || backend.user_drop_available(shell_user),
     )
     .await;
-    let (t, sid, dev, device_pub, admitted_via_ceiling, plan) = match admission {
+    let (t, sid, dev, device_pub, admitted_via_ceiling, admitted_via_owned_shell, plan) = match admission {
         crate::shell::admit::ShellAdmission::Admitted {
             transport,
             sid,
             device,
             device_pub,
             admitted_via_ceiling,
+            admitted_via_owned_shell,
             plan,
         } => (
             transport,
@@ -337,6 +339,7 @@ pub async fn open_pty(
             device,
             device_pub,
             admitted_via_ceiling,
+            admitted_via_owned_shell,
             plan,
         ),
         crate::shell::admit::ShellAdmission::Ignored => return,
@@ -587,6 +590,7 @@ pub async fn open_pty(
         argv,
         device_pub,
         admitted_via_ceiling,
+        admitted_via_owned_shell,
     };
     match backend.spawn(spec, reservation).await {
         Some(sess) => {

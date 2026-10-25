@@ -69,6 +69,10 @@ pub enum ShellAdmission<A> {
         /// with no explicit grant. A live session re-checks a narrowed ceiling
         /// only for this population; a grant-admitted one ignores it.
         admitted_via_ceiling: bool,
+        /// True when the gate admitted this open only as the owner's own
+        /// device (`ShellGateInputs::admitted_via_owned_shell`). A live session
+        /// ends when this device stops accepting owned shells.
+        admitted_via_owned_shell: bool,
         plan: A,
     },
     /// Refused by the shared shell gate. The caller's existing
@@ -115,6 +119,8 @@ pub struct PtyOpen {
     /// `gate_inputs.ceiling_covers && !gate_inputs.has_grant`, exactly as pty
     /// computed it before the move.
     pub admitted_via_ceiling: bool,
+    /// `gate_inputs.admitted_via_owned_shell()`.
+    pub admitted_via_owned_shell: bool,
 }
 
 /// Admit one `pty-open` frame.
@@ -223,6 +229,7 @@ pub async fn admit_pty_open(
         // Ceiling-admitted (covered, grantless) sessions must die when the
         // ceiling narrows; grant-admitted ones ignore it.
         admitted_via_ceiling: gate_inputs.ceiling_covers && !gate_inputs.has_grant,
+        admitted_via_owned_shell: gate_inputs.admitted_via_owned_shell(),
     };
     ShellAdmission::Admitted {
         transport: t,
@@ -230,6 +237,7 @@ pub async fn admit_pty_open(
         device,
         device_pub: gate_inputs.idev,
         admitted_via_ceiling: gate_inputs.ceiling_covers && !gate_inputs.has_grant,
+        admitted_via_owned_shell: gate_inputs.admitted_via_owned_shell(),
         plan,
     }
 }
@@ -294,6 +302,7 @@ pub async fn admit_exec_open(
         device,
         device_pub: gate_inputs.idev,
         admitted_via_ceiling: gate_inputs.ceiling_covers && !gate_inputs.has_grant,
+        admitted_via_owned_shell: gate_inputs.admitted_via_owned_shell(),
         plan,
     }
 }
