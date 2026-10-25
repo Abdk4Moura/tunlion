@@ -31,6 +31,18 @@ pub(crate) fn any_shell_grant() -> bool {
     crate::devices_store::store().any_shell_grant()
 }
 
+/// Should this daemon serve shells at all (the L2/shell acceptor)? Yes when any
+/// device holds a shell grant (above), and also when this device accepts the
+/// owner's own devices' shells (docs/owned-shell-default.md): an owned shell has
+/// no grant behind it, so without this the acceptor stayed off and every owned
+/// open was refused "shell serving is off there" before the gate was asked.
+/// Like the grant case this does NOT broaden access: the per-peer gate still
+/// decides every open (owned class, signed ceiling, acceptance, deny, revoke).
+/// Re-read each receive-loop iteration, so an opt-in/out is live.
+pub(crate) fn shell_serving_wanted() -> bool {
+    any_shell_grant() || crate::host_impl::owned_shell_accepted_now()
+}
+
 pub(crate) fn any_shell_grant_at(path: &Path) -> bool {
     !filament_peerloop::recv::store::shell_grant_names_at(path).is_empty()
 }

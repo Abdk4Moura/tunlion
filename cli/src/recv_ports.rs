@@ -478,7 +478,7 @@ impl RecvStore for CliRecv {
         crate::device_view::devices_find_by_device_pub(device_pub)
     }
     fn any_shell_grant(&self) -> bool {
-        crate::shell_support::any_shell_grant()
+        crate::shell_support::shell_serving_wanted()
     }
 }
 

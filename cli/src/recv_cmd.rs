@@ -53,7 +53,7 @@ pub(crate) async fn recv_cmd(
     let server = server.to_string();
     let engine_log = log.clone();
     let engine_report = RecvReport::clone(report);
-    let l2_launch = shell_policy.enables_l2() || crate::any_shell_grant();
+    let l2_launch = shell_policy.enables_l2() || crate::shell_support::shell_serving_wanted();
     let env = RecvEnv {
         display_name: display_name(),
         uid: mk_uid("r"),
