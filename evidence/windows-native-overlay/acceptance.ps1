@@ -26,9 +26,13 @@ $script:results.environment = [ordered]@{ os=(Get-CimInstance Win32_OperatingSys
 function Record($name,$status,$detail) { $e=[ordered]@{name=$name;status=$status;detail=$detail;utc=[DateTime]::UtcNow.ToString('o')}; $script:events.Add($e); Write-Host (ConvertTo-Json $e -Compress -Depth 10); if($status -eq 'FAIL'){$script:failed=$true};if($status -eq 'BLOCKED'){$script:blocked=$true} }
 function Invoke-Tun([string[]]$Arguments) {
   $tag=[guid]::NewGuid().ToString('N');$stdout=Join-Path $EvidenceDir "$tag.stdout.txt";$stderr=Join-Path $EvidenceDir "$tag.stderr.txt"
-  & $Exe @Arguments 1> $stdout 2> $stderr
-  $ec=$LASTEXITCODE
-  $out=if(Test-Path $stdout){Get-Content -Raw $stdout}else{''};$err=if(Test-Path $stderr){Get-Content -Raw $stderr}else{''}
+  try {
+    & $Exe @Arguments 1> $stdout 2> $stderr
+    $ec=$LASTEXITCODE
+    $out=if(Test-Path $stdout){Get-Content -Raw $stdout}else{''};$err=if(Test-Path $stderr){Get-Content -Raw $stderr}else{''}
+    $recovery=Join-Path $script:root 'recovery.txt'
+    if(Test-Path -LiteralPath $recovery){$phrase=(Get-Content -LiteralPath $recovery -Raw).Trim();if($phrase){$out=$out.Replace($phrase,'[REDACTED-RECOVERY-PHRASE]');$err=$err.Replace($phrase,'[REDACTED-RECOVERY-PHRASE]')}}
+  } finally {Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue}
   [ordered]@{command="`"$Exe`" $($Arguments -join ' ')";exitCode=$ec;stdout=$out.Trim();stderr=$err.Trim()}
 }
 function Assert-Command($name,[string[]]$Arguments) { $r=Invoke-Tun -Arguments $Arguments; if($r.exitCode -ne 0){Record $name 'FAIL' $r; throw "$name failed: $($r.stderr) $($r.stdout)"}; Record $name 'PASS' $r; return $r }

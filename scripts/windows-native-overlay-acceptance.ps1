@@ -3,12 +3,16 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'Run with PowerShell 7 (pwsh) to preserve native stderr/exit handling.' }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$expected = if ($env:TUNLION_EXPECTED_SOURCE_SHA) { $env:TUNLION_EXPECTED_SOURCE_SHA } else { '734bb3e35cf011c1a4205da639ea3ce4f91a7764' }
+$expected = if ($env:TUNLION_EXPECTED_SOURCE_SHA) { $env:TUNLION_EXPECTED_SOURCE_SHA } else { '0bcf1854a8bafe12a32d926f30cfd89f7cdb6d9c' }
 $head = (git -C $root rev-parse HEAD).Trim()
 $resolvedSource = git -C $root rev-parse "$expected^{commit}" 2>$null
 if ($LASTEXITCODE -ne 0 -or $resolvedSource.Trim() -ne $expected) { throw "Expected exact source commit $expected is unavailable in this checkout" }
 $ancestor = git -C $root merge-base --is-ancestor $expected HEAD 2>$null
 if ($LASTEXITCODE -ne 0) { throw "Expected source $expected is not an ancestor of wrapper checkout $head" }
+$allowedHarnessPaths = @('.github/workflows/windows-native-overlay-acceptance.yml','scripts/windows-native-overlay-acceptance.ps1','evidence/windows-native-overlay/acceptance.ps1')
+$changedPaths = @(git -C $root diff --name-only $expected HEAD)
+$unexpectedPaths = @($changedPaths | Where-Object { $_ -notin $allowedHarnessPaths })
+if ($LASTEXITCODE -ne 0 -or $unexpectedPaths.Count) { throw "CI commit contains changes outside test harness allowlist: $($unexpectedPaths -join ', ')" }
 $env:TUNLION_BUILD_SHA = $expected.Substring(0,7)
 $target = 'x86_64-pc-windows-msvc'
 New-Item -ItemType Directory -Force -Path $EvidenceDir | Out-Null
@@ -30,11 +34,13 @@ try {
   if (-not (Test-Path $exe)) { throw "Expected debug executable not found: $exe" }
   # Match the repository's installer/release trust checks exactly.
   $expectedZip = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
-  $zip = Join-Path $EvidenceDir 'wintun-0.14.1.zip'
+  $downloadDir = Join-Path $env:RUNNER_TEMP 'tunlion-native-download'
+  New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+  $zip = Join-Path $downloadDir 'wintun-0.14.1.zip'
   Invoke-WebRequest 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip
   $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
   if ($zipHash -ne $expectedZip) { throw "Wintun zip SHA256 mismatch: $zipHash" }
-  $extract = Join-Path $EvidenceDir 'wintun-extract'
+  $extract = Join-Path $downloadDir 'wintun-extract'
   Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
   $dll = Join-Path $extract 'wintun\bin\amd64\wintun.dll'
   $signature = Get-AuthenticodeSignature -LiteralPath $dll
