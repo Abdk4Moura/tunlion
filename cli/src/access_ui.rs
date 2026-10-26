@@ -185,8 +185,7 @@ fn offer_lines(snapshot: &AgreementSnapshot, now: u64) -> Vec<String> {
 /// Only a caller holding the shared engine's authenticated review may call this.
 pub(crate) fn review_offer(snapshot: &AgreementSnapshot, stop: &AtomicBool) -> Result<()> {
     // Refuse BEFORE describing anything this build could not actually deliver.
-    if snapshot.spec.shell {
-        #[cfg(not(all(unix, feature = "pty-server")))]
+    if snapshot.spec.shell && !crate::platform::temporary_shell_supported() {
         bail!("this build cannot open the offered shell, so the offer was not accepted");
     }
     if snapshot.spec.device_network {
@@ -500,7 +499,7 @@ pub(crate) fn temporary_access() -> Result<AccessSpec> {
     // server serves every resource kind; a pty-only Unix build serves a scope
     // that includes the shell.
     let servable = cfg!(feature = "forward-server")
-        || (cfg!(all(unix, feature = "pty-server")) && draft.spec.shell);
+        || (crate::platform::temporary_shell_supported() && draft.spec.shell);
     if servable {
         return Ok(draft.spec);
     }

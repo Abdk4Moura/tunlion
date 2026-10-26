@@ -672,8 +672,9 @@ pub(crate) enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
-    /// Internal Windows relay smoke test. Only exists in test-hooks builds.
-    #[cfg(all(windows, feature = "test-hooks"))]
+    /// Internal Windows relay smoke test. Only exists in test-hooks builds;
+    /// refuses off Windows (platform::win_pty_smoke).
+    #[cfg(feature = "test-hooks")]
     #[command(hide = true, name = "__win-pty-smoke")]
     WinPtySmoke {
         /// `owner-equivalent` (always available) or `standard` (needs a linked token when elevated).

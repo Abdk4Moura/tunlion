@@ -2996,6 +2996,26 @@ mod tests {
 /// feature and a pinned no-clobber publisher. Linux and Windows both provide one
 /// (`download_output::OwnedDownload`); Windows publishes through a retained
 /// directory HANDLE and does not claim directory-entry durability.
+/// Can this build serve a temporary-access SHELL (a real interactive PTY on the
+/// host's account)? Unix builds with the PTY server only, today.
+pub fn temporary_shell_supported() -> bool {
+    cfg!(all(unix, feature = "pty-server"))
+}
+
+/// The hidden `__win-pty-smoke` test command. Both arms here so the command
+/// itself is portable: Windows runs the relay smoke; elsewhere it refuses.
+#[cfg(feature = "test-hooks")]
+pub fn win_pty_smoke(mode: &str) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::win_pty::smoke(mode)
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("__win-pty-smoke {mode}: the Windows PTY relay exists only on Windows")
+    }
+}
+
 pub fn folder_download_supported() -> bool {
     cfg!(all(any(target_os = "linux", target_os = "windows"), feature = "mount-server"))
 }

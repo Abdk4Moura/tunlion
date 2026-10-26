@@ -2041,8 +2041,8 @@ pub(crate) async fn async_main() -> Result<()> {
             resize,
             argv,
         } => crate::win_pty::relay(cols, rows, &resize, &argv),
-        #[cfg(all(windows, feature = "test-hooks"))]
-        Cmd::WinPtySmoke { mode } => crate::win_pty::smoke(&mode),
+        #[cfg(feature = "test-hooks")]
+        Cmd::WinPtySmoke { mode } => crate::platform::win_pty_smoke(&mode),
         Cmd::Netcat { peer, rport } => {
             // Hidden one-release alias for the netcat shape, now forward --stdio.
             #[cfg(not(feature = "forward-server"))]
