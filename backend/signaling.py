@@ -24,7 +24,8 @@ minted by the relay on a tokenless join and returned only to that socket (in
 the welcome/sync ack, never in a roster). A valid token may replace its own
 previous sid; a new generation for that token retires the old one. uid/name are
 display attributes only: a uid alone is never authority, and a tokenless client
-gets an independent session.
+gets an independent session (one per socket: a client that omits both token and
+gen keeps the session its socket was given).
 """
 import os
 import re
@@ -301,6 +302,18 @@ class _MemRegistry:
         self._retired[key] = exp
         self._retired_order.append((token, gen, exp))
 
+    def holds_session(self, token, gen, sid):
+        """True when `sid` is already the live holder of TOKEN at generation
+        `gen`: a claim with these values could only be a refresh ("current"),
+        never a create, a takeover or a generation bump. Read-only."""
+        if not isinstance(token, str) or not token or not _valid_id(gen):
+            return False
+        with self._lock:
+            rec = self._sessions.get(token)
+            if not rec or rec.get("exp", 0) <= _time.time():
+                return False
+            return rec.get("gen") == gen and rec.get("sid") == sid
+
     def rename(self, sid, name):
         with self._lock:
             m = self._m.get(sid)
@@ -565,6 +578,13 @@ class _RedisRegistry:
         return {"status": status, "token": out_token or None, "gen": out_gen or None,
                 "prev": prev or None,
                 "evicted": [s for s in (evicted or "").split(",") if s]}
+
+    def holds_session(self, token, gen, sid):
+        """Redis twin of _MemRegistry.holds_session (read-only peek)."""
+        if not isinstance(token, str) or not token or not _valid_id(gen):
+            return False
+        cur_sid, cur_gen = self.r.hmget(self._sess(token), "sid", "gen")
+        return bool(cur_gen) and cur_gen == gen and cur_sid == sid
 
     def rename(self, sid, name):
         import json
@@ -852,20 +872,57 @@ def register(socketio, registry):
         getattr(registry, "r", None),
     )
 
-    def _session_claim_allowed(sid):
-        return _session_claim_limiter.allow([
-            f"sid:{sid}",
-            "ip:" + ratelimit.ip_bucket(ratelimit.client_ip(request)),
-        ])
+    # What the per-IP budget protects: every claim that is not a pure refresh
+    # can mint a session record (MAX_SESSIONS, whose capacity path evicts
+    # other callers' non-live sessions and then refuses everyone), add a
+    # retired-generation tombstone (MAX_RETIRED_TOTAL, a global FIFO, so a
+    # flood would age out other tokens' tombstones), or move a session to a
+    # new sid. Those stay charged to the sid AND the caller's IP.
+    #
+    # A periodic full `sync` from the socket that already holds the session at
+    # the same generation, in the room it is already in, does none of that:
+    # registry.claim_session answers "current" and only slides the TTL. It is
+    # charged to the sid only. Charging it to the IP made the budget a device
+    # cap: a daemon full-syncs every 30 s, so 600/min allowed about 300
+    # devices behind one public IP (an office or carrier NAT), and the rest
+    # were silently refused with session-superseded {reason: rate-limited}.
+    #
+    # sid -> (token, gen) the relay minted for a tokenless, generation-less
+    # (CLI) claim on this socket. Local to this instance (a socket's events
+    # always arrive at its own instance) and dropped on leave/disconnect or
+    # when the sid is superseded or evicted, so it is bounded by live sockets.
+    _legacy_sessions = {}
 
-    def _claim_session(sid, uid, gen, token, name):
+    def _session_claim_allowed(sid, refresh_only=False):
+        keys = [f"sid:{sid}"]
+        if not refresh_only:
+            keys.append("ip:" + ratelimit.ip_bucket(ratelimit.client_ip(request)))
+        return _session_claim_limiter.allow(keys)
+
+    def _claim_session(sid, uid, gen, token, name, room=None):
         """Create/reattach a token-keyed session and return
-        (ok, owner_token, effective_gen). uid/name are labels only."""
+        (ok, owner_token, effective_gen). uid/name are labels only.
+
+        `room` is passed by `sync` only: when this sid already holds TOKEN at
+        GEN and is already in ROOM, the claim is a refresh and skips the
+        per-IP budget (see _session_claim_allowed). `join` never passes it."""
         if not _valid_id(uid):
             _tel("session-invalid", sid=sid)
             emit("session-superseded", {"reason": "invalid"})
             return False, None, None
-        if gen is None:
+        legacy = token is None and gen is None
+        reuse = _legacy_sessions.get(sid) if legacy else None
+        if reuse and registry.holds_session(reuse[0], reuse[1], sid):
+            # A tokenless, generation-less client (the CLI daemon) on the SAME
+            # socket that the relay already gave a session. It never echoes
+            # the token, so without this every 30 s full sync minted a brand
+            # new session record and could never be recognised as a refresh.
+            # Only this sid can speak as this sid, and the relay minted that
+            # session for it, so continuing it grants nothing new.
+            token, gen = reuse
+        elif gen is None:
+            if reuse:
+                _legacy_sessions.pop(sid, None)
             # Legacy/CLI clients omit a generation. It is server-assigned and
             # only orders generations for THIS token; it grants no uid rights.
             gen = secrets.token_urlsafe(8)
@@ -877,7 +934,12 @@ def register(socketio, registry):
             _tel("session-invalid", sid=sid)
             emit("session-superseded", {"reason": "invalid"})
             return False, None, None
-        if not _session_claim_allowed(sid):
+        refresh_only = (
+            room is not None
+            and registry.room_of(sid) == room
+            and registry.holds_session(token, gen, sid)
+        )
+        if not _session_claim_allowed(sid, refresh_only):
             _tel("session-claim-rate-limited", sid=sid, uid=uid)
             emit("session-superseded", {"reason": "rate-limited"})
             return False, None, None
@@ -892,11 +954,14 @@ def register(socketio, registry):
                  sid=sid, uid=uid, gen=str(gen)[:8], status=status)
             emit("session-superseded", {"reason": reason})
             return False, None, None
+        if legacy:
+            _legacy_sessions[sid] = (owner_token, effective_gen)
         for evicted_sid in verdict.get("evicted") or []:
             if not evicted_sid or evicted_sid == sid:
                 continue
             _tel("session-evicted", sid=evicted_sid, uid=uid)
             socketio.emit("session-superseded", {"reason": "session-evicted"}, to=evicted_sid)
+            _legacy_sessions.pop(evicted_sid, None)
             _channel_goodbye(evicted_sid)
             local_sids.discard(evicted_sid)
             _leave_room(evicted_sid)
@@ -904,6 +969,7 @@ def register(socketio, registry):
         if prev and prev != sid:
             _tel("session-supersede", old=prev, new=sid, uid=uid, gen=str(effective_gen)[:8])
             socketio.emit("session-superseded", {"reason": "newer-generation"}, to=prev)
+            _legacy_sessions.pop(prev, None)
             _channel_goodbye(prev)
             local_sids.discard(prev)
             _leave_room(prev)
@@ -1155,7 +1221,7 @@ def register(socketio, registry):
         # Token-first: a reload's new generation replaces that token's old sid,
         # and a retired generation cannot take the session back with a late
         # sync. A uid alone creates an independent session and affects nothing.
-        ok, owner_token, effective_gen = _claim_session(sid, uid, gen, token, name)
+        ok, owner_token, effective_gen = _claim_session(sid, uid, gen, token, name, room=room)
         if not ok:
             return {"v": 1, "ok": False, "superseded": True, "room": None,
                     "channels": 0, "lease": False}
@@ -1235,6 +1301,7 @@ def register(socketio, registry):
 
     def _do_leave(sid):
         """Full departure (leave event, disconnect): channels and room."""
+        _legacy_sessions.pop(sid, None)
         _channel_goodbye(sid)
         local_sids.discard(sid)
         _leave_room(sid)

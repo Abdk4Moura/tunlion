@@ -201,6 +201,16 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   first, and if all are live a new tokenless session is refused with a clear
   capacity error (never superseding a live sid). One sliding 24h TTL covers
   sid/gen/token together (one Redis hash/Lua).
+- A client that sends neither `token` nor `gen` (the CLI daemon) gets a session
+  on its first claim, and later claims on the SAME socket continue that
+  session instead of minting a new one each time. A new socket is a new
+  session.
+- Claims are rate-limited per socket and per client IP
+  (`FIL_SESSION_CLAIM_LIMIT`, 600/min). A `sync` that only refreshes a session
+  the same socket already holds (same token, same `gen`, same room) is charged
+  to the socket only, so the per-IP budget bounds new sessions, takeovers and
+  generation bumps, not the number of devices behind one address. Over budget,
+  the claim is refused with `session-superseded {reason: "rate-limited"}`.
 - `pagehide` closes local PeerConnections synchronously, stops link/session/
   pairing/config timers, and `sendBeacon`s `{token, gen}` to
   `POST /api/session/close`. The endpoint requires the token, honors the
