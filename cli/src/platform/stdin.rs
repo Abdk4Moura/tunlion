@@ -1144,3 +1144,31 @@ mod windows_tests {
         }
     }
 }
+
+/// One bounded read of raw stdin bytes, for callers that own their own loop
+/// (the temporary-access terminal). `Idle` means nothing arrived within the
+/// timeout; `Closed` ends the loop. Unix polls fd 0. Elsewhere there is no raw
+/// terminal session to feed (no Windows temporary shell is claimed), so it is
+/// `Closed` at once: a named absence, not a reader that silently never fires.
+pub enum RawStdin {
+    Idle,
+    Bytes(usize),
+    Closed,
+}
+
+#[cfg(unix)]
+pub fn read_stdin_timeout(buffer: &mut [u8], timeout_ms: i32) -> RawStdin {
+    let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd, and a read into a buffer we own of its length.
+    let ready = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+    if ready <= 0 {
+        return RawStdin::Idle;
+    }
+    let count = unsafe { libc::read(0, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if count <= 0 { RawStdin::Closed } else { RawStdin::Bytes(count as usize) }
+}
+
+#[cfg(not(unix))]
+pub fn read_stdin_timeout(_buffer: &mut [u8], _timeout_ms: i32) -> RawStdin {
+    RawStdin::Closed
+}

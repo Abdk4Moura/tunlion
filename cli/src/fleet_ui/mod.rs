@@ -69,11 +69,6 @@ pub fn err_refused(msg: &str) -> String {
     format!("{} {msg}", ui::paint(Tone::Err, ui::glyph_err()))
 }
 
-/// Echo the equivalent command (Dim, arrow-prefixed).
-pub fn echo_cmd(cmd: &str) -> String {
-    format!("{} {cmd}", ui::paint(Tone::Dim, ui::glyph_echo()))
-}
-
 /// Capabilities that require deliberate, bounded approval rather than a normal
 /// one-click grant. Keep this predicate canonical for every trust surface.
 pub fn is_deliberate_capability(capability: &str) -> bool {

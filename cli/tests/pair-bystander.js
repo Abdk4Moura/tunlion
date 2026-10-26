@@ -88,7 +88,7 @@ function runJoin(dir, code) {
       if (links[0] !== by.name) {
         say(`FAIL: P${i} setup: the CLI's first link was not the bystander (links: ${links.join(', ') || 'none'})`)
         fail++
-      } else if (!offered || rc !== 0 || !out.includes(`remembered as '${cr.name}'`)) {
+      } else if (!offered || rc !== 0 || !out.includes(`${cr.name} connected \u00b7 remembered on both devices`) || !out.includes(`saved as '${cr.name}'`)) {
         say(`FAIL: P${i} join ${code} with ${by.name} linked first: offered=${offered} rc=${rc}`)
         say(out.split('\n').slice(-6).join('\n'))
         fail++

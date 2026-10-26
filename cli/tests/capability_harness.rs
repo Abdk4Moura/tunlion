@@ -1416,8 +1416,20 @@ fn shell_owner_gate_refuses_real_spawn() {
         .expect("spawn shell gate probe");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "ungated shell spawn unexpectedly succeeded: {stderr}");
+    assert!(!stderr.contains("socket.io connect"), "a precondition did not fire before signaling: {stderr}");
+    // Unix: a plain `--shell` PTY runs as this process's user, so it is
+    // owner-equivalent and refused without --i-know.
+    #[cfg(unix)]
     assert!(stderr.contains("owner's authority"), "missing owner-equivalence refusal: {stderr}");
-    assert!(!stderr.contains("socket.io connect"), "shell gate did not fire before signaling: {stderr}");
+    // Windows (shell privilege plane): a plain `--shell` runs on the linked,
+    // NON-elevated standard token, so it is not owner-equivalent and needs no
+    // --i-know; it must get past the owner gate and stop at the next real
+    // precondition (no identity in this fresh dir), still before signaling.
+    #[cfg(windows)]
+    {
+        assert!(!stderr.contains("owner's authority"), "Windows standard shell wrongly treated as owner-equivalent: {stderr}");
+        assert!(stderr.contains("no identity yet"), "Windows standard shell did not reach the identity precondition: {stderr}");
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 

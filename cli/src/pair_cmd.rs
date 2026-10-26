@@ -307,6 +307,27 @@ pub(crate) async fn pair_cmd(
     // alternative on the code screen instead, where it is relevant.
     quick: bool,
 ) -> Result<()> {
+    pair_with_purpose(server, code, name, word, relay, internal, posture, enrol_ttl, quick, None).await
+}
+
+pub(crate) async fn temporary_cmd(server: &str, spec: filament_peerloop::access::AccessSpec, relay: bool) -> Result<()> {
+    spec.validate()?;
+    pair_with_purpose(server, None, None, None, relay, false, Vec::new(), None, true, Some(spec)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pair_with_purpose(
+    server: &str,
+    mut code: Option<String>,
+    name: Option<String>,
+    mut word: Option<String>,
+    relay: bool,
+    internal: bool,
+    posture: Vec<String>,
+    enrol_ttl: Option<u64>,
+    quick: bool,
+    temporary_spec: Option<filament_peerloop::access::AccessSpec>,
+) -> Result<()> {
     if code.is_none() && word.is_none() && !interactive_allowed() {
         let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
         eprintln!("{message}");
@@ -407,10 +428,23 @@ pub(crate) async fn pair_cmd(
         }
         None => None,
     };
+    if internal {
+        // Action-first setup: use the existing atomic, owner-only key store.
+        // Guided cancellation and invalid input above cannot mint an identity.
+        crate::identity_flow::ensure_user_key(false)?;
+    }
     let my_uid = mk_uid("p");
     let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
+    // The home screen may already have opened this connection while the
+    // person was choosing (preconnect.rs); otherwise connect now, as always.
+    let (sio, tx, mut rx) = match crate::preconnect::take(server).await {
+        Some(warm) => warm,
+        None => {
+            let (tx, rx) = mpsc::unbounded_channel::<Ev>();
+            let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
+            (sio, tx, rx)
+        }
+    };
     // Meta must exist for pairing; an unguessable solo room keeps strangers
     // out (the daemon's trick), the pair-claim moves people, not the room.
     let solo = format!("pairc-{}", fresh_secret());
@@ -563,7 +597,14 @@ pub(crate) async fn pair_cmd(
     // words. Both sides MUST pass identical password AND nameplate (spec §3.1).
     // Fixed convention for plain pair: Device-scoped (device-to-device). Scope byte is derived from the authenticated introduction token, not a local guess. Both sides must pass same scope or confirmation fails.
     let scope = crate::identity::IntroScope::Device.to_byte();
-    let mut cer = Ceremony::new(&my_words, &my_nameplate, caps.clone(), scope);
+    let mut temporary = temporary_spec.map(crate::temporary_session::Session::host).transpose()?;
+    let mut cer = match temporary.as_ref() {
+        Some(session) => session.ceremony(&my_words, &my_nameplate),
+        None => Ceremony::new(&my_words, &my_nameplate, caps.clone(), scope),
+    };
+    // A joining client waits for the host's first element so the authenticated
+    // purpose can choose temporary access without ever entering permanent pairing.
+    let mut host_element_received = creator;
     let deadline = Instant::now() + Duration::from_secs(600); // code TTL
     // The pairing peer left before the ceremony finished. Give a short grace
     // for a transient reconnect, then FAIL FAST, don't orphan in the room
@@ -586,10 +627,12 @@ pub(crate) async fn pair_cmd(
     // deterministically (same-machine pairs otherwise finish in ~1s).
     let stall = test_hooks::pair_stall();
 
+    let result = async {
     loop {
         // Done when the petname is settled AND the PAKE agreed a secret (key
         // confirmation passed). The secret is HKDF(K), never transmitted, the
         // same on both sides; it drops straight into devices.json.
+        if temporary.is_none() {
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
                 if identity_exchange_window.map_or(false, |dl| std::time::Instant::now() < dl)
@@ -898,40 +941,51 @@ pub(crate) async fn pair_cmd(
                             ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
                         } else if same_identity_member {
                             ui::say(&format!(
-                                "  {} {} is in the same fleet as this device (same identity); paired",
+                                "  {} {} connected \u{b7} your devices",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
                         } else {
                             ui::say(&format!(
-                                "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
+                                "  {} {} connected \u{b7} remembered on both devices",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
                             if named_by_default {
                                 ui::say(&ui::paint(
                                     ui::Tone::Dim,
-                                    &format!("  remembered as '{n}'; rename it any time:  tunlion devices rename {n} <name>"),
+                                    &format!("  saved as '{n}' \u{b7} rename any time: tunlion devices rename {n} <name>"),
                                 ));
                             }
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
-                                &format!("  try: tunlion send <file> --to {n}   ·   tunlion up"),
+                                &format!("  next: tunlion send <file> --to {n}"),
                             ));
                         }
                         tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                         let _ = sio.disconnect().await;
+                        offer_background_after_pairing();
                         return Ok(());
                     } // close: not awaiting an enrolment answer
                 } // close identity_exchange_window else
             }
         }
-        if Instant::now() > deadline {
+        }
+        if let Some(session) = temporary.as_mut() {
+            if let Some(pid) = pake_peer.as_deref() {
+                if session.progress(&cer, &conn, pid).await? {
+                    let _ = sio.disconnect().await;
+                    return Ok(());
+                }
+            }
+        }
+        let active_temporary = temporary.as_ref().is_some_and(|session| session.is_active());
+        if !active_temporary && Instant::now() > deadline {
             bail!("timed out, the code was never used (codes expire after 10 minutes)");
         }
         // Fail fast: the code was claimed but the ceremony didn't finish in
         // time, the peer disconnected or never connected.
-        if let Some(dl) = ceremony_deadline {
+        if let Some(dl) = ceremony_deadline.filter(|_| !active_temporary && !(temporary.is_some() && cer.secret().is_some())) {
             if Instant::now() > dl {
                 bail!(
                     "the other device disconnected before setup finished; keep `tunlion add` running on one device while the other runs `tunlion join <code>`, then try again"
@@ -949,7 +1003,7 @@ pub(crate) async fn pair_cmd(
             // so the exchange can't complete on either side and the ceremony's
             // fail-fast `ceremony_deadline` fires, proving the no-10-min-orphan
             // guard. Test-only: `stall` is set solely by that env var.
-            if !stall {
+            if !stall && host_element_received {
                 if let Some(data) = cer.take_msg_payload() {
                     sio.emit("signal", json!({ "to": pid, "data": data }))
                         .await
@@ -978,7 +1032,7 @@ pub(crate) async fn pair_cmd(
             // device cert, send EXACTLY ONE device + its cert sealed under K-derived key
             // with possession signature, inside the authed channel. Server never sees
             // user key (sealed) and cannot substitute (possession sig binds to session).
-            if !sent_identity {
+            if temporary.is_none() && !sent_identity {
                 if agreed_secret.is_some() {
                     if let Some(local_cert) = local_device_cert() {
                         if let Some(pid2) = pake_peer.clone() {
@@ -1048,7 +1102,8 @@ pub(crate) async fn pair_cmd(
             }
         }
 
-        let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        let poll_interval = temporary.as_ref().map_or(Duration::from_secs(2), |session| session.poll_interval());
+        let ev = match tokio::time::timeout(poll_interval, rx.recv()).await {
             Ok(Some(ev)) => ev,
             Ok(None) => bail!("signaling closed"),
             Err(_) => continue,
@@ -1079,6 +1134,7 @@ pub(crate) async fn pair_cmd(
                 // L1-a: the server allocated our nameplate. Display the FULL code
                 // from OUR OWN local mint (the server never echoed any words).
                 let full = format!("{my_words}-{my_nameplate}");
+                ui::timing("pairing code shown");
                 ui::clipboard(&full);
                 ui::say("");
                 ui::say(&format!(
@@ -1086,33 +1142,23 @@ pub(crate) async fn pair_cmd(
                     ui::paint(ui::Tone::Brand, &full.to_uppercase())
                 ));
                 ui::say("");
+                // The prototype's code screen: the code, where to type it, keep
+                // this open. Everything else fits on one dim line.
+                ui::say("  On the other device: tunlion join");
+                ui::say("  Enter this code there. Keep this window open.");
                 if interactive_allowed() {
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
-                        "  scan this in Tunlion, or enter the code below it",
-                    ));
                     ui::say(&ui::qr_or_text(&full, 6));
                 }
+                // The HOW question was skipped to get here in one step, so its
+                // other answer is offered here instead: the file path was once
+                // reachable only by a flag nobody was told about.
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  on the other device: type it into the web app, or `tunlion join <code>`",
-                ));
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    "  keep this window open until the other device claims it",
-                ));
-                if quick {
-                    // The HOW question was skipped to get here in one step, so
-                    // its other answer is offered here instead: the file path
-                    // was once reachable only by a flag nobody was told about.
-                    ui::say(&ui::paint(
-                        ui::Tone::Dim,
-                        "  not both here? add --via file writes an invitation to claim later",
-                    ));
-                }
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)",
+                    if quick {
+                        "  works once \u{b7} 10 min \u{b7} not both here? tunlion add --via file"
+                    } else {
+                        "  works once \u{b7} 10 min \u{b7} or scan it in the Tunlion app"
+                    },
                 ));
             }
             Ev::PairCode(v) => {
@@ -1221,6 +1267,15 @@ pub(crate) async fn pair_cmd(
                         None => None,
                     };
                     let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                    if !creator && !host_element_received && data["type"].as_str() == Some("pake-msg") {
+                        use filament_peerloop::send::ceremony::inspect_temporary_binding;
+                        if let Some(binding) = inspect_temporary_binding(&data)? {
+                            let session = crate::temporary_session::Session::recipient(binding);
+                            cer = session.ceremony(&my_words, &my_nameplate);
+                            temporary = Some(session);
+                        }
+                        host_element_received = true;
+                    }
                     match cer.on_signal(&data, fp_ref) {
                         PakeInbound::Consumed => {
                             if let Some(sec) = cer.secret() {
@@ -1238,6 +1293,9 @@ pub(crate) async fn pair_cmd(
                         PakeInbound::Ignored => {}
                     }
                     continue;
+                }
+                if temporary.is_some() && matches!(data["type"].as_str(), Some("enrol-offer" | "enrol-grant" | "enrol-decline" | "identity-expose")) {
+                    bail!("temporary access refused an enrollment frame; no device was remembered");
                 }
                 // Identity expose: sealed cert + possession signature, inside authed PAKE channel.
                 // Fixes holes A (confidentiality+integrity via K-derived seal, server never sees user_pub)
@@ -1556,7 +1614,7 @@ pub(crate) async fn pair_cmd(
                 // `partner_for`), offer our element to each peer that comes up:
                 // only the creator can use it, and a bystander ignores a
                 // nameplate that is not its own.
-                if !creator && !cer.has_k() && pake_peer.as_deref() != Some(pid.as_str()) && !stall {
+                if !creator && host_element_received && temporary.is_none() && !cer.has_k() && pake_peer.as_deref() != Some(pid.as_str()) && !stall {
                     sio.emit("signal", json!({ "to": pid, "data": cer.msg_payload() }))
                         .await
                         .ok();
@@ -1592,6 +1650,15 @@ pub(crate) async fn pair_cmd(
             }
             Ev::Control(pid, v) if stall => {
                 let _ = (pid, v); // gate 17b: connected, but ignore all ceremony control
+            }
+            Ev::Control(pid, v) if temporary.is_some() => {
+                if pake_peer.as_deref() != Some(pid.as_str()) { continue; }
+                temporary.as_mut().unwrap().control(&cer, &conn, &pid, v).await?;
+            }
+            Ev::Chunk(pid, sid, _offset, data) if temporary.is_some() => {
+                if pake_peer.as_deref() == Some(pid.as_str()) {
+                    temporary.as_mut().unwrap().chunk(sid, data).await;
+                }
             }
             Ev::Control(_pid, v) => match v["type"].as_str() {
                 // L1-a downgrade-refusal (spec §6.1): a v2 client NEVER stores a
@@ -1637,10 +1704,16 @@ pub(crate) async fn pair_cmd(
                     "  {n} disconnected, waiting briefly in case it reconnects..."
                 ));
             }
-            Ev::Interrupted => bail!("interrupted"),
+            Ev::Interrupted => {
+                if let Some(session) = temporary.as_mut() { session.shutdown().await; }
+                bail!("interrupted");
+            }
             _ => {}
         }
     }
+    }.await;
+    if let Some(session) = temporary.as_mut() { session.shutdown().await; }
+    result
 }
 
 #[cfg(test)]
@@ -1800,5 +1873,31 @@ mod external_notice_tests {
                 }
             }
         }
+    }
+}
+
+/// Right after a pairing is the one moment "will this device be reachable?"
+/// matters, and the answer is usually "only while this window is open": shells,
+/// sends and forwards to it need something listening, and they start cold
+/// without the background service. So ask once, here, instead of showing a
+/// check mark that fails later. Never in a script, never when a daemon already
+/// serves this config dir, and "Not now" leaves the command to type later.
+fn offer_background_after_pairing() {
+    if !interactive_allowed() || crate::daemon_alive().is_some() {
+        return;
+    }
+    ui::say("");
+    ui::say("  Keep this device reachable when this window is closed?");
+    let choices = vec!["Yes, run in the background".to_string(), "Not now".to_string()];
+    match codeentry::pick("", &choices) {
+        Ok(Some(0)) => {
+            let started = std::env::current_exe().ok().and_then(|exe| {
+                crate::platform::command(exe).args(["up", "--install"]).status().ok()
+            });
+            if !started.is_some_and(|status| status.success()) {
+                ui::say(&ui::paint(ui::Tone::Dim, "  That did not finish. Try again with: tunlion up --install"));
+            }
+        }
+        _ => ui::say(&ui::paint(ui::Tone::Dim, "  Later: tunlion up --install")),
     }
 }

@@ -1037,6 +1037,29 @@ impl DeviceStore {
         self.owner_pub_from_keystore().is_some() || self.local_device_cert_path().exists()
     }
 
+    /// Bootstrap internal identity only for a requested mutation. Shares the
+    /// CLI's cross-process identity lock; repeated inspection must not call it.
+    /// Never replace an existing/corrupt owner key or turn a joined device into
+    /// a new owner. The explicit root must already exist with host permissions.
+    pub fn ensure_identity_on_mutation(&self) -> Result<()> {
+        let _lock = StoreLock::acquire(&self.root.join("identity.lock"))
+            .context("lock identity bootstrap")?;
+        if UserKey::load(&self.keystore())?.is_some() || self.local_device_cert_path().exists() {
+            return Ok(());
+        }
+        filament_id::PendingIdentity::generate()?.commit(&self.keystore())?;
+        Ok(())
+    }
+
+    /// Explicit recovery-confirmed creation participates in the same lock as
+    /// implicit bootstrap, so the two mutation paths cannot replace each other.
+    pub fn commit_pending_identity(&self, pending: filament_id::PendingIdentity) -> Result<UserKey> {
+        let _lock = StoreLock::acquire(&self.root.join("identity.lock"))
+            .context("lock identity commit")?;
+        anyhow::ensure!(!self.local_device_cert_path().exists(), "this device already has joined identity state");
+        pending.commit(&self.keystore())
+    }
+
     /// Any unexpired armed invitation? Prunes expired entries on read, so the
     /// file self-cleans and a stale entry never keeps the enrollment room open.
     pub fn is_armed(&self) -> bool {
@@ -2006,6 +2029,38 @@ mod port_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_bootstrap_is_mutating_serialized_and_never_replaces_existing_state() {
+        let root = std::env::temp_dir().join(format!("fil-identity-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        assert!(!store.has_identity());
+        assert!(!root.join("identity.ed25519").exists());
+        let workers: Vec<_> = (0..4).map(|_| {
+            let root=root.clone();
+            std::thread::spawn(move || {
+                let store=DeviceStore::open(&root);
+                store.ensure_identity_on_mutation().unwrap();
+                store.owner_pub_from_keystore().unwrap()
+            })
+        }).collect();
+        let keys: Vec<_> = workers.into_iter().map(|w|w.join().unwrap()).collect();
+        assert!(keys.iter().all(|key|key==&keys[0]));
+        std::fs::write(root.join("identity.ed25519"),b"corrupt existing key").unwrap();
+        assert!(store.ensure_identity_on_mutation().is_err());
+        assert_eq!(std::fs::read(root.join("identity.ed25519")).unwrap(),b"corrupt existing key");
+        std::fs::remove_file(root.join("identity.ed25519")).unwrap();
+        std::fs::create_dir_all(root.join("identity")).unwrap();
+        std::fs::write(store.local_device_cert_path(),b"existing joined state").unwrap();
+        store.ensure_identity_on_mutation().unwrap();
+        assert!(!root.join("identity.ed25519").exists());
+        // Only this test's unique fixture directory, not production state.
+        std::fs::remove_file(store.local_device_cert_path()).unwrap();
+        std::fs::remove_dir(root.join("identity")).unwrap();
+        std::fs::remove_file(root.join("identity.lock")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn stale_provisional_identities_are_collected_and_fresh_ones_kept() {

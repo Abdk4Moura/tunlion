@@ -156,6 +156,8 @@ pub const SESSION_BUFFER_CAP: usize = 256 * 1024;
 /// THE VALUE COMES FROM THE PEER and is used to build a filesystem path below,
 /// so anything that is not a plausible terminal name is replaced before it is
 /// ever joined onto a directory (`../../etc/passwd` must not become a probe).
+/// The TERM a shell session gets. The Windows relay sets TERM/COLORTERM on the
+/// ConPTY itself and ignores it (see `platform::pty::spawn_shell`).
 pub(crate) fn effective_term(requested: &str) -> String {
     const FALLBACK: &str = "xterm-256color";
     let plausible = !requested.is_empty()
@@ -333,58 +335,19 @@ pub async fn spawn_pty_session(
     // ceiling (the grant authorizes); uncovered sessions never set this.
     admitted_via_ceiling: bool,
 ) -> Option<PtySessionHandle> {
-    use crate::platform::pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read as _, Write as _};
-
-    let size = PtySize {
-        rows: rows.max(1),
-        cols: cols.max(1),
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-    let pair = match native_pty_system().openpty(size) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = transport
-                .send_control(
-                    &json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") }),
-                )
-                .await;
-            return None;
-        }
-    };
-    let mut cmd = CommandBuilder::new(&argv[0]);
-    for a in &argv[1..] {
-        cmd.arg(a);
-    }
-    cmd.env("TERM", effective_term(term));
-    // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
-    // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
-    // truecolor fine, so set this to get full-color output (verified: opencode
-    // emits 38;2;R;G;B with this set, 38;5;N without).
-    cmd.env("COLORTERM", "truecolor");
-    cmd.cwd(crate::platform::Paths::home_dir());
-    let mut child = match pair.slave.spawn_command(cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = transport
-                .send_control(
-                    &json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") }),
-                )
-                .await;
-            return None;
-        }
-    };
-    drop(pair.slave); // close our copy so the shell owns the only slave
-    let master = pair.master;
-    let mut reader = match master.try_clone_reader() {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-    let mut writer = match master.take_writer() {
-        Ok(w) => w,
-        Err(_) => return None,
-    };
+    // The backend (portable-pty, or the Windows token relay) is chosen in the
+    // platform adapter; this loop only reads, writes, resizes and ends it.
+    let (mut reader, mut writer, mut control) =
+        match crate::platform::pty::spawn_shell(&argv, cols, rows, &effective_term(term)) {
+            Ok(shell) => shell,
+            Err(e) => {
+                let _ = transport
+                    .send_control(&json!({ "type": "l2-close", "sid": sid, "err": e }))
+                    .await;
+                return None;
+            }
+        };
 
     // Blocking PTY-master reads -> async output channel.
     let (otx, mut orx) = mpsc::channel::<Vec<u8>>(128);
@@ -509,7 +472,7 @@ pub async fn spawn_pty_session(
                 },
                 rs = resize_rx.recv() => {
                     if let Some((c, r)) = rs {
-                        let _ = master.resize(PtySize { rows: r.max(1), cols: c.max(1), pixel_width: 0, pixel_height: 0 });
+                        control.resize(c, r);
                     }
                 }
                 _ = reaper.tick() => {
@@ -560,8 +523,7 @@ pub async fn spawn_pty_session(
         // Teardown (shell exit, reap, revoke, or store removal): kill the shell,
         // tell the currently-attached link (if any) the session ended, drop from
         // the store.
-        let _ = child.kill();
-        let _ = child.wait();
+        control.end();
         dead.store(true, Ordering::Release);
         // Publish "ended" BEFORE taking the slot. A concurrent attach that
         // loses the race then sees `is_dead()` and releases its own stream,

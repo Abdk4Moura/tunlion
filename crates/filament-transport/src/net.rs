@@ -2322,7 +2322,7 @@ async fn wire_channel(
                             }
                             Ok((n, true)) => {
                                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
-                                    if let Ok(v) = serde_json::from_slice::<Value>(&buf[..n]) {
+                                    if let Some(v) = crate::control_limits::decode_control(&buf[..n]) {
                                         let _ = tx.send(Ev::Control(peer_id.clone(), v));
                                     }
                                 }

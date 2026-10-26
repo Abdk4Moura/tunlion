@@ -1,5 +1,6 @@
 pub mod fs_at;
 pub mod pty;
+pub mod win_pty;
 pub(crate) mod recv_signals;
 
 use std::path::{Path, PathBuf};
@@ -2394,6 +2395,20 @@ impl InstallSource {
 mod tests {
     use super::*;
 
+    /// The UI must offer Download exactly where the pinned publisher exists.
+    /// Linux and Windows both do; a reduced build without `mount-server` or a
+    /// platform without a publisher must not advertise an action it cannot finish.
+    #[test]
+    fn folder_download_capability_matches_the_publisher_platforms() {
+        let expected = cfg!(feature = "mount-server")
+            && (cfg!(target_os = "linux") || cfg!(target_os = "windows"));
+        assert_eq!(super::folder_download_supported(), expected);
+        #[cfg(all(target_os = "windows", feature = "mount-server"))]
+        assert!(super::folder_download_supported(), "Windows must expose the validated download publisher");
+        #[cfg(all(target_os = "linux", feature = "mount-server"))]
+        assert!(super::folder_download_supported(), "Linux must expose the validated download publisher");
+    }
+
     // The record is in place before the child runs any of the program: the
     // child itself checks for what `record` wrote, so a record that landed
     // after the program started would fail the run. Repeated, because the
@@ -2977,6 +2992,36 @@ mod tests {
     }
 }
 
+/// Whether this build can publish a downloaded folder file. Browse and preview
+/// are protocol-level everywhere; download publication needs the `mount-server`
+/// feature and a pinned no-clobber publisher. Linux and Windows both provide one
+/// (`download_output::OwnedDownload`); Windows publishes through a retained
+/// directory HANDLE and does not claim directory-entry durability.
+
+/// The hidden `__win-pty-smoke` test command. Both arms here so the command
+/// itself is portable: Windows runs the relay smoke; elsewhere it refuses.
+#[cfg(feature = "test-hooks")]
+pub fn win_pty_smoke(mode: &str) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::platform::win_pty::smoke(mode)
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("__win-pty-smoke {mode}: the Windows PTY relay exists only on Windows")
+    }
+}
+
+/// Can this build serve a temporary-access SHELL (a real interactive PTY on the
+/// host's account)? Unix builds with the PTY server only, today.
+pub fn temporary_shell_supported() -> bool {
+    cfg!(all(unix, feature = "pty-server"))
+}
+
+pub fn folder_download_supported() -> bool {
+    cfg!(all(any(target_os = "linux", target_os = "windows"), feature = "mount-server"))
+}
+
 /// Policy routing for exit nodes, kept behind the platform adapter so the rest
 /// of the tree stays free of `cfg(target_os)`.
 ///
@@ -3163,6 +3208,78 @@ impl ConsoleModes {
             }
         }
     }
+}
+
+/// Let the console interpret the escape sequences the menus and colours write.
+///
+/// WINDOWS: a classic console host (a Start Menu launch on Windows 10) has VT
+/// output processing OFF until a program asks for it. Nothing asked before the
+/// first menu drew, so `\x1b[2K` and the colour codes could print as literal
+/// `←[2K` until a later crossterm call happened to switch it on. Output only:
+/// VT *input* would change how keys reach crossterm, which the pickers rely on.
+///
+/// ELSEWHERE: terminals already interpret escapes; a no-op.
+pub fn enable_vt_output() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+        for handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            if let Some(cur) = win_console_get(handle) {
+                if cur & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0 {
+                    win_console_set(handle, cur | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                }
+            }
+        }
+    }
+}
+
+/// True when this process is the only one attached to its console, which is
+/// what a Start Menu or Explorer launch looks like: the console window was made
+/// for us and closes the moment we exit. Run from cmd/PowerShell/Terminal, the
+/// shell shares the console, so the count is at least two.
+///
+/// ELSEWHERE: there is no such window to lose; always false.
+pub fn console_is_ours() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::GetConsoleProcessList;
+        let mut ids = [0u32; 4];
+        // SAFETY: writes at most `ids.len()` process ids into a valid buffer and
+        // returns how many processes share the console (0 on failure).
+        let attached = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) };
+        attached == 1
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Keep THIS process alive through console Ctrl-C/Ctrl-Break: the Start Menu
+/// launcher shares its console with the child it runs, the child decides what
+/// Ctrl-C means, and the launcher must not die of it and take the window with
+/// it. A handler, not the inherited "ignore" flag, so the child keeps normal
+/// Ctrl-C behaviour. Elsewhere there is no such launcher; a no-op.
+pub fn ignore_console_interrupts() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+        unsafe extern "system" fn handler(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
+            i32::from(kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT)
+        }
+        // SAFETY: registers a plain function pointer that touches no state.
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+}
+
+/// Windows has the validated download publisher (mount-server), so the CLI
+/// offers Download there.
+#[cfg(all(test, target_os = "windows", feature = "mount-server"))]
+#[test]
+fn windows_offers_folder_download() {
+    assert!(folder_download_supported());
 }
 
 #[cfg(windows)]
@@ -4102,7 +4219,7 @@ mod recv_daemon;
 pub(crate) use recv_daemon::*;
 
 mod stdin;
-pub(crate) use stdin::spawn_stdin;
+pub(crate) use stdin::{read_stdin_timeout, spawn_stdin, RawStdin};
 
 /// Ask the running daemon for its live L3 state, where this platform has a
 /// control socket. Windows has no unix-domain control socket; there the
