@@ -8,7 +8,7 @@
 
 Tunlion started as the file transfer nothing else does: the **receiving end needs nothing installed** — it can be any browser, on any phone or laptop. That still holds. But the same crypto-addressed link that carries a file also lets you **shell into your machines, forward a port, or mount a folder** across the internet. One tool, one identity, your devices meshed.
 
-Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other — it never sees a byte.
+Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other. It sees who paired with whom and when, never file contents.
 
 ![tunlion demo: send with a speakable code + QR, receive in another terminal, remembered devices](docs/launch/demo.gif)
 
