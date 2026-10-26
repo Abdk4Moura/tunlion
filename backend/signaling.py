@@ -114,6 +114,7 @@ class _MemRegistry:
     RETIRED_TTL = 24 * 3600  # per-token generation tombstone lifetime
     MAX_SESSIONS = 50_000  # token records (LRU-evicted, never uid ownership)
     MAX_RETIRED_TOTAL = 200_000
+    PRUNE_INTERVAL = 30  # seconds between full sweeps of expired token records
 
     def __init__(self):
         self._m = {}  # sid -> {"room", "name", "uid", "gen"}
@@ -125,6 +126,7 @@ class _MemRegistry:
         self._sid_token = {}
         self._retired = {}
         self._retired_order = deque()
+        self._next_prune = 0.0
         # async_mode=threading really is concurrent: claim/take must not
         # interleave or two generations can both believe they own a session.
         self._lock = threading.RLock()
@@ -174,7 +176,17 @@ class _MemRegistry:
         with self._lock:
             now = _time.time()
             self._prune_retired(now)
-            evicted = self._prune_sessions(now)
+            # Expired records are swept at most every PRUNE_INTERVAL, not on
+            # every claim: the sweep walks every record, so per-claim it made
+            # each claim O(records) and the server's CPU grow with the square
+            # of the device count. The claimed token's own expiry is still
+            # checked inline below, and capacity (_make_room) never counts on
+            # the sweep, since an expired record is never live.
+            if now >= self._next_prune:
+                evicted = self._prune_sessions(now)
+                self._next_prune = now + self.PRUNE_INTERVAL
+            else:
+                evicted = []
             rec = self._sessions.get(token) if token else None
             if rec and rec.get("exp", 0) <= now:
                 self._sessions.pop(token, None)
