@@ -931,6 +931,13 @@ pub(crate) async fn send_cmd(
                 ));
             }
         }
+        // A code ceremony in flight: its next outbound step (our element, our
+        // confirmation) goes out from the progression block below this wait,
+        // but becomes sendable when an event is handled further down. Waiting
+        // a full 2 s slice in between cost a browser receiving a code about
+        // 2 s between "authenticating..." and "authenticated" (measured 2.0 to
+        // 2.1 s on every run). The ceremony is budgeted, so the short wait is.
+        let ceremony_live = pake_peer.is_some() && !pake_done;
         // The wait-for-peer deadline only applies while we have no peer (F3).
         let ev = if conn.active.is_none() && conn.rejoin.waiting_rejoin.is_none() {
             // C30: read in ≤2s slices, a blocking full-deadline read starves
@@ -944,10 +951,16 @@ pub(crate) async fn send_cmd(
             }
             let slice =
                 Duration::from_secs(2).min(claim_deadline.saturating_sub(started.elapsed()));
+            let slice = if ceremony_live { slice.min(CEREMONY_TICK) } else { slice };
             match tokio::time::timeout(slice, rx.recv()).await {
                 Ok(Some(ev)) => Some(ev),
                 Ok(None) => bail!("signaling channel closed"),
                 Err(_) => None, // tick
+            }
+        } else if ceremony_live && conn.rejoin.waiting_rejoin.is_none() {
+            match tokio::time::timeout(CEREMONY_TICK, next_ev(&mut rx, &conn, false)).await {
+                Ok(ev) => ev?,
+                Err(_) => None, // tick: drive the ceremony
             }
         } else {
             next_ev(&mut rx, &conn, false).await?
@@ -2946,6 +2959,8 @@ pub(crate) fn missing_input(path: &str, e: &std::io::Error) -> anyhow::Error {
 /// How long an offer may go unanswered before the send fails. Long enough for
 /// any receiver that is working; a person deciding stops the clock entirely.
 const SEND_ANSWER_WAIT: Duration = Duration::from_secs(60);
+/// Event wait while a code ceremony is in flight (see the send loop).
+const CEREMONY_TICK: Duration = Duration::from_millis(100);
 
 /// The receiver's reason, for a `file-decline` that carries one (a typed
 /// refusal); `None` for a plain decline (a person said no).
