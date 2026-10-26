@@ -153,8 +153,9 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       // C30 phase 2: the digest may carry the server's roster, hand it to
       // the reconciler (ok:true only; error digests carry no roster).
       if (onDigest && resp && resp.ok === true && Array.isArray(resp.peers)) onDigest(resp.peers)
-      // `desired` moved while this sync was in flight: converge now.
-      if (digest(desired) !== digest(snapshot)) maybeSync(Date.now())
+      // `desired` moved while this sync was in flight: converge now (unless
+      // the loop was stopped meanwhile: pagehide, or a superseded tab).
+      if (timer && digest(desired) !== digest(snapshot)) maybeSync(Date.now())
     })
     // The transport declined to emit (no session token yet: the initial join
     // owns minting it). Nothing is in flight, so do not hold the guard for a
