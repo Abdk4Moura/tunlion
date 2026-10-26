@@ -237,6 +237,11 @@ pub trait MeshTunnel: Send + Sync + 'static {
     fn my_addr_v4(&self) -> Option<Ipv4Addr>;
     /// Is the endpoint the userspace netstack (no kernel TUN, no host firewall)?
     fn is_userspace(&self) -> bool;
+    /// Why the kernel endpoint's native IPv4 address or route is missing, if it
+    /// is. A userspace endpoint has no native address to miss.
+    fn native_v4_problem(&self) -> Option<String> {
+        None
+    }
     /// This node's identity addrs, when it has a signing identity.
     fn identity_addrs(&self) -> Option<(Ipv6Addr, Ipv4Addr)>;
     /// Record `name` -> overlay addresses for MagicDNS and refresh the host file.

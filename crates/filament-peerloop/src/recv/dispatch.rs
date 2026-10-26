@@ -1600,7 +1600,7 @@ async fn recv_run(
                     match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
                             l3_status = L3Status::ready(l3_mode_word(m.is_userspace()))
-                                .with_v4_problem(if m.is_userspace() { None } else { crate::l3::native_v4_problem() });
+                                .with_v4_problem(m.native_v4_problem());
                             if let Ok(text) = serde_json::to_string(&l3_status) {
                                 host.l3_state_report(&text);
                             }
