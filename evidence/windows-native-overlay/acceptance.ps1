@@ -85,7 +85,8 @@ try {
   if(-not $admin){Record 'elevation' 'BLOCKED' 'Runner is not elevated; explicit-kernel native test cannot run.'; throw 'not elevated'}
   if($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'WireGuard LLC'){Record 'wintun-signature' 'FAIL' @{status=$sig.Status;signer=$sig.SignerCertificate.Subject}; throw 'invalid Wintun signature'}
   Record 'wintun-signature' 'PASS' @{sha256=$dllHash;status=$sig.Status;signer=$sig.SignerCertificate.Subject}
-  Assert-Command 'init' @('--json','init','--name','win-native-accept','--inbox',$script:inbox,'--recovery-file',(Join-Path $script:root 'recovery.txt'),'--yes') | Out-Null
+  Record 'init-start' 'OBSERVED' @{exe=$Exe; config=$script:config; inbox=$script:inbox}
+  try { Assert-Command 'init' @('--json','init','--name','win-native-accept','--inbox',$script:inbox,'--recovery-file',(Join-Path $script:root 'recovery.txt'),'--yes') | Out-Null } catch { Record 'init-error' 'FAIL' @{message=$_.Exception.Message;stack=$_.ScriptStackTrace;line=$_.InvocationInfo.PositionMessage}; throw }
   Assert-Command 'select-kernel' @('set','l3-mode','kernel') | Out-Null
   $pidPath=Join-Path $script:config 'up.pid';$exePath=Join-Path $script:config 'up.exe'
   $up=Invoke-Tun @('up','--detach'); Record 'start-kernel-daemon' $(if($up.exitCode -eq 0){'PASS'}else{'FAIL'}) $up
@@ -123,7 +124,7 @@ try {
   $instance2=Get-ScratchDaemon $pidPath $exePath;if($null -eq $instance2 -or $instance2.pid -ne $daemonPid -or $instance2.created -ne $daemonCreated){throw 'post-restart ready state does not match captured new daemon incarnation'}
   Record 'restart-ready' 'PASS' @{status=$j;pid=$daemonPid;processPath=$daemonPath;creationDate=$daemonCreated;previousPid=$firstPid;previousCreationDate=$firstCreated}
   $second=Get-NativeState 'after-restart'
-} catch { if(-not $script:events.Where({$_.status -eq 'FAIL'}).Count){Record 'acceptance-abort' 'BLOCKED' $_.Exception.Message} else {Record 'acceptance-abort' 'FAIL' $_.Exception.Message} }
+} catch { if(-not $script:events.Where({$_.status -eq 'FAIL'}).Count){Record 'acceptance-abort' 'BLOCKED' @{message=$_.Exception.Message;stack=$_.ScriptStackTrace;line=$_.InvocationInfo.PositionMessage}} else {Record 'acceptance-abort' 'FAIL' @{message=$_.Exception.Message;stack=$_.ScriptStackTrace;line=$_.InvocationInfo.PositionMessage}} }
 finally {
   if($daemonPid){$p=Get-CimInstance Win32_Process -Filter "ProcessId=$daemonPid" -ErrorAction SilentlyContinue;if($p -and $p.ExecutablePath -eq $daemonPath -and [string]$p.CreationDate -eq $daemonCreated){Stop-Process -Id $daemonPid -Force -ErrorAction SilentlyContinue;Wait-Process -Id $daemonPid -Timeout 15 -ErrorAction SilentlyContinue;$after=Get-CimInstance Win32_Process -Filter "ProcessId=$daemonPid" -ErrorAction SilentlyContinue;if($after -and $after.ExecutablePath -eq $daemonPath -and [string]$after.CreationDate -eq $daemonCreated){Record 'cleanup-daemon' 'FAIL' 'Verified scratch daemon remained alive after stop timeout.'}elseif($after){Record 'cleanup-daemon' 'SKIPPED' 'PID now identifies a different incarnation; refused to stop it.'}else{Record 'cleanup-daemon' 'PASS' 'Verified scratch daemon stopped.'}}else{Record 'cleanup-daemon' 'FAIL' 'PID/path/creation timestamp no longer matches; refused to stop an unverified process; manual review required.'}}
   $evidenceFull=[IO.Path]::GetFullPath($EvidenceDir);$scratchFull=[IO.Path]::GetFullPath($script:root)
