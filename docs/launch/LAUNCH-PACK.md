@@ -171,7 +171,7 @@ no upload, no app, no account, no size limit.
 Tunlion transfers files straight between two browsers. Devices on the same WiFi
 discover each other automatically (like AirDrop, but cross-platform). Devices on
 different networks pair with a one-time spoken code that works exactly once.
-Files never touch a server: they stream peer to peer over an encrypted WebRTC
+Files are never uploaded to a server: they stream peer to peer over an encrypted WebRTC
 data channel, with an encrypted relay as fallback for strict networks. A route
 badge shows exactly how the bytes travel (LAN, P2P, or RELAY). Interrupted
 transfers pause and resume from the same byte, verified by content hash. There

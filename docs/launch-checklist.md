@@ -26,6 +26,8 @@ executing the phases below.
 - [x] awesome-selfhosted entry prepared → `docs/launch/awesome-selfhosted.md`
 - [x] MIT LICENSE added to the repo
 - [x] **v1.0.0 release** cut (required: awesome-selfhosted needs a release ≥ 4 months old)
+      (`v1.0.0` is the filament-era web app release on commit "Add MIT license"; CLI
+      versions are tagged separately as `cli-vX.Y.Z`, newest published `cli-v0.8.5`)
 
 ## Phase 2 — Launch (A executes, C's drafts in hand)
 - [ ] Publish the blog post on Abdk4Moura.github.io (C can push after approval)

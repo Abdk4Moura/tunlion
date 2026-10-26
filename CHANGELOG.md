@@ -4,6 +4,12 @@ All notable, user-facing changes to tunlion are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+Versions here are CLI versions, tagged `cli-vX.Y.Z`. The newest published one is
+`0.8.5`. `cli/Cargo.toml` already says `0.9.0` because that release is staged
+below but not yet tagged or published. The separate `v1.0.0` tag and release
+(2026-06-06) is the filament-era web app's first stable release; it is not a
+CLI version and does not mean the CLI is at 1.0.
+
 ## [Unreleased]
 
 ### Breaking
@@ -52,7 +58,7 @@ the GitHub release notes.
   and a piped stdout (where raw mode is never entered) the same restoration
   applies for the whole session, and a CRLF split across reads stays one Enter.
 
-## [0.9.0]
+## [0.9.0] - unreleased (staged, not yet tagged)
 
 ### Added
 

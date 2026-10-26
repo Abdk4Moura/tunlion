@@ -8,13 +8,27 @@
 
 Tunlion started as the file transfer nothing else does: the **receiving end needs nothing installed** — it can be any browser, on any phone or laptop. That still holds. But the same crypto-addressed link that carries a file also lets you **shell into your machines, forward a port, or mount a folder** across the internet. One tool, one identity, your devices meshed.
 
-Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other — it never sees a byte.
+Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other. It sees who paired with whom and when, never file contents.
 
 ![tunlion demo: send with a speakable code + QR, receive in another terminal, remembered devices](docs/launch/demo.gif)
 
 ## Install
 
 Runs on **Linux, macOS, and Windows** (all first-class), or use it with **nothing installed** in a browser.
+
+> **The first Tunlion release (`cli-v0.9.0`) has not been cut yet.** The newest
+> published release, `cli-v0.8.5`, carries only the predecessor's `filament-*`
+> binaries, so the installers and package names below have nothing to fetch
+> until `cli-v0.9.0` ships (winget additionally waits on review of the new
+> `Abdk4Moura.Tunlion` package). The names published today, winget
+> `Abdk4Moura.Filament`, Homebrew `abdk4moura/tap/filament`, and `filament-cli`
+> 0.8.5 on crates.io and npm, install the predecessor `filament` binary, not
+> `tunlion`. Until then, build from source with
+> `cargo install --locked --git https://github.com/Abdk4Moura/tunlion filament-cli`
+> (it installs the `tunlion` binary), or open
+> [tunlion.autumated.com](https://tunlion.autumated.com) on both devices.
+
+From `cli-v0.9.0` on:
 
 ```sh
 # Linux / macOS — curl | sh
@@ -24,7 +38,7 @@ curl -fsSL https://tunlion.autumated.com/install | sh
 irm https://tunlion.autumated.com/install.ps1 | iex
 ```
 
-Or a package manager:
+Or a package manager (same release):
 
 | Manager | Command |
 |---|---|

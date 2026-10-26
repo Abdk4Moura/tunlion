@@ -173,7 +173,36 @@ def api_room_code():
 
 @app.get("/api/health")
 def api_health():
+    """Process liveness only. Test harnesses poll this to learn the server is
+    up; it deliberately does not consult Redis (see /health for that)."""
     return jsonify({"ok": True})
+
+
+# A dedicated client for the readiness probe, with short timeouts, so a
+# blackholed Redis makes /health answer 503 within about a second instead of
+# hanging the monitor. It shares only the URL with the registry's client.
+_HEALTH_REDIS = None
+if config.REDIS_URL:
+    import redis as _redis
+    _HEALTH_REDIS = _redis.Redis.from_url(
+        config.REDIS_URL, socket_connect_timeout=1.0, socket_timeout=1.0)
+
+
+@app.get("/health")
+def health():
+    """Readiness for external monitors. An explicit route, so it never falls
+    through to the SPA fallback (which answers 503 when the frontend build is
+    absent, as it is in the split deploy). 200 while signalling can serve;
+    503 only when the configured Redis, a real dependency of the registry and
+    the Socket.IO message queue, does not answer a PING. No error detail is
+    returned, so the probe cannot leak connection strings."""
+    if _HEALTH_REDIS is None:
+        return jsonify({"ok": True, "redis": "not-configured"})
+    try:
+        _HEALTH_REDIS.ping()
+    except Exception:  # any failure to PING means the dependency is down
+        return jsonify({"ok": False, "redis": "down"}), 503
+    return jsonify({"ok": True, "redis": "up"})
 
 
 # ----------------------------------------------------------- Telemetry -------
