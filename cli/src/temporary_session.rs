@@ -547,9 +547,12 @@ impl Session {
 /// for this foreground temporary agreement. The host match arm below calls
 /// `AgreementEngine::serve_pty`/`serve_shell` directly, with the accepted
 /// revision and proven peer; it never enters standing shell admission.
-#[cfg(all(unix, feature = "pty-server"))]
+#[cfg(feature = "pty-server")]
 fn shell_runtime() -> Option<filament_peerloop::access_session::ShellRuntime> {
     use filament_peerloop::access_session::ShellRuntime;
+    if !crate::platform::temporary_shell_supported() {
+        return None;
+    }
     use filament_peerloop::recv::servers::shell::PtyBackend;
     let log: Arc<dyn filament_peerloop::host::LogSink> =
         Arc::new(filament_peerloop::host::NoLog);
@@ -565,7 +568,7 @@ fn shell_runtime() -> Option<filament_peerloop::access_session::ShellRuntime> {
     }
 }
 
-#[cfg(not(all(unix, feature = "pty-server")))]
+#[cfg(not(feature = "pty-server"))]
 fn shell_runtime() -> Option<filament_peerloop::access_session::ShellRuntime> { None }
 
 impl Drop for Session {

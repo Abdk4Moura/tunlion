@@ -148,7 +148,7 @@ pub fn spawn_shell(argv: &[String], cols: u16, rows: u16, term: &str) -> Result<
         let _ = term;
         // Refuse the session exactly like the portable-pty spawn failure; never
         // fall back to the daemon's own token.
-        let pty = crate::win_pty::spawn(argv, cols, rows).map_err(|e| format!("spawn: {e}"))?;
+        let pty = crate::platform::win_pty::spawn(argv, cols, rows).map_err(|e| format!("spawn: {e}"))?;
         // The resize pipe is a *synchronous* Windows pipe: `write_all` blocks once
         // its buffer fills (a relay that stopped draining it, or a wedged shell),
         // and the caller resizes from its session task, which also drives the

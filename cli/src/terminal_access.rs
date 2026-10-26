@@ -217,20 +217,20 @@ fn terminal_size() -> (u16, u16) {
 }
 
 /// Poll stdin with a bounded timeout so it can stop when the terminal ends.
-/// `libc` keeps this to the same Unix-only path the agreement PTY serving uses;
-/// no Windows shell/terminal support is claimed by this adapter.
-#[cfg(unix)]
+/// The raw read is `platform::read_stdin_timeout`: Unix only today, and no
+/// Windows shell/terminal support is claimed by this adapter.
 fn spawn_stdin(stop: Arc<AtomicBool>) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<StdinItem>) {
+    use crate::platform::RawStdin;
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
         let mut buffer = [0u8; 1024];
         while !stop.load(Ordering::Acquire) {
-            let ready = unsafe { libc::poll(&mut fd, 1, 50) };
-            if ready <= 0 { continue; }
-            let count = unsafe { libc::read(0, buffer.as_mut_ptr().cast(), buffer.len()) };
-            if count <= 0 { break; }
-            let bytes = &buffer[..count as usize];
+            let count = match crate::platform::read_stdin_timeout(&mut buffer, 50) {
+                RawStdin::Idle => continue,
+                RawStdin::Closed => break,
+                RawStdin::Bytes(count) => count,
+            };
+            let bytes = &buffer[..count];
             if let Some(position) = bytes.iter().position(|byte| *byte == DETACH) {
                 if position > 0 && tx.send(StdinItem::Bytes(bytes[..position].to_vec())).is_err() { return; }
                 let _ = tx.send(StdinItem::Detach);
@@ -240,11 +240,6 @@ fn spawn_stdin(stop: Arc<AtomicBool>) -> (std::thread::JoinHandle<()>, std::sync
         }
     });
     (handle, rx)
-}
-
-#[cfg(not(unix))]
-fn spawn_stdin(_: Arc<AtomicBool>) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<StdinItem>) {
-    (std::thread::spawn(|| {}), std::sync::mpsc::channel().1)
 }
 
 /// The terminal menu calls this while a remote session is active. It is kept

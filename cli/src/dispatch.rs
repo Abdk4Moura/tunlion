@@ -2040,7 +2040,7 @@ pub(crate) async fn async_main() -> Result<()> {
             rows,
             resize,
             argv,
-        } => crate::win_pty::relay(cols, rows, &resize, &argv),
+        } => crate::platform::win_pty::relay(cols, rows, &resize, &argv),
         #[cfg(feature = "test-hooks")]
         Cmd::WinPtySmoke { mode } => crate::platform::win_pty_smoke(&mode),
         Cmd::Netcat { peer, rport } => {

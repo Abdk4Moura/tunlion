@@ -1,5 +1,6 @@
 pub mod fs_at;
 pub mod pty;
+pub mod win_pty;
 pub(crate) mod recv_signals;
 
 use std::path::{Path, PathBuf};
@@ -2996,11 +2997,6 @@ mod tests {
 /// feature and a pinned no-clobber publisher. Linux and Windows both provide one
 /// (`download_output::OwnedDownload`); Windows publishes through a retained
 /// directory HANDLE and does not claim directory-entry durability.
-/// Can this build serve a temporary-access SHELL (a real interactive PTY on the
-/// host's account)? Unix builds with the PTY server only, today.
-pub fn temporary_shell_supported() -> bool {
-    cfg!(all(unix, feature = "pty-server"))
-}
 
 /// The hidden `__win-pty-smoke` test command. Both arms here so the command
 /// itself is portable: Windows runs the relay smoke; elsewhere it refuses.
@@ -3008,12 +3004,18 @@ pub fn temporary_shell_supported() -> bool {
 pub fn win_pty_smoke(mode: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        crate::win_pty::smoke(mode)
+        crate::platform::win_pty::smoke(mode)
     }
     #[cfg(not(windows))]
     {
         anyhow::bail!("__win-pty-smoke {mode}: the Windows PTY relay exists only on Windows")
     }
+}
+
+/// Can this build serve a temporary-access SHELL (a real interactive PTY on the
+/// host's account)? Unix builds with the PTY server only, today.
+pub fn temporary_shell_supported() -> bool {
+    cfg!(all(unix, feature = "pty-server"))
 }
 
 pub fn folder_download_supported() -> bool {
@@ -4217,7 +4219,7 @@ mod recv_daemon;
 pub(crate) use recv_daemon::*;
 
 mod stdin;
-pub(crate) use stdin::spawn_stdin;
+pub(crate) use stdin::{read_stdin_timeout, spawn_stdin, RawStdin};
 
 /// Ask the running daemon for its live L3 state, where this platform has a
 /// control socket. Windows has no unix-domain control socket; there the

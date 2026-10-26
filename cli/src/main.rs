@@ -293,7 +293,6 @@ mod shutdown;
 mod sshd;
 mod sshkeys;
 mod local;
-mod win_pty;
 mod ui;
 mod style;
 mod fleet_ui;
