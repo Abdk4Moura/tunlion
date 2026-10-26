@@ -69,6 +69,21 @@ class RedisTokenParity(unittest.TestCase):
         tokenless = self.claim(gen="g4", sid="s4")
         self.assertNotEqual(tokenless["token"], token)
 
+    def test_holds_session_matches_the_current_claim(self):
+        # The per-IP claim budget exempts a claim only when holds_session says
+        # it can be nothing but a refresh, so it must agree with the Lua claim.
+        token = self.claim(gen="g1", sid="s1")["token"]
+        self.assertTrue(self.reg.holds_session(token, "g1", "s1"))
+        self.assertEqual(self.claim(token, "g1", "s1")["status"], "current")
+        self.assertFalse(self.reg.holds_session(token, "g1", "s2"), "another sid is a takeover")
+        self.assertFalse(self.reg.holds_session(token, "g2", "s1"), "another gen is a bump")
+        self.assertFalse(self.reg.holds_session("not-the-token", "g1", "s1"))
+        self.assertFalse(self.reg.holds_session(None, "g1", "s1"))
+        self.assertEqual(self.claim(token, "g2", "s1")["status"], "new")
+        self.assertFalse(self.reg.holds_session(token, "g1", "s1"), "a retired gen is not held")
+        self.reg.take_session(token, "g2")
+        self.assertFalse(self.reg.holds_session(token, "g2", "s1"), "a closed session is not held")
+
     def test_uid_alone_and_wrong_token_are_new_sessions(self):
         victim = self.claim()
         uid = self.uid
