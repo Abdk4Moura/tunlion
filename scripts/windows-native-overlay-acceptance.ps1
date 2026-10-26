@@ -21,7 +21,7 @@ Push-Location $root
 $harnessError = $null
 try {
   $testLog = Join-Path $EvidenceDir 'unit-tests.log'; $testErr = Join-Path $EvidenceDir 'unit-tests.stderr.log'
-  $testProc = Start-Process -FilePath 'cargo.exe' -ArgumentList @('test','-p','filament-peerloop','--locked','--lib','l3::tun::windows','--target',$target) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $testLog -RedirectStandardError $testErr
+  $testProc = Start-Process -FilePath 'cargo.exe' -ArgumentList @('test','-p','filament-peerloop','--locked','--features','l3','--lib','l3::tun::windows','--target',$target) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $testLog -RedirectStandardError $testErr
   if ($testProc.ExitCode -ne 0) { throw "Windows l3::tun::windows test failed (exit $($testProc.ExitCode))" }
   $testText = (Get-Content (Join-Path $EvidenceDir 'unit-tests.log') -Raw) + (Get-Content (Join-Path $EvidenceDir 'unit-tests.stderr.log') -Raw)
   $passCounts = [regex]::Matches($testText, '(?m)\b(\d+) passed;') | ForEach-Object { [int]$_.Groups[1].Value }
