@@ -2187,6 +2187,9 @@ async fn recv_run(
             cleanup.watchdog.tick(log.clone());
         }
         cleanup.tasks.reap(log.as_ref()).await;
+        // Read before the select: a code ceremony is in flight (see the
+        // event wait below for why that shortens the wait).
+        let ceremony_live = recv_code_path && !recv_pake_done && !st.recv_cers.is_empty();
         let ev = tokio::select! {
             biased;
             // Warm-link reuse request from a sibling process. Handle it inline
@@ -2475,7 +2478,17 @@ async fn recv_run(
                 // dispatched this iteration is acted on promptly instead of
                 // up to a full 2s later (a settled release must not miss its
                 // own bound). Idle cost is unchanged when nothing is parked.
-                if parked_opens.is_empty() {
+                //
+                // Same for a code ceremony in flight: the progression block
+                // that sends our SPAKE2 element and our confirmation runs at
+                // the top of an iteration, but the events that make them
+                // sendable (a candidate's channel opening, its element
+                // arriving) are handled at the bottom. Waiting the full 2s
+                // in between cost a cross-network `receive <code>` about 4s
+                // between "authenticating..." and "authenticated" (two such
+                // waits, measured 4.0 to 4.1s in 4 of 5 runs). The ceremony
+                // is budgeted, so the fast tick is too.
+                if parked_opens.is_empty() && !ceremony_live {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_millis(100)
