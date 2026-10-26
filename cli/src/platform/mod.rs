@@ -4503,6 +4503,10 @@ mod request_write_tests {
         let result = super::write_request_file(&path, "482\nnew-token\nnew-nonce\n", "tag", |p, c| {
             std::fs::write(p, c)
         });
+        // The exclusive handle induces replacement failure, but it also
+        // prevents our own subsequent read. Release it before checking that
+        // the original request survived.
+        unsafe { CloseHandle(held) };
         assert!(result.is_err(), "replacement must fail while deletion is denied");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old_request);
         assert!(
@@ -4511,8 +4515,6 @@ mod request_write_tests {
                 .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".tmp.")),
             "the failed replacement must clean up its own temp file"
         );
-
-        unsafe { CloseHandle(held) };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
