@@ -1744,6 +1744,10 @@ fn verb_on_command_line() -> Option<String> {
 }
 
 fn main() -> std::process::ExitCode {
+    crate::platform::run_entry(main_inner)
+}
+
+fn main_inner() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.

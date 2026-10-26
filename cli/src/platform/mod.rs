@@ -4117,3 +4117,27 @@ pub async fn l3_state_over_control() -> Option<serde_json::Value> {
         None
     }
 }
+
+/// Run the CLI entry point. Windows debug/release builds can exhaust the
+/// default 1 MB main-thread stack while constructing the large Clap command
+/// tree, before `main` can dispatch even a harmless command (observed:
+/// `thread 'main' has overflowed its stack` before `init`). There the real
+/// entry runs on a bounded 16 MB thread. This is a startup-stack fix, not a
+/// privilege or sandbox boundary. Elsewhere it runs in place.
+pub fn run_entry(entry: fn() -> std::process::ExitCode) -> std::process::ExitCode {
+    #[cfg(windows)]
+    {
+        match std::thread::Builder::new()
+            .name("tunlion-main".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(entry)
+        {
+            Ok(handle) => handle.join().unwrap_or_else(|_| std::process::ExitCode::from(1)),
+            Err(_) => entry(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        entry()
+    }
+}
