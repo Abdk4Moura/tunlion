@@ -1,0 +1,98 @@
+name: Windows native overlay acceptance
+
+on:
+  push:
+    branches: [ci/windows-native-overlay-acceptance-682d8bb1]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact product source commit to build (must be an ancestor of this CI-only branch)
+        required: true
+        type: string
+        default: 682d8bb16a65943dc6e20bc63227a5c49b82c544
+
+permissions:
+  contents: read
+
+jobs:
+  native-overlay:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout CI harness branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Create isolated evidence directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\tunlion-native-acceptance" | Out-Null
+
+      - name: Validate PowerShell syntax before build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            'scripts/windows-native-overlay-acceptance.ps1',
+            'evidence/windows-native-overlay/acceptance.ps1'
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { $errors | Format-List | Out-String | Write-Host; throw "PowerShell parse failed: $file" }
+            Write-Host "PowerShell syntax OK: $file"
+          }
+
+      - name: Install stable Rust with Windows MSVC target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Run exact-source build, focused tests, and native acceptance
+        shell: pwsh
+        env:
+          TUNLION_EXPECTED_SOURCE_SHA: ${{ inputs.source_sha || '682d8bb16a65943dc6e20bc63227a5c49b82c544' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          & (Join-Path $PWD 'scripts/windows-native-overlay-acceptance.ps1') -EvidenceDir "$env:RUNNER_TEMP\tunlion-native-acceptance"
+
+      - name: Sanitize and stage only native acceptance evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = Join-Path $env:RUNNER_TEMP 'tunlion-native-acceptance'
+          $publish = Join-Path $base 'publish'
+          New-Item -ItemType Directory -Force -Path $publish | Out-Null
+          $recovery = Join-Path $base 'runtime\scratch\recovery.txt'
+          $phrase = if (Test-Path -LiteralPath $recovery) { (Get-Content -LiteralPath $recovery -Raw).Trim() } else { '' }
+          $allowed = @(
+            'unit-tests.log','unit-tests.stderr.log','build.log','build.stderr.log',
+            'build-provenance.txt','harness-failure.txt','harness-status.json',
+            'runtime\acceptance.log','runtime\result.json'
+          )
+          foreach ($relative in $allowed) {
+            $source = Join-Path $base $relative
+            if (Test-Path -LiteralPath $source -PathType Leaf) {
+              $destination = Join-Path $publish $relative
+              New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+              $content = Get-Content -LiteralPath $source -Raw
+              if ($phrase) { $content = $content.Replace($phrase, '[REDACTED-RECOVERY-PHRASE]') }
+              Set-Content -LiteralPath $destination -Value $content -Encoding utf8
+            }
+          }
+          if (Test-Path -LiteralPath (Join-Path $base 'runtime\scratch')) {
+            Remove-Item -LiteralPath (Join-Path $base 'runtime\scratch') -Recurse -Force
+          }
+
+      - name: Upload sanitized acceptance evidence (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-overlay-${{ inputs.source_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}\tunlion-native-acceptance\publish\
+          if-no-files-found: warn
+          retention-days: 14
