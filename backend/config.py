@@ -152,8 +152,10 @@ def _cf_turn_fetch():
         f"https://rtc.live.cloudflare.com/v1/turn/keys/{CF_TURN_KEY_ID}"
         "/credentials/generate-ice-servers",
         data=json.dumps({"ttl": TURN_TTL}).encode(),
+        # Cloudflare rejects urllib's default User-Agent (error 1010, a 403).
         headers={"Authorization": f"Bearer {CF_TURN_API_TOKEN}",
-                 "Content-Type": "application/json"},
+                 "Content-Type": "application/json",
+                 "User-Agent": "tunlion-api"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=3) as resp:

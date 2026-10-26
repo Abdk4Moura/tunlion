@@ -79,5 +79,28 @@ class CloudflareTurn(unittest.TestCase):
         self.assertEqual(config._cf_turn_servers(fetch=lambda: 1 / 0), [])
 
 
+class CloudflareTurnRequest(unittest.TestCase):
+    def test_the_mint_request_does_not_send_urllibs_default_user_agent(self):
+        import io
+        import json
+        import urllib.request
+
+        seen = {}
+
+        def fake_urlopen(req, timeout):
+            seen["ua"] = req.get_header("User-agent")
+            return io.BytesIO(json.dumps(CF_REPLY).encode())
+
+        saved = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            out = config._cf_turn_fetch()
+        finally:
+            urllib.request.urlopen = saved
+        self.assertTrue(seen["ua"])
+        self.assertNotIn("Python-urllib", seen["ua"])
+        self.assertEqual(len(out), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
