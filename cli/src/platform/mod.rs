@@ -4474,9 +4474,9 @@ mod request_write_tests {
     #[test]
     fn a_failed_windows_replacement_preserves_the_existing_request_and_nonce() {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, GENERIC_READ, OPEN_EXISTING,
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
         };
 
         let dir = std::env::temp_dir().join(format!("tunlion-req-replace-{}", std::process::id()));
@@ -4495,7 +4495,7 @@ mod request_write_tests {
                 std::ptr::null(),
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL,
-                0,
+                std::ptr::null_mut(),
             )
         };
         assert_ne!(held, INVALID_HANDLE_VALUE, "hold the destination against replacement");
