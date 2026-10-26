@@ -8,11 +8,11 @@
 // failed attempt, or a few seconds still down, lead with polling. Websocket
 // stays in the list so a later upgrade can still take it.
 //
-// "A few seconds" used to be the only bound: a held websocket cost every page
+// The fixed bound used to be the only one: a held websocket cost every page
 // load about 5 s before it could see a single peer (measured: 4.9 to 6.7 s to
 // the first peer tile, against 0.6 to 0.9 s when the websocket opens). The
-// hedge below bounds the websocket attempt by what this network has already
-// shown it needs, not by a fixed constant.
+// hedge below bounds a websocket-led attempt by what this network has already
+// shown it needs (signaling.js sets it as that attempt's connect timeout).
 
 export const SOCKET_TIMEOUT_MS = 4000
 export const POLL_AFTER_MS = 4000
@@ -48,9 +48,9 @@ export function apiRttFromEntries(entries, apiBase) {
   return Number.isFinite(best) ? best : null
 }
 
-export function transportsAfterFailure(current, { attempts = 0, downMs = 0, pollAfterMs = POLL_AFTER_MS } = {}) {
+export function transportsAfterFailure(current, { attempts = 0, downMs = 0 } = {}) {
   const cur = current && current.length ? current.slice() : ['websocket', 'polling']
   if (cur[0] === 'polling') return cur
-  if (attempts >= 1 || downMs >= pollAfterMs) return ['polling', 'websocket']
+  if (attempts >= 1 || downMs >= POLL_AFTER_MS) return ['polling', 'websocket']
   return cur
 }

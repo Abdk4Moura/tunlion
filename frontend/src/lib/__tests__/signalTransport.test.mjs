@@ -18,7 +18,6 @@ eq('the hung-upgrade bound is under the create-code wait', SOCKET_TIMEOUT_MS < 8
 
 // The hedge: a held websocket is abandoned after what this network's own
 // round trip says an open needs, never later than the old fixed bound.
-eq('a hedged attempt leads with polling at once', transportsAfterFailure(wsFirst, { attempts: 0, downMs: 900, pollAfterMs: 0 }), ['polling', 'websocket'])
 eq('a fast network hedges at the floor', hedgeDelayMs(20), HEDGE_MIN_MS)
 eq('a 300 ms network hedges after three round trips and a margin', hedgeDelayMs(300), 1200)
 eq('a very slow network never waits past the old bound', hedgeDelayMs(5000), POLL_AFTER_MS)

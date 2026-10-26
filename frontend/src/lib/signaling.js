@@ -81,7 +81,9 @@ class SocketIOSignaling extends Emitter {
     this._openedAt = Date.now()
     this._connectErrors = 0
     this.socket = io(API_BASE || undefined, {
-      autoConnect: true,
+      // Connected at the end of the constructor, once the first attempt's
+      // bound is set (see bindAttempt below).
+      autoConnect: false,
       transports: ['websocket', 'polling'],
       timeout: SOCKET_TIMEOUT_MS,
       reconnectionDelay: 400,
@@ -100,30 +102,11 @@ class SocketIOSignaling extends Emitter {
     for (const ev of ['peer-joined', 'peer-left', 'peer-updated', 'session-superseded', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }
-    // Hedge the websocket attempt: if it has not opened within what this
-    // network's own round trip says it needs, lead with polling now instead
-    // of waiting out the fixed bound below. One-shot per attempt, so it does
-    // not depend on the 2 s recovery cadence.
-    this._hedgeTimer = null
-    const armHedge = () => {
-      clearTimeout(this._hedgeTimer)
-      this._hedgeTimer = null
-      if (this.socket.io.opts.transports[0] !== 'websocket') return
-      this._hedgeTimer = setTimeout(() => {
-        this._hedgeTimer = null
-        if (this.socket.connected || this.suspended) return
-        this.#applyTransports(true, true)
-      }, hedgeDelayMs(apiRttMs()))
-    }
-    armHedge()
-    this.socket.io.on('reconnect_attempt', armHedge)
     // Resilience: on every (re)connect, rejoin the current room. A reconnect
     // gives us a fresh sid and the server dropped our old membership on
     // disconnect, so without this we'd be connected but in no room. The server
     // re-emits `welcome`, which the hook treats as a fresh roster.
     this.socket.on('connect', () => {
-      clearTimeout(this._hedgeTimer)
-      this._hedgeTimer = null
       this._connectErrors = 0
       this._openedAt = Date.now()
       if (this.suspended) {
@@ -151,13 +134,27 @@ class SocketIOSignaling extends Emitter {
     this._recoverTimer = setInterval(() => {
       if (!this.socket.connected) this.#applyTransports(true)
     }, 2000)
+    // Hedge a websocket-led attempt. A held upgrade used to cost every page
+    // load the whole fixed bound plus a reconnect delay before it could see a
+    // peer (measured 4.9 to 6.7 s). A websocket open is a fresh TCP + TLS +
+    // upgrade, about three round trips, and the page has just measured its
+    // round trip to this API (/api/config, /api/room). Bound the attempt by
+    // that (hedgeDelayMs: never under 0.8 s, never over the old bound), using
+    // socket.io's own connect timeout so its reconnect state stays intact; the
+    // failure then leads with polling as before. Polling-led attempts keep
+    // the full bound: a slow long-poll handshake is not a held upgrade.
+    const bindAttempt = () => {
+      const wsLed = this.socket.io.opts.transports[0] === 'websocket'
+      this.socket.io.timeout(wsLed ? hedgeDelayMs(apiRttMs()) : SOCKET_TIMEOUT_MS)
+    }
+    this.socket.io.on('reconnect_attempt', bindAttempt)
+    bindAttempt()
+    this.socket.connect()
   }
-  // hedged: the hedge timer saw this attempt outlast its measured bound.
-  #applyTransports(nudge, hedged) {
+  #applyTransports(nudge) {
     const next = transportsAfterFailure(this.socket.io.opts.transports, {
       attempts: this._connectErrors,
       downMs: Date.now() - this._openedAt,
-      ...(hedged ? { pollAfterMs: 0 } : null),
     })
     const leadChanged = next[0] !== this.socket.io.opts.transports[0]
     this.socket.io.opts.transports = next
@@ -199,7 +196,6 @@ class SocketIOSignaling extends Emitter {
   leave() {
     this.room = null
     clearInterval(this._recoverTimer)
-    clearTimeout(this._hedgeTimer)
     this.socket.emit('leave', {})
   }
   // Drop a hung websocket and try polling. Called when a click needs the
