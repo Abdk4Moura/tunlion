@@ -166,6 +166,9 @@ jobs:
       - name: backend session close HTTP
         run: python -m unittest backend.tests.test_session_close_http
 
+      - name: backend health HTTP
+        run: python -m unittest backend.tests.test_health_http
+
       - name: backend rate limiter (Mem + Redis)
         env:
           FIL_TEST_REDIS_URL: redis://127.0.0.1:6379/0

@@ -9,7 +9,7 @@ networking layer, the CLI, and any UI all depend on this and nothing else.
       │                 Socket.IO /socket.io ─────► signaling relay
       │
       └────────── WebRTC DataChannel (P2P) ───────► other browser
-                  (files travel here; server never sees bytes)
+                  (files travel here; server never sees file bytes)
 ```
 
 ## REST (Flask → browser)
@@ -18,7 +18,8 @@ networking layer, the CLI, and any UI all depend on this and nothing else.
 |--------|---------------------|---------|
 | GET    | `/api/config`       | `{ signaling: "socketio"\|"firebase", iceServers: RTCIceServer[], firebase: object\|null, chunkSize: number }` |
 | GET    | `/api/room`         | `{ room: string }` — stable default room derived from caller IP |
-| GET    | `/api/health`       | `{ ok: true }` |
+| GET    | `/api/health`       | `{ ok: true }`, process liveness only (never consults Redis) |
+| GET    | `/health`           | readiness for monitors: 200 `{ ok: true, redis: "up"\|"not-configured" }`, 503 `{ ok: false, redis: "down" }` when the configured Redis does not answer a PING. An explicit route, never the SPA fallback |
 | GET    | `/` and `/rooms/:id`| the SPA (`index.html`) |
 
 ## Signaling events (browser ↔ Flask, Socket.IO)
