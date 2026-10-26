@@ -107,12 +107,7 @@ impl KernelTun {
         // job, called by l3.rs with the device name).
         let (addr, prefixlen) = split_cidr(cidr);
         let proto = if addr.contains(':') { "ipv6" } else { "ipv4" };
-        // `set address` first (idempotent for an existing adapter), then `add`.
-        let addr_spec = format!("address={addr}/{prefixlen}");
-        let iface = format!("interface={name}");
-        netsh(&["interface", proto, "set", "address", &iface, &addr_spec])
-            .or_else(|_| netsh(&["interface", proto, "add", "address", &iface, &addr_spec]))
-            .with_context(|| format!("netsh set address {addr}/{prefixlen} on {name}"))?;
+        assign_addr(&addr, &prefixlen, name)?;
         // MTU is best-effort (a Wintun default is fine if this fails).
         let _ = netsh(&["interface", proto, "set", "subinterface", name, &format!("mtu={mtu}"), "store=active"]);
 
@@ -275,12 +270,110 @@ pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
 /// then `add`, mirroring `open`.
 pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
     let (addr, prefixlen) = split_cidr(cidr);
-    let proto = if addr.contains(':') { "ipv6" } else { "ipv4" };
-    let addr_spec = format!("address={addr}/{prefixlen}");
-    let iface = format!("interface={dev}");
-    netsh(&["interface", proto, "set", "address", &iface, &addr_spec])
-        .or_else(|_| netsh(&["interface", proto, "add", "address", &iface, &addr_spec]))
-        .with_context(|| format!("netsh add address {addr}/{prefixlen} on {dev}"))
+    assign_addr(&addr, &prefixlen, dev)
+}
+
+/// Put `addr/prefixlen` on `dev` and PROVE it is there.
+///
+/// IPv4 is configured STATICALLY (`source=static` + an explicit mask). The old
+/// shared form, `ipv4 set address interface=X address=A/32` with no source,
+/// could report success while the adapter stayed in DHCP mode with no static
+/// address; Windows then picked an APIPA 169.254.x source and native traffic
+/// failed, while the v4 prefix route (installed only after this returned Ok)
+/// made it look configured (incident: dgmfa, 0.9.0 d7d62d3). IPv6 keeps the
+/// address/prefix form, which works.
+///
+/// Success is the address actually listed on the adapter, not netsh's exit
+/// status: the listing is read back (briefly waiting for readiness) and a
+/// missing address is an error carrying the captured output.
+fn assign_addr(addr: &str, prefixlen: &str, dev: &str) -> Result<()> {
+    let v6 = addr.contains(':');
+    let proto = if v6 { "ipv6" } else { "ipv4" };
+    if v6 {
+        let addr_spec = format!("address={addr}/{prefixlen}");
+        let iface = format!("interface={dev}");
+        netsh(&["interface", proto, "set", "address", &iface, &addr_spec])
+            .or_else(|_| netsh(&["interface", proto, "add", "address", &iface, &addr_spec]))
+            .with_context(|| format!("netsh set address {addr}/{prefixlen} on {dev}"))?;
+    } else {
+        let set = ipv4_static_args("set", dev, addr, prefixlen)?;
+        let add = ipv4_static_args("add", dev, addr, prefixlen)?;
+        let set_ref: Vec<&str> = set.iter().map(String::as_str).collect();
+        let add_ref: Vec<&str> = add.iter().map(String::as_str).collect();
+        netsh(&set_ref)
+            .or_else(|_| netsh(&add_ref))
+            .with_context(|| format!("netsh static IPv4 {addr}/{prefixlen} on {dev}"))?;
+    }
+    verify_listed(proto, dev, addr)
+}
+
+/// Read `dev`'s address list back until `addr` appears (DAD/readiness can lag
+/// the configuration call), or fail with what the adapter actually shows.
+fn verify_listed(proto: &str, dev: &str, addr: &str) -> Result<()> {
+    let mut last = String::new();
+    for attempt in 0..20 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let out = crate::l3::command("netsh")
+            // Positional name: ipv4 takes `name=` and ipv6 `interface=`, but
+            // both accept the bare adapter name.
+            .args(["interface", proto, "show", "addresses", dev])
+            .output()
+            .context("exec netsh show addresses")?;
+        last = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        if address_listed(&last, addr) {
+            return Ok(());
+        }
+    }
+    bail!(
+        "{proto} address {addr} is not on {dev} after configuration (netsh reported success). Adapter shows: {}",
+        last.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
+
+/// The netsh arguments that make `addr/prefixlen` the adapter's STATIC IPv4.
+/// `verb` is `set` (replaces the v4 config of OUR adapter and disables DHCP) or
+/// `add` (fallback). Pure, so the exact command is pinned by tests.
+fn ipv4_static_args(verb: &str, dev: &str, addr: &str, prefixlen: &str) -> Result<Vec<String>> {
+    let mask = prefix_to_mask(prefixlen)?;
+    let mut args = vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        verb.to_string(),
+        "address".to_string(),
+        format!("name={dev}"),
+    ];
+    if verb == "set" {
+        args.push("source=static".to_string());
+    }
+    args.push(format!("address={addr}"));
+    args.push(format!("mask={mask}"));
+    Ok(args)
+}
+
+/// `32` -> `255.255.255.255`, `15` -> `255.254.0.0`. Pure.
+fn prefix_to_mask(prefixlen: &str) -> Result<String> {
+    let bits: u32 = prefixlen
+        .trim()
+        .parse()
+        .ok()
+        .filter(|b| *b <= 32)
+        .ok_or_else(|| anyhow::anyhow!("invalid IPv4 prefix length '{prefixlen}'"))?;
+    let mask: u32 = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    Ok(std::net::Ipv4Addr::from(mask).to_string())
+}
+
+/// Is `addr` one of the addresses in a netsh listing? Whole-token match, so
+/// 198.18.194.14 is not mistaken for 198.18.194.149. Language-independent: it
+/// looks for the address itself, not for a localized label. Pure.
+fn address_listed(listing: &str, addr: &str) -> bool {
+    let want = addr.trim().to_ascii_lowercase();
+    listing
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '"' | '%'))
+        .map(|t| t.trim_end_matches(|c| c == '.' || c == ':').to_ascii_lowercase())
+        .map(|t| t.split('/').next().unwrap_or_default().to_string())
+        .any(|t| t == want)
 }
 
 /// Windows has no capability model; Wintun adapter creation needs Administrator.
@@ -366,3 +459,46 @@ mod tests {
         assert_eq!(classify_wintun_failure(&raw), Some(WintunFailure::DllAbsent));
     }
 }
+
+#[cfg(test)]
+mod v4_assignment_tests {
+    use super::{address_listed, ipv4_static_args, prefix_to_mask};
+
+    #[test]
+    fn masks_are_exact() {
+        assert_eq!(prefix_to_mask("32").unwrap(), "255.255.255.255");
+        assert_eq!(prefix_to_mask("15").unwrap(), "255.254.0.0");
+        assert_eq!(prefix_to_mask("0").unwrap(), "0.0.0.0");
+        assert!(prefix_to_mask("33").is_err());
+        assert!(prefix_to_mask("x").is_err());
+    }
+
+    #[test]
+    fn ipv4_is_configured_statically_with_an_explicit_mask() {
+        assert_eq!(
+            ipv4_static_args("set", "tunlion0", "198.18.194.149", "32").unwrap(),
+            ["interface", "ipv4", "set", "address", "name=tunlion0", "source=static", "address=198.18.194.149", "mask=255.255.255.255"]
+        );
+        // the fallback adds the same address without touching the source mode
+        assert_eq!(
+            ipv4_static_args("add", "tunlion0", "198.18.194.149", "32").unwrap(),
+            ["interface", "ipv4", "add", "address", "name=tunlion0", "address=198.18.194.149", "mask=255.255.255.255"]
+        );
+        // never the old prefix-only form that left DHCP on
+        let set = ipv4_static_args("set", "tunlion0", "198.18.194.149", "32").unwrap();
+        assert!(!set.iter().any(|a| a.contains('/')), "{set:?}");
+    }
+
+    #[test]
+    fn a_listing_proves_the_exact_address_only() {
+        let listing = "Configuration for interface \"tunlion0\"\n    DHCP enabled: No\n    IP Address: 198.18.194.149\n    Subnet Prefix: 198.18.194.149/32 (mask 255.255.255.255)\n";
+        assert!(address_listed(listing, "198.18.194.149"));
+        assert!(!address_listed(listing, "198.18.194.14"), "a prefix of the real address must not match");
+        // the incident's state: only an APIPA address is present
+        assert!(!address_listed("IP Address: 169.254.9.236", "198.18.194.149"));
+        // IPv6 listings carry a zone or prefix suffix
+        assert!(address_listed("Address fdf1:1af7:c30d:b813:b4f2:4f9d:b10b:8f34 Parameters", "fdf1:1af7:c30d:b813:b4f2:4f9d:b10b:8f34"));
+        assert!(address_listed("fe80::1%48", "fe80::1"));
+    }
+}
+
