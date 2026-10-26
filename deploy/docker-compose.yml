@@ -12,11 +12,20 @@
 # and redeploy just the api container:  API_MEM, API_CPUS, COTURN_MEM, ...
 # Usage:  cp .env.example .env && edit .env && docker compose up -d
 
+# Bounded container logs: the api writes a TEL line per connect, sync and
+# disconnect, and json-file with no options grows without limit.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   # Stateless behind Redis, so `docker compose up -d --scale api=N` (or
   # deploy/scale.sh N) spins replicas up/down in seconds. cloudflared
   # round-robins across them by the `api` service DNS name.
   api:
+    logging: *logging
     image: ghcr.io/abdk4moura/filament-api:latest
     build: # only used for local builds; CI/droplet use the GHCR image
       context: ..
@@ -67,6 +76,7 @@ services:
   # Shared room registry + Socket.IO message queue for the api replicas.
   # Ephemeral (no persistence) — it's coordination state, not data.
   redis:
+    logging: *logging
     image: redis:7-alpine
     restart: unless-stopped
     oom_score_adj: -800  # see the api service for why; -800 = last in line
@@ -84,6 +94,7 @@ services:
     cpus: ${REDIS_CPUS:-0.20}
 
   cloudflared:
+    logging: *logging
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     oom_score_adj: -800  # see the api service for why; -800 = last in line
@@ -96,6 +107,7 @@ services:
     cpus: ${CLOUDFLARED_CPUS:-0.50}
 
   coturn:
+    logging: *logging
     image: coturn/coturn:latest
     restart: unless-stopped
     oom_score_adj: -800  # see the api service for why; -800 = last in line
