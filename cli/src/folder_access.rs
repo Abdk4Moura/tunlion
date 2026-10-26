@@ -501,13 +501,11 @@ mod protocol_tests {
         assert!(!destination.join("big.bin").exists());
     }
 
-    /// Windows-specific recipient contract: the validated publisher exists, so
-    /// the CLI advertises Download, and no peer-facing relative path can turn
-    /// into a drive, UNC or backslash path.
-    #[cfg(all(target_os = "windows", feature = "mount-server"))]
+    /// No peer-facing relative path can turn into a drive, UNC or backslash
+    /// path, on ANY platform (relative_path rejects `\` and `:` everywhere). The
+    /// "Windows offers Download" half lives in platform/'s tests.
     #[test]
-    fn windows_download_is_offered_and_peer_paths_cannot_become_local_paths() {
-        assert!(crate::platform::folder_download_supported());
+    fn peer_paths_cannot_become_local_paths_on_any_platform() {
         for path in [r"C:\secret", r"\\server\share", r"sub\file.bin", "C:/secret", "file:stream"] {
             assert!(relative_path(path).is_err(), "accepted Windows-looking path {path:?}");
         }

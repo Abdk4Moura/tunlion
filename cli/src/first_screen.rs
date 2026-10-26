@@ -227,21 +227,9 @@ fn wait_back_or_close() -> bool {
 }
 
 /// The launcher shares the console with the child it runs, so Ctrl-C reaches
-/// both. The child decides what Ctrl-C means; the launcher must not die of it
-/// and take the window with it. A handler (not the inherited "ignore" flag), so
-/// the child keeps normal Ctrl-C behaviour.
+/// both; see `platform::ignore_console_interrupts`.
 fn ignore_console_interrupts() {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
-        unsafe extern "system" fn handler(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
-            i32::from(kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT)
-        }
-        // SAFETY: registers a plain function pointer that touches no state.
-        unsafe {
-            SetConsoleCtrlHandler(Some(handler), 1);
-        }
-    }
+    crate::platform::ignore_console_interrupts();
 }
 
 /// Where the home screen's "recent" entry lives: one small file in the config

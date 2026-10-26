@@ -3253,6 +3253,33 @@ pub fn console_is_ours() -> bool {
     }
 }
 
+/// Keep THIS process alive through console Ctrl-C/Ctrl-Break: the Start Menu
+/// launcher shares its console with the child it runs, the child decides what
+/// Ctrl-C means, and the launcher must not die of it and take the window with
+/// it. A handler, not the inherited "ignore" flag, so the child keeps normal
+/// Ctrl-C behaviour. Elsewhere there is no such launcher; a no-op.
+pub fn ignore_console_interrupts() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+        unsafe extern "system" fn handler(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
+            i32::from(kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT)
+        }
+        // SAFETY: registers a plain function pointer that touches no state.
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+}
+
+/// Windows has the validated download publisher (mount-server), so the CLI
+/// offers Download there.
+#[cfg(all(test, target_os = "windows", feature = "mount-server"))]
+#[test]
+fn windows_offers_folder_download() {
+    assert!(folder_download_supported());
+}
+
 #[cfg(windows)]
 fn win_console_get(which: u32) -> Option<u32> {
     use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle};
