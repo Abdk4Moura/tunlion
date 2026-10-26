@@ -53,17 +53,29 @@ pub struct L3Status {
     pub mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A kernel endpoint can be live (IPv6 + routes) while its native IPv4
+    /// address failed to install, and then IPv4 overlay traffic cannot use the
+    /// adapter even though a derived v4 address still prints (incident: dgmfa).
+    /// The cause, when that happened; absent when v4 is fine or not applicable.
+    #[serde(default, rename = "v4Problem", skip_serializing_if = "Option::is_none")]
+    pub v4_problem: Option<String>,
 }
 
 impl L3Status {
     /// A live endpoint that can bind and dial.
     pub fn ready(mode: &str) -> Self {
-        Self { state: "ready".into(), mode: mode.into(), reason: None }
+        Self { state: "ready".into(), mode: mode.into(), reason: None, v4_problem: None }
+    }
+
+    /// The same status, recording that native IPv4 is not installed.
+    pub fn with_v4_problem(mut self, problem: Option<String>) -> Self {
+        self.v4_problem = problem;
+        self
     }
 
     /// No endpoint yet, but startup is in progress.
     pub fn starting(mode: &str) -> Self {
-        Self { state: "starting".into(), mode: mode.into(), reason: None }
+        Self { state: "starting".into(), mode: mode.into(), reason: None, v4_problem: None }
     }
 
     /// No live endpoint. `reason` is the operator-facing cause, never empty.
@@ -77,6 +89,7 @@ impl L3Status {
             } else {
                 reason
             }),
+            v4_problem: None,
         }
     }
 

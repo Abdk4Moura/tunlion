@@ -1218,6 +1218,21 @@ impl MeshListener for OverlayListener {
 /// route (crypto mode). Both steps can fail in a container (no cap, no /dev/net/tun,
 /// no `ip`, locked netns); doing them together lets `L3Mode::Auto` catch ANY failure
 /// and fall back to the userspace netstack instead of dropping off the overlay.
+static NATIVE_V4_PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Why the kernel endpoint's native IPv4 address or route is missing, if it is.
+/// Read by the daemon when it publishes `L3Status`, so `addr`/`status` stop
+/// implying a derived v4 address is installed.
+pub fn native_v4_problem() -> Option<String> {
+    NATIVE_V4_PROBLEM.lock().ok().and_then(|p| p.clone())
+}
+
+fn set_native_v4_problem(problem: Option<String>) {
+    if let Ok(mut slot) = NATIVE_V4_PROBLEM.lock() {
+        *slot = problem;
+    }
+}
+
 fn open_kernel(
     cidr: &str,
     mtu: u32,
@@ -1238,10 +1253,18 @@ fn open_kernel(
         // So assign our v4 address + route the v4 prefix, logging on failure rather
         // than bailing. `add_addr` first so the /32 is local before the /15 is routed.
         if let Some(v4) = addr_v4 {
+            // Best-effort for the DATA PLANE, never silent: a missing v4 address
+            // is exactly what made native IPv4 traffic fail while `addr --v4`
+            // still printed the derived address (incident: dgmfa). Say it at a
+            // level a person sees, with the captured cause.
             if let Err(e) = tun::add_addr(&format!("{v4}/32"), &name) {
-                log.debug(&format!("  L3 v4 address not assigned ({e}); v6 overlay unaffected"));
+                log.critical(&format!("  ! native IPv4 {v4} was NOT installed on {name}: {e:#}. IPv6 overlay unaffected; IPv4 overlay traffic will not use this adapter."));
+                set_native_v4_problem(Some(format!("IPv4 {v4} not installed on {name}: {e:#}")));
             } else if let Err(e) = tun::add_route(&filament_overlay::prefix_v4_cidr(), &name) {
-                log.debug(&format!("  L3 v4 route not installed ({e}); v6 overlay unaffected"));
+                log.critical(&format!("  ! native IPv4 route {} was NOT installed on {name}: {e:#}. IPv6 overlay unaffected.", filament_overlay::prefix_v4_cidr()));
+                set_native_v4_problem(Some(format!("IPv4 route {} not installed on {name}: {e:#}", filament_overlay::prefix_v4_cidr())));
+            } else {
+                set_native_v4_problem(None);
             }
         }
     }
