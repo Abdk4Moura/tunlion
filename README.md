@@ -16,20 +16,6 @@ Files and streams travel **peer to peer** (WebRTC data channel in the browser, d
 
 Runs on **Linux, macOS, and Windows** (all first-class), or use it with **nothing installed** in a browser.
 
-> **The first Tunlion release (`cli-v0.9.0`) has not been cut yet.** The newest
-> published release, `cli-v0.8.5`, carries only the predecessor's `filament-*`
-> binaries, so the installers and package names below have nothing to fetch
-> until `cli-v0.9.0` ships (winget additionally waits on review of the new
-> `Abdk4Moura.Tunlion` package). The names published today, winget
-> `Abdk4Moura.Filament`, Homebrew `abdk4moura/tap/filament`, and `filament-cli`
-> 0.8.5 on crates.io and npm, install the predecessor `filament` binary, not
-> `tunlion`. Until then, build from source with
-> `cargo install --locked --git https://github.com/Abdk4Moura/tunlion filament-cli`
-> (it installs the `tunlion` binary), or open
-> [tunlion.autumated.com](https://tunlion.autumated.com) on both devices.
-
-From `cli-v0.9.0` on:
-
 ```sh
 # Linux / macOS — curl | sh
 curl -fsSL https://tunlion.autumated.com/install | sh
@@ -42,10 +28,10 @@ Or a package manager (same release):
 
 | Manager | Command |
 |---|---|
-| **winget** (Windows) | `winget install Abdk4Moura.Tunlion` |
+| **winget** (Windows) | `winget install Abdk4Moura.Tunlion` (new package, in winget review) |
 | **Homebrew** (macOS/Linux) | `brew install abdk4moura/tap/tunlion` |
-| **Cargo** (Rust) | `cargo install filament-cli` |
-| **npm** (Node) | `npm i -g @abdk4moura/filament-cli` |
+| **Cargo** (Rust, from source) | `cargo install --locked --git https://github.com/Abdk4Moura/tunlion filament-cli` |
+| **npm** (Node) | `npm i -g tunlion` |
 
 Homebrew and npm install `tl` too. Homebrew reports a link conflict and leaves
 an existing `tl` in its bin directory in place; npm writes both shims into its
