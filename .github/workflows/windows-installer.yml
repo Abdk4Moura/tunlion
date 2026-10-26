@@ -35,7 +35,12 @@ permissions:
   actions: read
 
 jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   installer:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: windows-latest
     timeout-minutes: 90
     steps:

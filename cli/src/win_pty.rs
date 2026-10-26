@@ -465,10 +465,10 @@ mod windows_impl {
         let (elevated, token) = process_token(want_linked)?;
         let owner_ack = std::env::var("TUNLION_SHELL_OWNER_ACK").as_deref() == Ok("1");
         #[cfg(feature = "test-hooks")]
-        eprintln!(
+        crate::ui::critical(&format!(
             "WIN-PTY-SPAWN privilege={privilege:?} privileged={elevated} linked={}",
             token.is_some()
-        );
+        ));
         check_spawn_policy(privilege, owner_ack, elevated, token.is_some())?;
         let exe = std::env::current_exe().context("current executable")?;
         let exe_w = wide(&exe.to_string_lossy());
@@ -695,13 +695,13 @@ pub use windows_impl::{WinChild, WinPty, spawn};
 pub fn smoke(mode: &str) -> Result<()> {
     use std::io::Read;
 
-    eprintln!("WIN-PTY-SMOKE begin mode={mode}");
+    crate::ui::critical(&format!("WIN-PTY-SMOKE begin mode={mode}"));
     unsafe { std::env::set_var("TUNLION_WIN_PTY_DIAG", "1") };
     // The devloop has no command timeout. A wedged spawn/read must fail the
     // smoke with a marker instead of consuming the lease.
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(60));
-        eprintln!("WIN-PTY-SMOKE watchdog timeout");
+        crate::ui::critical("WIN-PTY-SMOKE watchdog timeout");
         std::process::exit(99);
     });
     match mode {
@@ -716,7 +716,7 @@ pub fn smoke(mode: &str) -> Result<()> {
         other => bail!("unknown smoke mode {other:?}; use owner-equivalent or standard"),
     }
     let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-    eprintln!("WIN-PTY-SMOKE before spawn");
+    crate::ui::critical("WIN-PTY-SMOKE before spawn");
     let mut pty = spawn(
         &[
             comspec,
@@ -727,7 +727,7 @@ pub fn smoke(mode: &str) -> Result<()> {
         80,
         24,
     )?;
-    eprintln!("WIN-PTY-SMOKE after spawn");
+    crate::ui::critical("WIN-PTY-SMOKE after spawn");
     // Bound the smoke. A relay that keeps its stdout open after the shell exits
     // must not wedge the whole devloop lease; a timeout is a test failure, not a
     // reason to wait forever.
@@ -747,14 +747,14 @@ pub fn smoke(mode: &str) -> Result<()> {
         }
     };
     read_result?;
-    eprintln!("WIN-PTY-SMOKE after read");
+    crate::ui::critical("WIN-PTY-SMOKE after read");
     let text = String::from_utf8_lossy(&out);
     let _ = pty.child.wait();
-    eprintln!("WIN-PTY-SMOKE after wait");
+    crate::ui::critical("WIN-PTY-SMOKE after wait");
     if !text.contains("tunlion-win-pty-ok") {
         bail!("relay returned no marker: {text:?}");
     }
-    println!("WIN-PTY-SMOKE {mode} ok: {}", text.trim());
+    crate::ui::critical(&format!("WIN-PTY-SMOKE {mode} ok: {}", text.trim()));
     Ok(())
 }
 
@@ -939,7 +939,7 @@ pub fn relay(cols: u16, rows: u16, resize: &str, argv: &[String]) -> Result<()> 
 #[cfg(all(windows, feature = "test-hooks"))]
 fn relay_diag(message: &str) {
     if std::env::var("TUNLION_WIN_PTY_DIAG").as_deref() == Ok("1") {
-        eprintln!("WIN-PTY-RELAY {message}");
+        crate::ui::critical(&format!("WIN-PTY-RELAY {message}"));
     }
 }
 

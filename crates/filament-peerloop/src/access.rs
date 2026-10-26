@@ -256,13 +256,15 @@ impl Drop for ShellCleanup {
 /// The PTY session is owned by the host's session map, so dropping this future
 /// does not end it by itself. The guard ends the shell on every abnormal exit
 /// and releases the host's record asynchronously.
-#[cfg(unix)]
+// The PTY plumbing is the dispatch layer's (recv::servers); a build without
+// `dispatch` has no PTY backend to drive, so these items do not exist there.
+#[cfg(all(unix, feature = "dispatch"))]
 struct PtySessionGuard {
     session: Option<Arc<dyn crate::recv::servers::shell::PtySession>>,
     backend: Arc<dyn crate::recv::servers::shell::PtyBackend>,
     session_id: String, mux: Arc<crate::l2::Mux>, sid: u32, armed: bool,
 }
-#[cfg(unix)]
+#[cfg(all(unix, feature = "dispatch"))]
 impl Drop for PtySessionGuard {
     fn drop(&mut self) {
         if !self.armed { return; }
@@ -277,7 +279,7 @@ impl Drop for PtySessionGuard {
         }
     }
 }
-#[cfg(unix)]
+#[cfg(all(unix, feature = "dispatch"))]
 async fn teardown_pty(
     session: &Arc<dyn crate::recv::servers::shell::PtySession>,
     backend: &dyn crate::recv::servers::shell::PtyBackend,
@@ -686,6 +688,7 @@ impl AgreementEngine {
     /// session through `PtySession::end` (the host kills the shell process
     /// tree) and forgets the host's session record. This is a one-shot
     /// interactive attachment; it intentionally offers no resume/reattach.
+    #[cfg(feature = "dispatch")]
     #[allow(clippy::too_many_arguments)]
     pub async fn serve_pty(&self, id: &str, revision: u64, peer: ProvenPeer, sid: u32,
         request: crate::shell::admit::PtyOpenFields, mux: Arc<crate::l2::Mux>,
@@ -1237,7 +1240,9 @@ mod tests {
 
         /// Proves the PTY endpoint reaches no backend effect before agreement
         /// admission for the exact peer/revision.
+        #[cfg(feature = "dispatch")]
         struct NeverPty;
+        #[cfg(feature = "dispatch")]
         #[async_trait::async_trait]
         impl crate::recv::servers::shell::PtyBackend for NeverPty {
             async fn get_live(&self, _: &str) -> Option<Arc<dyn crate::recv::servers::shell::PtySession>> {
@@ -1298,6 +1303,7 @@ mod tests {
             assert_eq!(result, Err(AccessError::StaleRevision));
             assert!(!mux.has_stream(sid).await);
         }
+        #[cfg(feature = "dispatch")]
         #[tokio::test]
         async fn pty_serving_checks_the_agreement_before_it_reaches_the_backend() {
             let e = engine(); let k = key(); let other = key(); let p = peer(&k);
