@@ -29,19 +29,21 @@ function Invoke-Tun([string[]]$Arguments) {
   try {
     & $Exe @Arguments 1> $stdout 2> $stderr
     $ec=$LASTEXITCODE
-    $out=if(Test-Path $stdout){Get-Content -Raw $stdout}else{''};$err=if(Test-Path $stderr){Get-Content -Raw $stderr}else{''}
+    $out=if(Test-Path $stdout){[string](Get-Content -Raw $stdout)}else{''};$err=if(Test-Path $stderr){[string](Get-Content -Raw $stderr)}else{''}
     if (($out -match 'overflowed its stack') -or ($err -match 'overflowed its stack')) {
       $ec = if ($ec -eq 0) { 70 } else { $ec }
     }
     $recovery=Join-Path $script:root 'recovery.txt'
-    if(Test-Path -LiteralPath $recovery){$phrase=(Get-Content -LiteralPath $recovery -Raw).Trim();if($phrase){$out=$out.Replace($phrase,'[REDACTED-RECOVERY-PHRASE]');$err=$err.Replace($phrase,'[REDACTED-RECOVERY-PHRASE]')}}
+    if(Test-Path -LiteralPath $recovery){$phrase=[string](Get-Content -LiteralPath $recovery -Raw);if($phrase.Trim()){$out=$out.Replace($phrase,'[REDACTED-RECOVERY-PHRASE]');$err=$err.Replace($phrase,'[REDACTED-RECOVERY-PHRASE]')}}
   } finally {Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue}
-  [ordered]@{command="`"$Exe`" $($Arguments -join ' ')";exitCode=$ec;stdout=$out.Trim();stderr=$err.Trim()}
+  [ordered]@{command="`"$Exe`" $($Arguments -join ' ')";exitCode=$ec;stdout=([string]$out).Trim();stderr=([string]$err).Trim()}
 }
 function Assert-Command($name,[string[]]$Arguments) { $r=Invoke-Tun -Arguments $Arguments; if($r.exitCode -ne 0){Record $name 'FAIL' $r; throw "$name failed: $($r.stderr) $($r.stdout)"}; Record $name 'PASS' $r; return $r }
 function Get-ScratchDaemon([string]$PidPath,[string]$ExePath) {
   if(-not (Test-Path -LiteralPath $PidPath) -or -not (Test-Path -LiteralPath $ExePath)){return $null}
-  $candidatePid=[int](Get-Content -LiteralPath $PidPath -Raw).Trim();$candidateExe=(Get-Content -LiteralPath $ExePath -Raw).Trim()
+  $pidText=[string](Get-Content -LiteralPath $PidPath -Raw);$exeText=[string](Get-Content -LiteralPath $ExePath -Raw)
+  if(-not $pidText.Trim() -or -not $exeText.Trim()){return $null}
+  $candidatePid=[int]$pidText.Trim();$candidateExe=$exeText.Trim()
   if($candidateExe -ne $Exe){throw "scratch pidfile executable mismatch: $candidateExe"}
   $candidate=Get-CimInstance Win32_Process -Filter "ProcessId=$candidatePid" -ErrorAction SilentlyContinue
   if(-not $candidate -or $candidate.ExecutablePath -ne $Exe){return $null}
