@@ -171,6 +171,12 @@ pub async fn stream_one(
                     bar.lock().await.tick(total);
                 }
                 let tick_us = t_tick_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                // Compiled out unless `debug-logs`: a runtime `trace` check alone
+                // still links the format string, and cli-release fails any
+                // release binary that carries a `[TRACE ...]` marker.
+                #[cfg(not(feature = "debug-logs"))]
+                let _ = (trace, send_us, tick_us);
+                #[cfg(feature = "debug-logs")]
                 if trace && (chunk_idx % 10 == 0 || send_us + tick_us > 5000) {
                     log.debug(&format!(
                         "[TRACE stream_one] chunk={} offset={} len={} send_frame={}us tick={}us",
