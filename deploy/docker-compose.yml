@@ -26,6 +26,12 @@ services:
   # round-robins across them by the `api` service DNS name.
   api:
     logging: *logging
+    # One fd per websocket: the default soft limit of 1024 capped the server at
+    # ~1000 devices whatever --worker-connections says.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     image: ghcr.io/abdk4moura/filament-api:latest
     build: # only used for local builds; CI/droplet use the GHCR image
       context: ..
