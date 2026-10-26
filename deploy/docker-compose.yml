@@ -60,8 +60,8 @@ services:
     # worse than no shield: the master respawns, the container never exits,
     # `docker ps` says Up, and every live socket.io connection dies anyway.
     oom_score_adj: -800
-    mem_limit: ${API_MEM:-220m}
-    cpus: ${API_CPUS:-0.40}
+    mem_limit: ${API_MEM:-512m}
+    cpus: ${API_CPUS:-1.00}
     pids_limit: 256
 
   # Shared room registry + Socket.IO message queue for the api replicas.
@@ -92,8 +92,8 @@ services:
       TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN}
     depends_on:
       - api
-    mem_limit: ${CLOUDFLARED_MEM:-64m}
-    cpus: ${CLOUDFLARED_CPUS:-0.20}
+    mem_limit: ${CLOUDFLARED_MEM:-128m}
+    cpus: ${CLOUDFLARED_CPUS:-0.50}
 
   coturn:
     image: coturn/coturn:latest
