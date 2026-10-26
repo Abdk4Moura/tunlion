@@ -34,7 +34,7 @@ function Invoke-Tun([string[]]$Arguments) {
       $ec = if ($ec -eq 0) { 70 } else { $ec }
     }
     $recovery=Join-Path $script:root 'recovery.txt'
-    if(Test-Path -LiteralPath $recovery){$phrase=[string](Get-Content -LiteralPath $recovery -Raw);if($phrase.Trim()){$out=$out.Replace($phrase,'[REDACTED-RECOVERY-PHRASE]');$err=$err.Replace($phrase,'[REDACTED-RECOVERY-PHRASE]')}}
+    if(Test-Path -LiteralPath $recovery){$phrase=[string](Get-Content -LiteralPath $recovery -Raw);if($phrase.Trim()){$out=([string]$out).Replace($phrase,'[REDACTED-RECOVERY-PHRASE]');$err=([string]$err).Replace($phrase,'[REDACTED-RECOVERY-PHRASE]')}}
   } finally {Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue}
   [ordered]@{command="`"$Exe`" $($Arguments -join ' ')";exitCode=$ec;stdout=([string]$out).Trim();stderr=([string]$err).Trim()}
 }
