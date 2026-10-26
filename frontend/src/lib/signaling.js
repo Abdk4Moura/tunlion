@@ -21,7 +21,18 @@
 import { io } from 'socket.io-client'
 import { API_BASE } from './api.js'
 import { loadOwnerToken, saveOwnerToken } from './identity.js'
-import { SOCKET_TIMEOUT_MS, transportsAfterFailure } from './signalTransport.js'
+import { SOCKET_TIMEOUT_MS, apiRttFromEntries, hedgeDelayMs, transportsAfterFailure } from './signalTransport.js'
+
+// Measured round trip to the API origin (null when unknown). Read at each
+// connect attempt, so a later attempt uses whatever the page has measured.
+function apiRttMs() {
+  try {
+    const base = API_BASE || window.location.origin
+    return apiRttFromEntries(performance.getEntriesByType('resource'), base)
+  } catch {
+    return null
+  }
+}
 
 class Emitter {
   #handlers = {}
@@ -70,7 +81,9 @@ class SocketIOSignaling extends Emitter {
     this._openedAt = Date.now()
     this._connectErrors = 0
     this.socket = io(API_BASE || undefined, {
-      autoConnect: true,
+      // Connected at the end of the constructor, once the first attempt's
+      // bound is set (see bindAttempt below).
+      autoConnect: false,
       transports: ['websocket', 'polling'],
       timeout: SOCKET_TIMEOUT_MS,
       reconnectionDelay: 400,
@@ -100,8 +113,13 @@ class SocketIOSignaling extends Emitter {
         try { this.socket.disconnect() } catch {}
         return
       }
-      this._emit('status', { connected: true })
+      // Join BEFORE announcing the socket is up: the session loop syncs on
+      // socket-up, and a sync that reaches the relay first runs the room join
+      // itself; the join after it then ran it again, so every other peer saw
+      // this device leave and re-arrive (peer-left + peer-joined) on each
+      // reload. With the join first, the sync finds the room already held.
       this._emitJoin()
+      this._emit('status', { connected: true })
     })
     this.socket.on('disconnect', () => {
       this._openedAt = Date.now()
@@ -116,6 +134,22 @@ class SocketIOSignaling extends Emitter {
     this._recoverTimer = setInterval(() => {
       if (!this.socket.connected) this.#applyTransports(true)
     }, 2000)
+    // Hedge a websocket-led attempt. A held upgrade used to cost every page
+    // load the whole fixed bound plus a reconnect delay before it could see a
+    // peer (measured 4.9 to 6.7 s). A websocket open is a fresh TCP + TLS +
+    // upgrade, about three round trips, and the page has just measured its
+    // round trip to this API (/api/config, /api/room). Bound the attempt by
+    // that (hedgeDelayMs: never under 0.8 s, never over the old bound), using
+    // socket.io's own connect timeout so its reconnect state stays intact; the
+    // failure then leads with polling as before. Polling-led attempts keep
+    // the full bound: a slow long-poll handshake is not a held upgrade.
+    const bindAttempt = () => {
+      const wsLed = this.socket.io.opts.transports[0] === 'websocket'
+      this.socket.io.timeout(wsLed ? hedgeDelayMs(apiRttMs()) : SOCKET_TIMEOUT_MS)
+    }
+    this.socket.io.on('reconnect_attempt', bindAttempt)
+    bindAttempt()
+    this.socket.connect()
   }
   #applyTransports(nudge) {
     const next = transportsAfterFailure(this.socket.io.opts.transports, {
@@ -202,7 +236,7 @@ class SocketIOSignaling extends Emitter {
     if (!this.token) this.token = loadOwnerToken() || null
     // Initial join owns token minting. Do not race it with a tokenless sync
     // (which would create a second, independent session).
-    if (!this.token) return // join mints the token; retry on the session tick
+    if (!this.token) return false // join mints the token; its welcome re-syncs
     this.socket.emit('sync', { ...state, token: this.token }, (resp) => {
       if (resp && resp.token) {
         this.token = resp.token
@@ -211,6 +245,7 @@ class SocketIOSignaling extends Emitter {
       if (resp && resp.gen) this.gen = resp.gen
       onAck?.(resp)
     })
+    return true
   }
   // Live socket truth, for the session loop's connected-gate (state captured in
   // closures goes stale; this reads the socket directly).

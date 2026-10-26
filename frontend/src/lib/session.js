@@ -9,7 +9,8 @@
 //   desired   = { room, name, uid, channels: Set<hex> }   (edited ONLY by app actions)
 //   confirmed = { snapshot, at }                           (edited ONLY by sync acks)
 //
-// Every 5s (and on kick(): socket-up, tab-visible), if the socket is up AND
+// Every 5s (and on kick(): socket-up, tab-visible, any change to desired, the
+// ack of a sync that `desired` outran, the end of an ack window), if the socket is up AND
 // (digest(desired) != digest(confirmed) OR confirmed is stale > 30s), we emit
 // ONE idempotent `sync { full desired state }`. The server ensures membership,
 // subscriptions, and lease refresh, then acks with its resulting digest; the
@@ -76,16 +77,32 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
   // must NOT fire a second: confirmed hasn't updated yet so the digest still
   // differs. This replaces the old debounce; the digest check kills the
   // boot-storm but only with this guard.
+  //
+  // The guard must never turn a kick into a wait for the next tick. Two
+  // follow-ups make the fast path independent of TICK_MS:
+  //   - when the ack lands and `desired` moved on meanwhile (a room switch or a
+  //     freshly stored device kicked while we waited), the next sync goes out
+  //     at once instead of up to 5 s later;
+  //   - a one-shot timer re-checks exactly when the ack window lapses, so a
+  //     lost emit or ack is re-sent at ACK_MS, not at the first tick after it.
+  // The 5 s tick stays as the backstop; correctness never depended on either.
   let pendingSince = 0 // 0 = nothing outstanding
   let pendingDigest = null // digest of the snapshot we're awaiting an ack for
+  let ackTimer = null // one-shot re-check at the end of the ack window
+  let kickQueued = false // a setter's microtask kick is already scheduled
 
   const { loss, rng } = readLossConfig()
   const shouldDrop = () => loss > 0 && rng && rng() < loss
 
+  function clearAckTimer() {
+    if (ackTimer) clearTimeout(ackTimer)
+    ackTimer = null
+  }
+
   function maybeSync(now) {
     if (!sig?.connected) return
-    // An outstanding sync still inside its ack window: leave it be (the loop
-    // retries naturally once the window lapses).
+    // An outstanding sync still inside its ack window: leave it be. The ack
+    // (or the ack-window timer) re-runs this check, so nothing waits a tick.
     if (pendingSince && now - pendingSince < ACK_MS) return
     if (pendingSince && now - pendingSince >= ACK_MS) {
       // The ack never came (lost emit, lost ack, or a shim-dropped emit).
@@ -119,32 +136,67 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       channels: [...snapshot.channels].sort(),
     }
 
-    pendingSince = now
-    pendingDigest = digest(snapshot)
-    // Keep tel volume low (spec: only when state changed or an ack was missed).
-    // The 30s staleness re-sync is a heartbeat, neither, don't log it.
-    if (changed) tel('sync', { changed })
+    // Pending BEFORE the emit: a transport may ack synchronously (Firebase).
+    markPending(now, snapshot, changed)
 
-    // Loss shim: drop our OWN emit silently, confirmed stays stale, the loop
-    // retries on the next tick, and the missed-ack path fires above.
+    // Loss shim: drop our OWN emit silently, confirmed stays stale, and the
+    // ack-window timer re-runs this check (the missed-ack path fires above).
     if (shouldDrop()) return
 
-    sig.sync(wire, (resp) => {
+    const sent = sig.sync(wire, (resp) => {
       // Stale ack guard: only the ack for the snapshot we're awaiting counts.
       if (pendingDigest !== digest(snapshot)) return
       confirmed = { snapshot, at: Date.now() }
       pendingSince = 0
       pendingDigest = null
+      clearAckTimer()
       // C30 phase 2: the digest may carry the server's roster, hand it to
       // the reconciler (ok:true only; error digests carry no roster).
       if (onDigest && resp && resp.ok === true && Array.isArray(resp.peers)) onDigest(resp.peers)
+      // `desired` moved while this sync was in flight: converge now (unless
+      // the loop was stopped meanwhile: pagehide, or a superseded tab).
+      if (timer && digest(desired) !== digest(snapshot)) maybeSync(Date.now())
     })
+    // The transport declined to emit (no session token yet: the initial join
+    // owns minting it). Nothing is in flight, so do not hold the guard for a
+    // whole ack window; the join's welcome calls rejoined(), which syncs.
+    if (sent === false && pendingDigest === digest(snapshot)) {
+      pendingSince = 0
+      pendingDigest = null
+      clearAckTimer()
+    }
+  }
+
+  function markPending(now, snapshot, changed) {
+    pendingSince = now
+    pendingDigest = digest(snapshot)
+    // Keep tel volume low (spec: only when state changed or an ack was missed).
+    // The 30s staleness re-sync is a heartbeat, neither, don't log it.
+    if (changed) tel('sync', { changed })
+    clearAckTimer()
+    ackTimer = setTimeout(() => {
+      ackTimer = null
+      maybeSync(Date.now())
+    }, ACK_MS)
   }
 
   // kick(): callers fire this on socket-up and tab-visible for an immediate
   // raise (the immediate-raise semantics the old subscribeKnown had).
   function kick() {
     maybeSync(Date.now())
+  }
+
+  // A data edit that changes `desired` raises itself. The kick is deferred to
+  // a microtask so a caller's same-turn work goes first (rejoin() emits its
+  // `join` right after setRoom; syncing before it would make the server run
+  // the room join twice).
+  function kickSoon() {
+    if (kickQueued) return
+    kickQueued = true
+    queueMicrotask(() => {
+      kickQueued = false
+      if (timer) kick()
+    })
   }
 
   let timer = setInterval(() => maybeSync(Date.now()), TICK_MS)
@@ -156,16 +208,22 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
   }
 
   return {
-    // Pure data edit: room membership. kick() to raise immediately.
+    // Data edit: room membership. A change raises itself (kickSoon); an
+    // explicit kick() is still fine and costs nothing extra.
     setRoom(room, name, uid, gen) {
+      const before = digest(desired)
       desired.room = room
       desired.name = name
       desired.uid = uid
       if (gen !== undefined) desired.gen = gen
+      if (digest(desired) !== before) kickSoon()
     },
-    // Pure data edit: known-device presence channels (64-hex strings).
+    // Data edit: known-device presence channels (64-hex strings). A change
+    // raises itself, so a known device never waits for the 5 s tick.
     setChannels(hexArray) {
+      const before = digest(desired)
       desired.channels = new Set(hexArray || [])
+      if (digest(desired) !== before) kickSoon()
     },
     kick,
     // Invalidate the confirmed snapshot. `confirmed` is implicitly bound to a
@@ -180,6 +238,7 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       confirmed = { snapshot: null, at: 0 }
       pendingSince = 0
       pendingDigest = null
+      clearAckTimer()
     },
     // The server just ran a room join for this socket (a `welcome` arrived).
     // A join drops every channel subscription the socket held, including the
@@ -191,12 +250,14 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       confirmed = { snapshot: null, at: 0 }
       pendingSince = 0
       pendingDigest = null
+      clearAckTimer()
       maybeSync(Date.now())
     },
     // Teardown: clears the loop timer (HMR/unmount/bfcache leak otherwise).
     stop() {
       if (timer) clearInterval(timer)
       timer = null
+      clearAckTimer()
     },
     // Restart the loop after a bfcache restore stopped it on pagehide.
     start,

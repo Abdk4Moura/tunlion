@@ -36,7 +36,10 @@ confirmed = the last server-ACKED snapshot + timestamp
 ```
 
 One loop per client (browser `lib/session.js`, CLI `session.rs` module),
-ticking on: every 5 s, every socket-up, every tab-visible:
+ticking on: every 5 s, every socket-up, every tab-visible, and (browser) on
+every change to `desired`, on the ack of a sync that `desired` outran, and
+when an ack window lapses. The 5 s tick is the backstop, never the fast path:
+a change made while a sync is in flight must not wait for it.
 
 ```
 if digest(desired) != digest(confirmed) or confirmed is stale (> 30 s):
