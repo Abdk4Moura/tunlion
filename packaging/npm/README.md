@@ -10,7 +10,7 @@ tl send video.mp4 --code
 ```
 
 The other end can be a terminal **or any browser** at
-[tunlion.autumated.com](https://tunlion.autumated.com) — nothing to install on
+[tunlion.autumated.com](https://tunlion.autumated.com), with nothing to install on
 the receiving device. Pair your machines once and you can also `tunlion <device>`
 (shell in), `tunlion expose <port>`, or `tunlion mount` across the internet.
 
