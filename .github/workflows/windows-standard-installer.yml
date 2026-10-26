@@ -18,7 +18,7 @@ jobs:
       - name: Checkout combined source
         uses: actions/checkout@v4
         with:
-          ref: d7d62d379035edaaf5c54ef712bf5e905b7bd87c
+          ref: 02736bcfa2c43675cc4221f9e16513ca4356bad7
           path: src
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
