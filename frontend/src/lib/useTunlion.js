@@ -612,20 +612,24 @@ export function useTunlion() {
       }
     } catch {}
     ;(async () => {
+      // Auto room ('people near you' via shared network) unless the URL pins one.
+      // Both requests go out together: the room does not depend on the config,
+      // and in series they cost one extra round trip before the socket opens.
+      const urlRoom = roomFromUrl()
+      const autoP = urlRoom ? null : fetch(api('/api/room')).then((r) => r.json())
+      autoP?.catch(() => {}) // a config failure must not leave this one unhandled
       const cfg = await fetch(api('/api/config')).then((r) => r.json())
       if (cancelled) return
       cfgRef.current = cfg
       setSignalingKind(cfg.signaling)
 
-      // Auto room ('people near you' via shared network) unless the URL pins one.
-      const urlRoom = roomFromUrl()
       let room, scope
       if (urlRoom) {
         room = urlRoom
         scope = urlRoom.startsWith('code-') ? 'code' : 'link'
         if (scope === 'code') setRoomCode(urlRoom.slice(5))
       } else {
-        const auto = await fetch(api('/api/room')).then((r) => r.json())
+        const auto = await autoP
         room = auto.room
         scope = 'auto'
         setNetwork(auto.network)

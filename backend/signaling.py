@@ -1034,6 +1034,22 @@ def register(socketio, registry):
         ok, owner_token, effective_gen = _claim_session(sid, uid, gen, token, name)
         if not ok:
             return
+        me = registry.meta(sid)
+        if (registry.room_of(sid) == room and me
+                and me.get("name") == name and me.get("uid") == uid):
+            # A duplicate join: this sid already holds this room under this
+            # identity (a browser's socket-up `sync` can reach us first and run
+            # the join itself). Re-send the roster to the joiner only. Leaving
+            # and re-adding told every other member this device left and
+            # arrived again, so each of them tore down its link and dialed anew.
+            registry.refresh([sid])
+            peers = [p for p in registry.peers_in(room, exclude=sid) if _sid_alive(p["id"])]
+            _tel("join-dup", sid=sid, uid=uid, room=room, peers=len(peers))
+            welcome = {"id": sid, "peers": peers, "gen": effective_gen}
+            if owner_token:
+                welcome["token"] = owner_token
+            _push("welcome", welcome)
+            return
         _do_join(sid, room, name, uid, effective_gen, owner_token)
 
     # -- one-time pairing (#11): say the code aloud; it works exactly once. --

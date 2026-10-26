@@ -21,7 +21,18 @@
 import { io } from 'socket.io-client'
 import { API_BASE } from './api.js'
 import { loadOwnerToken, saveOwnerToken } from './identity.js'
-import { SOCKET_TIMEOUT_MS, transportsAfterFailure } from './signalTransport.js'
+import { SOCKET_TIMEOUT_MS, apiRttFromEntries, hedgeDelayMs, transportsAfterFailure } from './signalTransport.js'
+
+// Measured round trip to the API origin (null when unknown). Read at each
+// connect attempt, so a later attempt uses whatever the page has measured.
+function apiRttMs() {
+  try {
+    const base = API_BASE || window.location.origin
+    return apiRttFromEntries(performance.getEntriesByType('resource'), base)
+  } catch {
+    return null
+  }
+}
 
 class Emitter {
   #handlers = {}
@@ -89,19 +100,43 @@ class SocketIOSignaling extends Emitter {
     for (const ev of ['peer-joined', 'peer-left', 'peer-updated', 'session-superseded', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }
+    // Hedge the websocket attempt: if it has not opened within what this
+    // network's own round trip says it needs, lead with polling now instead
+    // of waiting out the fixed bound below. One-shot per attempt, so it does
+    // not depend on the 2 s recovery cadence.
+    this._hedgeTimer = null
+    const armHedge = () => {
+      clearTimeout(this._hedgeTimer)
+      this._hedgeTimer = null
+      if (this.socket.io.opts.transports[0] !== 'websocket') return
+      this._hedgeTimer = setTimeout(() => {
+        this._hedgeTimer = null
+        if (this.socket.connected || this.suspended) return
+        this.#applyTransports(true, true)
+      }, hedgeDelayMs(apiRttMs()))
+    }
+    armHedge()
+    this.socket.io.on('reconnect_attempt', armHedge)
     // Resilience: on every (re)connect, rejoin the current room. A reconnect
     // gives us a fresh sid and the server dropped our old membership on
     // disconnect, so without this we'd be connected but in no room. The server
     // re-emits `welcome`, which the hook treats as a fresh roster.
     this.socket.on('connect', () => {
+      clearTimeout(this._hedgeTimer)
+      this._hedgeTimer = null
       this._connectErrors = 0
       this._openedAt = Date.now()
       if (this.suspended) {
         try { this.socket.disconnect() } catch {}
         return
       }
-      this._emit('status', { connected: true })
+      // Join BEFORE announcing the socket is up: the session loop syncs on
+      // socket-up, and a sync that reaches the relay first runs the room join
+      // itself; the join after it then ran it again, so every other peer saw
+      // this device leave and re-arrive (peer-left + peer-joined) on each
+      // reload. With the join first, the sync finds the room already held.
       this._emitJoin()
+      this._emit('status', { connected: true })
     })
     this.socket.on('disconnect', () => {
       this._openedAt = Date.now()
@@ -117,10 +152,12 @@ class SocketIOSignaling extends Emitter {
       if (!this.socket.connected) this.#applyTransports(true)
     }, 2000)
   }
-  #applyTransports(nudge) {
+  // hedged: the hedge timer saw this attempt outlast its measured bound.
+  #applyTransports(nudge, hedged) {
     const next = transportsAfterFailure(this.socket.io.opts.transports, {
       attempts: this._connectErrors,
       downMs: Date.now() - this._openedAt,
+      ...(hedged ? { pollAfterMs: 0 } : null),
     })
     const leadChanged = next[0] !== this.socket.io.opts.transports[0]
     this.socket.io.opts.transports = next
@@ -162,6 +199,7 @@ class SocketIOSignaling extends Emitter {
   leave() {
     this.room = null
     clearInterval(this._recoverTimer)
+    clearTimeout(this._hedgeTimer)
     this.socket.emit('leave', {})
   }
   // Drop a hung websocket and try polling. Called when a click needs the
@@ -202,7 +240,7 @@ class SocketIOSignaling extends Emitter {
     if (!this.token) this.token = loadOwnerToken() || null
     // Initial join owns token minting. Do not race it with a tokenless sync
     // (which would create a second, independent session).
-    if (!this.token) return // join mints the token; retry on the session tick
+    if (!this.token) return false // join mints the token; its welcome re-syncs
     this.socket.emit('sync', { ...state, token: this.token }, (resp) => {
       if (resp && resp.token) {
         this.token = resp.token
@@ -211,6 +249,7 @@ class SocketIOSignaling extends Emitter {
       if (resp && resp.gen) this.gen = resp.gen
       onAck?.(resp)
     })
+    return true
   }
   // Live socket truth, for the session loop's connected-gate (state captured in
   // closures goes stale; this reads the socket directly).
