@@ -16,7 +16,7 @@
 ;   (%APPDATA%\tunlion), and never touches the TunlionKernel scheduled task.
 ;
 ; Build with:
-;   ISCC.exe /DAppVersion=0.9.0 tunlion.iss
+;   ISCC.exe /DAppVersion=0.9.1 tunlion.iss
 ; after staging tunlion.exe, wintun.dll and tl.cmd under stage\.
 
 #ifndef AppVersion
