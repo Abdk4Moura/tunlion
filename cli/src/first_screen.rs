@@ -191,7 +191,7 @@ pub(crate) fn maybe_run_home_loop() -> Option<std::process::ExitCode> {
     let exe = std::env::current_exe().ok()?;
     ignore_console_interrupts();
     loop {
-        let status = match std::process::Command::new(&exe).env(HOME_CHILD_ENV, "1").status() {
+        let status = match crate::platform::command(&exe).env(HOME_CHILD_ENV, "1").status() {
             Ok(status) => status,
             // Could not start the child: fall back to running in this process.
             Err(_) => return None,

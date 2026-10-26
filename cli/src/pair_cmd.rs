@@ -1892,7 +1892,7 @@ fn offer_background_after_pairing() {
     match codeentry::pick("", &choices) {
         Ok(Some(0)) => {
             let started = std::env::current_exe().ok().and_then(|exe| {
-                std::process::Command::new(exe).args(["up", "--install"]).status().ok()
+                crate::platform::command(exe).args(["up", "--install"]).status().ok()
             });
             if !started.is_some_and(|status| status.success()) {
                 ui::say(&ui::paint(ui::Tone::Dim, "  That did not finish. Try again with: tunlion up --install"));
