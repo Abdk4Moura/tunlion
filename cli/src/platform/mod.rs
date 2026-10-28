@@ -4432,12 +4432,12 @@ mod detach_inheritance_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(status.success(), "middle process failed: {status}");
-        assert!(grandchild.is_some(), "middle never reported its detached child; output: {text:?}");
         assert!(
             got.is_ok(),
             "the caller's stdout pipe stayed open after the middle exited ({:?}): the detached child inherited it",
             started.elapsed()
         );
+        assert!(grandchild.is_some(), "middle never reported its detached child; output: {text:?}");
     }
 }
 
