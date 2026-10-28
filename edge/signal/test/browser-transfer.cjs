@@ -12,6 +12,12 @@
 // SCENARIO=cli-to-browser instead runs `tunlion send --code` (TUNLION_BIN,
 // an isolated TUNLION_CONFIG_DIR, TUNLION_SERVER=$API) and has ONE browser
 // enter the code and receive.
+// SCENARIO=poll-crash ports the crash and ctx-close cases of
+// frontend/tests/polling-liveness.spec.cjs (PR #608) to any API: page A on
+// websocket watches page B on forced long-polling in the same auto room; B's
+// renderer is crashed (CDP Page.crash, close beacon blocked) or its context
+// closed, and B's row must leave A within KILL_BOUND_MS (hold 2 s + grace 7 s
+// + ticks), where the ping timeout alone would take 85 s.
 // The helpers mirror lab/matrix/browser/cells.cjs (BB1, B01), by visible label.
 'use strict';
 const fs = require('fs'), path = require('path'), http = require('http'), crypto = require('crypto'), cp = require('child_process');
@@ -23,7 +29,7 @@ const DIST = process.env.DIST;
 const MODE = process.env.MODE || 'websocket';
 const OUT = process.env.OUT || 'browser-transfer-out';
 fs.mkdirSync(OUT, { recursive: true });
-const TAG = SCENARIO === 'cli-to-browser' ? `cli-${MODE}` : MODE;
+const TAG = SCENARIO === 'cli-to-browser' ? `cli-${MODE}` : SCENARIO === 'poll-crash' ? 'poll-crash' : MODE;
 const LOG = path.join(OUT, `browser-${TAG}.log`);
 fs.writeFileSync(LOG, '');
 const say = (...a) => { const s = `${new Date().toISOString()} ${a.join(' ')}`; fs.appendFileSync(LOG, s + '\n'); console.log(s); };
@@ -97,7 +103,7 @@ async function open(origin, label) {
   await p.goto(origin + '/', { waitUntil: 'commit' }).catch(() => {});
   await p.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
   await p.waitForTimeout(2500);
-  return { b, p, t };
+  return { b, ctx, p, t };
 }
 
 async function cliToBrowser(origin) {
@@ -135,9 +141,74 @@ async function cliToBrowser(origin) {
   }
 }
 
+const KILL_BOUND_MS = 13000;
+
+async function pollCrash(origin) {
+  let pass = true;
+  for (const how of ['crash', 'ctx-close']) {
+    const A = await open(origin, 'A');
+    const B = await openPolling(origin); // B always on long-polling
+    try {
+      const bname = await selfName(B.p);
+      const row = sendTo(A.p, bname);
+      await row.waitFor({ state: 'visible', timeout: 30000 });
+      say(how, 'B row visible on A; B polls', B.t.polls, 'B websockets', B.t.websockets.length);
+      await B.ctx.route('**/api/session/close', (r) => r.abort());
+      const t0 = Date.now();
+      if (how === 'crash') {
+        const cdp = await B.ctx.newCDPSession(B.p);
+        cdp.send('Page.crash').catch(() => {});
+        await A.p.waitForTimeout(300);
+      }
+      await B.ctx.close().catch(() => {});
+      await row.waitFor({ state: 'detached', timeout: 60000 }).catch(() => {});
+      const took = Date.now() - t0;
+      const gone = !(await row.isVisible().catch(() => false));
+      const ok = gone && took <= KILL_BOUND_MS && B.t.websockets.length === 0;
+      say(how, 'B row left A after', took, 'ms, bound', KILL_BOUND_MS, ok ? 'ok' : 'FAILED');
+      await A.p.screenshot({ path: path.join(OUT, `poll-crash-${how}-A-after.png`) });
+      pass = pass && ok;
+    } finally {
+      await A.b.close(); await B.b.close().catch(() => {});
+    }
+  }
+  return pass;
+}
+
+async function openPolling(origin) {
+  const b = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  const ctx = await b.newContext({ viewport: { width: 1280, height: 860 }, acceptDownloads: true, serviceWorkers: 'block' });
+  await ctx.addInitScript(() => {
+    const Real = window.WebSocket;
+    window.WebSocket = function (url, protocols) {
+      if (String(url).includes('/socket.io/')) throw new Error('websocket blocked for the polling run');
+      return new Real(url, protocols);
+    };
+    Object.assign(window.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+    window.WebSocket.prototype = Real.prototype;
+  });
+  const p = await ctx.newPage();
+  const t = { websockets: [], polls: 0, backends: new Set() };
+  p.on('websocket', (ws) => { if (ws.url().includes('/socket.io/')) t.websockets.push(ws.url()); });
+  p.on('request', (r) => { if (r.url().includes('/socket.io/') && r.url().includes('transport=polling')) t.polls += 1; });
+  await p.goto(origin + '/', { waitUntil: 'commit' }).catch(() => {});
+  await p.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  await p.waitForTimeout(2500);
+  return { b, ctx, p, t };
+}
+
 (async () => {
   if (!API || !DIST) throw new Error('API and DIST are required');
   const srv = await serve();
+  if (SCENARIO === 'poll-crash') {
+    const origin = `http://127.0.0.1:${srv.address().port}`;
+    say('scenario poll-crash api', API);
+    let pass = false;
+    try { pass = await pollCrash(origin); } catch (e) { say('error', e.stack || e); }
+    srv.close();
+    say(pass ? 'PASS' : 'FAIL', TAG);
+    process.exit(pass ? 0 : 1);
+  }
   if (SCENARIO === 'cli-to-browser') {
     const origin = `http://127.0.0.1:${srv.address().port}`;
     say('scenario cli-to-browser mode', MODE, 'api', API);

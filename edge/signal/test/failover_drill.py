@@ -206,6 +206,16 @@ def wait_converged(clients, want_cf, label, limit, since=None):
 
 def main():
     say("router", ROUTER, "room", ROOM)
+    # Precondition: the router must be up and settled (no straggler drains
+    # pending), or the baseline measures the previous outage, not this one.
+    t = time.time()
+    while time.time() - t < 600:
+        h = status().get("health") or {}
+        if h.get("phase") == "up" and time.time() * 1000 - (h.get("since") or 0) > 120_000:
+            break
+        time.sleep(5)
+    else:
+        raise SystemExit("router never settled up")
     say("status", json.dumps(status()))
     # Long-polling never upgrades here: every poll is its own request through
     # the router, so it exercises the sid stickiness rule directly.

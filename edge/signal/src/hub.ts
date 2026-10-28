@@ -56,7 +56,7 @@ interface PollSession {
   ns: boolean;
   ip: string;
   queue: string[];
-  waiter: ((body: string) => void) | null;
+  waiter: ((body: string | null) => void) | null; // null: answer 400, the session is gone
   waiterTimer: ReturnType<typeof setTimeout> | null;
   lastSeen: number;
   upgraded: boolean;
@@ -344,7 +344,15 @@ export class SignalHub extends DurableObject<Env> {
     this.armPollTick();
     if (sess.queue.length) return new Response(sess.queue.splice(0).join(SEP), { headers });
     return new Promise<Response>((resolve) => {
-      sess.waiter = (body) => resolve(new Response(body, { headers }));
+      sess.waiter = (body) =>
+        resolve(
+          body === null
+            ? new Response(JSON.stringify({ code: 1, message: "Session ID unknown" }), {
+                status: 400,
+                headers: { ...cors, "content-type": "application/json" },
+              })
+            : new Response(body, { headers }),
+        );
       // Never hold a poll past one ping interval: the ping tick normally
       // releases it first, this only covers a missed tick.
       sess.waiterTimer = setTimeout(() => this.pollPush(sess, "6"), (this.ping.interval + 5) * 1000);
@@ -586,9 +594,17 @@ export class SignalHub extends DurableObject<Env> {
     }
   }
 
+  /** End a polling session the way a server restart does: a held GET (and
+   * every later one) gets 400 "Session ID unknown", which every client
+   * treats as a transport error and reconnects from. An engine.io CLOSE
+   * packet would not do: python-socketio takes a server CLOSE as final. */
   private dropPoll(sess: PollSession) {
-    if (sess.waiter) this.pollPush(sess, "1");
     if (sess.waiterTimer) clearTimeout(sess.waiterTimer);
+    if (sess.waiter) {
+      const w = sess.waiter;
+      sess.waiter = null;
+      w(null);
+    }
     this.polls.delete(sess.eid);
     if (this.pollBySid.get(sess.sid) === sess.eid) this.pollBySid.delete(sess.sid);
     this.lastSeen.delete(sess.eid);
@@ -621,7 +637,6 @@ export class SignalHub extends DurableObject<Env> {
       n += 1;
     }
     for (const sess of [...this.polls.values()]) {
-      this.pollPush(sess, "1");
       this.dropPoll(sess);
       this.quietLeave(sess.sid);
       n += 1;

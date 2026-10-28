@@ -17,6 +17,7 @@ instance.
 import json
 import os
 import random
+import threading
 import time
 import unittest
 
@@ -489,33 +490,94 @@ class Pairing(Base):
         self.assertEqual(b.wait("pair-error"), {"error": "invalid", "why": "sender-gone"})
 
 
+# Polling liveness (PR #608, fix/polling-liveness; mirrored in edge/signal).
+# FIL_POLL_HOLD_S=2, FIL_POLL_GRACE_S=7, FIL_POLL_TICK_S=1 on the backend.
+HOLD, GRACE, TICK = 2.0, 7.0, 1.0
+
+
+class RawPoller:
+    """A minimal engine.io v4 long-polling client (no websocket), ported from
+    backend/tests/test_poll_liveness.py to speak to any base URL."""
+
+    def __init__(self):
+        body = http("GET", "/socket.io/?EIO=4&transport=polling").text
+        assert body.startswith("0"), body
+        self.eid = json.loads(body[1:])["sid"]
+        self.q = f"/socket.io/?EIO=4&transport=polling&sid={self.eid}"
+        assert http("POST", self.q, data="40").status_code == 200
+        first = http("GET", self.q).text.split("\x1e")
+        self.sid = json.loads(first[0][2:])["sid"]
+        self.stop = threading.Event()
+        self.gets = 0
+        self.packets = []
+
+    def emit(self, event, payload):
+        assert http("POST", self.q, data="42" + json.dumps([event, payload])).status_code == 200
+
+    def run(self, delay=0.0):
+        """Poll until stopped, answering pings; `delay` slows each re-poll."""
+        while not self.stop.is_set():
+            try:
+                r = http("GET", self.q, timeout=60)
+            except Exception:
+                return
+            if r.status_code != 200:
+                return
+            self.gets += 1
+            for pkt in r.text.split("\x1e"):
+                self.packets.append(pkt[:1])
+                if pkt == "2":
+                    http("POST", self.q, data="3")
+            if delay:
+                time.sleep(delay)
+
+
 @unittest.skipUnless(os.environ.get("CONFORMANCE_POLL_LIVENESS") == "1",
-                     "polling liveness (fix/polling-liveness): set CONFORMANCE_POLL_LIVENESS=1 "
+                     "polling liveness (PR #608): set CONFORMANCE_POLL_LIVENESS=1 "
                      "once the backend under test carries it")
 class PollLiveness(Base):
     """A long-polling client that stops polling without a word (a killed tab)
-    leaves the room within seconds (FIL_POLL_HOLD_S=2 + FIL_POLL_GRACE_S=7 +
-    ticks), not after pingInterval + pingTimeout (85 s in production)."""
+    leaves the room within seconds, not after pingInterval + pingTimeout
+    (85 s in production); one that keeps polling, even slowly, stays."""
 
-    BOUND = 15.0
+    def start(self, poller, **kw):
+        th = threading.Thread(target=poller.run, kwargs=kw, daemon=True)
+        th.start()
+        self.addCleanup(poller.stop.set)
+        return th
 
     def test_silent_polling_client_leaves_quickly(self):
         room = uniq()
         watcher, _ = self.joined(room, "watcher")
-        r = http("GET", "/socket.io/?EIO=4&transport=polling")
-        eid = json.loads(r.text[1:])["sid"]
-        q = f"/socket.io/?EIO=4&transport=polling&sid={eid}"
-        self.assertEqual(http("POST", q, data="40").status_code, 200)
-        sid = json.loads(http("GET", q).text.split("\x1e")[0][2:])["sid"]
-        join = "42" + json.dumps(["join", {"room": room, "name": "ghost", "uid": uniq("u"), "gen": uniq("g")}])
-        self.assertEqual(http("POST", q, data=join).status_code, 200)
-        watcher.wait("peer-joined", lambda d: d["id"] == sid)
-        # One last GET, read to completion, then silence: no more polls.
-        http("GET", q)
+        a, b = RawPoller(), RawPoller()
+        self.start(a)
+        self.start(b)
+        a.emit("join", {"room": room, "name": "a", "uid": uniq("u"), "gen": uniq("g")})
+        b.emit("join", {"room": room, "name": "b", "uid": uniq("u"), "gen": uniq("g")})
+        watcher.wait("peer-joined", lambda d: d["id"] == a.sid)
+        watcher.wait("peer-joined", lambda d: d["id"] == b.sid)
+        # Well past HOLD + GRACE while both keep polling: nobody leaves, and
+        # held GETs are cycled with NOOPs.
+        watcher.none("peer-left", within=HOLD * 2 + GRACE)
+        self.assertIn("6", a.packets, "a held GET was not cycled with a NOOP")
+        # b dies without a word: it just stops polling.
+        b.stop.set()
         t0 = time.time()
-        watcher.wait("peer-left", lambda d: d["id"] == sid, timeout=self.BOUND + 5)
-        self.assertLess(time.time() - t0, self.BOUND)
+        bound = HOLD + GRACE + 2 * TICK + 3.0  # + the round trips of a remote backend
+        watcher.wait("peer-left", lambda d: d["id"] == b.sid, timeout=bound + 10)
+        took = time.time() - t0
+        self.assertLessEqual(took, bound, f"left after {took:.1f}s, want <= {bound:.1f}s")
+        watcher.none("peer-left", lambda d: d["id"] == a.sid)
 
+    def test_slow_poller_inside_the_grace_is_kept(self):
+        room = uniq()
+        watcher, _ = self.joined(room, "watcher")
+        p = RawPoller()
+        self.start(p, delay=GRACE * 0.6)
+        p.emit("join", {"room": room, "name": "slow", "uid": uniq("u"), "gen": uniq("g")})
+        watcher.wait("peer-joined", lambda d: d["id"] == p.sid)
+        watcher.none("peer-left", within=GRACE * 4)
+        self.assertGreater(p.gets, 3)
 
 if __name__ == "__main__":
     unittest.main()
