@@ -96,6 +96,13 @@ export function useTunlion() {
   // without a late close from that session tearing down the new link.
   const genRef = useRef(currentGeneration())
   const supersededRef = useRef(false)
+  // Between this page's pagehide and its pageshow. The pagehide close beacon
+  // makes the relay echo `session-superseded {reason: 'page-closed'}` to this
+  // page's own socket; a page that comes back from bfcache must not read that
+  // echo as another tab taking over.
+  const pageHiddenRef = useRef(false)
+  const closedGenRef = useRef(null) // the generation our own pagehide closed
+  const rejoinFreshRef = useRef(null) // rotate the generation and rejoin (set below)
   // Resume stores, deliberately OUTLIVE individual PeerLinks (see docs/resilience.md):
   const partialsRef = useRef(new Map()) // transferId -> { received, buffers, size, mime, name }
   const outgoingRef = useRef(new Map()) // transferId -> { file, name, size, mime, peerUid }
@@ -749,6 +756,22 @@ export function useTunlion() {
       // the intentional way back, and loses no pairing (localStorage stays).
       sig.on('session-superseded', ({ reason } = {}) => {
         if (supersededRef.current) return
+        if (reason === 'page-closed') {
+          // Our own departure, confirmed: only this device's token at its
+          // current generation can close the session, so no other tab took
+          // over. Suspending here left a bfcache-restored page dead (it showed
+          // "a newer tab took over" and never rejoined). Hidden: pageshow
+          // rotates the generation and rejoins. Visible, and the generation
+          // was not already rotated since (the echo raced a restore, or a
+          // duplicated tab closed this page's shared generation): rejoin now
+          // under a fresh generation.
+          tel('session-closed-echo', { hidden: pageHiddenRef.current })
+          if (pageHiddenRef.current) return
+          if (closedGenRef.current && closedGenRef.current !== genRef.current) return
+          rejoinFreshRef.current?.()
+          sessionRef.current?.kick()
+          return
+        }
         supersededRef.current = true
         tel('session-superseded', {})
         for (const link of linksRef.current.values()) link.close()
@@ -1462,6 +1485,7 @@ export function useTunlion() {
     // normal thing, not a departure).
     const onPageHide = () => {
       pageHideSeen = true
+      pageHiddenRef.current = true
       if (recoverTimer) { clearTimeout(recoverTimer); recoverTimer = null }
       for (const link of linksRef.current.values()) {
         try { link.close() } catch {}
@@ -1486,6 +1510,7 @@ export function useTunlion() {
         try { resolveWait?.(false) } catch {}
       }
       if (helperTimerRef.current) { clearInterval(helperTimerRef.current); helperTimerRef.current = null }
+      closedGenRef.current = genRef.current
       beaconSessionClose(genRef.current, loadOwnerToken())
     }
     // pageshow fires on a normal load AND on a BFCache restore. Always
@@ -1493,24 +1518,31 @@ export function useTunlion() {
     // because the relay may have retired the generation it was frozen under
     // (another load/tab owned the device meanwhile). The old close note then
     // cannot match, and the restored page legitimately takes over again.
+    // A fresh generation for this page, and the session re-asserted under it:
+    // the relay retired (or closed) the old one, so it can never be replayed.
+    const rejoinFresh = () => {
+      genRef.current = rotateGeneration()
+      try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
+      supersededRef.current = false
+      setSuperseded(null)
+      // Update the reconnect cache BEFORE any socket reconnect can replay the
+      // retired generation in `join`.
+      sigRef.current?.setIdentity?.({ name: myNameRef.current, uid: uidRef.current, gen: genRef.current })
+      sigRef.current?.resume?.()
+      sessionRef.current?.setRoom(roomIdRef.current, myNameRef.current, uidRef.current, genRef.current)
+      sessionRef.current?.invalidate()
+    }
+    rejoinFreshRef.current = rejoinFresh
     const onPageShow = (e) => {
       const persisted = !!(e && e.persisted)
       const restoring = persisted || pageHideSeen
       pageHideSeen = false
+      pageHiddenRef.current = false
       // A superseded tab stays suspended until an explicit full reload. A
       // BFCache restore is not a reload and must not steal the session back.
       if (supersededRef.current) return
       if (restoring) {
-        genRef.current = rotateGeneration()
-        try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
-        supersededRef.current = false
-        setSuperseded(null)
-        // Update the reconnect cache BEFORE any socket reconnect can replay the
-        // retired generation in `join`.
-        sigRef.current?.setIdentity?.({ name: myNameRef.current, uid: uidRef.current, gen: genRef.current })
-        sigRef.current?.resume?.()
-        sessionRef.current?.setRoom(roomIdRef.current, myNameRef.current, uidRef.current, genRef.current)
-        sessionRef.current?.invalidate()
+        rejoinFresh()
         tel('bfcache-restore', { gen: genRef.current.slice(0, 8) })
       }
       sessionRef.current?.start()

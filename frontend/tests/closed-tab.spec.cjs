@@ -139,6 +139,8 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
   const out = leaving.sent.slice(sentBefore).filter((x) => /session\/close/.test(x));
   console.log(`[closed-tab] ${tag}: tile gone after ${gone == null ? '>' + (DEPART_MS + 8000) : gone} ms; page sent [${out.join(', ')}]; relay saw [${ev.join(', ')}]`);
   await leaving.ctx.close().catch(() => {});
+  const evAll = telEvents().slice(before).map((e) => e.ev);
+  if (!evAll.includes('session-close')) failures.push(`${tag}: the relay never applied the page's own close (saw [${ev.join(', ')}])`);
   if (gone == null || gone > DEPART_MS) {
     failures.push(`${tag}: the closed page stayed on the other peer for ${gone == null ? 'over ' + (DEPART_MS + 8000) : gone} ms (want <= ${DEPART_MS} ms)`);
     // The tile may still be up: wait it out so the next scenario starts clean.
@@ -177,6 +179,7 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
       const b = await open(browser, hold);
       const name = await deviceName(b.page);
       if ((await waitTile(a.page, name, true, 20000)) == null) fail(`${tag}: the observer never saw ${name}`);
+      const mark = telEvents().length;
       await b.page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })));
       await sleep(300);
       await b.page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
@@ -186,6 +189,8 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
       const why = back == null ? 'the restored page never came back on the other peer'
         : (await tilesFor(a.page, name)) === 0 ? 'the restored page dropped off the other peer again'
           : /took over/i.test(await b.page.evaluate(() => document.body.innerText)) ? 'the restored page shows itself superseded' : null;
+      const seen = telEvents().slice(mark).map((e) => e.ev).filter((e) => /close|leave|disconnect|supersede|join|sync/.test(e));
+      console.log(`[closed-tab] ${tag}: relay saw [${[...new Set(seen)].join(', ')}]`);
       if (why) failures.push(`${tag}: ${why}`);
       else ok(`${tag}: a restored page comes back and stays on the other peer`);
       await b.ctx.close();
