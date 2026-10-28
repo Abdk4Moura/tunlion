@@ -68,10 +68,23 @@ Polling liveness mirrors `signaling.PollWatch` from `fix/polling-liveness`
 is answered with a NOOP so a live client re-polls at once, and a polling
 session with no GET for `FIL_POLL_GRACE_S` (7 s) is closed as if its ping had
 timed out, so a silently dead tab leaves its room in about 8 s instead of
-85 s. Same env names and defaults, `FIL_POLL_GRACE_S=0` turns it off. Its
-conformance test (`PollLiveness`) is gated by `CONFORMANCE_POLL_LIVENESS=1`
-until the Python side merges; then drop the gate. The cost: a polling client
-makes a request every ~2 s instead of every 25 s (table below).
+85 s. Same env names and defaults, `FIL_POLL_GRACE_S=0` turns it off. The
+cost: a polling client makes a request every ~2 s instead of every 25 s
+(table below).
+
+A page hidden on purpose says so with socket.io's `away` event (#608). Only
+the socket the event arrived on is affected, and only one that has already
+polled: `{"on": true}` extends that session's no-GET limit to
+`FIL_POLL_AWAY_S` (180 s), anything else clears it, and a websocket session
+accepts and ignores it. The 25 s / 60 s ping timeout still bounds a frozen
+page, so the hint only bridges a file picker or a frozen background tab. TEL
+`poll-lapsed` carries the socket.io `sid` alongside the engine.io id.
+
+`PollLiveness` has six tests: the silent death, the slow poller inside the
+grace, and four `away` cases (own socket only, off restores, only `true`
+sets it, a websocket ignores it). The class is gated by
+`CONFORMANCE_POLL_LIVENESS=1` until the Python side merges; then drop the
+gate.
 
 engine.io pings: the hub's alarm sends `2` every `FIL_PING_INTERVAL` while
 any socket is open and closes a transport silent for interval plus timeout.
@@ -186,6 +199,21 @@ CONFORMANCE_URL=<base> CONFORMANCE_TRANSPORT=websocket|polling|upgrade \
   python -m unittest backend.conformance.test_conformance -v
 CONFORMANCE_URL=<small-budget base> python -m unittest backend.conformance.test_limits -v
 ```
+
+Results at the head of `feat/cf-signaling` on 2026-10-28, evidence in
+`/root/pairing-ux/evidence/cf-signal/final-3a420bb1/`:
+
+- #608's relay `a5244008`: 48/48 with `CONFORMANCE_POLL_LIVENESS=1` on
+  websocket, polling and upgrade, so the `away` cases pass on the Python
+  side too.
+- staging DO: 48/48 with liveness on websocket, polling and upgrade, plus
+  3/3 limits on the small-budget instance.
+- `PollLiveness` alone: green in two consecutive runs and in the transport
+  rerun; the slow-poller case also 4/4 on its own. One earlier run lost a
+  `peer-joined` to a network stall and one later run lapsed the slow poller
+  once; the same test then passed 4/4 alone, so the suite keeps its bounds.
+  This deployment did not stream Durable Object console logs to
+  `wrangler tail`, so the wire assertions, not TEL counts, are the evidence.
 
 The Python side needs `FIL_CLAIM_LIMIT>=200 FIL_PAIR_CREATE_LIMIT>=800` (every
 client shares one address); the small-budget run uses

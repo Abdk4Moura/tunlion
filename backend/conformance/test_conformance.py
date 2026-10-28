@@ -509,12 +509,29 @@ class RawPoller:
         assert body.startswith("0"), body
         self.eid = json.loads(body[1:])["sid"]
         self.q = f"/socket.io/?EIO=4&transport=polling&sid={self.eid}"
-        assert http("POST", self.q, data="40").status_code == 200
-        first = http("GET", self.q).text.split("\x1e")
-        self.sid = json.loads(first[0][2:])["sid"]
         self.stop = threading.Event()
         self.gets = 0
         self.packets = []
+        assert http("POST", self.q, data="40").status_code == 200
+        # The connect ack ("40{sid}") is one packet among others: a ping ("2")
+        # or a NOOP ("6") can be queued ahead of it, legitimately, whenever a
+        # ping tick lands between the POST and this GET. A raw client has to
+        # read the payload in order, so answer pings and find the ack.
+        self.sid = None
+        deadline = time.time() + WAIT
+        while self.sid is None:
+            if time.time() > deadline:
+                raise AssertionError("no connect ack on the polling session")
+            r = http("GET", self.q, timeout=WAIT)
+            assert r.status_code == 200, r.status_code
+            for pkt in r.text.split("\x1e"):
+                if not pkt:
+                    continue
+                self.packets.append(pkt[:1])
+                if pkt == "2":
+                    http("POST", self.q, data="3")
+                elif pkt.startswith("40"):
+                    self.sid = json.loads(pkt[2:])["sid"]
 
     def emit(self, event, payload):
         assert http("POST", self.q, data="42" + json.dumps([event, payload])).status_code == 200
