@@ -479,12 +479,17 @@ class Pairing(Base):
         self.assertEqual(b.wait("pair-error"), {"error": "invalid", "why": "bad-nameplate"})
 
     def test_creator_gone(self):
-        a, _ = self.joined(uniq(), "a")
+        room = uniq()
+        a, _ = self.joined(room, "a")
+        watcher, _ = self.joined(room, "w")
         n = self.nameplate()
         a.emit("pair-create", {"nameplate": n, "v": 2})
         a.wait("pair-ok")
+        asid = a.sid
         a.close()
-        time.sleep(1.0)
+        # Claim only once the server has run the creator's departure; a fixed
+        # sleep raced the disconnect on a slow transport.
+        watcher.wait("peer-left", lambda d: d["id"] == asid)
         b = self.peer()
         b.emit("pair-claim", {"nameplate": n, "v": 2})
         self.assertEqual(b.wait("pair-error"), {"error": "invalid", "why": "sender-gone"})
