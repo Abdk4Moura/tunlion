@@ -45,7 +45,9 @@ async function waitReady(page, n, ms = 40000) { const t0 = Date.now(); while (Da
   const departures = [];
   ctx.on('request', (r) => { const u = r.url(); if (/session\/close/.test(u)) departures.push('session-close'); else if (/socket\.io/.test(u) && r.method() === 'POST' && /\["leave"/.test(r.postData() || '')) departures.push('leave(polling)'); });
   await ctx.addInitScript(shim, HOLD);
-  const page = await ctx.newPage();
+  let page = ctx.pages()[0];
+  try { page = await ctx.newPage(); } catch (e) { console.log(`[probe ${label}] newPage: ${String(e).slice(0, 100)}; using the open tab`); }
+  if (!page) throw new Error('no page');
   await page.goto(BASE + '/?test=1'); await up(page);
   const phone = await nameOf(page);
   if (!(await waitReady(obs, phone)) || !(await waitReady(page, obsName))) { console.log(`[probe ${label}] FAIL: never paired; obs sees ${JSON.stringify(await tiles(obs, phone))}`); process.exit(1); }
