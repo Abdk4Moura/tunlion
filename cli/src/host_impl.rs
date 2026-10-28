@@ -320,6 +320,9 @@ impl HostServices for CliHost {
     fn device_allows(&self, name: &str, capability: &str) -> bool {
         crate::device_caps::device_allows(name, capability)
     }
+    fn device_record_grants(&self, name: &str, capability: &str) -> bool {
+        crate::device_caps::device_caps(name).is_some_and(|c| c.iter().any(|g| g == capability))
+    }
     fn device_key_known(&self, device_pub: &[u8; 32]) -> bool {
         crate::device_view::devices_find_by_device_pub(device_pub).is_some()
     }

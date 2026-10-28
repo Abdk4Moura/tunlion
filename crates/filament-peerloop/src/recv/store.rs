@@ -707,8 +707,85 @@ impl DeviceStore {
             .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
         {
             None => false, // unknown device, not revoked
-            Some(d) => d["certRevoked"].as_bool().unwrap_or(false),
+            Some(d) => {
+                d["certRevoked"].as_bool().unwrap_or(false) || self.sibling_record_delisted(d)
+            }
         }
+    }
+
+    /// Fleet auto-mesh revocation, as seen from a JOINED device.
+    ///
+    /// A sibling is a device we never paired with: we hold no pair secret for
+    /// it, only the index record a verified `fleet-hello` wrote. We did not
+    /// decide to trust it, the owner did, by certifying it. So the owner is
+    /// also the only one who can withdraw that decision, and the owner's
+    /// statement of who is still in the fleet is the signed roster it pushes
+    /// (`recv::roster`). A sibling the newest roster we hold no longer lists
+    /// was revoked or forgotten on the owner, and is refused here exactly as a
+    /// locally revoked device is.
+    ///
+    /// The roster only ever NARROWS: being listed authorizes nothing (the
+    /// certificate is still the evidence, and capability is still the gate).
+    /// Not transitive: the roster is signed by the owner key this device
+    /// already holds, never by a peer.
+    ///
+    /// Not delisted, by construction: anything on the owner device (its own
+    /// records are authoritative), a device we hold a pair secret for (that is
+    /// our own pairwise decision, unchanged by auto-mesh), and a certificate
+    /// from a different owner (cross-owner behaviour is unchanged).
+    fn sibling_record_delisted(&self, record: &Value) -> bool {
+        if record["secret"].as_str().is_some_and(|s| !s.is_empty()) {
+            return false;
+        }
+        let Some(cert) = DeviceCert::from_json(&record["deviceCert"]) else {
+            return false;
+        };
+        if self.owner_pub_from_keystore().is_some() {
+            return false;
+        }
+        let Some(owner) = self.owner_pub_for_resources(None) else {
+            return false;
+        };
+        if cert.user_pub != owner {
+            return false;
+        }
+        !self.owner_roster_lists(&cert.device_pub, &owner)
+    }
+
+    /// May a same-owner sibling be admitted over the fleet channel at all?
+    /// On the owner device: yes (its local records and revocations decide).
+    /// On a joined device: only when the newest owner-signed roster it holds
+    /// lists the device. No roster held means no admission: without a roster
+    /// there is no channel by which a revocation could reach us, so admitting
+    /// would make revocation unenforceable here. Expiry of the held roster is
+    /// deliberately not consulted: it is still the owner's latest statement,
+    /// and a listing can only narrow.
+    pub fn sibling_admissible(&self, device_pub: &[u8; 32]) -> bool {
+        if self.owner_pub_from_keystore().is_some() {
+            return true;
+        }
+        let Some(owner) = self.owner_pub_for_resources(None) else {
+            return false;
+        };
+        self.owner_roster_lists(device_pub, &owner)
+    }
+
+    /// Does the stored roster (signed by `owner`, verified at receipt) list
+    /// `device_pub`? A missing, unreadable or foreign-owner roster lists no one.
+    pub fn owner_roster_lists(&self, device_pub: &[u8; 32], owner: &[u8; 32]) -> bool {
+        let Ok(raw) = std::fs::read_to_string(self.root.join("roster.json")) else {
+            return false;
+        };
+        let Ok(r) = serde_json::from_str::<Value>(&raw) else {
+            return false;
+        };
+        if r["owner_pub"].as_str() != Some(hex::encode(owner).as_str()) {
+            return false;
+        }
+        let key = hex::encode(device_pub);
+        r["devices"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|d| d["device_pub"].as_str() == Some(key.as_str())))
     }
 
     /// Update the `lastSeen` timestamp and overlay addresses for a known device.
@@ -2798,5 +2875,155 @@ mod store_guards {
         assert_eq!(other["uses"].as_u64(), Some(1));
         assert_eq!(other["expires"].as_u64(), Some(20_000));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod sibling_roster_revocation {
+    //! Fleet auto-mesh revocation on a JOINED device: the owner's signed roster
+    //! is the only voice that can withdraw a sibling, and it can only narrow.
+    use super::*;
+    use filament_id::{DeviceCert, UserKey};
+    use serde_json::json;
+
+    fn unique(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fil-sib-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    struct Joined {
+        root: PathBuf,
+        store: DeviceStore,
+        owner: UserKey,
+        sib: [u8; 32],
+    }
+
+    /// A joined device: its own certificate from `owner`, and one sibling
+    /// indexed the way a verified fleet-hello writes it (no pair secret).
+    fn joined(tag: &str) -> Joined {
+        let root = unique(tag);
+        let store = DeviceStore::open(&root);
+        let owner = UserKey::from_seed(&[21u8; 32]).unwrap();
+        let now = now_secs();
+        let me = DeviceCert::certify(&owner, [1u8; 32], now, 3600).unwrap();
+        store
+            .write_local_device_cert_record(&json!({"name": "me", "cert": me.to_json()}))
+            .unwrap();
+        let sib = [2u8; 32];
+        let sib_cert = DeviceCert::certify(&owner, sib, now, 3600).unwrap();
+        std::fs::write(
+            store.devices_path(),
+            serde_json::to_string(&json!([
+                {"name": "sib", "deviceCert": sib_cert.to_json(), "caps": []},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        Joined { root, store, owner, sib }
+    }
+
+    fn write_roster(j: &Joined, owner_pub: [u8; 32], listed: &[[u8; 32]]) {
+        let devices: Vec<Value> = listed
+            .iter()
+            .map(|d| json!({"device_pub": hex::encode(d), "petname": "x"}))
+            .collect();
+        std::fs::write(
+            j.root.join("roster.json"),
+            serde_json::to_string(&json!({
+                "owner_pub": hex::encode(owner_pub),
+                "epoch": 3, "valid_until": 1, "received_at": 0,
+                "devices": devices,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn listed_sibling_is_admissible_and_not_revoked() {
+        let j = joined("listed");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32], j.sib]);
+        assert!(j.store.sibling_admissible(&j.sib));
+        assert!(!j.store.device_cert_revoked(&j.sib));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn a_sibling_the_owner_delisted_is_refused_and_reads_revoked() {
+        let j = joined("delisted");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        assert!(!j.store.sibling_admissible(&j.sib));
+        assert!(j.store.device_cert_revoked(&j.sib));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn no_roster_means_no_sibling_admission() {
+        // Fail closed: with no roster there is no way a revocation could
+        // reach this device, so a sibling is not admitted.
+        let j = joined("none");
+        assert!(!j.store.sibling_admissible(&j.sib));
+        assert!(j.store.device_cert_revoked(&j.sib));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn a_roster_from_another_owner_lists_no_one() {
+        let j = joined("foreign");
+        let other = UserKey::from_seed(&[22u8; 32]).unwrap();
+        write_roster(&j, other.public_key_bytes(), &[j.sib]);
+        assert!(!j.store.sibling_admissible(&j.sib));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn paired_and_cross_owner_records_are_never_governed_by_the_roster() {
+        let j = joined("exempt");
+        write_roster(&j, j.owner.public_key_bytes(), &[]);
+        let now = now_secs();
+        // A device we PAIRED with (it has a pair secret): our own decision.
+        let paired_pub = [3u8; 32];
+        let paired = DeviceCert::certify(&j.owner, paired_pub, now, 3600).unwrap();
+        // A device certified by a DIFFERENT owner, no secret.
+        let other = UserKey::from_seed(&[23u8; 32]).unwrap();
+        let foreign_pub = [4u8; 32];
+        let foreign = DeviceCert::certify(&other, foreign_pub, now, 3600).unwrap();
+        std::fs::write(
+            j.store.devices_path(),
+            serde_json::to_string(&json!([
+                {"name": "paired", "secret": "ab".repeat(32), "deviceCert": paired.to_json()},
+                {"name": "foreign", "deviceCert": foreign.to_json()},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!j.store.device_cert_revoked(&paired_pub));
+        assert!(!j.store.device_cert_revoked(&foreign_pub));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn the_owner_device_is_never_governed_by_a_roster() {
+        let j = joined("owner");
+        UserKey::generate(&j.store.keystore()).unwrap();
+        // Even with no roster at all, the owner admits by its own records.
+        assert!(j.store.sibling_admissible(&j.sib));
+        assert!(!j.store.device_cert_revoked(&j.sib));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn the_roster_file_name_matches_the_roster_module() {
+        #[cfg(feature = "dispatch")]
+        assert_eq!(crate::recv::roster::ROSTER_FILE, "roster.json");
     }
 }

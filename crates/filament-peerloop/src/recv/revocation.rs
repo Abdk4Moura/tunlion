@@ -53,6 +53,30 @@ pub fn link_must_close(
     f.device_pub.as_ref().is_some_and(|k| key_listed(k))
 }
 
+/// Must this fleet SIBLING link close now? A sibling (a `FleetDevice`
+/// principal: admitted on its owner-signed certificate, never paired) holds its
+/// link on exactly two facts, and loses it the moment either stops being true:
+/// the device is not revoked (locally, or by the owner withdrawing it from the
+/// signed roster, which `revoked` folds in), and its certificate is unexpired.
+/// Any other link kind is never closed by this rule.
+pub fn sibling_link_must_close(
+    is_fleet_sibling: bool,
+    device_pub: Option<&[u8; 32]>,
+    cert_expires: Option<u64>,
+    now: u64,
+    revoked: &dyn Fn(&[u8; 32]) -> bool,
+) -> bool {
+    if !is_fleet_sibling {
+        return false;
+    }
+    let Some(dev) = device_pub else {
+        // A sibling principal with no proven key is not a state admission can
+        // produce; fail closed rather than keep an unidentified sibling.
+        return true;
+    };
+    revoked(dev) || cert_expires.is_some_and(|exp| exp <= now)
+}
+
 /// Must this link lose its overlay route?
 pub fn route_must_withdraw(
     device_pub: Option<&[u8; 32]>,
@@ -72,3 +96,27 @@ pub fn facts_for<'a>(conn: &'a Conn, pid: &str) -> LinkFacts<'a> {
 
 #[allow(dead_code)]
 fn _arc(_: &Arc<dyn std::any::Any>) {}
+
+#[cfg(test)]
+mod sibling_cut_tests {
+    use super::sibling_link_must_close;
+
+    #[test]
+    fn a_sibling_link_closes_on_revocation_or_expiry_and_nothing_else() {
+        let dev = [7u8; 32];
+        let never = |_: &[u8; 32]| false;
+        let always = |_: &[u8; 32]| true;
+        // Healthy sibling: kept.
+        assert!(!sibling_link_must_close(true, Some(&dev), Some(200), 100, &never));
+        // Revoked (locally or delisted by the owner's roster): closed.
+        assert!(sibling_link_must_close(true, Some(&dev), Some(200), 100, &always));
+        // Certificate expired: closed, at the expiry second itself.
+        assert!(sibling_link_must_close(true, Some(&dev), Some(100), 100, &never));
+        // Unidentified sibling: fail closed.
+        assert!(sibling_link_must_close(true, None, Some(200), 100, &never));
+        // Not a sibling (paired, owner, delegated): this rule never fires,
+        // whatever the other inputs say. Pairwise links keep their own rules.
+        assert!(!sibling_link_must_close(false, Some(&dev), Some(1), 100, &always));
+        assert!(!sibling_link_must_close(false, None, None, 100, &always));
+    }
+}
