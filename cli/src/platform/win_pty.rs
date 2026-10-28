@@ -805,21 +805,18 @@ pub fn relay(cols: u16, rows: u16, resize: &str, argv: &[String]) -> Result<()> 
     // whole inherited environment with the registry merged over it, which
     // handed the shell every variable the daemon was started with. With no
     // account block (a service-account daemon, an API failure) the filtered
-    // baseline `user_env` keeps for that case is used, and the reason goes to
-    // the relay's stderr (visible as the daemon's log or WIN-PTY diag).
+    // baseline `user_env` keeps for that case is used. The relay has no log
+    // sink of its own (its stderr is NUL in release builds), so the exec path
+    // is where the reason is logged.
     let inherited: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
     let user = super::Paths::exec_user_context(None).map_err(|e| anyhow!(e))?;
-    let account = super::account_environment();
-    if let Err(why) = &account {
-        eprintln!("tunlion: account environment unavailable ({why}); keeping the filtered Windows baseline");
-    }
     let env = filament_peerloop::shell::user_env::child_env(
         true,
         &user,
         false,
-        account,
+        super::account_environment(),
         &inherited,
         &[],
     )
