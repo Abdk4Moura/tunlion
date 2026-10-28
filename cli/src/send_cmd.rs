@@ -2793,9 +2793,29 @@ pub(crate) async fn send_cmd(
 ///
 /// Block until the peer has acked every byte before we exit: a torn-down QUIC
 /// connection drops un-acked send-buffer bytes and truncates the last file.
+///
+/// Except when the receiver has already confirmed everything: a whole-file
+/// verified `delivery-ack` for every file it accepted means every byte that
+/// matters is on the far side, so a transport whose drain only waits for its
+/// own ack of the tail (WebRTC's SCTP SACK, about 1 s late cross-network) is
+/// not waited on. A file done without that ack (no digest, so size-only) still
+/// drains, as does an empty send.
 async fn exit_drain(out: &[Outgoing], t: &Arc<dyn Transport>) -> Result<()> {
-    let _ = out;
+    if receiver_confirmed_all(out) && !t.drain_after_delivery_ack() {
+        return Ok(());
+    }
     t.drain_finish().await
+}
+
+/// Did the receiver itself confirm every file: a digest-verified delivery-ack,
+/// or its refusal (it answered, and nothing of that file is owed)? A file with
+/// no `full` digest is `acked` on send without the receiver saying anything,
+/// so it never counts.
+fn receiver_confirmed_all(out: &[Outgoing]) -> bool {
+    !out.is_empty()
+        && out
+            .iter()
+            .all(|o| o.declined || (o.acked && o.full.is_some()))
 }
 
 /// Copy `from` into the spool file, returning the bytes written, or the bytes
@@ -3460,6 +3480,54 @@ mod exit_drain_tests {
             "a file the receiver never confirmed must not skip the drain"
         );
         assert_eq!(drains.load(Ordering::SeqCst), 1);
+    }
+
+    /// A link whose drain is also the receiver's clean end of stream (direct
+    /// QUIC) still drains after a full set of delivery-acks.
+    #[tokio::test]
+    async fn a_link_that_needs_its_drain_keeps_it_after_the_ack() {
+        struct EndsStream(SlowTail);
+        #[async_trait::async_trait]
+        impl Transport for EndsStream {
+            async fn send_control(&self, m: &Value) -> anyhow::Result<()> {
+                self.0.send_control(m).await
+            }
+            async fn send_frame(&self, sid: u32, off: u64, p: &[u8]) -> anyhow::Result<()> {
+                self.0.send_frame(sid, off, p).await
+            }
+            async fn flush(&self) -> anyhow::Result<()> {
+                self.0.flush().await
+            }
+            async fn drain_finish(&self) -> anyhow::Result<()> {
+                self.0.drain_finish().await
+            }
+            fn drain_after_delivery_ack(&self) -> bool {
+                true
+            }
+            fn max_payload(&self) -> usize {
+                self.0.max_payload()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let drains = Arc::new(AtomicUsize::new(0));
+        let t: Arc<dyn Transport> = Arc::new(EndsStream(SlowTail { drains: drains.clone() }));
+        let out = vec![delivered("a.bin")];
+        assert!(!finishes_within(&out, &t, Duration::from_millis(300)).await);
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refusal is the receiver answering: with every other file
+    /// delivery-acked there is nothing left to wait for.
+    #[tokio::test]
+    async fn a_declined_file_counts_as_answered() {
+        let (t, _) = slow_tail();
+        let mut no = file("d.bin", Some("digest"));
+        no.declined = true;
+        no.done = true;
+        let out = vec![delivered("a.bin"), no];
+        assert!(finishes_within(&out, &t, Duration::from_millis(500)).await);
     }
 
     /// Nothing to confirm is never "everything confirmed".

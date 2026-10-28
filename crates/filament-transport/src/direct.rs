@@ -1378,6 +1378,11 @@ impl Transport for DirectTransport {
         }
     }
 
+    fn drain_after_delivery_ack(&self) -> bool {
+        // The drain is also how the receiver sees the stream end cleanly.
+        true
+    }
+
     fn max_payload(&self) -> usize {
         MAX_DIRECT_PAYLOAD
     }
