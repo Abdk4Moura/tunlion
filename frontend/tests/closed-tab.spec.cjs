@@ -1,21 +1,24 @@
-// A closed tab must leave the other peers' rosters at once, against the REAL
-// app + relay, on both socket.io transports.
+// A page that goes away must leave the other peers' rosters at once, and a
+// page that comes back from bfcache must rejoin, against the REAL app + relay,
+// on both socket.io transports.
 //
-// Guards the "connecting ghost": a page on the polling transport (a network
-// that holds the websocket upgrade) was closed, and every other peer kept its
-// tile for the lease TTL plus the engine.io ping timeout (about a minute in
-// production). A websocket page went at once only because its TCP close
-// reached the relay. The page now announces its own departure on pagehide, and
-// the relay drops a closed session from the room at once on either transport.
-//
-//   1. polling: a page behind a held websocket is closed; the other peer drops
-//      its tile within DEPART_MS.
+//   1. polling: a page behind a held websocket (so on long-polling) is closed;
+//      the other peer drops its tile within DEPART_MS, through the page's own
+//      pagehide close (the relay applies a session-close), not the backstop.
 //   2. websocket: the same, for a page whose websocket opened.
-//   3. bfcache: a pagehide with persisted=true followed by a pageshow restore
-//      must come back; the other peer sees the device again.
+//   3. bfcache: pagehide(persisted) then pageshow(persisted), three rounds per
+//      transport. The restored page must be back on the other peer, hear the
+//      other peer itself, and not call itself superseded. Two defects failed
+//      this: the relay's echo of the page's own close (session-superseded,
+//      reason page-closed) was read as another tab taking over, so the page
+//      suspended for good; and engine.io-client drops its in-flight long-poll
+//      requests on pagehide without settling them, so a polling page came back
+//      with a transport that sent and received nothing until a ping timeout.
 //
 // The relay runs with a long ping timeout (as the other browser gates do), so
-// the backstop cannot pass this gate: only an explicit departure can.
+// the backstop cannot pass this gate: only an explicit departure can. A page
+// that dies without running pagehide at all (a killed renderer) is outside
+// what any explicit signal can cover; there the ping timeout still decides.
 //
 //   node frontend/tests/closed-tab.spec.cjs        (from the repo root; needs frontend/dist)
 const { spawn } = require('child_process');
@@ -90,7 +93,8 @@ function instrument({ hold }) {
 
 async function open(browser, hold) {
   const ctx = await browser.newContext();
-  // What the page sent on its way out (the context outlives the page).
+  // The page's socket.io and close requests (the context outlives the page),
+  // printed when a bfcache round fails.
   const sent = [];
   const t00 = Date.now();
   const note = (r, how) => { if (/\/api\/session\/close|socket\.io/.test(r.url())) sent.push(`${Date.now() - t00}:${how} ${r.method()} ${r.url().replace(BASE, '').replace(/[?].*/, '')}${/close/.test(r.url()) ? '' : /transport=(\w+)/.exec(r.url())?.[1] || ''}`); };
@@ -99,8 +103,8 @@ async function open(browser, hold) {
   ctx.on('requestfailed', (r) => note(r, 'failed'));
   await ctx.addInitScript(instrument, { hold });
   const page = await ctx.newPage();
-  // A throw inside a socket.io handler stops a polling transport for good
-  // (the next long-poll is never issued), so a page error fails the gate.
+  // A throw inside a socket.io handler would stop a polling transport too
+  // (the next long-poll is never issued), so page errors go in that log.
   page.on('pageerror', (e) => sent.push(`${Date.now() - t00}:pageerror ${String(e && e.message || e).slice(0, 200)}`));
   page.on('console', (m) => { if (m.type() === 'error') sent.push(`${Date.now() - t00}:console ${m.text().slice(0, 200)}`); });
   await page.goto(BASE + '/?test=1');
@@ -132,7 +136,6 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
   // Let the room settle, so a late roster refresh cannot mask the departure.
   await sleep(1000);
   const before = telEvents().length;
-  const sentBefore = leaving.sent.length;
   const t0 = Date.now();
   // A real tab close: the renderer runs pagehide/unload, then the target goes.
   await leaving.page.close({ runBeforeUnload: true });
@@ -141,12 +144,10 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
     if ((await tilesFor(observer, name)) === 0) { gone = Date.now() - t0; break; }
     await sleep(25);
   }
-  const ev = telEvents().slice(before).map((e) => e.ev).filter((e) => /close|leave|disconnect/.test(e));
-  const out = leaving.sent.slice(sentBefore).filter((x) => /session\/close/.test(x) && !/start/.test(x));
-  console.log(`[closed-tab] ${tag}: tile gone after ${gone == null ? '>' + (DEPART_MS + 8000) : gone} ms; page sent [${out.join(', ')}]; relay saw [${ev.join(', ')}]`);
   await leaving.ctx.close().catch(() => {});
-  const evAll = telEvents().slice(before).map((e) => e.ev);
-  if (!evAll.includes('session-close')) failures.push(`${tag}: the relay never applied the page's own close (saw [${ev.join(', ')}])`);
+  const ev = telEvents().slice(before).map((e) => e.ev).filter((e) => /close|leave|disconnect/.test(e));
+  console.log(`[closed-tab] ${tag}: tile gone after ${gone == null ? '>' + (DEPART_MS + 8000) : gone} ms; relay saw [${ev.join(', ')}]`);
+  if (!ev.includes('session-close')) failures.push(`${tag}: the relay never applied the page's own close (saw [${ev.join(', ')}])`);
   if (gone == null || gone > DEPART_MS) {
     failures.push(`${tag}: the closed page stayed on the other peer for ${gone == null ? 'over ' + (DEPART_MS + 8000) : gone} ms (want <= ${DEPART_MS} ms)`);
     // The tile may still be up: wait it out so the next scenario starts clean.
@@ -180,8 +181,8 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
     await closeAndTime('websocket', a.page, w, { polling: false });
 
     // 3. bfcache: pagehide(persisted) then pageshow(persisted) is a page that
-    //    comes back, not a departure. It must end up on the other peer again.
-    // Three rounds each: the echo of the page's own close races the restore.
+    //    comes back, not a departure. Three rounds each: the relay's echo of
+    //    the page's own close races the restore.
     for (const hold of [true, false, true, false, true, false]) {
       const tag = hold ? 'bfcache/polling' : 'bfcache/websocket';
       const b = await open(browser, hold);
@@ -207,11 +208,14 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
           : /took over/i.test(await b.page.evaluate(() => document.body.innerText)) ? 'the restored page shows itself superseded' : null;
       const seen = telEvents().slice(mark).filter((e) => !/^web:(vis|net|conn|link|ice|tile|cfg)/.test(e.ev))
         .map((e) => e.ev + (e.reason ? '(' + e.reason + ')' : '') + (e.status ? '(' + e.status + ')' : ''));
-      console.log(`[closed-tab] ${tag}: relay saw [${seen.slice(0, 40).join(', ')}]`);
-      console.log(`[closed-tab] ${tag}: socket after restore ${JSON.stringify(sock1)} later ${JSON.stringify(sock2)}`);
-      console.log(`[closed-tab] ${tag}: page requests [${b.sent.slice(Math.max(0, sentMark - 4), sentMark + 40).join(', ')}]`);
-      if (why) failures.push(`${tag}: ${why}`);
-      else ok(`${tag}: a restored page comes back and stays on the other peer`);
+      if (why) {
+        // What a failure needs to be read: the relay's view, the page's
+        // socket transport state, and its socket.io requests around the trip.
+        console.log(`[closed-tab] ${tag}: relay saw [${seen.slice(0, 40).join(', ')}]`);
+        console.log(`[closed-tab] ${tag}: socket after restore ${JSON.stringify(sock1)} later ${JSON.stringify(sock2)}`);
+        console.log(`[closed-tab] ${tag}: page requests [${b.sent.slice(Math.max(0, sentMark - 4), sentMark + 40).join(', ')}]`);
+        failures.push(`${tag}: ${why}`);
+      } else ok(`${tag}: a restored page comes back and stays on the other peer`);
       await b.ctx.close();
     }
     await a.ctx.close();

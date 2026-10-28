@@ -153,9 +153,11 @@ jobs:
         run: node frontend/tests/fast-detect.spec.cjs
 
       # A closed tab leaves the other peers' rosters at once on both socket.io
-      # transports. A polling page (held websocket) used to stay as a
-      # "connecting" tile for the lease plus the ping timeout. Also gates a
-      # bfcache pagehide/pageshow round trip coming back.
+      # transports, through its own pagehide close rather than the ping
+      # timeout, and a page restored from bfcache comes back on both: it used
+      # to suspend itself on the relay's echo of its own close (websocket) or
+      # keep a long-poll transport wedged by engine.io-client's pagehide abort
+      # (polling).
       - name: closed-tab
         env:
           TUNLION_TEST_VENV: python3
