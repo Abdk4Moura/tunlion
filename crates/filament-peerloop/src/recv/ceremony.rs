@@ -168,6 +168,10 @@ pub struct Ceremony {
     /// stalled forever after "authenticated". Only routing, not a secret: a
     /// server that strips it just keeps the transfer on WebRTC.
     peer_direct: bool,
+    /// The peer can move a live transfer to direct QUIC at a frame boundary
+    /// (`handoff`, the make-before-break promotion). An older CLI advertises
+    /// `direct` without this and still tears its WebRTC link down at confirm.
+    peer_handoff: bool,
 }
 
 /// Who a pairing ceremony should run with, given one inbound PAKE payload.
@@ -243,6 +247,7 @@ impl Ceremony {
             resend: Resend::default(),
             nameplate: nameplate.to_string(),
             peer_direct: false,
+            peer_handoff: false,
         }
     }
 
@@ -293,6 +298,7 @@ impl Ceremony {
             "msg": b64_encode(&self.msg),
             "np": self.nameplate,
             "direct": true,
+            "handoff": 1,
         })
     }
 
@@ -397,6 +403,13 @@ impl Ceremony {
         self.peer_direct
     }
 
+    /// Whether the peer runs the make-before-break promotion. Without it the
+    /// promotion must behave as the peer expects (tear down at confirm), or
+    /// the peer's teardown and our handoff would race on a dying link.
+    pub fn peer_supports_handoff(&self) -> bool {
+        self.peer_direct && self.peer_handoff
+    }
+
     /// Scope byte (mandatory, no default).
     pub fn scope(&self) -> u8 {
         self.scope
@@ -418,6 +431,9 @@ impl Ceremony {
         ) && data["direct"].as_bool() == Some(true)
         {
             self.peer_direct = true;
+            if data["handoff"].as_u64() == Some(1) {
+                self.peer_handoff = true;
+            }
         }
         match data["type"].as_str() {
             // A re-sent element after K is a no-op: K comes from the FIRST
@@ -1038,5 +1054,24 @@ mod tests {
         assert!(b.secret().is_none() && b.aborted().is_none());
         assert!(matches!(b.on_signal(&a_conf, Some(B_FPS)), Inbound::Consumed));
         assert!(b.secret().is_some());
+    }
+
+    /// Two current CLIs advertise the make-before-break handoff. A 0.9.1 CLI
+    /// sends `direct` but no `handoff` (its payload, byte for byte, minus the
+    /// new field): facing it, the promotion must behave the old way.
+    #[test]
+    fn only_a_peer_that_advertises_handoff_is_handed_off() {
+        let (a, b) = run_pair("brave-otter", "brave-otter", "314");
+        assert!(a.peer_supports_handoff() && b.peer_supports_handoff());
+
+        let scope = filament_id::IntroScope::Device.to_byte();
+        let mut new_cli = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut old_side = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut from_old = old_side.take_msg_payload().unwrap();
+        assert_eq!(from_old["handoff"], json!(1), "a current CLI must advertise it");
+        from_old.as_object_mut().unwrap().remove("handoff");
+        assert!(matches!(new_cli.on_signal(&from_old, None), Inbound::Consumed));
+        assert!(new_cli.peer_supports_direct(), "0.9.1 still goes direct");
+        assert!(!new_cli.peer_supports_handoff(), "0.9.1 cannot answer path-promote");
     }
 }

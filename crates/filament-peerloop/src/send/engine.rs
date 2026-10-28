@@ -847,15 +847,22 @@ async fn drive_over(
                                         code_deadline = None;
                                         last_activity = Instant::now();
                                         ports.log.say("  authenticated, sending");
+                                        // Make-before-break: direct QUIC races beside
+                                        // the WebRTC link, which starts the transfer
+                                        // now; this end leads the handoff if it wins.
                                         let promotion = if cer.peer_supports_direct() {
-                                            conn.start_direct_promote(&from, &from, &secret).await
+                                            conn.start_direct_promote(
+                                                &from,
+                                                &from,
+                                                &secret,
+                                                crate::conn::PromoteRole::Lead,
+                                                cer.peer_supports_handoff(),
+                                            )
+                                            .await
                                         } else {
                                             crate::conn::Promotion::Retained
                                         };
-                                        // The promote may drop the serving WebRTC
-                                        // link, and drop_link clears the active
-                                        // slot. The authenticated peer is the
-                                        // target, so claim it AFTER the promote.
+                                        // The authenticated peer is the target.
                                         conn.active = Some(from.clone());
                                         conn.rearm_channel_ready(&from, promotion);
                                     }
@@ -938,6 +945,9 @@ async fn drive_over(
                 offer_unfinished(&outgoing, &t).await?;
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("path-promote" | "path-promoted" | "path-declined" | "path-stay") => {
+                    let _ = conn.on_promote_control(&pid, &v).await;
+                }
                 Some("identity-nonce-challenge") => {
                     if let Some(t) = conn.transport_of(&pid) {
                         ports.identity.respond_to_identity_challenge(&t, &v).await;

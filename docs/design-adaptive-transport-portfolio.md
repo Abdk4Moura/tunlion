@@ -124,8 +124,10 @@ UDP policer we hit.
 
 ## 5. How it composes with existing tunlion
 
-- **Establishment**: extend the current direct-vs-WebRTC race (Option A,
-  `start_direct` post-PAKE) into an N-arm race. The `worker-ports` /
+- **Establishment**: extend the current direct-vs-WebRTC race (the post-PAKE
+  promotion, now make-before-break: the serving link carries the transfer
+  while direct races beside it, then hands over at a frame boundary; see
+  CONTRACT.md "Post-PAKE promotion") into an N-arm race. The `worker-ports` /
   candidate-exchange plumbing already exists.
 - **Framing / bridge**: unchanged - `serve_stream` / `socket_to_dc` /
   `dc_to_socket` are already `S: AsyncRead+AsyncWrite` generic, so any arm

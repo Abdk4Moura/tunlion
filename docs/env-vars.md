@@ -190,7 +190,7 @@ must not be set in production.
 
 A small number of "test-only" vars are not actually under
 `#[cfg(feature = "test-hooks")]` in source (`TUNLION_DIRECT_NO_PUBLIC`,
-`TUNLION_DIRECT_TEST_BLOCK`): they are *only* set by gate scripts, have
+`TUNLION_DIRECT_TEST_BLOCK`, `TUNLION_TEST_DIRECT_DELAY_MS`): they are *only* set by gate scripts, have
 no value outside that context, and the production code never branches on
 them. They are still listed in the test-only section.
 
@@ -295,6 +295,7 @@ dropped event, a wedged loop).
 | `TUNLION_TEST_EMIT_LOSS` | Float in `[0.0, 1.0)` (unset → `0.0`). C30's gate L: drops this fraction of outbound session-state emits (`join`, `subscribe`, `sync`) at random. The convergence tick loop is what must repair the damage. Default 0.0 means no loss; the gate typically sets a non-zero value plus a seed. |
 | `TUNLION_TEST_EMIT_SEED` | Integer (default `0xF11AC30D`). Seeds the xorshift64* PRNG the loss shim uses, so a given loss fraction + seed deterministically drops the same emits across runs. Reproducibility for gate L. |
 | `TUNLION_DIRECT_TEST_BLOCK` | `1` (unset → race runs). Force the rung-1 direct race to fail (simulate a blocked direct path) so the fallback gate can assert WebRTC still completes with the rung-1 flag on. Not a product knob, only the fallback gate sets it. |
+| `TUNLION_TEST_DIRECT_DELAY_MS` | Milliseconds (unset → no delay). Hold an authenticated direct-QUIC link for this long before it is announced, modelling a slow cross-network race. The make-before-break gates use it to show a code transfer starts, and can finish, on the serving WebRTC link instead of waiting for QUIC, and then moves to QUIC mid-file. Not a product knob, only the promotion gate sets it. |
 | `TUNLION_DIRECT_NO_PUBLIC` | `1` (unset → public candidate advertised). Suppress rung-1's public (`whoami`) candidate. Models the common NAT class that does not preserve the source port, the class rung-2's STUN-learned srflx exists to catch. Not a product knob, only the hole-punch gate sets it. |
 | `TUNLION_DIRECT_LOOPBACK_ONLY` | `1` (unset → full candidate set). Pin rung-1 candidates to loopback (`127.0.0.1`). A multi-homed host advertises many local candidates and the simultaneous-open race can then pick a pair that cannot actually carry data; this knob makes same-host gates deterministic by advertising only loopback. Compiled in only under the `test-hooks` cargo feature. |
 | `TUNLION_L2_DIALHOST` | Hostname or IP (production: `127.0.0.1`). The dial target the L2 initiator (`netcat` / `ssh` / `forward`) advertises for the `l2-open` control frame. Production is localhost-only (the SSRF defense); the env is a test-only override so the SSRF gate can drive a non-loopback open and observe the acceptor refuse it. |

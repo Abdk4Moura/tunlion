@@ -67,6 +67,22 @@ fn test_block() -> bool {
     std::env::var("TUNLION_DIRECT_TEST_BLOCK").map(|v| v == "1").unwrap_or(false)
 }
 
+/// Test-only: `TUNLION_TEST_DIRECT_DELAY_MS=N` holds an authenticated direct
+/// link for N ms before it is announced, modelling a slow direct-QUIC setup (a
+/// cross-network race that takes over a second to win). The make-before-break
+/// gates use it to show a code transfer starts, and can finish, on the serving
+/// WebRTC link instead of waiting for QUIC. Like `TUNLION_DIRECT_TEST_BLOCK`,
+/// only gate scripts set it.
+pub async fn test_setup_delay() {
+    let ms = std::env::var("TUNLION_TEST_DIRECT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0);
+    if let Some(ms) = ms {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
 /// Bug 2 PROOF hook (test-only): `TUNLION_DIRECT_TEST_DIE_AT=<bytes>` forces
 /// the FIRST established direct transport's QUIC connection to DIE (structurally
 /// error, dead=true) after N cumulative bytes of file data have been written

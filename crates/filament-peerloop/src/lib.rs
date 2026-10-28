@@ -70,6 +70,7 @@ pub mod download_output;
 pub mod exec_frame;
 #[cfg(feature = "mount-server")]
 pub mod fs_at;
+pub mod handoff;
 pub mod holepunch;
 pub mod host;
 pub mod identity;

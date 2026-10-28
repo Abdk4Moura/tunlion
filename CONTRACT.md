@@ -385,6 +385,64 @@ single emit is load-bearing (C30):
 - A receiver that has authenticated its sender keeps that one ceremony to
   answer re-sends; it still ignores PAKE traffic from every other peer.
 
+### Post-PAKE promotion is make-before-break (`path-promote`)
+
+After the code ceremony confirms, both CLI ends race direct QUIC keyed by the
+ceremony secret, **beside** the authenticated WebRTC link. The WebRTC link is
+never torn down to make room for the race: the transfer is offered and starts
+on it immediately, and it keeps serving if QUIC never comes up (no rebuild, no
+gap). This replaces "Option A", which dropped the WebRTC link at confirmation
+and made every cross-network code transfer wait the 1.35 to 1.5 s QUIC took to
+come up before its first byte.
+
+A race that wins yields a verified (authenticated, MAC-checked) direct link
+held as a standby. The two ends move to it at a frame boundary with one round
+trip on the **serving** channel, led by the sender (the end whose frames must
+stop):
+
+- `{ type:"path-promote", v:1 }` sender → receiver, on the serving channel,
+  written only after the last data frame the sender puts on that channel. The
+  sender sends no further frames anywhere until it has an answer; its control
+  messages keep riding the serving channel.
+- `{ type:"path-promoted", v:1 }` receiver → sender, on the serving channel.
+  Sent only when the receiver holds its own verified direct link. Because the
+  serving channel is one ordered channel, the receiver has processed every
+  frame that preceded the ask when it answers. It then installs the direct link
+  in place of the WebRTC one in a single step.
+- `{ type:"path-declined", v:1 }` receiver → sender: no direct link here (none
+  armed, or its race lost at its deadline). Nothing moves.
+- `{ type:"path-stay", v:1 }` sender → receiver: the sender stopped waiting for
+  an answer (a backstop longer than the receiver's own race budget). The
+  receiver must not move after it.
+
+On `path-promoted` the sender's frames resume on the direct link from the next
+chunk, at their absolute offsets: nothing is re-offered and nothing is resent,
+and `file-end` follows the remaining frames on the direct link. The ordering
+guarantee is the point of the round trip: no frame and no `file-end` can reach
+the receiver on the direct link before every byte the WebRTC link carried has
+been dispatched (receivers write at absolute offsets, so this is the only
+property the move needs). Both ends keep reading the retired WebRTC channel for
+a short grace (the drop-close grace, 2 s) so a message the peer queued on it
+just before moving is still delivered, then close it.
+
+Invariants this preserves: the direct link is adopted exactly as before
+(born untrusted, keyed by the ephemeral ceremony secret, never owner-equivalent);
+the race's pending is never reaped while its winner waits for the handoff, so
+the adoption always sees it; nothing is ever destroyed without an armed
+successor (`proofs/transport_upgrade_model.py`, design `PATHSET`). When the
+serving link dies while the race runs, the winner is adopted at once, as before.
+A browser peer never races (it announces `direct:false`), so it never sees these
+messages.
+
+**Mixed versions.** Each CLI's `pake-msg` carries `handoff: 1` beside
+`direct: true`. The make-before-break promotion runs only when the peer's
+`pake-msg` carried it. A peer without it (0.9.1 and earlier) tears its own
+WebRTC link down at confirm and never answers `path-promote`, so against such a
+peer the promotion behaves exactly as before: the WebRTC link is replaced at
+confirm and the direct link is adopted when the race wins. No frame gate is
+ever closed toward a peer that cannot answer it. The field is advisory and rides
+the opaque relay like `direct`; stripping it only selects the old behaviour.
+
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or
 pass a custom keyword — collisions are rejected). Say it aloud; the other side

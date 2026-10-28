@@ -64,8 +64,11 @@ one destroyed in order to try the other — is not representable in either. They
 stayed green through every defect below, and a clean run from an instrument that
 cannot represent the fault is not evidence.
 
-After the PAKE ceremony the code drops the authenticated WebRTC link and races a
-direct-QUIC dial ("Option A"). Six separate fixes over three days were each a way
+After the PAKE ceremony the code dropped the authenticated WebRTC link and raced a
+direct-QUIC dial ("Option A"). Main now runs the model's `PATHSET` design instead
+(make-before-break: the WebRTC link keeps serving and hands over to QUIC at a frame
+boundary, CONTRACT.md "Post-PAKE promotion"), and the model's gate pins that: it
+fails if a promotion teardown grows back in `start_direct_inner`. Six separate fixes over three days were each a way
 of making the resulting gap smaller: reordering `establish()`, carrying
 `expected_secret` across the rebuild, `DirectIntent::Promote`, the
 `direct_pending` removal that precedes a `bind_endpoint` failure, sync-digest
