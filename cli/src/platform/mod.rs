@@ -2235,12 +2235,47 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        stop_std_handle_inheritance();
     }
     #[cfg(not(any(unix, windows)))]
     {
         anyhow::bail!("detached spawn is not supported on this platform");
     }
     Ok(cmd.spawn()?)
+}
+
+/// Keep this process's own stdin/stdout/stderr out of a detached daemon.
+///
+/// Windows `CreateProcess` is called with handle inheritance on (it has to be,
+/// for the log file the daemon writes to), and that passes on EVERY inheritable
+/// handle this process holds, not only the three it was given. A `tunlion`
+/// started with its output captured (PowerShell `$x = tunlion up --detach`, a
+/// redirect, a CI step, a scheduled task wrapper) holds the capturing pipe as
+/// an inheritable stdout, so the daemon kept a stray copy of it for its whole
+/// life and the caller waited for an end of file that never came: `up
+/// --detach` printed "serving" and never returned (observed on a real
+/// windows-latest runner, a 54-minute hang until the job was cancelled).
+/// Unix is unaffected: Rust opens every descriptor close-on-exec and the
+/// child's 0/1/2 are replaced.
+///
+/// Clearing the inherit flag on our three standard handles is enough and is
+/// safe for later spawns: a child given `Stdio::inherit()` receives a fresh
+/// inheritable duplicate, not the original handle.
+#[cfg(windows)]
+fn stop_std_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle has no preconditions; SetHandleInformation only
+        // changes a flag on a handle this process owns and fails cleanly on a
+        // null or invalid one.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 // --------------------------------------------------- process identity --
@@ -4232,5 +4267,73 @@ pub async fn l3_state_over_control() -> Option<serde_json::Value> {
     #[cfg(not(unix))]
     {
         None
+    }
+}
+
+/// `up --detach` from a caller that captures its output must return: the
+/// detached daemon may not keep the caller's pipe open (see
+/// `stop_std_handle_inheritance`). Real processes and a real pipe; Windows only,
+/// because that is where handle inheritance passes the pipe on.
+#[cfg(all(test, windows))]
+mod detach_inheritance_tests {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    const MIDDLE_ENV: &str = "TUNLION_TEST_DETACH_MIDDLE_LOG";
+    const TEST_PATH: &str = "platform::detach_inheritance_tests::a_detached_child_does_not_hold_the_callers_output_open";
+
+    #[test]
+    fn a_detached_child_does_not_hold_the_callers_output_open() {
+        // Middle role: this same test binary, run by the outer test with its
+        // stdout on a pipe. It starts a long-lived detached grandchild exactly
+        // as `up --detach` starts the daemon, prints the pid, and exits.
+        if let Ok(log) = std::env::var(MIDDLE_ENV) {
+            let ping = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()))
+                .join("System32\\PING.EXE");
+            let child = super::spawn_detached(&ping, &["-n", "60", "127.0.0.1"], std::path::Path::new(&log))
+                .expect("spawn_detached");
+            println!("GRANDCHILD={}", child.id());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tunlion-detach-inherit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("grandchild.log");
+        let exe = std::env::current_exe().unwrap();
+        let mut middle = super::command(&exe)
+            .args([TEST_PATH, "--exact", "--nocapture", "--test-threads=1"])
+            .env(MIDDLE_ENV, &log)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut out = middle.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = out.read_to_string(&mut text);
+            let _ = tx.send(text);
+        });
+        let status = middle.wait().unwrap();
+        // ping -n 60 lives about 59 s. EOF must come when the middle exits,
+        // not when the grandchild does.
+        let got = rx.recv_timeout(Duration::from_secs(20));
+        let text = got.as_deref().unwrap_or("");
+        let grandchild = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("GRANDCHILD="))
+            .and_then(|p| p.trim().parse::<u32>().ok());
+        if let Some(pid) = grandchild {
+            let _ = super::command("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "middle process failed: {status}");
+        assert!(grandchild.is_some(), "middle never reported its detached child; output: {text:?}");
+        assert!(
+            got.is_ok(),
+            "the caller's stdout pipe stayed open after the middle exited ({:?}): the detached child inherited it",
+            started.elapsed()
+        );
     }
 }
