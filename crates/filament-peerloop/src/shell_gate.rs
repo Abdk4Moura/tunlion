@@ -288,7 +288,7 @@ pub fn sibling_transfer_facts(conn: &Conn, pid: &str) -> SiblingTransferFacts {
     let Some(l) = conn.link(pid) else {
         return SiblingTransferFacts::default();
     };
-    let is_sibling = matches!(l.principal_kind, PrincipalKind::FleetDevice);
+    let is_sibling = l.is_sibling_link();
     let record_grant = is_sibling
         && l.fleet_proven()
         && l

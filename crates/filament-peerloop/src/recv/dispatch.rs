@@ -3358,7 +3358,7 @@ async fn recv_run(
             // this tick (the sweep below closes it), not on its next open.
             let now_s = identity::now_secs();
             if conn.links.values().any(|l| {
-                matches!(l.principal_kind, cap::PrincipalKind::FleetDevice)
+                l.is_sibling_link()
                     && l.identity_cert_expires.is_some_and(|e| e <= now_s)
             }) {
                 revocation_sweep_now = true;
@@ -3413,7 +3413,7 @@ async fn recv_run(
                         // out. Sibling links exist only because of that
                         // certificate, so nothing is left to carry.
                         let sibling_cut = crate::recv::revocation::sibling_link_must_close(
-                            matches!(l.principal_kind, cap::PrincipalKind::FleetDevice),
+                            l.is_sibling_link(),
                             l.identity_device_pub.as_ref(),
                             l.identity_cert_expires,
                             identity::now_secs(),
