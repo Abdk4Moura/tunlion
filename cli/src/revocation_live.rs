@@ -105,8 +105,7 @@ pub(crate) struct LinkFacts<'a> {
 /// one whose proven key is on the key revocation list (a forgotten live
 /// certificate, which has no record left for any other check to find).
 ///
-/// Deliberately NOT here: a device revoked IN PLACE (`revoke --certificate`,
-/// `devices revoke`), whose record stays. Every open on its link meets the
+/// Deliberately NOT here: a device revoked IN PLACE (`demote --to cut`), whose record stays. Every open on its link meets the
 /// capability gate, which refuses it with the reason ("device revoked"), and
 /// that reason reaching the device is worth keeping. Its overlay route is
 /// withdrawn separately (`route_must_withdraw`).

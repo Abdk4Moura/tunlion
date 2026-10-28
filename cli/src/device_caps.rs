@@ -149,7 +149,7 @@ pub(crate) fn device_allows(name: &str, capability: &str) -> bool {
 /// policy never read caps: `ShellPolicy::All => true`, name and caps ignored.
 /// So the command printed "revoked 'shell' from 'X'" and the shell kept
 /// working. Worse for a vouched record, which has no certificate, so
-/// `revoke --certificate` bailed too and NEITHER verb could reach it. The
+/// the certificate revoke bailed too and NEITHER verb could reach it. The
 /// operator ran the security verb, got a success line, and lost nothing.
 ///
 /// A grant is a capability. A revoke is a DECISION, and a decision has to

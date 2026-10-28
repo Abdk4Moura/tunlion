@@ -240,8 +240,22 @@ pub(crate) fn action_argv(verb: &str, a: &Value, is_known: &dyn Fn(&str) -> bool
     Ok(match verb {
         "grant" => { let (d, c) = (device()?, cap()?); [v(&["grant"]), vec![d, c], v(&["-y"])].concat() }
         "revoke-cap" => { let (d, c) = (device()?, cap()?); [v(&["revoke"]), vec![d, c], v(&["-y"])].concat() }
-        "cut" => [v(&["devices", "revoke"]), vec![device()?], v(&["-y"])].concat(),
-        "restore" => [v(&["devices", "restore"]), vec![device()?], v(&["-y"])].concat(),
+        "cut" => [v(&["demote"]), vec![device()?], v(&["--to", "cut", "-y"])].concat(),
+        "restore" => [v(&["promote"]), vec![device()?], v(&["-y"])].concat(),
+        // The ladder: one step, or `to` a named rung.
+        "promote" | "demote" => {
+            let d = device()?;
+            let to = s("to");
+            let mut argv = [vec![verb.to_string()], vec![d]].concat();
+            if !to.is_empty() {
+                let Some(r) = crate::ladder::Rung::parse(&to) else {
+                    return Err("Pick a rung: cut, paired, device or shell.".to_string());
+                };
+                argv.extend(v(&["--to", r.word()]));
+            }
+            argv.push("-y".to_string());
+            argv
+        }
         "forget" => [v(&["devices", "forget"]), vec![device()?], v(&["-y"])].concat(),
         "approve" => {
             let (i, c, dur) = (id()?, cap()?, s("for"));
@@ -395,6 +409,7 @@ async fn state_json() -> Value {
         "daemon": { "running": crate::shell_support::daemon_alive().is_some(), "answering": pending.is_some() },
         "devices": devices,
         "perms": perms,
+        "ladder": crate::ladder::dashboard_ladder(),
         "requests": requests,
         "history": daemon_log_tail(300),
     })
@@ -883,7 +898,14 @@ mod tests {
         assert_eq!(a, ["requests", "approve", "3", "--allow", "shell", "--for", "1d", "-y"]);
         assert!(action_argv("approve", &json!({"id": 3, "cap": "shell", "for": "forever"}), &known).is_err());
         assert!(action_argv("approve", &json!({"id": "3", "cap": "shell", "for": "1d"}), &known).is_err());
-        assert_eq!(action_argv("cut", &json!({"device": "web-vps"}), &known).unwrap(), ["devices", "revoke", "web-vps", "-y"]);
+        assert_eq!(action_argv("cut", &json!({"device": "web-vps"}), &known).unwrap(), ["demote", "web-vps", "--to", "cut", "-y"]);
+        assert_eq!(action_argv("promote", &json!({"device": "laptop"}), &known).unwrap(), ["promote", "laptop", "-y"]);
+        assert_eq!(
+            action_argv("demote", &json!({"device": "laptop", "to": "cut"}), &known).unwrap(),
+            ["demote", "laptop", "--to", "cut", "-y"]
+        );
+        assert!(action_argv("promote", &json!({"device": "laptop", "to": "--json"}), &known).is_err());
+        assert!(action_argv("promote", &json!({"device": "nobody"}), &known).is_err());
     }
 
     #[test]

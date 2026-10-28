@@ -460,7 +460,7 @@ pub fn enrollment_refusal(prior: &Value) -> Option<String> {
     let revoked = prior["certRevoked"].as_bool() == Some(true)
         || prior["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED);
     revoked.then(|| {
-        "this device was revoked; the owner must run 'tunlion devices restore <name>' to allow it back"
+        "this device was revoked; the owner must run 'tunlion promote <name>' to allow it back"
             .to_string()
     })
 }
@@ -485,7 +485,7 @@ mod tests {
         let record = json!({"certRevoked": true});
         assert!(enrollment_refusal(&record)
             .unwrap()
-            .contains("devices restore"));
+            .contains("tunlion promote"));
         let lapsed = json!({"principalState": PRINCIPAL_STATE_LAPSED});
         assert!(enrollment_refusal(&lapsed).is_none());
     }

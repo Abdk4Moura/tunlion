@@ -159,7 +159,7 @@ run_arm() {
   echo "  joined as ${dev:-<none>}, certificate expires at $before"
 
   if [ "$revoke" = "yes" ]; then
-    own revoke "$dev" --certificate --yes 2>&1 | tail -1
+    own demote "$dev" --to cut --yes 2>&1 | tail -1
     echo "  certificate revoked on the owner"
   fi
 

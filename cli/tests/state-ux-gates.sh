@@ -16,7 +16,7 @@
 #      print "joined your fleet" while every send was declined "device revoked").
 #   P  `add --for person --name <one of my devices>` is refused with the reason
 #      before any code is minted (it silently re-enrolled it as fleet).
-#   F2 `devices restore` of a FORGOTTEN device lifts the key block and says to
+#   F2 `promote` of a FORGOTTEN device lifts the key block and says to
 #      re-add it; restore of a name nobody had exits 3.
 #   Q  a default-verbosity `add <device>` + `join <code>` prints its steps and
 #      the outcome, and no internal trace lines (peer=, source paths, ICE urls).
@@ -157,12 +157,12 @@ if [ $PR -eq 2 ] && grep -q "already one of your devices" "$WORK/p.log" \
 else bad "P person names own device (rc=$PR)"; tail -n 5 "$WORK/p.log"; fi
 
 # --------------------------------------------------------------------- F2 --
-say "F2: devices restore lifts a forget's key block"
+say "F2: promote lifts a forget's key block"
 t "$OWN" devices forget d1 -y >"$WORK/f2-forget.log" 2>&1
 B2=$(revoked_named "$OWN" d1)
-t "$OWN" devices restore d1 >"$WORK/f2-restore.log" 2>&1; F2R=$?
+t "$OWN" promote d1 >"$WORK/f2-restore.log" 2>&1; F2R=$?
 A2=$(revoked_named "$OWN" d1)
-t "$OWN" devices restore nobody-here >"$WORK/f2-none.log" 2>&1; F2N=$?
+t "$OWN" promote nobody-here >"$WORK/f2-none.log" 2>&1; F2N=$?
 if [ "$B2" -ge 1 ] && [ "$A2" -eq 0 ] && [ $F2R -eq 0 ] \
    && grep -q "tunlion add d1" "$WORK/f2-restore.log" && [ $F2N -eq 3 ]; then
   ok "F2: restore of a forgotten device lifted its block ($B2 -> $A2) and named the re-add; an unknown name exits 3"

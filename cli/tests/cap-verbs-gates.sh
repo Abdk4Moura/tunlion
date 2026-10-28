@@ -13,7 +13,7 @@
 #   A  #226 grant refuses — a device enrolled with the default ceiling
 #      (transfer, mount) cannot be granted shell; refusal names the ceiling.
 #   B  #228 revoke refuses — a capability inside the ceiling cannot be revoked;
-#      refusal names `revoke <device> --certificate`.
+#      refusal names `demote <device> --to cut`.
 #   C  devices shows the ceiling — the row and the --json caps field list the
 #      ceiling, never a shell the verb claimed to grant.
 #   D  an already-covered grant is an idempotent success (exit 0), and A's
@@ -81,7 +81,7 @@ else
 fi
 
 # ===================================================================== GATE B ==
-# #228: revoke a capability inside the ceiling must refuse, naming --certificate.
+# #228: revoke a capability inside the ceiling must refuse, naming `demote --to cut`.
 say B
 enroll golf --allow mount
 OUTB=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke golf mount --yes 2>&1)
@@ -89,8 +89,8 @@ rcB=$?
 echo "## (revoke mount) rc=$rcB"
 echo "$OUTB" | sed 's/^/    /'
 if [ "$rcB" != "0" ] && echo "$OUTB" | grep -q "comes from the enrollment ceiling" \
-   && echo "$OUTB" | grep -q -- "--certificate"; then
-  ok "gateB: revoke inside the ceiling REFUSED (names --certificate)"
+   && echo "$OUTB" | grep -q -- "demote .* --to cut"; then
+  ok "gateB: revoke inside the ceiling REFUSED (names demote --to cut)"
 else
   bad "gateB: revoke inside the ceiling NOT refused (rc=$rcB)"
 fi

@@ -104,6 +104,8 @@ mod membership;
 mod pair_cmd;
 /// One spelling rule for device names, and the forgiving lookup.
 mod device_names;
+/// `tunlion promote` / `tunlion demote`: one ladder for what a device may do.
+mod ladder;
 mod preconnect;
 mod access_ui;
 mod temporary_session;
@@ -958,7 +960,7 @@ fn enrollment_refusal(prior: &Value) -> Option<String> {
     let revoked = prior["certRevoked"].as_bool() == Some(true)
         || prior["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED);
     if revoked {
-        Some("this device was revoked; the owner must run 'tunlion devices restore <name>' to allow it back".to_string())
+        Some("this device was revoked; the owner must run 'tunlion promote <name>' to allow it back".to_string())
     } else {
         None
     }
@@ -1357,7 +1359,7 @@ fn local_request(id: u64) -> Option<PendingRequest> {
     load_requests().into_iter().find(|request| request.id == id)
 }
 
-fn warm_device_names(value: Option<&Value>) -> HashSet<String> {
+pub(crate) fn warm_device_names(value: Option<&Value>) -> HashSet<String> {
     value
         .and_then(|v| v.get("links"))
         .and_then(Value::as_array)

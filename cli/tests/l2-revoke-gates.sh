@@ -90,7 +90,7 @@ fi
 say B
 REASON="l2: peer revoked, closing the live stream"
 reason_before=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
-env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" demote bravo --to cut --yes >"$WORK/revoke.out" 2>&1
 revoke_rc=$?
 sleep "$GRACE"
 reason_after=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)

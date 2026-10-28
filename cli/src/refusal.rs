@@ -118,7 +118,7 @@ pub(crate) fn remedy_with(
             )
         }
         Code::CertRevoked => {
-            let cmd = format!("tunlion devices restore {me_w}");
+            let cmd = format!("tunlion promote {me_w}");
             (
                 format!(
                     "'{peer}' revoked this device's certificate. Its owner can restore it, on '{peer}':"

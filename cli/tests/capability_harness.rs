@@ -715,12 +715,12 @@ fn revoked_device_first_transfer_is_denied() {
     // 2. Durable revoke: A is no longer recognized on B.
     let revoke = Command::new(&bin)
         .env("TUNLION_CONFIG_DIR", &h.b_dir)
-        .args(["devices", "revoke", "test-a", "--yes"])
+        .args(["demote", "test-a", "--to", "cut", "--yes"])
         .output()
         .expect("revoke");
     assert!(
         revoke.status.success(),
-        "devices revoke failed: {}",
+        "demote --to cut failed: {}",
         String::from_utf8_lossy(&revoke.stderr)
     );
 
@@ -1023,12 +1023,12 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
     // 5. Revoke A on B.
     let revoke = Command::new(&bin)
         .env("TUNLION_CONFIG_DIR", &h.b_dir)
-        .args(["devices", "revoke", "test-a", "--yes"])
+        .args(["demote", "test-a", "--to", "cut", "--yes"])
         .output()
         .expect("revoke");
     assert!(
         revoke.status.success(),
-        "devices revoke failed: {}",
+        "demote --to cut failed: {}",
         String::from_utf8_lossy(&revoke.stderr)
     );
 

@@ -81,10 +81,10 @@ echo "$pre" | grep -q "PRE-OK" \
 # Revoke bravo's certificate on the owner. Its exit code is asserted: a revoke
 # that failed leaves bravo valid, and then the refusal below would be measuring
 # something other than revocation.
-fs_cli 45 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+fs_cli 45 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" demote bravo --to cut --yes >/dev/null 2>&1
 rc_revoke=$(fs_rc)
-echo "## revoke bravo --certificate rc=$rc_revoke"
-[ "$rc_revoke" = "0" ] || bad "gateB-revoke: revoke bravo --certificate failed (rc=$rc_revoke: $(fs_out | tail -2 | tr '\n' ' '))"
+echo "## demote bravo --to cut rc=$rc_revoke"
+[ "$rc_revoke" = "0" ] || bad "gateB-revoke: demote bravo --to cut failed (rc=$rc_revoke: $(fs_out | tail -2 | tr '\n' ' '))"
 # The owner names the reason in its log on every refusal (fleet-cert gateD greps
 # the same line). Counted, so gateB2 can require a NEW refusal of its own.
 refusals() { grep -c "pty refused: bravo: device revoked" "$WORK/up.log" 2>/dev/null || true; }

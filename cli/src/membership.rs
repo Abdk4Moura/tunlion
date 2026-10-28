@@ -189,7 +189,57 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
     Ok(())
 }
 
+/// What `devices vouch a b` may do. Pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VouchDecision {
+    /// Both are your own certified devices: introduce them (a plain pairing
+    /// secret, nothing more; their certificates are what make them yours).
+    Introduce,
+    /// One side is someone else's device, or only paired: its person must
+    /// agree on that device, so the introduction is refused and the code
+    /// pairing that does need their OK is named.
+    NeedsConsent(String),
+}
+
+/// The rule. A vouch is one hop of trust the OTHER device never agreed to,
+/// so it is only made between devices this owner already certified; anything
+/// else goes through a code its person types (`add --for person` + `join`),
+/// which can only create a pairing that sends files. Pure.
+pub(crate) fn vouch_decision(a: Option<&crate::ladder::Facts>, b: Option<&crate::ladder::Facts>) -> VouchDecision {
+    for f in [a, b].into_iter().flatten() {
+        if f.kind != crate::ladder::Kind::Mine || !f.certified_mine || f.revoked {
+            return VouchDecision::NeedsConsent(f.name.clone());
+        }
+    }
+    VouchDecision::Introduce
+}
+
+/// The refusal for [`VouchDecision::NeedsConsent`], with the steps. Pure.
+pub(crate) fn vouch_needs_consent_msg(who: &str, a: &str, b: &str) -> String {
+    let other = if who == a { b } else { a };
+    let w = crate::refusal::word(who);
+    format!(
+        "{who} is not one of your certified devices right now (someone else's, only paired, or cut off), so nothing was introduced: an introduction adds a device it never agreed to.\n  \
+         If {who} is yours, make it one first:  tunlion promote {w}\n  \
+         If it is someone else's, its person agrees by pairing with a code (files only): on {other} run  tunlion add --for person --name {w}  and on {who}  tunlion join <code>"
+    )
+}
+
 pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()> {
+    match vouch_decision(crate::ladder::facts_for(a).as_ref(), crate::ladder::facts_for(b).as_ref()) {
+        VouchDecision::NeedsConsent(who) => {
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::Denied,
+                vouch_needs_consent_msg(&who, a, b),
+            ));
+        }
+        VouchDecision::Introduce => {
+            ui::say(&ui::paint(
+                ui::Tone::Dim,
+                &format!("  {a} and {b} are both your devices; this gives them a direct pairing (files), their certificates stay what makes them yours"),
+            ));
+        }
+    }
     let store = devices_load();
     let find = |n: &str| {
         store
@@ -528,6 +578,42 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
 
 #[cfg(test)]
 mod depart_tests {
+    use super::{vouch_decision, vouch_needs_consent_msg, VouchDecision};
+
+    fn f(name: &str, kind: crate::ladder::Kind, certified: bool) -> crate::ladder::Facts {
+        crate::ladder::Facts {
+            name: name.into(),
+            kind,
+            revoked: false,
+            certified_mine: certified,
+            caps: vec!["transfer".into()],
+            owner_here: true,
+            ceiling: vec![],
+        }
+    }
+
+    /// Security: vouch cannot bring a third party into the owner's devices or
+    /// into someone else's device; only two of the owner's certified devices.
+    #[test]
+    fn vouch_is_only_between_your_own_certified_devices() {
+        use crate::ladder::Kind;
+        let mine = f("laptop", Kind::Mine, true);
+        let desk = f("desk", Kind::Mine, true);
+        assert_eq!(vouch_decision(Some(&mine), Some(&desk)), VouchDecision::Introduce);
+        let carol = f("carol", Kind::Theirs, false);
+        assert_eq!(vouch_decision(Some(&mine), Some(&carol)), VouchDecision::NeedsConsent("carol".into()));
+        assert_eq!(vouch_decision(Some(&carol), Some(&mine)), VouchDecision::NeedsConsent("carol".into()));
+        let paired = f("pop-os", Kind::Mine, false);
+        assert_eq!(vouch_decision(Some(&mine), Some(&paired)), VouchDecision::NeedsConsent("pop-os".into()));
+        let cut = crate::ladder::Facts { revoked: true, ..f("old", Kind::Mine, true) };
+        assert_eq!(vouch_decision(Some(&cut), Some(&mine)), VouchDecision::NeedsConsent("old".into()));
+        // An unknown name decides nothing here (the lookup below says so).
+        assert_eq!(vouch_decision(None, Some(&mine)), VouchDecision::Introduce);
+        let msg = vouch_needs_consent_msg("carol", "laptop", "carol");
+        assert!(msg.contains("tunlion add --for person --name carol"), "{msg}");
+        assert!(msg.contains("tunlion promote carol"), "{msg}");
+    }
+
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};

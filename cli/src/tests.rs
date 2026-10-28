@@ -4164,7 +4164,7 @@ fn capability_revoke_warning_only_live_same_owner_cert() {
     .unwrap();
     let warning = fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 150).unwrap();
     assert!(warning.contains("laptop still has fleet access via its certificate"));
-    assert!(warning.contains("tunlion revoke laptop --certificate"));
+    assert!(warning.contains("tunlion demote laptop --to cut"));
     assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
     assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
 }
@@ -5425,9 +5425,9 @@ fn every_reenrolment_recipe_runs_as_printed_in_a_script() {
                 Some(crate::Cmd::Down)
                     | Some(crate::Cmd::Reset)
                     | Some(crate::Cmd::Add { .. })
+                    | Some(crate::Cmd::Demote { .. })
                     | Some(crate::Cmd::Devices {
-                        action: Some(crate::DevicesAction::Forget { .. })
-                            | Some(crate::DevicesAction::Revoke { .. }),
+                        action: Some(crate::DevicesAction::Forget { .. }),
                         ..
                     })
             );
@@ -5592,7 +5592,7 @@ fn a_barred_device_is_named_for_why_and_live_devices_are_not_barred() {
 
     let r = request_bar_refusal(2, "guest2", RequestBar::Revoked);
     assert!(
-        r.contains("revoked") && r.contains("tunlion devices restore guest2"),
+        r.contains("revoked") && r.contains("tunlion promote guest2"),
         "{r}"
     );
     let e = request_bar_refusal(2, "guest2", RequestBar::Expired(10));

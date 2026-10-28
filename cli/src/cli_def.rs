@@ -44,7 +44,8 @@ COMMANDS
     devices                list your known devices
     requests               approve or deny access others asked for
     dashboard              devices, people, codes and asks in your browser
-    grant / revoke         give or take a capability on a device
+    promote / demote       move a device a step: cut off, paired, your device, + shell
+    grant / revoke         give or take one capability on a device
     add --for runner       a temporary key for a CI or borrowed box; it runs `tunlion join <file>` (--reuse N for several)
     status                 what the daemon is doing / recently received
   Mesh
@@ -174,7 +175,7 @@ pub(crate) struct Cli {
     /// Independent of TTY: a pipe still gets human text unless --json is set.
     #[arg(long, global = true)]
     pub(crate) json: bool,
-    /// Auto-confirm prompts: down, reset, revoke, devices revoke, devices
+    /// Auto-confirm prompts: down, reset, revoke, demote, devices
     /// forget, unmount, unexpose, set --reset, add --for with remote
     /// authority, and init. Required for these from a non-TTY; a TTY
     /// prompts instead.
@@ -777,19 +778,43 @@ pub(crate) enum Cmd {
         #[arg(long, conflicts_with = "tag")]
         user: bool,
     },
-    /// Revoke a capability or a fleet certificate from a known device.
+    /// Revoke one capability from a known device. To move a device a whole
+    /// step (cut off, paired, your device, your device + shell), use
+    /// `tunlion demote` / `tunlion promote`.
     Revoke {
         /// Known device (petname)
         device: String,
         /// Capability to revoke (e.g. `shell`)
         capability: Option<String>,
-        /// Revoke the device's local fleet certificate instead of a capability.
-        #[arg(long)]
-        certificate: bool,
         /// Revoke a user-wide grant (one made with `grant --user`), which
         /// removes it from every device of that user.
-        #[arg(long, conflicts_with = "certificate")]
+        #[arg(long)]
         user: bool,
+    },
+    /// Move a device one step up its ladder: cut off > paired > your device >
+    /// your device + shell. `--to` jumps. At a terminal with no device, pick
+    /// one. Someone else's device moves through capability presets instead.
+    Promote {
+        /// Known device (petname); omit at a terminal to pick one
+        device: Option<String>,
+        /// Jump to a rung: cut, paired, device or shell
+        #[arg(long, value_name = "RUNG")]
+        to: Option<String>,
+        /// Machine-readable JSON result
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move a device one step down its ladder: your device + shell > your
+    /// device > paired > cut off. `--to cut` cuts it off now.
+    Demote {
+        /// Known device (petname); omit at a terminal to pick one
+        device: Option<String>,
+        /// Jump to a rung: cut, paired, device or shell
+        #[arg(long, value_name = "RUNG")]
+        to: Option<String>,
+        /// Machine-readable JSON result
+        #[arg(long)]
+        json: bool,
     },
     /// Mount a remote directory over Tunlion's native filesystem protocol.
     /// Read-only is the default; the remote share root and grant remain authoritative.
@@ -1106,12 +1131,6 @@ pub(crate) enum DevicesAction {
     /// Vouch between two known devices: mints a fresh secret and delivers it
     /// to both over verified channels (run on the device that knows both)
     Vouch { a: String, b: String },
-    /// Durable revoke: the device stops being recognized NOW and forever (the
-    /// record survives as evidence; the gate refuses it on reconnect).
-    Revoke { name: String },
-    /// Undo a revoke (the device returns to its prior record), or lift the
-    /// key block a `forget` left behind (then re-add it with `tunlion add`).
-    Restore { name: String },
 }
 
 #[cfg(test)]

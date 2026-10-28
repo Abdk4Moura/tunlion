@@ -13,6 +13,25 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
+### Added
+
+- `tunlion promote` / `tunlion demote`: one ladder for what a device may do
+  (cut off, paired, your device, your device + shell; for someone else's
+  device: files, files + your shared folder, + shell). One step at a time or
+  `--to <rung>`, `--json`, the exact undo command after every move, and an
+  interactive picker at a terminal (also under More, and on the dashboard's
+  device page).
+
+### Changed
+
+- Removed `revoke --certificate`, `devices revoke` and `devices restore`:
+  `tunlion demote <device> --to cut` and `tunlion promote <device>` replace
+  them. `grant` / `revoke <device> <capability>` stay for single capabilities.
+- `devices vouch` introduces only between two of your own certified devices;
+  for anyone else it names the code pairing their person has to accept. A
+  daemon now ignores an introduction from a device that is not its own
+  owner's.
+
 ## [0.9.1] - 2026-10-26
 
 ### Added

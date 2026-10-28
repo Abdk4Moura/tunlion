@@ -294,7 +294,7 @@ impl IdentityService {
                 .update_peer_identity(&petname, &cert, VOUCH_CERT_SCOPE)
             {
                 Ok(()) => self.log.say(&format!(
-                    "  {} first identity for '{}' pinned; `tunlion revoke {} --certificate` can now reach it",
+                    "  {} first identity for '{}' pinned; `tunlion demote {} --to cut` can now reach it",
                     self.log.paint(Tone::Ok, self.log.glyph_ok()),
                     petname,
                     petname

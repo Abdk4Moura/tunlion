@@ -35,7 +35,7 @@ pub const REQUEST_WITHDRAWN: &str = "withdrawn";
 /// Why a device can neither file an access request nor have one approved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestBar {
-    /// Revoked here (`devices revoke`), or its key is refused (forgotten).
+    /// Revoked here (`demote --to cut`), or its key is refused (forgotten).
     Revoked,
     /// The invitation that admitted it ended at this time.
     Expired(u64),
@@ -50,7 +50,7 @@ pub fn request_bar_refusal(id: u64, peer: &str, bar: RequestBar) -> String {
     match bar {
         RequestBar::Revoked => format!(
             "request {id} is from '{peer}', which is revoked here; approving cannot let it in. \
-             To restore it, run:  tunlion devices restore {w}"
+             To restore it, run:  tunlion promote {w}"
         ),
         RequestBar::Expired(at) => format!(
             "request {id} is from '{peer}', whose access expired {}; approving cannot extend it. \
@@ -65,7 +65,7 @@ pub fn request_bar_refusal(id: u64, peer: &str, bar: RequestBar) -> String {
 }
 
 /// A name as a command word: quoted when it contains whitespace or a quote, so
-/// a petname copied into `tunlion devices restore ...` stays one argument.
+/// a petname copied into `tunlion promote ...` stays one argument.
 /// Pure. Moved here from `cli::refusal` so the two sentences that quote a peer
 /// use one rule.
 pub fn word(s: &str) -> String {
@@ -84,8 +84,50 @@ pub fn format_approval_expiry(expires: u64) -> String {
         .unwrap_or_else(|| expires.to_string())
 }
 
+/// May the paired device `hub` introduce a new device into this store?
+///
+/// An introduction (`devices vouch`) stores a pairing secret this device never
+/// agreed to by itself. That is only this device's owner's decision to make,
+/// so it is accepted only from a device certified by THE SAME OWNER as this
+/// one (`owner` is this device's owner key, from its keystore or its own
+/// certificate). From anyone else (someone else's device, or a plain pairing)
+/// it is refused: the way in for them is a code this device's person types.
+/// Pure over the records.
+pub fn intro_hub_is_same_owner(records: &[serde_json::Value], hub: &str, owner: Option<[u8; 32]>) -> bool {
+    let Some(owner) = owner else { return false };
+    let want = hex::encode(owner);
+    records.iter().any(|r| {
+        r["name"].as_str() == Some(hub)
+            && r["deviceCert"]["userPub"].as_str().is_some_and(|u| u.eq_ignore_ascii_case(&want))
+            && !r["certRevoked"].as_bool().unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    /// `devices vouch` cannot introduce a third party through someone else's
+    /// device or a plain pairing, only through the same owner's own device.
+    #[test]
+    fn only_the_same_owners_device_may_introduce() {
+        let owner = [7u8; 32];
+        let cert = |u: [u8; 32]| json!({"userPub": hex::encode(u), "devicePub": hex::encode([1u8; 32])});
+        let records = vec![
+            json!({"name": "laptop", "deviceCert": cert(owner)}),
+            json!({"name": "carol", "deviceCert": cert([8u8; 32])}),
+            json!({"name": "plain"}),
+            json!({"name": "cut", "deviceCert": cert(owner), "certRevoked": true}),
+        ];
+        assert!(intro_hub_is_same_owner(&records, "laptop", Some(owner)));
+        assert!(!intro_hub_is_same_owner(&records, "carol", Some(owner)), "someone else's device");
+        assert!(!intro_hub_is_same_owner(&records, "plain", Some(owner)), "a plain pairing");
+        assert!(!intro_hub_is_same_owner(&records, "cut", Some(owner)), "a cut-off device");
+        assert!(!intro_hub_is_same_owner(&records, "nobody", Some(owner)));
+        // A device with no identity of its own accepts introductions from nobody.
+        assert!(!intro_hub_is_same_owner(&records, "laptop", None));
+    }
+
     use super::*;
 
     /// The three sentences name the one command that restores access, and an
@@ -94,7 +136,7 @@ mod tests {
     fn a_barred_device_is_named_for_why_and_given_the_restoring_command() {
         let r = request_bar_refusal(2, "guest2", RequestBar::Revoked);
         assert!(
-            r.contains("revoked") && r.contains("tunlion devices restore guest2"),
+            r.contains("revoked") && r.contains("tunlion promote guest2"),
             "{r}"
         );
         let e = request_bar_refusal(2, "guest2", RequestBar::Expired(10));

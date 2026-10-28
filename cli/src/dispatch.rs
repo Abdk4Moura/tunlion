@@ -82,7 +82,6 @@ use crate::reset_cmd;
 use crate::resolve_for_kind;
 use crate::resolve_mount_plan;
 use crate::send_cmd::send_cmd;
-use crate::set_device_cert_revoked;
 use crate::set_device_revoked;
 use crate::settings;
 use crate::sshkeys;
@@ -117,6 +116,8 @@ pub(crate) fn json_supported(cmd: &Cmd) -> bool {
             | Cmd::Addr { .. }
             | Cmd::Devices { action: None, .. }
             | Cmd::Skill { .. }
+            | Cmd::Promote { .. }
+            | Cmd::Demote { .. }
     )
 }
 
@@ -185,6 +186,11 @@ pub(crate) fn devices_json_envelope(rows: Vec<Value>, l3: Value) -> Value {
 /// The daemon's warm-link reply with only the links whose device answered a
 /// liveness ping just now (bounded, in parallel; never establishes anything).
 /// `None` stays `None`: no daemon means the rows assert nothing (#217).
+/// The answering links right now, for screens that show online state.
+pub(crate) async fn answering_links_now() -> Option<Value> {
+    answering_links(ctl::try_list_warm().await).await
+}
+
 async fn answering_links(warm: Option<Value>) -> Option<Value> {
     let mut warm = warm?;
     let names: Vec<String> = crate::warm_device_names(Some(&warm)).into_iter().collect();
@@ -632,6 +638,8 @@ pub(crate) async fn async_main() -> Result<()> {
             Cmd::Status { json } => Some((*json, "status")),
             Cmd::Reach { json, .. } => Some((*json, "reach")),
             Cmd::Doctor { json, .. } => Some((*json, "doctor")),
+            Cmd::Promote { json, .. } => Some((*json, "promote")),
+            Cmd::Demote { json, .. } => Some((*json, "demote")),
             _ => None,
         };
         if let Some((true, verb)) = own_json {
@@ -1706,47 +1714,6 @@ pub(crate) async fn async_main() -> Result<()> {
                 Some(DevicesAction::Vouch { a, b }) => {
                     introduce_cmd(&server, &a, &b, relay).await?;
                 }
-                Some(DevicesAction::Revoke { name }) => {
-                    if !device_record_exists(&name) {
-                        bail!("no device named '{name}', see `tunlion devices`");
-                    }
-                    ui_caps.confirm(&format!("durably revoke {name} (it will stop being recognized and cannot rejoin until restored)"))?;
-                    set_device_revoked(&name, true)?;
-                    crate::withdraw_requests_for(&name);
-                    crate::outln!(
-                        "revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `tunlion devices restore {name}` can)"
-                    );
-                    let answer = crate::revocation_live::tell_daemon().await;
-                    match crate::revocation_live::daemon_line(&name, &answer, false) {
-                        Ok(line) => ui::say(&line),
-                        Err(e) => bail!(e),
-                    }
-                }
-                Some(DevicesAction::Restore { name }) => {
-                    // Eval item 2: restore did nothing for a FORGOTTEN device,
-                    // whose record is gone but whose key stays refused. It now
-                    // undoes both: a revoke (record kept) and the key block a
-                    // forget leaves behind.
-                    let record = device_record_exists(&name);
-                    let revoked = record && crate::device_view::device_record_revoked(&name);
-                    if revoked {
-                        set_device_revoked(&name, false)?;
-                    }
-                    let lifted = crate::fleet_support::lift_key_revocations_named(&name)?;
-                    crate::outln!(
-                        "{}",
-                        crate::fleet_support::restore_report(&name, record, revoked, &lifted)
-                    );
-                    if !record && lifted.is_empty() {
-                        return Err(crate::exit_codes::err(
-                            crate::exit_codes::ExitKind::UnknownDevice,
-                            format!("no device named '{name}', and no forgotten device by that name; see `tunlion devices`"),
-                        ));
-                    }
-                    if revoked || !lifted.is_empty() {
-                        let _ = crate::revocation_live::tell_daemon().await;
-                    }
-                }
             }
             Ok(())
         }
@@ -2107,573 +2074,17 @@ pub(crate) async fn async_main() -> Result<()> {
             capability,
             tag,
             user,
-        } => {
-            let (device, capability) = grant_operands(device, capability, tag.as_deref())?;
-            // Valid on every device or on none: checked before the owner/joined
-            // split, so no advice below can name a spec that would be refused.
-            validate_grant_spec(&capability).map_err(grant_usage)?;
-            // The owner key resolves the RESOURCE, so it is needed before the
-            // capability name is final: `route:10.0.0.0/24` names an owner-bound
-            // resource, while `shell` names "self".
-            let spec = capability;
-            let config_dir = crate::settings::config_dir();
-            let mut store = crate::capability::load_cap_store(&config_dir);
-
-            if let Some(ref t) = tag {
-                // Grant to tag
-                // The tag path SIGNS the CapOp below with the owner keypair, so
-                // unlike the device path it genuinely needs the signing key, not
-                // just the public half. Keep requiring a full identity here.
-                let user_key = crate::identity_flow::ensure_user_key(false)?;
-                let pk = user_key.public_key_bytes();
-                let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
-                let (capability, resource) = (g.action.clone(), g.resource.clone());
-                let target_bytes = crate::capability::make_tag_target(&pk, t);
-                let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
-                let mut op = crate::capability::CapOp {
-                    op: crate::capability::CapOpKind::Grant,
-                    grantor: pk,
-                    target_kind: 0x03,
-                    target: target_bytes,
-                    resource: resource.clone(),
-                    permissions: vec![capability.clone()],
-                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
-                    issued_at: crate::capability::now_secs(),
-                    version: ver,
-                    sig: [0u8; 64],
-                };
-                op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
-                store.push(op.to_json());
-                let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
-                    .context("save cap store")?;
-                crate::outln!("granted '{capability}' to tag '{t}'.");
-                return Ok(());
-            }
-            // grant_operands returns a device whenever there is no --tag.
-            let Some(device) = device else {
-                crate::bail_usage!("name a device: tunlion grant <device> <capability>");
-            };
-            // Device path. The owner PUBLIC key is needed up front for the same
-            // reason as the tag path: it resolves a `route:CIDR` spec to its
-            // owner-bound resource id.
-            //
-            // The SIGNING key, deliberately. Naming the resource would only need
-            // the public half, but the grant below is issued as an owner-signed
-            // CapOp, and a joined device cannot mint one. That restriction is the
-            // security model rather than an oversight: if a fleet member could
-            // sign its own route authorization, any member could authorize any
-            // prefix for itself and the capability would gate nothing.
-            //
-            // Verification is the asymmetric half and needs only the public key,
-            // which is why enforcement uses owner_pub_for_resources() and this
-            // does not. What WAS wrong here is the diagnosis printed on failure:
-            // a joined device has an identity, so "Run `tunlion init` first" is
-            // both false and unactionable. See the error below.
-            let owner_pk = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
-                .ok()
-                .flatten()
-                .map(|k| k.public_key_bytes());
-            let (capability, cap_resource, cap_nonce) = match owner_pk {
-                Some(pk) => {
-                    let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
-                    (g.action, g.resource, g.nonce)
-                }
-                None => {
-                    // No identity: only the legacy self-scoped verbs are possible.
-                    if spec.contains(':') {
-                        // Distinguish "no identity at all" from "an identity that
-                        // cannot sign". Telling a joined device to run `init` is
-                        // wrong twice over: it already has an identity, and init
-                        // is not what would make this work.
-                        if owner_pub_for_resources().is_some() {
-                            bail!(
-                                "'{spec}' must be granted by the fleet owner. This is a joined device, \
-                                 which holds no owner signing key and so cannot issue an owner-signed \
-                                 grant. Run this on the owner's machine:\n  tunlion grant {device} {spec}"
-                            );
-                        }
-                        // U1: not joined and no key, so this is the first use;
-                        // mint the identity and bind the resource to it.
-                        let pk = crate::identity_flow::ensure_user_key(false)?.public_key_bytes();
-                        let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
-                        (g.action, g.resource, g.nonce)
-                    } else {
-                        (
-                            crate::capability::canonical_capability(&spec).map_err(grant_usage)?,
-                            "self".to_string(),
-                            crate::capability::self_resource_nonce(),
-                        )
-                    }
-                }
-            };
-
-            // A delegated device's authority comes from its enrollment ceiling,
-            // which enforcement reads from its fleet certificate; a grant targets
-            // a key the device never presents, so it cannot bind. Refuse rather
-            // than report a success enforcement will not honour.
-            if let Some(ceiling) = principal_ceiling_for(&device) {
-                // A ceiling records an ACTION and nothing else. It has no
-                // resource dimension, so it cannot express WHICH prefix a router
-                // may advertise: `route` in a ceiling means "may carry routes",
-                // not "may carry 10.66.0.0/24". A resource-scoped grant is
-                // therefore strictly NARROWER than the ceiling entry, not
-                // redundant with it, and refusing it as redundant left the
-                // prefix permanently unauthorized: the ceiling satisfied this
-                // check while enforcement, which asks about the prefix-bound
-                // resource id, still found nothing and declined every route.
-                // Only a bare, self-scoped grant can be genuinely redundant.
-                let resource_scoped = cap_resource != "self";
-                // The same decision the pairing hint asks (`grant_vs_ceiling`),
-                // so a hint can never name a grant this refuses.
-                match crate::pair_cmd::grant_vs_ceiling(
-                    Some(ceiling.as_slice()),
-                    &capability,
-                    resource_scoped,
-                ) {
-                    // The state asked for already holds: success, not an
-                    // error. It exited 1, so a provisioning script that
-                    // grants idempotently failed on its second run.
-                    crate::pair_cmd::GrantVsCeiling::AlreadyCovered => {
-                        ui::say(&format!(
-                            "'{capability}' is already granted to '{device}' by its invitation ceiling; nothing to do"
-                        ));
-                        return Ok(());
-                    }
-                    // A decision against the request: the documented
-                    // "denied" exit (4), not the catch-all 1.
-                    _ => {
-                        return Err(crate::exit_codes::err(
-                            crate::exit_codes::ExitKind::Denied,
-                            format!(
-                                "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
-                                ceiling.join(", "),
-                                crate::identity_state::reenrol_steps(
-                                    &device,
-                                    &crate::display_name(),
-                                    &capability,
-                                    &ceiling
-                                )
-                            ),
-                        ));
-                    }
-                }
-            }
-            if user && owner_pk.is_none() {
-                bail!(
-                    "a user-wide grant (--user) is an owner-signed grant to a user key, and this device holds no owner signing key. Run it on the owner's machine, or grant to the device:\n  tunlion grant {device} {spec}"
-                );
-            }
-            // A device with no certified identity (a browser, which pairs by
-            // code and holds only the pairing secret) cannot be the target of an
-            // owner-signed grant. Its pairing permission below is what the gate
-            // honours for it. This used to write that permission, which took
-            // effect, and THEN fail with "identity not available" (exit 1), so
-            // a grant that worked reported that it had not.
-            let signing_key =
-                crate::identity::UserKey::load(&crate::platform::PlatformKeyStore).ok().flatten();
-            let peer_cert = device_cert_for(&device);
-            if signing_key.is_some() && peer_cert.is_none() && user {
-                bail!(
-                    "'{device}' has no certified identity (a browser, or a device paired by code only), so there is no user key to grant to. Grant to the device instead:\n  tunlion grant {device} {spec}"
-                );
-            }
-            device_set_cap(&device, &capability, true, None)?;
-            if signing_key.is_some() && peer_cert.is_none() {
-                ui::say(&format!(
-                    "'{device}' has no certified identity (a browser, or a device paired by code only), so this is a pairing permission, not an owner-signed grant. It takes effect now; `tunlion revoke {device} {capability}` removes it."
-                ));
-            }
-            // If identity layer is active, also issue an owner-signed CapOp
-            if let (Some(user_key), Some(peer_cert)) = (signing_key, peer_cert) {
-                let config_dir = crate::settings::config_dir();
-                let mut store = crate::capability::load_cap_store(&config_dir);
-
-                // Ensure a genesis header exists for the resource being granted.
-                // Keyed by the RESOURCE, so a route prefix gets its own header
-                // rather than riding on "self": each prefix is a distinct
-                // resource with its own succession, which is what lets one
-                // prefix be revoked without touching another.
-                let has_header = store.iter().any(|e| {
-                    e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                        && e["resource"].as_str() == Some(cap_resource.as_str())
-                });
-                if !has_header {
-                    let pk = user_key.public_key_bytes();
-                    // The nonce must match the one the resource id was derived
-                    // from, or the header does not describe the resource it is
-                    // filed under.
-                    let nonce = cap_nonce;
-                    let resource = cap_resource.clone();
-                    let mut hdr = crate::capability::CapHeader {
-                        resource,
-                        epoch: 0,
-                        owner_pub: pk,
-                        nonce,
-                        floors: vec![],
-                        issued_at: crate::capability::now_secs(),
-                        prev_owner_pub: None,
-                        prev_header_hash: None,
-                        sig: [0u8; 64],
-                    };
-                    hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
-                    let mut hdr_json = hdr.to_json();
-                    // The header's signature is over the self-certifying resource id
-                    // (SHA-256(owner_pub||nonce)), but the STORED header has resource="self".
-                    // This signature is decorative: cap_authorize/evaluate never calls
-                    // verify_genesis/verify_sig on the stored header (those run only on
-                    // the grant-creation path, not the authorize path). Consistent with
-                    // Cmd::Grant which does the same. The header is trusted local state
-                    // in the owner's own caps.json, not a cross-verified object.
-                    hdr_json["resource"] = serde_json::json!(cap_resource.clone());
-                    store.push(hdr_json);
-                }
-
-                // Create CapOp: target the peer's DEVICE key from their stored
-                // device cert (not SHA-256 of the device name, which never
-                // matches evaluate()'s principal comparison). Requires the peer
-                // to have a certified identity (paired + identity-expose
-                // completed).
-                //
-                // The DEVICE key, not the user key, unless `--user` says so. A
-                // user-targeted grant matches every device that user certified,
-                // and for a device of my own fleet that user is ME: `grant
-                // laptop shell` granted shell to the whole fleet under
-                // authoritative evaluation. See device_caps::GrantScope.
-                if peer_cert.verify(crate::identity::now_secs()).is_err() {
-                    return Err(anyhow!(
-                        "peer identity cert for '{device}' is expired; re-pair to refresh it"
-                    ));
-                }
-                let scope = if user {
-                    crate::device_caps::GrantScope::User
-                } else {
-                    crate::device_caps::GrantScope::Device
-                };
-
-                // Version must EXCEED everything recorded for this target,
-                // revoke tombstones included: the same monotonic ratchet
-                // `revoke` respects, and apply_cap_op refuses anything at or
-                // below it.
-                let op = crate::device_caps::sign_next_cap_op(
-                    &store,
-                    &user_key,
-                    crate::capability::CapOpKind::Grant,
-                    scope.target(&peer_cert),
-                    &cap_resource,
-                    vec![capability.clone()],
-                    crate::capability::now_secs().saturating_add(90 * 24 * 3600),
-                );
-                // ONE VALIDATED OP-CREATION PATH. `revoke` already went through
-                // apply_cap_op; `grant` pushed its JSON straight into the store
-                // and then called update_ratchet by hand, patching the single
-                // consequence somebody had been bitten by. The TODO that asked
-                // for this is now discharged.
-                //
-                // What grant was skipping: signature verification against the
-                // header's owner_pub, the resource header existing at all, and
-                // the version FLOOR. apply_cap_op does the push and the ratchet
-                // itself, so both are removed here rather than duplicated.
-                let hdr = store
-                    .iter()
-                    .find(|e| {
-                        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                            && e["resource"].as_str() == Some("self")
-                    })
-                    .and_then(crate::capability::CapHeader::from_json)
-                    .ok_or_else(|| {
-                        anyhow!("capability store has no header for 'self'; re-run the grant")
-                    })?;
-                crate::capability::apply_cap_op(&mut store, &hdr, &op, crate::capability::now_secs())
-                    .context("the grant was refused by the capability store, so it did NOT take. Nothing was written")?;
-                // save_and_list_revoked: persist THEN reconcile (reconciliation
-                // is a property of the write). GATED on authoritative: in shadow
-                // only REPORT what would be removed.
-                let revoked = crate::capability::save_and_list_revoked(&store, &config_dir)
-                    .context("save cap store")?;
-                {
-                    let authoritative = crate::capability::cap_authoritative();
-                    let ak_path = sshkeys::authorized_keys_path();
-                    let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
-                    // Emit per-device shadow logs for actual-block devices.
-                    for device in &revoked {
-                        if sshkeys::has_block(&ak_content, device) && !authoritative {
-                            ui::critical(&format!(
-                                "CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow"
-                            ));
-                        }
-                    }
-                    let new_ak = crate::capability::reconcile_shell_keys(
-                        &revoked,
-                        &ak_content,
-                        authoritative,
-                    );
-                    if new_ak != ak_content {
-                        if let Err(e) = crate::platform::SecretFile::write_str(&ak_path, &new_ak) {
-                            eprintln!("shell-key reconcile: failed to write authorized_keys: {e}");
-                        }
-                    }
-                }
-            }
-            #[cfg(feature = "ssh-server")]
-            if capability == "shell" {
-                crate::sshd::arm_ssh_ca_for_serving().await;
-            }
-            if user {
-                let names: Vec<String> = device_cert_for(&device)
-                    .map(|c| {
-                        crate::certified_device_names(&c.user_pub)
-                            .into_iter()
-                            .map(|(n, _)| n)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                ui::say(&format!(
-                    "user-wide grant: every device certified by the user key of '{device}' holds '{capability}' ({})",
-                    if names.is_empty() { device.clone() } else { names.join(", ") }
-                ));
-            }
-            crate::outln!(
-                "granted '{capability}' to '{device}'. {}",
-                if capability == "shell" {
-                    "OWNER-EQUIVALENT: they can act as you through `tunlion shell`, `tunlion exec` and `tunlion shell --ssh` (for ssh, their key is installed on first connect)."
-                } else {
-                    ""
-                }
-            );
-            // Grants are read per open, and the daemon re-reads whether ANY
-            // shell grant exists on every loop turn, so this applies to a running
-            // daemon at once. It used to need a restart that nothing mentioned.
-            if capability == "shell" && crate::daemon_alive().is_some() {
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    "  the running daemon applies this on the next connection; no restart needed",
-                ));
-            }
-            Ok(())
-        }
+        } => grant_cmd(device, capability, tag, user).await,
         Cmd::Revoke {
             device,
             capability,
-            certificate,
             user,
-        } => {
-            if certificate {
-                if capability.is_some() {
-                    crate::bail_usage!("choose either a capability or --certificate, not both");
-                }
-                ui_caps.confirm(&format!("revoke fleet certificate from {device}"))?;
-                let cert = device_cert_for(&device)
-                    .ok_or_else(|| anyhow!(
-                            // #244: this used to end here, so an operator revoking a
-                            // vouched device got an error and no route. A record with no
-                            // certificate is removed by forgetting it, and nothing else
-                            // said so.
-                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `tunlion devices`).\n  To remove its access: tunlion devices forget {device} -y"
-                        ))?;
-                let owner = load_owner_key().ok_or_else(|| anyhow!("no local user identity"))?;
-                if cert.user_pub != owner.public_key_bytes() {
-                    bail!("device '{device}' certificate is not chained to this user identity");
-                }
-                set_device_cert_revoked(&device, true)?;
-                crate::outln!(
-                    "revoked fleet certificate from '{device}'; the device is denied by the local capability gate"
-                );
-                let answer = crate::revocation_live::tell_daemon().await;
-                match crate::revocation_live::daemon_line(&device, &answer, false) {
-                    Ok(line) => ui::say(&line),
-                    Err(e) => bail!(e),
-                }
-                return Ok(());
-            }
-            let capability = capability
-                .ok_or_else(|| anyhow!("capability is required unless --certificate is set"))?;
-            let capability = crate::capability::canonical_capability(&capability)?;
-            // A delegated device's authority comes from its enrollment ceiling, not
-            // a grant, so revoking a capability from it cannot bind. Name the thing
-            // that does work: revoking the certificate.
-            if let Some(ceiling) = principal_ceiling_for(&device) {
-                if ceiling.iter().any(|c| c == &capability) {
-                    bail!(
-                        "'{capability}' cannot be revoked from {device}: its access comes from the enrollment ceiling on its fleet certificate, not from a grant. Revoke the certificate:\n  tunlion revoke {device} --certificate"
-                    );
-                }
-                bail!(
-                    "'{capability}' is not granted to {device} (its invitation ceiling is {}); nothing to revoke",
-                    ceiling.join(", ")
-                );
-            }
-            if user && load_owner_key().is_none() {
-                bail!(
-                    "a user-wide grant (--user) is owner-signed, and this device holds no owner signing key; run the revoke on the owner's machine"
-                );
-            }
-            ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
-            device_set_cap(&device, &capability, false, None)?;
-            // Mirror the grant path: also emit an owner-signed Revoke cap_op so
-            // the AUTHORITATIVE capability gate actually denies. The legacy
-            // device_set_cap(false) only clears devices.json; it leaves the cap
-            // store granting, so under TUNLION_CAP_AUTHORITATIVE the gate keeps
-            // ALLOWing and a re-connect re-installs the shell key (revocation was
-            // a no-op at the gate). apply_cap_op removes the matching grant, so
-            // evaluate() then denies and devices_with_shell_revoked lists this
-            // device; save_and_list_revoked + reconcile_shell_keys then strips
-            // its managed authorized_keys block under authoritative.
-            if let Ok(Some(user_key)) =
-                crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
-            {
-                let config_dir = crate::settings::config_dir();
-                let mut store = crate::capability::load_cap_store(&config_dir);
-                let header = store
-                    .iter()
-                    .find(|e| {
-                        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                            && e["resource"].as_str() == Some("self")
-                    })
-                    .and_then(crate::capability::CapHeader::from_json);
-                // A revoke only bites if there is a header AND the peer has a
-                // certified identity to target (same requirement as grant).
-                if let (Some(hdr), Some(peer_cert)) = (header, device_cert_for(&device)) {
-                    let now = crate::capability::now_secs();
-                    // The revoke names the same key the grant named: the
-                    // DEVICE key by default, the user key with `--user`. See
-                    // device_caps::GrantScope.
-                    let scope = if user {
-                        crate::device_caps::GrantScope::User
-                    } else {
-                        crate::device_caps::GrantScope::Device
-                    };
-                    // A user-wide grant (made with `--user`, or by a release
-                    // that targeted every grant at the user key) still covers
-                    // this device after its own grant is revoked, so revoking
-                    // only the device key would print success and change
-                    // nothing. signed_revoke_ops takes the user-wide grant
-                    // too, and we say who else it covered.
-                    let (ops, also_user_wide) = crate::device_caps::signed_revoke_ops(
-                        &store,
-                        &user_key,
-                        &peer_cert,
-                        &capability,
-                        scope,
-                    );
-                    if also_user_wide {
-                        let others: Vec<String> = crate::certified_device_names(&peer_cert.user_pub)
-                            .into_iter()
-                            .map(|(n, _)| n)
-                            .filter(|n| n != &device)
-                            .collect();
-                        ui::say(&format!(
-                            "'{capability}' was also granted user-wide to the user key of '{device}'; revoking that too{}",
-                            if others.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    ", which also removes it from {} unless they hold their own grant",
-                                    others.join(", ")
-                                )
-                            }
-                        ));
-                    }
-                    let applied = ops
-                        .iter()
-                        .try_for_each(|op| crate::capability::apply_cap_op(&mut store, &hdr, op, now));
-                    match applied {
-                        Ok(()) => {
-                            let revoked =
-                                crate::capability::save_and_list_revoked(&store, &config_dir)
-                                    .unwrap_or_default();
-                            let authoritative = crate::capability::cap_authoritative();
-                            let ak_path = sshkeys::authorized_keys_path();
-                            let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
-                            for d in &revoked {
-                                if sshkeys::has_block(&ak_content, d) && authoritative {
-                                    eprintln!(
-                                        "shell-key reconcile (revoke): removing managed key for '{d}' (cap store denies shell)"
-                                    );
-                                }
-                            }
-                            let new_ak = crate::capability::reconcile_shell_keys(
-                                &revoked,
-                                &ak_content,
-                                authoritative,
-                            );
-                            if new_ak != ak_content {
-                                if let Err(e) =
-                                    crate::platform::SecretFile::write_str(&ak_path, &new_ak)
-                                {
-                                    eprintln!(
-                                        "shell-key reconcile (revoke): failed to write authorized_keys: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "revoke: owner-signed cap_op not applied ({e}); legacy revoke still took effect"
-                            );
-                        }
-                    }
-                }
-            }
-            if capability == "shell" {
-                sshkeys::remove_authorized_key(&device)?;
-                crate::outln!(
-                    "revoked 'shell' from '{device}' and removed its tunlion-managed authorized_keys block."
-                );
-            } else {
-                crate::outln!("revoked '{capability}' from '{device}'.");
-            }
-            if capability == "shell" && crate::daemon_alive().is_some() {
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    "  the running daemon applies this now; no restart needed",
-                ));
-            }
-            if let Some(warning) = fleet_certificate_warning(&device) {
-                eprintln!("{warning}");
-            }
-            // #244: revoking the `shell` CAP does nothing while `up --shell` is
-            // serving, because that policy auto-allows without consulting a
-            // per-device capability at all. The operator ran the security verb,
-            // saw success, and lost nothing. Say so, and name what does work.
-            //
-            // Asked of the RUNNING daemon, not derived from settings: `--shell`
-            // is a launch flag that never lands in the settings file, so a local
-            // guess would be confidently wrong in exactly the case that matters.
-            // When no daemon answers we say NOTHING rather than guess: silence
-            // here means "not known", and inventing a reassurance would repeat
-            // the defect one layer up.
-            if capability == "shell" {
-                if let Some(st) = crate::ctl::try_cap_status().await {
-                    let policy = st["shell_policy"].as_str().unwrap_or("");
-                    let auto = st["shell_auto"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(|v| v.as_str()).any(|n| n == device))
-                        .unwrap_or(false);
-                    if policy == "all" || (policy == "only" && auto) {
-                        let how = if policy == "all" {
-                            "`up --shell` is serving, which auto-allows every paired device"
-                                .to_string()
-                        } else {
-                            format!("`up --shell-only` is serving and lists {device}")
-                        };
-                        ui::caution(
-                            &format!("{device} still has shell access"),
-                            Some(&format!(
-                                "the grant is revoked, but {how}, so this revoke changed nothing for it."
-                            )),
-                            &[
-                                format!(
-                                    "restart the daemon without it, or scope it: tunlion up --shell-only <others>"
-                                ),
-                                format!(
-                                    "or remove the device entirely: tunlion devices forget {device} -y"
-                                ),
-                            ],
-                        );
-                    }
-                }
-            }
-            Ok(())
+        } => revoke_cmd(&ui_caps, device, capability, user, true).await,
+        Cmd::Promote { device, to, json } => {
+            crate::ladder::ladder_cmd(&ui_caps, true, device, to, json || cli.json, &server, relay).await
+        }
+        Cmd::Demote { device, to, json } => {
+            crate::ladder::ladder_cmd(&ui_caps, false, device, to, json || cli.json, &server, relay).await
         }
         Cmd::Mount {
             peer,
@@ -2782,6 +2193,562 @@ fn add_code_needs_people(named: Option<&str>) -> anyhow::Error {
 /// The rows of `devices --json` (`data.devices`), one per stored device: what
 /// the gate enforces now, liveness from the daemon's answering links, and the
 /// address. Shared by `devices --json` and the dashboard so both say the same.
+/// `tunlion grant`: the one owner-signed grant path, shared with `promote`.
+pub(crate) async fn grant_cmd(
+    device: Option<String>,
+    capability: Option<String>,
+    tag: Option<String>,
+    user: bool,
+) -> Result<()> {
+    let (device, capability) = grant_operands(device, capability, tag.as_deref())?;
+    // Valid on every device or on none: checked before the owner/joined
+    // split, so no advice below can name a spec that would be refused.
+    validate_grant_spec(&capability).map_err(grant_usage)?;
+    // The owner key resolves the RESOURCE, so it is needed before the
+    // capability name is final: `route:10.0.0.0/24` names an owner-bound
+    // resource, while `shell` names "self".
+    let spec = capability;
+    let config_dir = crate::settings::config_dir();
+    let mut store = crate::capability::load_cap_store(&config_dir);
+
+    if let Some(ref t) = tag {
+        // Grant to tag
+        // The tag path SIGNS the CapOp below with the owner keypair, so
+        // unlike the device path it genuinely needs the signing key, not
+        // just the public half. Keep requiring a full identity here.
+        let user_key = crate::identity_flow::ensure_user_key(false)?;
+        let pk = user_key.public_key_bytes();
+        let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
+        let (capability, resource) = (g.action.clone(), g.resource.clone());
+        let target_bytes = crate::capability::make_tag_target(&pk, t);
+        let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
+        let mut op = crate::capability::CapOp {
+            op: crate::capability::CapOpKind::Grant,
+            grantor: pk,
+            target_kind: 0x03,
+            target: target_bytes,
+            resource: resource.clone(),
+            permissions: vec![capability.clone()],
+            expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+            issued_at: crate::capability::now_secs(),
+            version: ver,
+            sig: [0u8; 64],
+        };
+        op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
+        store.push(op.to_json());
+        let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
+            .context("save cap store")?;
+        crate::outln!("granted '{capability}' to tag '{t}'.");
+        return Ok(());
+    }
+    // grant_operands returns a device whenever there is no --tag.
+    let Some(device) = device else {
+        crate::bail_usage!("name a device: tunlion grant <device> <capability>");
+    };
+    // Device path. The owner PUBLIC key is needed up front for the same
+    // reason as the tag path: it resolves a `route:CIDR` spec to its
+    // owner-bound resource id.
+    //
+    // The SIGNING key, deliberately. Naming the resource would only need
+    // the public half, but the grant below is issued as an owner-signed
+    // CapOp, and a joined device cannot mint one. That restriction is the
+    // security model rather than an oversight: if a fleet member could
+    // sign its own route authorization, any member could authorize any
+    // prefix for itself and the capability would gate nothing.
+    //
+    // Verification is the asymmetric half and needs only the public key,
+    // which is why enforcement uses owner_pub_for_resources() and this
+    // does not. What WAS wrong here is the diagnosis printed on failure:
+    // a joined device has an identity, so "Run `tunlion init` first" is
+    // both false and unactionable. See the error below.
+    let owner_pk = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
+        .ok()
+        .flatten()
+        .map(|k| k.public_key_bytes());
+    let (capability, cap_resource, cap_nonce) = match owner_pk {
+        Some(pk) => {
+            let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
+            (g.action, g.resource, g.nonce)
+        }
+        None => {
+            // No identity: only the legacy self-scoped verbs are possible.
+            if spec.contains(':') {
+                // Distinguish "no identity at all" from "an identity that
+                // cannot sign". Telling a joined device to run `init` is
+                // wrong twice over: it already has an identity, and init
+                // is not what would make this work.
+                if owner_pub_for_resources().is_some() {
+                    bail!(
+                        "'{spec}' must be granted by the fleet owner. This is a joined device, \
+                         which holds no owner signing key and so cannot issue an owner-signed \
+                         grant. Run this on the owner's machine:\n  tunlion grant {device} {spec}"
+                    );
+                }
+                // U1: not joined and no key, so this is the first use;
+                // mint the identity and bind the resource to it.
+                let pk = crate::identity_flow::ensure_user_key(false)?.public_key_bytes();
+                let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
+                (g.action, g.resource, g.nonce)
+            } else {
+                (
+                    crate::capability::canonical_capability(&spec).map_err(grant_usage)?,
+                    "self".to_string(),
+                    crate::capability::self_resource_nonce(),
+                )
+            }
+        }
+    };
+
+    // A delegated device's authority comes from its enrollment ceiling,
+    // which enforcement reads from its fleet certificate; a grant targets
+    // a key the device never presents, so it cannot bind. Refuse rather
+    // than report a success enforcement will not honour.
+    if let Some(ceiling) = principal_ceiling_for(&device) {
+        // A ceiling records an ACTION and nothing else. It has no
+        // resource dimension, so it cannot express WHICH prefix a router
+        // may advertise: `route` in a ceiling means "may carry routes",
+        // not "may carry 10.66.0.0/24". A resource-scoped grant is
+        // therefore strictly NARROWER than the ceiling entry, not
+        // redundant with it, and refusing it as redundant left the
+        // prefix permanently unauthorized: the ceiling satisfied this
+        // check while enforcement, which asks about the prefix-bound
+        // resource id, still found nothing and declined every route.
+        // Only a bare, self-scoped grant can be genuinely redundant.
+        let resource_scoped = cap_resource != "self";
+        // The same decision the pairing hint asks (`grant_vs_ceiling`),
+        // so a hint can never name a grant this refuses.
+        match crate::pair_cmd::grant_vs_ceiling(
+            Some(ceiling.as_slice()),
+            &capability,
+            resource_scoped,
+        ) {
+            // The state asked for already holds: success, not an
+            // error. It exited 1, so a provisioning script that
+            // grants idempotently failed on its second run.
+            crate::pair_cmd::GrantVsCeiling::AlreadyCovered => {
+                ui::say(&format!(
+                    "'{capability}' is already granted to '{device}' by its invitation ceiling; nothing to do"
+                ));
+                return Ok(());
+            }
+            // A decision against the request: the documented
+            // "denied" exit (4), not the catch-all 1.
+            _ => {
+                return Err(crate::exit_codes::err(
+                    crate::exit_codes::ExitKind::Denied,
+                    format!(
+                        "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
+                        ceiling.join(", "),
+                        crate::identity_state::reenrol_steps(
+                            &device,
+                            &crate::display_name(),
+                            &capability,
+                            &ceiling
+                        )
+                    ),
+                ));
+            }
+        }
+    }
+    if user && owner_pk.is_none() {
+        bail!(
+            "a user-wide grant (--user) is an owner-signed grant to a user key, and this device holds no owner signing key. Run it on the owner's machine, or grant to the device:\n  tunlion grant {device} {spec}"
+        );
+    }
+    // A device with no certified identity (a browser, which pairs by
+    // code and holds only the pairing secret) cannot be the target of an
+    // owner-signed grant. Its pairing permission below is what the gate
+    // honours for it. This used to write that permission, which took
+    // effect, and THEN fail with "identity not available" (exit 1), so
+    // a grant that worked reported that it had not.
+    let signing_key =
+        crate::identity::UserKey::load(&crate::platform::PlatformKeyStore).ok().flatten();
+    let peer_cert = device_cert_for(&device);
+    if signing_key.is_some() && peer_cert.is_none() && user {
+        bail!(
+            "'{device}' has no certified identity (a browser, or a device paired by code only), so there is no user key to grant to. Grant to the device instead:\n  tunlion grant {device} {spec}"
+        );
+    }
+    device_set_cap(&device, &capability, true, None)?;
+    if signing_key.is_some() && peer_cert.is_none() {
+        ui::say(&format!(
+            "'{device}' has no certified identity (a browser, or a device paired by code only), so this is a pairing permission, not an owner-signed grant. It takes effect now; `tunlion revoke {device} {capability}` removes it."
+        ));
+    }
+    // If identity layer is active, also issue an owner-signed CapOp
+    if let (Some(user_key), Some(peer_cert)) = (signing_key, peer_cert) {
+        let config_dir = crate::settings::config_dir();
+        let mut store = crate::capability::load_cap_store(&config_dir);
+
+        // Ensure a genesis header exists for the resource being granted.
+        // Keyed by the RESOURCE, so a route prefix gets its own header
+        // rather than riding on "self": each prefix is a distinct
+        // resource with its own succession, which is what lets one
+        // prefix be revoked without touching another.
+        let has_header = store.iter().any(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some(cap_resource.as_str())
+        });
+        if !has_header {
+            let pk = user_key.public_key_bytes();
+            // The nonce must match the one the resource id was derived
+            // from, or the header does not describe the resource it is
+            // filed under.
+            let nonce = cap_nonce;
+            let resource = cap_resource.clone();
+            let mut hdr = crate::capability::CapHeader {
+                resource,
+                epoch: 0,
+                owner_pub: pk,
+                nonce,
+                floors: vec![],
+                issued_at: crate::capability::now_secs(),
+                prev_owner_pub: None,
+                prev_header_hash: None,
+                sig: [0u8; 64],
+            };
+            hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
+            let mut hdr_json = hdr.to_json();
+            // The header's signature is over the self-certifying resource id
+            // (SHA-256(owner_pub||nonce)), but the STORED header has resource="self".
+            // This signature is decorative: cap_authorize/evaluate never calls
+            // verify_genesis/verify_sig on the stored header (those run only on
+            // the grant-creation path, not the authorize path). Consistent with
+            // Cmd::Grant which does the same. The header is trusted local state
+            // in the owner's own caps.json, not a cross-verified object.
+            hdr_json["resource"] = serde_json::json!(cap_resource.clone());
+            store.push(hdr_json);
+        }
+
+        // Create CapOp: target the peer's DEVICE key from their stored
+        // device cert (not SHA-256 of the device name, which never
+        // matches evaluate()'s principal comparison). Requires the peer
+        // to have a certified identity (paired + identity-expose
+        // completed).
+        //
+        // The DEVICE key, not the user key, unless `--user` says so. A
+        // user-targeted grant matches every device that user certified,
+        // and for a device of my own fleet that user is ME: `grant
+        // laptop shell` granted shell to the whole fleet under
+        // authoritative evaluation. See device_caps::GrantScope.
+        if peer_cert.verify(crate::identity::now_secs()).is_err() {
+            return Err(anyhow!(
+                "peer identity cert for '{device}' is expired; re-pair to refresh it"
+            ));
+        }
+        let scope = if user {
+            crate::device_caps::GrantScope::User
+        } else {
+            crate::device_caps::GrantScope::Device
+        };
+
+        // Version must EXCEED everything recorded for this target,
+        // revoke tombstones included: the same monotonic ratchet
+        // `revoke` respects, and apply_cap_op refuses anything at or
+        // below it.
+        let op = crate::device_caps::sign_next_cap_op(
+            &store,
+            &user_key,
+            crate::capability::CapOpKind::Grant,
+            scope.target(&peer_cert),
+            &cap_resource,
+            vec![capability.clone()],
+            crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+        );
+        // ONE VALIDATED OP-CREATION PATH. `revoke` already went through
+        // apply_cap_op; `grant` pushed its JSON straight into the store
+        // and then called update_ratchet by hand, patching the single
+        // consequence somebody had been bitten by. The TODO that asked
+        // for this is now discharged.
+        //
+        // What grant was skipping: signature verification against the
+        // header's owner_pub, the resource header existing at all, and
+        // the version FLOOR. apply_cap_op does the push and the ratchet
+        // itself, so both are removed here rather than duplicated.
+        let hdr = store
+            .iter()
+            .find(|e| {
+                e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                    && e["resource"].as_str() == Some("self")
+            })
+            .and_then(crate::capability::CapHeader::from_json)
+            .ok_or_else(|| {
+                anyhow!("capability store has no header for 'self'; re-run the grant")
+            })?;
+        crate::capability::apply_cap_op(&mut store, &hdr, &op, crate::capability::now_secs())
+            .context("the grant was refused by the capability store, so it did NOT take. Nothing was written")?;
+        // save_and_list_revoked: persist THEN reconcile (reconciliation
+        // is a property of the write). GATED on authoritative: in shadow
+        // only REPORT what would be removed.
+        let revoked = crate::capability::save_and_list_revoked(&store, &config_dir)
+            .context("save cap store")?;
+        {
+            let authoritative = crate::capability::cap_authoritative();
+            let ak_path = sshkeys::authorized_keys_path();
+            let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
+            // Emit per-device shadow logs for actual-block devices.
+            for device in &revoked {
+                if sshkeys::has_block(&ak_content, device) && !authoritative {
+                    ui::critical(&format!(
+                        "CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow"
+                    ));
+                }
+            }
+            let new_ak = crate::capability::reconcile_shell_keys(
+                &revoked,
+                &ak_content,
+                authoritative,
+            );
+            if new_ak != ak_content {
+                if let Err(e) = crate::platform::SecretFile::write_str(&ak_path, &new_ak) {
+                    eprintln!("shell-key reconcile: failed to write authorized_keys: {e}");
+                }
+            }
+        }
+    }
+    #[cfg(feature = "ssh-server")]
+    if capability == "shell" {
+        crate::sshd::arm_ssh_ca_for_serving().await;
+    }
+    if user {
+        let names: Vec<String> = device_cert_for(&device)
+            .map(|c| {
+                crate::certified_device_names(&c.user_pub)
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect()
+            })
+            .unwrap_or_default();
+        ui::say(&format!(
+            "user-wide grant: every device certified by the user key of '{device}' holds '{capability}' ({})",
+            if names.is_empty() { device.clone() } else { names.join(", ") }
+        ));
+    }
+    crate::outln!(
+        "granted '{capability}' to '{device}'. {}",
+        if capability == "shell" {
+            "OWNER-EQUIVALENT: they can act as you through `tunlion shell`, `tunlion exec` and `tunlion shell --ssh` (for ssh, their key is installed on first connect)."
+        } else {
+            ""
+        }
+    );
+    // Grants are read per open, and the daemon re-reads whether ANY
+    // shell grant exists on every loop turn, so this applies to a running
+    // daemon at once. It used to need a restart that nothing mentioned.
+    if capability == "shell" && crate::daemon_alive().is_some() {
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            "  the running daemon applies this on the next connection; no restart needed",
+        ));
+    }
+    Ok(())
+}
+
+/// `tunlion revoke <device> <capability>`: the one revoke path, shared with
+/// `demote`.
+pub(crate) async fn revoke_cmd(
+    ui_caps: &UiCapability,
+    device: String,
+    capability: Option<String>,
+    user: bool,
+    // `demote` keeps a device yours on purpose; the "still has fleet access"
+    // nudge is for a bare `revoke`.
+    warn_fleet: bool,
+) -> Result<()> {
+    let Some(capability) = capability else {
+        crate::bail_usage!(
+            "name the capability: tunlion revoke {device} <capability> (e.g. shell). To cut a device off: tunlion demote {device} --to cut"
+        );
+    };
+    let capability = crate::capability::canonical_capability(&capability)?;
+    // A delegated device's authority comes from its enrollment ceiling, not
+    // a grant, so revoking a capability from it cannot bind. Name the thing
+    // that does work: revoking the certificate.
+    if let Some(ceiling) = principal_ceiling_for(&device) {
+        if ceiling.iter().any(|c| c == &capability) {
+            bail!(
+                "'{capability}' cannot be revoked from {device}: its access comes from the enrollment ceiling on its fleet certificate, not from a grant. To take it away, cut it off:\n  tunlion demote {device} --to cut"
+            );
+        }
+        bail!(
+            "'{capability}' is not granted to {device} (its invitation ceiling is {}); nothing to revoke",
+            ceiling.join(", ")
+        );
+    }
+    if user && load_owner_key().is_none() {
+        bail!(
+            "a user-wide grant (--user) is owner-signed, and this device holds no owner signing key; run the revoke on the owner's machine"
+        );
+    }
+    ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
+    device_set_cap(&device, &capability, false, None)?;
+    // Mirror the grant path: also emit an owner-signed Revoke cap_op so
+    // the AUTHORITATIVE capability gate actually denies. The legacy
+    // device_set_cap(false) only clears devices.json; it leaves the cap
+    // store granting, so under TUNLION_CAP_AUTHORITATIVE the gate keeps
+    // ALLOWing and a re-connect re-installs the shell key (revocation was
+    // a no-op at the gate). apply_cap_op removes the matching grant, so
+    // evaluate() then denies and devices_with_shell_revoked lists this
+    // device; save_and_list_revoked + reconcile_shell_keys then strips
+    // its managed authorized_keys block under authoritative.
+    if let Ok(Some(user_key)) =
+        crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
+    {
+        let config_dir = crate::settings::config_dir();
+        let mut store = crate::capability::load_cap_store(&config_dir);
+        let header = store
+            .iter()
+            .find(|e| {
+                e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                    && e["resource"].as_str() == Some("self")
+            })
+            .and_then(crate::capability::CapHeader::from_json);
+        // A revoke only bites if there is a header AND the peer has a
+        // certified identity to target (same requirement as grant).
+        if let (Some(hdr), Some(peer_cert)) = (header, device_cert_for(&device)) {
+            let now = crate::capability::now_secs();
+            // The revoke names the same key the grant named: the
+            // DEVICE key by default, the user key with `--user`. See
+            // device_caps::GrantScope.
+            let scope = if user {
+                crate::device_caps::GrantScope::User
+            } else {
+                crate::device_caps::GrantScope::Device
+            };
+            // A user-wide grant (made with `--user`, or by a release
+            // that targeted every grant at the user key) still covers
+            // this device after its own grant is revoked, so revoking
+            // only the device key would print success and change
+            // nothing. signed_revoke_ops takes the user-wide grant
+            // too, and we say who else it covered.
+            let (ops, also_user_wide) = crate::device_caps::signed_revoke_ops(
+                &store,
+                &user_key,
+                &peer_cert,
+                &capability,
+                scope,
+            );
+            if also_user_wide {
+                let others: Vec<String> = crate::certified_device_names(&peer_cert.user_pub)
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .filter(|n| n != &device)
+                    .collect();
+                ui::say(&format!(
+                    "'{capability}' was also granted user-wide to the user key of '{device}'; revoking that too{}",
+                    if others.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            ", which also removes it from {} unless they hold their own grant",
+                            others.join(", ")
+                        )
+                    }
+                ));
+            }
+            let applied = ops
+                .iter()
+                .try_for_each(|op| crate::capability::apply_cap_op(&mut store, &hdr, op, now));
+            match applied {
+                Ok(()) => {
+                    let revoked =
+                        crate::capability::save_and_list_revoked(&store, &config_dir)
+                            .unwrap_or_default();
+                    let authoritative = crate::capability::cap_authoritative();
+                    let ak_path = sshkeys::authorized_keys_path();
+                    let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
+                    for d in &revoked {
+                        if sshkeys::has_block(&ak_content, d) && authoritative {
+                            eprintln!(
+                                "shell-key reconcile (revoke): removing managed key for '{d}' (cap store denies shell)"
+                            );
+                        }
+                    }
+                    let new_ak = crate::capability::reconcile_shell_keys(
+                        &revoked,
+                        &ak_content,
+                        authoritative,
+                    );
+                    if new_ak != ak_content {
+                        if let Err(e) =
+                            crate::platform::SecretFile::write_str(&ak_path, &new_ak)
+                        {
+                            eprintln!(
+                                "shell-key reconcile (revoke): failed to write authorized_keys: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "revoke: owner-signed cap_op not applied ({e}); legacy revoke still took effect"
+                    );
+                }
+            }
+        }
+    }
+    if capability == "shell" {
+        sshkeys::remove_authorized_key(&device)?;
+        crate::outln!(
+            "revoked 'shell' from '{device}' and removed its tunlion-managed authorized_keys block."
+        );
+    } else {
+        crate::outln!("revoked '{capability}' from '{device}'.");
+    }
+    if capability == "shell" && crate::daemon_alive().is_some() {
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            "  the running daemon applies this now; no restart needed",
+        ));
+    }
+    if let Some(warning) = fleet_certificate_warning(&device).filter(|_| warn_fleet) {
+        eprintln!("{warning}");
+    }
+    // #244: revoking the `shell` CAP does nothing while `up --shell` is
+    // serving, because that policy auto-allows without consulting a
+    // per-device capability at all. The operator ran the security verb,
+    // saw success, and lost nothing. Say so, and name what does work.
+    //
+    // Asked of the RUNNING daemon, not derived from settings: `--shell`
+    // is a launch flag that never lands in the settings file, so a local
+    // guess would be confidently wrong in exactly the case that matters.
+    // When no daemon answers we say NOTHING rather than guess: silence
+    // here means "not known", and inventing a reassurance would repeat
+    // the defect one layer up.
+    if capability == "shell" {
+        if let Some(st) = crate::ctl::try_cap_status().await {
+            let policy = st["shell_policy"].as_str().unwrap_or("");
+            let auto = st["shell_auto"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).any(|n| n == device))
+                .unwrap_or(false);
+            if policy == "all" || (policy == "only" && auto) {
+                let how = if policy == "all" {
+                    "`up --shell` is serving, which auto-allows every paired device"
+                        .to_string()
+                } else {
+                    format!("`up --shell-only` is serving and lists {device}")
+                };
+                ui::caution(
+                    &format!("{device} still has shell access"),
+                    Some(&format!(
+                        "the grant is revoked, but {how}, so this revoke changed nothing for it."
+                    )),
+                    &[
+                        format!(
+                            "restart the daemon without it, or scope it: tunlion up --shell-only <others>"
+                        ),
+                        format!(
+                            "or remove the device entirely: tunlion devices forget {device} -y"
+                        ),
+                    ],
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
     let warm = answering_links(ctl::try_list_warm().await).await;
     let online: std::collections::HashMap<String, Option<bool>> =

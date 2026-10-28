@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# #238: a revoke that reports success must persist. `revoke --certificate` and the
+# #238: a revoke that reports success must persist. `demote --to cut` and the
 # daemon's periodic liveness sweep both read-modify-write devices.json; before the
 # sidecar lock the sweep could clobber the freshly-written `certRevoked`, so a
 # revoke intermittently reported success and did not stick. Standalone, hermetic,
@@ -42,12 +42,12 @@ sleep 5
 LASTSEEN_START=$(json_get "$DA/devices.json" lastSeen)
 MISSES=0
 for i in $(seq 1 "$CYCLES"); do
-  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" demote bravo --to cut --yes >/dev/null 2>&1
   sleep 1
   if [ "$(json_get "$DA/devices.json" certRevoked)" != "True" ]; then
     MISSES=$((MISSES+1))
   fi
-  env TUNLION_CONFIG_DIR="$DA" "$BIN" devices restore bravo >/dev/null 2>&1
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" promote bravo >/dev/null 2>&1
   sleep 1
 done
 LASTSEEN_END=$(json_get "$DA/devices.json" lastSeen)

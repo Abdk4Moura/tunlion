@@ -238,9 +238,9 @@ c_revoke_cap() {
   x $L <<<'tunlion exec server -- true'; want_exit 4 $? "exec after revoke"
 }
 c_devices_revoke_restore() {
-  x $L <<<'tunlion grant third shell >/dev/null; tunlion devices revoke third -y' || return 1
+  x $L <<<'tunlion grant third shell >/dev/null; tunlion demote third --to cut -y' || return 1
   x $T <<<'echo r > rv.txt; tunlion send rv.txt --to laptop'; local rc=$?; echo "send after revoke rc=$rc"; [ $rc -ne 0 ] || return 1
-  x $L <<<'tunlion devices restore third' || return 1
+  x $L <<<'tunlion promote third' || return 1
   sleep 3
   x $T <<<'tunlion send rv.txt --to laptop'; want_exit 0 $? "send after restore"
 }
@@ -344,7 +344,7 @@ cell C18 cli-cli "exit codes 3 2 9 11 7 6"                  c_exit_codes
 cell C19 cli-cli "skill install"                            c_skill
 cell C20 cli-cli "forced relay: send and exec"              c_relay
 cell C21 cli-cli "revoke a capability"                      c_revoke_cap
-cell C22 cli-cli "devices revoke, then restore"             c_devices_revoke_restore
+cell C22 cli-cli "demote --to cut, then promote"             c_devices_revoke_restore
 cell C23 cli-cli "devices forget, then re-add"              c_forget_readd
 cell C24 cli-cli "invitation --expires cuts live sessions"  c_invite_expiry
 cell C25 cli-cli "hostile machines: code, invite, send"     c_hostile

@@ -13,13 +13,13 @@ the exit codes that command can return.
 ## Rules
 
 1. Always pass `--json` on commands that support it: `init add join id status
-   set reach send receive sync doctor addr devices skill`. Other commands refuse
+   set reach send receive sync doctor addr devices skill promote demote`. Other commands refuse
    `--json`; read their exit code and stderr instead.
 2. Decide by exit code, never by parsing human text. Under `--json`,
    `ok` is true exactly when the exit code is 0, and a failure is one object:
    `{"ok":false,"error":{"code":"unknown_device","exit":3,"message":"..."}}`.
 3. You are never at a TTY. Prompts do not appear; commands that need
-   confirmation (`down`, `reset`, `revoke`, `devices forget`, `devices revoke`,
+   confirmation (`down`, `reset`, `revoke`, `devices forget`, `demote`,
    `expose --off`) fail unless you pass `-y`. Pass `-y` only when the user asked for that exact
    action. `reset` wipes this machine's identity: never run it unless the user
    explicitly asked. `tunlion demo` is a tour for people at a terminal; do not
@@ -187,6 +187,20 @@ tunlion add --for person --out <file> --json
 Get the file to the other machine; there the user (or you) runs
 `tunlion join <file> --json`. Pairing always needs consent on both ends; never
 try to pair silently.
+
+### Change what a device may do
+
+```bash
+tunlion demote <device> --to cut -y --json   # cut it off now
+tunlion promote <device> -y --json           # one step up (from cut off: back to where it was)
+```
+
+Rungs: `cut`, `paired`, `device` (one of the user's devices), `shell` (it can
+act as the user). `--json` reports `from`, `to` and the `undo` command. Never
+promote to `shell` unless the user asked for exactly that. Making a paired
+device one of the user's devices needs a one-time code typed on it, so it
+refuses under `--json` (exit 2): tell the user to run `tunlion promote
+<device>` at a terminal.
 
 ### Diagnose a link
 

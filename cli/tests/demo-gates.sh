@@ -117,7 +117,7 @@ H="$(mkenv i)"
 keys=$(python3 -c 'import json; print(json.dumps(["\\r"]*80))')
 st=$(pty_run "{\"cmd\":[\"$BIN\",\"demo\",\"--speed\",\"0\"],\"env\":{\"HOME\":\"$H\",\"TMPDIR\":\"$H/tmp\",\"TERM\":\"xterm-256color\",\"LANG\":\"C.UTF-8\"},\"keys\":$keys,\"gap\":0.08,\"bound\":60,\"out\":\"$WORK/i.out\"}")
 if [ "$st" = 0 ] && grep -aq "$N_STEPS/$N_STEPS" "$WORK/i.out" && grep -aq "That's the tour." "$WORK/i.out" \
-   && grep -aq "tunlion devices revoke old-phone" "$WORK/i.out"; then
+   && grep -aq "tunlion demote old-phone --to cut" "$WORK/i.out"; then
   ok "I: an interactive run driven by Enter alone reaches the end and exits 0"
 else
   bad "I interactive walk (status $st)"; tail -c 2000 "$WORK/i.out"
