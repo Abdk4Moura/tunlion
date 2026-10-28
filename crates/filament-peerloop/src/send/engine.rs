@@ -856,6 +856,7 @@ async fn drive_over(
                                                 &from,
                                                 &secret,
                                                 crate::conn::PromoteRole::Lead,
+                                                cer.peer_supports_handoff(),
                                             )
                                             .await
                                         } else {

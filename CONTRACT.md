@@ -434,6 +434,15 @@ serving link dies while the race runs, the winner is adopted at once, as before.
 A browser peer never races (it announces `direct:false`), so it never sees these
 messages.
 
+**Mixed versions.** Each CLI's `pake-msg` carries `handoff: 1` beside
+`direct: true`. The make-before-break promotion runs only when the peer's
+`pake-msg` carried it. A peer without it (0.9.1 and earlier) tears its own
+WebRTC link down at confirm and never answers `path-promote`, so against such a
+peer the promotion behaves exactly as before: the WebRTC link is replaced at
+confirm and the direct link is adopted when the race wins. No frame gate is
+ever closed toward a peer that cannot answer it. The field is advisory and rides
+the opaque relay like `direct`; stripping it only selects the old behaviour.
+
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or
 pass a custom keyword — collisions are rejected). Say it aloud; the other side

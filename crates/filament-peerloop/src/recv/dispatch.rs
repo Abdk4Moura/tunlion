@@ -4610,11 +4610,13 @@ async fn recv_run(
                     let mut is_abort = false;
                     let mut abort_why = String::new();
                     let mut peer_direct = false;
+                    let mut peer_handoff = false;
                     if let Some(cer) = st.recv_cers.get_mut(&from) {
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
                                 secret_opt = cer.secret().cloned();
                                 peer_direct = cer.peer_supports_direct();
+                                peer_handoff = cer.peer_supports_handoff();
                             }
                             PakeInbound::Abort(why) => {
                                 is_abort = true;
@@ -4659,6 +4661,7 @@ async fn recv_run(
                                 &from,
                                 &sec,
                                 crate::conn::PromoteRole::Follow,
+                                peer_handoff,
                             )
                             .await
                         } else {

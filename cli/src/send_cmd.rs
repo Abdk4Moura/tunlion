@@ -1497,6 +1497,7 @@ pub(crate) async fn send_cmd(
                                                 &from,
                                                 &sec,
                                                 crate::conn::PromoteRole::Lead,
+                                                cer.peer_supports_handoff(),
                                             )
                                             .await
                                         } else {

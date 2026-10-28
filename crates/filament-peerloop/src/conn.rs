@@ -91,8 +91,10 @@ use tokio::sync::{mpsc, oneshot};
 /// Promotion is now make-before-break (see `handoff`): the WebRTC link keeps
 /// serving, the transfer starts on it, and a direct link that wins its race
 /// takes over at a frame boundary through an explicit round trip. So the link
-/// is always retained and must always be announced, which is what this token
-/// is for.
+/// is retained and must be announced, which is what this token is for. The one
+/// exception is a peer that does not advertise `handoff` (an older CLI, which
+/// tears its own side down at confirm): against it the promotion still
+/// replaces the link, exactly as before, and reports `Replaced`.
 ///
 /// The `#[must_use]` is the point, and so is taking this by value in
 /// `rearm_channel_ready`: it keeps re-announcement unreachable from a `Normal`
@@ -106,6 +108,10 @@ use tokio::sync::{mpsc, oneshot};
               `rearm_channel_ready`, or explain in a comment why this command \
               does not need the retained link announced."]
 pub enum Promotion {
+    /// Only against a peer that does not run make-before-break (an older
+    /// CLI): the link was torn down at confirm, as that peer does on its own
+    /// side, and the direct link will announce itself.
+    Replaced,
     Retained,
 }
 
@@ -1492,7 +1498,9 @@ impl Conn {
     /// replaces the link any more (make-before-break), so after one this always
     /// has the serving transport to announce, and the transfer starts on it.
     pub fn rearm_channel_ready(&self, pid: &str, outcome: Promotion) {
-        let Promotion::Retained = outcome;
+        if outcome == Promotion::Replaced {
+            return; // the replacement transport announces itself
+        }
         let Some(l) = self.links.get(pid) else { return };
         let Some(t) = l.transport.as_ref() else {
             return;
@@ -2261,13 +2269,26 @@ impl Conn {
         name: &str,
         secret: &str,
         role: PromoteRole,
+        peer_handoff: bool,
     ) -> Promotion {
         self.start_direct_inner(pid, name, secret, DirectIntent::Promote)
             .await;
         // An armed promotion is exactly an ephemeral pending: every early return
         // in start_direct_inner (direct off, browser peer, bind failure) leaves
         // none, and then there is nothing to hand off and nothing to track.
-        if self.direct_pending.get(pid).is_some_and(|p| p.ephemeral) {
+        let armed = self.direct_pending.get(pid).is_some_and(|p| p.ephemeral);
+        if armed && !peer_handoff {
+            // The peer is an older CLI (no `handoff` in its ceremony): it tears
+            // its own WebRTC link down at confirm and adopts direct QUIC the
+            // moment its race wins, and it would never answer `path-promote`.
+            // Keeping our side of a link it is closing, or gating frames on an
+            // answer it cannot give, only adds a stall. So do exactly what it
+            // does: replace the link now (the pending is registered, so the
+            // fallback reaper still has an attempt to expire).
+            self.drop_link(pid);
+            return Promotion::Replaced;
+        }
+        if armed {
             self.abandon_promotion(pid);
             self.promotions
                 .insert(pid.to_string(), PromoteState::new(role));
@@ -5231,7 +5252,7 @@ mod relay_privacy_tests {
             conn.start_direct("peer-sid", "peer", "00").await;
             conn.start_direct_fleet("peer-sid", "00").await;
             let _ = conn
-                .start_direct_promote("peer-sid", "peer", "00", PromoteRole::Lead)
+                .start_direct_promote("peer-sid", "peer", "00", PromoteRole::Lead, true)
                 .await;
             assert!(conn.direct_pending.is_empty(), "no direct attempt may be armed");
             // Control: the recorder really does see what this client emits.
@@ -6810,7 +6831,7 @@ mod warm_identity_tests {
         let pid = "sid-code";
         code_link(&mut conn, pid, Rec::new("webrtc", &log));
         let promo = conn
-            .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead)
+            .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead, true)
             .await;
         assert!(conn.links.contains_key(pid), "the promotion tore the serving link down");
         assert!(conn.is_active(pid), "the promotion released the transfer slot");
@@ -6828,6 +6849,35 @@ mod warm_identity_tests {
             }
         }
         assert!(announced, "the retained link was not announced, so nothing would be offered");
+    }
+
+    /// A peer that does not advertise `handoff` (an older CLI) tears its own
+    /// WebRTC link down at confirm and never answers `path-promote`. Against
+    /// it the promotion must do what it always did: replace the link at once,
+    /// arm no promotion and no frame gate, and let the winner adopt directly.
+    #[tokio::test]
+    async fn an_old_peer_gets_the_old_promotion() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-old-cli";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        let promo = conn
+            .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead, false)
+            .await;
+        assert_eq!(promo, Promotion::Replaced);
+        assert!(!conn.links.contains_key(pid), "kept a link the old peer is closing");
+        assert!(conn.promotions.is_empty(), "armed a handoff the old peer cannot answer");
+        assert!(conn.direct_pending.get(pid).is_some_and(|p| p.ephemeral));
+        conn.rearm_channel_ready(pid, promo);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|ev| matches!(ev, Ev::ChannelReady(..))),
+            "announced a link that was replaced"
+        );
+        // The race's expiry still falls back to WebRTC, as before.
+        conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(conn.expired_direct().len(), 1, "the old fallback was not armed");
     }
 
     /// QUIC never comes up: WebRTC keeps serving. No fallback establish (the
