@@ -335,15 +335,18 @@ pub(crate) fn tier_for(
 }
 
 /// The tier the `devices` LIST shows. A device with no identity of its own
-/// (paired by code, never joined anyone) has nobody to call "other people"
-/// and no owner key to review with, so every row there is simply paired.
+/// (paired by code, never joined anyone) has nobody to call "other people",
+/// so a peer that holds an identity is simply paired there.
 /// The capability view (`devices --caps`) keeps `tier_for`. Pure.
 pub(crate) fn list_tier(
     cert: Option<&identity::DeviceCert>,
     same_owner: Option<&[u8; 32]>,
     invited_as_person: bool,
 ) -> fleet_ui::devices::DeviceTier {
-    if same_owner.is_none() && !invited_as_person {
+    // The peer holds an identity (someone's device) and this one holds none:
+    // "other people, deny-by-default" was the label, for the owner that paired
+    // it. An uncertified peer keeps NEEDS REVIEW and its one-line fix.
+    if same_owner.is_none() && cert.is_some() && !invited_as_person {
         return fleet_ui::devices::DeviceTier::Paired;
     }
     tier_for(cert, same_owner, invited_as_person)
@@ -559,7 +562,7 @@ mod person_tier_tests {
         assert_eq!(tier_for(None, Some(&owner), true), DeviceTier::NeedsReview);
         // No identity here: whatever the peer holds, the list says paired.
         assert_eq!(list_tier(Some(&cert), None, false), DeviceTier::Paired);
-        assert_eq!(list_tier(None, None, false), DeviceTier::Paired);
+        assert_eq!(list_tier(None, None, false), DeviceTier::NeedsReview);
         assert_eq!(list_tier(Some(&cert), Some(&owner), false), DeviceTier::Fleet);
     }
 }

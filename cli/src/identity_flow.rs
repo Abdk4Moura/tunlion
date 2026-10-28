@@ -819,7 +819,7 @@ pub(crate) fn join_transfer_code_msg(code: &str) -> String {
 /// judgement), which also takes a pasted invitation or a file path. Invitation
 /// material is never drawn, so there is nothing to clear afterwards.
 fn prompt_accept_input() -> Result<Zeroizing<String>> {
-    match crate::codeentry::run_accept("  join / code or invitation  ")? {
+    match crate::codeentry::run_accept("  join / code or invitation:  ")? {
         crate::codeentry::Outcome::Submitted(s) | crate::codeentry::Outcome::Claim(s) => Ok(Zeroizing::new(s)),
         crate::codeentry::Outcome::Empty | crate::codeentry::Outcome::Cancelled => Err(crate::cancelled()),
         crate::codeentry::Outcome::Interrupted => {
