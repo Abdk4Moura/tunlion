@@ -4,11 +4,12 @@
   "filament-fleet": 13,
   "filament-id": 33,
   "filament-overlay": 16,
-  "filament-peerloop": 99,
   "filament-pair": 21,
+  "filament-peerloop": 99,
   "filament-proto": 8,
   "filament-signal": 7,
   "filament-transfer": 14,
   "filament-transport": 27,
+  "filament-transport-iroh": 2,
   "tunlion-core": 5
 }
