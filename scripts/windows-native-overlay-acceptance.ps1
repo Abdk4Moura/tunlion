@@ -120,7 +120,7 @@ function Stop-Daemon([string]$phase, [string]$how) {
   $d = Get-Daemon
   if (-not $d) { Record "$phase-stop" 'FAIL' 'no daemon of ours to stop'; return }
   if ($how -ne 'kill') {
-    $down = Invoke-Tun @('down') 60
+    $down = Invoke-Tun @('down', '-y') 60
     $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($d.pid)" -ErrorAction SilentlyContinue
     $stoppedByDown = -not ($still -and [string]$still.CreationDate -eq $d.created)
     $detail = [ordered]@{ down = $down; daemonStoppedByDown = $stoppedByDown }
@@ -134,8 +134,14 @@ function Stop-Daemon([string]$phase, [string]$how) {
   }
   # A verified pid (same executable, same creation time) only.
   Stop-Process -Id $d.pid -Force
-  Wait-Process -Id $d.pid -Timeout 30 -ErrorAction SilentlyContinue
-  $gone = -not (Get-CimInstance Win32_Process -Filter "ProcessId=$($d.pid)" -ErrorAction SilentlyContinue | Where-Object { [string]$_.CreationDate -eq $d.created })
+  # TerminateProcess is asynchronous: the process object lingers while its
+  # handles and pending I/O are torn down. Poll, bounded, for it to be gone.
+  $deadline = (Get-Date).AddSeconds(30)
+  do {
+    $gone = -not (Get-CimInstance Win32_Process -Filter "ProcessId=$($d.pid)" -ErrorAction SilentlyContinue | Where-Object { [string]$_.CreationDate -eq $d.created })
+    if ($gone) { break }
+    Start-Sleep -Milliseconds 250
+  } while ((Get-Date) -lt $deadline)
   $null = Check "$phase-daemon-exited" $gone $d
 }
 
@@ -287,6 +293,22 @@ try {
     $old = Get-Native 'released'
     Record 'released-native-state' 'OBSERVED' $old
     Record 'released-native-http-v4' 'OBSERVED' (Get-Http "http://$($script:PeerV4):8766/token.txt")
+    # Root cause, observed rather than inferred: re-run the released build's
+    # exact IPv4 commands (set, then add as its fallback) on this adapter, and
+    # record what netsh returns and what the adapter then holds.
+    $v4 = $old.addrV4
+    foreach ($verb in @('set', 'add')) {
+      $o = netsh.exe interface ipv4 $verb address "interface=tunlion0" "address=$v4/32" 2>&1
+      $code = $LASTEXITCODE
+      Record "released-old-netsh-$verb" 'OBSERVED' ([ordered]@{
+        command = "netsh interface ipv4 $verb address interface=tunlion0 address=$v4/32"
+        exitCode = $code; output = ($o | Out-String).Trim()
+        addresses = @(Get-NetIPAddress -InterfaceAlias 'tunlion0' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object IPAddress, PrefixLength, PrefixOrigin, AddressState)
+        dhcp = [string](Get-NetIPInterface -InterfaceAlias 'tunlion0' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
+      })
+    }
+    $o = netsh.exe interface ipv4 show addresses tunlion0 2>&1
+    Record 'released-netsh-show' 'OBSERVED' ($o | Out-String).Trim()
   }
   Remove-Item Env:TUNLION_LOG
   Stop-Daemon 'released' 'observe'
@@ -303,6 +325,10 @@ try {
   Stop-Daemon 'restart' 'kill'
   Assert-TornDown 'restart'
   if (Start-Daemon 'restart' $true) { Assert-Native 'restart' }
+
+  # The peer has served everything it needs to; tell it before the overlay
+  # goes away (it also stops waiting when this job's evidence appears).
+  try { Invoke-WebRequest -Uri "http://[$($script:PeerV6)]:8766/done" -NoProxy -TimeoutSec 10 -UseBasicParsing | Out-Null; Record 'peer-done' 'OBSERVED' 'sent' } catch { Record 'peer-done' 'OBSERVED' $_.Exception.Message }
 
   # ---- teardown: graceful, through `tunlion down`.
   Stop-Daemon 'final' 'down'
