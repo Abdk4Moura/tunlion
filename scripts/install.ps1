@@ -418,17 +418,23 @@ try {
     # as another account, whose `down` would not reach the user's daemon; it
     # only renames the running files aside.
     $restart = @()
-    if (-not $AllUsers -and (Test-Path -LiteralPath $exe)) {
+    $stuck = @()
+    if (Test-Path -LiteralPath $exe) {
         foreach ($d in @(Get-RunningDaemons $exe)) {
+            if ($AllUsers) { $stuck += $d; continue }
             Say "stopping the running daemon (pid $($d.Id)) to replace its binary ..."
             & $exe down --yes 2>&1 | Out-Null
             if (Get-Process -Id $d.Id -ErrorAction SilentlyContinue) {
                 Say "the daemon (pid $($d.Id)) did not stop; it keeps running the previous version"
+                $stuck += $d
             } else {
                 $restart += $d
             }
         }
     }
+    # Whatever still runs from here keeps its file through the rename below.
+    # Asked now: after the rename Windows may still report the old path.
+    $busy = @(Get-RunningFrom @($exe))
 
     foreach ($f in @('tunlion.exe', 'wintun.dll')) {
         $src = Join-Path $extract $f
@@ -495,13 +501,15 @@ try {
             Say "the daemon was stopped but did not restart (exit $code); start it with: $cmd"
         }
     }
-    $oldExe = [System.IO.Path]::ChangeExtension($exe, 'old')
-    $stillOld = @(Get-RunningFrom @($oldExe))
+    $stillOld = @($busy | Where-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue })
     if ($stillOld.Count -gt 0) {
+        $oldExe = [System.IO.Path]::ChangeExtension($exe, 'old')
         $ids = ($stillOld | ForEach-Object { $_.ProcessId }) -join ', '
-        Say "still running the previous version from $oldExe (pid $ids); it is removed by the next install once it exits"
-        foreach ($d in @(Get-RunningDaemons $oldExe)) {
-            Say "  to move the daemon (pid $($d.Id)) to the new version:  tunlion down --yes, then: $(Format-UpCommand $d.Flags)"
+        Say "still running the previous version (pid $ids), renamed to $oldExe; it is removed by a later install once it exits"
+        foreach ($d in $stuck) {
+            if (Get-Process -Id $d.Id -ErrorAction SilentlyContinue) {
+                Say "  to move the daemon (pid $($d.Id)) to the new version:  tunlion down --yes, then: $(Format-UpCommand $d.Flags)"
+            }
         }
     }
 } finally {
