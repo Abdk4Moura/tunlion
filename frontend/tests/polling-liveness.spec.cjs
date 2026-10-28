@@ -134,6 +134,9 @@ function backgroundTab() {
   window.__bgAt = Date.now();
 }
 
+// Signaling up. The phone layout has no "online" label, so read the socket.
+const waitUp = (page) => page.waitForFunction(() => /online/i.test(document.body.innerText) || !!(window.__tunlionTestSocket && window.__tunlionTestSocket().connected), null, { timeout: 20000 });
+
 // An Android phone (Pixel 7: mobile UA, viewport, touch).
 function androidCtx() {
   const d = { ...playwright.devices['Pixel 7'] };
@@ -156,7 +159,7 @@ async function open(browser, hold, { android = false } = {}) {
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e && e.message || e).slice(0, 200)));
   await page.goto(BASE + '/?test=1');
-  await page.waitForFunction(() => /online/i.test(document.body.innerText), null, { timeout: 20000 });
+  await waitUp(page);
   return { ctx, page, errors, departures };
 }
 
@@ -366,7 +369,7 @@ async function killedReopen(observer, { hold }) {
   await sleep(+(process.env.PL_KILLED_GAP_MS || 5000)); // the user away in the picker / another app
   const page2 = await p.ctx.newPage();
   await page2.goto(BASE + '/?test=1');
-  await page2.waitForFunction(() => /online/i.test(document.body.innerText), null, { timeout: 20000 });
+  await waitUp(page2);
   const name2 = await deviceName(page2);
   const back = await page2.waitForFunction((x) => [...document.querySelectorAll('[data-testid="peer-tile"]')].some((el) => (el.getAttribute('aria-label') || '').startsWith(x + ', ready')), observer.name, { timeout: 30000 }).then(() => Date.now() - t0).catch(() => null);
   const ghost = await tilesFor(observer.page, name);
