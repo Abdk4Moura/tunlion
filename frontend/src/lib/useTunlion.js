@@ -1543,7 +1543,8 @@ export function useTunlion() {
     rejoinFreshRef.current = rejoinFresh
     const onPageShow = (e) => {
       const persisted = !!(e && e.persisted)
-      const restoring = persisted || pageHideSeen
+      const hidden = pageHideSeen
+      const restoring = persisted || hidden
       pageHideSeen = false
       pageHiddenRef.current = false
       // A superseded tab stays suspended until an explicit full reload. A
@@ -1554,7 +1555,7 @@ export function useTunlion() {
         // After the fresh generation is cached, so the reconnect's join
         // carries it. The pagehide close already took the old sid off every
         // roster, so a new sid costs the other peers nothing.
-        sigRef.current?.restart?.()
+        if (hidden) sigRef.current?.reviveAfterPageHide?.()
         tel('bfcache-restore', { gen: genRef.current.slice(0, 8) })
       }
       sessionRef.current?.start()
