@@ -275,17 +275,20 @@ pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
 
 /// Put `addr/prefixlen` on `dev` and PROVE it is there.
 ///
-/// IPv4 is configured STATICALLY (`source=static` + an explicit mask). The old
-/// shared form, `ipv4 set address interface=X address=A/32` with no source,
-/// could report success while the adapter stayed in DHCP mode with no static
-/// address; Windows then picked an APIPA 169.254.x source and native traffic
-/// failed, while the v4 prefix route (installed only after this returned Ok)
-/// made it look configured (incident: dgmfa, 0.9.0 d7d62d3). IPv6 keeps the
-/// address/prefix form, which works.
+/// IPv4 is configured STATICALLY with its own syntax (`name=`, `source=static`,
+/// an explicit mask). The old shared form, `ipv4 set|add address interface=X
+/// address=A/32`, is a syntax error for IPv4 (`interface` is IPv6's tag), and
+/// netsh reports that error with exit status 0: observed on a real Windows
+/// runner with the released commands. So no address was ever set, Windows put
+/// an APIPA 169.254.x address on the adapter, native IPv4 failed, and the v4
+/// prefix route (installed only after this returned Ok) made it look
+/// configured (incident: dgmfa, 0.9.0 d7d62d3). IPv6 keeps its form, which
+/// works.
 ///
-/// Success is the address actually listed on the adapter, not netsh's exit
-/// status: the listing is read back (briefly waiting for readiness) and a
-/// missing address is an error carrying the captured output.
+/// Success is the address actually listed on the adapter, never netsh's exit
+/// status (which is 0 even for a rejected command): the listing is read back
+/// (briefly waiting for readiness) and a missing address is an error carrying
+/// the captured output.
 fn assign_addr(addr: &str, prefixlen: &str, dev: &str) -> Result<()> {
     let v6 = addr.contains(':');
     let proto = if v6 { "ipv6" } else { "ipv4" };
@@ -484,9 +487,16 @@ mod v4_assignment_tests {
             ipv4_static_args("add", "tunlion0", "198.18.194.149", "32").unwrap(),
             ["interface", "ipv4", "add", "address", "name=tunlion0", "address=198.18.194.149", "mask=255.255.255.255"]
         );
-        // never the old prefix-only form that left DHCP on
-        let set = ipv4_static_args("set", "tunlion0", "198.18.194.149", "32").unwrap();
-        assert!(!set.iter().any(|a| a.contains('/')), "{set:?}");
+        // never the old form. Observed on a real windows-latest runner with the
+        // released 0.9.1 commands: `netsh interface ipv4 set|add address
+        // interface=tunlion0 address=A/32` prints "'interface' is not a valid
+        // argument for this command" and still EXITS 0, so nothing was set and
+        // nothing failed. IPv4 takes `name=`; `interface=` is IPv6's tag.
+        for verb in ["set", "add"] {
+            let args = ipv4_static_args(verb, "tunlion0", "198.18.194.149", "32").unwrap();
+            assert!(!args.iter().any(|a| a.starts_with("interface=")), "{args:?}");
+            assert!(!args.iter().any(|a| a.contains('/')), "{args:?}");
+        }
     }
 
     #[test]

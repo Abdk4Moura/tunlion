@@ -1505,7 +1505,6 @@ fn load_delegation(path: &std::path::Path) -> Result<crate::ephemeral::Invitatio
 
 
 /// The refusal for a `kill` that did not succeed, or None when it did.
-#[cfg_attr(windows, allow(dead_code))]
 fn kill_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
     if status.success() {
         return None;
@@ -1533,23 +1532,22 @@ fn down_cmd() -> Result<()> {
             // through the manager first, and only fall back to a bare kill
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
-            #[allow(unused_mut)]
             let mut note_override: Option<&str> = None;
-            #[cfg(not(windows))]
-            if !stop_managed_service(pid) {
-                let status = crate::platform::command("kill").arg(pid.to_string()).status()?;
-                // A failed kill leaves the daemon running. Saying "stopped" and
-                // deleting the pidfile would hide it from `status` and `reset`
-                // while it keeps serving, so keep the pidfile and say why.
-                if let Some(why) = kill_failure(pid, &status) {
-                    bail!("{why}");
-                }
-            }
-            // Windows has no `kill` program and no SIGTERM: spawning `kill`
-            // failed with "program not found" and the daemon kept running
-            // (incident: dgmfa). Ask through the daemon's stop event instead.
-            #[cfg(windows)]
             match platform::ask_daemon_to_stop(pid) {
+                Ok(platform::StopAsk::UseSignals) => {
+                    if !stop_managed_service(pid) {
+                        let status = crate::platform::command("kill").arg(pid.to_string()).status()?;
+                        // A failed kill leaves the daemon running. Saying
+                        // "stopped" and deleting the pidfile would hide it from
+                        // `status` and `reset` while it keeps serving.
+                        if let Some(why) = kill_failure(pid, &status) {
+                            bail!("{why}");
+                        }
+                    }
+                }
+                // Windows: no `kill` program and no SIGTERM (spawning `kill`
+                // failed with "program not found" and the daemon kept running,
+                // incident: dgmfa). The daemon's stop event was set instead.
                 Ok(platform::StopAsk::Sent) => {}
                 Ok(platform::StopAsk::Denied) => bail!(
                     "could not stop the daemon (pid {pid}): it runs elevated (as Administrator) and this \
