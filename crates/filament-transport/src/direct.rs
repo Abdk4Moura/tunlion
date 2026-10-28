@@ -988,7 +988,7 @@ fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
     tokio::spawn(async move {
         c.closed().await;
         #[cfg(debug_assertions)]
-        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?} — connection closed, dropping endpoint");
+        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?}: connection closed, dropping endpoint");
         drop(ep);
     });
 }
