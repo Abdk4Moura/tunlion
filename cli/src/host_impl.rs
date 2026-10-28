@@ -111,6 +111,25 @@ pub(crate) struct CliHost;
 
 #[async_trait::async_trait]
 impl HostServices for CliHost {
+    fn device_cert_for_key(&self, device_pub: &[u8; 32]) -> Option<filament_id::DeviceCert> {
+        crate::device_view::devices_find_by_device_pub(device_pub)
+            .and_then(|record| filament_id::DeviceCert::from_json(&record["deviceCert"]))
+    }
+    fn owner_user_pub(&self) -> Option<[u8; 32]> {
+        crate::host_impl::owner_pub_for_resources()
+    }
+    fn transfer_request_event(&self, event: &filament_peerloop::recv::requests::RequestEvent) {
+        let Ok(hook) = std::env::var("TUNLION_NOTIFY_HOOK") else { return; };
+        if hook.is_empty() { return; }
+        // No shell, no grants, and no notification delivery claim. This callback
+        // runs after the engine's atomic commit, even if the hook fails to start.
+        let _ = crate::platform::command(&hook)
+            .arg(&event.offer_id).arg("transfer")
+            .env("TUNLION_REQUEST_ID", event.request_id.to_string())
+            .env("TUNLION_REQUEST_REV", event.rev.to_string())
+            .env("TUNLION_REQUEST_STATE", &event.status)
+            .spawn();
+    }
     fn config_dir(&self) -> std::path::PathBuf {
         crate::settings::config_dir()
     }

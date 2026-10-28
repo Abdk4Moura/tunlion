@@ -369,7 +369,7 @@ fn before_write_json_array(path: &Path) -> io::Result<()> {
 /// An exclusive, cross-process lock on a sidecar file. On Unix this is
 /// `flock`; on Windows `LockFileEx`; elsewhere it is an ordinary open (the
 /// store's own atomic rename still prevents torn writes).
-struct StoreLock {
+pub(crate) struct StoreLock {
     _file: std::fs::File,
 }
 
@@ -431,7 +431,7 @@ impl StoreLock {
         Ok(Some(Self { _file: file }))
     }
 
-    fn acquire(path: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
         #[allow(unused_mut)]
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(false);
@@ -1500,7 +1500,37 @@ pub fn principal_from_records(
     });
     if let Some(record) = record {
         if record["principalKind"].is_null() {
-            return (PrincipalKind::OwnerDevice, None, None, None);
+            // A legacy owner record has no principal fields at all. If any
+            // delegation marker exists, a null kind is a half-written/legacy
+            // delegated record: fail closed rather than promoting it to owner.
+            let delegated_marker = [
+                "principalCeiling",
+                "principalExpires",
+                "principalIssued",
+                "principalMaxOffline",
+                "principalState",
+                "lapsedAt",
+            ]
+            .iter()
+            .any(|key| record.get(*key).is_some_and(|value| !value.is_null()));
+            if !delegated_marker {
+                return (PrincipalKind::OwnerDevice, None, None, None);
+            }
+            let caps = record["principalCeiling"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return (
+                PrincipalKind::Delegated { caps },
+                Some(record["principalExpires"].as_u64().unwrap_or(0)),
+                record["principalMaxOffline"].as_u64(),
+                record["lastSeen"].as_u64(),
+            );
         }
         if record["principalKind"].as_str() == Some("delegated") {
             let caps = record["principalCeiling"]
@@ -2798,5 +2828,58 @@ mod store_guards {
         assert_eq!(other["uses"].as_u64(), Some(1));
         assert_eq!(other["expires"].as_u64(), Some(20_000));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_null_principal_kind_with_delegation_markers_fails_closed() {
+        let cert = DeviceCert {
+            device_pub: [3; 32],
+            user_pub: [4; 32],
+            expires: 10_000,
+            issued: 1,
+            sig: [0; 64],
+        };
+        for (marker, value, expected_expires) in [
+            ("principalCeiling", json!(["transfer"]), Some(0u64)),
+            ("principalExpires", json!(9_000), Some(9_000u64)),
+            ("principalIssued", json!(1), Some(0u64)),
+            ("principalMaxOffline", json!(60), Some(0u64)),
+            ("principalState", json!("lapsed"), Some(0u64)),
+            ("lapsedAt", json!(2), Some(0u64)),
+        ] {
+            let mut record = json!({
+                "name": "delegate",
+                "deviceCert": cert.to_json(),
+                "principalKind": Value::Null,
+            });
+            record[marker] = value;
+            let (kind, expires, _, _) =
+                principal_from_records(&[record], &cert, Some(&[4u8; 32]));
+            assert!(
+                matches!(kind, PrincipalKind::Delegated { .. }),
+                "{marker} must not promote a legacy owner record"
+            );
+            assert_eq!(expires, expected_expires, "{marker} end");
+        }
+    }
+
+    #[test]
+    fn a_null_principal_kind_without_delegation_markers_stays_a_legacy_owner() {
+        let cert = DeviceCert {
+            device_pub: [5; 32],
+            user_pub: [6; 32],
+            expires: 10_000,
+            issued: 1,
+            sig: [0; 64],
+        };
+        let record = json!({
+            "name": "owner-laptop",
+            "deviceCert": cert.to_json(),
+            "principalKind": Value::Null,
+        });
+        let (kind, expires, _, _) =
+            principal_from_records(&[record], &cert, Some(&[6u8; 32]));
+        assert!(matches!(kind, PrincipalKind::OwnerDevice));
+        assert_eq!(expires, None);
     }
 }

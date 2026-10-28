@@ -205,6 +205,19 @@ impl HostServices for CoreHost {
         self.store.device_cert_for(name)
     }
 
+    fn device_cert_for_key(&self, device_pub: &[u8; 32]) -> Option<DeviceCert> {
+        self.store.devices_find_by_device_pub(device_pub)
+            .and_then(|record| DeviceCert::from_json(&record["deviceCert"]))
+    }
+
+    fn owner_user_pub(&self) -> Option<[u8; 32]> {
+        trusted_owner_pub(&self.store, &self.overlay)
+    }
+
+    fn device_known(&self, device_pub: &[u8; 32]) -> bool {
+        self.store.devices_find_by_device_pub(device_pub).is_some()
+    }
+
     fn principal_ceiling_for(&self, name: &str) -> Option<Vec<String>> {
         let record = self
             .store

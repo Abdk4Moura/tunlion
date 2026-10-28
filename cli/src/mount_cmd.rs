@@ -145,6 +145,8 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ),
     ("caps.json", "capability store"),
     ("requests.json", "pending consent requests"),
+    ("transfer-requests", "durable transfer offers"),
+    ("retained-sends", "retained outgoing snapshots and offers"),
     ("expose.json", "exposed-service records"),
     ("mounts.json", "mount records"),
     ("l2-allow.json", "L2 forward allowlist"),
@@ -521,7 +523,7 @@ mod reset_tests {
     fn populate(dir: &std::path::Path) {
         for (name, _) in RESET_STATE {
             let p = dir.join(name);
-            if matches!(*name, "identity" | "ssh" | "mount-profiles") {
+            if matches!(*name, "identity" | "ssh" | "mount-profiles" | "transfer-requests" | "retained-sends") {
                 std::fs::create_dir_all(&p).unwrap();
                 std::fs::write(p.join("inner"), b"x").unwrap();
             } else {
@@ -558,6 +560,8 @@ mod reset_tests {
             "identity",
             "devices.json",
             "caps.json",
+            "transfer-requests",
+            "retained-sends",
             "ssh",
             "revoked-keys.json",
             "used-invitations.json",

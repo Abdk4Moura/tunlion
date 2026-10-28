@@ -220,6 +220,15 @@ pub(crate) enum Cmd {
     Send {
         /// Files or directories to send; '-' reads stdin
         paths: Vec<String>,
+        /// Retain a private snapshot for a named device and retry when serving
+        #[arg(long, requires = "to", conflicts_with_all = ["code", "word", "room", "remember", "auth_key", "resume", "cancel"])]
+        defer: bool,
+        /// Retry one retained offer with its original identity and exact bytes
+        #[arg(long, value_name = "OFFER", conflicts_with_all = ["paths", "code", "word", "room", "remember", "auth_key", "name", "defer", "cancel"])]
+        resume: Option<String>,
+        /// Cancel a retained outgoing offer and remove its private snapshot
+        #[arg(long, value_name = "OFFER", conflicts_with_all = ["paths", "code", "word", "room", "remember", "auth_key", "name", "defer", "resume", "to"])]
+        cancel: Option<String>,
         /// Mint a speakable one-time code the receiver claims
         #[arg(long)]
         code: bool,
@@ -1068,7 +1077,8 @@ pub(crate) enum IdAction {
     },
 }
 
-/// Consent request management: list, approve, or deny pending requests.
+/// Request management: access consent (`approve`/`deny`) and durable file
+/// offers (`accept`/`decline`). The two id spaces are separate.
 #[derive(Subcommand)]
 pub(crate) enum RequestsAction {
     /// List pending requests (default: pending-only; --all for full history).
@@ -1092,6 +1102,29 @@ pub(crate) enum RequestsAction {
     Deny {
         /// Request id
         id: u64,
+    },
+    /// Accept a durable file offer by id, binding its exact manifest.
+    ///
+    /// This is not an access grant: it records the file destination and waits
+    /// for the sender to offer the same bytes again.
+    Accept {
+        /// Transfer offer id
+        id: u64,
+        /// File name to land in the configured drop directory (default: the
+        /// first free name derived from the offer)
+        #[arg(long, value_name = "NAME")]
+        to: Option<PathBuf>,
+        /// Reviewed revision; defaults to the current one
+        #[arg(long, value_name = "REV")]
+        rev: Option<u64>,
+    },
+    /// Decline a durable file offer by id.
+    Decline {
+        /// Transfer offer id
+        id: u64,
+        /// Reviewed revision; defaults to the current one
+        #[arg(long, value_name = "REV")]
+        rev: Option<u64>,
     },
 }
 

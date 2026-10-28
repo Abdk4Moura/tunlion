@@ -174,6 +174,9 @@ pub(crate) use identity_flow::{init_experience, join_cmd, local_device_cert, ope
 pub(crate) use identity_flow::principal_from_records;
 /// The inspect commands and their state helpers.
 mod status_cmd;
+/// The durable file-offer adapter: accept/decline/list beside access consent.
+mod transfer_requests;
+mod retained_send_cmd;
 pub(crate) use status_cmd::{detach_up, delegated_device_state, mesh_enrolment, requests_cmd, status_cmd, tour_cmd};
 /// Identity, principal and capability state helpers.
 mod identity_state;
