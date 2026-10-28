@@ -154,13 +154,15 @@ async function open(browser, hold, { android = false } = {}) {
     const u = r.url();
     if (/\/api\/session\/close/.test(u)) departures.push('session-close');
     else if (/socket\.io/.test(u) && r.method() === 'POST' && /\["leave"/.test(r.postData() || '')) departures.push('leave(polling)');
+    else if (/socket\.io\/.*transport=polling.*sid=/.test(u) && r.method() === 'GET') polls.push(Date.now());
   });
+  const polls = [];
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e && e.message || e).slice(0, 200)));
   await page.goto(BASE + '/?test=1');
   await waitUp(page);
-  return { ctx, page, errors, departures };
+  return { ctx, page, errors, departures, polls };
 }
 
 const deviceName = (page) => page.evaluate(() => document.querySelector('[data-testid="device-name-input"]')?.value || document.documentElement.getAttribute('data-device-name') || '');
@@ -316,8 +318,20 @@ async function picker(observer, { hold, freezeS }) {
     Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
     document.dispatchEvent(new Event('visibilitychange'));
   });
+  await sleep(150);
+  // Frozen. Page.setWebLifecycleState frozen is what Chrome does, but it is a
+  // silent no-op on a page Chrome considers visible, which every page in a
+  // Playwright browser is (measured: timers and long-polls ran on through a
+  // "frozen" state). So the freeze is the debugger's pause, which stops every
+  // task on the page's main thread exactly as a frozen renderer does; the
+  // request log below proves it held.
   const cdp = await p.ctx.newCDPSession(p.page);
-  await cdp.send('Page.setWebLifecycleState', { state: 'frozen' });
+  await cdp.send('Page.setWebLifecycleState', { state: 'frozen' }).catch(() => {});
+  await cdp.send('Debugger.enable');
+  const paused = new Promise((r) => cdp.once('Debugger.paused', () => r(true)));
+  await cdp.send('Debugger.pause');
+  if (!(await Promise.race([paused, sleep(5000).then(() => false)]))) fail(`${tag}: the page never froze`);
+  const getsAt = p.polls.length;
   const t0 = Date.now();
   let gaps = 0, gapStart = null, longest = 0;
   const sample = async () => {
@@ -327,7 +341,11 @@ async function picker(observer, { hold, freezeS }) {
   };
   while (Date.now() - t0 < freezeS * 1000) { await sample(); await sleep(200); }
   // The picker returns: active, visible, focused.
-  await cdp.send('Page.setWebLifecycleState', { state: 'active' });
+  const getsFrozen = p.polls.slice(getsAt).filter((t) => t - t0 > 1000).length;
+  await cdp.send('Debugger.resume');
+  await cdp.send('Debugger.disable').catch(() => {});
+  await cdp.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
+  if (hold && getsFrozen > 0) fail(`${tag}: the frozen page still sent ${getsFrozen} long-poll(s): the freeze is not real`);
   await p.page.evaluate(() => {
     delete document.visibilityState; delete document.hidden;
     document.dispatchEvent(new Event('visibilitychange'));
@@ -350,7 +368,7 @@ async function picker(observer, { hold, freezeS }) {
     freezeS, transport: hold ? 'polling' : 'websocket', gaps, longestGapMs: longest,
     pollLapsed: count('poll-lapsed'), disconnects: count('disconnect'), away: count('poll-away'),
     sameSid: sidAfter === bSid, linkKept: link.kept, linkState: link.state,
-    departures: p.departures.slice(), wsLeaves: fd.leaves || 0, sendMs,
+    departures: p.departures.slice(), wsLeaves: fd.leaves || 0, sendMs, getsWhileFrozen: getsFrozen,
   };
   results[tag] = r;
   console.log(`[polling-liveness] ${tag}: tile gaps ${gaps} (longest ${longest} ms); relay for its sid: poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects}, away ${r.away}; same sid ${r.sameSid}; observer link kept ${r.linkKept} (${r.linkState}); departures [${r.departures.join(', ')}] ws leave ${r.wsLeaves}; send ${sendMs == null ? 'FAILED' : sendMs + ' ms'}`);
