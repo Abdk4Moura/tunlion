@@ -279,7 +279,15 @@ mod tests {
     fn stop_notes_say_what_was_done() {
         assert_eq!(Stopped::Asked.note(), "");
         assert!(Stopped::Resumed.note().contains("resumed"));
+        #[cfg(not(windows))]
         assert!(Stopped::Killed.note().contains("SIGKILL"));
+        // Windows has no signals: the note names the stop request and the
+        // termination that followed it, never a SIGKILL that did not happen.
+        #[cfg(windows)]
+        {
+            let n = Stopped::Killed.note();
+            assert!(n.contains("stop request") && n.contains("terminated") && !n.contains("SIG"), "{n}");
+        }
     }
 
     /// A pid with no process behind it is gone, whatever executable we expected.
