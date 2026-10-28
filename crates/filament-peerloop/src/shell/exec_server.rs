@@ -1380,6 +1380,109 @@ mod tests {
         .expect("windows env")
     }
 
+    /// A user variable and a user PATH entry written AFTER this process
+    /// started must be in the account block, read fresh. This is the runtime
+    /// half of the freshness claim and runs on the real windows-latest runner.
+    /// `HKCU\Environment` is restored on drop, panic included.
+    #[cfg(windows)]
+    #[test]
+    fn windows_account_block_is_read_fresh_after_start() {
+        struct Guard {
+            name: String,
+            old_path: Option<(String, String)>,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("reg")
+                    .args(["delete", r"HKCU\Environment", "/v", &self.name, "/f"])
+                    .output();
+                match &self.old_path {
+                    Some((kind, data)) => {
+                        let _ = std::process::Command::new("reg")
+                            .args([
+                                "add", r"HKCU\Environment", "/v", "Path", "/t", kind, "/d", data,
+                                "/f",
+                            ])
+                            .output();
+                    }
+                    None => {
+                        let _ = std::process::Command::new("reg")
+                            .args(["delete", r"HKCU\Environment", "/v", "Path", "/f"])
+                            .output();
+                    }
+                }
+            }
+        }
+        fn reg_value(name: &str) -> Option<(String, String)> {
+            let out = std::process::Command::new("reg")
+                .args(["query", r"HKCU\Environment", "/v", name])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            let line = text.lines().find(|l| l.trim_start().starts_with(name))?;
+            let (_, rest) = line.split_once("REG_")?;
+            let (suffix, data) = rest.split_once(char::is_whitespace)?;
+            Some((format!("REG_{suffix}"), data.trim_start().to_string()))
+        }
+        let nonce = std::process::id();
+        let name = format!("TUNLION_ENVPROBE_FRESH_{nonce}");
+        let value = format!("fresh-{nonce}");
+        let dir = std::env::temp_dir().join(format!("tunlion-envprobe-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let guard = Guard {
+            name: name.clone(),
+            old_path: reg_value("Path"),
+        };
+        let old = guard
+            .old_path
+            .clone()
+            .unwrap_or_else(|| ("REG_SZ".to_string(), String::new()));
+        let joined = if old.1.is_empty() {
+            dir.display().to_string()
+        } else {
+            format!("{};{}", old.1, dir.display())
+        };
+        for (var, kind, data) in [
+            (name.as_str(), "REG_SZ", value.as_str()),
+            ("Path", old.0.as_str(), joined.as_str()),
+        ] {
+            let status = std::process::Command::new("reg")
+                .args([
+                    "add", r"HKCU\Environment", "/v", var, "/t", kind, "/d", data, "/f",
+                ])
+                .status()
+                .expect("reg add");
+            assert!(status.success(), "reg add {var} failed");
+        }
+
+        let account =
+            super::super::user_env::os_account_environment().expect("the account block");
+        let env = super::super::user_env::child_env(
+            true,
+            &windows_current_user(),
+            false,
+            Ok(account),
+            &[],
+            &[],
+        )
+        .expect("windows env");
+        assert_eq!(
+            env_value(&env, &name),
+            Some(value.as_str()),
+            "a user variable set after this process started is missing from the block"
+        );
+        let path = env_value(&env, "PATH").unwrap_or_default();
+        let want = dir.display().to_string();
+        assert!(
+            path.split(';').any(|d| d.eq_ignore_ascii_case(&want)),
+            "a user PATH entry added after this process started is missing from the block: {path}"
+        );
+        drop(guard);
+    }
+
     /// Acceptance on a real Windows child: the filtered environment must let
     /// Node's CSPRNG work and let Node resolve `node` again through PATH.
     #[cfg(windows)]
