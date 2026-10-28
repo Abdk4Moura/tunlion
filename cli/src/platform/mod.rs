@@ -2235,8 +2235,7 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-        // PROOF RUN: fix disabled
-        let _ = stop_std_handle_inheritance;
+        stop_std_handle_inheritance();
     }
     #[cfg(not(any(unix, windows)))]
     {

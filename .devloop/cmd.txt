@@ -1,1 +1,1 @@
-(cargo test --locked -p filament-cli --bin tunlion -- detach_inheritance --nocapture)
+(cargo test --locked -p filament-cli --bin tunlion)
