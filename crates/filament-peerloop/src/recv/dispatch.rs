@@ -5108,7 +5108,7 @@ async fn recv_run(
                                     // direct vs relayed. Always shown, even under -q.
                                     log.debug(&format!(
                                         "    {}",
-                                        log.paint(Tone::Dim, &format!("route: {r}"))
+                                        log.paint(Tone::Dim, &format!("route: {}", p.route_shown(&r).await))
                                     ));
                                     // Relay honesty (§3.3): the quiet `route:` line
                                     // is legible but not loud. When the route is

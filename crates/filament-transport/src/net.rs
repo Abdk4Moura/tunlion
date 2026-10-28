@@ -1567,6 +1567,9 @@ pub struct Peer {
     /// exchange, pair-proofs are bound to them so a MITM'd channel (even by
     /// the signaling server) fails verification.
     fps: Mutex<(Option<String>, Option<String>)>,
+    /// TURN over TCP/TLS bridges for this connection (`turn_bridge`); `None`
+    /// when the config had no TCP or TLS TURN URL.
+    turn_bridges: Option<Arc<crate::turn_bridge::TurnBridges>>,
 }
 
 /// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
@@ -1611,6 +1614,9 @@ impl Peer {
             ice_servers.len(),
             ice_servers.iter().flat_map(|s| s.urls.clone()).collect::<Vec<_>>()
         ));
+        // webrtc-ice only relays over UDP; route TCP and TLS TURN URLs through
+        // loopback bridges so a UDP-blocked network still gets a relay.
+        let (ice_servers, turn_bridges) = crate::turn_bridge::install(ice_servers).await;
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
         let mut registry = Registry::new();
@@ -1676,10 +1682,14 @@ impl Peer {
             let sio = sio.clone();
             let to = peer_id.clone();
             let uid = my_uid.clone();
+            let bridges = turn_bridges.clone();
             pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
                 let sio = sio.clone();
                 let to = to.clone();
                 let uid = uid.clone();
+                if let (Some(b), Some(c)) = (&bridges, &c) {
+                    b.note_candidate(c);
+                }
                 Box::pin(async move {
                     if let Some(ref c) = c {
                         let typ = c.typ.to_string();
@@ -1781,6 +1791,7 @@ impl Peer {
             sio,
             closed,
             fps: Mutex::new((None, None)),
+            turn_bridges,
         });
         // local fingerprint from whatever description we already sent (offer
         // path emits before Peer exists; capture lazily on first access too)
@@ -1844,6 +1855,10 @@ impl Peer {
     pub async fn close(&self) {
         self.mark_closed();
         let _ = self.pc.close().await;
+        // After pc.close(): its TURN deallocations travel through the bridges.
+        if let Some(b) = &self.turn_bridges {
+            b.shutdown();
+        }
     }
 
     /// Apply one relayed signal (description or candidate), browser-equivalent
@@ -1984,6 +1999,42 @@ impl Peer {
             return Some(format!("direct over {iface}"));
         }
         Some(format!("direct over {iface}"))
+    }
+
+    /// What carries OUR side of a relayed path to the TURN server: "udp", "tcp"
+    /// or "tls". `None` when the selected pair's local candidate is not a relay
+    /// (a direct path, or only the peer relays).
+    pub async fn local_relay_transport(&self) -> Option<&'static str> {
+        let pair = self
+            .pc
+            .sctp()
+            .transport()
+            .ice_transport()
+            .get_selected_candidate_pair()
+            .await?;
+        if pair.local.typ != RTCIceCandidateType::Relay {
+            return None;
+        }
+        Some(
+            self.turn_bridges
+                .as_ref()
+                .and_then(|b| b.kind_for_port(pair.local.related_port))
+                .map(|k| k.label())
+                .unwrap_or("udp"),
+        )
+    }
+
+    /// `route()` for people: a relay route says what it rides on, e.g.
+    /// "relay (TURN over tcp)", so a UDP-blocked network is visible. Callers
+    /// that compare against [`ROUTE_RELAY`] keep using `route()`.
+    pub async fn route_shown(&self, route: &str) -> String {
+        if route != ROUTE_RELAY {
+            return route.to_string();
+        }
+        match self.local_relay_transport().await {
+            Some(t) => format!("{route} (TURN over {t})"),
+            None => format!("{route} (the other side's TURN)"),
+        }
     }
 
     /// The selected ICE pair's concrete endpoints, for `tunlion ping`/`doctor`
