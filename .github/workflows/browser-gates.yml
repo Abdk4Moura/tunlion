@@ -152,6 +152,15 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/fast-detect.spec.cjs
 
+      # A closed tab leaves the other peers' rosters at once on both socket.io
+      # transports. A polling page (held websocket) used to stay as a
+      # "connecting" tile for the lease plus the ping timeout. Also gates a
+      # bfcache pagehide/pageshow round trip coming back.
+      - name: closed-tab
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/closed-tab.spec.cjs
+
       # A re-pair used to append a second known-device record for the same local
       # petname, so both the iPad and Pixel showed two rows for one peer. Seed
       # the broken localStorage shape, prove load migration leaves ONE online
