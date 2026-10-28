@@ -49,7 +49,8 @@ process.on('exit', () => { try { relay && relay.kill('SIGKILL'); } catch {} try 
   const ctx = await device.launchBrowser();
   await sleep(3000);
   const departures = [];
-  ctx.on('request', (r) => { const u = r.url(); if (/session\/close/.test(u)) departures.push('session-close'); else if (/socket\.io/.test(u) && r.method() === 'POST' && /\["leave"/.test(r.postData() || '')) departures.push('leave(polling)'); });
+  const phoneGets = [];
+  ctx.on('request', (r) => { const u = r.url(); if (/transport=polling.*sid=/.test(u) && r.method() === 'GET') phoneGets.push(Date.now()); if (/session\/close/.test(u)) departures.push('session-close'); else if (/socket\.io/.test(u) && r.method() === 'POST' && /\["leave"/.test(r.postData() || '')) departures.push('leave(polling)'); });
   await ctx.addInitScript(shim, HOLD);
   let page = ctx.pages()[0];
   try { page = await ctx.newPage(); } catch (e) { console.log(`[probe ${label}] newPage: ${String(e).slice(0, 100)}; using the open tab`); }
@@ -67,7 +68,19 @@ process.on('exit', () => { try { relay && relay.kill('SIGKILL'); } catch {} try 
     await page.locator(`[data-testid="peer-tile"][aria-label^="${obsName},"] button[aria-label^="send files to"]`).first().click();
     await sleep(1500);
     const top = adb('dumpsys activity activities | grep -E "mResumedActivity|topResumedActivity" | head -2').trim();
-    const g0 = pollGets();
+    // The chooser (Files / Camera / ...) is a dialog over Chrome; pick Files,
+    // which opens DocumentsUI full screen and stops Chrome's activity.
+    let chose = null;
+    for (let i = 0; i < 10 && !chose; i++) {
+      adb('uiautomator dump /sdcard/ui.xml >/dev/null');
+      const xml = adb('cat /sdcard/ui.xml');
+      const m = /text="(Files|Browse|Documents)"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/.exec(xml);
+      if (m) { const x = (+m[2] + +m[4]) >> 1, y = (+m[3] + +m[5]) >> 1; adb(`input tap ${x} ${y}`); chose = m[1]; }
+      else await sleep(500);
+    }
+    await sleep(1500);
+    const top2 = adb('dumpsys activity activities | grep -E "topResumedActivity" | head -1').trim();
+    const g0 = phoneGets.length;
     const t0 = Date.now(); let gaps = 0, gapAt = null, longest = 0, firstGap = null;
     while (Date.now() - t0 < f * 1000) {
       const n = (await tiles(obs, phone)).length;
@@ -75,9 +88,11 @@ process.on('exit', () => { try { relay && relay.kill('SIGKILL'); } catch {} try 
       if (n && gapAt != null) { longest = Math.max(longest, Date.now() - gapAt); gapAt = null; }
       await sleep(250);
     }
-    const getsDuring = pollGets() - g0;
+    const getsDuring = phoneGets.slice(g0).filter((t) => t - t0 > 1500).length;
     const topEnd = adb('dumpsys activity activities | grep -E "topResumedActivity" | head -1').trim();
     adb('input keyevent KEYCODE_BACK');
+    await sleep(700);
+    if (!/com\.android\.chrome\//.test(adb('dumpsys activity activities | grep -E "topResumedActivity" | head -1'))) adb('input keyevent KEYCODE_BACK');
     const tBack = Date.now();
     await sleep(1000);
     // Back in Chrome: send a file through an intercepted chooser.
@@ -97,7 +112,7 @@ process.on('exit', () => { try { relay && relay.kill('SIGKILL'); } catch {} try 
     if (gapAt != null) longest = Math.max(longest, Date.now() - gapAt);
     const ev = tel().slice(before).map((e) => e.ev);
     const fd = await page.evaluate(() => window.__fd).catch(() => ({}));
-    const r = { label, freezeS: f, transport: HOLD ? 'polling' : 'websocket', pickerTop: !/com\.android\.chrome\//.test(top) ? top.replace(/.*ActivityRecord\{\S+ \S+ /, '').slice(0, 80) : 'CHROME', topAtEnd: topEnd.replace(/.*ActivityRecord\{\S+ \S+ /, '').slice(0, 80), pollGetsDuringPicker: getsDuring, gaps, firstGapMs: firstGap, longestGapMs: longest, pollLapsed: ev.filter((e) => e === 'poll-lapsed').length, disconnects: ev.filter((e) => e === 'disconnect').length, away: ev.filter((e) => e === 'poll-away').length, readyAfterBackMs: backReady, sendMs, departures: departures.splice(0), wsLeaves: fd.leaves };
+    const r = { label, freezeS: f, transport: HOLD ? 'polling' : 'websocket', chose, topAfterChoose: top2.replace(/.*ActivityRecord\{\S+ \S+ /, '').slice(0, 80), pickerTop: !/com\.android\.chrome\//.test(top) ? top.replace(/.*ActivityRecord\{\S+ \S+ /, '').slice(0, 80) : 'CHROME', topAtEnd: topEnd.replace(/.*ActivityRecord\{\S+ \S+ /, '').slice(0, 80), pollGetsDuringPicker: getsDuring, gaps, firstGapMs: firstGap, longestGapMs: longest, pollLapsed: ev.filter((e) => e === 'poll-lapsed').length, disconnects: ev.filter((e) => e === 'disconnect').length, away: ev.filter((e) => e === 'poll-away').length, webHidden: ev.filter((e) => e === 'web:hidden').length, readyAfterBackMs: backReady, sendMs, departures: departures.splice(0), wsLeaves: fd.leaves };
     rows.push(r);
     console.log(`[probe ${label}] ${JSON.stringify(r)}`);
   }
