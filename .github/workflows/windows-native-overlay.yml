@@ -1,0 +1,147 @@
+# Windows native overlay acceptance, on real machines.
+#
+# Two disposable runners, one throwaway identity, the production signaling
+# server (as the launch matrix uses it):
+#   linux-peer       the owner. Kernel L3 (sudo), an HTTP server on its overlay
+#                    addresses, and a one-claim invitation for the Windows box.
+#   windows-native   joins with the RELEASED binary (the version a user updates
+#                    from), observes it, updates in place to this commit's
+#                    build, and asserts the native data plane end to end: static
+#                    IPv4 on the Wintun adapter, DHCP off, IPv6, both prefix
+#                    routes, source selection, and native HTTP to the peer's v4
+#                    and v6 addresses with no proxy. Then across a daemon
+#                    restart, and teardown (adapter and routes gone).
+#
+# The invitation crosses between the jobs as a run artifact: it allows one
+# claim, expires in 2h, belongs to an identity created for this run only, and
+# the owner deletes the artifact as soon as the Windows box has claimed it.
+#
+# Not a merge gate (dispatch, or a push to a ci/windows-native-overlay* branch).
+name: Windows native overlay
+
+on:
+  push:
+    branches: ["ci/windows-native-overlay*"]
+  workflow_dispatch:
+    inputs:
+      from_release:
+        description: Released CLI tag the Windows box starts on before updating
+        default: cli-v0.9.1
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  FROM_RELEASE: ${{ inputs.from_release || 'cli-v0.9.1' }}
+  PEER_NAME: ci-linux-owner
+  WIN_NAME: win-native
+
+jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
+  linux-peer:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: native-overlay-linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: native-overlay-linux-
+      - name: Build the CLI (debug)
+        run: |
+          cargo build --locked -p filament-cli --bin tunlion
+          ./target/debug/tunlion --version
+      - name: Owner, kernel L3 daemon, HTTP server, invitation
+        run: bash scripts/native-overlay-linux-peer.sh start "$PWD/target/debug/tunlion" "$RUNNER_TEMP/peer"
+      - name: Publish the one-claim invitation for the Windows job
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-overlay-invite-${{ github.run_id }}
+          path: ${{ runner.temp }}/peer/invite/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Serve until the Windows box finishes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/native-overlay-linux-peer.sh wait "$PWD/target/debug/tunlion" "$RUNNER_TEMP/peer"
+      - name: Peer evidence (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-overlay-linux-peer-${{ github.run_id }}
+          path: ${{ runner.temp }}/peer/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-native:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: windows-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          $t = $null; $e = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/windows-native-overlay-acceptance.ps1), [ref]$t, [ref]$e) | Out-Null
+          if ($e.Count) { $e | Format-List | Out-String | Write-Host; throw 'parse failed' }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: native-overlay-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: native-overlay-windows-
+      - name: Build the CLI (debug) at this commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:TUNLION_BUILD_SHA = "${{ github.sha }}".Substring(0,7)
+          cargo build --locked -p filament-cli --bin tunlion
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+      - name: Native overlay acceptance (released -> this build, restart, teardown)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/windows-native-overlay-acceptance.ps1 `
+            -NewExe (Resolve-Path target/debug/tunlion.exe).Path `
+            -FromRelease $env:FROM_RELEASE `
+            -Work "$env:RUNNER_TEMP\native" `
+            -RunId "${{ github.run_id }}" -Repo "${{ github.repository }}"
+          if ($LASTEXITCODE -ne 0) { throw "acceptance exited $LASTEXITCODE" }
+      - name: Windows unit tests for the overlay and detach fixes
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --locked -p filament-cli --bin tunlion detach_inheritance -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "detach inheritance test failed" }
+          cargo test --locked -p filament-peerloop --features l3 --lib l3::
+          if ($LASTEXITCODE -ne 0) { throw "peerloop l3 tests failed" }
+      - name: Acceptance evidence (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-overlay-windows-${{ github.run_id }}
+          path: ${{ runner.temp }}\native\evidence\
+          if-no-files-found: warn
+          retention-days: 14
