@@ -378,7 +378,7 @@ async fn tcp_waits_for_the_udp_window_before_allocating() {
     let (out, _bridges) = install(vec![RTCIceServer {
         urls: vec![
             // Never answers: stands in for a UDP TURN that a firewall drops.
-            "turn:127.0.0.1:9?transport=udp".into(),
+            "turn:192.0.2.1:3478?transport=udp".into(),
             format!("turn:127.0.0.1:{srv}?transport=tcp"),
         ],
         username: "user".into(),
@@ -405,7 +405,7 @@ async fn a_udp_relay_candidate_refuses_tcp_fast() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let srv = l.local_addr().unwrap().port();
     let (out, bridges) = install(vec![RTCIceServer {
-        urls: vec!["turn:127.0.0.1:9".into(), format!("turn:127.0.0.1:{srv}?transport=tcp")],
+        urls: vec!["turn:192.0.2.1:3478".into(), format!("turn:127.0.0.1:{srv}?transport=tcp")],
         username: "user".into(),
         credential: "secret".into(),
     }])
