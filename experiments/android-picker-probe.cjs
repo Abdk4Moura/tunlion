@@ -8,8 +8,9 @@ const fs = require('fs');
 const path = require('path');
 const pw = require(require.resolve('playwright', { paths: [path.join(process.cwd(), 'frontend')] }));
 const ROOT = process.cwd();
-const PORT = 8275, BASE = `http://localhost:${PORT}`;
-const [label, freezesCsv, holdArg] = process.argv.slice(2);
+const [label, freezesCsv, holdArg, portArg] = process.argv.slice(2);
+const PORT = +(portArg || 8275), BASE = `http://localhost:${PORT}`;
+const ROOM = `/rooms/probe-${label}-${Date.now().toString(36)}`;
 const HOLD = holdArg !== '0';
 const LOG = `/tmp/probe-relay-${label}.log`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -30,29 +31,32 @@ const tiles = (page, n) => page.evaluate((x) => [...document.querySelectorAll('[
 const nameOf = (page) => page.evaluate(() => document.querySelector('[data-testid="device-name-input"]')?.value || document.documentElement.getAttribute('data-device-name') || '');
 const up = (page) => page.waitForFunction(() => !!(window.__tunlionTestSocket && window.__tunlionTestSocket().connected), null, { timeout: 30000 });
 async function waitReady(page, n, ms = 40000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if ((await tiles(page, n)).some((l) => l.startsWith(n + ', ready'))) return true; await sleep(200); } return false; }
+let relay = null;
+process.on('exit', () => { try { relay && relay.kill('SIGKILL'); } catch {} try { execSync(`adb reverse --remove tcp:${PORT}`); } catch {} });
 (async () => {
-  const relay = spawn(process.env.PY || 'python3', ['app.py'], { cwd: path.join(ROOT, 'backend'), env: { ...process.env, PORT: String(PORT), FIL_ASYNC_MODE: 'eventlet', FIL_SELF_MONKEYPATCH: '1', FIL_CLAIM_LIMIT: '1000000', FIL_PING_TIMEOUT: '60', FIL_PING_INTERVAL: '25', FIL_SECRET: 'probe' }, stdio: ['ignore', fs.openSync(LOG, 'w'), fs.openSync(LOG, 'a')] });
+  relay = spawn(process.env.PY || 'python3', ['app.py'], { cwd: path.join(ROOT, 'backend'), env: { ...process.env, PORT: String(PORT), FIL_ASYNC_MODE: 'eventlet', FIL_SELF_MONKEYPATCH: '1', FIL_CLAIM_LIMIT: '1000000', FIL_PING_TIMEOUT: '60', FIL_PING_INTERVAL: '25', FIL_SECRET: 'probe' }, stdio: ['ignore', fs.openSync(LOG, 'w'), fs.openSync(LOG, 'a')] });
   for (let i = 0; i < 100; i++) { const ok = await new Promise((r) => http.get(BASE + '/api/health', (x) => { x.resume(); r(x.statusCode === 200); }).on('error', () => r(false))); if (ok) break; await sleep(300); }
   execSync(`adb reverse tcp:${PORT} tcp:${PORT}`);
   const host = await pw.chromium.launch();
   const obsCtx = await host.newContext();
   const obs = await obsCtx.newPage();
-  await obs.goto(BASE + '/?test=1'); await up(obs);
+  await obs.goto(BASE + ROOM + '?test=1'); await up(obs);
   const obsName = await nameOf(obs);
   const [device] = await pw._android.devices();
   console.log(`[probe ${label}] device ${device.model()} ${device.serial()}; chrome ${adb('dumpsys package com.android.chrome | grep versionName | head -1').trim()}`);
   await device.shell('am force-stop com.android.chrome');
   for (const perm of ['READ_MEDIA_IMAGES', 'READ_MEDIA_VIDEO', 'READ_MEDIA_AUDIO', 'READ_MEDIA_VISUAL_USER_SELECTED', 'READ_EXTERNAL_STORAGE', 'POST_NOTIFICATIONS', 'CAMERA']) adb(`pm grant com.android.chrome android.permission.${perm}`);
   const ctx = await device.launchBrowser();
+  await sleep(3000);
   const departures = [];
   ctx.on('request', (r) => { const u = r.url(); if (/session\/close/.test(u)) departures.push('session-close'); else if (/socket\.io/.test(u) && r.method() === 'POST' && /\["leave"/.test(r.postData() || '')) departures.push('leave(polling)'); });
   await ctx.addInitScript(shim, HOLD);
   let page = ctx.pages()[0];
   try { page = await ctx.newPage(); } catch (e) { console.log(`[probe ${label}] newPage: ${String(e).slice(0, 100)}; using the open tab`); }
   if (!page) throw new Error('no page');
-  await page.goto(BASE + '/?test=1'); await up(page);
+  await page.goto(BASE + ROOM + '?test=1'); await up(page);
   const phone = await nameOf(page);
-  if (!(await waitReady(obs, phone, 60000)) || !(await waitReady(page, obsName, 60000))) { await page.reload(); await up(page); }
+  if (!(await waitReady(obs, phone, 60000)) || !(await waitReady(page, obsName, 60000))) { await page.goto(BASE + ROOM + '?test=1').catch(() => {}); await up(page).catch(() => {}); }
   if (!(await waitReady(obs, phone, 60000)) || !(await waitReady(page, obsName, 60000))) { console.log(`[probe ${label}] FAIL: never paired; obs sees ${JSON.stringify(await tiles(obs, phone))}`); process.exit(1); }
   console.log(`[probe ${label}] phone ${phone} transport ${JSON.stringify(await page.evaluate(() => [window.__fd, window.__tunlionTestSocket()]))}`);
   const rows = [];

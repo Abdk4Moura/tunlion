@@ -42,11 +42,12 @@ jobs:
           adb shell pm list packages | grep -i -E "chrome|webview" || true
           adb shell settings put global window_animation_scale 0 || true
           P="$GITHUB_WORKSPACE/experiments/android-picker-probe.cjs"
+          port=8400
           for d in main naive fix; do
-            (cd "$GITHUB_WORKSPACE/../$d" && timeout 1500 node "$P" "$d" 10,30,60,120 1) 2>&1 | grep -v '127.0.0.1 - -'
+            port=$((port+1))
+            (cd "$GITHUB_WORKSPACE/../$d" && timeout 1500 node "$P" "$d" 10,30,60 1 $port) 2>&1 | grep -v '127.0.0.1 - -'
           done
-          (cd "$GITHUB_WORKSPACE/../fix" && timeout 900 node "$P" fix-ws 30,60 0) 2>&1 | grep -v '127.0.0.1 - -'
-          (cd "$GITHUB_WORKSPACE/../main" && timeout 900 node "$P" main-ws 30,60 0) 2>&1 | grep -v '127.0.0.1 - -'
+          (cd "$GITHUB_WORKSPACE/../fix" && timeout 900 node "$P" fix-ws 30 0 8410) 2>&1 | grep -v '127.0.0.1 - -'
           cat /tmp/probe-*.json > /tmp/probe-all.txt 2>/dev/null || true
           exit 0
           SH
