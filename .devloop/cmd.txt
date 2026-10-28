@@ -1,1 +1,1 @@
-pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .devloop\win-combined.ps1
+cargo test --locked -p filament-cli --bin tunlion -- detach_inheritance stop_event a_stop_request l3_state && cargo test --locked -p filament-peerloop --features l3 --lib l3::
