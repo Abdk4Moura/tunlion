@@ -353,6 +353,7 @@ pub async fn install(ice_servers: Vec<RTCIceServer>) -> (Vec<RTCIceServer>, Opti
 
 async fn listener(shared: Arc<Shared>, up: Upstream, sock: Arc<UdpSocket>) {
     let mut sessions: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut dropped: u64 = 0;
     // Dropped with this task, which aborts every session (TurnBridges::shutdown).
     let mut running = JoinSet::new();
     let mut buf = vec![0u8; 65536];
@@ -383,8 +384,14 @@ async fn listener(shared: Arc<Shared>, up: Upstream, sock: Arc<UdpSocket>) {
                         tx
                     }
                 };
-                // Full means the stream is backed up: drop, as UDP would.
-                let _ = tx.try_send(pkt);
+                // Full means the stream is backed up: drop, as UDP would, so
+                // the sender sees loss instead of an ever-growing queue.
+                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(pkt) {
+                    dropped += 1;
+                    if dropped == 1 || dropped % 1000 == 0 {
+                        crate::hooks::debug(&format!("tunlion: {up}: stream backed up, {dropped} packet(s) dropped"));
+                    }
+                }
             }
             Some(_) = running.join_next(), if !running.is_empty() => {
                 sessions.retain(|_, tx| !tx.is_closed());
@@ -464,7 +471,14 @@ async fn session(
         }
         loop {
             match tokio::time::timeout(IDLE, rx.recv()).await {
-                Ok(Some(p)) => write_frame(&mut wr, &p).await?,
+                Ok(Some(p)) => {
+                    let t = Instant::now();
+                    write_frame(&mut wr, &p).await?;
+                    let took = t.elapsed();
+                    if took > Duration::from_secs(1) {
+                        crate::hooks::debug(&format!("tunlion: {up}: a write stalled {} ms", took.as_millis()));
+                    }
+                }
                 Ok(None) | Err(_) => return Ok::<(), std::io::Error>(()),
             }
         }

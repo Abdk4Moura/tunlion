@@ -15,6 +15,16 @@ const fs = require('fs');
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   console.log('[pw] app loaded', url);
 
+  // The RELAY badge belongs to the live peer row and goes when the sender
+  // disconnects, so watch for it from the start instead of after completion.
+  let relayBadge = false;
+  const badgeSeen = page
+    .getByTestId('route-relay')
+    .first()
+    .waitFor({ timeout: 300000 })
+    .then(() => { relayBadge = true; console.log('[pw] relay badge visible'); })
+    .catch(() => {});
+
   const accept = page.getByRole('button', { name: /^accept$/i }).first();
   await accept.waitFor({ timeout: 120000 });
   console.log('[pw] offer visible, accepting');
@@ -24,13 +34,8 @@ const fs = require('fs');
   await save.waitFor({ timeout: 150000 });
   console.log('[pw] transfer complete');
 
-  let relayBadge = false;
-  try {
-    await page.getByTestId('route-relay').first().waitFor({ timeout: 10000 });
-    relayBadge = true;
-  } catch (_) {
-    relayBadge = false;
-  }
+  // Still connected a moment after completion if it was not seen yet.
+  await Promise.race([badgeSeen, new Promise((r) => setTimeout(r, 5000))]);
 
   const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 30000 }), save.click()]);
   await dl.saveAs(out);

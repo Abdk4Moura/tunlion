@@ -199,7 +199,7 @@ send_in_ns() {
   local envs=() args=()
   while [ $# -gt 0 ]; do case "$1" in *=*) envs+=("$1") ;; *) args+=("$1") ;; esac; shift; done
   nsx sudo -n -u "$ME" env HOME="$S" TUNLION_CONFIG_DIR="$S" TUNLION_NONINTERACTIVE=1 "${envs[@]}" \
-    "$BIN" --server "$SERVER" send "$PAY" --room "$room" --timeout 90 -v "${args[@]}" \
+    "$BIN" --server "$SERVER" send "$PAY" --room "$room" --timeout 90 -vv "${args[@]}" \
     </dev/null >"$log.out" 2>"$log.err"
 }
 
