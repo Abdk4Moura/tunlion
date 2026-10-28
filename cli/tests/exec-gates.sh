@@ -10,6 +10,8 @@
 #   A  NEGATIVE no-grant -- acceptor serving, initiator NOT granted: refused,
 #      nonzero, reason names the capability (exercises authorize_exec live).
 #   B  SPACES -- an argument with spaces arrives as ONE argv element.
+#   S  STATUS THROUGH EXEC -- `exec boxB -- tunlion status` sees boxB's daemon
+#      (the served child keeps the daemon's TUNLION_CONFIG_DIR).
 #   C  QUOTES -- single and double quotes inside one argument survive byte-exact.
 #   D  GLOB LITERAL -- `*.log` arrives literally (proves no shell expansion).
 #   E  STDERR SPLIT -- bytes written to each stream land on the right local
@@ -142,6 +144,23 @@ if [ "$rcB" = "0" ] && [ "$OUTB" = "hello world" ]; then
 else
   echo "-- B.err --"; cat "$WORK/B.err"
   bad "gateB: spaces NOT preserved (rc=$rcB out='$OUTB')"
+fi
+
+# ===================================================================== GATE S ==
+# STATUS THROUGH EXEC: `exec boxB -- tunlion status` reports boxB's daemon as
+# up. boxB runs with TUNLION_CONFIG_DIR, as any hermetic or relocated daemon
+# does; the served child used to lose that variable, look in the default config
+# dir and say "not running" while the daemon that served it was alive.
+say S
+OUTS=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$BIN" status 2>"$WORK/S.err" </dev/null)
+rcS=$?
+echo "## (status via exec) rc=$rcS out='$(printf '%s' "$OUTS" | head -3)'"
+if [ "$rcS" = "0" ] && printf '%s' "$OUTS" | grep -q "up (pid" \
+   && ! printf '%s' "$OUTS" | grep -qi "not running"; then
+  ok "gateS: status run through exec sees the daemon that served it"
+else
+  echo "-- S out --"; printf '%s\n' "$OUTS"; echo "-- S.err --"; cat "$WORK/S.err"
+  bad "gateS: status through exec did NOT see boxB's daemon (rc=$rcS)"
 fi
 
 # ===================================================================== GATE C ==
