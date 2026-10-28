@@ -1585,7 +1585,7 @@ impl ServiceHost {
 // installed side by side. Pinned by `frozen_service_names`.
 pub(crate) const SYSTEMD_UNIT: &str = "tunlion";
 #[allow(dead_code)] // macOS only
-const LAUNCHD_LABEL: &str = "autumated.tunlion";
+pub(crate) const LAUNCHD_LABEL: &str = "autumated.tunlion";
 #[allow(dead_code)] // Windows only
 const WINDOWS_AUTOSTART_NAME: &str = "Tunlion";
 #[allow(dead_code)] // Windows only

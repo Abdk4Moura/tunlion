@@ -177,6 +177,11 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         found.ok_or_else(|| anyhow!("{inner} not found in zip archive"))?
     };
 
+    // Which daemon runs the CURRENT binary, asked before the swap: afterwards
+    // the running daemon's image is the renamed `.old` (Windows) or an
+    // unlinked inode (unix), and the question gets harder to answer.
+    let old_daemon = daemon_alive().map(OldDaemon::probe);
+
     // Atomic replace: write staging file next to current exe, then swap.
     let me = std::env::current_exe()?;
     let staging = me.with_extension("update-staging");
@@ -246,18 +251,271 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     // Reload a running daemon onto the new binary with no manual restart. A
     // supervised daemon (systemd) takes the graceful SIGTERM path - which cleanly
     // closes the QUIC links so peers re-establish and L3 recovers - and its
-    // supervisor restarts it with fresh ambient caps: no sudo. If it isn't
-    // supervised (or predates this op), tell the user to restart it.
+    // supervisor restarts it with fresh ambient caps: no sudo. Otherwise the
+    // daemon goes on running the OLD binary, and the user is told so with the
+    // exact command for how it runs: its service manager's restart, or `down`
+    // and `up --detach` with the flags it was started with. Windows has no
+    // control socket, so it always takes the second path.
     #[cfg(unix)]
-    {
-        let reloading = matches!(ctl::try_reload().await, Some(ref v) if v["reloading"].as_bool() == Some(true));
-        if reloading {
-            println!("reloading the daemon onto the new binary (graceful restart, no sudo)");
-        } else if daemon_alive().is_some() {
-            println!(
-                "restart the daemon to run the new binary: `systemctl restart tunlion` (or `tunlion down` then `tunlion up ...`)"
-            );
-        }
+    let answer = ctl::try_reload().await;
+    #[cfg(not(unix))]
+    let answer: Option<Value> = None;
+    let reloading = matches!(answer, Some(ref v) if v["reloading"].as_bool() == Some(true));
+    if reloading {
+        println!("reloading the daemon onto the new binary (graceful restart, no sudo)");
+    } else if let Some(advice) = restart_advice(old_daemon.as_ref(), answer.is_some(), &latest_ver) {
+        println!("{advice}");
     }
     Ok(())
+}
+
+/// What restarts the daemon when it exits. The advice differs: under a service
+/// manager, `tunlion down` then `up --detach` would leave the unit stopped and
+/// start a second, unsupervised daemon beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Supervisor {
+    SystemdSystem,
+    SystemdUser,
+    /// A launchd job, by its service target (`gui/501/autumated.tunlion`).
+    Launchd(String),
+    None,
+}
+
+/// The daemon that was running the binary `update` just replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OldDaemon {
+    pub(crate) pid: u32,
+    pub(crate) supervisor: Supervisor,
+    /// The flags after `up` it was started with, where the platform lets us
+    /// read another process's command line (Linux). None elsewhere.
+    pub(crate) up_flags: Option<Vec<String>>,
+}
+
+impl OldDaemon {
+    fn probe(pid: u32) -> Self {
+        OldDaemon {
+            pid,
+            supervisor: supervisor_of(pid),
+            up_flags: process_argv(pid).and_then(|argv| up_flags_from_argv(&argv)),
+        }
+    }
+}
+
+fn supervisor_of(pid: u32) -> Supervisor {
+    match crate::service_manager_for_pid(pid) {
+        Some(crate::ServiceManager::SystemdSystem) => return Supervisor::SystemdSystem,
+        Some(crate::ServiceManager::SystemdUser) => return Supervisor::SystemdUser,
+        None => {}
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let uid = unsafe { libc::getuid() };
+        for target in [
+            format!("gui/{uid}/{}", platform::LAUNCHD_LABEL),
+            format!("system/{}", platform::LAUNCHD_LABEL),
+        ] {
+            let out = platform::command("launchctl").args(["print", &target]).output();
+            if let Ok(out) = out {
+                if out.status.success()
+                    && launchd_pid(&String::from_utf8_lossy(&out.stdout)) == Some(pid)
+                {
+                    return Supervisor::Launchd(target);
+                }
+            }
+        }
+    }
+    Supervisor::None
+}
+
+/// The running pid in `launchctl print <target>` output (`\tpid = 123`).
+pub(crate) fn launchd_pid(print: &str) -> Option<u32> {
+    print.lines().find_map(|l| {
+        let (k, v) = l.trim().split_once(" = ")?;
+        (k == "pid").then(|| v.trim().parse().ok()).flatten()
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_argv(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect(),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn process_argv(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+/// The flags a daemon was started with, from its full argv (`tunlion up
+/// --shell-only=dgmfa --i-know` gives `--shell-only=dgmfa --i-know`). None
+/// when the argv is not an `up` (its first word after the program is not
+/// `up`). `--detach` is dropped: the restart adds it.
+pub(crate) fn up_flags_from_argv(argv: &[String]) -> Option<Vec<String>> {
+    let at = argv.iter().skip(1).position(|a| !a.starts_with('-'))? + 1;
+    if argv[at] != "up" {
+        return None;
+    }
+    Some(
+        argv[at + 1..]
+            .iter()
+            .filter(|a| a.as_str() != "--detach")
+            .cloned()
+            .collect(),
+    )
+}
+
+/// What `update` prints about a daemon left on the old binary, or None when
+/// no daemon is running. `answered` is whether a daemon answered the reload
+/// request (unix), which proves one runs even when `old` could not name it.
+pub(crate) fn restart_advice(old: Option<&OldDaemon>, answered: bool, new_ver: &str) -> Option<String> {
+    if old.is_none() && !answered {
+        return None;
+    }
+    let who = match old {
+        Some(d) => format!("the daemon (pid {})", d.pid),
+        None => "the daemon".to_string(),
+    };
+    let mut out = format!("{who} is still running the previous binary. Restart it to run {new_ver}:");
+    let supervisor = old.map(|d| d.supervisor.clone()).unwrap_or(Supervisor::None);
+    match supervisor {
+        Supervisor::SystemdSystem => out.push_str("\n    sudo systemctl restart tunlion"),
+        Supervisor::SystemdUser => out.push_str("\n    systemctl --user restart tunlion"),
+        Supervisor::Launchd(target) => {
+            let sudo = if target.starts_with("system/") { "sudo " } else { "" };
+            out.push_str(&format!("\n    {sudo}launchctl kickstart -k {target}"));
+        }
+        Supervisor::None => {
+            out.push_str("\n    tunlion down --yes");
+            // Built word by word: a `{}` after "up" reads to the printed-hint
+            // scanner as a positional `up` does not take.
+            let mut up = String::from("tunlion up --detach");
+            let flags = old.and_then(|d| d.up_flags.clone());
+            for f in flags.iter().flatten() {
+                up.push(' ');
+                if f.chars().any(char::is_whitespace) {
+                    up.push_str(&format!("'{f}'"));
+                } else {
+                    up.push_str(f);
+                }
+            }
+            out.push_str("\n    ");
+            out.push_str(&up);
+            if flags.is_none() {
+                out.push_str("\n  (add the `up` flags it was started with, such as --shell-only)");
+            }
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn daemon(supervisor: Supervisor, flags: Option<&[&str]>) -> OldDaemon {
+        OldDaemon {
+            pid: 4242,
+            supervisor,
+            up_flags: flags.map(|f| f.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    /// Every `tunlion ...` line the advice prints must parse as typed.
+    fn assert_lines_parse(advice: &str) {
+        use clap::Parser;
+        for line in advice.lines().map(str::trim).filter(|l| l.starts_with("tunlion ")) {
+            let argv: Vec<String> = line
+                .split_whitespace()
+                .map(|w| w.trim_matches('\'').to_string())
+                .collect();
+            if let Err(e) = crate::Cli::try_parse_from(&argv) {
+                panic!("printed `{line}` does not parse: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unsupervised_daemon_gets_down_then_up_with_its_own_flags() {
+        let d = daemon(Supervisor::None, Some(&["--shell-only=dgmfa", "--i-know"]));
+        let a = restart_advice(Some(&d), false, "0.9.2").expect("a running daemon gets advice");
+        assert!(a.contains("pid 4242"), "{a}");
+        assert!(a.contains("previous binary"), "{a}");
+        assert!(a.contains("0.9.2"), "{a}");
+        assert!(a.contains("\n    tunlion down --yes\n"), "{a}");
+        assert!(a.ends_with("\n    tunlion up --detach --shell-only=dgmfa --i-know"), "{a}");
+        assert!(!a.contains("systemctl"), "an unsupervised daemon has no unit: {a}");
+        assert_lines_parse(&a);
+    }
+
+    #[test]
+    fn unreadable_flags_say_to_add_them() {
+        let d = daemon(Supervisor::None, None);
+        let a = restart_advice(Some(&d), false, "0.9.2").unwrap();
+        assert!(a.contains("\n    tunlion up --detach\n"), "{a}");
+        assert!(a.contains("flags it was started with"), "{a}");
+        assert_lines_parse(&a);
+    }
+
+    #[test]
+    fn a_supervised_daemon_is_restarted_by_its_manager_not_by_down_and_up() {
+        for (sup, want) in [
+            (Supervisor::SystemdSystem, "    sudo systemctl restart tunlion"),
+            (Supervisor::SystemdUser, "    systemctl --user restart tunlion"),
+            (
+                Supervisor::Launchd("gui/501/autumated.tunlion".into()),
+                "    launchctl kickstart -k gui/501/autumated.tunlion",
+            ),
+            (
+                Supervisor::Launchd("system/autumated.tunlion".into()),
+                "    sudo launchctl kickstart -k system/autumated.tunlion",
+            ),
+        ] {
+            let d = daemon(sup.clone(), Some(&["--shell"]));
+            let a = restart_advice(Some(&d), true, "0.9.2").unwrap();
+            assert!(a.ends_with(want), "{sup:?}: {a}");
+            assert!(!a.contains("tunlion down"), "{sup:?}: down would stop the unit: {a}");
+            assert!(!a.contains("tunlion up"), "{sup:?}: up would start a second daemon: {a}");
+        }
+    }
+
+    #[test]
+    fn no_daemon_no_advice_and_an_unnamed_one_still_gets_it() {
+        assert_eq!(restart_advice(None, false, "0.9.2"), None);
+        let a = restart_advice(None, true, "0.9.2").expect("a daemon answered the reload");
+        assert!(a.starts_with("the daemon is still running"), "{a}");
+        assert!(a.contains("tunlion down --yes"), "{a}");
+    }
+
+    #[test]
+    fn up_flags_come_from_the_daemon_argv() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            up_flags_from_argv(&argv(&["/root/.local/bin/tunlion", "up", "--shell-only=dgmfa", "--i-know"])),
+            Some(argv(&["--shell-only=dgmfa", "--i-know"]))
+        );
+        assert_eq!(
+            up_flags_from_argv(&argv(&["tunlion", "up", "--detach", "--userspace"])),
+            Some(argv(&["--userspace"]))
+        );
+        assert_eq!(up_flags_from_argv(&argv(&["tunlion", "up"])), Some(vec![]));
+        assert_eq!(up_flags_from_argv(&argv(&["tunlion", "send", "up"])), None, "a file named up");
+        assert_eq!(
+            up_flags_from_argv(&argv(&["tunlion", "--json", "up", "--shell"])),
+            Some(argv(&["--shell"]))
+        );
+        assert_eq!(up_flags_from_argv(&argv(&["tunlion", "status"])), None);
+        assert_eq!(up_flags_from_argv(&argv(&["up"])), None, "argv[0] is the program, never the verb");
+    }
+
+    #[test]
+    fn launchd_print_names_the_running_pid() {
+        let print = "gui/501/autumated.tunlion = {\n\tactive count = 1\n\tpath = /Users/me/Library/LaunchAgents/autumated.tunlion.plist\n\tstate = running\n\tpid = 812\n\tlast exit code = 0\n}\n";
+        assert_eq!(launchd_pid(print), Some(812));
+        assert_eq!(launchd_pid("gui/501/autumated.tunlion = {\n\tstate = waiting\n}\n"), None);
+    }
 }
