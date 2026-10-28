@@ -1070,6 +1070,14 @@ fn device_names_resolve_forgivingly_against_the_real_store() {
         }
         _ => unreachable!(),
     }
+    // This device's own name takes the rule too (`init --name`, `set name`).
+    match canonicalize_cmd(Cmd::Init {
+        name: Some("Box B".into()), inbox: None, recovery_file: None, recovery_fd: None,
+        background: false, no_background: false,
+    }).unwrap() {
+        Cmd::Init { name, .. } => assert_eq!(name.as_deref(), Some("box-b")),
+        _ => unreachable!(),
+    }
     unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }

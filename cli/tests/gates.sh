@@ -788,15 +788,15 @@ fi
 # --------------------------------------------------------------- gate 14 ----
 say "14: daemon — pair, introduce-grade trust, room-less up receives (C19/C20/C12)"
 DA="$WORK/g14a"; DB="$WORK/g14b"; DD="$WORK/g14drop"; mkdir -p "$DA" "$DB" "$DD"
-TUNLION_CONFIG_DIR="$DA" "$BIN" -v send "$SMALL" --word "$CODE_WORD" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA" "$BIN" -v send "$SMALL" --word "$CODE_WORD" --remember boxb --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g14-s1.log") || { bad "daemon (no code minted)"; tail -n 3 "$WORK/g14-s1.log"; }
-TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" -v receive "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
+TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" -v receive "$W" -y --remember boxa --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
 wait $SP
 TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" up --dir "$DD" --server "$SERVER" >"$WORK/g14-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
 G14=0
-TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g14-s2.log" 2>&1 || G14=1
+TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$BIG" --to boxb --server "$SERVER" >"$WORK/g14-s2.log" 2>&1 || G14=1
 sleep 1; kill $UP 2>/dev/null
 if [ $G14 -eq 0 ] && [ "$(hashof "$DD/big.bin")" = "$H_BIG" ] \
    && grep -q "identity verified" "$WORK/g14-up.log" \
@@ -809,7 +809,7 @@ say "14b: a daemon receiver SIGKILLed mid-transfer and restarted 4s later: the s
 # The blind run: the sender ignored the replacement daemon and failed with exit 8
 # after 26 s ("delivery not confirmed"), because its delivery-ack wait ran out
 # while the receiver was away, and a re-run was needed to resume. Reuses gate
-# 14's pairing (DA sends to boxB, whose daemon runs on DB). NOT in the ratchet
+# 14's pairing (DA sends to boxb, whose daemon runs on DB). NOT in the ratchet
 # yet: gate 14 itself (and 7, `send --to`) is red on the CI runner, so this
 # gate's premise fails there before the behaviour it checks is reached
 # (measured: the daemon received 0 bytes). Ratchet it with gate 14.
@@ -817,7 +817,7 @@ DD2="$WORK/g14bdrop"; mkdir -p "$DD2"
 TUNLION_CONFIG_DIR="$DB" "$BIN" up --dir "$DD2" --server "$SERVER" >"$WORK/g14b-up1.log" 2>&1 &
 UP1=$!; pids+=($UP1); sleep 3
 TUNLION_TEST_TRANSFER_STALL_MS=10 TUNLION_CONFIG_DIR="$DA" \
-  "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g14b-send.log" 2>&1 &
+  "$BIN" send "$BIG" --to boxb --server "$SERVER" >"$WORK/g14b-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 for _ in $(seq 1 120); do
   sz=$(stat -c %s "$DD2/big.bin.part" 2>/dev/null || echo 0)
@@ -851,9 +851,9 @@ say "14c: one peer's failed adoption never ends the daemon: logged, still servin
 # "direct fallback adoption failed for peer ... ICE config: no answer within
 # 3s". Every per-peer step in the serving loop ended the process with `?`.
 # TUNLION_TEST_FAIL_ADOPT=1 fails the daemon's first adoption the same way
-# (the known-device adoption when boxA's sender appears). A build without the
+# (the known-device adoption when boxa's sender appears). A build without the
 # fix dies right there, so the alive and status checks below fail on it.
-# Reuses gate 14's pairing (DA sends to boxB, whose daemon runs on DB).
+# Reuses gate 14's pairing (DA sends to boxb, whose daemon runs on DB).
 DD3="$WORK/g14cdrop"; mkdir -p "$DD3"
 G14C="$WORK/g14c.bin"; head -c $((2 * 1024 * 1024)) /dev/urandom > "$G14C"; H_G14C=$(hashof "$G14C")
 # No timeout wrapper: $! is the daemon itself, so `status` must name this pid.
@@ -862,7 +862,7 @@ UPC=$!; pids+=($UPC); sleep 3
 # The attempt that meets the injected failure. Its own outcome is not the
 # claim (the direct dial may still win); the daemon outliving it is.
 RC1=0
-TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$SMALL" --to boxB --server "$SERVER" >"$WORK/g14c-s1.log" 2>&1 || RC1=$?
+TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$SMALL" --to boxb --server "$SERVER" >"$WORK/g14c-s1.log" 2>&1 || RC1=$?
 FIRED=""
 for _ in $(seq 1 20); do
   grep -q "PEER-STEP-FAILED.*TUNLION_TEST_FAIL_ADOPT" "$WORK/g14c-up.log" && { FIRED=yes; break; }
@@ -871,7 +871,7 @@ done
 ALIVE=""; kill -0 $UPC 2>/dev/null && ALIVE=yes
 ST14C=$(TUNLION_CONFIG_DIR="$DB" timeout 20 "$BIN" status 2>&1)
 RC2=0
-TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$G14C" --to boxB --server "$SERVER" >"$WORK/g14c-s2.log" 2>&1 || RC2=$?
+TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$G14C" --to boxb --server "$SERVER" >"$WORK/g14c-s2.log" 2>&1 || RC2=$?
 ALIVE2=""; kill -0 $UPC 2>/dev/null && ALIVE2=yes
 kill_tree $UPC
 echo "  hook fired: ${FIRED:-no}; alive after it: ${ALIVE:-no}, after the next send: ${ALIVE2:-no}; first send exit $RC1, next send exit $RC2"
@@ -963,11 +963,11 @@ say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
 # read it here (the non-TTY refusal says exactly this and names --word). These
 # gates ran `add --name X` bare and were refused before any ceremony started.
 DA17="$WORK/g17a"; DB17="$WORK/g17b"; mkdir -p "$DA17" "$DB17"
-TUNLION_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --word "$CODE_WORD" --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxb --word "$CODE_WORD" --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
 P17=$!; pids+=($P17); sleep 4
 C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
-TUNLION_CONFIG_DIR="$DB17" timeout 90 "$BIN" join "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
+TUNLION_CONFIG_DIR="$DB17" timeout 90 "$BIN" join "$C17" --name boxa --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
 wait $P17 || G17=1
 # The channel id is in `devices --json`; the table stopped printing it, so this
 # compared two empty strings and the gate could not pass.
@@ -1125,18 +1125,18 @@ say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 # bugs by hand before becoming a gate (a tick starved behind a blocking
 # 600s read; see C30 in the ledger).
 DA19="$WORK/g19a"; DB19="$WORK/g19b"; D19="$WORK/g19"; mkdir -p "$DA19" "$DB19" "$D19"
-TUNLION_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --word "$CODE_WORD" --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxb --word "$CODE_WORD" --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
 P19=$!; pids+=($P19); sleep 4
 C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0
-TUNLION_CONFIG_DIR="$DB19" timeout 90 "$BIN" join "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
+TUNLION_CONFIG_DIR="$DB19" timeout 90 "$BIN" join "$C19" --name boxa --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
 wait $P19 || G19=1
 TUNLION_TEST_EMIT_LOSS=0.5 TUNLION_TEST_EMIT_SEED=16 TUNLION_CONFIG_DIR="$DB19" \
   timeout 120 "$BIN" up --dir "$D19" --server "$SERVER" </dev/null >"$WORK/g19-up.log" 2>&1 &
 U19=$!; pids+=($U19); sleep 2
 T0=$(date +%s)
 TUNLION_TEST_EMIT_LOSS=0.5 TUNLION_TEST_EMIT_SEED=16 TUNLION_CONFIG_DIR="$DA19" \
-  timeout 120 "$BIN" send "$SMALL" --to boxB --server "$SERVER" >"$WORK/g19-send.log" 2>&1 || G19=1
+  timeout 120 "$BIN" send "$SMALL" --to boxb --server "$SERVER" >"$WORK/g19-send.log" 2>&1 || G19=1
 T1=$(date +%s)
 kill $U19 2>/dev/null; wait $U19 2>/dev/null
 if [ $G19 -eq 0 ] && [ "$(hashof "$D19/small.bin")" = "$H_SMALL" ] && [ $((T1 - T0)) -lt 60 ]; then

@@ -10,7 +10,7 @@
 #      nonzero and the reason names the capability.
 #   B  POSITIVE granted — `tunlion shell <peer> -- 'echo HELLO'` returns 0 with
 #      HELLO on stdout.
-#   G  INTERACTIVE clean exit — `tunlion shell boxB` under a pty over the warm
+#   G  INTERACTIVE clean exit — `tunlion shell boxb` under a pty over the warm
 #      link, `exit 0`: rc 0, no "refused"/"no such session", and the tty modes
 #      after equal the modes before (the terminal is restored).
 #   C  NEIGHBOUR `-- true` — a legitimately fast-exiting remote command stays
@@ -18,7 +18,7 @@
 #   D  NEGATIVE revoked — after `revoke <peer> shell`, the shell is refused
 #      (nonzero, reason).
 #   A1 PRECISE no-cap — that refusal names the real cause (no grant there) and
-#      the exact fix to run on the other device (`tunlion grant boxA shell`),
+#      the exact fix to run on the other device (`tunlion grant boxa shell`),
 #      and never claims serving is off (it is on).
 #   E  NEGATIVE acceptor off — peer runs plain `up` (no --shell) with NO shell
 #      grant; the initiator is told the acceptor is not serving, nonzero.
@@ -72,16 +72,16 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat
 
 DA="$WORK/A"; DB="$WORK/B"; mkdir -p "$DA" "$DB"
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
-printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
+printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
+printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
-A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa)
 
 start_acceptor() {  # $1 = 1 (serve shell, grant-required) | 0 (plain up)
   local l2_env=""
   [ "$1" = "1" ] && l2_env="TUNLION_L2=1"
   local drop="$WORK/Bdrop"; mkdir -p "$drop"
-  env $l2_env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB \
+  env $l2_env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb \
     "$BIN" up --dir "$drop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
   pids+=($!)
   sleep 3
@@ -92,7 +92,7 @@ start_acceptor() {  # $1 = 1 (serve shell, grant-required) | 0 (plain up)
 # names the capability.
 say A
 start_acceptor 1
-OUTA=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo SHOULD-NOT-RUN' 2>"$WORK/A.err" </dev/null)
+OUTA=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxb -- 'echo SHOULD-NOT-RUN' 2>"$WORK/A.err" </dev/null)
 rcA=$?
 echo "## (no-cap) rc=$rcA out='$OUTA'"
 if [ "$rcA" != "0" ] \
@@ -107,24 +107,24 @@ fi
 # ==================================================================== GATE A1 ==
 # The SAME refusal, read for what it tells the user: the acceptor IS serving
 # (TUNLION_L2=1), so "serving is off" would be false; the cause is the missing
-# grant and the fix is one command on boxB, naming boxA as boxB knows it.
+# grant and the fix is one command on boxb, naming boxa as boxb knows it.
 say A1
-if grep -q "tunlion grant boxA shell" "$WORK/A.err" \
+if grep -q "tunlion grant boxa shell" "$WORK/A.err" \
    && ! grep -qi "serving is off" "$WORK/A.err"; then
-  ok "gateA1: no-cap refusal names the grant fix (tunlion grant boxA shell), not 'serving is off'"
+  ok "gateA1: no-cap refusal names the grant fix (tunlion grant boxa shell), not 'serving is off'"
 else
   echo "-- A.err --"; cat "$WORK/A.err"
   bad "gateA1: no-cap refusal did not name the precise cause and fix"
 fi
 
 # ===================================================================== grant ===
-env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grant.log" 2>&1
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
 # ===================================================================== GATE B ==
 # POSITIVE: granted, one-shot exec returns the command output, rc=0.
 say B
-OUTB=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo HELLO' 2>"$WORK/B.err" </dev/null)
+OUTB=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxb -- 'echo HELLO' 2>"$WORK/B.err" </dev/null)
 rcB=$?
 echo "## (granted) rc=$rcB out='$OUTB'"
 if [ "$rcB" = "0" ] && echo "$OUTB" | grep -q "HELLO"; then
@@ -144,10 +144,10 @@ say A2
 # Own PID variable (NOT pids+=): gate E kills pids[-1] expecting the
 # acceptor, and a lingering initiator daemon would also reroute later
 # gates onto the warm path. Clean up at the end of this gate.
-env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA "$BIN" up --dir "$WORK/Adrop" --server "$SERVER" >"$WORK/upA.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa "$BIN" up --dir "$WORK/Adrop" --server "$SERVER" >"$WORK/upA.log" 2>&1 &
 ADPID=$!
 sleep 3
-OUTA2=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo DAEMON-WARM-OK' 2>"$WORK/A2.err" </dev/null)
+OUTA2=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxb -- 'echo DAEMON-WARM-OK' 2>"$WORK/A2.err" </dev/null)
 rcA2=$?
 kill "$ADPID" 2>/dev/null
 wait "$ADPID" 2>/dev/null
@@ -161,7 +161,7 @@ fi
 
 # ===================================================================== GATE G ==
 # INTERACTIVE clean exit. A first-time-user test typed `exit` in an interactive
-# `tunlion shell` over the warm link and got "shell refused by 'boxB': no such
+# `tunlion shell` over the warm link and got "shell refused by 'boxb': no such
 # session", exit 1, and a terminal left in raw mode (stair-stepping until
 # `stty sane`): the warm bridge cannot tell a clean exit from a drop, so it
 # hands off to a resume-only attach, and the acceptor's "no such session"
@@ -170,7 +170,7 @@ fi
 # Asserts the CLIENT: rc 0, no refusal text, and the tty's modes after the
 # client exits are exactly the modes before it started (`stty -g` equality).
 say G
-env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA "$BIN" up --dir "$WORK/Adrop" --server "$SERVER" >"$WORK/upA-G.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa "$BIN" up --dir "$WORK/Adrop" --server "$SERVER" >"$WORK/upA-G.log" 2>&1 &
 GDPID=$!
 sleep 3
 GRES=$("$PYV" - "$BIN" "$SERVER" "$DA" "$WORK/G.out" <<'PYEOF'
@@ -178,8 +178,8 @@ import os, select, subprocess, sys, termios, time
 binp, server, cfg, outp = sys.argv[1:5]
 master, slave = os.openpty()
 before = termios.tcgetattr(slave)
-env = dict(os.environ, TUNLION_CONFIG_DIR=cfg, TUNLION_NAME="boxA", TERM="xterm")
-p = subprocess.Popen([binp, "--server", server, "shell", "boxB"],
+env = dict(os.environ, TUNLION_CONFIG_DIR=cfg, TUNLION_NAME="boxa", TERM="xterm")
+p = subprocess.Popen([binp, "--server", server, "shell", "boxb"],
                      stdin=slave, stdout=slave, stderr=slave, env=env,
                      start_new_session=True)
 buf = b""
@@ -233,7 +233,7 @@ fi
 
 
 say C
-OUTC=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'true' 2>"$WORK/C.err" </dev/null)
+OUTC=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxb -- 'true' 2>"$WORK/C.err" </dev/null)
 rcC=$?
 echo "## (-- true) rc=$rcC out='$OUTC'"
 if [ "$rcC" = "0" ] && [ -z "$OUTC" ]; then
@@ -246,8 +246,8 @@ fi
 # ===================================================================== GATE D ==
 # NEGATIVE: revoke the grant, then the same shell is refused.
 say D
-env TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
-OUTD=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo AFTER' 2>"$WORK/D.err" </dev/null)
+env TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxa shell -y >"$WORK/revoke.log" 2>&1
+OUTD=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxb -- 'echo AFTER' 2>"$WORK/D.err" </dev/null)
 rcD=$?
 echo "## (revoked) rc=$rcD out='$OUTD'"
 if [ "$rcD" != "0" ] \
@@ -265,7 +265,7 @@ fi
 say E
 kill "${pids[-1]}" 2>/dev/null; sleep 1   # stop the --shell acceptor
 start_acceptor 0                           # plain up
-OUTE=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo X' 2>"$WORK/E.err" </dev/null)
+OUTE=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxb -- 'echo X' 2>"$WORK/E.err" </dev/null)
 rcE=$?
 echo "## (acceptor off) rc=$rcE out='$OUTE'"
 # Message is "shell serving is off there..." since the acceptor wording change;
@@ -282,8 +282,8 @@ fi
 # LIVE: grant on the RUNNING plain daemon (#219 repro order), no restart. The
 # grant must apply at once, and the grant command must say no restart is needed.
 say E2
-env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant2.log" 2>&1
-OUTE2=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo LIVE-GRANT-OK' 2>"$WORK/E2.err" </dev/null)
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grant2.log" 2>&1
+OUTE2=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxb -- 'echo LIVE-GRANT-OK' 2>"$WORK/E2.err" </dev/null)
 rcE2=$?
 echo "## (granted live, no restart) rc=$rcE2 out='$OUTE2'"
 if [ "$rcE2" = "0" ] && echo "$OUTE2" | grep -q "LIVE-GRANT-OK" \
@@ -302,7 +302,7 @@ fi
 # without it the restarted daemon would go to the default server.
 say F
 t0=$(date +%s)
-timeout 20 env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB "$BIN" --server "$SERVER" \
+timeout 20 env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb "$BIN" --server "$SERVER" \
   up --detach --shell --i-know >"$WORK/F.out" 2>&1 </dev/null
 rcF=$?
 tF=$(( $(date +%s) - t0 ))
@@ -319,7 +319,7 @@ fi
 
 # ==================================================================== GATE F2 ==
 say F2
-timeout 20 env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB "$BIN" --server "$SERVER" \
+timeout 20 env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb "$BIN" --server "$SERVER" \
   up --detach >"$WORK/F2.out" 2>&1 </dev/null
 rcF2=$?
 echo "## (up --detach, same settings) rc=$rcF2"
@@ -335,7 +335,7 @@ fi
 # The posture gap: a flag other than the shell posture, given over a daemon whose
 # shell posture matches, used to read as "nothing to do" and was dropped.
 say F3
-timeout 20 env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB "$BIN" --server "$SERVER" \
+timeout 20 env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb "$BIN" --server "$SERVER" \
   up --detach --userspace >"$WORK/F3.out" 2>&1 </dev/null
 rcF3=$?
 echo "## (up --detach --userspace, same shell posture) rc=$rcF3"

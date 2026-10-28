@@ -308,17 +308,17 @@ TUNLION_CONFIG_DIR="$DX" timeout 15 "$BIN" down -y >/dev/null 2>&1
 # ============================================= transfer fixture (D, W, N) ======
 # Owner A runs a daemon; B joins A's fleet and receives into a tiny disk.
 DA="$WORK/cfg-A"; DB="$WORK/cfg-B"; mkdir -p "$DA" "$DB"
-env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxa --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1
 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/A-drop" >"$WORK/A-up.log" 2>&1 &
 ADAEMON=$!; pids+=($ADAEMON)
 sleep 3
-env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxB --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
-env TUNLION_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxB --no-interactive >"$WORK/join.log" 2>&1
+env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxb --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxb --no-interactive >"$WORK/join.log" 2>&1
 # The sends below are one-shots from A, as in transport-gates.sh: A's daemon
 # was only needed to admit the join.
 kill "$ADAEMON" 2>/dev/null; sleep 2
-if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxB; then
-  echo "setup: boxB did not join"; tail -5 "$WORK/add.log" "$WORK/join.log"
+if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxb; then
+  echo "setup: boxb did not join"; tail -5 "$WORK/add.log" "$WORK/join.log"
 fi
 FULL="$WORK/tiny"; mount_small "$FULL" 2m
 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$FULL" >"$WORK/B-up.log" 2>&1 &
@@ -328,7 +328,7 @@ sleep 4
 # ===================================================================== GATE D ==
 say "D: a file larger than the receiver's free space"
 head -c 3000000 /dev/urandom >"$WORK/three.bin"
-outD=$(env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/three.bin" --to boxB 2>&1); rcD=$?
+outD=$(env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/three.bin" --to boxb 2>&1); rcD=$?
 echo "## send rc=$rcD"; echo "$outD" | tail -8 | sed 's/^/    /'
 leftD=$(ls -A "$FULL" 2>/dev/null | tr '\n' ' ')
 if [ "$rcD" = "4" ] && echo "$outD" | grep -q "out of disk space" && echo "$outD" | grep -q "needs" \
@@ -342,7 +342,7 @@ fi
 # ===================================================================== GATE W ==
 say "W: ENOSPC part way through is out of disk space, not corruption"
 head -c 1500000 /dev/urandom >"$WORK/w1.bin"; head -c 1500000 /dev/urandom >"$WORK/w2.bin"
-outW=$(env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/w1.bin" "$WORK/w2.bin" --to boxB 2>&1); rcW=$?
+outW=$(env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/w1.bin" "$WORK/w2.bin" --to boxb 2>&1); rcW=$?
 echo "## send rc=$rcW"; echo "$outW" | tail -8 | sed 's/^/    /'
 if [ "$rcW" = "4" ] && echo "$outW" | grep -q "out of disk space" \
    && ! grep -qi "checksum still wrong" "$WORK/B-up.log" && ! ls "$FULL"/*.part >/dev/null 2>&1; then
@@ -358,7 +358,7 @@ say "N: a 250-character file name"
 LONGNAME="$(printf 'n%.0s' $(seq 1 246)).bin"
 mkdir -p "$WORK/longsrc"
 head -c 1000 /dev/urandom >"$WORK/longsrc/$LONGNAME" 2>/dev/null || cp "$WORK/w1.bin" "$WORK/longsrc/x.bin"
-outN=$(env TUNLION_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$WORK/longsrc/$LONGNAME" --to boxB 2>&1); rcN=$?
+outN=$(env TUNLION_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$WORK/longsrc/$LONGNAME" --to boxb 2>&1); rcN=$?
 echo "## send rc=$rcN"; echo "$outN" | tail -5 | sed 's/^/    /'
 gotN=$(ls "$FULL" 2>/dev/null | grep '\.bin$' | head -1)
 echo "## landed as: ${gotN:-(nothing)} (${#gotN} bytes)"

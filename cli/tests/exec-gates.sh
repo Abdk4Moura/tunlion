@@ -20,7 +20,7 @@
 #   H  BULK BYTES -- 1 MiB through `cat` matches local sha256 (binary-safe bulk).
 #   I  RSYNC-OVER-EXEC -- real rsync across the link (skipped cleanly when rsync
 #      is absent on PATH). `rsync -e '<tunlion> exec'` appends
-#      `boxB rsync --server ...`, which our trailing-argv shape takes directly --
+#      `boxb rsync --server ...`, which our trailing-argv shape takes directly --
 #      itself an argv-exactness proof under a real workload.
 #   J  NEGATIVE revoked -- grant revoked, same command refused again.
 #   K  REVOKED MID-SESSION -- a live exec ends when the grant is revoked.
@@ -98,14 +98,14 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat
 
 DA="$WORK/A"; DB="$WORK/B"; mkdir -p "$DA" "$DB"
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
-printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
+printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
+printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
-A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa)
 
 start_acceptor() { # [log file name, default up.log]
   local drop="$WORK/Bdrop"; mkdir -p "$drop"
-  env TUNLION_L2=1 TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB \
+  env TUNLION_L2=1 TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb \
     "$BIN" up --dir "$drop" --server "$SERVER" >"$WORK/${1:-up.log}" 2>&1 &
   pids+=($!)
   sleep 3
@@ -115,7 +115,7 @@ start_acceptor() { # [log file name, default up.log]
 # NEGATIVE: serving acceptor, initiator with NO grant. Refused, nonzero, reason.
 say A
 start_acceptor
-OUTA=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" SHOULD-NOT-RUN 2>"$WORK/A.err" </dev/null)
+OUTA=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" SHOULD-NOT-RUN 2>"$WORK/A.err" </dev/null)
 rcA=$?
 echo "## (no-grant) rc=$rcA out='$OUTA'"
 if [ "$rcA" != "0" ] \
@@ -128,13 +128,13 @@ else
 fi
 
 # =================================================================== grant ====
-env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grant.log" 2>&1
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
 # ===================================================================== GATE B ==
 # SPACES: one argv element with spaces arrives whole.
 say B
-OUTB=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" 'hello world' 2>"$WORK/B.err" </dev/null)
+OUTB=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" 'hello world' 2>"$WORK/B.err" </dev/null)
 rcB=$?
 echo "## (spaces) rc=$rcB out='$OUTB'"
 if [ "$rcB" = "0" ] && [ "$OUTB" = "hello world" ]; then
@@ -147,7 +147,7 @@ fi
 # ===================================================================== GATE C ==
 # QUOTES: single and double quotes inside one argument survive byte-exact.
 say C
-OUTC=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" 'say "hi" and '"'"'bye'"'" 2>"$WORK/C.err" </dev/null)
+OUTC=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" 'say "hi" and '"'"'bye'"'" 2>"$WORK/C.err" </dev/null)
 rcC=$?
 echo "## (quotes) rc=$rcC out='$OUTC'"
 if [ "$rcC" = "0" ] && [ "$OUTC" = 'say "hi" and '"'"'bye'"'" ]; then
@@ -160,7 +160,7 @@ fi
 # ===================================================================== GATE D ==
 # GLOB LITERAL: `*.log` arrives literally -- proves no shell expansion.
 say D
-OUTD=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" '*.log' 2>"$WORK/D.err" </dev/null)
+OUTD=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" '*.log' 2>"$WORK/D.err" </dev/null)
 rcD=$?
 echo "## (glob) rc=$rcD out='$OUTD'"
 if [ "$rcD" = "0" ] && [ "$OUTD" = '*.log' ]; then
@@ -173,7 +173,7 @@ fi
 # ===================================================================== GATE E ==
 # STDERR SPLIT: each stream lands on the right local descriptor.
 say E
-OUTE=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$SH_BIN" "$SH_C" 'echo out; echo err >&2' 2>"$WORK/E.err" </dev/null)
+OUTE=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$SH_BIN" "$SH_C" 'echo out; echo err >&2' 2>"$WORK/E.err" </dev/null)
 rcE=$?
 echo "## (split) rc=$rcE out='$OUTE' err='$(cat "$WORK/E.err")'"
 if [ "$rcE" = "0" ] && [ "$OUTE" = "out" ] && grep -qx "err" "$WORK/E.err"; then
@@ -188,7 +188,7 @@ fi
 # come back (the rsync gate's precondition, isolated -- every earlier gate
 # uses empty stdin).
 say E2
-OUTE2=$(echo "STDIN-ROUNDTRIP-67890" | timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$CAT_BIN" 2>"$WORK/E2.err")
+OUTE2=$(echo "STDIN-ROUNDTRIP-67890" | timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$CAT_BIN" 2>"$WORK/E2.err")
 rcE2=$?
 echo "## (stdin) rc=$rcE2 out='$OUTE2'"
 if [ "$rcE2" = "0" ] && [ "$OUTE2" = "STDIN-ROUNDTRIP-67890" ]; then
@@ -203,7 +203,7 @@ fi
 # must end cleanly (output + rc 0), not hang: a write error to the dead
 # child's stdin is treated as EOF and the loop still waits for its exit.
 say E3
-yes | timeout 20 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- head -n 1 >"$WORK/E3.out" 2>"$WORK/E3.err"
+yes | timeout 20 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- head -n 1 >"$WORK/E3.out" 2>"$WORK/E3.err"
 rcE3=${PIPESTATUS[1]}
 OUTE3=$(cat "$WORK/E3.out")
 echo "## (epipe) rc=$rcE3 out='$OUTE3'"
@@ -217,7 +217,7 @@ fi
 # ===================================================================== GATE F ==
 # EXIT CODES: remote exit status becomes our exit code.
 say F
-timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$SH_BIN" "$SH_C" 'exit 3' 2>"$WORK/F.err" </dev/null
+timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$SH_BIN" "$SH_C" 'exit 3' 2>"$WORK/F.err" </dev/null
 rcF=$?
 echo "## (exit 3) rc=$rcF"
 if [ "$rcF" = "3" ]; then
@@ -232,7 +232,7 @@ fi
 # the 128+signal MAPPING itself is unit-tested (status_mapping_is_shell_convention).
 say G
 if [ "$PLATFORM" = "unix" ]; then
-  timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$SH_BIN" "$SH_C" 'kill -9 $$' 2>"$WORK/G.err" </dev/null
+  timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$SH_BIN" "$SH_C" 'kill -9 $$' 2>"$WORK/G.err" </dev/null
   rcG=$?
   echo "## (kill -9) rc=$rcG"
   if [ "$rcG" = "137" ]; then
@@ -250,7 +250,7 @@ fi
 say H
 head -c 1048576 /dev/urandom > "$WORK/bulk.bin"
 sha256sum "$WORK/bulk.bin" | awk '{print $1}' > "$WORK/bulk.want"
-timeout 60 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$CAT_BIN" "$WORK/bulk.bin" 2>"$WORK/H.err" </dev/null | sha256sum | awk '{print $1}' > "$WORK/bulk.got"
+timeout 60 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$CAT_BIN" "$WORK/bulk.bin" 2>"$WORK/H.err" </dev/null | sha256sum | awk '{print $1}' > "$WORK/bulk.got"
 rcH=${PIPESTATUS[0]}
 echo "## (bulk) rc=$rcH"
 if [ "$rcH" = "0" ] && cmp -s "$WORK/bulk.want" "$WORK/bulk.got"; then
@@ -266,7 +266,7 @@ say I
 if command -v rsync >/dev/null 2>&1; then
   mkdir -p "$WORK/rsrc" "$WORK/rdest"
   echo "rsync-payload-$(date +%s)" > "$WORK/rsrc/payload.txt"
-  timeout 60 ${A_ENV[@]} rsync -av -e "$BIN --server $SERVER exec" "$WORK/rsrc/" "boxB:$WORK/rdest/" >"$WORK/I.log" 2>&1
+  timeout 60 ${A_ENV[@]} rsync -av -e "$BIN --server $SERVER exec" "$WORK/rsrc/" "boxb:$WORK/rdest/" >"$WORK/I.log" 2>&1
   rcI=$?
   echo "## (rsync) rc=$rcI"
   if [ "$rcI" = "0" ] && cmp -s "$WORK/rsrc/payload.txt" "$WORK/rdest/payload.txt"; then
@@ -280,9 +280,9 @@ else
 fi
 
 # ============================================================ LIFETIME GATES ==
-# A remote command never outlives its initiator. Before, `exec boxB -- sleep
+# A remote command never outlives its initiator. Before, `exec boxb -- sleep
 # 300` killed locally (kill -9 OR a plain SIGTERM from `timeout`) left the
-# sleep running as a child of boxB's daemon for the full five minutes, and a
+# sleep running as a child of boxb's daemon for the full five minutes, and a
 # `seq` behind `| head -2` was still producing 19 s after head exited. Unix
 # only: the gates find the remote processes with pgrep by their exact argv
 # (both ends share this host, so the patterns are anchored at the program path
@@ -314,7 +314,7 @@ started_within() { # <seconds> <pattern>: 0 once it matches
 # child proves the whole process group is ended, not only its leader.
 say M
 if [ "$PLATFORM" = "unix" ]; then
-  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sh -c '/bin/sleep 3011 & /bin/sleep 3012; wait' \
+  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- /bin/sh -c '/bin/sleep 3011 & /bin/sleep 3012; wait' \
     >/dev/null 2>"$WORK/M.err" </dev/null &
   MPid=$!
   if started_within 30 '^/bin/sleep 3012$'; then
@@ -342,7 +342,7 @@ fi
 # and closes the session before it exits rather than waiting on a heartbeat.
 say N
 if [ "$PLATFORM" = "unix" ]; then
-  timeout 5 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 3013 \
+  timeout 5 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- /bin/sleep 3013 \
     >/dev/null 2>"$WORK/N.err" </dev/null
   rcN=$?
   t0=$(date +%s)
@@ -363,7 +363,7 @@ fi
 say O
 if [ "$PLATFORM" = "unix" ]; then
   MARK="$WORK/O.int"
-  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sh -c \
+  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- /bin/sh -c \
     "trap 'echo INT > $MARK; exit 130' INT; /bin/sleep 3014 & wait" \
     >/dev/null 2>"$WORK/O.err" </dev/null &
   OPid=$!
@@ -395,7 +395,7 @@ fi
 say P
 if [ "$PLATFORM" = "unix" ] && command -v seq >/dev/null 2>&1; then
   SEQ=$(command -v seq)
-  OUTP=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$SEQ" 1 99999917 2>"$WORK/P.err" </dev/null | head -2)
+  OUTP=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$SEQ" 1 99999917 2>"$WORK/P.err" </dev/null | head -2)
   t0=$(date +%s)
   if [ "$OUTP" = "$(printf '1\n2')" ] && gone_within 5 "^$SEQ 1 99999917\$"; then
     ok "gateP: | head -2 printed two lines and the remote producer was gone in $(( $(date +%s) - t0 ))s"
@@ -411,8 +411,8 @@ fi
 # ===================================================================== GATE J ==
 # NEGATIVE revoked: same command refused again after revoke.
 say J
-env TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
-OUTJ=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" AFTER 2>"$WORK/J.err" </dev/null)
+env TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxa shell -y >"$WORK/revoke.log" 2>&1
+OUTJ=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" AFTER 2>"$WORK/J.err" </dev/null)
 rcJ=$?
 echo "## (revoked) rc=$rcJ out='$OUTJ'"
 if [ "$rcJ" != "0" ] \
@@ -429,11 +429,11 @@ fi
 # shell grant is revoked underneath it -- the receiver ticker re-asks the
 # gate instead of letting the child run out its clock.
 say K
-env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantK.log" 2>&1
-timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 30 2>"$WORK/K.err" </dev/null &
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grantK.log" 2>&1
+timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- /bin/sleep 30 2>"$WORK/K.err" </dev/null &
 KPid=$!
 sleep 5
-env TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revokeK.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxa shell -y >"$WORK/revokeK.log" 2>&1
 wait "$KPid"
 rcK=$?
 echo "## (revoked mid-session) rc=$rcK"
@@ -455,11 +455,11 @@ fi
 # afterwards (the served-groups record is cleared).
 say Q
 if [ "$PLATFORM" = "unix" ] && [ "$(uname -s)" = "Linux" ]; then
-  env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantQ.log" 2>&1
-  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 3017 \
+  env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grantQ.log" 2>&1
+  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- /bin/sleep 3017 \
     >/dev/null 2>"$WORK/Q1.err" </dev/null &
   Q1Pid=$!
-  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sh -c '/bin/sleep 3018 & /bin/sleep 3019; wait' \
+  "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- /bin/sh -c '/bin/sleep 3018 & /bin/sleep 3019; wait' \
     >/dev/null 2>"$WORK/Q2.err" </dev/null &
   Q2Pid=$!
   if started_within 30 '^/bin/sleep 3017$' && started_within 30 '^/bin/sleep 3019$'; then
@@ -507,15 +507,15 @@ fi
 # then the forget, then the same exec: refused within seconds, exit 4
 # (denied), naming the identity, with no "tunnel up" claim and nothing run.
 say R
-env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantR.log" 2>&1
-OUTR0=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" BEFORE-FORGET 2>"$WORK/R0.err" </dev/null)
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grantR.log" 2>&1
+OUTR0=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" BEFORE-FORGET 2>"$WORK/R0.err" </dev/null)
 rcR0=$?
 cp "$DB/devices.json" "$WORK/devices.before-forget.json"
-env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices forget boxA -y >"$WORK/forgetR.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices forget boxa -y >"$WORK/forgetR.log" 2>&1
 rcRF=$?
 sleep 3
 t0=$(date +%s)
-OUTR=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$ECHO_BIN" SHOULD-NOT-RUN 2>"$WORK/R.err" </dev/null)
+OUTR=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" SHOULD-NOT-RUN 2>"$WORK/R.err" </dev/null)
 rcR=$?
 elR=$(( $(date +%s) - t0 ))
 echo "## (before forget) rc=$rcR0 out='$OUTR0'; (forget) rc=$rcRF; (after forget) rc=$rcR in ${elR}s out='$OUTR'"
@@ -530,7 +530,7 @@ else
   echo "-- R.err --"; cat "$WORK/R.err"; tail -15 "$WORK/up-Q.log" 2>/dev/null
   bad "gateR: a forgotten device's exec was not refused as unrecognized (before rc=$rcR0, after rc=$rcR in ${elR}s)"
 fi
-# Gate L below re-uses boxB's pairing with boxA.
+# Gate L below re-uses boxb's pairing with boxa.
 cp "$WORK/devices.before-forget.json" "$DB/devices.json"
 
 # ================================================================ GATE W1-W6 ==
@@ -550,7 +550,7 @@ A_DROP="$WORK/Adrop"; mkdir -p "$A_DROP"
 # The standby link is the daemon's job; make that default explicit instead of
 # relying on the runner's persisted settings.
 env TUNLION_CONFIG_DIR="$DA" "$BIN" set auto-warm on >"$WORK/W-set.log" 2>&1 || true
-env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA \
+env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa \
   "$BIN" up --dir "$A_DROP" --server "$SERVER" >"$WORK/upA.log" 2>&1 &
 pids+=($!)
 # Wait for the control socket to answer, then for warm-hold to actually hold
@@ -558,7 +558,7 @@ pids+=($!)
 warm_ready=0
 for _ in $(seq 1 40); do
   if env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" status --json >/dev/null 2>&1 \
-     && grep -qE "warm-hold: (established connection to|skip) 'boxB'" "$WORK/upA.log"; then
+     && grep -qE "warm-hold: (established connection to|skip) 'boxb'" "$WORK/upA.log"; then
     warm_ready=1; break
   fi
   sleep 0.5
@@ -570,7 +570,7 @@ CMD_W=(/bin/sh -c 'printf out; printf err >&2; exit 7')
 # Portable milliseconds (BSD date has no %N).
 now_ms() { "$PYV" -c 'import time; print(int(time.time()*1000))'; }
 t0=$(now_ms)
-OUTW=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -v exec boxB -- "${CMD_W[@]}" 2>"$WORK/W.err" </dev/null)
+OUTW=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -v exec boxb -- "${CMD_W[@]}" 2>"$WORK/W.err" </dev/null)
 rcW=$?
 elW=$(( $(now_ms) - t0 ))
 echo "## (warm) rc=$rcW out='$OUTW' ${elW}ms"
@@ -585,7 +585,7 @@ else
 fi
 
 t0=$(now_ms)
-OUTC=$(TUNLION_NO_WARM_REUSE=1 timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -v exec boxB -- "${CMD_W[@]}" 2>"$WORK/Wcold.err" </dev/null)
+OUTC=$(TUNLION_NO_WARM_REUSE=1 timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -v exec boxb -- "${CMD_W[@]}" 2>"$WORK/Wcold.err" </dev/null)
 rcC=$?
 elC=$(( $(now_ms) - t0 ))
 echo "## (cold fallback) rc=$rcC out='$OUTC' ${elC}ms"
@@ -600,7 +600,7 @@ else
 fi
 echo "## measured: warm=${elW}ms cold=${elC}ms"
 
-OUTQ=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -q exec boxB -- "${CMD_W[@]}" 2>"$WORK/Wq.err" </dev/null)
+OUTQ=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" -q exec boxb -- "${CMD_W[@]}" 2>"$WORK/Wq.err" </dev/null)
 rcQ=$?
 echo "## (-q) rc=$rcQ out='$OUTQ' stderr_bytes=$(wc -c <"$WORK/Wq.err")"
 # The command's own stderr ("err") is expected; the assertion is that no
@@ -618,7 +618,7 @@ fi
 # must notice the missing heartbeats around the 12 s bound and fail, not wait
 # for QUIC's ~23 s idle. A replay would run the whole sleep again.
 say W5
-( timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- \
+( timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- \
     /bin/sh -c 'echo START; sleep 80; echo DONE' >"$WORK/W5.out" 2>"$WORK/W5.err" </dev/null
   echo $? >"$WORK/W5.rc" ) &
 W5P=$!
@@ -644,7 +644,7 @@ fi
 # No replay: a warm command's stdout starts, then the DAEMON dies. The remote
 # tree is ended by link death; a cold replay would run the whole command again
 # and eventually print DONE. It must never do that.
-( timeout 25 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- \
+( timeout 25 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- \
     /bin/sh -c 'echo START; sleep 8; echo DONE' >"$WORK/WK.out" 2>"$WORK/WK.err" </dev/null
   echo $? >"$WORK/WK.rc" ) &
 CPID=$!
@@ -682,7 +682,7 @@ import os, pty, select, subprocess, sys, time, json
 bin, cfg, server = sys.argv[1:4]
 master, slave = pty.openpty()
 env = os.environ.copy()
-env.update(TUNLION_CONFIG_DIR=cfg, TUNLION_NAME="boxA", TERM="xterm", NO_COLOR="1")
+env.update(TUNLION_CONFIG_DIR=cfg, TUNLION_NAME="boxa", TERM="xterm", NO_COLOR="1")
 t0 = time.time()
 p = subprocess.Popen([bin, "--server", server, "exec", "ghost", "--", "/bin/true"],
                      stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True)
@@ -764,7 +764,7 @@ elif [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
   echo "SKIP gateL: needs root or passwordless sudo"
 else
   if [ "$(id -u)" = "0" ]; then AS_ROOT=(); else AS_ROOT=(sudo -n); fi
-  # Stop the unprivileged acceptor so only the root one answers as boxB (the
+  # Stop the unprivileged acceptor so only the root one answers as boxb (the
   # backend in $pids keeps running; the acceptor is matched by its drop dir).
   for p in $(pgrep -f -- "--dir $WORK/Bdrop" 2>/dev/null); do kill "$p" 2>/dev/null; done
   sleep 2
@@ -772,12 +772,12 @@ else
   mkdir -p "$DR" "$RHOME" "$RDROP"
   cp "$DB/devices.json" "$DR/devices.json"
   "${AS_ROOT[@]}" env HOME="$RHOME" XDG_CONFIG_HOME="$RHOME/.config" TUNLION_CONFIG_DIR="$DR" \
-    "$BIN" grant boxA shell >"$WORK/grantL.log" 2>&1
+    "$BIN" grant boxa shell >"$WORK/grantL.log" 2>&1
   "${AS_ROOT[@]}" env HOME="$RHOME" XDG_CONFIG_HOME="$RHOME/.config" TUNLION_L2=1 \
-    TUNLION_CONFIG_DIR="$DR" TUNLION_NAME=boxB \
+    TUNLION_CONFIG_DIR="$DR" TUNLION_NAME=boxb \
     "$BIN" up --dir "$RDROP" --server "$SERVER" --shell-user nobody >"$WORK/upL.log" 2>&1 &
   sleep 4
-  OUTL=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- id -un 2>"$WORK/L.err" </dev/null)
+  OUTL=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- id -un 2>"$WORK/L.err" </dev/null)
   rcL=$?
   echo "## (--shell-user nobody) rc=$rcL out='$OUTL'"
   if [ "$rcL" = "0" ] && [ "$OUTL" = "nobody" ]; then
@@ -786,7 +786,7 @@ else
     echo "-- L.err --"; cat "$WORK/L.err"; echo "-- upL.log --"; tail -20 "$WORK/upL.log"
     bad "gateL: exec did NOT run as the --shell-user account (rc=$rcL out='$OUTL')"
   fi
-  OUTLENV=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- \
+  OUTLENV=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- \
     /bin/sh -c 'printf "%s|%s|%s|%s" "$HOME" "$USER" "$SHELL" "$XDG_CONFIG_HOME"' \
     2>"$WORK/L-env.err" </dev/null)
   rcLENV=$?
