@@ -32,6 +32,7 @@ export interface Env {
   FIL_POLL_HOLD_S?: string;
   FIL_POLL_GRACE_S?: string;
   FIL_POLL_TICK_S?: string;
+  FIL_POLL_AWAY_S?: string;
   FILAMENT_TEST_DROP_PUSH?: string;
 
   // Router.

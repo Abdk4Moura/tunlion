@@ -67,6 +67,7 @@ interface PollSession {
   pollSince: number;
   cycled: boolean; // NOOP already sent for the held GET
   upgrading: boolean; // a websocket probe is open (the client pauses polling)
+  awayUntil: number; // ms; the page said it is hidden on purpose (#608 `away`)
 }
 
 interface Ctx {
@@ -321,7 +322,7 @@ export class SignalHub extends DurableObject<Env> {
     const sess: PollSession = {
       eid, sid, ns: false, ip, queue: [], waiter: null, waiterTimer: null,
       lastSeen: Date.now(), upgraded: false,
-      watched: false, pollSince: 0, cycled: false, upgrading: false,
+      watched: false, pollSince: 0, cycled: false, upgrading: false, awayUntil: 0,
     };
     this.polls.set(eid, sess);
     this.pollBySid.set(sid, eid);
@@ -406,7 +407,12 @@ export class SignalHub extends DurableObject<Env> {
       const n = parseFloat(String(this.env[k] ?? ""));
       return Number.isFinite(n) ? n : d;
     };
-    return { hold: f("FIL_POLL_HOLD_S", 2), grace: f("FIL_POLL_GRACE_S", 7), tick: f("FIL_POLL_TICK_S", 1) };
+    return {
+      hold: f("FIL_POLL_HOLD_S", 2),
+      grace: f("FIL_POLL_GRACE_S", 7),
+      tick: f("FIL_POLL_TICK_S", 1),
+      away: f("FIL_POLL_AWAY_S", 180),
+    };
   }
 
   private armPollTick() {
@@ -432,7 +438,11 @@ export class SignalHub extends DurableObject<Env> {
           this.pollPush(sess, "6");
         }
       } else if (age >= grace) {
-        tel("poll-lapsed", { eio: sess.eid.slice(0, 11), idle: Math.round(age * 10) / 10 });
+        // Hidden on purpose (a file picker, a background tab): the OS may
+        // freeze it, and a frozen page cannot poll. The ping timeout still
+        // ends it if it never comes back.
+        if (sess.awayUntil > now) continue;
+        tel("poll-lapsed", { sid: sess.sid, eio: sess.eid.slice(0, 11), idle: Math.round(age * 10) / 10 });
         // No CLOSE packet to a client that is not there; the departure runs
         // as for a ping timeout (peer-left, known-peer-left).
         this.dropPoll(sess);
@@ -747,6 +757,8 @@ export class SignalHub extends DurableObject<Env> {
         return this.onSignal(ctx, data);
       case "leave":
         return this.doLeave(ctx.sid);
+      case "away":
+        return this.onAway(ctx, data);
       default:
         return undefined;
     }
@@ -1054,6 +1066,19 @@ export class SignalHub extends DurableObject<Env> {
       return;
     }
     this.emitTo(to, "signal", { from: sid, data: payload ?? null });
+  }
+
+  /** on_away (#608): the page behind THIS socket says it is out of sight.
+   * Only the session the event arrived on, and only one that has polled;
+   * a websocket session accepts and ignores it. on===true lengthens this
+   * session's grace to FIL_POLL_AWAY_S; anything else restores it. */
+  private onAway(ctx: Ctx, raw: unknown) {
+    const p = this.pollFor(ctx.sid);
+    if (!p || !p.watched) return;
+    const on = !!raw && typeof raw === "object" && (raw as Record<string, unknown>).on === true;
+    const { away } = this.pollCfg();
+    p.awayUntil = on && away > 0 ? Date.now() + away * 1000 : 0;
+    tel("poll-away", { sid: ctx.sid, on });
   }
 
   private onDisconnect(sid: string) {

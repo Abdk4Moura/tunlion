@@ -574,6 +574,71 @@ class PollLiveness(Base):
         self.assertLessEqual(took, bound, f"left after {took:.1f}s, want <= {bound:.1f}s")
         watcher.none("peer-left", lambda d: d["id"] == a.sid)
 
+    # The `away` hint (#608): a page hidden on purpose (a file picker, a hidden
+    # tab) says so; THAT socket alone then gets FIL_POLL_AWAY_S (180 s) of
+    # grace instead of 7 s. The 25/60 ping timeout still bounds it.
+
+    def two_pollers_in_a_room(self):
+        room = uniq()
+        watcher, _ = self.joined(room, "watcher")
+        hid, other = RawPoller(), RawPoller()
+        self.start(hid)
+        self.start(other)
+        hid.emit("join", {"room": room, "name": "hid", "uid": uniq("u"), "gen": uniq("g")})
+        other.emit("join", {"room": room, "name": "other", "uid": uniq("u"), "gen": uniq("g")})
+        watcher.wait("peer-joined", lambda d: d["id"] == hid.sid)
+        watcher.wait("peer-joined", lambda d: d["id"] == other.sid)
+        time.sleep(HOLD + 0.5)
+        return watcher, hid, other
+
+    def test_away_extends_only_the_callers_own_socket(self):
+        watcher, hid, other = self.two_pollers_in_a_room()
+        # The hidden page says so, then freezes (stops polling). The other one
+        # dies silently at the same moment.
+        hid.emit("away", {"on": True})
+        time.sleep(0.3)
+        hid.stop.set()
+        other.stop.set()
+        t0 = time.time()
+        bound = HOLD + GRACE + 2 * TICK + 3.0
+        watcher.wait("peer-left", lambda d: d["id"] == other.sid, timeout=bound + 10)
+        self.assertLessEqual(time.time() - t0, bound, "another socket's away kept a dead one open")
+        watcher.none("peer-left", lambda d: d["id"] == hid.sid, within=GRACE * 2)
+
+    def test_away_off_restores_the_short_grace(self):
+        watcher, hid, _ = self.two_pollers_in_a_room()
+        hid.emit("away", {"on": True})
+        hid.emit("away", {"on": False})
+        time.sleep(0.3)
+        hid.stop.set()
+        t0 = time.time()
+        bound = HOLD + GRACE + 2 * TICK + 3.0
+        watcher.wait("peer-left", lambda d: d["id"] == hid.sid, timeout=bound + 10)
+        self.assertLessEqual(time.time() - t0, bound)
+
+    def test_away_with_anything_but_true_is_off(self):
+        watcher, hid, _ = self.two_pollers_in_a_room()
+        hid.emit("away", {"on": "yes"})
+        time.sleep(0.3)
+        hid.stop.set()
+        t0 = time.time()
+        bound = HOLD + GRACE + 2 * TICK + 3.0
+        watcher.wait("peer-left", lambda d: d["id"] == hid.sid, timeout=bound + 10)
+        self.assertLessEqual(time.time() - t0, bound)
+
+    def test_away_on_a_websocket_is_accepted_and_ignored(self):
+        room = uniq()
+        a, wa = self.joined(room, "a")
+        b, _ = self.joined(room, "b")
+        a.emit("away", {"on": True})
+        a.emit("away", {"on": False})
+        a.emit("away", "garbage")
+        d = a.call("sync", {"v": 1, "room": room, "name": "a", "uid": uniq("u"),
+                            "gen": wa["gen"], "token": wa["token"]})
+        self.assertTrue(d["ok"])
+        self.assertEqual([p["id"] for p in d["peers"]], [b.sid])
+        b.none("peer-left")
+
     def test_slow_poller_inside_the_grace_is_kept(self):
         room = uniq()
         watcher, _ = self.joined(room, "watcher")
