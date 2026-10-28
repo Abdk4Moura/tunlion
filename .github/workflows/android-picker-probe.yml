@@ -1,0 +1,66 @@
+# Throwaway probe for PR #608 (not for merge): real Android Chrome in an
+# emulator, the real system file picker, polling transport, local relay;
+# main vs #608 (naive 7 s rule) vs #608 with the away hint.
+name: android-picker-probe
+on:
+  push:
+    branches: [ci/android-picker-probe]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Builds
+        run: |
+          set -eux
+          git worktree add ../main origin/main
+          git worktree add ../naive 4d670bf2
+          git worktree add ../fix origin/fix/polling-liveness
+          pip install -r backend/requirements.txt
+          (cd frontend && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium)
+          for d in main naive fix; do
+            ln -s "$GITHUB_WORKSPACE/frontend/node_modules" ../$d/frontend/node_modules
+            (cd ../$d/frontend && VITE_TUNLION_API= npm run build)
+          done
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Probe script
+        run: |
+          cat > "$RUNNER_TEMP/probe.sh" <<'SH'
+          set -u
+          adb wait-for-device
+          adb shell pm list packages | grep -i -E "chrome|webview" || true
+          adb shell settings put global window_animation_scale 0 || true
+          P="$GITHUB_WORKSPACE/experiments/android-picker-probe.cjs"
+          for d in main naive fix; do
+            (cd "$GITHUB_WORKSPACE/../$d" && timeout 1500 node "$P" "$d" 10,30,60,120 1) 2>&1 | grep -v '127.0.0.1 - -'
+          done
+          (cd "$GITHUB_WORKSPACE/../fix" && timeout 900 node "$P" fix-ws 30,60 0) 2>&1 | grep -v '127.0.0.1 - -'
+          (cd "$GITHUB_WORKSPACE/../main" && timeout 900 node "$P" main-ws 30,60 0) 2>&1 | grep -v '127.0.0.1 - -'
+          cat /tmp/probe-*.json > /tmp/probe-all.txt 2>/dev/null || true
+          exit 0
+          SH
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: bash "$RUNNER_TEMP/probe.sh"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe
+          path: |
+            /tmp/probe-*.json
+            /tmp/probe-relay-*.log
