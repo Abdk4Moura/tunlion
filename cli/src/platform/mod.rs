@@ -4422,10 +4422,11 @@ mod detach_inheritance_tests {
         // not when the grandchild does.
         let got = rx.recv_timeout(Duration::from_secs(20));
         let text = got.as_deref().unwrap_or("");
-        let grandchild = text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("GRANDCHILD="))
-            .and_then(|p| p.trim().parse::<u32>().ok());
+        // The harness prints "test <name> ... " before the test's own output,
+        // so the marker can sit mid-line.
+        let grandchild = text.split_once("GRANDCHILD=").and_then(|(_, rest)| {
+            rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok()
+        });
         if let Some(pid) = grandchild {
             let _ = super::command("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
         }
