@@ -36,9 +36,12 @@ impl Signals {
             #[cfg(windows)]
             let received = {
                 let requested = async {
-                    match stop_request {
-                        Some(rx) if rx.await.is_ok() => {}
-                        _ => std::future::pending::<()>().await,
+                    let fired = match stop_request {
+                        Some(rx) => rx.await.is_ok(),
+                        None => false,
+                    };
+                    if !fired {
+                        std::future::pending::<()>().await;
                     }
                 };
                 tokio::select! {
