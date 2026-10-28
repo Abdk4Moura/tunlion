@@ -1,0 +1,94 @@
+name: signal-conformance
+
+# One protocol, two backends. The SAME wire-level suite (backend/conformance)
+# runs against the Python relay and against the Cloudflare port (edge/signal,
+# run locally under wrangler dev / workerd), on websocket, long-polling and
+# the polling->websocket upgrade, plus the small-budget rate-limit suite.
+# A change to either side that the other does not mirror goes red here.
+# No secrets and no Cloudflare account: everything runs on the runner.
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - "edge/signal/**"
+      - ".github/workflows/signal-conformance.yml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "edge/signal/**"
+      - ".github/workflows/signal-conformance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          python -m pip install -q -r backend/requirements.txt "python-socketio[client]" websocket-client requests
+          cd edge/signal && npm ci --no-audit --no-fund
+
+      - name: Typecheck and unit tests (edge)
+        working-directory: edge/signal
+        run: |
+          npx tsc --noEmit
+          npm test
+
+      - name: Start both backends, each twice (lifted and small budgets)
+        run: |
+          set -euo pipefail
+          common="FIL_SELF_MONKEYPATCH=1 FIL_ASYNC_MODE=eventlet FIL_DEV=1 FIL_SECRET=conformance FIL_PING_INTERVAL=25 FIL_PING_TIMEOUT=60"
+          (cd backend && env $common PORT=5055 FIL_CLAIM_LIMIT=200 FIL_PAIR_CREATE_LIMIT=800 \
+             nohup python app.py > ../py-main.log 2>&1 &)
+          (cd backend && env $common PORT=5056 FIL_SESSION_CLAIM_LIMIT=8 FIL_CLAIM_LIMIT=3 FIL_CLOSE_LIMIT=4 \
+             nohup python app.py > ../py-limits.log 2>&1 &)
+          cd edge/signal
+          nohup npx wrangler@4.151.3 dev --env staging --port 8787 --ip 127.0.0.1 \
+             --var FIL_SECRET:conformance --persist-to ../../.wrangler-main > ../../cf-main.log 2>&1 &
+          nohup npx wrangler@4.151.3 dev --env limits --port 8788 --inspector-port 9230 --ip 127.0.0.1 \
+             --var FIL_SECRET:conformance --persist-to ../../.wrangler-limits > ../../cf-limits.log 2>&1 &
+          for url in http://127.0.0.1:5055 http://127.0.0.1:5056 http://127.0.0.1:8787 http://127.0.0.1:8788; do
+            for i in $(seq 1 120); do curl -sf "$url/api/health" >/dev/null && break; sleep 1; done
+            curl -sf "$url/api/health" >/dev/null || { echo "::error::$url never came up"; tail -50 ../../cf-*.log ../../py-*.log; exit 1; }
+          done
+
+      - name: Conformance, Python relay
+        run: |
+          set -euo pipefail
+          for t in websocket polling upgrade; do
+            CONFORMANCE_URL=http://127.0.0.1:5055 CONFORMANCE_TRANSPORT=$t python -m unittest backend.conformance.test_conformance
+          done
+          CONFORMANCE_URL=http://127.0.0.1:5056 python -m unittest backend.conformance.test_limits
+
+      - name: Conformance, Cloudflare port
+        # PollLiveness mirrors fix/polling-liveness, not yet on the Python
+        # side's main; enable it for Python too once that lands.
+        env:
+          CONFORMANCE_POLL_LIVENESS: "1"
+        run: |
+          set -euo pipefail
+          for t in websocket polling upgrade; do
+            CONFORMANCE_URL=http://127.0.0.1:8787 CONFORMANCE_TRANSPORT=$t python -m unittest backend.conformance.test_conformance
+          done
+          CONFORMANCE_URL=http://127.0.0.1:8788 python -m unittest backend.conformance.test_limits
+
+      - name: Logs
+        if: failure()
+        run: tail -n 80 py-main.log py-limits.log cf-main.log cf-limits.log || true

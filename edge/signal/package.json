@@ -1,0 +1,14 @@
+{
+  "name": "tunlion-signal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "dev": "wrangler dev --env staging"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20251001.0",
+    "typescript": "5.6.3"
+  }
+}

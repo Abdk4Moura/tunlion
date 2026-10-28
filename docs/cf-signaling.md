@@ -1,0 +1,278 @@
+# Cloudflare duplicate of the signaling backend
+
+Status: built and drilled on staging; not in front of production. The VPS
+(`deploy/`: Flask-SocketIO under gunicorn/eventlet, cloudflared, coturn) stays
+the primary. Cloudflare is a hot duplicate that takes over when the VPS is
+down and hands back when it returns. Code: `edge/signal/`.
+
+## Shape
+
+```
+ client ──► router Worker (route on the API hostname)
+              │  origin up:   proxy to ORIGIN_URL (the VPS tunnel), as today
+              │  origin down: serve here
+              │                 REST (/api/config, /api/room, ...) in the Worker
+              │                 /socket.io + /api/session/close in SignalHub
+              │
+              ├─ HealthState (Durable Object): probes ORIGIN_URL/health,
+              │  hysteresis, publishes the up/down flag to KV on a flip
+              └─ Cron Trigger, every minute: HealthState.tick()
+```
+
+One script, `edge/signal/src/index.ts`, plays both roles. Without
+`ORIGIN_URL` it is a complete signaling backend (the staging targets are
+this); with it, it is the router.
+
+### SignalHub: the port of `backend/signaling.py`
+
+`edge/signal/src/hub.ts` is engine.io v4 (websocket, HTTP long-polling, and
+the polling to websocket upgrade), socket.io v5 framing (CONNECT, EVENT,
+ACK, DISCONNECT), and the relay's event handlers in the same order and under
+the same names as `register()`. `registry.ts` is `_MemRegistry` method for
+method. Every constant the two must agree on is in `policy.ts`, each naming
+its Python twin.
+
+One hub, not one object per room or channel. The Python relay is a single
+process and its semantics rest on that: a socket's room and its presence
+channels are independent (`known-peer` crosses rooms), `signal` may go to any
+sid that shares a room or a channel, and nameplates and session tokens are
+global. Splitting by room would need a gateway object in front of every
+socket fanning each event out to several objects: a new protocol surface and
+several billed requests per event. A single object carries up to 32k
+websockets and roughly a thousand small events a second, far past launch
+traffic; the split is the change to make when one object stops being enough,
+not before.
+
+State and hibernation. The hub uses the WebSocket Hibernation API. A
+hibernated or evicted object keeps its sockets but loses its heap, so:
+
+- per-socket identity (engine.io id, socket.io sid, namespace state, client
+  IP, the #592 legacy session) rides each websocket's attachment;
+- sessions, retired generations, room membership, channel subscriptions and
+  nameplates are written through to the object's SQLite, and memory is the
+  read path (reloaded on the first use after a wake);
+- a refresh-only claim (the 30 s daemon sync) does not write: its sliding
+  expiry is held in memory and written once it drifts 30 minutes;
+- liveness is the transport itself (an open websocket or a live polling
+  session), the same ground truth `_eio_alive` gives the Python lease loop.
+  A row whose transport vanished without a close event is cleaned up the
+  next time anyone looks at its room, and by a five-minute sweep, with the
+  `peer-left` the room would have heard.
+
+Polling sessions live in memory only: if the object is evicted mid-session,
+the client gets `Session ID unknown` and reconnects, as it would after a
+Python restart.
+
+Polling liveness mirrors `signaling.PollWatch` from `fix/polling-liveness`
+(not yet on main when this was written): a GET held `FIL_POLL_HOLD_S` (2 s)
+is answered with a NOOP so a live client re-polls at once, and a polling
+session with no GET for `FIL_POLL_GRACE_S` (7 s) is closed as if its ping had
+timed out, so a silently dead tab leaves its room in about 8 s instead of
+85 s. Same env names and defaults, `FIL_POLL_GRACE_S=0` turns it off. Its
+conformance test (`PollLiveness`) is gated by `CONFORMANCE_POLL_LIVENESS=1`
+until the Python side merges; then drop the gate. The cost: a polling client
+makes a request every ~2 s instead of every 25 s (table below).
+
+engine.io pings: the hub's alarm sends `2` every `FIL_PING_INTERVAL` while
+any socket is open and closes a transport silent for interval plus timeout.
+Defaults are production's 25 s / 60 s (`deploy/docker-compose.yml`), not the
+app's 5 s / 10 s: every pong is a billed inbound message here.
+
+Engine.io ids minted by the hub start with `cf.` and so do its session
+tokens. Python's are base64url and never contain a dot. The router uses the
+prefix to keep every request of a session on the backend that minted it.
+
+### The router and stickiness
+
+Both peers of a room must land on the same backend, because the two backends
+share no state. Three rules give that (`index.ts`):
+
+1. A new engine.io session goes where the one global flag says.
+2. A request for an existing session follows the backend that minted its
+   sid (`cf.` prefix). A polling session is never split mid-life; a
+   `/api/session/close` beacon follows its token's prefix.
+3. On failback the hub closes every transport without a socket.io
+   DISCONNECT (which would stop socket.io-client from reconnecting), so each
+   client reconnects and follows rule 1 home. The drain waits until every
+   router has seen the flip, and for ten minutes afterwards each cron minute
+   sweeps any straggler off the hub.
+
+When the origin is down its sockets are already gone, so rule 1 alone moves
+everyone over.
+
+Stateless REST (`/api/config`, `/api/room`, `/api/room/code`, `/api/whoami`,
+`/api/health`, `/health`) is answered by the Worker itself whenever a
+proxied request fails, before any flip: the answers are identical given the
+same `FIL_SECRET` and TURN secrets, so a page load never waits on the
+hysteresis. Sockets are not failed over per request: splitting a room on
+one failed request is worse than a short retry.
+
+Every router response carries `x-tunlion-backend: origin|cf`.
+`GET /__router/status` shows the health state machine (phase, streaks, last
+probe, the last 20 transitions). No secrets.
+
+### Health, with hysteresis (`health.ts`)
+
+```
+up --probe fails, or the router reports a failed proxy--> suspect
+suspect --3 consecutive failed probes, 10 s apart--> down
+suspect --one good probe--> up
+down --3 consecutive good probes, 20 s apart, and >= 60 s down--> up, then drain
+```
+
+A probe is `GET ORIGIN_URL/health`, 5 s timeout, healthy only on 200 with
+`{"ok": true}`. The cron probes once a minute; while suspect or down the
+object's own alarm probes on the faster cadence. Thresholds are env vars
+(`HEALTH_*` in `shared.ts`). The router counts only "the origin did not
+answer" statuses (502, 504, 52x, 530) as failures, never 503, which the
+Python app returns for its SPA fallback.
+
+The decision lives in HealthState, a Durable Object, so it is the same answer
+everywhere. The router does not ask it per request: HealthState writes the
+flag to KV on a flip, and the router reads it from isolate memory (5 s),
+then its colo's Cache API (15 s), then KV (30 s edge cache). Reading the
+object directly would keep it awake all day, about 11,000 GB-s, which with
+the hub's own duration is over the Free plan's 13,000. Without the `FLAGS`
+KV binding the router reads HealthState directly (faster to flip, costs
+duration). The drain delay follows: 75 s after a failback with KV, 8 s
+without.
+
+### ICE servers
+
+`/api/config` hands out the same list as `config.public_config()`: Google
+STUN, coturn REST credentials (HMAC-SHA1 of the expiry with
+`FIL_TURN_SECRET`, Worker secret), and Cloudflare Realtime TURN credentials
+minted server-side with `FIL_CF_TURN_KEY_ID` / `FIL_CF_TURN_API_TOKEN`,
+filtered the same way (TURN only, no port 53), cached per isolate for half
+the TTL. `FIL_ICE_SERVERS` overrides, as in Python.
+
+## Mirroring a Python change
+
+| Python | Port |
+|---|---|
+| a constant in `_MemRegistry` / `register()` | `edge/signal/src/policy.ts` |
+| `_MemRegistry.<method>` | `Registry.<camelCase method>` in `registry.ts` |
+| an event handler `on_<x>` | `SignalHub.on<X>` in `hub.ts` |
+| `_claim_session`, `_do_join`, `_do_leave` | `claimSession`, `doJoin`, `doLeave` |
+| `close_session` | `SignalHub.closeSession` |
+| `config.public_config` and TURN | `config.ts` |
+| engine.io ping / payload settings | env `FIL_PING_*`, `FIL_MAX_DECODE_PACKETS` |
+
+Then add or extend a test in `backend/conformance/` and run it against both.
+
+Known differences, all deliberate:
+
+- Python's in-memory nameplates never expire (the Redis twin does, with
+  `EX`); the hub expires them after 10 minutes, as CONTRACT.md says.
+- Python's `_do_join` drops the sid from `local_sids`, so its lease is kept
+  alive only by later syncs; the hub's liveness is the transport, always.
+- After an eviction a session's stored expiry can be up to 30 minutes older
+  than in memory (the write-through slack). It still lasts a day after use.
+
+## Conformance suite
+
+`backend/conformance/` runs the same tests over the real wire against any
+base URL: REST shapes, engine.io facts (open packet, unknown sid, version,
+batched POSTs), the Rust CLI's exact framing on a bare websocket (`40`,
+`42[...]`, `42<id>[...]`, the `synced` event, #592 session reuse), rooms and
+`welcome`/`peer-joined`/`peer-left`, #594 duplicate join, the sync digest,
+generations, supersede and retire, the close beacon, signal relay and its
+refusals, presence channels, and v2 pairing. `test_limits.py` runs against an
+instance with small budgets: the per-socket and per-IP claim budget with the
+#592 refresh exemption, the pair-claim budget, the close budget.
+
+```
+CONFORMANCE_URL=<base> CONFORMANCE_TRANSPORT=websocket|polling|upgrade \
+  python -m unittest backend.conformance.test_conformance -v
+CONFORMANCE_URL=<small-budget base> python -m unittest backend.conformance.test_limits -v
+```
+
+The Python side needs `FIL_CLAIM_LIMIT>=200 FIL_PAIR_CREATE_LIMIT>=800` (every
+client shares one address); the small-budget run uses
+`FIL_SESSION_CLAIM_LIMIT=8 FIL_CLAIM_LIMIT=3 FIL_CLOSE_LIMIT=4`.
+
+## Free plan fit
+
+Free plan limits (Workers and Durable Objects, per day): 100k Worker
+requests, 100k Durable Object requests, 13,000 GB-s duration, 5M SQLite rows
+read, 100k rows written; KV 100k reads, 1k writes. An incoming websocket
+message bills as 1/20 of a request; outgoing messages are free.
+
+Per-client cost on the hub (measured shapes, 25 s pings):
+
+| client | inbound messages | hub requests | Worker requests |
+|---|---|---|---|
+| CLI daemon, always on (pong every 25 s + sync every 30 s) | ~6,300/day | ~320/day + 1 per reconnect | 1 per reconnect |
+| browser tab, per open hour (pong + 30 s session sync) | ~264/h | ~13/h + 1 per load | ~3 per load (config, room, socket) |
+| browser on long-polling, per hour (PollWatch 2 s hold) | n/a | ~2,000/h | ~2,000/h |
+| the same with `FIL_POLL_GRACE_S=0` (25 s holds) | n/a | ~410/h | ~410/h |
+
+Duration: the one hub is awake while any socket is open, about
+0.125 GB x 86,400 s = 10,800 GB-s/day, inside 13,000. HealthState wakes
+only for probes.
+
+Rows: a refresh writes nothing; a session row is rewritten at most every 30
+minutes, so an always-on daemon is about 50 rows written a day plus one per
+join or leave. Reads come from memory, a few rows per claim.
+
+What that means:
+
+- Normal operation (VPS up). Only the router runs: one Worker request per
+  HTTP request (a websocket is one, its messages ride through unbilled), plus
+  about 1,440 probes a day. Page loads (about 3 each), websocket connects and
+  any polling traffic share the 100k. That is roughly 25k page loads a day
+  with daemon reconnects on top. Configure the route to fail OPEN (below):
+  over the daily cap, requests then skip the Worker and reach the VPS
+  directly, so the cap can disable failover for the rest of the day but
+  never take the API down.
+- Failover. The hub's 100k requests cover about 300 always-on daemons for a
+  whole day, or 3,000 daemons for about 2.5 hours. At 10,000 devices a
+  failover spends the Free daily budget in under an hour, after which the
+  hub refuses new work until 00:00 UTC.
+
+So Free covers launch traffic for short outages only. Workers Paid ($5/month,
+10M Worker requests and 1M Durable Object requests a month included, then
+$0.30/M and $0.15/M) removes the cliff. Estimates for the owner's
+10k-device and 50k-device scenarios, if the hub carried everyone all month:
+about 96M hub requests/month at 10k devices (~$14) and ~480M at 50k (~$72),
+plus $5. If it only carries outages, which is the design, it is the $5 base
+plus cents per outage-hour; the earlier ~$7/month at 10k and ~$25/month at
+50k sit between the two. Nothing has been bought.
+
+## Putting it in front of production
+
+Not done; for the owner, after review. Order matters: the router must be able
+to serve everything before the route sends it anything.
+
+1. Secrets, from stdin only, on the production script:
+   `wrangler secret put FIL_SECRET` (the VPS value, or `/api/room` diverges),
+   `FIL_TURN_SECRET` (coturn's `static-auth-secret`),
+   `FIL_CF_TURN_API_TOKEN`. Vars in `wrangler.toml` `[vars]`: `FIL_TURN_HOST`
+   and `FIL_TURN_TTL` (same as `deploy/.env`), `FIL_CF_TURN_KEY_ID`,
+   `FIL_CORS_ORIGINS` (same as the VPS), `ORIGIN_URL`.
+2. An origin hostname that does not go through the router:
+   add `vps-api.tunlion.autumated.com` as a second public hostname on the
+   existing tunnel (ingress `http://api:8000`, as `api.tunlion`), in the same
+   zone. `ORIGIN_URL=https://vps-api.tunlion.autumated.com`. Same zone is
+   required: a same-zone subrequest keeps the client's `CF-Connecting-IP`,
+   which the VPS uses for rate limits and `/api/room` (verified on staging:
+   `/api/whoami` through the router returned the caller's address).
+3. KV for the flag: `wrangler kv namespace create tunlion-signal-flags`,
+   bind it as `FLAGS` in the top-level config. Add the cron
+   `triggers = { crons = ["* * * * *"] }`.
+4. Deploy without a route, then check the hub directly:
+   `wrangler deploy`, temporarily with `workers_dev = true`, and run the
+   conformance suite and `edge/signal/test/browser-transfer.cjs` against the
+   workers.dev URL. `GET /__router/status` shows the probe going green.
+5. Add the route `api.tunlion.autumated.com/*` (zone autumated.com) to the
+   script and, in the dashboard, set the route's request-limit failure mode
+   to Fail open. Repeat for `api.filament.autumated.com/*` if that hostname
+   should be covered too. DNS stays as it is: the CNAME to the tunnel keeps
+   serving whatever the Worker does not.
+6. Watch: `x-tunlion-backend: origin` on every response,
+   `wrangler tail` for `health-*` TEL lines. Point the external monitor at
+   `vps-api.tunlion.autumated.com/health` (the API hostname now answers 200
+   from Cloudflare while the VPS is down).
+7. Rollback: remove the route (traffic goes straight to the tunnel again).
+   `ROUTER_MODE=origin` keeps the router but disables failover;
+   `ROUTER_MODE=cf` sends everything to the hub.
