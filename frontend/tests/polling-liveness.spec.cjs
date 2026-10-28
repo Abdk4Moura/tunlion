@@ -45,7 +45,7 @@ const FLAP_BACK_MS = 15000;
 const SLOW_LAT_MS = +(process.env.PL_LAT || 2500);
 const SLOW_CPU = +(process.env.PL_CPU || 20);
 const LOG_FILE = path.join(os.tmpdir(), `tunlion-polling-liveness-${PORT}.log`);
-const ONLY = (process.env.PL_ONLY || 'crash,ctx-close,slow,flaps').split(',');
+const ONLY = (process.env.PL_ONLY || 'crash,ctx-close,slow,flaps,picker,killed').split(',');
 
 let backend = null;
 const failures = [];
@@ -95,10 +95,28 @@ function instrument({ hold }) {
     }
     const ws = new W(...a);
     ws.addEventListener('open', () => { fd.wsOpen += 1 });
+    const send = ws.send.bind(ws);
+    ws.send = (d) => { if (typeof d === 'string' && /^42\d*\["leave"/.test(d)) fd.leaves = (fd.leaves || 0) + 1; return send(d); };
     return ws;
   };
   window.WebSocket.prototype = W.prototype;
   Object.assign(window.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+  // RTCPeerConnection lifecycle, so a scenario can tell whether the link to a
+  // peer was torn down and rebuilt.
+  const PC = window.RTCPeerConnection;
+  if (PC) {
+    fd.pcs = { made: 0, closed: 0, failed: 0 };
+    window.RTCPeerConnection = function (...a) {
+      const pc = new PC(...a);
+      fd.pcs.made += 1;
+      const close = pc.close.bind(pc);
+      pc.close = () => { if (pc.signalingState !== 'closed') fd.pcs.closed += 1; return close(); };
+      pc.addEventListener('connectionstatechange', () => { if (pc.connectionState === 'failed') fd.pcs.failed += 1; });
+      return pc;
+    };
+    window.RTCPeerConnection.prototype = PC.prototype;
+    Object.setPrototypeOf(window.RTCPeerConnection, PC);
+  }
 }
 
 // A hidden tab as Chrome treats one: visibilityState hidden (and the event,
@@ -116,15 +134,30 @@ function backgroundTab() {
   window.__bgAt = Date.now();
 }
 
-async function open(browser, hold) {
-  const ctx = await browser.newContext();
+// An Android phone (Pixel 7: mobile UA, viewport, touch).
+function androidCtx() {
+  const d = { ...playwright.devices['Pixel 7'] };
+  delete d.defaultBrowserType;
+  return d;
+}
+
+async function open(browser, hold, { android = false } = {}) {
+  const ctx = await browser.newContext(android ? androidCtx() : {});
   await ctx.addInitScript(instrument, { hold });
+  // Every departure the page could send: the pagehide close beacon, and a
+  // socket.io `leave` on either transport (polling writes are POST bodies).
+  const departures = [];
+  ctx.on('request', (r) => {
+    const u = r.url();
+    if (/\/api\/session\/close/.test(u)) departures.push('session-close');
+    else if (/socket\.io/.test(u) && r.method() === 'POST' && /\["leave"/.test(r.postData() || '')) departures.push('leave(polling)');
+  });
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e && e.message || e).slice(0, 200)));
   await page.goto(BASE + '/?test=1');
   await page.waitForFunction(() => /online/i.test(document.body.innerText), null, { timeout: 20000 });
-  return { ctx, page, errors };
+  return { ctx, page, errors, departures };
 }
 
 const deviceName = (page) => page.evaluate(() => document.querySelector('[data-testid="device-name-input"]')?.value || document.documentElement.getAttribute('data-device-name') || '');
@@ -228,6 +261,129 @@ async function slow(observer) {
   await p.ctx.close();
 }
 
+// A file picker on Android: the tab goes to the background (visibilitychange
+// hidden) and the OS freezes it (CDP Page.setWebLifecycleState frozen) until
+// the picker returns. Then the picked file must reach the other peer. A
+// merely frozen page is not a departure: no session-close, no leave, and for a
+// freeze inside the ping timeout no peer-left, no tile gap, no rebuilt link.
+const RAND = (n) => require('crypto').randomBytes(n);
+async function sendAndReceive(observer, sender, chooser, name) {
+  const bytes = RAND(256 * 1024);
+  const t0 = Date.now();
+  await chooser.setFiles({ name, mimeType: 'application/octet-stream', buffer: bytes });
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    const acc = observer.page.locator('button', { hasText: /^Accept$/ });
+    if (await acc.count()) await acc.first().click().catch(() => {});
+    const done = await observer.page.evaluate((n) => [...document.querySelectorAll('button')].some((b) => b.textContent === 'Save' && (b.closest('div')?.parentElement?.innerText || '').includes(n)), name);
+    if (done) return Date.now() - t0;
+    await sleep(100);
+  }
+  return null;
+}
+
+async function pickFile(observer, page, peerName) {
+  const chooser = page.waitForEvent('filechooser', { timeout: 15000 });
+  await page.locator(`[data-testid="peer-tile"][aria-label^="${peerName},"] button[aria-label^="send files to"]`).first().click();
+  return chooser;
+}
+
+async function picker(observer, { hold, freezeS }) {
+  const tag = `picker/${hold ? 'polling' : 'websocket'}/${freezeS}s`;
+  const p = await open(observer.browser, hold, { android: true });
+  const name = await deviceName(p.page);
+  if ((await waitTile(observer.page, name, true, 20000)) == null) fail(`${tag}: the observer never saw ${name}`);
+  if ((await waitTile(p.page, observer.name, true, 20000)) == null) fail(`${tag}: the phone never saw the observer`);
+  const readyOn = (pg, n) => pg.waitForFunction((x) => [...document.querySelectorAll('[data-testid="peer-tile"]')].some((el) => (el.getAttribute('aria-label') || '').startsWith(x + ', ready')), n, { timeout: 30000 });
+  await readyOn(p.page, observer.name);
+  await readyOn(observer.page, name);
+  if (hold) await onPolling(tag, p);
+  await sleep(3000);
+  const pcs0 = await observer.page.evaluate(() => ({ ...window.__fd.pcs }));
+  const before = telEvents().length;
+  const chooser = await pickFile(observer, p.page, observer.name);
+  // The picker is up: the tab goes to the background and is frozen.
+  await p.page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  const cdp = await p.ctx.newCDPSession(p.page);
+  await cdp.send('Page.setWebLifecycleState', { state: 'frozen' });
+  const t0 = Date.now();
+  let gaps = 0, gapStart = null, longest = 0;
+  const sample = async () => {
+    const n = await tilesFor(observer.page, name);
+    if (n === 0 && gapStart == null) { gapStart = Date.now(); gaps += 1; }
+    if (n > 0 && gapStart != null) { longest = Math.max(longest, Date.now() - gapStart); gapStart = null; }
+  };
+  while (Date.now() - t0 < freezeS * 1000) { await sample(); await sleep(200); }
+  // The picker returns: active, visible, focused.
+  await cdp.send('Page.setWebLifecycleState', { state: 'active' });
+  await p.page.evaluate(() => {
+    delete document.visibilityState; delete document.hidden;
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('focus'));
+  });
+  const sendMs = await sendAndReceive(observer, p, await chooser, `pick-${freezeS}.bin`);
+  for (let i = 0; i < 10; i++) { await sample(); await sleep(100); }
+  if (gapStart != null) longest = Math.max(longest, Date.now() - gapStart);
+  const ev = telEvents().slice(before).map((e) => e.ev);
+  const count = (x) => ev.filter((e) => e === x).length;
+  const pcs1 = await observer.page.evaluate(() => ({ ...window.__fd.pcs }));
+  const fd = await p.page.evaluate(() => window.__fd);
+  const r = {
+    freezeS, transport: hold ? 'polling' : 'websocket', gaps, longestGapMs: longest,
+    pollLapsed: count('poll-lapsed'), disconnects: count('disconnect'), away: count('poll-away'),
+    observerPcClosed: pcs1.closed - pcs0.closed, observerPcMade: pcs1.made - pcs0.made, observerPcFailed: pcs1.failed - pcs0.failed,
+    departures: p.departures.slice(), wsLeaves: fd.leaves || 0, sendMs,
+  };
+  results[tag] = r;
+  console.log(`[polling-liveness] ${tag}: tile gaps ${gaps} (longest ${longest} ms); relay poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects}, away ${r.away}; observer pc closed ${r.observerPcClosed} made ${r.observerPcMade} failed ${r.observerPcFailed}; departures [${r.departures.join(', ')}] ws leave ${r.wsLeaves}; send ${sendMs == null ? 'FAILED' : sendMs + ' ms'}`);
+  if (r.departures.length || r.wsLeaves) failures.push(`${tag}: opening the file picker sent a departure (${r.departures.join(', ')}${r.wsLeaves ? ' ws leave x' + r.wsLeaves : ''})`);
+  if (sendMs == null) failures.push(`${tag}: the picked file never reached the other peer`);
+  // Inside the ping timeout a frozen page must ride it out, as it did before
+  // the polling liveness rule.
+  if (freezeS <= 50 && (gaps || r.pollLapsed || r.disconnects)) failures.push(`${tag}: a page frozen behind a file picker for ${freezeS} s was dropped (gaps ${gaps}, poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects})`);
+  else if (freezeS <= 50) ok(`${tag}: a page frozen ${freezeS} s behind the picker stayed, and its file arrived in ${sendMs} ms`);
+  await p.ctx.close();
+}
+
+// The OS killed the backgrounded tab's process; Chrome restores it by loading
+// the same URL in the same profile. The new page must take over its session
+// and send.
+async function killedReopen(observer, { hold }) {
+  const tag = `killed-reopen/${hold ? 'polling' : 'websocket'}`;
+  const p = await open(observer.browser, hold, { android: true });
+  const name = await deviceName(p.page);
+  if ((await waitTile(observer.page, name, true, 20000)) == null) fail(`${tag}: the observer never saw ${name}`);
+  await sleep(3000);
+  const before = telEvents().length;
+  const crashed = new Promise((r) => p.page.once('crash', () => r(true)));
+  (await p.ctx.newCDPSession(p.page)).send('Page.crash').catch(() => {});
+  await Promise.race([crashed, sleep(5000)]);
+  const t0 = Date.now();
+  await sleep(+(process.env.PL_KILLED_GAP_MS || 5000)); // the user away in the picker / another app
+  const page2 = await p.ctx.newPage();
+  await page2.goto(BASE + '/?test=1');
+  await page2.waitForFunction(() => /online/i.test(document.body.innerText), null, { timeout: 20000 });
+  const name2 = await deviceName(page2);
+  const back = await page2.waitForFunction((x) => [...document.querySelectorAll('[data-testid="peer-tile"]')].some((el) => (el.getAttribute('aria-label') || '').startsWith(x + ', ready')), observer.name, { timeout: 30000 }).then(() => Date.now() - t0).catch(() => null);
+  const ghost = await tilesFor(observer.page, name);
+  const chooser = await pickFile(observer, page2, observer.name);
+  const sendMs = await sendAndReceive(observer, { page: page2 }, chooser, 'reopen.bin');
+  await sleep(1500);
+  const rows = await tilesFor(observer.page, name);
+  const ev = telEvents().slice(before).map((e) => e.ev);
+  const r = { sameName: name2 === name, readyAgainMs: back, observerRowsAfter: rows, observerRowsAtReady: ghost, pollLapsed: ev.filter((e) => e === 'poll-lapsed').length, disconnects: ev.filter((e) => e === 'disconnect').length, sendMs };
+  results[tag] = r;
+  console.log(`[polling-liveness] ${tag}: same name ${r.sameName}; ready again ${back} ms after the kill; observer rows for it ${rows}; relay poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects}; send ${sendMs == null ? 'FAILED' : sendMs + ' ms'}`);
+  if (sendMs == null) failures.push(`${tag}: the restored page could not send`);
+  else if (rows !== 1) failures.push(`${tag}: the observer shows ${rows} rows for the restored device`);
+  else ok(`${tag}: the restored page took over and sent in ${sendMs} ms`);
+  await p.ctx.close();
+}
+
 async function flaps(observer) {
   const tag = 'flaps';
   const p = await open(observer.browser, true);
@@ -279,6 +435,13 @@ async function flaps(observer) {
     if (ONLY.includes('ctx-close')) await kill('ctx-close', observer, 'ctx-close');
     if (ONLY.includes('slow')) await slow(observer);
     if (ONLY.includes('flaps')) await flaps(observer);
+    // Default: one freeze inside the ping timeout on each transport. The
+    // measurement runs pass PL_FREEZE=10,30,60,120.
+    const freezes = (process.env.PL_FREEZE || '30').split(',').map(Number);
+    for (const hold of [true, false]) {
+      if (ONLY.includes('picker')) for (const f of freezes) await picker(observer, { hold, freezeS: f });
+      if (ONLY.includes('killed')) await killedReopen(observer, { hold });
+    }
     await a.ctx.close();
   } finally {
     await browser.close().catch(() => {});

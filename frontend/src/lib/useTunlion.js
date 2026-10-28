@@ -1474,11 +1474,22 @@ export function useTunlion() {
     }
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
+        sigRef.current?.away?.(false)
         recover()
       } else {
+        sigRef.current?.away?.(true)
         for (const link of linksRef.current.values()) link.sendBrb?.(120)
       }
     }
+    // A file picker (Android: the system picker) backgrounds the tab, and the
+    // OS may freeze it before visibilitychange's own emit can leave a
+    // long-poll transport. Say so at the click, while the page is still fully
+    // running. Capture phase: the file inputs stop the click's propagation.
+    const onPickerClick = (e) => {
+      const el = e.target
+      if (el && el.tagName === 'INPUT' && el.type === 'file') sigRef.current?.away?.(true)
+    }
+    document.addEventListener('click', onPickerClick, true)
     // M3: a network change is a full recovery trigger, not just a relay probe. On
     // wifi<->cellular the active interface (and our public IP) changes, so the old
     // ICE path is dead; recover() reconnects signaling AND rebuilds dead links.
@@ -1574,6 +1585,7 @@ export function useTunlion() {
     return () => {
       if (recoverTimer) clearTimeout(recoverTimer)
       document.removeEventListener('visibilitychange', onVisibility)
+      document.removeEventListener('click', onPickerClick, true)
       window.removeEventListener('focus', onVisibility)
       window.removeEventListener('pagehide', onPageHide)
       window.removeEventListener('pageshow', onPageShow)

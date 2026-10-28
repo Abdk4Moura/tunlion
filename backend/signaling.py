@@ -818,7 +818,8 @@ class PollWatch:
         self._clock = clock
         self._lock = threading.Lock()
         # engine.io sid -> [GETs in flight, since (start of the held GET, or
-        # end of the last one), NOOP already sent for the held GET]
+        # end of the last one), NOOP already sent for the held GET, away
+        # until (monotonic; the page said it is hidden, e.g. a file picker)]
         self._polls = {}
 
     def _poll_sid(self, environ):
@@ -848,7 +849,7 @@ class PollWatch:
 
     def begin(self, sid):
         with self._lock:
-            st = self._polls.setdefault(sid, [0, 0.0, False])
+            st = self._polls.setdefault(sid, [0, 0.0, False, 0.0])
             st[0] += 1
             st[1] = self._clock()
             st[2] = False
@@ -873,6 +874,21 @@ class PollWatch:
             if st is None:
                 return None
             return st[0], self._clock() - st[1], st[2]
+
+    def set_away(self, sid, seconds):
+        """The page behind this socket says it is out of sight for up to
+        `seconds` (0 clears). Only for a socket already recorded as polling."""
+        with self._lock:
+            st = self._polls.get(sid)
+            if st is not None:
+                st[3] = self._clock() + seconds if seconds > 0 else 0.0
+                return True
+            return False
+
+    def away(self, sid):
+        with self._lock:
+            st = self._polls.get(sid)
+            return bool(st and st[3] > self._clock())
 
     def mark_cycled(self, sid):
         with self._lock:
@@ -911,6 +927,11 @@ def poll_check(eio, watch, hold, grace):
                 watch.mark_cycled(eio_sid)
                 sock.send(_eio_packet.Packet(_eio_packet.NOOP))
         elif age >= grace:
+            if watch.away(eio_sid):
+                # Hidden on purpose (a file picker, a background tab): the OS
+                # may freeze it, and a frozen page cannot poll. The ping
+                # timeout still ends it if it never comes back.
+                continue
             watch.forget(eio_sid)
             _tel("poll-lapsed", eio=eio_sid[:8], idle=round(age, 1))
             reason = getattr(getattr(eio, "reason", None), "TRANSPORT_CLOSE", None)
@@ -1017,6 +1038,22 @@ def register(socketio, registry, poll_watch=None):
     poll_hold = float(os.environ.get("FIL_POLL_HOLD_S", "2"))
     poll_grace = float(os.environ.get("FIL_POLL_GRACE_S", "7"))
     poll_tick = float(os.environ.get("FIL_POLL_TICK_S", "1"))
+    poll_away = float(os.environ.get("FIL_POLL_AWAY_S", "180"))
+
+    @socketio.on("away")
+    def on_away(data=None):
+        # The caller's OWN socket only: request.sid is the socket this event
+        # arrived on, so a page can lengthen no other session's grace.
+        if poll_watch is None:
+            return
+        on = isinstance(data, dict) and data.get("on") is True
+        try:
+            eio_sid = socketio.server.manager.eio_sid_from_sid(request.sid, "/")
+        except Exception:
+            return
+        if eio_sid and poll_watch.set_away(eio_sid, poll_away if on else 0):
+            _tel("poll-away", sid=request.sid, on=on)
+
     if poll_watch is not None and poll_grace > 0:
         def _poll_loop():
             while True:

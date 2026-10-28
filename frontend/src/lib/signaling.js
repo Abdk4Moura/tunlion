@@ -247,6 +247,16 @@ class SocketIOSignaling extends Emitter {
     })
     return true
   }
+  // The page is going out of sight on purpose (a file picker, a hidden tab),
+  // where the OS may freeze it and it stops long-polling for a while. Tells
+  // the relay to give THIS socket's polling liveness a long grace (the relay
+  // keys it by this socket, so it can extend no one else's). on=false when
+  // the page is visible again. A no-op on websocket, harmless if lost: the
+  // relay's ping timeout still bounds a page that never returns.
+  away(on) {
+    if (this.suspended || !this.socket?.connected) return
+    try { this.socket.emit('away', { on: !!on }) } catch {}
+  }
   // Live socket truth, for the session loop's connected-gate (state captured in
   // closures goes stale; this reads the socket directly).
   get connected() {

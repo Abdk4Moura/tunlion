@@ -106,6 +106,27 @@ class PollRule(unittest.TestCase):
             self.assertEqual(self.check(), [])
         self.assertEqual(self.sock.close_calls, [])
 
+    def test_away_holds_a_silent_socket_until_it_expires_or_is_cleared(self):
+        self.watch.begin("e1")
+        self.watch.end("e1")
+        self.assertTrue(self.watch.set_away("e1", 30))
+        self.clock.t += GRACE * 5
+        self.assertEqual(self.check(), [], "a page that said it is hidden was closed")
+        self.clock.t += 30
+        self.assertEqual(self.check(), ["e1"], "away outlived its window")
+
+    def test_clearing_away_restores_the_short_grace(self):
+        self.watch.begin("e1")
+        self.watch.end("e1")
+        self.watch.set_away("e1", 30)
+        self.watch.set_away("e1", 0)
+        self.clock.t += GRACE + 0.1
+        self.assertEqual(self.check(), ["e1"])
+
+    def test_away_is_only_recorded_for_a_known_polling_socket(self):
+        self.assertFalse(self.watch.set_away("never-polled", 30))
+        self.assertIsNone(self.watch.state("never-polled"))
+
     def test_upgraded_sockets_are_forgotten_and_upgrading_ones_left_alone(self):
         self.watch.begin("e1")
         self.watch.end("e1")
@@ -238,6 +259,28 @@ class PollEndToEnd(unittest.TestCase):
         self.assertEqual(names, ["a"], "the silent client is still in the room")
         self.assertTrue(self.alive(a))
         a.stop.set()
+
+    def test_away_extends_only_the_callers_own_socket(self):
+        hid, other = RawPoller(self.port), RawPoller(self.port)
+        th = [threading.Thread(target=x.run, daemon=True) for x in (hid, other)]
+        for t in th:
+            t.start()
+        hid.emit("join", {"room": "poll-away", "name": "hid", "uid": "u-away-hid"})
+        other.emit("join", {"room": "poll-away", "name": "other", "uid": "u-away-other"})
+        time.sleep(HOLD + 0.5)
+        # The hidden page says so, then freezes (stops polling). The other one
+        # dies silently at the same moment.
+        hid.emit("away", {"on": True})
+        time.sleep(0.3)
+        hid.stop.set()
+        other.stop.set()
+        t0 = time.monotonic()
+        while self.alive(other) and time.monotonic() - t0 < 30:
+            time.sleep(0.05)
+        self.assertFalse(self.alive(other), "another socket's away kept a dead one open")
+        self.assertLessEqual(time.monotonic() - t0, HOLD + GRACE + 2 * TICK + 1.0)
+        time.sleep(GRACE * 2)
+        self.assertTrue(self.alive(hid), "a page that said it is hidden was closed")
 
     def test_a_slow_poller_inside_the_grace_is_kept(self):
         p = RawPoller(self.port)
