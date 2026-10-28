@@ -41,7 +41,11 @@ $tool = "envprobe$nonce"
 $savedUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $procs = @()
 $docs = [Environment]::GetFolderPath('MyDocuments')
-$profiles = @((Join-Path $docs 'PowerShell\profile.ps1'), (Join-Path $docs 'WindowsPowerShell\profile.ps1'))
+$profiles = @(
+    (Join-Path $docs 'PowerShell\profile.ps1'),
+    (Join-Path $docs 'PowerShell\Microsoft.PowerShell_profile.ps1'),
+    (Join-Path $docs 'WindowsPowerShell\profile.ps1'),
+    (Join-Path $docs 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'))
 $savedProfiles = @{}
 foreach ($pf in $profiles) { $savedProfiles[$pf] = if (Test-Path -LiteralPath $pf) { Get-Content -LiteralPath $pf -Raw } else { $null } }
 
@@ -100,7 +104,11 @@ try {
         "echo PROBE-LEAK=%$leakVar%"
         "where $tool >nul 2>&1 && echo PROBE-TOOL=found || echo PROBE-TOOL=missing"
         'echo PROBE-PROFILE=%TUNLION_PROFILE_PROBE%'
+        'echo PROBE-HOME=%USERPROFILE%'
+        'if exist "%USERPROFILE%\Documents\PowerShell\profile.ps1" echo PROBE-PFILE7=yes'
+        'if exist "%USERPROFILE%\Documents\WindowsPowerShell\profile.ps1" echo PROBE-PFILE5=yes'
     ) -join "`r`n" | Set-Content -LiteralPath $probe -Encoding Ascii
+    Write-Host ("profiles: " + (($profiles | ForEach-Object { "$_=$(Test-Path -LiteralPath $_)" }) -join '; '))
 
     $env:TUNLION_CONFIG_DIR = $da; $env:TUNLION_NAME = 'boxA'
     function Run-Tunlion([string]$label, [string[]]$a) {
