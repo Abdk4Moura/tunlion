@@ -92,7 +92,9 @@ async function open(browser, hold) {
   const ctx = await browser.newContext();
   // What the page sent on its way out (the context outlives the page).
   const sent = [];
-  const note = (r, how) => { if (/\/api\/session\/close|transport=polling.*POST/.test(r.url() + ' ' + r.method())) sent.push(`${how} ${r.method()} ${r.url().replace(BASE, '').slice(0, 60)}`); };
+  const t00 = Date.now();
+  const note = (r, how) => { if (/\/api\/session\/close|socket\.io/.test(r.url())) sent.push(`${Date.now() - t00}:${how} ${r.method()} ${r.url().replace(BASE, '').replace(/[?].*/, '')}${/close/.test(r.url()) ? '' : /transport=(\w+)/.exec(r.url())?.[1] || ''}`); };
+  ctx.on('request', (r) => note(r, 'start'));
   ctx.on('requestfinished', (r) => note(r, 'ok'));
   ctx.on('requestfailed', (r) => note(r, 'failed'));
   await ctx.addInitScript(instrument, { hold });
@@ -136,7 +138,7 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
     await sleep(25);
   }
   const ev = telEvents().slice(before).map((e) => e.ev).filter((e) => /close|leave|disconnect/.test(e));
-  const out = leaving.sent.slice(sentBefore).filter((x) => /session\/close/.test(x));
+  const out = leaving.sent.slice(sentBefore).filter((x) => /session\/close/.test(x) && !/start/.test(x));
   console.log(`[closed-tab] ${tag}: tile gone after ${gone == null ? '>' + (DEPART_MS + 8000) : gone} ms; page sent [${out.join(', ')}]; relay saw [${ev.join(', ')}]`);
   await leaving.ctx.close().catch(() => {});
   const evAll = telEvents().slice(before).map((e) => e.ev);
@@ -180,6 +182,7 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
       const name = await deviceName(b.page);
       if ((await waitTile(a.page, name, true, 20000)) == null) fail(`${tag}: the observer never saw ${name}`);
       const mark = telEvents().length;
+      const sentMark = b.sent.length;
       await b.page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })));
       await sleep(300);
       await b.page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
@@ -192,6 +195,7 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
       const seen = telEvents().slice(mark).filter((e) => !/^web:(vis|net|conn|link|ice|tile|cfg)/.test(e.ev))
         .map((e) => e.ev + (e.reason ? '(' + e.reason + ')' : '') + (e.status ? '(' + e.status + ')' : ''));
       console.log(`[closed-tab] ${tag}: relay saw [${seen.slice(0, 40).join(', ')}]`);
+      console.log(`[closed-tab] ${tag}: page requests [${b.sent.slice(Math.max(0, sentMark - 4), sentMark + 40).join(', ')}]`);
       if (why) failures.push(`${tag}: ${why}`);
       else ok(`${tag}: a restored page comes back and stays on the other peer`);
       await b.ctx.close();
