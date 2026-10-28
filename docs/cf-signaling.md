@@ -215,6 +215,22 @@ Results at the head of `feat/cf-signaling` on 2026-10-28, evidence in
   This deployment did not stream Durable Object console logs to
   `wrangler tail`, so the wire assertions, not TEL counts, are the evidence.
 
+Browsers through the staging DO, from the CI worker: #608's
+`polling-liveness-remote.cjs` with `PL_ONLY=picker,killed`, against a
+frontend built from `a5244008` with `VITE_TUNLION_API` set to the staging
+hub:
+
+- picker, 30 s frozen behind the file chooser, on both transports: no tile
+  gap, same sid, the observer's link kept, no departure, and the picked
+  256 KiB file arrived (54 to 214 ms).
+- killed, then the same URL reopened: one row on the observer for the
+  device, and a send worked (48 to 269 ms).
+- One earlier websocket picker run lost the socket for about 20 s and the
+  page came back on a new sid. It then passed twice in a row; the CI
+  worker's route to Cloudflare drops about 3% of requests, and that run
+  recorded no `session-close` and no `leave`, so it was a transport drop,
+  not a picker departure.
+
 The Python side needs `FIL_CLAIM_LIMIT>=200 FIL_PAIR_CREATE_LIMIT>=800` (every
 client shares one address); the small-budget run uses
 `FIL_SESSION_CLAIM_LIMIT=8 FIL_CLAIM_LIMIT=3 FIL_CLOSE_LIMIT=4`.

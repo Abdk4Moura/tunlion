@@ -74,10 +74,16 @@ const LOG_FILE = path.join(os.tmpdir(), `tunlion-polling-liveness-${PORT}.log`);
 const ONLY = (process.env.PL_ONLY || 'crash,ctx-close,slow,flaps,picker,killed').split(',');
 
 let backend = null;
+let staticServer = null;
 const failures = [];
 const results = {};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function cleanup() { try { backend && backend.kill('SIGKILL'); } catch {} }
+function cleanup() {
+  try { backend && backend.kill('SIGKILL'); } catch {}
+  // Remote mode serves the build from this process; without this the pass
+  // path never exits because the listener keeps the loop alive.
+  try { staticServer && staticServer.close(); } catch {}
+}
 function fail(msg) { console.error('[polling-liveness] FAIL:', msg); cleanup(); process.exit(1); }
 const ok = (msg) => console.log('[polling-liveness] OK:', msg);
 
@@ -479,13 +485,13 @@ async function flaps(observer) {
   if (REMOTE_API) {
     if (!REMOTE_DIST || !fs.existsSync(path.join(REMOTE_DIST, 'index.html'))) fail('PL_DIST must be a build made with VITE_TUNLION_API=$PL_API');
     const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.wasm': 'application/wasm' };
-    const srv = http.createServer((req, res) => {
+    const srv = (staticServer = http.createServer((req, res) => {
       const u = new URL(req.url, 'http://x');
       let f = path.join(REMOTE_DIST, decodeURIComponent(u.pathname));
       if (!f.startsWith(path.resolve(REMOTE_DIST)) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(REMOTE_DIST, 'index.html');
       res.writeHead(200, { 'content-type': types[path.extname(f)] || 'application/octet-stream' });
       res.end(fs.readFileSync(f));
-    });
+    }));
     await new Promise((r) => srv.listen(0, '127.0.0.1', r));
     BASE = `http://127.0.0.1:${srv.address().port}`;
     console.log('[polling-liveness] remote mode: api', REMOTE_API, 'page', BASE);
@@ -523,4 +529,6 @@ async function flaps(observer) {
   if (process.env.PL_OUT) fs.writeFileSync(process.env.PL_OUT, JSON.stringify(results, null, 1));
   if (failures.length) fail(failures.join('; '));
   console.log('[polling-liveness] PASSED');
+  cleanup();
+  process.exit(0);
 })().catch((e) => fail(e && e.stack || String(e)));
