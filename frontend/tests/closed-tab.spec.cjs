@@ -99,6 +99,10 @@ async function open(browser, hold) {
   ctx.on('requestfailed', (r) => note(r, 'failed'));
   await ctx.addInitScript(instrument, { hold });
   const page = await ctx.newPage();
+  // A throw inside a socket.io handler stops a polling transport for good
+  // (the next long-poll is never issued), so a page error fails the gate.
+  page.on('pageerror', (e) => sent.push(`${Date.now() - t00}:pageerror ${String(e && e.message || e).slice(0, 200)}`));
+  page.on('console', (m) => { if (m.type() === 'error') sent.push(`${Date.now() - t00}:console ${m.text().slice(0, 200)}`); });
   await page.goto(BASE + '/?test=1');
   await page.waitForFunction(() => /online/i.test(document.body.innerText), null, { timeout: 20000 });
   return { ctx, page, sent };
@@ -176,7 +180,8 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
 
     // 3. bfcache: pagehide(persisted) then pageshow(persisted) is a page that
     //    comes back, not a departure. It must end up on the other peer again.
-    for (const hold of [true, false]) {
+    // Three rounds each: the echo of the page's own close races the restore.
+    for (const hold of [true, false, true, false, true, false]) {
       const tag = hold ? 'bfcache/polling' : 'bfcache/websocket';
       const b = await open(browser, hold);
       const name = await deviceName(b.page);
