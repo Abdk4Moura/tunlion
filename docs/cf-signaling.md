@@ -191,6 +191,44 @@ The Python side needs `FIL_CLAIM_LIMIT>=200 FIL_PAIR_CREATE_LIMIT>=800` (every
 client shares one address); the small-budget run uses
 `FIL_SESSION_CLAIM_LIMIT=8 FIL_CLAIM_LIMIT=3 FIL_CLOSE_LIMIT=4`.
 
+## Failover drill (staging, 2026-10-28)
+
+`edge/signal/test/failover_drill.py`: four clients in one room through the
+router (two socket.io on websocket, one socket.io on long-polling, one with
+the Rust CLI's raw framing), then SIGKILL the origin, wait until every client
+is on the hub AND sees every other in its roster, restart the origin, wait
+until every client is home and sees every other again. The origin was a
+throwaway Python relay (this branch's `backend/`, `FIL_TRUSTED_PROXIES=*`)
+behind a throwaway same-zone tunnel; the router was on a same-zone staging
+route. Evidence: `/root/pairing-ux/evidence/cf-signal/drill-*`.
+
+| run | flag path | kill -> down flip | kill -> all on hub, rosters whole | restart -> up flip | restart -> all home |
+|---|---|---|---|---|---|
+| drill-4 | KV + Cache API (Free) | 22.3 s | 36.7 s | 49.2 s | 125.4 s |
+| drill-5 | HealthState direct | 24.1 s | 30.9 s | 57.5 s | 66.7 s |
+
+Reading it: detection is the router's passive report (first failed proxy)
+plus three probes 10 s apart. Failback waits for 60 s down and three good
+probes 20 s apart, then the drain: 75 s behind KV, 8 s behind the object.
+Clients moved within about 1.5 s of each drain. Tighter numbers are a matter
+of the `HEALTH_*` knobs; the hysteresis is there so one slow `/health` does
+not split rooms.
+
+What the drills found and fixed: drill-2 showed the long-polling client
+never coming home after a failback. The hub ended polling sessions with an
+engine.io CLOSE packet, which python-socketio takes as final. A drained or
+lapsed polling session now answers 400 `Session ID unknown`, exactly what a
+restarted Python server answers, and every client reconnects from that
+(drill-3 onwards). The drills also confirmed `CF-Connecting-IP` survives the
+same-zone hop: `/api/whoami` through the router returned the caller's
+address from the Python origin.
+
+To rerun: recreate a throwaway tunnel and two DNS names in the zone, set
+`ORIGIN_URL`, the route and a KV id in `[env.drill]` (the ones committed were
+deleted after the drill), `wrangler deploy --env drill`, and run the script
+with `ROUTER`, `ORIGIN_CMD_KILL`, `ORIGIN_CMD_START`. Delete the staging
+router afterwards: its cron keeps probing and spends free-tier requests.
+
 ## Free plan fit
 
 Free plan limits (Workers and Durable Objects, per day): 100k Worker

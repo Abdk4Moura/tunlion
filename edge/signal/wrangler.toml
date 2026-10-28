@@ -57,7 +57,9 @@ durable_objects.bindings = [
   { name = "HEALTH", class_name = "HealthState" },
 ]
 
-# Router in front of a throwaway origin, for the failover drill. Same zone as
+# Router in front of a throwaway origin, for the failover drill (see
+# docs/cf-signaling.md). The route, ORIGIN_URL and KV id below were throwaway
+# resources, deleted after the 2026-10-28 drill; recreate before reuse. Same zone as
 # production (autumated.com) on purpose: a same-zone subrequest keeps the
 # client's CF-Connecting-IP, which the origin's rate limits and /api/room need.
 [env.drill]
