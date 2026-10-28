@@ -457,7 +457,10 @@ jobs:
               ('[{"name":"boxB","secret":"' + ('ab' * 32) + '"}]') |
                 Set-Content -LiteralPath (Join-Path $cfg 'devices.json') -Encoding Ascii
               $env:TUNLION_CONFIG_DIR = $cfg
-              & $runExe up --detach '--server=http://127.0.0.1:9' 2>&1 | Write-Host
+              # Not `& ... | Write-Host`: the detached daemon would inherit
+              # that pipe and the step would wait on it forever.
+              $up = Start-Process -FilePath $runExe -ArgumentList 'up --detach --server=http://127.0.0.1:9' -NoNewWindow -PassThru
+              $up.WaitForExit()
               $daemonsBefore = @()
               for ($i = 0; $i -lt 50 -and $daemonsBefore.Count -eq 0; $i++) {
                 Start-Sleep -Milliseconds 200
@@ -465,8 +468,19 @@ jobs:
               }
               if ($daemonsBefore.Count -ne 1) { throw "test setup: expected one daemon from $runExe, found $($daemonsBefore.Count)" }
               $oldPid = $daemonsBefore[0].ProcessId
-              $daemonOut = Run-Installer -InstallerArgs @('-Archive', $zip)
+              # Output to files, not Run-Installer's pipe: the restarted
+              # daemon inherits the installer's handles on Windows, and a pipe
+              # it holds would never reach EOF while it runs.
+              $outFile = Join-Path $tempRoot 'daemon-install.out'
+              $errFile = Join-Path $tempRoot 'daemon-install.err'
+              $inst = Start-Process -FilePath (Get-Process -Id $PID).Path -PassThru -NoNewWindow `
+                -ArgumentList "-NoProfile -File `"$installer`" -Archive `"$zip`"" `
+                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+              $null = $inst.Handle
+              if (-not $inst.WaitForExit(180000)) { throw 'the installer did not finish within 180 s' }
+              $daemonOut = (Get-Content -LiteralPath $outFile -Raw) + (Get-Content -LiteralPath $errFile -Raw)
               Write-Host $daemonOut
+              if ($inst.ExitCode -ne 0) { throw "install.ps1 over a running daemon exited $($inst.ExitCode)" }
               if ($daemonOut -notmatch 'restarted the daemon on the new version') {
                 throw 'the installer did not restart the daemon it stopped'
               }

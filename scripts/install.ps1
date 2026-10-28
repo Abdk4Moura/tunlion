@@ -251,6 +251,20 @@ function Move-Aside([string]$path) {
     Move-Item -Force -LiteralPath $path -Destination $old
 }
 
+# `tunlion up --detach <flags>`, returning its exit code. Not `& $exe ... |`:
+# the detached daemon inherits the pipe a PowerShell capture opens, so the
+# pipeline would wait on the daemon's whole life. Start-Process gives it the
+# console instead, and WaitForExit waits for the `up` alone, not the daemon.
+function Start-Detached([string]$exe, [string[]]$flags) {
+    $argLine = (@('up', '--detach') + @($flags | ForEach-Object {
+        if ($_ -match '\s') { "`"$_`"" } else { $_ }
+    })) -join ' '
+    $p = Start-Process -FilePath $exe -ArgumentList $argLine -NoNewWindow -PassThru
+    $null = $p.Handle  # keep the handle so ExitCode survives the exit
+    $p.WaitForExit()
+    return $p.ExitCode
+}
+
 function Format-UpCommand([string[]]$flags) {
     $words = @('tunlion', 'up', '--detach') + @($flags | ForEach-Object {
         if ($_ -match '\s') { "`"$_`"" } else { $_ }
@@ -474,11 +488,11 @@ try {
 
     foreach ($d in $restart) {
         $cmd = Format-UpCommand $d.Flags
-        & $exe up --detach @($d.Flags) 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $code = Start-Detached $exe $d.Flags
+        if ($code -eq 0) {
             Say "restarted the daemon on the new version ($cmd)"
         } else {
-            Say "the daemon was stopped but did not restart (exit $LASTEXITCODE); start it with: $cmd"
+            Say "the daemon was stopped but did not restart (exit $code); start it with: $cmd"
         }
     }
     $oldExe = [System.IO.Path]::ChangeExtension($exe, 'old')
