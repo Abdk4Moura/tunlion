@@ -673,6 +673,19 @@
       ]
     },
     {
+      "path": "deploy/coturn/start.sh",
+      "disposition": "operational",
+      "entrypoint": "sh deploy/coturn/start.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "deployment-host"
+        }
+      ],
+      "activation": "manual",
+      "invoked_by": []
+    },
+    {
       "path": "deploy/monitor/install-timers.sh",
       "disposition": "operational",
       "entrypoint": "sudo bash deploy/monitor/install-timers.sh",
