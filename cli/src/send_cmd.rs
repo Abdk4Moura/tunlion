@@ -1484,15 +1484,21 @@ pub(crate) async fn send_cmd(
                                             ui::Tone::Dim,
                                             "  authenticated, sending",
                                         ));
-                                        // Option A: race direct-quic FIRST; start_direct
-                                        // replaces WebRTC only after pending registration.
-                                        // If direct wins: transfer rides QUIC (130+ MB/s).
-                                        // If direct fails: expired_direct → establish → WebRTC fallback
-                                        //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
-                                        // A browser cannot take direct QUIC: promoting
-                                        // it would drop the WebRTC link it is on.
+                                        // Make-before-break: race direct-quic BESIDE the
+                                        // authenticated WebRTC link, which starts the
+                                        // transfer now (rearm below). When direct wins, we
+                                        // lead the handoff and the stream continues on
+                                        // QUIC from the next chunk; if it never wins,
+                                        // WebRTC simply keeps serving. A browser cannot
+                                        // take direct QUIC, so it is not raced at all.
                                         let promo = if cer.peer_supports_direct() {
-                                            conn.start_direct_promote(&from, &from, &sec).await
+                                            conn.start_direct_promote(
+                                                &from,
+                                                &from,
+                                                &sec,
+                                                crate::conn::PromoteRole::Lead,
+                                            )
+                                            .await
                                         } else {
                                             crate::conn::Promotion::Retained
                                         };
@@ -1798,6 +1804,10 @@ pub(crate) async fn send_cmd(
                 }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
+                // The post-PAKE promotion's handoff (crate::conn, `handoff`).
+                Some("path-promote" | "path-promoted" | "path-declined" | "path-stay") => {
+                    let _ = conn.on_promote_control(&pid, &v).await;
+                }
                 // Fleet target: the peer's certificate. The fleet secret proved
                 // it is IN the fleet; this proves WHICH member. The device key it
                 // names must resolve to the local record the user typed, or we

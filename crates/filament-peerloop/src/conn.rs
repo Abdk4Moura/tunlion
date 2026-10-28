@@ -42,6 +42,7 @@
 //!     frozen `recv_cmd`; the abstraction waits on the `Link` move.
 //!   - `crate::test_hooks` and the FLEET/REJOIN constants: process/test facts, not
 //!     host services.
+use crate::handoff::{self, HandoffTransport};
 use crate::holepunch;
 use crate::host::{peer_entry, HostServices, Level, LogSink, Tone};
 use crate::identity::resolve_peer_identity;
@@ -79,32 +80,84 @@ use tokio::sync::{mpsc, oneshot};
 /// `answerer: true`, `has_flowed() -> true`, `expected_secret: None`. This
 /// makes the meaningless combination unrepresentable instead of merely
 /// unreachable-by-convention.
-/// What a promotion did to the serving WebRTC link.
+/// What a promotion leaves behind: the serving WebRTC link, always.
 ///
-/// Carried rather than inferred at the call site, because the two outcomes need
-/// opposite follow-ups and getting it wrong is silent both ways:
+/// A promotion used to have two outcomes. `Replaced` tore the authenticated
+/// WebRTC link down and waited for direct QUIC to bring a successor (Option A),
+/// so the transfer could not start until QUIC was up, 1.35 to 1.5 s after
+/// `authenticated` on every cross-network code transfer, and a lost race meant
+/// rebuilding WebRTC from scratch. `Retained` was the case where direct was off.
 ///
-///   Replaced  the link was torn down and a successor is coming; announcing the
-///             old transport would advertise something already gone.
-///   Retained  direct was disabled, or setup failed before registering a
-///             pending, so the ORIGINAL link is still live and NOTHING else
-///             will announce it. That silence is the macOS wedge.
+/// Promotion is now make-before-break (see `handoff`): the WebRTC link keeps
+/// serving, the transfer starts on it, and a direct link that wins its race
+/// takes over at a frame boundary through an explicit round trip. So the link
+/// is always retained and must always be announced, which is what this token
+/// is for.
 ///
 /// The `#[must_use]` is the point, and so is taking this by value in
 /// `rearm_channel_ready`: it keeps re-announcement unreachable from a `Normal`
-/// or `Probe` start_direct, both of which register a pending WITHOUT dropping,
-/// where re-announcing would advertise a transport with a live direct race
-/// pending against it. Same argument that made `DirectIntent` an enum rather
-/// than two bools.
+/// or `Probe` start_direct, whose winners adopt or verify on their own. A
+/// promotion's winner never clobbers the serving link (it is routed to the
+/// handoff as a standby), so announcing the retained link is always right.
+/// Same argument that made `DirectIntent` an enum rather than two bools.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[must_use = "a promotion that RETAINED the link leaves its transport \
+#[must_use = "a promotion RETAINS the serving link and leaves its transport \
               unannounced, and nothing else will announce it. Pass this to \
               `rearm_channel_ready`, or explain in a comment why this command \
               does not need the retained link announced."]
 pub enum Promotion {
-    Replaced,
     Retained,
 }
+
+/// Which end of a make-before-break promotion this is. The end that sends the
+/// data leads, because only it can stop its frames at a boundary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PromoteRole {
+    /// Sends the file: asks the peer to move once its own direct link is up.
+    Lead,
+    /// Receives it: moves when asked, and only then.
+    Follow,
+}
+
+/// One post-PAKE promotion in progress. Exists from `start_direct_promote`
+/// until the direct link is adopted, the race is lost, or the link goes away.
+pub struct PromoteState {
+    pub role: PromoteRole,
+    /// The direct transport, once our race won (authenticated QUIC). Held
+    /// beside the serving link, which it does not touch, until the handoff.
+    standby: Option<(Arc<dyn Transport>, &'static str)>,
+    /// Lead: the wrapper around the serving transport whose frame gate is the
+    /// boundary.
+    gate: Option<Arc<HandoffTransport>>,
+    /// Lead: resolves the barrier with the peer's answer.
+    answer: Option<oneshot::Sender<Option<Arc<dyn Transport>>>>,
+    /// Follow: the peer asked before our own race finished.
+    asked: bool,
+    /// The handoff completed; the next `adopt_direct` for this peer retires
+    /// the serving WebRTC link and installs the direct one in its place.
+    handed: bool,
+}
+
+impl PromoteState {
+    fn new(role: PromoteRole) -> Self {
+        PromoteState {
+            role,
+            standby: None,
+            gate: None,
+            answer: None,
+            asked: false,
+            handed: false,
+        }
+    }
+
+    fn has_standby(&self) -> bool {
+        self.standby.is_some()
+    }
+}
+
+/// How long a retired WebRTC link keeps delivering what the peer queued on it
+/// before the handoff, before it is closed.
+const RETIRE_GRACE: Duration = DROP_CLOSE_GRACE;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DirectIntent {
@@ -112,7 +165,8 @@ enum DirectIntent {
     Normal,
     /// Upgrade probe: bypass the live-link guard, but never drop.
     Probe,
-    /// Option A: the ONLY intent permitted to replace a serving link.
+    /// Post-PAKE promotion: dial alongside the serving WebRTC link, which is
+    /// replaced only through the make-before-break handoff (`handoff`).
     Promote,
     /// Fleet auto-mesh: dial a same-owner device using the FLEET rendezvous
     /// secret as the transport MAC key. Behaves like `Normal` for teardown, but
@@ -747,6 +801,10 @@ pub struct Conn {
     /// 1 (pre-PAKE offers): buffered here and replayed once `start_direct` creates
     /// the pending. pid → (candidates, srflx).
     pub buffered_offers: HashMap<String, (Vec<String>, Option<String>, Option<String>, u8)>,
+    /// Post-PAKE promotions in progress (make-before-break; see `handoff`),
+    /// keyed by peer sid. Each pairs with an ephemeral `direct_pending` entry
+    /// that must survive beside the serving link until the handoff resolves.
+    pub promotions: HashMap<String, PromoteState>,
     /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
     pub resil: ResilienceState,
     /// Is the rung-1 direct-QUIC path allowed for THIS session? Normally this is
@@ -966,6 +1024,7 @@ impl Conn {
             direct_pending: HashMap::new(),
             webrtc_only: HashSet::new(),
             buffered_offers: HashMap::new(),
+            promotions: HashMap::new(),
             resil: ResilienceState {
                 stall_repairs: HashMap::new(),
                 relay_committed: std::collections::HashSet::new(),
@@ -1183,6 +1242,9 @@ impl Conn {
             l.transport = Some(t.clone());
             l.presence = Presence::Ready;
         }
+        // A promotion's lead end may have authenticated before its channel
+        // opened; the transfer it is about to start must ride the gate.
+        self.gate_for_promotion(pid);
         if claim_active && self.active.is_none() {
             self.active = Some(pid.to_string());
         }
@@ -1426,12 +1488,11 @@ impl Conn {
     /// fresh channel-open still has to tell the loop.
     ///
     /// No-op when the link is gone or its transport is dead, so it is safe to
-    /// call unconditionally after a promotion attempt: if the promotion DID
-    /// happen the link was replaced and the new transport will announce itself.
+    /// call unconditionally after a promotion attempt. A promotion never
+    /// replaces the link any more (make-before-break), so after one this always
+    /// has the serving transport to announce, and the transfer starts on it.
     pub fn rearm_channel_ready(&self, pid: &str, outcome: Promotion) {
-        if outcome == Promotion::Replaced {
-            return; // the replacement transport announces itself
-        }
+        let Promotion::Retained = outcome;
         let Some(l) = self.links.get(pid) else { return };
         let Some(t) = l.transport.as_ref() else {
             return;
@@ -1469,6 +1530,13 @@ impl Conn {
         self.room_digest_absent.remove(pid);
         self.buffered_offers.remove(pid);
         self.stuck_retry.remove(pid);
+        // A promotion dies with its link: nothing will adopt the standby, and a
+        // barrier still waiting on the peer must release onto the old path. One
+        // already handed over is the exception: its adoption is queued and needs
+        // the entry to keep its ephemeral pending from being reaped first.
+        if !self.promotions.get(pid).is_some_and(|s| s.handed) {
+            self.abandon_promotion(pid);
+        }
         if let Some(old) = self.links.remove(pid) {
             // Never await close in the event loop (F8): mark + spawn.
             if let Some(p) = old.peer.clone() {
@@ -1523,6 +1591,11 @@ impl Conn {
                 t.force_close();
                 n += 1;
             }
+        }
+        // A promotion's direct standby is a live QUIC connection too.
+        for (t, _) in self.promotions.values().filter_map(|p| p.standby.as_ref()) {
+            t.force_close();
+            n += 1;
         }
         n
     }
@@ -2171,27 +2244,77 @@ impl Conn {
             .await
     }
 
-    /// Option A: replace the serving WebRTC link with direct after PAKE. This
-    /// is the ONLY caller permitted to tear down a live link, and the teardown
-    /// happens inside `start_direct_inner` AFTER `direct_pending` is registered,
-    /// so a failure anywhere in setup leaves WebRTC serving and the fallback
-    /// reaper has an attempt to expire.
+    /// Post-PAKE promotion, make-before-break. Dials direct QUIC with the
+    /// ceremony secret while the authenticated WebRTC link keeps serving: the
+    /// caller announces the retained link (`rearm_channel_ready`) and the
+    /// transfer starts on it at once. When the race wins, the direct link is
+    /// held as a standby and the two ends move to it at a frame boundary (see
+    /// `handoff`); a race that never wins leaves WebRTC serving with nothing to
+    /// rebuild. `role` says which end this is: the sender leads the handoff.
+    ///
+    /// This used to tear the WebRTC link down here ("Option A") and make the
+    /// transfer wait for QUIC, 1.35 to 1.5 s after `authenticated` on every
+    /// cross-network code transfer (and a full WebRTC rebuild when QUIC lost).
     pub async fn start_direct_promote(
         &mut self,
         pid: &str,
         name: &str,
         secret: &str,
+        role: PromoteRole,
     ) -> Promotion {
         self.start_direct_inner(pid, name, secret, DirectIntent::Promote)
             .await;
-        // The promotion drops the link ONLY after registering a pending (the
-        // insert and the drop are straight-line, nothing returns between them),
-        // so the link's continued existence is an exact witness of which
-        // outcome happened and does not need threading out of the early returns.
-        if self.links.contains_key(pid) {
-            Promotion::Retained
-        } else {
-            Promotion::Replaced
+        // An armed promotion is exactly an ephemeral pending: every early return
+        // in start_direct_inner (direct off, browser peer, bind failure) leaves
+        // none, and then there is nothing to hand off and nothing to track.
+        if self.direct_pending.get(pid).is_some_and(|p| p.ephemeral) {
+            self.abandon_promotion(pid);
+            self.promotions
+                .insert(pid.to_string(), PromoteState::new(role));
+            self.gate_for_promotion(pid);
+        }
+        Promotion::Retained
+    }
+
+    /// Lead end: put the frame gate around the serving WebRTC transport, so a
+    /// transfer that starts on it can be moved at a boundary. Idempotent; a
+    /// no-op until the link has a transport (the channel may open after the
+    /// ceremony; `mark_ready` calls this again when it does).
+    fn gate_for_promotion(&mut self, pid: &str) {
+        let Some(st) = self.promotions.get_mut(pid) else {
+            return;
+        };
+        if st.role != PromoteRole::Lead || st.handed {
+            return;
+        }
+        let Some(l) = self.links.get_mut(pid) else {
+            return;
+        };
+        if l.direct {
+            return;
+        }
+        let Some(t) = l.transport.clone() else {
+            return;
+        };
+        if handoff::as_handoff(&t).is_some() {
+            return; // already gated
+        }
+        let gate = HandoffTransport::wrap(t);
+        let wrapped: Arc<dyn Transport> = gate.clone();
+        l.transport = Some(wrapped);
+        st.gate = Some(gate);
+    }
+
+    /// Forget a promotion: release a barrier still waiting on the peer onto the
+    /// serving path, and close a standby nothing will adopt.
+    fn abandon_promotion(&mut self, pid: &str) {
+        if let Some(st) = self.promotions.remove(pid) {
+            if let Some(answer) = st.answer {
+                let _ = answer.send(None);
+            }
+            if let Some((t, _)) = st.standby {
+                t.force_close();
+            }
         }
     }
 
@@ -2222,11 +2345,11 @@ impl Conn {
         port
     }
 
-    /// `promote`: this call is REPLACING a serving WebRTC link with direct
-    /// (Option A after PAKE). Only then may a live link be torn down, and only
-    /// after `direct_pending` is registered so the fallback reaper has an
-    /// attempt to expire. Every other caller (known-peer appeared, warm-hold,
-    /// re-dial) must leave a healthy link alone: dropping it there is what broke
+    /// No intent tears down a live link here. `Promote` (after PAKE) dials
+    /// alongside the serving WebRTC link and its winner becomes a standby that
+    /// replaces the link only through the handoff, once both ends agree.
+    /// Every other caller (known-peer appeared, warm-hold, re-dial) must leave
+    /// a healthy link alone too: dropping it is what broke
     /// `warm_all_makes_first_contact_warm`, because warm-hold's whole job is to
     /// have a link already up when first contact arrives.
     async fn start_direct_inner(
@@ -2318,21 +2441,21 @@ impl Conn {
         // certain a replacement exists. A promotion supersedes for its own
         // reason: any pending started before PAKE completed was dialled without
         // the shared secret and cannot authenticate, so letting it block the
-        // promotion is how Option A silently never runs.
+        // promotion is how the promotion silently never runs.
         let supersede = link_dead || intent == DirectIntent::Promote;
         if self.direct_pending.contains_key(pid) && !supersede {
             return; // already trying
         }
         // A live link is a REASON TO STOP for everyone except a deliberate
-        // promotion. Promotion is the one caller that intends to replace it.
+        // promotion, the one caller that intends to (eventually) replace it.
         // #246: `has_live_transport` now counts a mid-establish WebRTC peer as
         // live, so a Normal re-dial YIELDS to an establish that is still
         // making progress instead of arming a fresh direct attempt whose own
         // 5s fallback timer would then re-enter `establish` at the same cursor
         // and swap the still-establishing link. That is the livelock relocated
         // rather than removed, which is why both gates are needed. Promote
-        // bypasses on purpose (it is the one caller that intends to displace a
-        // live link, and its teardown is the designed Option A), and Probe
+        // bypasses on purpose (it dials beside the live link it means to
+        // displace, through the handoff, never by tearing it down), and Probe
         // bypasses on purpose (it dials ALONGSIDE the serving relay link and
         // never touches `links`, so it cannot disturb an establish it did not
         // create).
@@ -2530,12 +2653,9 @@ impl Conn {
                 cancel: cancel_emitter,
             },
         );
-        // Replace the serving WebRTC link only after all fallible setup has
-        // completed and the fallback reaper has a pending attempt to expire.
-        // Upgrade probes retain their serving relay link by design.
-        if intent == DirectIntent::Promote {
-            self.drop_link(pid);
-        }
+        // Nothing is torn down here, for any intent. A promotion keeps the
+        // serving WebRTC link and its winner is routed to the handoff as a
+        // standby (`on_transport_offer`); upgrade probes keep their relay link.
         // Bug 2: replay any transport-offers that were buffered while we had
         // no DirectPending (the sender re-dialed after a mid-transfer death).
         if let Some((cands, srflx, server_public, proto)) = self.buffered_offers.remove(pid) {
@@ -2627,6 +2747,10 @@ impl Conn {
         // DirectUpgradeReady (verify-before-upgrade) so the serving relay link is
         // never clobbered. A cold pending posts DirectReady as before.
         let is_probe = p.probe;
+        // A post-PAKE promotion's winner must not clobber the serving WebRTC
+        // link either: it is a standby for the make-before-break handoff, and
+        // every loop that promotes routes this event to the same stash.
+        let standby = is_probe || (p.ephemeral && self.promotions.contains_key(pid));
         // rung-2: hand the punch socket + peer's srflx to the chained ladder.
         let punch_sock = p.punch_sock.take();
         let peer_srflx_addr = peer_srflx
@@ -2651,7 +2775,7 @@ impl Conn {
         let my_uid = self.my_uid.clone();
         let my_id = self.my_id.clone();
         let mk = move |pid: String, t: Arc<dyn Transport>, route: &'static str| {
-            if is_probe {
+            if standby {
                 Ev::DirectUpgradeReady(pid, t, route)
             } else {
                 Ev::DirectReady(pid, t, route)
@@ -2701,6 +2825,7 @@ impl Conn {
             )
             .await
             {
+                direct::test_setup_delay().await;
                 t.announce(&tx, |t| mk(pid_s, t, "direct-quic"));
                 return;
             }
@@ -2734,6 +2859,7 @@ impl Conn {
                     )
                     .await
                     {
+                        direct::test_setup_delay().await;
                         t.announce(&tx, |t| mk(pid_s, t, "holepunched"));
                         return;
                     }
@@ -2770,6 +2896,16 @@ impl Conn {
     /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
     /// proved identity, at least as strong as the DTLS pair-proof it replaces).
     pub fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
+        // A promotion handed over (make-before-break): retire the serving
+        // WebRTC link in the same step that installs its successor below, so
+        // the peer is never without a link. The old channel keeps delivering
+        // what was already queued on it for a grace (`retire_serving_link`).
+        if self.promotions.get(pid).is_some_and(|s| s.handed) {
+            self.promotions.remove(pid);
+            if self.links.contains_key(pid) {
+                self.retire_serving_link(pid);
+            }
+        }
         let pend = self.direct_pending.remove(pid);
         // Read the fleet flag BEFORE the secret moves out of the pending.
         //
@@ -3013,6 +3149,10 @@ impl Conn {
     pub fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
         let now = Instant::now();
         let mut fell_back = Vec::new();
+        // Post-PAKE promotions first: one whose race lost leaves WebRTC serving
+        // (nothing was torn down, so nothing falls back), one whose race won is
+        // waiting on its handoff, not on this deadline.
+        self.settle_promotions(now);
         // P5 (GAP-6): an UPGRADE-PROBE pending whose budget expired with no winner
         // must NOT fall back to WebRTC, the relay link is still serving and the
         // whole point of the probe was to find a DIRECT path. Just DROP it and let
@@ -3035,7 +3175,12 @@ impl Conn {
         let expired: Vec<String> = self
             .direct_pending
             .iter()
-            .filter(|(pid, p)| !p.probe && now >= p.deadline && !self.links.contains_key(*pid))
+            .filter(|(pid, p)| {
+                !p.probe
+                    && now >= p.deadline
+                    && !self.links.contains_key(*pid)
+                    && !self.promotions.contains_key(*pid)
+            })
             .map(|(pid, _)| pid.clone())
             .collect();
         for pid in expired {
@@ -3081,10 +3226,14 @@ impl Conn {
         // relay link (that's the point), so this cleanup must not reap it before its
         // race runs; a probe is reaped only by its own deadline (above) or by the
         // upgrade cutover consuming it.
+        // A promotion's pending is EXCLUDED too: it coexists with the serving
+        // WebRTC link by design (make-before-break), and its adoption needs it.
         let linked: Vec<String> = self
             .direct_pending
             .iter()
-            .filter(|(pid, p)| !p.probe && self.links.contains_key(*pid))
+            .filter(|(pid, p)| {
+                !p.probe && self.links.contains_key(*pid) && !self.promotions.contains_key(*pid)
+            })
             .map(|(pid, _)| pid.clone())
             .collect();
         for pid in linked {
@@ -4046,6 +4195,336 @@ impl Conn {
         );
     }
 
+    // --- POST-PAKE PROMOTION: the make-before-break handoff (see `handoff`) ---
+
+    /// Our promotion race won: an authenticated direct link is up beside the
+    /// serving WebRTC link, which keeps carrying the transfer. The lead end
+    /// asks the peer to move now; a follower that was already asked moves now.
+    /// With nothing serving (the WebRTC link died while the race ran) there is
+    /// nothing to hand off from, and the direct link is adopted at once, as the
+    /// promotion always did.
+    fn on_promote_standby(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
+        let serving = self
+            .links
+            .get(pid)
+            .and_then(|l| l.transport.as_ref())
+            .is_some_and(|tr| !tr.is_dead());
+        if !serving || !self.promotions.contains_key(pid) {
+            self.promote_adopt_now(pid, t, route);
+            return;
+        }
+        let Some(st) = self.promotions.get_mut(pid) else {
+            return;
+        };
+        if st.handed {
+            return;
+        }
+        if let Some((held, _)) = &st.standby {
+            if !Arc::ptr_eq(held, &t) {
+                t.force_close(); // one direct link per promotion
+            }
+            return;
+        }
+        st.standby = Some((t, route));
+        let role = st.role;
+        let asked = st.asked;
+        self.log.debug(&format!(
+            "tunlion: PROMOTE-STANDBY peer={pid} route={route}: direct link up beside the serving link"
+        ));
+        match role {
+            PromoteRole::Lead => self.begin_handoff(pid),
+            PromoteRole::Follow if asked => self.follow_moves(pid),
+            PromoteRole::Follow => {}
+        }
+    }
+
+    /// Adopt a promotion's direct link with nothing to hand off from. It goes to
+    /// the loop as a plain `DirectReady`, whose arm adopts it exactly as before
+    /// make-before-break. The entry stays (`handed`) until that adoption so the
+    /// ephemeral pending it needs cannot be reaped in between: adopting with no
+    /// pending would be born trusted.
+    fn promote_adopt_now(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
+        let role = self
+            .promotions
+            .get(pid)
+            .map(|s| s.role)
+            .unwrap_or(PromoteRole::Follow);
+        if let Some(st) = self.promotions.remove(pid) {
+            if let Some(answer) = st.answer {
+                let _ = answer.send(None);
+            }
+            if let Some((held, _)) = st.standby {
+                if !Arc::ptr_eq(&held, &t) {
+                    held.force_close();
+                }
+            }
+        }
+        let mut st = PromoteState::new(role);
+        st.handed = true;
+        self.promotions.insert(pid.to_string(), st);
+        self.log.debug(&format!(
+            "tunlion: PROMOTE-ADOPT peer={pid} route={route}: no serving link to hand off from"
+        ));
+        let _ = self.tx.send(Ev::DirectReady(pid.to_string(), t, route));
+    }
+
+    /// Lead end: close the frame gate and ask the peer to move. Runs off the
+    /// event loop; the loop's only part is delivering the answer
+    /// (`on_promote_control`). A transfer that does not ride the gate (its
+    /// channel was re-announced with a raw transport) cannot be stopped at a
+    /// boundary, so then the promotion stays on WebRTC instead.
+    fn begin_handoff(&mut self, pid: &str) {
+        let serving = self.links.get(pid).and_then(|l| l.transport.clone());
+        let gate = self
+            .promotions
+            .get(pid)
+            .and_then(|st| st.gate.clone())
+            .filter(|g| {
+                serving
+                    .as_ref()
+                    .and_then(handoff::as_handoff)
+                    .is_some_and(|h| std::ptr::eq(h, g.as_ref()))
+            });
+        let Some(gate) = gate else {
+            self.promotion_stays(pid, "the serving transport is not gated");
+            if let Some(s) = serving {
+                // The follower may already hold a standby; it must not move.
+                tokio::spawn(async move {
+                    let msg = handoff::message(handoff::PATH_STAY);
+                    let _ = tokio::time::timeout(Duration::from_secs(2), s.send_control(&msg)).await;
+                });
+            }
+            return;
+        };
+        let (answer, rx) = oneshot::channel();
+        if let Some(st) = self.promotions.get_mut(pid) {
+            st.answer = Some(answer);
+        }
+        let log = self.log.clone();
+        let who = pid.to_string();
+        // Longer than the follower's own race can run, so it has always answered
+        // (moved or declined) before this gives up and withdraws the ask.
+        let backstop = if holepunch::holepunch_enabled() {
+            direct::DIRECT_BUDGET + holepunch::PUNCH_BUDGET + Duration::from_secs(5)
+        } else {
+            direct::DIRECT_BUDGET + Duration::from_secs(2)
+        };
+        tokio::spawn(async move {
+            let ask = handoff::message(handoff::PATH_PROMOTE);
+            let stay = handoff::message(handoff::PATH_STAY);
+            let outcome = gate.hand_off(&ask, &stay, rx, backstop).await;
+            log.debug(&format!("tunlion: PROMOTE-HANDOFF peer={who} outcome={outcome:?}"));
+        });
+    }
+
+    /// Follow end: asked to move with our direct link up. Answer on the serving
+    /// channel, then hand the direct link to the loop's `DirectReady` arm; its
+    /// `adopt_direct` retires the WebRTC link (still read for `RETIRE_GRACE`,
+    /// so nothing the lead queued on it is lost) and installs the direct one in
+    /// the same step, so the peer is never without a link.
+    fn follow_moves(&mut self, pid: &str) {
+        let serving = self.links.get(pid).and_then(|l| l.transport.clone());
+        let Some(st) = self.promotions.get_mut(pid) else {
+            return;
+        };
+        let Some((t, route)) = st.standby.clone() else {
+            return;
+        };
+        st.handed = true;
+        if let Some(s) = serving {
+            tokio::spawn(async move {
+                let msg = handoff::message(handoff::PATH_PROMOTED);
+                let _ = tokio::time::timeout(Duration::from_secs(2), s.send_control(&msg)).await;
+            });
+        }
+        self.log.debug(&format!(
+            "tunlion: PROMOTED peer={pid} route={route}: moving to the direct link at the lead's boundary"
+        ));
+        let _ = self.tx.send(Ev::DirectReady(pid.to_string(), t, route));
+    }
+
+    /// Lead end: the peer moved. Open the gate onto the direct link (frames
+    /// resume there from the next chunk), then retire the WebRTC link and
+    /// install the direct one, exactly as the promotion's adoption always built
+    /// it. Nothing is re-offered: what was offered on WebRTC is answered on
+    /// whichever path the peer is using.
+    fn lead_moves(&mut self, pid: &str) {
+        let Some(st) = self.promotions.get_mut(pid) else {
+            return;
+        };
+        if st.handed || st.gate.as_ref().is_none_or(|g| !g.asked()) {
+            return; // not an answer to anything we asked
+        }
+        let Some((t, route)) = st.standby.clone() else {
+            return;
+        };
+        match st.answer.take() {
+            Some(answer) if !answer.is_closed() => {
+                let _ = answer.send(Some(t.clone()));
+            }
+            _ => {
+                // Our barrier already gave up (the answer crossed our
+                // `path-stay`), but the peer has moved and will close the old
+                // path, so follow it rather than strand the transfer there.
+                if let Some(g) = &st.gate {
+                    g.force_switch(t.clone());
+                }
+            }
+        }
+        st.handed = true;
+        let tkey = self
+            .direct_pending
+            .get(pid)
+            .map(|p| direct::transport_key(&p.secret.1));
+        self.adopt_direct(pid, t.clone(), route);
+        if let Some(k) = tkey {
+            self.spawn_direct_workers(pid, &t, k);
+        }
+        self.log.debug(&format!(
+            "tunlion: PROMOTED peer={pid} route={route}: the transfer moved to the direct link at a frame boundary"
+        ));
+    }
+
+    /// The promotion ends with the WebRTC link still serving.
+    fn promotion_stays(&mut self, pid: &str, why: &str) {
+        self.abandon_promotion(pid);
+        self.direct_pending.remove(pid);
+        self.log.debug(&format!(
+            "tunlion: PROMOTE-STAY peer={pid} ({why}): the WebRTC link keeps serving"
+        ));
+    }
+
+    /// Take the serving WebRTC link out of `links` without cutting off what it
+    /// is still delivering: the peer may have queued messages on it before it
+    /// moved, so its channel keeps being read for `RETIRE_GRACE`, then closes.
+    /// The active slot stays with the peer; the caller installs the successor.
+    fn retire_serving_link(&mut self, pid: &str) {
+        let peer = self.links.get_mut(pid).and_then(|l| {
+            // On the lead end this is the handoff gate, which now forwards to
+            // the direct link: closing it with the link would close that.
+            l.transport = None;
+            l.peer.take()
+        });
+        let was_active = self.is_active(pid);
+        self.drop_link(pid);
+        if was_active {
+            self.active = Some(pid.to_string());
+        }
+        if let Some(p) = peer {
+            tokio::spawn(async move {
+                tokio::time::sleep(RETIRE_GRACE).await;
+                p.mark_closed();
+                p.close().await;
+            });
+        }
+    }
+
+    /// The handoff's control messages (`handoff::PATH_*`). Returns true when
+    /// `v` was one of them, so the loop does not dispatch it further.
+    pub async fn on_promote_control(&mut self, pid: &str, v: &Value) -> bool {
+        let Some(kind) = v["type"].as_str() else {
+            return false;
+        };
+        let role = self.promotions.get(pid).map(|s| s.role);
+        match kind {
+            handoff::PATH_PROMOTE => {
+                if role == Some(PromoteRole::Follow) {
+                    let Some(st) = self.promotions.get_mut(pid) else {
+                        return true;
+                    };
+                    if st.handed {
+                        return true;
+                    }
+                    if st.has_standby() {
+                        self.follow_moves(pid);
+                    } else {
+                        // Our race is still running; answer when it resolves
+                        // (moved on a win, declined at its deadline).
+                        st.asked = true;
+                    }
+                } else if let Some(t) = self.transport_of(pid) {
+                    // No direct link is coming at this end.
+                    let msg = handoff::message(handoff::PATH_DECLINED);
+                    let _ = tokio::time::timeout(Duration::from_secs(2), t.send_control(&msg)).await;
+                }
+            }
+            handoff::PATH_PROMOTED => {
+                if role == Some(PromoteRole::Lead) {
+                    self.lead_moves(pid);
+                }
+            }
+            handoff::PATH_DECLINED => {
+                if role == Some(PromoteRole::Lead)
+                    && !self.promotions.get(pid).is_some_and(|s| s.handed)
+                {
+                    self.promotion_stays(pid, "the peer has no direct link");
+                }
+            }
+            handoff::PATH_STAY => {
+                if role == Some(PromoteRole::Follow)
+                    && !self.promotions.get(pid).is_some_and(|s| s.handed)
+                {
+                    self.promotion_stays(pid, "the lead withdrew the handoff");
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Per tick: settle promotions whose race did not end in a handoff. A won
+    /// race whose serving link has since died is adopted directly; one whose
+    /// lead barrier gave up stays; a race past its deadline with no winner
+    /// leaves WebRTC serving (a follower that was asked says so), with no
+    /// rebuild because nothing was torn down.
+    fn settle_promotions(&mut self, now: Instant) {
+        let pids: Vec<String> = self.promotions.keys().cloned().collect();
+        for pid in pids {
+            let serving = self
+                .links
+                .get(&pid)
+                .and_then(|l| l.transport.as_ref())
+                .is_some_and(|t| !t.is_dead());
+            let Some(st) = self.promotions.get(&pid) else {
+                continue;
+            };
+            if st.handed {
+                continue; // its adoption is already queued
+            }
+            if let Some((t, route)) = st.standby.clone() {
+                if !serving {
+                    self.promote_adopt_now(&pid, t, route);
+                } else if st.answer.as_ref().is_some_and(|a| a.is_closed()) {
+                    self.promotion_stays(&pid, "the peer never answered the handoff");
+                }
+                continue;
+            }
+            let expired = self
+                .direct_pending
+                .get(&pid)
+                .is_none_or(|p| now >= p.deadline);
+            if !expired {
+                continue;
+            }
+            if serving {
+                let decline = (st.role == PromoteRole::Follow && st.asked)
+                    .then(|| self.transport_of(&pid))
+                    .flatten();
+                self.promotion_stays(&pid, "no direct path in budget");
+                if let Some(t) = decline {
+                    tokio::spawn(async move {
+                        let msg = handoff::message(handoff::PATH_DECLINED);
+                        let _ = tokio::time::timeout(Duration::from_secs(2), t.send_control(&msg)).await;
+                    });
+                }
+            } else {
+                // No live link: the pending's own expiry rebuilds WebRTC, as
+                // it always has. Only the promotion's bookkeeping goes.
+                self.abandon_promotion(&pid);
+            }
+        }
+    }
+
     /// P5 (GAP-6): a relay->direct upgrade probe's direct standby CONNECTED. Stash
     /// it on the peer's `UpgradeProbe` and START the verify window. Crucially, do
     /// NOT touch `links`, the relay link keeps serving until the standby is proven
@@ -4058,6 +4537,14 @@ impl Conn {
         t: Arc<dyn Transport>,
         route: &'static str,
     ) {
+        // A post-PAKE promotion's winner rides this event too (it must not
+        // clobber the serving link any more than a probe's may).
+        if self.promotions.contains_key(pid)
+            || self.direct_pending.get(pid).is_some_and(|p| p.ephemeral && !p.probe)
+        {
+            self.on_promote_standby(pid, t, route);
+            return;
+        }
         // Consume any probe DirectPending so expired_direct doesn't reap/backoff it
         // out from under the verify (the race already won).
         self.direct_pending.remove(pid);
@@ -4088,6 +4575,13 @@ impl Conn {
         let Some(l) = self.links.get_mut(pid) else {
             return;
         };
+        // A link with no WebRTC peer has no connection state to report. This is
+        // the retired peer of a promotion that moved to direct QUIC, still being
+        // read for a grace: its `disconnected` is the old path closing, not this
+        // link reconnecting.
+        if l.peer.is_none() {
+            return;
+        }
         // C26: collect the announcement, print after the borrow ends so the
         // roster can read every link.
         let mut announce: Option<(&'static str, Tone, &'static str)> = None;
@@ -4175,9 +4669,17 @@ impl Conn {
         // gone idle/dead and must drop now). TUNLION_TEST_NO_DEFER reverts to
         // the old unconditional-drop behaviour so an A/B repro can prove the
         // deferral is what saves the live transfer (baseline must FAIL).
+        //
+        // A receive that is already COMPLETE (`recv_done`: every file verified,
+        // nothing in flight, not a daemon) has nothing left for a live channel
+        // to carry, so deferring only delays the exit. That delay was 2 s on
+        // every code transfer that finished on WebRTC: the sender exits right
+        // after the delivery-ack and its data channel still reads as flowing
+        // (`link_flowing` counts the last data byte for 3 s). Promotion now
+        // lets small transfers finish on WebRTC, so this is the common case.
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
         let defer_disabled = test_hooks::no_defer();
-        if !forced && !defer_disabled && self.link_flowing(&pid) {
+        if !forced && !defer_disabled && !self.recv_done && self.link_flowing(&pid) {
             // Idempotent: first peer-left for this sid records the original
             // payload; a duplicate is swallowed (no double-defer, no drop).
             self.deferred_left
@@ -4728,7 +5230,9 @@ mod relay_privacy_tests {
             assert!(!conn.direct_ok, "relay mode must not keep direct_ok");
             conn.start_direct("peer-sid", "peer", "00").await;
             conn.start_direct_fleet("peer-sid", "00").await;
-            let _ = conn.start_direct_promote("peer-sid", "peer", "00").await;
+            let _ = conn
+                .start_direct_promote("peer-sid", "peer", "00", PromoteRole::Lead)
+                .await;
             assert!(conn.direct_pending.is_empty(), "no direct attempt may be armed");
             // Control: the recorder really does see what this client emits.
             sio.emit(
@@ -6209,6 +6713,327 @@ mod warm_identity_tests {
             conn.links.contains_key(pid),
             "the relay/WebRTC responder was suppressed by the hint"
         );
+    }
+
+    // --- post-PAKE promotion: make-before-break ---------------------------
+
+    /// A serving path that records every control type and frame offset, in
+    /// order, so a test can read what each end put on which path.
+    struct Rec {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        alive: AtomicBool,
+    }
+    impl Rec {
+        fn new(name: &'static str, log: &Arc<std::sync::Mutex<Vec<String>>>) -> Arc<Self> {
+            Arc::new(Rec { name, log: log.clone(), alive: AtomicBool::new(true) })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Transport for Rec {
+        async fn send_control(&self, msg: &Value) -> Result<()> {
+            let kind = msg["type"].as_str().unwrap_or("?");
+            self.log.lock().unwrap().push(format!("{}:{kind}", self.name));
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, offset: u64, _payload: &[u8]) -> Result<()> {
+            self.log.lock().unwrap().push(format!("{}:@{offset}", self.name));
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn is_dead(&self) -> bool {
+            !self.alive.load(Ordering::Relaxed)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn rec_log(log: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    /// The code-path WebRTC link a PAKE just authenticated: untrusted, no
+    /// stored secret, active.
+    fn code_link(conn: &mut Conn, pid: &str, t: Arc<dyn Transport>) {
+        let mut l = relay_link(pid, "peer", "peer", t);
+        l.trusted = false;
+        l.expected_secret = None;
+        l.verified_name = None;
+        conn.links.insert(pid.to_string(), l);
+        conn.active = Some(pid.to_string());
+    }
+
+    /// What `start_direct_promote` registers, without the network: the
+    /// ephemeral pending and the promotion, gated on the lead end.
+    fn armed_promotion(conn: &mut Conn, pid: &str, role: PromoteRole, deadline: Instant) {
+        conn.direct_pending.insert(
+            pid.to_string(),
+            DirectPending {
+                secret: (pid.to_string(), "ceremony".into()),
+                fleet: false,
+                ephemeral: true,
+                deadline,
+                racing: true,
+                endpoint: None,
+                punch_sock: None,
+                my_srflx: None,
+                peer_server_public: None,
+                server_public_dialed: Arc::new(AtomicBool::new(false)),
+                probe: false,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        conn.promotions
+            .insert(pid.to_string(), PromoteState::new(role));
+        conn.gate_for_promotion(pid);
+    }
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    /// THE latency fix. The promotion used to tear the authenticated WebRTC
+    /// link down here and make the transfer wait for QUIC. It must keep the
+    /// link, put the transfer's gate around it, and leave it to be announced
+    /// so the offer goes out on it at once.
+    #[tokio::test]
+    async fn a_promotion_keeps_the_serving_link_and_announces_it() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-code";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        let promo = conn
+            .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead)
+            .await;
+        assert!(conn.links.contains_key(pid), "the promotion tore the serving link down");
+        assert!(conn.is_active(pid), "the promotion released the transfer slot");
+        assert!(
+            conn.direct_pending.get(pid).is_some_and(|p| p.ephemeral),
+            "no direct race was armed beside the link"
+        );
+        let served = conn.transport_of(pid).expect("the link lost its transport");
+        assert!(handoff::as_handoff(&served).is_some(), "the transfer would not ride the gate");
+        conn.rearm_channel_ready(pid, promo);
+        let mut announced = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::ChannelReady(p, t) = ev {
+                announced = p == pid && Arc::ptr_eq(&t, &served);
+            }
+        }
+        assert!(announced, "the retained link was not announced, so nothing would be offered");
+    }
+
+    /// QUIC never comes up: WebRTC keeps serving. No fallback establish (the
+    /// old rebuild), no teardown, nothing left armed.
+    #[tokio::test]
+    async fn a_lost_race_leaves_webrtc_serving_with_nothing_to_rebuild() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lost";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        armed_promotion(&mut conn, pid, PromoteRole::Lead, Instant::now() - Duration::from_millis(1));
+        let fell_back = conn.expired_direct();
+        assert!(fell_back.is_empty(), "a lost race rebuilt WebRTC: {fell_back:?}");
+        assert!(conn.links.contains_key(pid), "the serving link was dropped");
+        assert!(conn.direct_pending.is_empty() && conn.promotions.is_empty());
+        let t = conn.transport_of(pid).unwrap();
+        t.send_frame(1, 0, b"x").await.unwrap();
+        assert_eq!(rec_log(&log), vec!["webrtc:@0"], "the transfer did not stay on WebRTC");
+    }
+
+    /// A race that won must not be expired or reaped while it waits beside the
+    /// serving link: the old cleanup dropped any pending whose peer had a link.
+    #[tokio::test]
+    async fn a_won_race_survives_the_deadline_and_the_linked_cleanup() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-parked";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        armed_promotion(&mut conn, pid, PromoteRole::Follow, soon());
+        conn.stash_upgrade_standby(pid, Rec::new("quic", &log), "direct-quic");
+        conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
+        assert!(conn.expired_direct().is_empty());
+        assert!(conn.direct_pending.contains_key(pid), "the won race's pending was reaped");
+        assert!(conn.promotions.get(pid).is_some_and(|s| s.has_standby()));
+        assert!(!conn.link(pid).unwrap().direct, "the follower moved before it was asked");
+    }
+
+    /// The lead's half: the winner is held beside the serving link, the ask
+    /// goes out on the old path after the last frame, frames wait for the
+    /// answer, and the answer moves them to QUIC and installs the direct link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lead_moves_frames_to_quic_only_after_the_peer_answers() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lead";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
+        let stream = conn.transport_of(pid).unwrap(); // what a running stream_one holds
+        stream.send_frame(1, 0, b"a").await.unwrap();
+        let quic = Rec::new("quic", &log);
+        conn.stash_upgrade_standby(pid, quic.clone(), "direct-quic");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!conn.link(pid).unwrap().direct, "the serving link changed before the answer");
+        let blocked = {
+            let s = stream.clone();
+            tokio::spawn(async move { s.send_frame(1, 1, b"b").await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rec_log(&log), vec!["webrtc:@0", "webrtc:path-promote"]);
+        assert!(
+            conn.on_promote_control(pid, &handoff::message(handoff::PATH_PROMOTED))
+                .await
+        );
+        blocked.await.unwrap().unwrap();
+        stream.send_control(&json!({ "type": "file-end" })).await.unwrap();
+        assert_eq!(
+            rec_log(&log),
+            vec!["webrtc:@0", "webrtc:path-promote", "quic:@1", "quic:file-end"]
+        );
+        let l = conn.link(pid).unwrap();
+        assert!(l.direct, "the direct link was not installed");
+        assert!(Arc::ptr_eq(l.transport.as_ref().unwrap(), &(quic as Arc<dyn Transport>)));
+        assert!(!l.trusted, "a ceremony-keyed direct link was born trusted");
+        assert!(conn.is_active(pid), "the move released the transfer slot");
+        assert!(conn.promotions.is_empty() && conn.direct_pending.is_empty());
+    }
+
+    /// The follower's half: asked before its own race finished, it moves when
+    /// the race wins, answering on the serving path and handing the direct
+    /// link to the loop's DirectReady arm, whose adoption replaces the WebRTC
+    /// link in one step.
+    #[tokio::test]
+    async fn the_follower_moves_when_asked_and_its_race_wins() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-follow";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        armed_promotion(&mut conn, pid, PromoteRole::Follow, soon());
+        assert!(
+            conn.on_promote_control(pid, &handoff::message(handoff::PATH_PROMOTE))
+                .await
+        );
+        assert!(rec_log(&log).is_empty(), "answered before it had a direct link");
+        let quic = Rec::new("quic", &log);
+        conn.stash_upgrade_standby(pid, quic.clone(), "direct-quic");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rec_log(&log), vec!["webrtc:path-promoted"]);
+        let mut ready = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::DirectReady(p, t, route) = ev {
+                ready = Some((p, t, route));
+            }
+        }
+        let (p, t, route) = ready.expect("the direct link was not handed to the loop");
+        assert_eq!(p, pid);
+        // The expiry tick between the hand-over and the arm must not reap the
+        // pending the adoption needs.
+        conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
+        assert!(conn.expired_direct().is_empty());
+        assert!(conn.links.contains_key(pid), "the peer had no link before its successor");
+        conn.adopt_direct(&p, t, route);
+        let l = conn.link(pid).unwrap();
+        assert!(l.direct && !l.trusted);
+        assert!(Arc::ptr_eq(l.transport.as_ref().unwrap(), &(quic as Arc<dyn Transport>)));
+        assert!(conn.is_active(pid));
+        assert!(conn.promotions.is_empty() && conn.direct_pending.is_empty());
+    }
+
+    /// No direct link at this end: the ask is declined at once; asked with a
+    /// race still running that then loses, the decline comes at its deadline.
+    /// Either way the receiver never leaves WebRTC.
+    #[tokio::test]
+    async fn a_follower_without_a_direct_link_declines() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        code_link(&mut conn, "sid-none", Rec::new("webrtc", &log));
+        assert!(
+            conn.on_promote_control("sid-none", &handoff::message(handoff::PATH_PROMOTE))
+                .await
+        );
+        assert_eq!(rec_log(&log), vec!["webrtc:path-declined"]);
+
+        let log2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-racing";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log2));
+        armed_promotion(&mut conn, pid, PromoteRole::Follow, soon());
+        let _ = conn
+            .on_promote_control(pid, &handoff::message(handoff::PATH_PROMOTE))
+            .await;
+        conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
+        assert!(conn.expired_direct().is_empty());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rec_log(&log2), vec!["webrtc:path-declined"]);
+        assert!(!conn.link(pid).unwrap().direct);
+        assert!(conn.promotions.is_empty() && conn.direct_pending.is_empty());
+    }
+
+    /// The lead stays on WebRTC when the peer declines, and its frames, held
+    /// for the round trip, resume there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declined_handoff_resumes_on_webrtc() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-declined";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
+        let stream = conn.transport_of(pid).unwrap();
+        let quic = Rec::new("quic", &log);
+        conn.stash_upgrade_standby(pid, quic, "direct-quic");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let held = {
+            let s = stream.clone();
+            tokio::spawn(async move { s.send_frame(1, 0, b"a").await })
+        };
+        assert!(
+            conn.on_promote_control(pid, &handoff::message(handoff::PATH_DECLINED))
+                .await
+        );
+        held.await.unwrap().unwrap();
+        assert_eq!(rec_log(&log), vec!["webrtc:path-promote", "webrtc:@0"]);
+        assert!(!conn.link(pid).unwrap().direct);
+        assert!(conn.promotions.is_empty() && conn.direct_pending.is_empty());
+    }
+
+    /// A finished receive does not wait out the deferral for a sender that has
+    /// left: the deferral protects a transfer still in flight, and there is
+    /// none. Mid-transfer the deferral is unchanged.
+    #[tokio::test]
+    async fn a_completed_receive_does_not_defer_the_departed_sender() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-sender";
+        conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", FakeQuic::flowing()));
+        conn.recv_done = false;
+        assert!(!conn.on_peer_left(&json!({ "id": pid })) && conn.links.contains_key(pid));
+        assert!(conn.deferred_left.contains_key(pid), "a mid-transfer departure was not deferred");
+        conn.recv_done = true;
+        conn.on_peer_left(&json!({ "id": pid }));
+        assert!(!conn.links.contains_key(pid), "a completed receive deferred its departed sender");
+    }
+
+    /// The serving link died while the race ran: there is nothing to hand off
+    /// from, so the winner is adopted at once, as the promotion always did.
+    #[tokio::test]
+    async fn a_winner_with_no_serving_link_is_adopted_at_once() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-dead";
+        let webrtc = Rec::new("webrtc", &log);
+        code_link(&mut conn, pid, webrtc.clone());
+        armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
+        webrtc.alive.store(false, Ordering::Relaxed);
+        conn.stash_upgrade_standby(pid, Rec::new("quic", &log), "direct-quic");
+        let readied = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|ev| matches!(ev, Ev::DirectReady(ref p, _, _) if p == pid));
+        assert!(readied, "the winner was not adopted");
+        assert!(rec_log(&log).is_empty(), "a handoff was attempted over a dead path");
     }
 }
 

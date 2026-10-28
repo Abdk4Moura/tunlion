@@ -4649,12 +4649,18 @@ async fn recv_run(
                             }
                         }
                         log.say(&log.paint(Tone::Dim, "  authenticated, receiving"));
-                        // Option A: start the direct-QUIC race. start_direct owns
-                        // replacement after all fallible setup and pending registration.
-                        // A browser sender cannot take direct QUIC:
-                        // promoting it would drop the WebRTC link it is on.
+                        // Make-before-break: race direct QUIC beside the WebRTC
+                        // link, which keeps receiving; the sender leads the
+                        // move to QUIC at a frame boundary if it wins. A
+                        // browser sender cannot take direct QUIC at all.
                         let promo = if peer_direct {
-                            conn.start_direct_promote(&from, &from, &sec).await
+                            conn.start_direct_promote(
+                                &from,
+                                &from,
+                                &sec,
+                                crate::conn::PromoteRole::Follow,
+                            )
+                            .await
                         } else {
                             crate::conn::Promotion::Retained
                         };
@@ -4664,12 +4670,13 @@ async fn recv_run(
                         // which a peer on a retained link would otherwise never get.
                         conn.rearm_channel_ready(&from, promo);
                         // #161 (WebRTC/relay path): issue the possession challenge
-                        // now that this peer authenticated. The direct path resolves
-                        // identity at DirectReady (start_direct_promote above); the
-                        // WebRTC path has no pair-proof for a fresh code peer (no
-                        // stored secret) and no DirectReady, so without this its
-                        // identity never resolves and revocation cannot bind. The
-                        // helper is idempotent with the DirectReady site.
+                        // now that this peer authenticated. The transfer starts on
+                        // the retained WebRTC link, which has no pair-proof for a
+                        // fresh code peer (no stored secret) and no DirectReady, so
+                        // without this its identity never resolves and revocation
+                        // cannot bind. If the promotion later hands over to direct,
+                        // DirectReady resolves it again on the new link; the helper
+                        // is idempotent with that site.
                         if recv_code_path {
                             if let Some(l) = conn.link_mut(&from) {
                                 crate::identity::resolve_peer_identity(l);
@@ -5196,6 +5203,11 @@ async fn recv_run(
                 }
             }
             Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str(), log.as_ref()) {
+                // The post-PAKE promotion's handoff: the sender asks us to move
+                // to the direct link at its frame boundary (crate::handoff).
+                Some("path-promote" | "path-promoted" | "path-declined" | "path-stay") => {
+                    let _ = conn.on_promote_control(&pid, &v).await;
+                }
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
                 // to this link and start pumping its datagrams into our TUN. Only
                 // when we run an overlay ourselves; ignored otherwise.

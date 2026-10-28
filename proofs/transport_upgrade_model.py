@@ -13,8 +13,10 @@ days reading one as if it were.
 WHAT THIS MODELS
 
 After the PAKE ceremony a pair holds an authenticated WebRTC link. The code then
-tries to upgrade to direct QUIC ("Option A"): it DROPS the WebRTC link and races
-a direct dial, intending to rebuild WebRTC if the race is lost.
+tried to upgrade to direct QUIC ("Option A"): it DROPPED the WebRTC link and raced
+a direct dial, intending to rebuild WebRTC if the race was lost. Main now runs
+PATHSET (make-before-break, see "which design main runs" in the gate below and
+CONTRACT.md "Post-PAKE promotion"); the history here is why.
 
     main.rs, both Option A call sites:
         conn.drop_link(&from);
@@ -650,6 +652,30 @@ if __name__ == '__main__':
     print(f"  transition guard: {len(DELETED_TRANSITIONS)}/{len(DELETED_TRANSITIONS)} "
           "code facts behind deleted transitions still hold.")
 
+    # ------------------------------------------------- which design main runs
+    # The matrix below scores three designs; this pins which one the TREE is.
+    # Make-before-break moved main from LATE to PATHSET: start_direct_inner no
+    # longer tears the serving link down for a promotion (the only drop left in
+    # it is of a link already dead). If the promotion teardown grows back, main
+    # is LATE again and every "main today" line below would be describing a
+    # design the code no longer runs.
+    MAIN_DESIGN = PATHSET
+    promote_teardown = re.search(
+        r"intent\s*==\s*DirectIntent::Promote\s*\{\s*self\.drop_link", body
+    )
+    if promote_teardown:
+        print("\n  MAIN DESIGN DRIFTED: start_direct_inner tears the serving link")
+        print("  down for a promotion again, so main is LATE, not PATHSET.")
+        print("  Restore make-before-break, or re-label MAIN_DESIGN and the T4 lines.")
+        sys.exit(1)
+    drops = body.count("self.drop_link(")
+    if drops != 1 or "if link_dead {\n            // The link is already dead" not in body:
+        print("\n  MAIN DESIGN UNVERIFIABLE: start_direct_inner's only teardown")
+        print(f"  should be of an already-dead link; found {drops} drop_link calls.")
+        sys.exit(1)
+    print(f"  main design: {MAIN_DESIGN} (no promotion teardown in start_direct_inner;")
+    print("  its one drop_link is of a link already dead).")
+
     print(f"  calibration current: tree is {tree_state}, calibrated for")
     print(f"  {CALIBRATED_FOR}. Fails LOUD on drift; cleared by re-deriving and")
     print("  bumping CALIBRATED_FOR, never by deleting the check.")
@@ -751,10 +777,11 @@ if __name__ == '__main__':
     print("    written to justify. Data-plane attachment had to come FIRST.")
     print()
     print("    #83 did that, so the tree is now post-rearm and:")
-    print(f"      LATE    (main today)       ctrl_carries=True:  {survives(LATE, True)}/8")
-    print(f"      PATHSET (now unblocked)    ctrl_carries=True:  {survives(PATHSET, True)}/8")
-    print("    PATHSET is no longer blocked. It is not thereby URGENT: main is")
-    print("    at 7/8 and the remaining break is a real gap, not a formality.")
+    print(f"      LATE    (main until MBB)   ctrl_carries=True:  {survives(LATE, True)}/8")
+    print(f"      PATHSET (main today)       ctrl_carries=True:  {survives(PATHSET, True)}/8")
+    print("    PATHSET was unblocked by #83 and is now what main runs: the")
+    print("    post-PAKE promotion keeps the WebRTC link serving and hands over")
+    print("    to direct QUIC at a frame boundary (CONTRACT.md, path-promote).")
     if not (survives(PATHSET, False) < survives(EAGER, False)):
         print("      !! PATHSET was not worse under ctrl_carries=False; T4 is wrong.")
         ok = False

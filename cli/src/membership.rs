@@ -258,6 +258,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         direct_pending: HashMap::new(),
         webrtc_only: std::collections::HashSet::new(),
         buffered_offers: HashMap::new(),
+        promotions: HashMap::new(),
         resil: ResilienceState {
             stall_repairs: HashMap::new(),
             relay_committed: std::collections::HashSet::new(),

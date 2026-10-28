@@ -99,6 +99,11 @@
 #                              allocates a real code and delivers bytes to the
 #                              normal CLI receiver; the CLI inbox matches and
 #                              the library summary reports the delivery
+#   promote-mbb-gates.sh       a code transfer starts on the WebRTC link the
+#                              ceremony authenticated instead of waiting for
+#                              direct QUIC, moves to QUIC mid-file at a frame
+#                              boundary when it comes up, and stays on WebRTC
+#                              with no stall when it never does; byte-identical
 #
 # mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
 # 6 PASS / 2 FAIL -- every mutation through the mount (create/write, mkdir,
@@ -158,6 +163,7 @@ on:
       - 'cli/tests/dashboard-gates.sh'
       - 'cli/tests/demo-gates.sh'
       - 'cli/tests/pair-bystander-gates.sh'
+      - 'cli/tests/promote-mbb-gates.sh'
       - 'cli/tests/pair-bystander.js'
       - 'backend/**'
       - '.github/workflows/gate-suite.yml'
@@ -306,6 +312,9 @@ jobs:
             [cli/tests/demo-gates.sh]=6
             # 3: P1 P2 P3 (fix/pair-ceremony-bystander: a bystander in the room links first).
             [cli/tests/pair-bystander-gates.sh]=3
+            # 4: M1 M2 M3 M4 (fix/direct-promote-make-before-break: the code
+            # transfer starts on the authenticated WebRTC link, not after QUIC).
+            [cli/tests/promote-mbb-gates.sh]=4
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
@@ -349,7 +358,8 @@ jobs:
                    cli/tests/core-send-e2e-gates.sh \
                    cli/tests/dashboard-gates.sh \
                    cli/tests/demo-gates.sh \
-                   cli/tests/pair-bystander-gates.sh; do
+                   cli/tests/pair-bystander-gates.sh \
+                   cli/tests/promote-mbb-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare
