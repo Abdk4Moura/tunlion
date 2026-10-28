@@ -302,7 +302,12 @@ async function picker(observer, { hold, freezeS }) {
   await readyOn(observer.page, name);
   if (hold) await onPolling(tag, p);
   await sleep(3000);
-  const pcs0 = await observer.page.evaluate(() => ({ ...window.__fd.pcs }));
+  // The phone's own socket, so relay events of other (earlier, closed) pages
+  // are not counted against it; and the observer's link to it, tagged, so a
+  // torn-down and rebuilt link is told from the same one.
+  const bSid = await p.page.evaluate(() => window.__tunlionTestSocket().id);
+  const tagged = await observer.page.evaluate((sid) => { const l = window.__tunlionTestLinks && window.__tunlionTestLinks.get(sid); if (!l) return false; l.__plTag = 'phone'; return true; }, bSid);
+  if (!tagged) fail(`${tag}: the observer holds no link to the phone's sid ${bSid}`);
   const before = telEvents().length;
   const chooser = await pickFile(observer, p.page, observer.name);
   // The picker is up: the tab goes to the background and is frozen.
@@ -331,23 +336,29 @@ async function picker(observer, { hold, freezeS }) {
   const sendMs = await sendAndReceive(observer, p, await chooser, `pick-${freezeS}.bin`);
   for (let i = 0; i < 10; i++) { await sample(); await sleep(100); }
   if (gapStart != null) longest = Math.max(longest, Date.now() - gapStart);
-  const ev = telEvents().slice(before).map((e) => e.ev);
+  const ev = telEvents().slice(before).filter((e) => e.sid === bSid).map((e) => e.ev);
   const count = (x) => ev.filter((e) => e === x).length;
-  const pcs1 = await observer.page.evaluate(() => ({ ...window.__fd.pcs }));
+  const link = await observer.page.evaluate((sid) => {
+    const m = window.__tunlionTestLinks; if (!m) return { kept: false };
+    const l = m.get(sid);
+    const same = !!(l && l.__plTag === 'phone');
+    return { kept: same, state: l && l.pc ? l.pc.connectionState : null };
+  }, bSid);
+  const sidAfter = await p.page.evaluate(() => window.__tunlionTestSocket().id);
   const fd = await p.page.evaluate(() => window.__fd);
   const r = {
     freezeS, transport: hold ? 'polling' : 'websocket', gaps, longestGapMs: longest,
     pollLapsed: count('poll-lapsed'), disconnects: count('disconnect'), away: count('poll-away'),
-    observerPcClosed: pcs1.closed - pcs0.closed, observerPcMade: pcs1.made - pcs0.made, observerPcFailed: pcs1.failed - pcs0.failed,
+    sameSid: sidAfter === bSid, linkKept: link.kept, linkState: link.state,
     departures: p.departures.slice(), wsLeaves: fd.leaves || 0, sendMs,
   };
   results[tag] = r;
-  console.log(`[polling-liveness] ${tag}: tile gaps ${gaps} (longest ${longest} ms); relay poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects}, away ${r.away}; observer pc closed ${r.observerPcClosed} made ${r.observerPcMade} failed ${r.observerPcFailed}; departures [${r.departures.join(', ')}] ws leave ${r.wsLeaves}; send ${sendMs == null ? 'FAILED' : sendMs + ' ms'}`);
+  console.log(`[polling-liveness] ${tag}: tile gaps ${gaps} (longest ${longest} ms); relay for its sid: poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects}, away ${r.away}; same sid ${r.sameSid}; observer link kept ${r.linkKept} (${r.linkState}); departures [${r.departures.join(', ')}] ws leave ${r.wsLeaves}; send ${sendMs == null ? 'FAILED' : sendMs + ' ms'}`);
   if (r.departures.length || r.wsLeaves) failures.push(`${tag}: opening the file picker sent a departure (${r.departures.join(', ')}${r.wsLeaves ? ' ws leave x' + r.wsLeaves : ''})`);
   if (sendMs == null) failures.push(`${tag}: the picked file never reached the other peer`);
   // Inside the ping timeout a frozen page must ride it out, as it did before
   // the polling liveness rule.
-  if (freezeS <= 50 && (gaps || r.pollLapsed || r.disconnects)) failures.push(`${tag}: a page frozen behind a file picker for ${freezeS} s was dropped (gaps ${gaps}, poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects})`);
+  if (freezeS <= 50 && (gaps || r.pollLapsed || r.disconnects || !r.sameSid || !r.linkKept)) failures.push(`${tag}: a page frozen behind a file picker for ${freezeS} s was dropped (gaps ${gaps}, poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects}, same sid ${r.sameSid}, link kept ${r.linkKept})`);
   else if (freezeS <= 50) ok(`${tag}: a page frozen ${freezeS} s behind the picker stayed, and its file arrived in ${sendMs} ms`);
   await p.ctx.close();
 }
@@ -361,6 +372,7 @@ async function killedReopen(observer, { hold }) {
   const name = await deviceName(p.page);
   if ((await waitTile(observer.page, name, true, 20000)) == null) fail(`${tag}: the observer never saw ${name}`);
   await sleep(3000);
+  const oldSid = await p.page.evaluate(() => window.__tunlionTestSocket().id);
   const before = telEvents().length;
   const crashed = new Promise((r) => p.page.once('crash', () => r(true)));
   (await p.ctx.newCDPSession(p.page)).send('Page.crash').catch(() => {});
@@ -377,10 +389,10 @@ async function killedReopen(observer, { hold }) {
   const sendMs = await sendAndReceive(observer, { page: page2 }, chooser, 'reopen.bin');
   await sleep(1500);
   const rows = await tilesFor(observer.page, name);
-  const ev = telEvents().slice(before).map((e) => e.ev);
+  const ev = telEvents().slice(before).filter((e) => e.sid === oldSid).map((e) => e.ev);
   const r = { sameName: name2 === name, readyAgainMs: back, observerRowsAfter: rows, observerRowsAtReady: ghost, pollLapsed: ev.filter((e) => e === 'poll-lapsed').length, disconnects: ev.filter((e) => e === 'disconnect').length, sendMs };
   results[tag] = r;
-  console.log(`[polling-liveness] ${tag}: same name ${r.sameName}; ready again ${back} ms after the kill; observer rows for it ${rows}; relay poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects}; send ${sendMs == null ? 'FAILED' : sendMs + ' ms'}`);
+  console.log(`[polling-liveness] ${tag}: same name ${r.sameName}; ready again ${back} ms after the kill; observer rows for it ${rows}; relay for the old sid: poll-lapsed ${r.pollLapsed}, disconnect ${r.disconnects}; send ${sendMs == null ? 'FAILED' : sendMs + ' ms'}`);
   if (sendMs == null) failures.push(`${tag}: the restored page could not send`);
   else if (rows !== 1) failures.push(`${tag}: the observer shows ${rows} rows for the restored device`);
   else ok(`${tag}: the restored page took over and sent in ${sendMs} ms`);

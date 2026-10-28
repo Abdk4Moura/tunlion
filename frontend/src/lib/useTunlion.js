@@ -627,7 +627,7 @@ export function useTunlion() {
           const s = sigRef.current?.socket
           const e = s?.io?.engine
           const t = e?.transport
-          return { connected: !!s?.connected, suspended: !!sigRef.current?.suspended, engine: e?.readyState, transport: t?.name, tstate: t?.readyState, polling: t?._polling, writable: t?.writable, buffered: e?.writeBuffer?.length }
+          return { id: s?.id, connected: !!s?.connected, suspended: !!sigRef.current?.suspended, engine: e?.readyState, transport: t?.name, tstate: t?.readyState, polling: t?._polling, writable: t?.writable, buffered: e?.writeBuffer?.length }
         }
       }
     } catch {}

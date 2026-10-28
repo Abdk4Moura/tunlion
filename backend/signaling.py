@@ -901,7 +901,7 @@ class PollWatch:
             self._polls.pop(sid, None)
 
 
-def poll_check(eio, watch, hold, grace):
+def poll_check(eio, watch, hold, grace, sio_sid=None):
     """One pass of the polling liveness rule over every recorded socket.
 
     Returns the engine.io sids it closed. Pure over (eio.sockets, watch), so a
@@ -933,7 +933,13 @@ def poll_check(eio, watch, hold, grace):
                 # timeout still ends it if it never comes back.
                 continue
             watch.forget(eio_sid)
-            _tel("poll-lapsed", eio=eio_sid[:8], idle=round(age, 1))
+            sid = None
+            if sio_sid is not None:
+                try:
+                    sid = sio_sid(eio_sid)
+                except Exception:
+                    sid = None
+            _tel("poll-lapsed", sid=sid, eio=eio_sid[:8], idle=round(age, 1))
             reason = getattr(getattr(eio, "reason", None), "TRANSPORT_CLOSE", None)
             # abort=True: no CLOSE packet to a client that is not there. The
             # disconnect handler runs as for a ping timeout (peer-left etc.).
@@ -1059,7 +1065,8 @@ def register(socketio, registry, poll_watch=None):
             while True:
                 socketio.sleep(poll_tick)
                 try:
-                    poll_check(socketio.server.eio, poll_watch, poll_hold, poll_grace)
+                    poll_check(socketio.server.eio, poll_watch, poll_hold, poll_grace,
+                               lambda e: socketio.server.manager.sid_from_eio_sid(e, "/"))
                 except Exception:
                     pass
 
