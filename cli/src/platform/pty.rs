@@ -118,6 +118,26 @@ pub fn spawn_shell(argv: &[String], cols: u16, rows: u16, term: &str) -> Result<
         for a in &argv[1..] {
             cmd.arg(a);
         }
+        // Like sshd: the account's default environment and identity, never
+        // the daemon's process environment; the login shell's profile files
+        // build the rest. (`runuser -l` for --shell-user resets it again for
+        // the target account.)
+        let daemon: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let user = crate::platform::Paths::exec_user_context(None)?;
+        let env = filament_peerloop::shell::user_env::child_env(
+            false,
+            &user,
+            false,
+            crate::platform::account_environment(),
+            &daemon,
+            &[],
+        )?;
+        cmd.env_clear();
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         cmd.env("TERM", term);
         // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
         // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders

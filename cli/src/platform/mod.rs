@@ -353,15 +353,46 @@ impl Paths {
         }
     }
 
+    /// The shell a terminal on this machine would open for this account.
+    ///
+    /// Unix: the login shell the password database records (what sshd
+    /// runs), then `$SHELL`, then bash, then sh.
+    ///
+    /// Windows, mirroring OpenSSH for Windows: the machine's configured
+    /// `HKLM\SOFTWARE\OpenSSH` `DefaultShell` when it names an existing
+    /// program, else PowerShell 7 (`pwsh`) when installed, else Windows
+    /// PowerShell, else cmd. An explicit `--shell-program`, `TUNLION_SHELL`
+    /// or `tunlion set shell-program` comes before all of this.
     fn default_shell() -> String {
         #[cfg(unix)]
         {
-            std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
-                if Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
-            })
+            passwd_user_context(None)
+                .and_then(|u| u.shell)
+                .filter(|s| !s.is_empty() && Path::new(s).exists())
+                .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| {
+                    if Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
+                })
         }
         #[cfg(windows)]
         {
+            if let Some(configured) = openssh_default_shell() {
+                return configured;
+            }
+            let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+            let pwsh = Path::new(&program_files).join(r"PowerShell\7\pwsh.exe");
+            if pwsh.exists() {
+                return pwsh.to_string_lossy().into_owned();
+            }
+            let account = account_environment().unwrap_or_default();
+            if let Some(path) = filament_peerloop::shell::user_env::path_of(&account) {
+                if let Some(found) = std::env::split_paths(path)
+                    .map(|d| d.join("pwsh.exe"))
+                    .find(|p| p.is_file())
+                {
+                    return found.to_string_lossy().into_owned();
+                }
+            }
             if Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
                 "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into()
             } else if Path::new("C:\\Windows\\System32\\cmd.exe").exists() {
@@ -375,6 +406,35 @@ impl Paths {
             "/bin/sh".into()
         }
     }
+}
+
+/// OpenSSH for Windows' `DefaultShell` (`HKLM\SOFTWARE\OpenSSH`), when the
+/// machine sets one that exists: the owner already chose what a remote
+/// terminal opens here.
+#[cfg(windows)]
+fn openssh_default_shell() -> Option<String> {
+    let out = command("reg")
+        .args(["query", r"HKLM\SOFTWARE\OpenSSH", "/v", "DefaultShell"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_reg_sz(&String::from_utf8_lossy(&out.stdout), "DefaultShell")
+        .filter(|p| Path::new(p).is_file())
+}
+
+/// The data of `name` in `reg query` output (`    name    REG_SZ    data`).
+#[allow(dead_code)] // Windows only, tested everywhere
+pub fn parse_reg_sz(text: &str, name: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let l = l.trim();
+        let rest = l.strip_prefix(name)?.trim_start();
+        let rest = rest
+            .strip_prefix("REG_EXPAND_SZ")
+            .or_else(|| rest.strip_prefix("REG_SZ"))?;
+        Some(rest.trim().to_string()).filter(|s| !s.is_empty())
+    })
 }
 
 /// The home directory the password database records for this effective uid.
@@ -2255,6 +2315,15 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
 /// /proc on either). The arms must ship together; a missing variant makes
 /// `daemon_alive` constant-false on that platform, which is the #204 bug this
 /// predicate exists to close for good.
+/// The OS default environment for a new process of this account, read
+/// fresh now: Windows' `CreateEnvironmentBlock` on this process's token
+/// (refused for a service account), the pam_env defaults on Unix. A served
+/// exec or shell is built on it, never on this process's own environment
+/// (`filament_peerloop::shell::user_env`).
+pub fn account_environment() -> std::result::Result<Vec<(String, String)>, String> {
+    filament_peerloop::shell::user_env::os_account_environment()
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
@@ -2861,6 +2930,18 @@ mod tests {
         // Same tool as the PTY drop: one mechanism, not two.
         let (pty, _) = Paths::shell_argv(Some("bash"), None, Some("nobody"));
         assert_eq!(pty[0], argv[0]);
+    }
+
+    /// OpenSSH's `DefaultShell` as `reg query` prints it.
+    #[test]
+    fn reg_query_output_names_the_default_shell() {
+        let out = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\OpenSSH\r\n    DefaultShell    REG_SZ    C:\\Program Files\\PowerShell\\7\\pwsh.exe\r\n\r\n";
+        assert_eq!(
+            parse_reg_sz(out, "DefaultShell").as_deref(),
+            Some(r"C:\Program Files\PowerShell\7\pwsh.exe")
+        );
+        assert_eq!(parse_reg_sz(out, "DefaultShellCommandOption"), None);
+        assert_eq!(parse_reg_sz("    DefaultShell    REG_SZ    \r\n", "DefaultShell"), None);
     }
 
     #[cfg(unix)]

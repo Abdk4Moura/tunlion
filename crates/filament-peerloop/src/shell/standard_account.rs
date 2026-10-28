@@ -42,7 +42,9 @@ impl StandardLocalExecProcess {
 }
 impl ExecProcess for StandardLocalExecProcess {
     fn resolve_program(&self,program:&str)->Option<PathBuf>{self.inner.resolve_program(program)}
+    fn resolve_program_on(&self,program:&str,path:&str)->Option<PathBuf>{self.inner.resolve_program_on(program,path)}
     fn daemon_environment(&self)->Vec<(String,String)>{self.inner.daemon_environment()}
+    fn account_environment(&self)->Result<Vec<(String,String)>,String>{self.inner.account_environment()}
     fn user_context(&self,user:Option<&str>)->Result<ExecUserContext,String>{
         if user.is_some(){return Err("standard local account backend does not perform account switching".into());}
         self.revalidate().map_err(|e|e.to_string())

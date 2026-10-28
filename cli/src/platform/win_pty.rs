@@ -798,6 +798,30 @@ pub fn relay(cols: u16, rows: u16, resize: &str, argv: &[String]) -> Result<()> 
     for arg in &argv[1..] {
         cmd.arg(arg);
     }
+    // The same environment a served `exec` gets: the account's own default,
+    // read now (fresh PATH, the user's variables), plus only the session's
+    // terminal facts and the config dir from this relay's inherited (daemon)
+    // environment. portable-pty's default was the relay's whole inherited
+    // environment with the registry merged over it, which handed the shell
+    // every variable the daemon was started with. No account block (a
+    // service-account daemon) refuses, as exec does.
+    let inherited: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let user = super::Paths::exec_user_context(None).map_err(|e| anyhow!(e))?;
+    let env = filament_peerloop::shell::user_env::child_env(
+        true,
+        &user,
+        false,
+        super::account_environment(),
+        &inherited,
+        &[],
+    )
+    .map_err(|e| anyhow!(e))?;
+    cmd.env_clear();
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     // The relay is the child of the daemon, whose working directory is not

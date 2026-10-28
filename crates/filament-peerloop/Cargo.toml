@@ -139,6 +139,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_System_IO",
     "Win32_System_Console",
+    # A served exec or shell starts from the account's own environment block
+    # (shell::user_env::os_account_environment).
+    "Win32_System_Environment",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

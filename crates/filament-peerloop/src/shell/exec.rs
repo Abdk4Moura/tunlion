@@ -118,14 +118,35 @@ pub struct ExecUserContext {
 /// capacity rules, heartbeat and revocation cancellation) stays in
 /// `super::exec_server`. Implementations must not run a second serve loop.
 pub trait ExecProcess: Send + Sync {
-    /// Resolve `argv[0]` the way the daemon's own PATH would. Absolute or
-    /// relative paths containing a separator are returned as-is; a bare name
-    /// is looked up. `None` refuses before any fork.
+    /// Resolve `argv[0]` on the PATH the child will run with: the account's
+    /// default environment (`account_environment`), not the daemon's own
+    /// PATH. Absolute or relative paths containing a separator are returned
+    /// as-is; a bare name is looked up. `None` refuses before any fork.
     fn resolve_program(&self, program: &str) -> Option<PathBuf>;
 
-    /// The daemon's own environment as string pairs. The library applies the
-    /// allowlist; this method supplies the ambient fact.
+    /// Resolve `argv[0]` on an explicit `--env PATH=...` the initiator sent,
+    /// which the child runs with instead of the account's (as `PATH=... cmd`
+    /// over ssh would). Hosts that cannot search a given PATH keep
+    /// `resolve_program`.
+    fn resolve_program_on(&self, program: &str, path: &str) -> Option<PathBuf> {
+        let _ = path;
+        self.resolve_program(program)
+    }
+
+    /// The daemon's own environment as string pairs. Only the session's
+    /// terminal facts and the config dir are taken from it
+    /// (`shell::user_env`); it is never the child's base.
     fn daemon_environment(&self) -> Vec<(String, String)>;
+
+    /// The OS default environment for a new process of the daemon's account,
+    /// read fresh now (Windows: `CreateEnvironmentBlock` on the daemon's
+    /// token without inheriting the daemon's block; Unix: the pam_env
+    /// defaults). `Err` names why there is none (a service account, an API
+    /// failure): Windows then refuses the spawn, Unix keeps only the passwd
+    /// identity and a standard PATH. See `shell::user_env`.
+    fn account_environment(&self) -> Result<Vec<(String, String)>, String> {
+        Err("this host does not read the account environment".into())
+    }
 
     /// Resolve the account this exec runs as (`None` = the daemon user,
     /// `Some` = `--shell-user`). `Err` refuses the exec before any fork; it

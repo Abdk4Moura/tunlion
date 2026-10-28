@@ -146,9 +146,9 @@ pub(crate) fn kill_leftover_groups() -> usize {
     0
 }
 
-/// Resolve `program` the way the DAEMON would: an absolute or relative path
+/// Resolve `program` the way the CHILD would: an absolute or relative path
 /// (anything containing a separator) is used as-is; a bare name is looked up
-/// in the daemon process's own PATH. Returns None when unresolvable, so the
+/// on the account's default PATH (`platform::account_environment`). Returns None when unresolvable, so the
 /// caller refuses instead of spawning something surprising. Runs BEFORE the
 /// child env is cleared, which removes PATH from the child's environment.
 #[cfg(feature = "exec-server")]
@@ -159,8 +159,26 @@ pub(crate) fn resolve_in_path(program: &str) -> Option<PathBuf> {
     if program.contains('/') || program.contains('\\') {
         return Some(PathBuf::from(program));
     }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    // The PATH the child will run with: the account's default as it is NOW
+    // (a tool installed or a PATH edit made after the daemon started is
+    // found), never the daemon's own start-time PATH.
+    let account = crate::platform::account_environment().unwrap_or_default();
+    let path = filament_peerloop::shell::user_env::path_of(&account)
+        .map(str::to_string)
+        .unwrap_or_else(|| filament_peerloop::shell::user_env::UNIX_DEFAULT_PATH.to_string());
+    resolve_on(program, &path)
+}
+
+/// Resolve a bare `program` on `path` (an explicit `--env PATH`, or the
+/// account default above).
+pub(crate) fn resolve_on(program: &str, path: &str) -> Option<PathBuf> {
+    if program.is_empty() {
+        return None;
+    }
+    if program.contains('/') || program.contains('\\') {
+        return Some(PathBuf::from(program));
+    }
+    for dir in std::env::split_paths(path) {
         if let Some(p) = resolve_bare_in(&dir, program) {
             return Some(p);
         }
@@ -238,6 +256,14 @@ impl ExecProcess for CliExecProcess {
         std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
             .collect()
+    }
+
+    fn resolve_program_on(&self, program: &str, path: &str) -> Option<PathBuf> {
+        resolve_on(program, path)
+    }
+
+    fn account_environment(&self) -> Result<Vec<(String, String)>, String> {
+        crate::platform::account_environment()
     }
 
     fn user_context(&self, user: Option<&str>) -> Result<ExecUserContext, String> {

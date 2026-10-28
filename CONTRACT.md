@@ -701,33 +701,35 @@ stream kinds are refused, never misinterpreted.
   the daemon account's home otherwise, with `/` as the documented fallback
   when a dropped account's passwd home is not a directory.
   `env` carries ONLY explicit `--env KEY=VALUE` pairs on the wire. The receiver
-  builds a user-like, non-secret baseline locally and never sends it:
-  - Unix: `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TERM`, `LANG`/`LC_*`,
-    `TMPDIR`, and `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_DATA_HOME`/
-    `XDG_STATE_HOME` (plus `XDG_RUNTIME_DIR` when the target account's runtime
-    directory exists).
-  - Windows: `SystemRoot`, `WINDIR`, `SYSTEMDRIVE`, `PATH`, `PATHEXT`,
-    `COMSPEC`, `TEMP`/`TMP`, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`, `APPDATA`,
-    `LOCALAPPDATA`, `PROGRAMDATA`, `PROGRAMFILES`, `PROGRAMFILES(X86)`,
-    `COMMONPROGRAMFILES`, `COMMONPROGRAMFILES(X86)`, `PSModulePath`,
-    `USERNAME`, `USERDOMAIN`, `COMPUTERNAME`,
-    `PROCESSOR_ARCHITECTURE`, and the locale/terminal facts `TERM`, `LANG`,
-    `LC_*`.
-  On both platforms `PATH` is the DAEMON'S executable-search path, not a
-  login-shell-resolved PATH for the target account (a login shell would require
-  re-parsing the command and would lose argv exactness). Explicit
-  `--env PATH=...` overrides it.
-  On Unix, `--shell-user` identity and home/shell values come from the password
-  database, not the daemon's environment. On Windows, `--shell-user` is
-  refused because deriving another account's profile requires its token
-  environment (`CreateEnvironmentBlock`) or credentials; the daemon's profile
-  is never copied to a target account. Names are case-insensitive and
-  de-duplicated on Windows. Explicit `--env` pairs win.
-  This is a user-like baseline, NOT a copy of the owner's secret environment.
-  Never inherited by default: `SSH_AUTH_SOCK`, cloud/provider tokens, proxy
-  credentials, `DBUS_SESSION_BUS_ADDRESS`, `NODE_OPTIONS`, and other variables
-  that can carry a secret or change how a command resolves. `--env` is the
-  explicit opt-in. Nothing from either side's environment otherwise crosses
+  starts the child from the account's OWN default environment, the one the OS
+  gives a new process of that account (as sshd does), never from the daemon's
+  process environment, and never sends it:
+  - Windows: the account's environment block (`CreateEnvironmentBlock` on the
+    daemon's token, not inheriting the daemon's block), read per spawn, so
+    PATH and user variables are current. With none (the daemon runs as
+    SYSTEM, LocalService or NetworkService, or the call failed) the exec is
+    refused; that account's profile is never handed out.
+  - Unix: the system defaults pam_env gives an ssh session
+    (`/etc/environment`, `/etc/default/locale`), then `HOME`, `USER`,
+    `LOGNAME`, `SHELL` from the password database for the account the child
+    runs as, and `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+    when the system sets no PATH.
+  Layered on top, and nothing else from the daemon: `TERM`/`COLORTERM`, the
+  daemon's `TUNLION_CONFIG_DIR` for a same-account child, and the explicit
+  `--env` pairs, which win. `argv[0]` resolves on the child's PATH (an explicit
+  `--env PATH` when sent, else the account default). An interactive `pty-open`
+  shell gets the same environment and is the account's login shell (Unix: the
+  passwd shell with `-l`; Windows: OpenSSH's `DefaultShell` when configured,
+  else `pwsh`, else Windows PowerShell, profiles loaded), so the account's
+  profile files build the rest. On Unix, `--shell-user` identity values come
+  from the password database. On Windows, `--shell-user` is refused because
+  deriving another account's environment requires its token. Names are
+  case-insensitive and de-duplicated on Windows.
+  Secrets the daemon was started with (`TUNLION_AUTHKEY`, proxy credentials,
+  `SSH_AUTH_SOCK`, tokens) cannot reach the child by construction: it reaches
+  the child only if the account's own default environment defines it.
+  `--env` is the explicit opt-in. Nothing from either side's environment
+  otherwise crosses
   the link. `tty` requests a pty instead of pipes.
 - `exec-open-ack` `{ type: "exec-open-ack", sid, out, err }` -- the
   receiver's acceptance: `out` (== `sid`) names the stdout stream, `err`

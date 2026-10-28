@@ -18,6 +18,7 @@
 pub mod admit;
 pub mod exec;
 pub mod standard_account;
+pub mod user_env;
 #[cfg(feature = "exec-server")]
 pub mod exec_server;
 pub mod off;
