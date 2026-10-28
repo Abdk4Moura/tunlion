@@ -49,19 +49,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      # Restore and save explicitly: the cache is saved right after the
+      # build, so a failed acceptance still leaves a warm target behind.
+      - uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target
-          key: native-overlay-linux-${{ hashFiles('Cargo.lock') }}
+          key: native-overlay-linux-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: native-overlay-linux-
       - name: Build the CLI (debug)
         run: |
           cargo build --locked -p filament-cli --bin tunlion
           ./target/debug/tunlion --version
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: native-overlay-linux-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
       - name: Owner, kernel L3 daemon, HTTP server, invitation
         run: bash scripts/native-overlay-linux-peer.sh start "$PWD/target/debug/tunlion" "$RUNNER_TEMP/peer"
       - name: Publish the one-claim invitation for the Windows job
@@ -100,14 +110,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - uses: actions/cache@v4
+      # Restore and save explicitly: the cache is saved right after the
+      # build, so a failed acceptance still leaves a warm target behind.
+      - uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target
-          key: native-overlay-windows-${{ hashFiles('Cargo.lock') }}
+          key: native-overlay-windows-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: native-overlay-windows-
       - name: Build the CLI (debug) at this commit
         shell: pwsh
@@ -116,6 +128,14 @@ jobs:
           $env:TUNLION_BUILD_SHA = "${{ github.sha }}".Substring(0,7)
           cargo build --locked -p filament-cli --bin tunlion
           if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: native-overlay-windows-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
       - name: Native overlay acceptance (released -> this build, restart, teardown)
         shell: pwsh
         env:

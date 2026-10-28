@@ -41,7 +41,8 @@ for _ in $(seq 1 90); do
 done
 printf '%s\n' "$j" > "$EV/addr-json.txt"
 [ -n "$ready" ] || die "kernel L3 never became ready: $j"
-V4=$(T addr --v4 2>/dev/null | tr -d '[:space:]'); V6=$(T addr 2>/dev/null | tr -d '[:space:]')
+V4=$(printf '%s' "$j" | python3 -c 'import json,sys; print(json.load(sys.stdin)["overlayV4"])')
+V6=$(printf '%s' "$j" | python3 -c 'import json,sys; print(json.load(sys.stdin)["overlayV6"])')
 [ -n "$V4" ] && [ -n "$V6" ] || die "no overlay addresses (v4='$V4' v6='$V6')"
 log "overlay v4=$V4 v6=$V6"
 ip -4 addr show dev tunlion0 >>"$EV/peer.log" 2>&1; ip -6 addr show dev tunlion0 >>"$EV/peer.log" 2>&1
