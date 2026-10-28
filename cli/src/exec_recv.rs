@@ -174,6 +174,7 @@ pub(crate) fn resolve_in_path(program: &str) -> Option<PathBuf> {
 
 /// Resolve a bare `program` on `path` (an explicit `--env PATH`, or the
 /// account default above).
+#[cfg(feature = "exec-server")]
 pub(crate) fn resolve_on(program: &str, path: &str) -> Option<PathBuf> {
     if program.is_empty() {
         return None;

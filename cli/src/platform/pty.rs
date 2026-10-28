@@ -30,6 +30,7 @@ mod android {
         }
         pub fn arg<S: AsRef<OsStr>>(&mut self, _arg: S) {}
         pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, _key: K, _val: V) {}
+        pub fn env_clear(&mut self) {}
         pub fn cwd<D: AsRef<OsStr>>(&mut self, _dir: D) {}
     }
 
