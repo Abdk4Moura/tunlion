@@ -236,7 +236,8 @@ pub fn gather_shell_gate_inputs(
     let (denied, policy_allows, store_allows) = match dev.as_deref() {
         Some(n) => (
             host.device_capability_denied(n, action),
-            pair_trusted && shell_policy.auto_allows(n),
+            policy_trusted(pair_trusted, fleet_proven, n, host.as_ref())
+                && shell_policy.auto_allows(n),
             host.device_allows(n, action),
         ),
         None => (false, false, false),
@@ -267,6 +268,36 @@ pub fn gather_shell_gate_inputs(
         action: action.to_string(),
     };
     (dev, inputs)
+}
+
+/// May the `--shell`/`--shell-only` policy speak for this link's device?
+///
+/// The policy names PAIRED devices, and the reference is the direct dial: a
+/// fresh CLI connection proves the pair secret, so the link is `trusted` and
+/// the policy applies to the record that secret belongs to. The same device
+/// reached over the daemon's warm link may instead be a fleet link, verified
+/// by fleet-hello: its `verified_name` is the record its PROVEN certificate key
+/// resolves to, but it is never pair-`trusted`. Reading pair trust alone made
+/// `up --shell-only dovm` refuse dovm over the warm link while the direct dial
+/// was admitted.
+///
+/// A proven fleet link counts here only when the record it resolves to is a
+/// paired one (it holds a pair secret), which is exactly the record a direct
+/// dial would have proven. A fleet sibling known only through fleet-hello has
+/// no pair secret, so a direct dial could never earn the policy for it, and it
+/// does not earn it here either.
+pub fn policy_trusted(
+    pair_trusted: bool,
+    fleet_proven: bool,
+    name: &str,
+    host: &dyn HostServices,
+) -> bool {
+    pair_trusted
+        || (fleet_proven
+            && host
+                .devices_load()
+                .iter()
+                .any(|(n, secret)| n == name && !secret.is_empty()))
 }
 
 /// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose

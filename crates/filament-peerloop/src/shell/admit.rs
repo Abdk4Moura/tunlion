@@ -369,6 +369,8 @@ mod tests {
         Allow,
         Deny(Option<String>),
         Proven,
+        /// Shadow mode, the default: the legacy fold decides.
+        Legacy,
     }
 
     // The policy site is injected, not reimplemented here: the test host records
@@ -381,6 +383,8 @@ mod tests {
         denied: AtomicBool,
         ceiling_covers: AtomicBool,
         ceiling_for: Mutex<Option<Vec<String>>>,
+        /// `devices_load`: the records holding a pair secret.
+        paired: Mutex<Vec<(String, String)>>,
         enqueues: Mutex<Vec<(String, String)>>,
         gates: Mutex<usize>,
     }
@@ -394,6 +398,7 @@ mod tests {
                 denied: AtomicBool::new(false),
                 ceiling_covers: AtomicBool::new(false),
                 ceiling_for: Mutex::new(None),
+                paired: Mutex::new(Vec::new()),
                 enqueues: Mutex::new(Vec::new()),
                 gates: Mutex::new(0),
             })
@@ -414,7 +419,7 @@ mod tests {
             NoHost.settings_get_str(key)
         }
         fn devices_load(&self) -> Vec<(String, String)> {
-            NoHost.devices_load()
+            self.paired.lock().unwrap().clone()
         }
         fn is_self_uid(&self, a: &str, b: Option<&str>) -> bool {
             NoHost.is_self_uid(a, b)
@@ -472,6 +477,8 @@ mod tests {
                     cap::GateDecision::Allow
                 }
                 Verdict::Proven => cap::GateDecision::Deny { cap_reason: None },
+                Verdict::Legacy if _gate.legacy_allowed => cap::GateDecision::Allow,
+                Verdict::Legacy => cap::GateDecision::Deny { cap_reason: None },
             }
         }
     }
@@ -1133,5 +1140,156 @@ mod tests {
             2,
             "serving-on re-drive gathers a fresh verdict"
         );
+    }
+
+    /// The same device over its two paths. `direct` is a fresh CLI dial: the
+    /// pair secret was proven, so the link is pair-`trusted`. `warm` is the
+    /// daemon's link verified by fleet-hello: Proven by certificate, named from
+    /// that key, never pair-`trusted`.
+    fn as_path(conn: &mut Conn, warm: bool) {
+        let l = conn.links.get_mut(PID).unwrap();
+        if warm {
+            l.trusted = false;
+            l.principal_kind = cap::PrincipalKind::FleetDevice;
+        } else {
+            l.trusted = true;
+            l.principal_kind = cap::PrincipalKind::OwnerDevice;
+        }
+    }
+
+    fn only(names: &[&str]) -> ShellPolicy {
+        ShellPolicy::Only(names.iter().map(|n| n.to_string()).collect())
+    }
+
+    async fn exec_and_pty_admitted(
+        host: &Arc<TestHost>,
+        policy: &ShellPolicy,
+        name: &str,
+        warm: bool,
+        binding: BindingStrength,
+    ) -> (bool, bool) {
+        let t = Arc::new(CaptureTransport::default());
+        let (mut conn, _far) = connection(host.clone(), t, Some(name)).await;
+        as_path(&mut conn, warm);
+        conn.links.get_mut(PID).unwrap().identity_binding = binding;
+        let exec =
+            admit_exec_open(&mut conn, PID, &exec_frame(json!({})), &cfg(policy, true)).await;
+        let pty = admit_pty_open(
+            &mut conn,
+            PID,
+            &pty_frame(json!({})),
+            &cfg(policy, true),
+            || false,
+        )
+        .await;
+        (
+            matches!(exec, ShellAdmission::Admitted { .. }),
+            matches!(pty, ShellAdmission::Admitted { .. }),
+        )
+    }
+
+    /// `up --shell-only dovm` admitted dovm on a direct dial and refused it,
+    /// "shell not granted to 'dovm' here", when the exec rode dovm's warm
+    /// link, because the policy term read pair trust alone and a fleet link
+    /// never has it. The direct decision is the reference.
+    #[tokio::test]
+    async fn shell_only_admits_the_paired_device_on_its_warm_fleet_link() {
+        let host = TestHost::new(Verdict::Legacy);
+        *host.paired.lock().unwrap() = vec![("dovm".into(), "pair-secret".into())];
+        for policy in [only(&["dovm"]), ShellPolicy::All] {
+            let direct =
+                exec_and_pty_admitted(&host, &policy, "dovm", false, BindingStrength::Proven).await;
+            assert_eq!(direct, (true, true), "the reference: direct dial admitted");
+            let warm =
+                exec_and_pty_admitted(&host, &policy, "dovm", true, BindingStrength::Proven).await;
+            assert_eq!(
+                warm, direct,
+                "the warm link decides as the direct dial does"
+            );
+        }
+    }
+
+    /// Never wider than the direct dial: every case the direct path refuses
+    /// (or could never reach) is refused on the fleet link too.
+    #[tokio::test]
+    async fn shell_only_refuses_on_the_fleet_link_what_the_direct_dial_refuses() {
+        // Not listed: refused on both paths.
+        let host = TestHost::new(Verdict::Legacy);
+        *host.paired.lock().unwrap() = vec![("dovm".into(), "pair-secret".into())];
+        let policy = only(&["laptop"]);
+        for warm in [false, true] {
+            let got =
+                exec_and_pty_admitted(&host, &policy, "dovm", warm, BindingStrength::Proven).await;
+            assert_eq!(got, (false, false), "unlisted device, warm={warm}");
+        }
+
+        // A fleet sibling with no pair secret: a direct dial can never prove a
+        // pairing, so neither the scoped nor the blanket policy speaks for it.
+        let host = TestHost::new(Verdict::Legacy);
+        for policy in [only(&["dovm"]), ShellPolicy::All] {
+            let got =
+                exec_and_pty_admitted(&host, &policy, "dovm", true, BindingStrength::Proven).await;
+            assert_eq!(got, (false, false), "unpaired sibling, {}", policy.label());
+        }
+
+        // The paired record is a DIFFERENT device than the one the fleet
+        // certificate resolved to.
+        let host = TestHost::new(Verdict::Legacy);
+        *host.paired.lock().unwrap() = vec![("laptop".into(), "pair-secret".into())];
+        let got = exec_and_pty_admitted(
+            &host,
+            &only(&["dovm", "laptop"]),
+            "dovm",
+            true,
+            BindingStrength::Proven,
+        )
+        .await;
+        assert_eq!(
+            got,
+            (false, false),
+            "a pairing of another record does not transfer"
+        );
+
+        // A record whose secret is empty is not a pairing.
+        let host = TestHost::new(Verdict::Legacy);
+        *host.paired.lock().unwrap() = vec![("dovm".into(), String::new())];
+        let got = exec_and_pty_admitted(
+            &host,
+            &only(&["dovm"]),
+            "dovm",
+            true,
+            BindingStrength::Proven,
+        )
+        .await;
+        assert_eq!(got, (false, false), "empty secret");
+
+        // A fleet link whose identity is not Proven is not fleet-proven.
+        let host = TestHost::new(Verdict::Legacy);
+        *host.paired.lock().unwrap() = vec![("dovm".into(), "pair-secret".into())];
+        let got = exec_and_pty_admitted(
+            &host,
+            &only(&["dovm"]),
+            "dovm",
+            true,
+            BindingStrength::Inferred,
+        )
+        .await;
+        assert_eq!(got, (false, false), "inferred binding");
+
+        // An explicit deny still wins on both paths.
+        let host = TestHost::new(Verdict::Legacy);
+        *host.paired.lock().unwrap() = vec![("dovm".into(), "pair-secret".into())];
+        host.denied.store(true, Ordering::Relaxed);
+        for warm in [false, true] {
+            let got = exec_and_pty_admitted(
+                &host,
+                &only(&["dovm"]),
+                "dovm",
+                warm,
+                BindingStrength::Proven,
+            )
+            .await;
+            assert_eq!(got, (false, false), "denied, warm={warm}");
+        }
     }
 }

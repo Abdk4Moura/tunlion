@@ -6402,21 +6402,31 @@ async fn recv_run(
                             continue;
                         }
                     }
-                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    let (trusted, fleet_proven) = conn
+                        .link(&pid)
+                        .map(|l| (l.trusted, l.fleet_proven()))
+                        .unwrap_or((false, false));
                     // Cap lookup keys on the PROVEN petname, not the presence name.
                     let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
                     // Granted if the device was explicitly `grant`ed shell OR an
                     // active `up --shell[-only]` policy auto-allows it. Trust
-                    // (pair-proof) is still required either way.
-                    let legacy_ok = trusted
-                        && dev
-                            .as_deref()
-                            .map(|n| {
-                                !host.device_capability_denied(n, "shell")
-                                    && (shell_policy.auto_allows(n)
-                                        || host.device_allows(n, "shell"))
-                            })
-                            .unwrap_or(false);
+                    // (pair-proof) is still required for the grant; the policy
+                    // also accepts a proven fleet link to the same PAIRED
+                    // record, which is what the direct dial proves (see
+                    // `shell_gate::policy_trusted`).
+                    let legacy_ok = dev
+                        .as_deref()
+                        .map(|n| {
+                            !host.device_capability_denied(n, "shell")
+                                && ((crate::shell_gate::policy_trusted(
+                                    trusted,
+                                    fleet_proven,
+                                    n,
+                                    host.as_ref(),
+                                ) && shell_policy.auto_allows(n))
+                                    || (trusted && host.device_allows(n, "shell")))
+                        })
+                        .unwrap_or(false);
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under TUNLION_CAP_AUTHORITATIVE.
