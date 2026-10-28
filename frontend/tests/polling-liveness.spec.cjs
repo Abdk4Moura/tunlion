@@ -20,6 +20,16 @@
 //                without one gap, and the relay never lapses it.
 //   4. flaps:    three 3 s offline flaps of a polling page; the page must be
 //                back on the other peer within FLAP_BACK_MS of each.
+//   5. picker:   an Android phone (Pixel 7 emulation) opens the file picker:
+//                the tab goes hidden and is frozen (debugger pause, verified
+//                by the request log) for PL_FREEZE seconds (default 30), on
+//                each transport. No session-close, no leave; inside the ping
+//                timeout no tile gap, same sid, same WebRTC link; and the
+//                picked file reaches the other peer afterwards. A naive 7 s
+//                rule drops it (measured: 10 to 120 s freezes all dropped).
+//   6. killed:   the phone's renderer is killed and the same URL reopened in
+//                the same profile (Chrome restoring a discarded tab): one row
+//                on the other peer, and a send works.
 //
 //   node frontend/tests/polling-liveness.spec.cjs   (from the repo root; needs frontend/dist)
 //   PL_ONLY=crash,slow  runs a subset;  PL_OUT=file.json  writes the numbers.

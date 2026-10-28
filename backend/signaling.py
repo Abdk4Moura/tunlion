@@ -807,6 +807,11 @@ class PollWatch:
     answers a GET that has been held HOLD seconds with a NOOP packet: a live
     client re-polls within one round trip, a dead one never does.
 
+    A page that is hidden on purpose (Android's file picker backgrounds and
+    may freeze the tab) says so with an `away` event; that socket alone then
+    gets FIL_POLL_AWAY_S instead of GRACE, so the ping timeout decides for it
+    as it did before this rule.
+
     Independent of the ping timeout, which stays long for slow and backgrounded
     clients. Only polling GETs are recorded (an upgraded socket is forgotten),
     so websocket clients are untouched.

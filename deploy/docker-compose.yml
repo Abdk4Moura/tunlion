@@ -50,7 +50,9 @@ services:
       # (it used to be interval + timeout, about 85 s): signaling.PollWatch
       # closes a polling socket that has had no GET for FIL_POLL_GRACE_S
       # (default 7 s), answering a GET held FIL_POLL_HOLD_S (default 2 s) with
-      # a NOOP so a live client re-polls. Websocket deaths end on TCP close.
+      # a NOOP so a live client re-polls. A page that says it is hidden (a
+      # file picker) gets FIL_POLL_AWAY_S (180 s) instead, so the ping timeout
+      # rules it as before. Websocket deaths end on TCP close.
       FIL_PING_TIMEOUT: "60"
       FIL_PING_INTERVAL: "25"
       # The api is reachable ONLY through cloudflared (expose, not ports), so

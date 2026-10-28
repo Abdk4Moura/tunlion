@@ -345,14 +345,40 @@ rule off.
 other peer in 8.1 to 8.9 s over 12 runs (84 s and 114 s on the old relay). A
 polling page at 20x CPU throttling, hidden, never drops: 60 s at 2.5 s added
 latency, and 30 s each at 4, 5, 6 and 8 s. Three 3 s offline flaps never
-remove the tile (the reconnect supersedes by uid). The rule trades one
-thing: a polling client whose next GET takes longer than the grace to reach the
-relay (round trips over about 7 s, or a tab the OS has frozen) is closed and
-reconnects, where before it rode out up to 85 s. A frozen tab was already
-dropped by the ping timeout; it now goes sooner and rejoins on resume.
+remove the tile (the reconnect supersedes by uid).
 
-*Files:* `backend/signaling.py` (`PollWatch`, `poll_check`, the poll loop in
-`register`), `backend/app.py`.
+**A frozen page is not a dead one.** On Android, choosing a file opens the
+system picker; the tab goes to the background and the OS may freeze it, and a
+frozen page cannot poll. The 7 s rule alone dropped such a page within seconds
+(measured: a 10 s freeze took the tile away for 61 s and the picked file never
+arrived), where the ping timeout had let it ride out up to about 60 s. So the
+page says it is going out of sight: `away {on: true}` on the signaling socket
+at the file-input click (capture phase, while the page still runs) and on
+`visibilitychange` hidden, `away {on: false}` when it is visible again. The
+relay keys the hint by the socket it arrived on (`request.sid`), so it can only
+lengthen that socket's own grace, to `FIL_POLL_AWAY_S` (180 s); inside it the
+ping timeout is again what ends a page that never comes back, exactly as
+before. A visible page that stops polling (a real crash) still drops in about
+8 s. With the hint, a page frozen 10, 30 or 60 s behind the picker keeps its
+tile, its sid and its WebRTC link, and the picked file arrives in under 0.5 s;
+a 120 s freeze is dropped by the ping timeout and rejoins, the same as before
+this rule. Opening the picker sends no session-close and no `leave` on either
+transport.
+
+What is left of the trade: a polling client that is visible and whose next
+GET takes longer than the grace to reach the relay (a round trip over about
+7 s) is closed and reconnects, where before it rode out up to 85 s.
+
+The freeze in the gate is the debugger's pause, not
+`Page.setWebLifecycleState frozen`: Chrome silently ignores that on a page it
+considers visible, and every page in a Playwright browser is one (measured:
+timers and long-polls ran on through the "frozen" state). The gate fails if
+the frozen page sends a long-poll.
+
+*Files:* `backend/signaling.py` (`PollWatch`, `poll_check`, the poll loop and
+the `away` handler in `register`), `backend/app.py`,
+`frontend/src/lib/signaling.js` (`away`), `frontend/src/lib/useTunlion.js`
+(`onVisibility`, `onPickerClick`).
 *Gates:* `backend/tests/test_poll_liveness.py`,
 `frontend/tests/polling-liveness.spec.cjs`.
 
