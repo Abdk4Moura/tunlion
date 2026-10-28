@@ -636,6 +636,17 @@
       ]
     },
     {
+      "path": "cli/tests/turn-stream-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/turn-stream-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "linux-netns"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/warm-hold-idle-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/warm-hold-idle-gates.sh",

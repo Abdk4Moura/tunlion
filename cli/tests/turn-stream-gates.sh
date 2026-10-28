@@ -113,6 +113,9 @@ run_root ip link set "$H_IF" up
 run_root ip -n "$NS" addr add "$NET.2/30" dev "$N_IF"
 run_root ip -n "$NS" link set "$N_IF" up
 run_root ip -n "$NS" route add default via "$NET.1"
+# IPv4 only, so the v4 rules below are the whole firewall: no link-local v6
+# path to the host can carry the UDP this namespace is denied.
+run_root ip netns exec "$NS" sysctl -q -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1
 run_root sysctl -q -w net.ipv4.ip_forward=1
 run_root iptables -I FORWARD 1 -i "$H_IF" -j ACCEPT
 run_root iptables -I FORWARD 1 -o "$H_IF" -j ACCEPT
@@ -147,8 +150,9 @@ firewall() { # mode: tcp | tls443 | open
     nsx iptables -A OUTPUT -p tcp -d "${ep%:*}" --dport "${ep#*:}" -m conntrack --ctstate NEW \
       -m comment --comment "tls:$ep" -j "$verdict"
   done
+  # Count-only (no target): UDP reaching a TURN UDP port, before any drop.
   for ep in $UDP_EPS; do
-    nsx iptables -A OUTPUT -p udp -d "${ep%:*}" --dport "${ep#*:}" -m comment --comment "udpturn:$ep" -j RETURN
+    nsx iptables -A OUTPUT -p udp -d "${ep%:*}" --dport "${ep#*:}" -m comment --comment "udpturn:$ep"
   done
   case "$mode" in
     tcp)    nsx iptables -A OUTPUT -p udp -m comment --comment udpdrop -j DROP ;;
