@@ -273,6 +273,11 @@ export function useTunlion() {
   const pendingPakeRef = useRef(null) // { nameplate, password } awaiting a peer
   const pakeRef = useRef(null) // active PakePairing for the current peer
   const pakePeerRef = useRef(null) // peer sid we run the PAKE with
+  // The last CONFIRMED ceremony, kept to answer its peer's re-sent
+  // confirmation should ours have been lost: { peerId, pairing }.
+  const pakeDoneRef = useRef(null)
+  // Ticks the live ceremony so its current message is re-sent on backoff.
+  const pakeTickRef = useRef(null)
   // A ceremony that never finishes must end in a clear failure, never in a
   // silent "paired" header: the CLI refuses a bad confirmation by leaving, and
   // nothing else would tell the browser.
@@ -796,6 +801,13 @@ export function useTunlion() {
         // pending v2 pairing, route pake-msg/pake-confirm into the PAKE machine
         // (creating the PakePairing on first contact), OUT of the WebRTC path.
         if (data?.type === 'pake-msg' || data?.type === 'pake-confirm') {
+          // A copy from the peer we already confirmed: it re-sends until it
+          // hears our confirmation, so ours was lost. Its ceremony answers.
+          const done = pakeDoneRef.current
+          if (done && done.peerId === from && (data.np == null || data.np === done.pairing.nameplate)) {
+            done.pairing.onSignal(data)
+            return
+          }
           const partner = pakePartnerFor({
             bound: pakeRef.current ? pakePeerRef.current : null,
             from,
@@ -902,6 +914,8 @@ export function useTunlion() {
     return () => {
       cancelled = true
       sessionRef.current?.stop() // clear the 5s loop (HMR/unmount leak otherwise)
+      if (pakeTickRef.current) clearInterval(pakeTickRef.current)
+      pakeTickRef.current = null
       sigRef.current?.leave()
       linksRef.current.forEach((l) => l.close())
       linksRef.current.clear()
@@ -983,6 +997,7 @@ export function useTunlion() {
     }
     if (p.secret) {
       const peerId = pakePeerRef.current
+      pakeDoneRef.current = { peerId, pairing: p }
       const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
       // L1-a EPHEMERAL transfer-auth (receiveWithCode): the SAME ceremony runs,
       // but the agreed secret is DISCARDED, it only authenticated the link
@@ -1029,6 +1044,7 @@ export function useTunlion() {
     const cfg = pendingPakeRef.current
     if (!cfg || !pakeReadyRef.current) return null
     pakePeerRef.current = peerId
+    pakeDoneRef.current = null
     pakeRef.current = new PakePairing({
       nameplate: cfg.nameplate,
       password: cfg.password,
@@ -1036,6 +1052,20 @@ export function useTunlion() {
       sendSignal: (payload) => sigRef.current?.signal(peerId, payload),
       getFingerprints: () => linksRef.current.get(peerId)?.fingerprints() || null,
     })
+    // C30: a lost element or confirmation is re-sent on backoff by the
+    // ceremony; this tick gives it the chance. It stops with the ceremony.
+    if (!pakeTickRef.current) {
+      pakeTickRef.current = setInterval(() => {
+        const p = pakeRef.current
+        if (!p) {
+          clearInterval(pakeTickRef.current)
+          pakeTickRef.current = null
+          return
+        }
+        p.tick()
+        drivePakeRef.current()
+      }, 100)
+    }
     setPairStatus('pairing')
     if (pairTimerRef.current) clearTimeout(pairTimerRef.current)
     pairTimerRef.current = setTimeout(() => {

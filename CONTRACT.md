@@ -355,6 +355,36 @@ Thus "first contact rides WebRTC" is correct for first contact with an unknown
 peer, and is required by the authentication order. It is not a statement that
 every connection or every platform always starts on WebRTC.
 
+### Code ceremony frames (`pake-msg`, `pake-confirm`)
+The SPAKE2 code ceremony rides the opaque `signal` relay, which may lose a
+frame (a relay drop, a socket reconnect mid-ceremony) or deliver one twice. No
+single emit is load-bearing (C30):
+
+- `{ type:"pake-msg", v:2, msg, np, direct? }` carries our 33-byte element.
+  `{ type:"pake-confirm", v:2, mac, msg, caps, scope, np, answer? }` carries the
+  confirmation MAC and ALSO our element (`msg`): a peer whose copy of the
+  element was lost derives K from it instead of refusing a confirmation that
+  arrived before key exchange. A confirmation with no K and no `msg` is still
+  refused.
+- **Re-send.** Each side re-sends its current message (the element until it
+  sends its confirmation, then the confirmation) at 250 ms, 500 ms, 1 s, then
+  every 2 s, until the peer's confirmation verifies or the ceremony is refused.
+  The caller's ceremony budget still bounds the whole exchange.
+- **Same bytes.** Every copy is the same element and the same MAC. One SPAKE2
+  session per ceremony: K comes from the first element received, so a re-sent
+  (or different) element after K changes nothing, and a re-send is never
+  another password guess.
+- **Duplicates.** A confirmation that arrives before this link's DTLS
+  fingerprints are known is dropped unverified (a later copy is checked). After
+  a side has verified the peer's confirmation, a further copy that verifies is
+  answered once with our same confirmation marked `answer:true` (the peer is
+  still waiting for ours); an `answer` is never answered, so two confirmed
+  sides do not ping-pong. A copy that does not verify after confirmation (an
+  old link's) is ignored. Neither is a second attempt: the outcome is fixed by
+  the first verification, and only that one can refuse the ceremony.
+- A receiver that has authenticated its sender keeps that one ceremony to
+  answer re-sends; it still ignores PAKE traffic from every other peer.
+
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or
 pass a custom keyword — collisions are rejected). Say it aloud; the other side

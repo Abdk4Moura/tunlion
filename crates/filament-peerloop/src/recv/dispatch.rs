@@ -4532,8 +4532,25 @@ async fn recv_run(
                     )
                 {
                     // Already authenticated a sender? Ignore stray PAKE traffic
-                    // from anyone else, including a late decoy.
+                    // from anyone else, including a late decoy. The sender itself
+                    // re-sends its confirmation until it hears ours, so a copy
+                    // from it means ours was lost: answer it, change nothing.
                     if recv_pake_done {
+                        let fps = match conn.link(&from) {
+                            Some(l) => match &l.peer {
+                                Some(p) => p.fingerprints().await,
+                                None => None,
+                            },
+                            None => None,
+                        };
+                        let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                        if let Some(cer) = st.recv_cers.get_mut(&from) {
+                            if let PakeInbound::Reply(reply) = cer.on_signal(&data, fp_ref) {
+                                sio.emit("signal", json!({ "to": from, "data": reply }))
+                                    .await
+                                    .ok();
+                            }
+                        }
                         continue;
                     }
                     // A sender of ANOTHER code on the same device shares this
@@ -4604,13 +4621,33 @@ async fn recv_run(
                                 abort_why = why;
                             }
                             PakeInbound::Ignored => {}
+                            PakeInbound::Reply(reply) => {
+                                sio.emit("signal", json!({ "to": from, "data": reply }))
+                                    .await
+                                    .ok();
+                            }
                         }
                     }
                     if let Some(sec) = secret_opt {
-                        // This peer authenticated. Record it as THE sender
+                        // This peer authenticated. Record it as THE sender, and
+                        // keep only its ceremony: it answers the sender's re-sent
+                        // confirmation should ours have been lost.
                         recv_pake_done = true;
-                        st.recv_cers.clear();
+                        st.recv_cers.retain(|pid, _| pid == &from);
                         st.recv_deadlines.clear();
+                        // The progression block stops once a sender is settled, and
+                        // its confirmation can verify here before ours went out.
+                        if let Some((my_fp, their_fp)) = fp_ref {
+                            let ours = st
+                                .recv_cers
+                                .get_mut(&from)
+                                .and_then(|c| c.take_confirm_payload(my_fp, their_fp));
+                            if let Some(data) = ours {
+                                sio.emit("signal", json!({ "to": from, "data": data }))
+                                    .await
+                                    .ok();
+                            }
+                        }
                         log.say(&log.paint(Tone::Dim, "  authenticated, receiving"));
                         // Option A: start the direct-QUIC race. start_direct owns
                         // replacement after all fallible setup and pending registration.
