@@ -189,8 +189,9 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
       const why = back == null ? 'the restored page never came back on the other peer'
         : (await tilesFor(a.page, name)) === 0 ? 'the restored page dropped off the other peer again'
           : /took over/i.test(await b.page.evaluate(() => document.body.innerText)) ? 'the restored page shows itself superseded' : null;
-      const seen = telEvents().slice(mark).map((e) => e.ev).filter((e) => /close|leave|disconnect|supersede|join|sync/.test(e));
-      console.log(`[closed-tab] ${tag}: relay saw [${[...new Set(seen)].join(', ')}]`);
+      const seen = telEvents().slice(mark).filter((e) => !/^web:(vis|net|conn|link|ice|tile|cfg)/.test(e.ev))
+        .map((e) => e.ev + (e.reason ? '(' + e.reason + ')' : '') + (e.status ? '(' + e.status + ')' : ''));
+      console.log(`[closed-tab] ${tag}: relay saw [${seen.slice(0, 40).join(', ')}]`);
       if (why) failures.push(`${tag}: ${why}`);
       else ok(`${tag}: a restored page comes back and stays on the other peer`);
       await b.ctx.close();
