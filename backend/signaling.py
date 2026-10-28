@@ -789,6 +789,138 @@ class _RedisRegistry:
         return out
 
 
+class PollWatch:
+    """WSGI middleware: when each engine.io long-polling socket last had a GET.
+
+    A websocket client that dies is seen at once: the TCP close ends the
+    socket. A long-polling client that dies without a word (a killed renderer,
+    a mobile OS kill) is not. Its last GET sits in the server until the next
+    ping, the write goes nowhere, and only the ping timeout ends the socket:
+    pingInterval + pingTimeout, 85 s in production. The lease loop keeps such a
+    socket leased the whole time, because engine.io still calls it open.
+
+    A live polling client is never without a GET for long. engine.io-client
+    keeps exactly one long-poll outstanding and sends the next one from the
+    previous one's load callback (not a timer, so tab throttling does not delay
+    it). So "no GET held, and none for GRACE seconds" is a client that stopped
+    polling. To make that visible within seconds, the poll loop in register()
+    answers a GET that has been held HOLD seconds with a NOOP packet: a live
+    client re-polls within one round trip, a dead one never does.
+
+    Independent of the ping timeout, which stays long for slow and backgrounded
+    clients. Only polling GETs are recorded (an upgraded socket is forgotten),
+    so websocket clients are untouched.
+    """
+
+    def __init__(self, app, path="socket.io", clock=_time.monotonic):
+        self.app = app
+        self._prefix = "/" + path.strip("/") + "/"
+        self._clock = clock
+        self._lock = threading.Lock()
+        # engine.io sid -> [GETs in flight, since (start of the held GET, or
+        # end of the last one), NOOP already sent for the held GET]
+        self._polls = {}
+
+    def _poll_sid(self, environ):
+        if environ.get("REQUEST_METHOD") != "GET":
+            return None
+        if not (environ.get("PATH_INFO") or "").startswith(self._prefix):
+            return None
+        qs = environ.get("QUERY_STRING") or ""
+        if "transport=polling" not in qs or "sid=" not in qs:
+            return None
+        from urllib.parse import parse_qs
+        q = parse_qs(qs)
+        if q.get("transport", [None])[0] != "polling":
+            return None
+        sid = q.get("sid", [None])[0]
+        return sid if sid and len(sid) <= 64 else None
+
+    def __call__(self, environ, start_response):
+        sid = self._poll_sid(environ)
+        if sid is None:
+            return self.app(environ, start_response)
+        self.begin(sid)
+        try:
+            return self.app(environ, start_response)
+        finally:
+            self.end(sid)
+
+    def begin(self, sid):
+        with self._lock:
+            st = self._polls.setdefault(sid, [0, 0.0, False])
+            st[0] += 1
+            st[1] = self._clock()
+            st[2] = False
+
+    def end(self, sid):
+        with self._lock:
+            st = self._polls.get(sid)
+            if st is None:
+                return
+            st[0] = max(0, st[0] - 1)
+            if st[0] == 0:
+                st[1] = self._clock()
+
+    def sids(self):
+        with self._lock:
+            return list(self._polls)
+
+    def state(self, sid):
+        """(GETs in flight, seconds in this state, NOOP sent) or None."""
+        with self._lock:
+            st = self._polls.get(sid)
+            if st is None:
+                return None
+            return st[0], self._clock() - st[1], st[2]
+
+    def mark_cycled(self, sid):
+        with self._lock:
+            st = self._polls.get(sid)
+            if st is not None:
+                st[2] = True
+
+    def forget(self, sid):
+        with self._lock:
+            self._polls.pop(sid, None)
+
+
+def poll_check(eio, watch, hold, grace):
+    """One pass of the polling liveness rule over every recorded socket.
+
+    Returns the engine.io sids it closed. Pure over (eio.sockets, watch), so a
+    test can drive it with a fake clock and fake sockets."""
+    from engineio import packet as _eio_packet
+
+    closed = []
+    for eio_sid in watch.sids():
+        sock = eio.sockets.get(eio_sid)
+        if sock is None or sock.closed or sock.upgraded:
+            watch.forget(eio_sid)  # gone, or on websocket now: not ours
+            continue
+        if sock.upgrading or sock.closing:
+            continue  # the client pauses polling during an upgrade
+        st = watch.state(eio_sid)
+        if st is None:
+            continue
+        inflight, age, cycled = st
+        if inflight:
+            if age >= hold and not cycled:
+                # End the held GET so a live client re-polls now; a dead one
+                # leaves the socket with no GET, which the next branch sees.
+                watch.mark_cycled(eio_sid)
+                sock.send(_eio_packet.Packet(_eio_packet.NOOP))
+        elif age >= grace:
+            watch.forget(eio_sid)
+            _tel("poll-lapsed", eio=eio_sid[:8], idle=round(age, 1))
+            reason = getattr(getattr(eio, "reason", None), "TRANSPORT_CLOSE", None)
+            # abort=True: no CLOSE packet to a client that is not there. The
+            # disconnect handler runs as for a ping timeout (peer-left etc.).
+            sock.close(wait=False, abort=True, reason=reason)
+            closed.append(eio_sid)
+    return closed
+
+
 def make_registry(redis_url):
     return _RedisRegistry(redis_url) if redis_url else _MemRegistry()
 
@@ -836,7 +968,7 @@ def _tel(event, **kv):
 # ALLOWS 3-5 digits (spec nameplate: 900 -- 3-digit, but 4-5 gas for widening).
 _NAMEPLATE_RE = re.compile(r"^[0-9]{3,5}$")
 
-def register(socketio, registry):
+def register(socketio, registry, poll_watch=None):
     local_sids = set()  # connections owned by THIS instance (for lease refresh)
 
     def _eio_alive(sid):
@@ -876,6 +1008,25 @@ def register(socketio, registry):
                 pass
 
     socketio.start_background_task(_lease_loop)
+
+    # Polling liveness (PollWatch): a long-polling socket with no GET for
+    # FIL_POLL_GRACE_S is closed; a GET held FIL_POLL_HOLD_S is answered with a
+    # NOOP so that rule can be read within seconds. Worst case from a silent
+    # death to peer-left is about HOLD + GRACE + 2 ticks + one round trip.
+    # FIL_POLL_GRACE_S=0 turns it off.
+    poll_hold = float(os.environ.get("FIL_POLL_HOLD_S", "2"))
+    poll_grace = float(os.environ.get("FIL_POLL_GRACE_S", "7"))
+    poll_tick = float(os.environ.get("FIL_POLL_TICK_S", "1"))
+    if poll_watch is not None and poll_grace > 0:
+        def _poll_loop():
+            while True:
+                socketio.sleep(poll_tick)
+                try:
+                    poll_check(socketio.server.eio, poll_watch, poll_hold, poll_grace)
+                except Exception:
+                    pass
+
+        socketio.start_background_task(_poll_loop)
 
     _session_claim_limiter = ratelimit.make_limiter(
         "session-claim",

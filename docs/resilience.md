@@ -312,6 +312,50 @@ UI hid it.
 `frontend/tests/peer-reload.spec.cjs`,
 `backend/tests/test_session_generation.py`.
 
+## 14. A silently dead polling page stayed a ghost tile for about 85 s
+
+**Symptom.** A page on the socket.io long-polling transport (a network that
+holds or blocks websockets) that dies without `pagehide` (a killed renderer, a
+mobile OS kill) stayed on every other peer as a "connecting" tile for about
+85 s. Websocket pages that die the same way leave at once.
+
+**Problem.** A websocket death ends the engine.io socket on TCP close. A
+polling client has no connection of its own to close: its last long-poll GET
+sits in the relay until the next ping (25 s), the answer goes nowhere, and only
+the ping timeout (60 s) ends the socket. Until then `_eio_alive` called it open
+and the lease loop kept refreshing it. The ping values are long on purpose
+(slow, high-RTT and backgrounded clients reconnect-stormed at 10 s/5 s), so
+they could not simply be shortened.
+
+**Solution.** A separate rule for polling sockets, in the relay
+(`signaling.PollWatch`, a WSGI middleware that records each polling GET, plus a
+1 s loop). A live engine.io-client always holds one long-poll and sends the next
+from the previous one's load callback, not from a timer, so CPU throttling and
+background-tab timer throttling do not delay it. The loop answers a GET held
+`FIL_POLL_HOLD_S` (2 s) with a NOOP packet, and closes a polling socket that
+then has no GET for `FIL_POLL_GRACE_S` (7 s): a live client re-polls within one
+round trip, a dead one never does. Closing runs the normal disconnect path, so
+the room gets `peer-left`. The ping timeout is unchanged and still covers
+websocket half-opens. Upgraded sockets are forgotten; a socket mid-upgrade is
+left alone (the client pauses polling then). `FIL_POLL_GRACE_S=0` turns the
+rule off.
+
+**Bounds, measured** (`frontend/tests/polling-liveness.spec.cjs`, production
+25/60 ping, eventlet): a crashed or silently closed polling page leaves the
+other peer in 8.1 to 8.9 s over 12 runs (84 s and 114 s on the old relay). A
+polling page at 20x CPU throttling, hidden, never drops: 60 s at 2.5 s added
+latency, and 30 s each at 4, 5, 6 and 8 s. Three 3 s offline flaps never
+remove the tile (the reconnect supersedes by uid). The rule trades one
+thing: a polling client whose next GET takes longer than the grace to reach the
+relay (round trips over about 7 s, or a tab the OS has frozen) is closed and
+reconnects, where before it rode out up to 85 s. A frozen tab was already
+dropped by the ping timeout; it now goes sooner and rejoins on resume.
+
+*Files:* `backend/signaling.py` (`PollWatch`, `poll_check`, the poll loop in
+`register`), `backend/app.py`.
+*Gates:* `backend/tests/test_poll_liveness.py`,
+`frontend/tests/polling-liveness.spec.cjs`.
+
 ## Testing
 
 `PeerLink`'s logic is exercised against a mock `RTCPeerConnection` (see the test
